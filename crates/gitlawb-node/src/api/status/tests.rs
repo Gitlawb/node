@@ -74,7 +74,7 @@ fn sample_material() -> crate::auth::SignatureMaterial {
         signature_input: "sig1=(\"@method\" \"@path\" \"content-digest\");alg=\"ed25519\""
             .to_string(),
         signing_string: "\"@method\": POST".to_string(),
-        body: axum::body::Bytes::from_static(b"{}"),
+        body: Some(axum::body::Bytes::from_static(b"{}")),
     }
 }
 
@@ -564,7 +564,7 @@ async fn oversized_signature_material_is_rejected_with_400(pool: PgPool) {
         (
             "request body",
             crate::auth::SignatureMaterial {
-                body: vec![b'b'; super::MAX_REQUEST_BODY_BYTES + 1].into(),
+                body: Some(vec![b'b'; super::MAX_REQUEST_BODY_BYTES + 1].into()),
                 ..sample_material()
             },
         ),
@@ -608,6 +608,64 @@ async fn oversized_signature_material_is_rejected_with_400(pool: PgPool) {
         resp.status(),
         StatusCode::CREATED,
         "material inside the bounds must still write, or the caps prove nothing"
+    );
+}
+
+/// Material that reached this handler without the body is a refusal, not an
+/// empty column.
+///
+/// The body is only captured on routes that mark themselves as persisting it,
+/// so an absent body here means the status route lost that marker or the
+/// marker layer was reordered behind the signature middleware. Writing the row
+/// anyway would record a claim nobody can re-verify, with nothing going red:
+/// the same absence-renders-as-success shape the missing-material branch
+/// already refuses.
+#[sqlx::test]
+async fn material_without_the_body_is_refused_rather_than_stored_empty(pool: PgPool) {
+    let state = test_state(pool).await;
+    let repo = seed_repo(OWNER, "no-body-repo", true);
+    let repo_id = repo.id.clone();
+    state.db.create_repo(&repo).await.unwrap();
+
+    let mut req = signed_request_as(
+        OWNER,
+        Method::POST,
+        &uri(OWNER, "no-body-repo", SHA_A),
+        body_of("success", "ci/build"),
+    );
+    req.extensions_mut().insert(crate::auth::SignatureMaterial {
+        body: None,
+        ..sample_material()
+    });
+    let resp = router(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a status write whose material carries no body must be refused"
+    );
+    assert!(
+        state
+            .db
+            .list_status_claims(&repo_id, SHA_A)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a refused write must leave no row"
+    );
+
+    // The control: the same request with the body present writes, so the
+    // refusal above is about the missing body and not the route.
+    let resp = post_as(
+        &state,
+        OWNER,
+        &uri(OWNER, "no-body-repo", SHA_A),
+        body_of("success", "ci/build"),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "material carrying the body must still write"
     );
 }
 
@@ -876,6 +934,44 @@ async fn middleware_persists_the_material_the_client_actually_sent(pool: PgPool)
     assert_eq!(claim.producer_did, did);
     assert_eq!(claim.state, "pending");
     assert_eq!(claim.context, "ci/wire");
+}
+
+/// The status write route shows the persist marker to the signature
+/// middleware, so the body is captured on the one route that stores it.
+///
+/// The marker is an extension layer on the status write group and the
+/// middleware reads it when it decides whether to carry the body. That only
+/// works if the marker layer is the OUTER of the two, and axum's layer order
+/// is a property of how `build_router` is written, not something the type
+/// system checks. Reordering the group, or dropping the layer, leaves a
+/// handler that still passes every test driving a hand-built material onto a
+/// bare router and stores nothing in production. This drives the real router.
+#[sqlx::test]
+async fn the_status_route_shows_the_persist_marker_to_the_signature_middleware(pool: PgPool) {
+    let state = test_state(pool).await;
+    let kp = gitlawb_core::identity::Keypair::generate();
+    let did = kp.did().to_string();
+    let repo = seed_repo(&did, "marker-order-repo", true);
+    let repo_id = repo.id.clone();
+    state.db.create_repo(&repo).await.unwrap();
+
+    let path = uri(&did, "marker-order-repo", SHA_A);
+    let body = br#"{"state":"success","context":"ci/marker"}"#;
+    let (resp, _) = post_really_signed(&state, &kp, &path, body).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "the status route must reach the signature middleware with the persist \
+         marker already applied; a marker layer inside the auth layers is never seen"
+    );
+
+    let claims = state.db.list_status_claims(&repo_id, SHA_A).await.unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(
+        claims[0].request_body,
+        body.to_vec(),
+        "the persist marker must make the middleware carry the body through to the row"
+    );
 }
 
 /// A captured signed write, put on the wire a second time, returns the claim
@@ -1820,9 +1916,11 @@ fn seed_pr(repo_id: &str, number: i64, source_branch: &str) -> crate::db::PullRe
 
 /// Point a branch at a SHA the way the receive-pack path does: one
 /// `repo_push_events` row, which is what the rollup's fallback resolves
-/// through. Each call takes a strictly later timestamp than the last, so a
-/// second call to the same branch reads as a later push rather than tying
-/// with the first.
+/// through. Call order is what decides: the fallback reads the highest `seq`,
+/// which the database assigns at insert, so a second call to the same branch
+/// reads as a later push. The distinct timestamps are only there to keep two
+/// fixture rows distinguishable in a failure message; changing them changes
+/// nothing about which one wins.
 async fn seed_branch_head(
     state: &crate::state::AppState,
     repo: &RepoRecord,
@@ -1837,9 +1935,12 @@ async fn seed_branch_head(
 
 /// One `repo_push_events` row, exactly the shape `record_push_events` writes
 /// on the receive-pack path: a FULL ref name and the post-push SHA. The
-/// timestamp is explicit because the fallback picks the most recent row for
-/// the ref and `created_at` is the ordering key; letting two seeds share a
-/// wall clock would leave which one wins to the uuid tiebreak.
+/// timestamp is a caller-chosen display value, NOT the ordering key: the
+/// fallback picks the row with the highest database-assigned `seq`, so the row
+/// inserted last wins even if it carries the earlier stamp, and there is no
+/// uuid tiebreak. `latest_push_sha_for_ref_follows_insertion_not_the_stamp`
+/// pins that. A fixture reordered on the assumption the stamp decides will get
+/// a different answer than it expects.
 async fn seed_push_event(
     state: &crate::state::AppState,
     repo: &RepoRecord,

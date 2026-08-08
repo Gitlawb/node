@@ -146,6 +146,20 @@ pub async fn create_status(
              the route is not behind require_signature"
         )));
     };
+    // The body is carried only behind the `PersistsSignedBody` marker, which
+    // this route's group applies outside the auth layers. Its absence means the
+    // marker did not reach the middleware, because the layer was dropped or
+    // reordered. That is the same class of misconfiguration as the branch above
+    // and gets the same answer. Storing an empty body instead would write claims
+    // that carry a signature over a digest of bytes nobody kept, which is
+    // exactly the case `stored_claim_re_verifies_and_a_tampered_row_does_not`
+    // exists to make impossible.
+    let Some(body) = material.body.clone() else {
+        return Err(AppError::Internal(anyhow::anyhow!(
+            "status claim write reached with signature material carrying no request body: \
+             the route lost its persist-body marker or applied it inside the auth layers"
+        )));
+    };
     // Bounded before anything is written. The material is verified, which says
     // the caller holds the key, not that what they signed is a reasonable size.
     bound("signature", material.signature.len(), MAX_SIGNATURE_CHARS)?;
@@ -159,14 +173,14 @@ pub async fn create_status(
         material.signing_string.len(),
         MAX_SIGNING_STRING_CHARS,
     )?;
-    bound("request body", material.body.len(), MAX_REQUEST_BODY_BYTES)?;
+    bound("request body", body.len(), MAX_REQUEST_BODY_BYTES)?;
 
-    let digest = request_digest(&material);
+    let digest = request_digest(&material, &body);
     let (signature, signature_input, signing_string, request_body) = (
         material.signature,
         material.signature_input,
         material.signing_string,
-        material.body.to_vec(),
+        body.to_vec(),
     );
 
     let claim = StatusClaim {
@@ -233,14 +247,14 @@ pub async fn create_status(
 /// This is not a nonce, and deliberately so. A nonce table needs pruning and a
 /// pruning window is a second replay window; the claim row IS the record of what
 /// was accepted, so uniqueness on it is self-maintaining.
-fn request_digest(material: &crate::auth::SignatureMaterial) -> String {
+fn request_digest(material: &crate::auth::SignatureMaterial, body: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     for part in [
         material.signature.as_bytes(),
         material.signature_input.as_bytes(),
         material.signing_string.as_bytes(),
-        &material.body,
+        body,
     ] {
         h.update((part.len() as u64).to_be_bytes());
         h.update(part);

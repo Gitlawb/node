@@ -197,6 +197,14 @@ pub fn build_router(state: AppState) -> Router {
             .layer(axum::Extension(state.rate_limiter.clone())),
         state.clone(),
     )
+    // The one route that persists the signed request body, so the one route
+    // whose signature material carries it. Applied OUTSIDE `add_auth_layers`
+    // (outermost = runs first) because `require_signature` reads this marker to
+    // decide whether to carry the body; a layer added inside the auth pair runs
+    // after the middleware and is never seen. `create_status` refuses an absent
+    // body rather than storing an empty column, so getting this order wrong
+    // fails loudly instead of quietly writing unverifiable claims.
+    .layer(axum::Extension(auth::PersistsSignedBody))
     .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
     .layer(axum::Extension(rate_limit::IpRateLimiter {
         limiter: state.create_ip_rate_limiter.clone(),

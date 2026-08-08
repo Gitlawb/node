@@ -142,9 +142,16 @@ pub(crate) fn scrape_source_region(
     };
     let rest = &src[from..];
     let to = match end {
-        // Search past the first byte, so an `end` anchor that also matches at the
-        // very start of the region cannot collapse it to nothing.
-        Some(anchor) => rest.get(1..)?.find(anchor)? + 1,
+        // Search past the first CHARACTER, so an `end` anchor that also matches
+        // at the very start of the region cannot collapse it to nothing. A fixed
+        // one-byte skip does the same job on ASCII and lands mid-character on a
+        // multibyte first character, where the slice fails and the helper answers
+        // `None`, which is indistinguishable, to every caller, from a missing
+        // anchor.
+        Some(anchor) => {
+            let skip = rest.chars().next().map_or(0, char::len_utf8);
+            rest.get(skip..)?.find(anchor)? + skip
+        }
         None => rest.len(),
     };
     Some(
@@ -204,8 +211,40 @@ mod scrape_source_region_tests {
         assert!(scrape_source_region(SRC, Some("fn target()"), Some("~absent~")).is_none());
     }
 
-    /// The end anchor is searched past the first byte, so a region whose own
-    /// start also matches the end anchor is not collapsed to nothing.
+    /// A region whose first character is multibyte is scraped, not reported
+    /// missing.
+    ///
+    /// The end-anchor search skips the region's first CHARACTER. Skipping a
+    /// fixed byte instead lands mid-character here, the slice fails, and the
+    /// helper answers `None`, which every caller reads as "the anchor is gone"
+    /// and reports as a missing region. A guard that says "not found"
+    /// for input that is present is worse than one that fails loudly, and the
+    /// five callers sharing this helper all inherit it.
+    #[test]
+    fn a_multibyte_first_character_does_not_read_as_a_missing_anchor() {
+        let src = "é prelude\nfn target() {\n    body();\n}\nfn later() {}\n";
+
+        let body = scrape_source_region(src, None, Some("\n}"))
+            .expect("a region starting on a multibyte character must be scraped");
+        assert!(
+            body.starts_with("é prelude") && body.contains("body();"),
+            "the region must cover the multibyte start through the end anchor, got: {body}"
+        );
+        assert!(
+            !body.contains("fn later()"),
+            "the region must still stop at the end anchor, got: {body}"
+        );
+
+        // The same through a multibyte START anchor, so the skip is measured
+        // from the region rather than from the top of the file.
+        let body = scrape_source_region(src, Some("é"), Some("\n}"))
+            .expect("a multibyte start anchor must be scraped");
+        assert!(body.starts_with('é'), "got: {body}");
+    }
+
+    /// The end anchor is searched past the region's first character, so a
+    /// region whose own start also matches the end anchor is not collapsed to
+    /// nothing.
     #[test]
     fn an_end_anchor_matching_at_the_start_does_not_collapse_the_region() {
         let src = "\n}\nfn target() {\n    body();\n}\n";

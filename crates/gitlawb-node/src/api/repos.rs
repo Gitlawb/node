@@ -1681,10 +1681,12 @@ pub(crate) struct RefUpdate {
 /// would publish a private repo's push metadata to anonymous callers.
 ///
 /// Every row of one push shares a single timestamp, which is why the read side
-/// pages on `(created_at, id)` rather than the timestamp alone. A failure is
-/// logged and skipped: the push itself already succeeded and the objects are on
-/// disk, so refusing the response over a missed poll row would be the worse
-/// trade.
+/// pages on the database-assigned `seq` and not on the timestamp: it is unique
+/// per row, so there is no tiebreak to get wrong, and it is assigned at insert
+/// rather than stamped here. `created_at` is display metadata on this surface.
+/// A failure is logged and skipped: the push itself already succeeded and the
+/// objects are on disk, so refusing the response over a missed poll row would be
+/// the worse trade.
 /// How many ref updates of one push go into a single database statement.
 ///
 /// A CHUNK SIZE, not a cap. `parse_ref_updates` puts no bound on how many refs a
@@ -1738,12 +1740,12 @@ pub(crate) async fn record_push_events(
     ref_updates: &[RefUpdate],
 ) {
     // Canonical UTC rfc3339 with a fixed sub-second width and a `Z` offset, not
-    // the default `+00:00`. Two reasons, both load-bearing for the cursor. The
-    // column is TEXT and the keyset predicate compares it lexicographically, so a
-    // single fixed width is what makes string order equal time order. And the
-    // value is handed back to the poller as a query parameter, where a literal
-    // `+` decodes to a space: a client that echoes the cursor unencoded would
-    // then re-read the page it just consumed, forever.
+    // the default `+00:00`. This is display metadata now, not the ordering key:
+    // the cursor pages on the database-assigned `seq`, so neither the fixed
+    // width nor the offset is load-bearing for paging any more. Kept canonical
+    // anyway so the value a poller reads back sorts and compares the way a
+    // reader expects, and so a literal `+` never reaches a query string, where
+    // it would decode to a space.
     let created_at =
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, /* use_z */ true);
     let events: Vec<crate::db::RepoPushEvent> = ref_updates
