@@ -2347,23 +2347,25 @@ mod tests {
     #[sqlx::test]
     async fn two_writers_on_the_same_repo_are_not_both_admitted(pool: PgPool) {
         let opts = (*pool.connect_options()).clone();
-        let store = write_store(&pool, &opts).await;
+        let store = write_store(&pool, &opts)
+            .await
+            .with_lock_acquire_deadline(std::time::Duration::from_millis(300));
 
         let _first = store
             .acquire_write("did:key:z6MkU3Excl", "same-repo")
             .await
             .expect("first writer acquires");
 
-        let second = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            store.acquire_write("did:key:z6MkU3Excl", "same-repo"),
-        )
-        .await;
-
+        let err = match store.acquire_write("did:key:z6MkU3Excl", "same-repo").await {
+            Err(e) => e,
+            Ok(second) => {
+                second.release(false).await;
+                panic!("a second writer must NOT be admitted while the first holds the guard");
+            }
+        };
         assert!(
-            second.is_err(),
-            "second writer must NOT be admitted while the first holds the guard \
-             (it should still be retrying when the deadline hits)"
+            err.downcast_ref::<RepoBusy>().is_some(),
+            "the second writer must be shed as RepoBusy, got {err:#}"
         );
     }
 
