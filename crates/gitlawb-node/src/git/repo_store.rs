@@ -198,7 +198,18 @@ impl RepoStore {
                                 "acquire_fresh: tigris download failed — falling back to local copy");
                             return Ok(local_path);
                         }
-                        return Err(e).context("downloading repo from tigris (fresh)");
+                        // No local copy, so the write cannot proceed and the archive's
+                        // readability is unknowable. Same epistemic class as the HEAD arm
+                        // and the under-lock refresh: a transient storage blip must be a
+                        // retryable refusal, not a 500 that tells the client the failure
+                        // is permanent. Wrap so the handler layer's `RepoUnavailable`
+                        // downcast maps this to a retryable 503 with a fixed body; the
+                        // detail (which repo, why) stays in this warn and the context.
+                        warn!(repo = %repo_name, err = %e,
+                            "acquire_fresh: tigris download failed and no local copy exists — refusing");
+                        return Err(anyhow::Error::new(RepoUnavailable).context(format!(
+                            "tigris download failed during acquire_fresh for {owner_slug}/{repo_name}: {e:#}"
+                        )));
                     }
                     return Ok(local_path);
                 }
@@ -2893,6 +2904,54 @@ mod tests {
             err.downcast_ref::<RepoUnavailable>().is_some(),
             "the refusal must be typed so the handler layer maps it to a retryable 503, got {err:#}"
         );
+    }
+
+    /// A download that fails when the HEAD succeeded tells us the archive is
+    /// present but unreadable, and with no local copy to fall back on the
+    /// pre-write refresh must refuse as `RepoUnavailable` — not leak a bare
+    /// Tigris error that the handler layer would map to a non-retryable 500.
+    ///
+    /// The server answers HEAD 200 and GET 500, so `exists()` returns
+    /// `Ok(true)` while `download()` fails at the transport layer, exactly the
+    /// "archive present per HEAD, GET failed, no local fallback" state.
+    #[sqlx::test]
+    async fn acquire_fresh_refuses_when_the_download_fails_and_no_local_copy_exists(pool: PgPool) {
+        use axum::response::IntoResponse;
+
+        let app = axum::Router::new().route(
+            "/{*key}",
+            axum::routing::any(|method: axum::http::Method| async move {
+                if method == axum::http::Method::HEAD {
+                    axum::http::StatusCode::OK.into_response()
+                } else {
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let opts = (*pool.connect_options()).clone();
+        let lock_pool = no_reap_pool(&opts, 2).await;
+        let store = RepoStore::for_testing_with_tigris(
+            PathBuf::from("/tmp/gitlawb-getfail-fresh"),
+            lock_pool,
+            TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint),
+        );
+
+        let err = store
+            .acquire_fresh("did:key:z6MkGetFail", "freshrepo")
+            .await
+            .expect_err("a failed download with no local copy must refuse");
+        assert!(
+            err.downcast_ref::<RepoUnavailable>().is_some(),
+            "the refusal must be typed so the handler layer maps it to a retryable 503, got {err:#}"
+        );
+
+        server.abort();
     }
 
     /// The under-lock sibling of the above. `acquire_write` already refuses on
