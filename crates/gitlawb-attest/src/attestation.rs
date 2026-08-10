@@ -217,8 +217,20 @@ fn verifying_key_from_did_key(did: &str) -> Result<VerifyingKey> {
     let key_bytes: [u8; 32] = bytes[ED25519_MULTICODEC.len()..]
         .try_into()
         .expect("length checked above");
-    VerifyingKey::from_bytes(&key_bytes)
-        .map_err(|e| Error::Did(format!("invalid ed25519 key: {e}")))
+    let key = VerifyingKey::from_bytes(&key_bytes)
+        .map_err(|e| Error::Did(format!("invalid ed25519 key: {e}")))?;
+
+    // `from_bytes` only decompresses, so it accepts a small-order point. This
+    // crate parses did:key itself rather than going through gitlawb-core's
+    // `Did`, and it cannot go through it (gitlawb-core is a dev-dependency
+    // here), so the rejection is mirrored rather than inherited. Signature
+    // verification is already strict, so this is defense in depth against a
+    // future consumer of this parser that does not verify strictly.
+    if key.is_weak() {
+        return Err(Error::Did("small-order ed25519 key".to_string()));
+    }
+
+    Ok(key)
 }
 
 #[cfg(test)]
@@ -559,6 +571,50 @@ mod tests {
     /// weak (small-order) public key satisfies the verification equation
     /// but must be rejected. The identity point is such a key: with R the
     /// identity and S = 0, [S]B - [k]A is the identity for any message.
+    /// gitlawb-attest parses did:key itself and never routes through
+    /// gitlawb-core's `Did`, which it cannot: gitlawb-core is a dev-dependency
+    /// here. So the choke-point rejection has to be mirrored in this parser or
+    /// this crate keeps handing out keys the rest of the system rejects.
+    #[test]
+    fn verifying_key_from_did_key_rejects_a_small_order_key() {
+        let mut weak = [0u8; 32];
+        weak[0] = 1; // compressed identity point
+        let mut buf = Vec::with_capacity(ED25519_MULTICODEC.len() + 32);
+        buf.extend_from_slice(&ED25519_MULTICODEC);
+        buf.extend_from_slice(&weak);
+        let did = format!(
+            "did:key:{}",
+            multibase::encode(multibase::Base::Base58Btc, &buf)
+        );
+
+        let err =
+            verifying_key_from_did_key(&did).expect_err("a small-order did:key must not resolve");
+        match err {
+            Error::Did(msg) => assert!(
+                msg.contains("small-order"),
+                "rejection must name the small-order key, got: {msg}"
+            ),
+            other => panic!("expected Error::Did, got {other:?}"),
+        }
+    }
+
+    /// Control for the guard above: a real did:key must still resolve.
+    #[test]
+    fn verifying_key_from_did_key_still_accepts_a_real_key() {
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        let vk = sk.verifying_key();
+        let mut buf = Vec::with_capacity(ED25519_MULTICODEC.len() + 32);
+        buf.extend_from_slice(&ED25519_MULTICODEC);
+        buf.extend_from_slice(&vk.to_bytes());
+        let did = format!(
+            "did:key:{}",
+            multibase::encode(multibase::Base::Base58Btc, &buf)
+        );
+
+        let got = verifying_key_from_did_key(&did).expect("a real did:key must resolve");
+        assert_eq!(got.to_bytes(), vk.to_bytes());
+    }
+
     #[test]
     fn verify_rejects_weak_key_signature() {
         let mut weak_key_bytes = [0u8; 32];
@@ -572,7 +628,13 @@ mod tests {
         let forged_sig = B64U.encode(forged);
 
         // Build an attestation with the weak key as signer and the forged
-        // signature. The weak-key check happens at verify time.
+        // signature. Rejection now happens at DID RESOLUTION rather than at
+        // verify time: `verifying_key_from_did_key` refuses a small-order key
+        // before `verify_strict` is reached, so the observed error is
+        // `Error::Did`, not `Error::Signature`. `verify_strict` remains the
+        // second layer for malleability cases that do not involve a weak
+        // public key (a small-order R under an honest key), which this fixture
+        // cannot construct and therefore no longer covers.
         let mut att = dummy_attestation(&SigningKey::generate(&mut OsRng), cert_hash);
         let mut buf = Vec::with_capacity(ED25519_MULTICODEC.len() + 32);
         buf.extend_from_slice(&ED25519_MULTICODEC);
@@ -584,9 +646,12 @@ mod tests {
         att.sig = forged_sig;
 
         let err = att.verify_signature(cert_hash).unwrap_err();
-        assert!(
-            matches!(err, Error::Signature(_)),
-            "signature under a weak (small-order) public key must be rejected"
-        );
+        match err {
+            Error::Did(msg) => assert!(
+                msg.contains("small-order"),
+                "weak signer must be refused as a small-order key, got: {msg}"
+            ),
+            other => panic!("expected Error::Did for a small-order signer, got {other:?}"),
+        }
     }
 }
