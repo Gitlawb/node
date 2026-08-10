@@ -261,6 +261,22 @@ pub async fn get_by_cid(
     // handler's `auth` extension, so resolve it once here.
     let caller_owned = auth.as_ref().map(|e| e.0 .0.as_str().to_string());
 
+    // Every DB await from here on runs while the scarce walk permits are ALREADY
+    // held, and the pool sets no statement_timeout, so an unclamped query blocked in
+    // Postgres would pin those slots for the whole stall, past the request budget,
+    // and capacity-503 later requests from any unauthenticated caller (#174 F2).
+    // Each one is clamped to the request deadline; returning on the timeout arm
+    // RAII-drops `admission`, which is the whole mechanism, so no new state is
+    // needed. Defined once here so the clamp sites on the provenance path share one
+    // definition (the legacy-scan preload below keeps its own `budget_shed` inside
+    // its nested scope).
+    let budget_shed = || {
+        AppError::Overloaded(format!(
+            "ipfs scan incomplete (budget) for CID {cid_str}; retry shortly"
+        ))
+    };
+    let remaining = || request_deadline.saturating_duration_since(std::time::Instant::now());
+
     // Resolve the content-addressed CID to the object's git oid(s). A real pin
     // CID digests the raw object content (`Cid::from_git_object_bytes`), NOT the
     // git oid (git frames content with a `"<type> <len>\0"` header first), so we
@@ -271,11 +287,19 @@ pub async fn get_by_cid(
     // when the chosen one is withheld or absent while another is readable (#173).
     // An empty result is an opaque 404, uniform with a genuine not-found and a
     // visibility denial.
-    let oids = state
-        .db
-        .oids_for_cid(&canonical_cid)
-        .await
-        .map_err(AppError::Internal)?;
+    let oids = match tokio::time::timeout(remaining(), state.db.oids_for_cid(&canonical_cid)).await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(AppError::Internal(e)),
+        Err(_elapsed) => {
+            tracing::warn!(
+                budget_secs = state.config.ipfs_request_budget_secs,
+                "/ipfs oids_for_cid exceeded the request budget \
+                 (GITLAWB_IPFS_REQUEST_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
+            );
+            return Err(budget_shed());
+        }
+    };
     if oids.is_empty() {
         return Err(AppError::RepoNotFound(format!(
             "no git object found for CID {cid_str}"
@@ -323,11 +347,23 @@ pub async fn get_by_cid(
         // scan fan-out. A shared object first pinned from a private/quarantined repo
         // still serves from a later PUBLIC source. Deterministic (ORDER BY on the
         // union), so no ordering can turn an authorized copy into a 404.
-        let sources = state
-            .db
-            .pin_sources_for_oid(sha256_hex)
-            .await
-            .map_err(AppError::Internal)?;
+        let sources = match tokio::time::timeout(
+            remaining(),
+            state.db.pin_sources_for_oid(sha256_hex),
+        )
+        .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(AppError::Internal(e)),
+            Err(_elapsed) => {
+                tracing::warn!(
+                    budget_secs = state.config.ipfs_request_budget_secs,
+                    "/ipfs pin_sources_for_oid exceeded the request budget \
+                     (GITLAWB_IPFS_REQUEST_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
+                );
+                return Err(budget_shed());
+            }
+        };
         // Provenance fast-path: try each recorded source repo through the SAME gate
         // (bounded to first-pinner + MAX_PIN_SOURCES). Empty for a legacy NULL-provenance
         // pin. The first source that authorizes serves — no scan fan-out on the common
@@ -341,13 +377,6 @@ pub async fn get_by_cid(
             // here drops the permits. The quarantine bit and the visibility rules are
             // both access control, so a timeout must DENY rather than fall through with
             // an empty answer (FAIL CLOSED).
-            let budget_shed = || {
-                AppError::Overloaded(format!(
-                    "ipfs scan incomplete (budget) for CID {cid_str}; retry shortly"
-                ))
-            };
-            let remaining =
-                || request_deadline.saturating_duration_since(std::time::Instant::now());
             let repo = match tokio::time::timeout(remaining(), state.db.get_repo_by_id(repo_id))
                 .await
             {
@@ -473,20 +502,48 @@ pub async fn get_by_cid(
                 continue;
             }
         }
-        let needs_scan = sources.is_empty() || {
-            #[cfg(test)]
-            bump_marker_queries();
-            state
-                .db
-                .pin_sources_at_cap(sha256_hex)
+        let needs_scan = sources.is_empty()
+            || {
+                #[cfg(test)]
+                bump_marker_queries();
+                let at_cap = match tokio::time::timeout(remaining(), async {
+                    #[cfg(test)]
+                    stall_marker_query(MarkerQuery::AtCap).await;
+                    state.db.pin_sources_at_cap(sha256_hex).await
+                })
                 .await
-                .map_err(AppError::Internal)?
-                || state
-                    .db
-                    .pin_sources_incomplete(sha256_hex)
+                {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => return Err(AppError::Internal(e)),
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                        budget_secs = state.config.ipfs_request_budget_secs,
+                        "/ipfs pin_sources_at_cap exceeded the request budget \
+                         (GITLAWB_IPFS_REQUEST_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
+                    );
+                        return Err(budget_shed());
+                    }
+                };
+                at_cap
+                    || match tokio::time::timeout(remaining(), async {
+                        #[cfg(test)]
+                        stall_marker_query(MarkerQuery::Incomplete).await;
+                        state.db.pin_sources_incomplete(sha256_hex).await
+                    })
                     .await
-                    .map_err(AppError::Internal)?
-        };
+                    {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(e)) => return Err(AppError::Internal(e)),
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                            budget_secs = state.config.ipfs_request_budget_secs,
+                            "/ipfs pin_sources_incomplete exceeded the request budget \
+                             (GITLAWB_IPFS_REQUEST_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
+                        );
+                            return Err(budget_shed());
+                        }
+                    }
+            };
         if needs_scan {
             // Load the scan context once, lazily (shared across oid candidates).
             if scan_ctx.is_none() {
@@ -1305,6 +1362,61 @@ fn bump_marker_queries() {
     MARKER_QUERIES.with(|c| c.set(c.get() + 1));
 }
 
+/// Which of the two `needs_scan` marker queries a test wants to stall.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MarkerQuery {
+    AtCap,
+    Incomplete,
+}
+
+// Test-only fault-injection seam for the `needs_scan` marker pair
+// (`pin_sources_at_cap`, `pin_sources_incomplete`), same idea as
+// `RepoStore::tigris_stall`: hold one specific await open so the clamp around it is
+// the one observed to fire.
+//
+// A `LOCK TABLE` fixture cannot isolate these two. `pin_sources_at_cap` reads
+// `pin_repo_sources` and `pin_sources_incomplete` reads `pinned_cids`, and BOTH tables
+// are already read by `oids_for_cid` and `pin_sources_for_oid` earlier in the same
+// admission-held region, so a lock taken before the request stalls one of those instead
+// and the RED is attributed to the wrong clamp. Taking the lock mid-request does not
+// help either: the window between `pin_sources_for_oid` returning and this pair running
+// is a single `get_repo_by_id` round trip (measured at ~0.15ms against this Postgres),
+// so timing a lock into it is a race that flakes under load.
+//
+// Armed per target so the second query can be reached with the first left untouched
+// (`at_cap` must return `false` for the `||` to evaluate `pin_sources_incomplete`).
+// `thread_local` for the same reason as the counters above: `#[sqlx::test]` runs each
+// case on its own current-thread runtime, so arming here is invisible to cases running
+// in parallel.
+#[cfg(test)]
+thread_local! {
+    static MARKER_QUERY_STALL: std::cell::Cell<Option<(MarkerQuery, std::time::Duration)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn arm_marker_query_stall(which: MarkerQuery, stall: std::time::Duration) {
+    MARKER_QUERY_STALL.with(|c| c.set(Some((which, stall))));
+}
+
+#[cfg(test)]
+pub(crate) fn disarm_marker_query_stall() {
+    MARKER_QUERY_STALL.with(|c| c.set(None));
+}
+
+/// Awaited INSIDE each marker query's `tokio::time::timeout`, never before it: a stall
+/// placed outside the clamp would elapse with the clamp never firing and prove nothing.
+#[cfg(test)]
+async fn stall_marker_query(which: MarkerQuery) {
+    let armed = MARKER_QUERY_STALL.with(|c| c.get());
+    if let Some((target, stall)) = armed {
+        if target == which {
+            tokio::time::sleep(stall).await;
+        }
+    }
+}
+
 // Test-only INV-10 cost counter (F6, U6/U7): how many times the serve path withheld an
 // object because it exceeded `ipfs_max_served_object_bytes`. The bounded read must reject
 // an oversized object rather than buffer it on the worker; the counter is the both-ways
@@ -1342,6 +1454,7 @@ mod tests {
     //! CID-resolution / visibility-gate behavior of the handler itself is covered by the
     //! `#[sqlx::test]` suite in `test_support.rs`.
 
+    use super::{arm_marker_query_stall, disarm_marker_query_stall, MarkerQuery};
     use axum::body::Body;
     use axum::extract::ConnectInfo;
     use axum::http::{Method, Request, StatusCode};
@@ -3581,6 +3694,178 @@ mod tests {
         );
     }
 
+    /// F2 (#174): `oids_for_cid` is the FIRST DB await inside the admission-held
+    /// region, and pre-fix it was a bare await with no deadline. A query blocked in
+    /// Postgres there pinned both walk permits for the whole stall, past the request
+    /// budget, so later /ipfs requests took capacity 503s long after
+    /// GITLAWB_IPFS_REQUEST_BUDGET_SECS elapsed, reachable by any unauthenticated
+    /// caller. Here `pinned_cids` (the only table `oids_for_cid` reads) is held
+    /// ACCESS EXCLUSIVE so the query blocks at lock acquisition.
+    ///
+    /// The follow-up after ROLLBACK is a 404 rather than a 200 because this scenario
+    /// seeds no pin at all; "admitted and answered, never capacity-503'd" is what
+    /// proves the permit came back.
+    ///
+    /// Load-bearing: pre-fix the bare await blocks on the lock until the 10s wrapping
+    /// timeout fires (RED). MUTATION (RED): drop the `tokio::time::timeout` around
+    /// `oids_for_cid` and this hangs past the wrap.
+    #[sqlx::test]
+    async fn get_by_cid_stalled_oids_query_frees_walk_permit(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        // Global walk pool of 1 so the held/freed permit is directly observable;
+        // per-source cap permissive so only the global pool matters.
+        state.git_ipfs_walk_semaphore = Arc::new(Semaphore::new(1));
+        state.git_ipfs_walk_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
+        let mut cfg = (*state.config).clone();
+        cfg.ipfs_request_budget_secs = 1;
+        state.config = Arc::new(cfg);
+
+        let sem = state.git_ipfs_walk_semaphore.clone();
+        // A well-formed CID with no `pinned_cids` row: the request still runs the
+        // `oids_for_cid` lookup, which is the await under test.
+        let cid = cid_for_oid(&absent_oid());
+        let router = ipfs_router(state);
+
+        let mut lock_conn = pool.acquire().await.unwrap();
+        sqlx::raw_sql("BEGIN; LOCK TABLE pinned_cids IN ACCESS EXCLUSIVE MODE;")
+            .execute(&mut *lock_conn)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.81:5000".parse().unwrap();
+        let started = std::time::Instant::now();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            router.clone().oneshot(get_cid(&cid, Some(peer))),
+        )
+        .await
+        .expect("the budget clamp must return within budget; a bare await hangs on the lock")
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an oid lookup blocked past the request budget must shed a retryable 503"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "the clamp must end the request at ~budget (1s); got {elapsed:?} \
+             (pre-fix the bare await blocks on the lock for the whole stall)"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("budget"),
+            "the shed must name the budget taint so it maps to \
+             GITLAWB_IPFS_REQUEST_BUDGET_SECS; got: {body}"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the walk permit must be freed on the budget-shed path, not held for the stall"
+        );
+
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut *lock_conn)
+            .await
+            .unwrap();
+        drop(lock_conn);
+        let resp2 = router.oneshot(get_cid(&cid, Some(peer))).await.unwrap();
+        assert_eq!(
+            resp2.status(),
+            StatusCode::NOT_FOUND,
+            "with the permit freed and the lock released, a follow-up is ADMITTED and \
+             answers 404 (no pin was seeded), never capacity-503'd"
+        );
+    }
+
+    /// F2 (#174), second lockable site: `pin_sources_for_oid` runs once per candidate
+    /// oid, still inside the admission-held region, and was likewise a bare await.
+    ///
+    /// The lock isolates it from the first await: `oids_for_cid` reads only
+    /// `pinned_cids`, which stays unlocked, so it completes and the handler reaches
+    /// the per-oid loop; `pin_sources_for_oid` also reads `pin_repo_sources`, which is
+    /// held ACCESS EXCLUSIVE, so it is the query that blocks. A seeded legacy pin is
+    /// what gives the loop an oid to iterate.
+    ///
+    /// Load-bearing: pre-fix the bare await blocks on the lock until the 10s wrap
+    /// fires (RED). MUTATION (RED): drop the `tokio::time::timeout` around
+    /// `pin_sources_for_oid`; that mutation must leave the `oids_for_cid` scenario
+    /// above GREEN, which is what proves the two tests isolate their own queries.
+    #[sqlx::test]
+    async fn get_by_cid_stalled_pin_sources_query_frees_walk_permit(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.git_ipfs_walk_semaphore = Arc::new(Semaphore::new(1));
+        state.git_ipfs_walk_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
+        let mut cfg = (*state.config).clone();
+        cfg.ipfs_request_budget_secs = 1;
+        state.config = Arc::new(cfg);
+
+        let sem = state.git_ipfs_walk_semaphore.clone();
+        let cid = seed_legacy_pin(&state, &absent_oid()).await;
+        let router = ipfs_router(state);
+
+        let mut lock_conn = pool.acquire().await.unwrap();
+        sqlx::raw_sql("BEGIN; LOCK TABLE pin_repo_sources IN ACCESS EXCLUSIVE MODE;")
+            .execute(&mut *lock_conn)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.82:5000".parse().unwrap();
+        let started = std::time::Instant::now();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            router.clone().oneshot(get_cid(&cid, Some(peer))),
+        )
+        .await
+        .expect("the budget clamp must return within budget; a bare await hangs on the lock")
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a pin-source lookup blocked past the request budget must shed a retryable 503"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "the clamp must end the request at ~budget (1s); got {elapsed:?} \
+             (pre-fix the bare await blocks on the lock for the whole stall)"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("budget"),
+            "the shed must name the budget taint so it maps to \
+             GITLAWB_IPFS_REQUEST_BUDGET_SECS; got: {body}"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the walk permit must be freed on the budget-shed path, not held for the stall"
+        );
+
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut *lock_conn)
+            .await
+            .unwrap();
+        drop(lock_conn);
+        let resp2 = router.oneshot(get_cid(&cid, Some(peer))).await.unwrap();
+        assert_eq!(
+            resp2.status(),
+            StatusCode::NOT_FOUND,
+            "with the permit freed and the lock released, a follow-up is served (404 \
+             against an empty repo set), never capacity-503'd"
+        );
+    }
+
     /// F6/KTD-5 FAIL CLOSED (security-critical): `list_visibility_rules_for_repos` is
     /// the access-control query. If its timeout let the handler fall through with an
     /// empty rule map, the loop would apply no visibility rules and serve an unfiltered
@@ -3684,5 +3969,157 @@ mod tests {
             .await
             .unwrap();
         drop(lock_conn);
+    }
+
+    /// Seed a PROVENANCED pin whose single recorded source repo does not exist, and
+    /// return its CID. `pin_sources_for_oid` therefore comes back NON-EMPTY (so
+    /// `needs_scan` cannot short-circuit on `sources.is_empty()`) while the per-source
+    /// loop takes the `get_repo_by_id -> None` arm and falls straight through to the
+    /// marker pair. `pin_repo_sources` stays empty, so `pin_sources_at_cap` is `false`
+    /// and the `||` goes on to evaluate `pin_sources_incomplete`.
+    async fn seed_provenanced_pin_with_missing_source(
+        state: &crate::state::AppState,
+        oid: &str,
+    ) -> String {
+        let cid = cid_for_oid(oid);
+        state
+            .db
+            .record_pinned_cid(oid, &cid, Some("repo-id-that-does-not-exist"))
+            .await
+            .expect("seed a provenanced pin row");
+        cid
+    }
+
+    /// Shared body for the two marker-query stall cases. Arms the seam for `which`,
+    /// drives one request, and asserts the whole budget-shed contract: a 503 inside the
+    /// budget, a body naming the budget taint, the walk permit BACK in the pool rather
+    /// than pinned for the stall, and a follow-up that is ADMITTED (404 here, since the
+    /// fixture seeds no servable object) instead of capacity-shed.
+    async fn assert_marker_query_stall_frees_walk_permit(
+        pool: sqlx::PgPool,
+        which: MarkerQuery,
+        peer: SocketAddr,
+        label: &str,
+    ) {
+        let mut state = crate::test_support::test_state(pool).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        // Global walk pool of 1 so the held/freed permit is directly observable;
+        // per-source cap permissive so only the global pool matters.
+        state.git_ipfs_walk_semaphore = Arc::new(Semaphore::new(1));
+        state.git_ipfs_walk_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
+        let mut cfg = (*state.config).clone();
+        cfg.ipfs_request_budget_secs = 1;
+        state.config = Arc::new(cfg);
+
+        let sem = state.git_ipfs_walk_semaphore.clone();
+        let cid = seed_provenanced_pin_with_missing_source(&state, &absent_oid()).await;
+        let router = ipfs_router(state);
+
+        // 30s so the stall is decided by the 1s budget clamp, never by the sleep
+        // finishing on its own.
+        arm_marker_query_stall(which, std::time::Duration::from_secs(30));
+        let started = std::time::Instant::now();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            router.clone().oneshot(get_cid(&cid, Some(peer))),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            disarm_marker_query_stall();
+            panic!("{label}: the budget clamp must return within budget; a bare await hangs")
+        })
+        .unwrap();
+        let elapsed = started.elapsed();
+        disarm_marker_query_stall();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{label}: a marker query blocked past the request budget must shed a retryable 503"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "{label}: the clamp must end the request at ~budget (1s); got {elapsed:?} \
+             (an unclamped await runs the full 30s stall)"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("budget"),
+            "{label}: the shed must name the budget taint so it maps to \
+             GITLAWB_IPFS_REQUEST_BUDGET_SECS; got: {body}"
+        );
+        // The scarce walk permit was RAII-dropped on the early return, not pinned for
+        // the stall: the slot is free again the instant the request returns.
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "{label}: the walk permit must be freed on the budget-shed path, not held \
+             for the stall"
+        );
+
+        // With the seam disarmed the follow-up is ADMITTED and answered (404, since the
+        // fixture seeds no servable object), never capacity-503'd, which is what proves
+        // the slot came back rather than staying pinned.
+        let resp2 = router.oneshot(get_cid(&cid, Some(peer))).await.unwrap();
+        assert_eq!(
+            resp2.status(),
+            StatusCode::NOT_FOUND,
+            "{label}: with the permit freed, a follow-up is admitted and answers 404, \
+             never capacity-503'd"
+        );
+    }
+
+    /// F2 (#174), marker pair, first query: `pin_sources_at_cap` runs on a provenance
+    /// MISS, still inside the admission-held region, and pre-fix was a bare await. A
+    /// query blocked in Postgres there pinned the walk permits for the whole stall,
+    /// past the request budget, capacity-503'ing later requests from any
+    /// unauthenticated caller.
+    ///
+    /// This one needs the `#[cfg(test)]` fault-injection seam rather than a `LOCK TABLE`
+    /// fixture: it reads `pin_repo_sources`, which `pin_sources_for_oid` already read
+    /// earlier in the same region, so a table lock stalls that earlier await and the RED
+    /// lands on the wrong clamp. See `MARKER_QUERY_STALL` for the full reasoning. The
+    /// injected sleep sits INSIDE the `tokio::time::timeout`, so the clamp is what ends
+    /// the request.
+    ///
+    /// MUTATION (RED): replace the clamp around `pin_sources_at_cap` with the bare
+    /// await, keeping the seam, and the request runs the full 30s stall past the 10s
+    /// wrap.
+    #[sqlx::test]
+    async fn get_by_cid_stalled_pin_sources_at_cap_frees_walk_permit(pool: sqlx::PgPool) {
+        assert_marker_query_stall_frees_walk_permit(
+            pool,
+            MarkerQuery::AtCap,
+            "203.0.113.83:5000".parse().unwrap(),
+            "pin_sources_at_cap",
+        )
+        .await;
+    }
+
+    /// F2 (#174), marker pair, second query: `pin_sources_incomplete` is a SEPARATE
+    /// clamp, evaluated only when `pin_sources_at_cap` came back `false`, and carries
+    /// the same pre-fix bare-await exposure. The fixture leaves `pin_repo_sources`
+    /// empty so `at_cap` is `false` and the `||` actually reaches this query; the seam
+    /// is armed for `Incomplete` only, so the first query is untouched and the RED is
+    /// attributable to this clamp alone.
+    ///
+    /// It reads `pinned_cids`, which `oids_for_cid` and `pin_sources_for_oid` already
+    /// read, so it is unlockable for the same reason as its sibling above.
+    ///
+    /// MUTATION (RED): replace the clamp around `pin_sources_incomplete` with the bare
+    /// await, keeping the seam, and the request runs the full 30s stall past the 10s
+    /// wrap.
+    #[sqlx::test]
+    async fn get_by_cid_stalled_pin_sources_incomplete_frees_walk_permit(pool: sqlx::PgPool) {
+        assert_marker_query_stall_frees_walk_permit(
+            pool,
+            MarkerQuery::Incomplete,
+            "203.0.113.84:5000".parse().unwrap(),
+            "pin_sources_incomplete",
+        )
+        .await;
     }
 }
