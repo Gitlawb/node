@@ -23,9 +23,15 @@ fn is_valid_tx_id(tx_id: &str) -> bool {
 ///
 /// Fetch the anchor from Arweave via the configured gateway, extract the embedded
 /// certificate, and verify:
-///   1. The node's Ed25519 signature on the certificate payload
-///   2. The `prev` hash chains correctly against the most recent local cert
-///   3. The `pusher_sig` can be verified (optional, informational)
+///   1. The node's Ed25519 signature on the certificate payload (with a
+///      7-field legacy fallback when the proof fields are absent)
+///   2. Chain continuity: `prev` hashes against the predecessor cert (seq > 1)
+///      and, on the legacy path, the stored row is corroborated
+///   3. The RFC 9421 `pusher_sig` — REQUIRED (not optional) whenever the
+///      signature context fields are present
+///
+/// The verdict only ever covers fields the certificate actually signed; the
+/// outer repo/owner_did are corroborated against the node's own record.
 pub async fn verify_anchor_endpoint(
     State(state): State<AppState>,
     Path(tx_id): Path<String>,

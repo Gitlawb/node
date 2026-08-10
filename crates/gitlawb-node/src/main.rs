@@ -98,29 +98,25 @@ async fn main() -> Result<()> {
     let mut config = Config::parse();
 
     // Fallback to legacy GITLAWB_IRYS_URL for backward compatibility during rename
-    let used_legacy_irys = if config.bundler_url.is_empty() {
+    if config.bundler_url.is_empty() {
         if let Ok(legacy) = std::env::var("GITLAWB_IRYS_URL") {
             if !legacy.is_empty() {
                 config.bundler_url = legacy;
                 tracing::warn!("GITLAWB_IRYS_URL is deprecated, use GITLAWB_BUNDLER_URL instead");
-                true
-            } else {
-                false
             }
-        } else {
-            false
         }
-    } else {
-        false
-    };
+    }
 
-    // When the legacy GITLAWB_IRYS_URL was used and GITLAWB_ARWEAVE_GATEWAY was
-    // not explicitly set, pair the gateway to the same network so that anchors
-    // uploaded to Irys devnet are verifiable through the verify endpoint.
-    if used_legacy_irys && std::env::var("GITLAWB_ARWEAVE_GATEWAY").is_err() {
+    // When a bundler URL is configured (whether via the modern
+    // GITLAWB_BUNDLER_URL or the legacy GITLAWB_IRYS_URL alias) and
+    // GITLAWB_ARWEAVE_GATEWAY was not explicitly set, pair the gateway to the
+    // same network so that anchors uploaded to a devnet bundler (whose
+    // transactions are not resolvable via the arweave.net default gateway) are
+    // verifiable through the verify endpoint.
+    if !config.bundler_url.is_empty() && std::env::var("GITLAWB_ARWEAVE_GATEWAY").is_err() {
         config.arweave_gateway = config.bundler_url.clone();
         tracing::warn!(
-            "GITLAWB_ARWEAVE_GATEWAY unset — inferred from legacy GITLAWB_IRYS_URL as {}",
+            "GITLAWB_ARWEAVE_GATEWAY unset — inferred from bundler URL as {}",
             config.arweave_gateway
         );
     }
@@ -361,12 +357,9 @@ async fn main() -> Result<()> {
 
     // Per-client-IP limiter for the Arweave verify endpoint. The route is
     // unauthenticated (anyone can check a tx_id) and the per-DID creation
-    // limiter is too restrictive (10/hr). GITLAWB_ARWEAVE_RATE_LIMIT overrides;
-    // 0 disables. Bounded key set — the key is a client-influenced IP.
-    let arweave_limit = std::env::var("GITLAWB_ARWEAVE_RATE_LIMIT")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(120);
+    // limiter is too restrictive (10/hr). 0 disables. Bounded key set — the
+    // key is a client-influenced IP.
+    let arweave_limit = config.arweave_rate_limit;
     let arweave_rate_limiter = rate_limit::RateLimiter::new_bounded(
         arweave_limit,
         std::time::Duration::from_secs(3600),

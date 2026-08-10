@@ -2769,6 +2769,9 @@ async fn post_receive_replication_tail(
 
                 if announce {
                     if let Some(p2p) = &p2p_handle {
+                        // Publish the exact cert issued for this ref transition so
+                        // peers can resolve the anchored certificate by id.
+                        let cert_id = ref_certs_clone.get(ref_name).map(|c| c.id.clone());
                         p2p.publish_ref_update(crate::p2p::RefUpdateEvent {
                             node_did: node_did_str.clone(),
                             pusher_did: pusher_did_clone.clone(),
@@ -2778,7 +2781,7 @@ async fn post_receive_replication_tail(
                             old_sha: old_sha.clone(),
                             new_sha: new_sha.clone(),
                             timestamp: chrono::Utc::now().to_rfc3339(),
-                            cert_id: None,
+                            cert_id,
                             cid: cid.map(|s| s.to_string()),
                         })
                         .await;

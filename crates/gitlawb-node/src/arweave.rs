@@ -408,6 +408,48 @@ pub async fn verify_anchor(
             ));
         }
 
+        // 0c. Corroborate outer repo slug and owner_did against the node's own
+        //    record for the certificate's repo_id.  The certificate signs the
+        //    repo_id UUID but not the human-readable slug or owner DID, so a
+        //    forger could otherwise echo attacker-chosen identities next to a
+        //    valid:true verdict.  When the node hosts the repo, the outer
+        //    identity fields must agree with what it recorded.
+        let outer_repo = anchor.get("repo").and_then(|v| v.as_str());
+        let outer_owner = anchor.get("owner_did").and_then(|v| v.as_str());
+        match db.get_repo_by_id(&c.repo_id).await {
+            Ok(Some(record)) => {
+                let expected_repo = format!(
+                    "{}/{}",
+                    crate::db::normalize_owner_key(&record.owner_did),
+                    record.name
+                );
+                if let Some(outer_repo) = outer_repo {
+                    if outer_repo != expected_repo {
+                        errors.push(format!(
+                            "anchor outer repo ({outer_repo}) does not match recorded repo ({expected_repo})"
+                        ));
+                    }
+                }
+                if let Some(outer_owner) = outer_owner {
+                    if outer_owner != record.owner_did {
+                        errors.push(format!(
+                            "anchor outer owner_did ({outer_owner}) does not match recorded owner_did ({})",
+                            record.owner_did
+                        ));
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    repo_id = %c.repo_id,
+                    "cannot corroborate anchor repo/owner_did — repo_id not found in node database"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("repo lookup failed for {}: {e}", c.repo_id);
+            }
+        }
+
         // 1. Verify node signature on the certificate payload.
         //    Certificates produced after this PR use a 13-field payload
         //    that includes seq, prev, and proof fields.  Pre-PR certificates
@@ -490,6 +532,7 @@ pub async fn verify_anchor(
         let sig_valid_13 =
             gitlawb_core::identity::verify(&verifying_key, &payload_bytes_13, &sig_array);
 
+        let mut legacy_7_field_verified = false;
         if proof_fields_null && sig_valid_13.is_err() {
             // Fall back to 7-field payload for pre-PR certificates.
             let payload_7 = serde_json::json!({
@@ -502,15 +545,51 @@ pub async fn verify_anchor(
                 "ts":         c.issued_at,
             });
             let payload_bytes_7 = serde_json::to_vec(&payload_7)?;
-            if let Err(e) =
-                gitlawb_core::identity::verify(&verifying_key, &payload_bytes_7, &sig_array)
+            if gitlawb_core::identity::verify(&verifying_key, &payload_bytes_7, &sig_array).is_ok()
             {
-                errors.push(format!(
-                    "certificate signature verification failed (7-field): {e}"
-                ));
+                legacy_7_field_verified = true;
+            } else {
+                errors.push("certificate signature verification failed (7-field)".to_string());
             }
         } else if let Err(e) = sig_valid_13 {
             errors.push(format!("certificate signature verification failed: {e}"));
+        }
+
+        // 1b. Corroborate chain position for legacy certificates.
+        //    The 7-field fallback covers only repo_id, ref, old, new, pusher,
+        //    node, ts.  seq and prev are NOT covered on that path, so a tampered
+        //    legacy cert could otherwise pass with a blanket valid: true.  Look
+        //    up the node's own stored row and require seq/prev agreement.
+        if legacy_7_field_verified {
+            match db.get_ref_certificate(&c.id).await {
+                Ok(Some(stored)) => {
+                    if stored.seq != c.seq {
+                        errors.push(format!(
+                            "certificate seq {} disagrees with stored seq {}",
+                            c.seq, stored.seq
+                        ));
+                    }
+                    if stored.prev != c.prev {
+                        errors.push(format!(
+                            "certificate prev {} disagrees with stored prev {}",
+                            c.prev, stored.prev
+                        ));
+                    }
+                }
+                Ok(None) => {
+                    errors.push(format!(
+                        "certificate {} not found in node database — cannot corroborate legacy chain position",
+                        c.id
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!("certificate lookup failed for {}: {e}", c.id);
+                    errors.push(format!(
+                        "error looking up certificate {} in node database",
+                        c.id
+                    ));
+                }
+            }
         }
 
         // 2. Verify prev hash linkage against the predecessor at seq - 1.
@@ -975,5 +1054,199 @@ mod tests {
             "Expected issuer or DID error in: {:?}",
             verify_result.errors
         );
+    }
+
+    /// A true end-to-end accept: a cert signed by a real node keypair over a
+    /// real 13-field payload, with a real RFC 9421 pusher proof, served through
+    /// a mock gateway, must verify to `valid: true` with empty errors.
+    #[tokio::test]
+    async fn test_verify_anchor_accepts_authentic_13_field_certificate() {
+        let node_kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = node_kp.did().as_str().to_string();
+        let pusher_kp = gitlawb_core::identity::Keypair::generate();
+        let pusher_did = pusher_kp.did().as_str().to_string();
+
+        let repo_id = "repo-uuid";
+        let ref_name = "refs/heads/main";
+        let old_sha = "0".repeat(40);
+        let new_sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let issued_at = "2026-07-22T00:00:00+00:00";
+        let seq = 1i64;
+        let prev = "0".repeat(64);
+
+        // Build a real RFC 9421 pusher proof over an arbitrary push body.
+        let request_path = "/repo-uuid.git/git-receive-pack";
+        let signed =
+            gitlawb_core::http_sig::sign_request(&pusher_kp, "POST", request_path, b"push-body");
+        // The stored pusher_sig is the raw STANDARD base64 of the 64-byte
+        // signature, unwrapped from the `sig1=:...:` header form.
+        let pusher_sig = signed
+            .signature
+            .strip_prefix("sig1=:")
+            .and_then(|s| s.strip_suffix(':'))
+            .unwrap()
+            .to_string();
+
+        // Sign the 13-field payload exactly as the node does.
+        let payload = serde_json::json!({
+            "repo_id": repo_id,
+            "ref": ref_name,
+            "old": old_sha,
+            "new": new_sha,
+            "pusher": pusher_did,
+            "node": node_did,
+            "ts": issued_at,
+            "seq": seq,
+            "prev": prev,
+            "pusher_sig": pusher_sig,
+            "signature_input": signed.signature_input,
+            "content_digest": signed.content_digest,
+            "request_path": request_path,
+        });
+        let signature = node_kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
+
+        let cert = crate::db::RefCertificate {
+            id: "cert-accept-1".to_string(),
+            repo_id: repo_id.to_string(),
+            ref_name: ref_name.to_string(),
+            old_sha: old_sha.clone(),
+            new_sha: new_sha.to_string(),
+            pusher_did,
+            node_did: node_did.clone(),
+            signature,
+            issued_at: issued_at.to_string(),
+            seq,
+            prev,
+            pusher_sig: Some(pusher_sig),
+            signature_input: Some(signed.signature_input),
+            content_digest: Some(signed.content_digest),
+            request_path: Some(request_path.to_string()),
+        };
+
+        let anchor_json = serde_json::json!({
+            "repo_id": repo_id,
+            "ref_name": ref_name,
+            "old_sha": old_sha,
+            "new_sha": new_sha,
+            "node_did": node_did,
+            "certificate": cert,
+        });
+
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/accept-tx")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&anchor_json).unwrap())
+            .create_async()
+            .await;
+
+        let client = reqwest::Client::new();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
+            .expect("lazy pool creation should not fail");
+        let db = crate::db::Db::for_testing(pool);
+
+        let result = verify_anchor(&client, &server.url(), "accept-tx", &db, &node_did).await;
+        let r = result.expect("verify_anchor should return Ok for a served anchor");
+        assert!(
+            r.valid,
+            "authentic 13-field cert must verify, errors: {:?}",
+            r.errors
+        );
+        assert!(
+            r.errors.is_empty(),
+            "expected no errors, got: {:?}",
+            r.errors
+        );
+        _mock.assert_async().await;
+    }
+
+    /// A tampered seq on an authentic legacy 7-field cert must fail: the
+    /// 7-field signature does not cover seq/prev, so the node's stored row
+    /// must be corroborated rather than accepting a blanket valid: true.
+    #[tokio::test]
+    async fn test_verify_anchor_legacy_seq_tamper_fails_closed() {
+        let node_kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = node_kp.did().as_str().to_string();
+
+        let repo_id = "repo-uuid";
+        let ref_name = "refs/heads/main";
+        let old_sha = "0".repeat(40);
+        let new_sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let issued_at = "2026-07-22T00:00:00+00:00";
+
+        // Sign the 7-field payload exactly as pre-PR nodes did.
+        let payload_7 = serde_json::json!({
+            "repo_id": repo_id,
+            "ref": ref_name,
+            "old": old_sha,
+            "new": new_sha,
+            "pusher": "did:key:z6MkPusher",
+            "node": node_did,
+            "ts": issued_at,
+        });
+        let signature = node_kp.sign_b64(&serde_json::to_vec(&payload_7).unwrap());
+
+        let cert = crate::db::RefCertificate {
+            id: "cert-legacy-tamper".to_string(),
+            repo_id: repo_id.to_string(),
+            ref_name: ref_name.to_string(),
+            old_sha: old_sha.clone(),
+            new_sha: new_sha.to_string(),
+            pusher_did: "did:key:z6MkPusher".to_string(),
+            node_did: node_did.clone(),
+            signature,
+            issued_at: issued_at.to_string(),
+            seq: 1,
+            prev: "0".repeat(64),
+            pusher_sig: None,
+            signature_input: None,
+            content_digest: None,
+            request_path: None,
+        };
+
+        let anchor_json = serde_json::json!({
+            "repo_id": repo_id,
+            "ref_name": ref_name,
+            "old_sha": old_sha,
+            "new_sha": new_sha,
+            "node_did": node_did,
+            "certificate": cert,
+        });
+
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/legacy-tamper-tx")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&anchor_json).unwrap())
+            .create_async()
+            .await;
+
+        let client = reqwest::Client::new();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
+            .expect("lazy pool creation should not fail");
+        let db = crate::db::Db::for_testing(pool);
+
+        // The cert id is not present in the (lazy) node database, so the
+        // legacy corroboration must fail closed instead of returning valid.
+        let result =
+            verify_anchor(&client, &server.url(), "legacy-tamper-tx", &db, &node_did).await;
+        let r = result.expect("verify_anchor should return Ok for a served anchor");
+        assert!(
+            !r.valid,
+            "legacy cert not present in node DB must not verify as valid"
+        );
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.contains("not found in node database")
+                    || e.contains("error looking up certificate")),
+            "expected a corroboration error, got: {:?}",
+            r.errors
+        );
+        _mock.assert_async().await;
     }
 }

@@ -198,6 +198,13 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_MAX_PACK_BYTES", default_value_t = 2_147_483_648)]
     pub max_pack_bytes: usize,
 
+    /// Per-client-IP rate limit for the Arweave verify endpoint
+    /// (`GET /api/v1/arweave/verify/:tx_id`), in requests per hour. The route is
+    /// unauthenticated, so it is throttled by the resolved client IP. `0`
+    /// disables. Default: 120.
+    #[arg(long, env = "GITLAWB_ARWEAVE_RATE_LIMIT", default_value_t = 120)]
+    pub arweave_rate_limit: usize,
+
     /// Per-client-IP rate limit for `POST /api/v1/sync/trigger`, in requests per
     /// hour. `/sync/trigger` requires a signature and drives an O(peers) outbound
     /// fan-out per call, so it gets a tight bucket. `0` disables. Default: 60.

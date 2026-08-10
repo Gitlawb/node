@@ -416,6 +416,7 @@ Important node settings:
 | `GITLAWB_PINATA_JWT` | Optional Pinata/IPFS warm-storage pinning. |
 | `GITLAWB_BUNDLER_URL` | Bundler URL for Arweave permanent anchoring (e.g., https://devnet.irys.xyz). Leave empty to disable. (Legacy name: `GITLAWB_IRYS_URL`). |
 | `GITLAWB_ARWEAVE_GATEWAY` | Arweave gateway URL for resolving anchors (defaults to `https://arweave.net`). |
+| `GITLAWB_ARWEAVE_RATE_LIMIT` | Per-client-IP rate limit for the verify endpoint, requests per hour (defaults to 120; `0` disables). |
 
 Production note: change the default Postgres password before exposing a node publicly.
 

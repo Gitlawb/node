@@ -1139,6 +1139,17 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE pin_repair_sweep ADD COLUMN IF NOT EXISTS discovery_cursor_id TEXT NOT NULL DEFAULT ''",
         ],
     },
+    Migration {
+        version: 20,
+        name: "drop_ref_certs_repo_ref_unique",
+        stmts: &[
+            // Remove the superseded (repo_id, ref_name) unique index plus its
+            // per-ref append-only rails.  Deferred to v20 so nodes are not
+            // running a mix of old/new code that each VACUUMed and relied on
+            // this unique index during a rolling upgrade (see v19).
+            "DROP INDEX IF EXISTS idx_ref_certs_repo_ref",
+        ],
+    },
 ];
 
 /// Max distinct source repos recorded per pinned object (F1, #173 jatmn round 8).
