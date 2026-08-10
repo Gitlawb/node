@@ -71,7 +71,8 @@ impl Did {
 
     /// Resolve the Ed25519 verifying key from a `did:key`.
     ///
-    /// Returns `Err` if the DID is not a `did:key` or the key bytes are invalid.
+    /// Returns `Err` if the DID is not a `did:key`, the key bytes are malformed,
+    /// or the key is a small-order (weak) point.
     pub fn to_verifying_key(&self) -> Result<VerifyingKey> {
         if !self.is_did_key() {
             return Err(Error::InvalidDid(format!(
@@ -111,8 +112,12 @@ impl Did {
 
         // `from_bytes` only decompresses, so it accepts a small-order point.
         // Such a key satisfies the verification equation for any message, and
-        // its Montgomery form is the all-zero X25519 u-coordinate, which makes
-        // any X25519 shared secret derived from it the all-zero key. Rejecting
+        // every X25519 shared secret derived from it is the all-zero key: the
+        // order-1 and order-2 points convert to the all-zero Montgomery u
+        // directly, and the order-4 and order-8 points are annihilated by the
+        // scalar clamping instead. `is_weak` covers the whole torsion set.
+        // Mixed-order points are correctly NOT rejected, since clamping clears
+        // the cofactor component. Rejecting
         // at resolution is what makes this the choke point: every consumer that
         // resolves a DID through here inherits the rejection, and a recipient
         // that cannot resolve already fails closed downstream.

@@ -105,16 +105,30 @@ impl Attestation {
         let bytes = canonical_signing_bytes(&self.type_, &self.payload, &self.cert_hash)?;
 
         let vk = verifying_key_from_did_key(&self.signer)?;
+        self.verify_sig_with_key(&vk, &bytes)?;
+
+        Ok(vk)
+    }
+
+    /// The signature check itself, against a key the caller supplies.
+    ///
+    /// Split out so the STRICTNESS of the check stays provable on its own.
+    /// `verifying_key_from_did_key` now refuses a small-order key, so a weak
+    /// signer can no longer reach this line through `verify_signature`. Without
+    /// this seam there would be nothing left that fails when `verify_strict` is
+    /// downgraded to the non-strict `verify`, and that regression would land
+    /// silently. Check order in `verify_signature` is unchanged.
+    fn verify_sig_with_key(&self, vk: &VerifyingKey, bytes: &[u8]) -> Result<()> {
         let sig_bytes: [u8; 64] = B64U
             .decode(&self.sig)
             .map_err(|e| Error::Signature(format!("base64url: {e}")))?
             .try_into()
             .map_err(|_| Error::Signature("signature must be 64 bytes".to_string()))?;
         let sig = Signature::from_bytes(&sig_bytes);
-        vk.verify_strict(&bytes, &sig)
+        vk.verify_strict(bytes, &sig)
             .map_err(|e| Error::Signature(format!("ed25519: {e}")))?;
 
-        Ok(vk)
+        Ok(())
     }
 
     /// Reparse `payload` as `P`. Errors if the type discriminator does not
@@ -596,6 +610,48 @@ mod tests {
             ),
             other => panic!("expected Error::Did, got {other:?}"),
         }
+    }
+
+    /// Strictness regression guard. The parser now refuses a small-order key,
+    /// so `verify_signature` can no longer carry a weak signer down to the
+    /// signature check; this drives that check directly to prove it is still
+    /// STRICT. Downgrading `verify_strict` to `verify` makes this go red,
+    /// which nothing else in the suite would catch.
+    #[test]
+    fn verify_sig_with_key_is_strict_about_a_weak_key() {
+        let mut weak_key_bytes = [0u8; 32];
+        weak_key_bytes[0] = 1; // compressed identity point
+        let weak_vk = VerifyingKey::from_bytes(&weak_key_bytes).unwrap();
+        assert!(weak_vk.is_weak());
+
+        let cert_hash = sample_cert_hash();
+        let mut att = dummy_attestation(&SigningKey::generate(&mut OsRng), cert_hash);
+        // R = identity, S = 0: satisfies the non-strict verification equation
+        // for any message under a small-order key.
+        let mut forged = [0u8; 64];
+        forged[0] = 1;
+        att.sig = B64U.encode(forged);
+
+        let bytes = canonical_signing_bytes(&att.type_, &att.payload, &att.cert_hash).expect("jcs");
+        let err = att
+            .verify_sig_with_key(&weak_vk, &bytes)
+            .expect_err("strict verification must reject a small-order key");
+        assert!(
+            matches!(err, Error::Signature(_)),
+            "expected a signature error, got {err:?}"
+        );
+    }
+
+    /// Accept control for the seam: a genuine signature still verifies through
+    /// the same helper, so the guard above is not simply rejecting everything.
+    #[test]
+    fn verify_sig_with_key_accepts_a_genuine_signature() {
+        let cert_hash = sample_cert_hash();
+        let sk = SigningKey::generate(&mut OsRng);
+        let att = dummy_attestation(&sk, cert_hash);
+        let bytes = canonical_signing_bytes(&att.type_, &att.payload, &att.cert_hash).expect("jcs");
+        att.verify_sig_with_key(&sk.verifying_key(), &bytes)
+            .expect("a real signature must verify");
     }
 
     /// Control for the guard above: a real did:key must still resolve.

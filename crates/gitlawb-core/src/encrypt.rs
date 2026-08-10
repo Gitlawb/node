@@ -12,13 +12,16 @@ use zeroize::Zeroizing;
 fn x25519_public(vk: &VerifyingKey) -> Result<[u8; 32]> {
     use curve25519_dalek::edwards::CompressedEdwardsY;
 
-    // A small-order point converts to the all-zero Montgomery u, and X25519
-    // against u = 0 yields the all-zero shared secret for every scalar, so the
-    // per-recipient wrap could be rebuilt by anyone. Resolution already refuses
-    // such a key (see Did::to_verifying_key); this guard makes the primitive
-    // safe on its own terms for a caller that obtained the key some other way.
+    // Every X25519 shared secret derived from a small-order point is the
+    // all-zero key: order-1 and order-2 convert to the all-zero Montgomery u
+    // directly, order-4 and order-8 are annihilated by the scalar clamping in
+    // x25519_secret_from_seed. Either way the per-recipient wrap could be
+    // rebuilt by anyone. Resolution already refuses such a key (see
+    // Did::to_verifying_key); this guard covers the SEAL side on its own terms
+    // for a caller that obtained the key some other way. The open side
+    // (open_blob's attacker-supplied `eph`) is NOT covered here.
     if vk.is_weak() {
-        anyhow::bail!("verifying key is a small-order point");
+        return Err(anyhow::anyhow!("verifying key is a small-order point"));
     }
 
     let edwards = CompressedEdwardsY::from_slice(vk.as_bytes())
@@ -304,6 +307,16 @@ mod tests {
         assert!(open_blob(&reframe(&header), &reader).is_err());
     }
 
+    /// The compressed identity point: a well-formed Ed25519 encoding that is
+    /// small-order, so every shared secret derived from it is all-zero.
+    fn weak_verifying_key() -> VerifyingKey {
+        let mut weak = [0u8; 32];
+        weak[0] = 1;
+        let vk = VerifyingKey::from_bytes(&weak).expect("identity point decompresses");
+        assert!(vk.is_weak(), "fixture precondition: key is small-order");
+        vk
+    }
+
     /// A small-order recipient key converts to Montgomery u = 0, and X25519
     /// against u = 0 is the all-zero shared secret for ANY scalar, so the
     /// wrapping box is reconstructable with no secret at all. Reject at the
@@ -311,10 +324,7 @@ mod tests {
     /// obtained the key.
     #[test]
     fn x25519_public_rejects_a_small_order_key() {
-        let mut weak = [0u8; 32];
-        weak[0] = 1; // compressed identity point
-        let weak_vk = VerifyingKey::from_bytes(&weak).expect("identity point decompresses");
-        assert!(weak_vk.is_weak(), "precondition: key is small-order");
+        let weak_vk = weak_verifying_key();
 
         assert!(
             x25519_public(&weak_vk).is_err(),
@@ -334,9 +344,7 @@ mod tests {
     /// recipient even when the DID choke point is bypassed entirely.
     #[test]
     fn seal_blob_refuses_a_small_order_recipient() {
-        let mut weak = [0u8; 32];
-        weak[0] = 1;
-        let weak_vk = VerifyingKey::from_bytes(&weak).unwrap();
+        let weak_vk = weak_verifying_key();
 
         assert!(
             seal_blob(b"withheld", &[weak_vk]).is_err(),
@@ -371,9 +379,7 @@ mod tests {
         use crate::did::Did;
         use std::str::FromStr;
 
-        let mut weak_bytes = [0u8; 32];
-        weak_bytes[0] = 1; // compressed identity point
-        let weak_vk = VerifyingKey::from_bytes(&weak_bytes).expect("decompresses");
+        let weak_vk = weak_verifying_key();
 
         // Layer 1: the attacker's did:key string must not resolve at all.
         let weak_did = Did::from_verifying_key(&weak_vk).to_string();

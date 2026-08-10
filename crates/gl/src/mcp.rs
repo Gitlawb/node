@@ -1362,11 +1362,25 @@ fn did_resolve_failure_message(
 #[cfg(test)]
 mod did_resolve_message_tests {
     use super::did_resolve_failure_message;
+    use gitlawb_core::did::Did;
+    use std::str::FromStr;
+
+    /// A well-formed did:key encoding the compressed identity point, which is
+    /// small-order. Indistinguishable by eye from a real key: same `z6Mk`
+    /// prefix, same fixed 48-character method-id.
+    const WEAK_DID_KEY: &str = "did:key:z6MkeXATEjyXENzBXBxgC5EHk2JE5aqd7qMGGtDpLUH1e2Sj";
 
     #[test]
-    fn a_did_key_that_fails_to_resolve_does_not_claim_did_key_is_unsupported() {
-        let err = gitlawb_core::Error::InvalidDid("small-order ed25519 key".to_string());
-        let msg = did_resolve_failure_message("did:key:z6MkWeak", true, &err);
+    fn test_did_key_failure_does_not_claim_did_key_is_unsupported() {
+        // Drive the real parse and the real resolution error rather than
+        // hardcoding the discriminator, so flipping it at the call site fails.
+        let did_str = WEAK_DID_KEY;
+        let did = Did::from_str(did_str).expect("well-formed did:key");
+        let err = did
+            .to_verifying_key()
+            .expect_err("a small-order did:key must not resolve");
+
+        let msg = did_resolve_failure_message(did_str, did.is_did_key(), &err);
         assert!(
             !msg.contains("only did:key is supported"),
             "a did:key must not be told did:key is unsupported: {msg}"
@@ -1378,9 +1392,14 @@ mod did_resolve_message_tests {
     }
 
     #[test]
-    fn a_non_key_method_keeps_the_no_resolver_message() {
-        let err = gitlawb_core::Error::InvalidDid("expected did:key, got did:web".to_string());
-        let msg = did_resolve_failure_message("did:web:example.com", false, &err);
+    fn test_non_key_method_keeps_the_no_resolver_message() {
+        let did_str = "did:web:example.com";
+        let did = Did::from_str(did_str).expect("did:web parses");
+        let err = did
+            .to_verifying_key()
+            .expect_err("did:web has no local resolver");
+
+        let msg = did_resolve_failure_message(did_str, did.is_did_key(), &err);
         assert!(
             msg.contains("only did:key is supported"),
             "an unresolvable method keeps its existing explanation: {msg}"

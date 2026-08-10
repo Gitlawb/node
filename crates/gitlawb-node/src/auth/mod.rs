@@ -141,15 +141,24 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
     let verifying_key = match sig.key_id.to_verifying_key() {
         Ok(vk) => vk,
         Err(e) => {
+            // The hint is only true for a method we have no resolver for.
+            // A did:key that parsed and then failed on its key material (a
+            // small-order key, wrong multicodec, wrong length) would be sent
+            // looking for the wrong problem by it.
+            let hint = if sig.key_id.is_did_key() {
+                "the DID is a did:key whose key material did not resolve"
+            } else {
+                "only did:key is supported in alpha"
+            };
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({
                     "error": "unresolvable_did",
                     "message": format!("cannot resolve DID '{}': {e}", sig.key_id),
-                    "hint": "only did:key is supported in alpha",
+                    "hint": hint,
                 })),
             )
-                .into_response()
+                .into_response();
         }
     };
 
