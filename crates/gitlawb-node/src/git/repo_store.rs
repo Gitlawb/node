@@ -3296,4 +3296,541 @@ mod tests {
         // Release the holders so the test's pool can be torn down cleanly.
         drop(holders);
     }
+
+    // ── conditional-semantics S3 mock (#279) ───────────────────────────────
+
+    /// A captured PUT: the body and the conditional headers as they arrived.
+    ///
+    /// Capture is deliberately separate from evaluation. When tokio drops an
+    /// SDK future the client can tear the TCP connection down and the server
+    /// side handler task is cancelled with it, so a parked handler that resumes
+    /// on its own is not something a test can depend on. Replaying what arrived
+    /// models the real S3 arm we care about (body fully transmitted, commit
+    /// decided later) with no timing in it.
+    #[derive(Clone, Debug)]
+    struct CapturedPut {
+        body: Vec<u8>,
+        if_match: Option<String>,
+        if_none_match: Option<String>,
+    }
+
+    /// One PUT as the mock judged it, for tests that assert on attempt counts.
+    /// `status` is `None` while a PUT is parked: it arrived and was logged, but
+    /// no precondition has been evaluated for it yet.
+    #[derive(Clone, Debug, PartialEq)]
+    struct PutAttempt {
+        if_match: Option<String>,
+        if_none_match: Option<String>,
+        status: Option<u16>,
+    }
+
+    #[derive(Default)]
+    struct MockState {
+        object: Option<Vec<u8>>,
+        etag: Option<String>,
+        next_etag: u64,
+        puts: Vec<PutAttempt>,
+        /// Set by `park_next_put`, consumed by the next arriving PUT.
+        park_next_put: bool,
+        captured: Option<CapturedPut>,
+    }
+
+    /// An in-process S3-compatible server with REAL conditional semantics.
+    ///
+    /// The fence tests downstream are only worth anything if a precondition can
+    /// actually fail here, so this helper carries its own semantics tests below.
+    struct S3Mock {
+        endpoint: String,
+        state: Arc<std::sync::Mutex<MockState>>,
+        gate: Arc<tokio::sync::Notify>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    /// S3 quotes ETags. Compare unquoted so a value that round-tripped through
+    /// the SDK (which surfaces `e_tag()` with the quotes intact) matches what
+    /// the mock minted.
+    fn unquote_etag(raw: &str) -> &str {
+        raw.trim().trim_matches('"')
+    }
+
+    /// The conditional evaluation, in one place so a live PUT and a replayed
+    /// one cannot drift apart. Returns the status, and on success the fresh
+    /// ETag. Preconditions are read against the state passed in, which is
+    /// always the state as of the CALL, never as of capture.
+    fn evaluate_put(
+        st: &mut MockState,
+        body: Vec<u8>,
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> (u16, Option<String>) {
+        let refuse = |st: &mut MockState| {
+            st.puts.push(PutAttempt {
+                if_match: if_match.map(str::to_string),
+                if_none_match: if_none_match.map(str::to_string),
+                status: Some(412),
+            });
+            (412u16, None)
+        };
+
+        if let Some(want) = if_match {
+            // An absent object matches nothing, so If-Match cannot pass.
+            match st.etag.as_deref() {
+                Some(have) if unquote_etag(have) == unquote_etag(want) => {}
+                _ => return refuse(st),
+            }
+        }
+        if if_none_match.map(str::trim) == Some("*") && st.object.is_some() {
+            return refuse(st);
+        }
+
+        // A fresh ETag per successful PUT, from a counter rather than a content
+        // hash: two writers can publish byte-identical archives, and an ETag
+        // that repeated across them would let a fence pass on a generation it
+        // never observed.
+        st.next_etag += 1;
+        let etag = format!("\"mock-etag-{}\"", st.next_etag);
+        st.object = Some(body);
+        st.etag = Some(etag.clone());
+        st.puts.push(PutAttempt {
+            if_match: if_match.map(str::to_string),
+            if_none_match: if_none_match.map(str::to_string),
+            status: Some(200),
+        });
+        (200, Some(etag))
+    }
+
+    impl S3Mock {
+        async fn start() -> Self {
+            use axum::response::IntoResponse;
+
+            let state = Arc::new(std::sync::Mutex::new(MockState::default()));
+            let gate = Arc::new(tokio::sync::Notify::new());
+
+            let app = axum::Router::new().route(
+                "/{*key}",
+                axum::routing::any({
+                    let state = state.clone();
+                    let gate = gate.clone();
+                    move |method: axum::http::Method,
+                          headers: axum::http::HeaderMap,
+                          body: axum::body::Bytes| {
+                        let state = state.clone();
+                        let gate = gate.clone();
+                        async move {
+                            let header = |name: &str| {
+                                headers
+                                    .get(name)
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(str::to_string)
+                            };
+                            match method {
+                                axum::http::Method::PUT => {
+                                    let if_match = header("if-match");
+                                    let if_none_match = header("if-none-match");
+
+                                    // A parked PUT records what arrived and then
+                                    // waits. The client will usually be gone by
+                                    // the time the gate opens, which is exactly
+                                    // why the deterministic arm is the replay.
+                                    let parked = {
+                                        let mut st = state.lock().unwrap();
+                                        if st.park_next_put {
+                                            st.park_next_put = false;
+                                            st.puts.push(PutAttempt {
+                                                if_match: if_match.clone(),
+                                                if_none_match: if_none_match.clone(),
+                                                status: None,
+                                            });
+                                            st.captured = Some(CapturedPut {
+                                                body: body.to_vec(),
+                                                if_match: if_match.clone(),
+                                                if_none_match: if_none_match.clone(),
+                                            });
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    };
+                                    if parked {
+                                        gate.notified().await;
+                                        return axum::http::StatusCode::OK.into_response();
+                                    }
+
+                                    let (status, etag) = {
+                                        let mut st = state.lock().unwrap();
+                                        evaluate_put(
+                                            &mut st,
+                                            body.to_vec(),
+                                            if_match.as_deref(),
+                                            if_none_match.as_deref(),
+                                        )
+                                    };
+                                    match etag {
+                                        Some(etag) => (
+                                            axum::http::StatusCode::OK,
+                                            [(axum::http::header::ETAG, etag)],
+                                        )
+                                            .into_response(),
+                                        None => axum::http::StatusCode::from_u16(status)
+                                            .unwrap()
+                                            .into_response(),
+                                    }
+                                }
+                                axum::http::Method::HEAD | axum::http::Method::GET => {
+                                    let st = state.lock().unwrap();
+                                    match (st.object.clone(), st.etag.clone()) {
+                                        (Some(bytes), Some(etag)) => (
+                                            axum::http::StatusCode::OK,
+                                            [(axum::http::header::ETAG, etag)],
+                                            axum::body::Body::from(bytes),
+                                        )
+                                            .into_response(),
+                                        _ => axum::http::StatusCode::NOT_FOUND.into_response(),
+                                    }
+                                }
+                                _ => axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response(),
+                            }
+                        }
+                    }
+                }),
+            );
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            Self {
+                endpoint,
+                state,
+                gate,
+                server,
+            }
+        }
+
+        fn endpoint(&self) -> &str {
+            &self.endpoint
+        }
+
+        fn current_etag(&self) -> Option<String> {
+            self.state.lock().unwrap().etag.clone()
+        }
+
+        fn object(&self) -> Option<Vec<u8>> {
+            self.state.lock().unwrap().object.clone()
+        }
+
+        fn put_attempts(&self) -> Vec<PutAttempt> {
+            self.state.lock().unwrap().puts.clone()
+        }
+
+        /// Park the next arriving PUT so the caller's transfer bound elapses
+        /// with the request in flight (the abandoned-writer arm).
+        fn park_next_put(&self) {
+            self.state.lock().unwrap().park_next_put = true;
+        }
+
+        /// Let a parked handler go. Only the socket-level arm needs this; the
+        /// deterministic assertion is `replay_captured`.
+        fn open_gate(&self) {
+            self.gate.notify_waiters();
+        }
+
+        fn captured_put(&self) -> Option<CapturedPut> {
+            self.state.lock().unwrap().captured.clone()
+        }
+
+        /// Re-run the captured PUT through the SAME evaluation the handler uses,
+        /// against the state as it is NOW.
+        fn replay_captured(&self) -> u16 {
+            let mut st = self.state.lock().unwrap();
+            let captured = st.captured.clone().expect("a PUT was captured");
+            evaluate_put(
+                &mut st,
+                captured.body,
+                captured.if_match.as_deref(),
+                captured.if_none_match.as_deref(),
+            )
+            .0
+        }
+
+        fn shutdown(&self) {
+            self.server.abort();
+        }
+    }
+
+    /// An SDK client aimed at the mock. Built here rather than through
+    /// `TigrisClient` because these tests exercise raw conditional PUTs, which
+    /// the storage client does not expose.
+    fn mock_s3_client(endpoint: &str) -> aws_sdk_s3::Client {
+        use aws_sdk_s3::config::{retry::RetryConfig, Credentials, Region};
+
+        let config = aws_sdk_s3::config::Config::builder()
+            .endpoint_url(endpoint)
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .region(Region::new("auto"))
+            .retry_config(RetryConfig::disabled())
+            .behavior_version_latest()
+            .build();
+        aws_sdk_s3::Client::from_conf(config)
+    }
+
+    /// PUT through the SDK, returning either the fresh ETag or the HTTP status
+    /// the mock refused with.
+    async fn mock_put(
+        client: &aws_sdk_s3::Client,
+        body: &[u8],
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> Result<String, u16> {
+        let mut req = client
+            .put_object()
+            .bucket("test-bucket")
+            .key("repos/v1/owner/repo.tar.zst")
+            .body(aws_sdk_s3::primitives::ByteStream::from(body.to_vec()));
+        if let Some(v) = if_match {
+            req = req.if_match(v);
+        }
+        if let Some(v) = if_none_match {
+            req = req.if_none_match(v);
+        }
+        match req.send().await {
+            Ok(out) => Ok(out
+                .e_tag()
+                .expect("a successful PUT returns an ETag")
+                .to_string()),
+            Err(e) => Err(e
+                .raw_response()
+                .map(|r| r.status().as_u16())
+                .unwrap_or_else(|| panic!("expected an HTTP response from the mock, got {e:?}"))),
+        }
+    }
+
+    /// HEAD through the SDK, reported the way `TigrisClient::exists` reports it:
+    /// `Ok(false)` for a not-found, `Ok(true)` for a hit whose ETag is present.
+    async fn mock_head(client: &aws_sdk_s3::Client) -> Result<bool, String> {
+        match client
+            .head_object()
+            .bucket("test-bucket")
+            .key("repos/v1/owner/repo.tar.zst")
+            .send()
+            .await
+        {
+            Ok(out) => {
+                out.e_tag().ok_or("a HEAD hit must carry an ETag")?;
+                Ok(true)
+            }
+            Err(e) if e.as_service_error().is_some_and(|e| e.is_not_found()) => Ok(false),
+            Err(e) => Err(format!("unexpected HEAD failure: {e}")),
+        }
+    }
+
+    /// 1. A stale If-Match must be refused, and the refusal must not write.
+    #[tokio::test]
+    async fn mock_refuses_a_wrong_if_match_and_leaves_the_object_unchanged() {
+        let mock = S3Mock::start().await;
+        let client = mock_s3_client(mock.endpoint());
+
+        let etag = mock_put(&client, b"first", None, None)
+            .await
+            .expect("the seeding PUT succeeds");
+
+        let status = mock_put(&client, b"second", Some("\"not-the-current-etag\""), None)
+            .await
+            .expect_err("a stale If-Match must be refused");
+        assert_eq!(status, 412, "a stale If-Match must answer 412");
+        assert_eq!(
+            mock.object().as_deref(),
+            Some(b"first".as_slice()),
+            "a refused PUT must leave the stored object unchanged"
+        );
+        assert_eq!(
+            mock.current_etag().as_deref().map(unquote_etag),
+            Some(unquote_etag(&etag)),
+            "a refused PUT must leave the ETag unchanged"
+        );
+
+        mock.shutdown();
+    }
+
+    /// 2. The matching If-Match is the write that must go through.
+    #[tokio::test]
+    async fn mock_accepts_a_matching_if_match_and_rotates_the_etag() {
+        let mock = S3Mock::start().await;
+        let client = mock_s3_client(mock.endpoint());
+
+        let first = mock_put(&client, b"first", None, None).await.expect("seed");
+        let second = mock_put(&client, b"second", Some(&first), None)
+            .await
+            .expect("a matching If-Match must succeed");
+
+        assert_ne!(
+            unquote_etag(&first),
+            unquote_etag(&second),
+            "a successful conditional PUT must mint a fresh ETag"
+        );
+        assert_eq!(
+            mock.object().as_deref(),
+            Some(b"second".as_slice()),
+            "the accepted body must be what is stored"
+        );
+        assert_eq!(
+            mock.current_etag().as_deref().map(unquote_etag),
+            Some(unquote_etag(&second)),
+            "HEAD/GET must report the ETag the PUT returned"
+        );
+
+        mock.shutdown();
+    }
+
+    /// 3. If-None-Match `*` is the create-only fence, so an existing object
+    /// must refuse it.
+    #[tokio::test]
+    async fn mock_refuses_if_none_match_star_against_an_existing_object() {
+        let mock = S3Mock::start().await;
+        let client = mock_s3_client(mock.endpoint());
+
+        mock_put(&client, b"first", None, None).await.expect("seed");
+        let status = mock_put(&client, b"second", None, Some("*"))
+            .await
+            .expect_err("create-only against an existing object must be refused");
+
+        assert_eq!(status, 412, "If-None-Match * on an existing object is 412");
+        assert_eq!(
+            mock.object().as_deref(),
+            Some(b"first".as_slice()),
+            "the refused create-only PUT must not overwrite"
+        );
+
+        mock.shutdown();
+    }
+
+    /// 4. The same fence must ADMIT the first writer, or the fresh-repo path
+    /// could never publish.
+    #[tokio::test]
+    async fn mock_accepts_if_none_match_star_against_an_empty_store() {
+        let mock = S3Mock::start().await;
+        let client = mock_s3_client(mock.endpoint());
+
+        // HEAD both ways, because `exists()` reads a not-found as "fresh repo"
+        // and any other status as a hard refusal. A mock that answered 200 on
+        // an empty store would send every fresh-repo test down the wrong arm.
+        assert!(
+            !mock_head(&client).await.expect("HEAD on an empty store"),
+            "an absent object must HEAD 404"
+        );
+
+        let etag = mock_put(&client, b"first", None, Some("*"))
+            .await
+            .expect("create-only against an empty store must succeed");
+        assert_eq!(mock.object().as_deref(), Some(b"first".as_slice()));
+        assert_eq!(
+            mock.current_etag().as_deref().map(unquote_etag),
+            Some(unquote_etag(&etag))
+        );
+        assert!(
+            mock_head(&client).await.expect("HEAD after the create"),
+            "a stored object must HEAD 200 with the ETag the PUT returned"
+        );
+
+        mock.shutdown();
+    }
+
+    /// 5. Identical bytes must still produce a new ETag. Without this, an
+    /// If-Match fence would pass on a generation it never observed.
+    #[tokio::test]
+    async fn mock_mints_a_distinct_etag_per_successful_put() {
+        let mock = S3Mock::start().await;
+        let client = mock_s3_client(mock.endpoint());
+
+        let first = mock_put(&client, b"same", None, None).await.expect("first");
+        let second = mock_put(&client, b"same", Some(&first), None)
+            .await
+            .expect("second");
+
+        assert_ne!(
+            unquote_etag(&first),
+            unquote_etag(&second),
+            "successive successful PUTs of identical bytes must still differ in ETag"
+        );
+
+        mock.shutdown();
+    }
+
+    /// 6. The whole point of capture-and-replay: the commit is judged when it
+    /// is replayed, not when the bytes arrived. A capture that was valid on
+    /// arrival must lose to a write that landed in between.
+    #[tokio::test]
+    async fn mock_judges_a_replayed_put_against_the_state_at_replay_time() {
+        let mock = S3Mock::start().await;
+        let client = mock_s3_client(mock.endpoint());
+
+        let first = mock_put(&client, b"first", None, None).await.expect("seed");
+
+        // Park the abandoned writer's PUT. Its If-Match is valid at ARRIVAL.
+        mock.park_next_put();
+        let parked = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            mock_put(&client, b"abandoned", Some(&first), None),
+        )
+        .await;
+        assert!(
+            parked.is_err(),
+            "the parked PUT must still be in flight when the caller's bound elapses"
+        );
+        let captured = mock
+            .captured_put()
+            .expect("the parked PUT must be captured at arrival");
+        assert_eq!(captured.body, b"abandoned".to_vec());
+        assert_eq!(
+            captured.if_match.as_deref().map(unquote_etag),
+            Some(unquote_etag(&first)),
+            "the capture must record the conditional headers as they arrived"
+        );
+        assert_eq!(captured.if_none_match, None);
+
+        // A successor commits while the capture sits parked.
+        let second = mock_put(&client, b"successor", Some(&first), None)
+            .await
+            .expect("the successor's PUT is the one that lands");
+
+        // Replaying now must be judged against the successor's state.
+        assert_eq!(
+            mock.replay_captured(),
+            412,
+            "a replayed PUT must be evaluated against the state at replay time, \
+             not the state it was captured against"
+        );
+        assert_eq!(
+            mock.object().as_deref(),
+            Some(b"successor".as_slice()),
+            "the refused replay must not clobber the successor's object"
+        );
+        assert_eq!(
+            mock.current_etag().as_deref().map(unquote_etag),
+            Some(unquote_etag(&second))
+        );
+        // Seed, parked, successor, replay. The log is what later tests assert
+        // attempt counts against, so it is checked here rather than trusted.
+        let attempts = mock.put_attempts();
+        assert_eq!(
+            attempts.len(),
+            4,
+            "every PUT attempt must be logged, got {attempts:?}"
+        );
+        assert_eq!(
+            attempts.iter().map(|a| a.status).collect::<Vec<_>>(),
+            vec![Some(200), None, Some(200), Some(412)],
+            "the parked attempt is logged undecided; the replay is the 412"
+        );
+        assert_eq!(
+            attempts[1].if_match.as_deref().map(unquote_etag),
+            Some(unquote_etag(&first)),
+            "the parked attempt must be logged with the headers it arrived with"
+        );
+
+        mock.open_gate();
+        mock.shutdown();
+    }
 }
