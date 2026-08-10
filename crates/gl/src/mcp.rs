@@ -775,13 +775,15 @@ async fn call_tool(
             let did: gitlawb_core::did::Did = did_str
                 .parse()
                 .map_err(|e: gitlawb_core::Error| anyhow::anyhow!("{e}"))?;
-            if let Ok(vk) = did.to_verifying_key() {
-                let doc = gitlawb_core::did::DidDocument::new(did, &vk);
-                Ok(serde_json::to_string_pretty(&doc)?)
-            } else {
-                Err(anyhow::anyhow!(
-                    "cannot resolve '{did_str}' locally — only did:key is supported without a resolver"
-                ))
+            let is_did_key = did.is_did_key();
+            match did.to_verifying_key() {
+                Ok(vk) => {
+                    let doc = gitlawb_core::did::DidDocument::new(did, &vk);
+                    Ok(serde_json::to_string_pretty(&doc)?)
+                }
+                Err(e) => Err(anyhow::anyhow!(did_resolve_failure_message(
+                    did_str, is_did_key, &e
+                ))),
             }
         }
 
@@ -1339,6 +1341,51 @@ fn write_message(writer: &mut impl Write, value: &Value) -> Result<()> {
     write!(writer, "Content-Length: {}\r\n\r\n{}", json.len(), json)?;
     writer.flush()?;
     Ok(())
+}
+
+/// Message for a `did_resolve` failure. A `did:key` that fails to resolve is a
+/// different situation from a DID method we have no resolver for, so saying
+/// "only did:key is supported" about something that IS a did:key sends the
+/// reader looking for the wrong problem.
+fn did_resolve_failure_message(
+    did_str: &str,
+    is_did_key: bool,
+    err: &gitlawb_core::Error,
+) -> String {
+    if is_did_key {
+        format!("cannot resolve '{did_str}': {err}")
+    } else {
+        format!("cannot resolve '{did_str}' locally — only did:key is supported without a resolver")
+    }
+}
+
+#[cfg(test)]
+mod did_resolve_message_tests {
+    use super::did_resolve_failure_message;
+
+    #[test]
+    fn a_did_key_that_fails_to_resolve_does_not_claim_did_key_is_unsupported() {
+        let err = gitlawb_core::Error::InvalidDid("small-order ed25519 key".to_string());
+        let msg = did_resolve_failure_message("did:key:z6MkWeak", true, &err);
+        assert!(
+            !msg.contains("only did:key is supported"),
+            "a did:key must not be told did:key is unsupported: {msg}"
+        );
+        assert!(
+            msg.contains("small-order"),
+            "the real cause must survive into the message: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_non_key_method_keeps_the_no_resolver_message() {
+        let err = gitlawb_core::Error::InvalidDid("expected did:key, got did:web".to_string());
+        let msg = did_resolve_failure_message("did:web:example.com", false, &err);
+        assert!(
+            msg.contains("only did:key is supported"),
+            "an unresolvable method keeps its existing explanation: {msg}"
+        );
+    }
 }
 
 #[cfg(test)]
