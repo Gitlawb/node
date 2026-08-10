@@ -345,15 +345,22 @@ impl RepoStore {
         let deadline = std::time::Instant::now() + deadline_budget;
         let mut lock_conn = None;
         for attempt in 0..60 {
-            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                break;
+            // The advertised cap is WALL CLOCK, so the remaining budget must bound
+            // every await in the loop, not just the sleep between attempts. A pool
+            // checkout or a slow advisory query that starts just before the deadline
+            // and lands after it would otherwise hold the write task past the budget
+            // it was promised, which is exactly what the deadline exists to prevent.
+            let left = match deadline.checked_duration_since(std::time::Instant::now()) {
+                Some(left) if !left.is_zero() => left,
+                _ => break,
             };
-            if left.is_zero() {
-                break;
-            }
-            let conn = match self.lock_pool.acquire().await {
-                Ok(c) => c,
-                Err(e) => {
+            // Bound the pool checkout by the remaining budget. A checkout that
+            // would outlive the deadline is not worth starting: it either waits out
+            // the full DB acquire timeout and fails anyway, or lands a connection
+            // with no budget left to use it.
+            let conn = match tokio::time::timeout(left, self.lock_pool.acquire()).await {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
                     // Saturation is surfaced HERE, in the request path, and
                     // deliberately not through /ready. Failing readiness on a full
                     // pool would pull this node out of routing, taking its reads
@@ -378,9 +385,51 @@ impl RepoStore {
                     );
                     return Err(e).context("advisory-lock pool exhausted or unreachable");
                 }
+                Err(_) => {
+                    // The pool checkout itself outlived the remaining budget. Same
+                    // refusal as running out of attempts: the wall-clock cap is what
+                    // is advertised, so a checkout that blows past it is contention
+                    // the caller was promised would not happen.
+                    warn!(
+                        repo = %repo_name,
+                        owner = %owner_slug,
+                        waited_secs = deadline_budget.as_secs(),
+                        "advisory-lock pool checkout exceeded the acquire deadline — shedding the write as busy"
+                    );
+                    return Err(anyhow::Error::new(RepoBusy).context(format!(
+                        "advisory-lock pool checkout exceeded the {}s deadline for {owner_slug}/{repo_name}",
+                        deadline_budget.as_secs()
+                    )));
+                }
+            };
+            // Bound the advisory query by the remaining budget too: a query that
+            // starts with budget left but answers after the deadline must not be
+            // accepted, or the cap is only as good as the fast path.
+            let left = match deadline.checked_duration_since(std::time::Instant::now()) {
+                Some(left) if !left.is_zero() => left,
+                _ => break,
             };
             let mut probe = LockProbe::new(conn);
-            if probe.try_lock(lock_key).await? {
+            let acquired = match tokio::time::timeout(left, probe.try_lock(lock_key)).await {
+                Ok(Ok(acquired)) => acquired,
+                Ok(Err(e)) => return Err(e).context("trying advisory lock"),
+                Err(_) => {
+                    // The query outlived the remaining budget. The probe's Drop
+                    // closes its session, which cannot hold the lock it never
+                    // confirmed taking, so this is a plain shed.
+                    warn!(
+                        repo = %repo_name,
+                        owner = %owner_slug,
+                        waited_secs = deadline_budget.as_secs(),
+                        "advisory-lock query exceeded the acquire deadline — shedding the write as busy"
+                    );
+                    return Err(anyhow::Error::new(RepoBusy).context(format!(
+                        "advisory-lock query exceeded the {}s deadline for {owner_slug}/{repo_name}",
+                        deadline_budget.as_secs()
+                    )));
+                }
+            };
+            if acquired {
                 lock_conn = probe.take_conn();
                 break;
             }
@@ -3191,4 +3240,60 @@ mod tests {
         server.abort();
     }
 
+    /// P2: the lock-acquire deadline must bound EVERY await in the retry loop,
+    /// not just the sleep between attempts. A pool checkout that would exceed
+    /// the deadline must shed as `RepoBusy` rather than wait out the pool's own
+    /// acquire timeout past the promised wall-clock cap.
+    ///
+    /// Observable: hold every lock-pool slot from an independent store, then
+    /// acquire with a short deadline. The pool checkout will not complete within
+    /// the deadline, so `acquire_write` must refuse as `RepoBusy` once the
+    /// deadline fires — not hang for the pool's 5s acquire timeout.
+    #[sqlx::test]
+    async fn pool_checkout_past_the_deadline_sheds_as_repo_busy(pool: PgPool) {
+        let opts = (*pool.connect_options()).clone();
+
+        // Exhaust every slot of the lock pool. The checkouts must come from the
+        // pool the store will use, not from independent connections: a separate
+        // `PgConnection::connect_with` consumes no slot, so the store's checkout
+        // would succeed immediately and the deadline would never be reached.
+        const N: u32 = 2;
+        let lock_pool = no_reap_pool(&opts, N).await;
+        let mut holders = Vec::new();
+        for _ in 0..N {
+            holders.push(lock_pool.acquire().await.expect("hold a lock-pool slot"));
+        }
+
+        // The store shares that exhausted pool (`PgPool` is a handle to one
+        // inner pool, so the clone is the same set of slots).
+        let store =
+            RepoStore::for_testing(PathBuf::from("/tmp/gitlawb-deadline"), lock_pool.clone())
+                .with_lock_acquire_deadline(std::time::Duration::from_millis(400));
+
+        // The pool is exhausted, so the checkout cannot complete within the
+        // deadline; the deadline must fire and shed as RepoBusy rather than let
+        // the pool's own 5s acquire timeout run.
+        let started = std::time::Instant::now();
+        let err = match store
+            .acquire_write("did:key:z6MkDeadline", "deadline-repo")
+            .await
+        {
+            Err(e) => e,
+            Ok(guard) => {
+                guard.release(false).await;
+                panic!("with the pool exhausted, the deadline must shed, not succeed");
+            }
+        };
+        assert!(
+            err.downcast_ref::<RepoBusy>().is_some(),
+            "a checkout past the deadline must shed as RepoBusy, got {err:#}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the refusal must come from the deadline, not the pool's own 5s acquire timeout"
+        );
+
+        // Release the holders so the test's pool can be torn down cleanly.
+        drop(holders);
+    }
 }
