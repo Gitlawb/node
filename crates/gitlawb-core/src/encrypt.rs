@@ -11,6 +11,16 @@ use zeroize::Zeroizing;
 /// X25519 public key (Montgomery u) for an Ed25519 verifying key.
 fn x25519_public(vk: &VerifyingKey) -> Result<[u8; 32]> {
     use curve25519_dalek::edwards::CompressedEdwardsY;
+
+    // A small-order point converts to the all-zero Montgomery u, and X25519
+    // against u = 0 yields the all-zero shared secret for every scalar, so the
+    // per-recipient wrap could be rebuilt by anyone. Resolution already refuses
+    // such a key (see Did::to_verifying_key); this guard makes the primitive
+    // safe on its own terms for a caller that obtained the key some other way.
+    if vk.is_weak() {
+        anyhow::bail!("verifying key is a small-order point");
+    }
+
     let edwards = CompressedEdwardsY::from_slice(vk.as_bytes())
         .ok()
         .and_then(|c| c.decompress())
@@ -292,5 +302,125 @@ mod tests {
         let mut header: serde_json::Value = serde_json::from_slice(header_bytes).unwrap();
         header["nonce"] = bad_nonce;
         assert!(open_blob(&reframe(&header), &reader).is_err());
+    }
+
+    /// A small-order recipient key converts to Montgomery u = 0, and X25519
+    /// against u = 0 is the all-zero shared secret for ANY scalar, so the
+    /// wrapping box is reconstructable with no secret at all. Reject at the
+    /// primitive so the seal side is safe regardless of how the caller
+    /// obtained the key.
+    #[test]
+    fn x25519_public_rejects_a_small_order_key() {
+        let mut weak = [0u8; 32];
+        weak[0] = 1; // compressed identity point
+        let weak_vk = VerifyingKey::from_bytes(&weak).expect("identity point decompresses");
+        assert!(weak_vk.is_weak(), "precondition: key is small-order");
+
+        assert!(
+            x25519_public(&weak_vk).is_err(),
+            "a small-order key must not yield an x25519 public key"
+        );
+    }
+
+    /// Control: a legitimate key still converts, and to a non-zero u.
+    #[test]
+    fn x25519_public_still_accepts_a_real_key() {
+        let kp = Keypair::generate();
+        let u = x25519_public(&kp.verifying_key()).expect("a real key must convert");
+        assert_ne!(u, [0u8; 32], "a real key must not map to the zero point");
+    }
+
+    /// The guard has to propagate: no envelope may be produced for a weak
+    /// recipient even when the DID choke point is bypassed entirely.
+    #[test]
+    fn seal_blob_refuses_a_small_order_recipient() {
+        let mut weak = [0u8; 32];
+        weak[0] = 1;
+        let weak_vk = VerifyingKey::from_bytes(&weak).unwrap();
+
+        assert!(
+            seal_blob(b"withheld", &[weak_vk]).is_err(),
+            "sealing to a weak recipient must fail"
+        );
+
+        // And a mixed set must fail too: one weak recipient exposes the shared
+        // content key, so a partial envelope is not an acceptable outcome.
+        let honest = Keypair::generate();
+        assert!(
+            seal_blob(b"withheld", &[honest.verifying_key(), weak_vk]).is_err(),
+            "a mixed honest+weak recipient set must fail closed, not seal partially"
+        );
+    }
+
+    /// Control for the two above: the ordinary seal/open round trip is intact.
+    #[test]
+    fn legit_seal_open_round_trip_still_works() {
+        let reader = Keypair::generate();
+        let env = seal_blob(b"withheld blob", &[reader.verifying_key()]).expect("seal");
+        assert_eq!(open_blob(&env, &reader).expect("open"), b"withheld blob");
+    }
+
+    /// The defect this fix exists to close, kept as an executable regression
+    /// rather than an assertion about absence. It runs the real attack: craft a
+    /// small-order did:key, get it into a recipient set alongside an honest
+    /// reader, then rebuild the wrapping box from the all-zero shared secret
+    /// that a small-order recipient forces. If any guard regresses, this does
+    /// not merely fail, it fails printing the plaintext it recovered.
+    #[test]
+    fn attacker_cannot_recover_plaintext_via_a_weak_recipient() {
+        use crate::did::Did;
+        use std::str::FromStr;
+
+        let mut weak_bytes = [0u8; 32];
+        weak_bytes[0] = 1; // compressed identity point
+        let weak_vk = VerifyingKey::from_bytes(&weak_bytes).expect("decompresses");
+
+        // Layer 1: the attacker's did:key string must not resolve at all.
+        let weak_did = Did::from_verifying_key(&weak_vk).to_string();
+        assert!(
+            Did::from_str(&weak_did)
+                .expect("still a well-formed did:key")
+                .to_verifying_key()
+                .is_err(),
+            "a small-order did:key must not resolve"
+        );
+
+        // Layer 2: even handed the key directly, sealing must refuse. One weak
+        // recipient would expose the single shared content key, so the honest
+        // reader's blob would be readable by anyone.
+        let honest = Keypair::generate();
+        let secret_plaintext = b"WITHHELD BLOB CONTENTS";
+        let envelope = match seal_blob(secret_plaintext, &[honest.verifying_key(), weak_vk]) {
+            Err(_) => return, // no envelope exists, nothing to attack
+            Ok(env) => env,
+        };
+
+        // Only reachable if a guard regressed. Run the attack and report what
+        // it got, so the failure names the actual exposure.
+        let mut p = MAGIC.len() + 1;
+        let hlen = u32::from_le_bytes(envelope[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        let header: serde_json::Value = serde_json::from_slice(&envelope[p..p + hlen]).unwrap();
+        let body = &envelope[p + hlen..];
+        let body_nonce = B64.decode(header["nonce"].as_str().unwrap()).unwrap();
+
+        // X25519 against u = 0 is the all-zero shared secret for any scalar, so
+        // the sealer's box is reconstructable with a key the attacker picks.
+        let zero_box = ChaChaBox::new(&XPublic::from([0u8; 32]), &XSecret::from([7u8; 32]));
+        for r in header["recipients"].as_array().unwrap() {
+            let n = B64.decode(r["nonce"].as_str().unwrap()).unwrap();
+            let w = B64.decode(r["wrap"].as_str().unwrap()).unwrap();
+            if let Ok(content_key) = zero_box.decrypt(n.as_slice().into(), w.as_slice()) {
+                let cipher = XChaCha20Poly1305::new_from_slice(&content_key).unwrap();
+                let recovered = cipher
+                    .decrypt(XNonce::from_slice(&body_nonce), body)
+                    .expect("body decrypts once the content key is out");
+                panic!(
+                    "REGRESSION: attacker recovered plaintext with no private key: {:?}",
+                    String::from_utf8_lossy(&recovered)
+                );
+            }
+        }
+        panic!("an envelope was sealed to a small-order recipient; the seal guard regressed");
     }
 }
