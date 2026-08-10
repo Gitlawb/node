@@ -22,10 +22,6 @@ use tracing::{debug, info};
 #[derive(Clone, Debug)]
 pub enum UploadPrecondition {
     /// Publish only if the stored object is still the generation we observed.
-    ///
-    /// Only tests construct this so far. The write guard's release path is the
-    /// production caller, and it is wired up in a follow-up change.
-    #[allow(dead_code)]
     IfMatch(String),
     /// Publish only if nothing is stored under the key yet.
     IfAbsent,
@@ -125,10 +121,6 @@ impl TigrisClient {
     /// Separate from `exists` rather than folded into it: `exists` has callers
     /// that only want the boolean, and widening its return type would churn
     /// every one of them for no benefit.
-    ///
-    /// Only tests call this so far; the write guard reads the ETag here before
-    /// it publishes, and that wiring is a follow-up change.
-    #[allow(dead_code)]
     pub async fn head_etag(&self, owner_slug: &str, repo_name: &str) -> Result<Option<String>> {
         let key = Self::repo_key(owner_slug, repo_name);
         match self

@@ -65,6 +65,9 @@ pub enum AppError {
     #[error("repository is temporarily unavailable")]
     RepoUnavailable,
 
+    #[error("repository write was fenced by a concurrent publish")]
+    RepoWriteFenced,
+
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 
@@ -117,7 +120,14 @@ impl From<anyhow::Error> for AppError {
                 // owner slug and repo, so the variant carries nothing.
                 Err(err) => match err.downcast::<crate::git::repo_store::RepoUnavailable>() {
                     Ok(_) => AppError::RepoUnavailable,
-                    Err(err) => AppError::Internal(err),
+                    // And one more rung: a publish the store refused twice is
+                    // transient in the same way, and the retry is the client's
+                    // to make. The variant carries nothing for the same reason
+                    // as the two above.
+                    Err(err) => match err.downcast::<crate::git::repo_store::RepoWriteFenced>() {
+                        Ok(_) => AppError::RepoWriteFenced,
+                        Err(err) => AppError::Internal(err),
+                    },
                 },
             },
         }
@@ -197,6 +207,15 @@ impl IntoResponse for AppError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "repo_unavailable",
                 "repository is temporarily unavailable, retry".into(),
+            ),
+            // 503 with a FIXED body again, and its own code: the caller should
+            // retry, but the condition is not contention, so a client that
+            // distinguishes them should be able to. The body must not say which
+            // repo lost its publish or to whom.
+            AppError::RepoWriteFenced => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repo_write_fenced",
+                "repository changed underneath this write, retry".into(),
             ),
             AppError::Db(e) if db_unavailable(e) => (
                 StatusCode::SERVICE_UNAVAILABLE,

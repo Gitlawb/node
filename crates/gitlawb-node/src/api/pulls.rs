@@ -224,7 +224,10 @@ pub async fn merge_pr(
     );
 
     // Always release the advisory lock — even on error; upload to Tigris only on success.
-    guard.release(merge_result.is_ok()).await;
+    // Short-circuit on a refused publish before the PR is marked merged and
+    // before the webhook fires. Both are irreversible announcements of a merge
+    // commit that only exists on this node's disk.
+    guard.release(merge_result.is_ok()).await.into_result()?;
 
     let merge_sha = merge_result.map_err(|e| AppError::Git(e.to_string()))?;
 

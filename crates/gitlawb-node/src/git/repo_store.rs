@@ -485,7 +485,7 @@ impl RepoStore {
         // From here the lock is HELD. Any early return must not simply drop the
         // connection back into the pool, so it is handed to the guard immediately
         // below and every exit after this point goes through the guard.
-        let guard = RepoWriteGuard {
+        let mut guard = RepoWriteGuard {
             owner_slug: owner_slug.clone(),
             repo_name: repo_name.to_string(),
             local_path: local_path.clone(),
@@ -493,6 +493,10 @@ impl RepoStore {
             conn: Some(lock_conn),
             tigris: self.tigris.clone(),
             lock_held_transfer_timeout: self.lock_held_transfer_timeout,
+            // Overwritten by the refresh below with the generation actually
+            // observed under the lock. Only reachable unset when no backend is
+            // configured, in which case `release` publishes nothing at all.
+            publish_fence: UploadPrecondition::Unconditional,
         };
 
         // Always download the latest from Tigris before writing. Local disk may be
@@ -518,15 +522,24 @@ impl RepoStore {
                     // fallback. Collapsing them (the `unwrap_or(false)` this replaced
                     // read a HEAD error as "no archive") skipped the refresh silently
                     // and then re-uploaded over a possibly-newer archive.
-                    match tigris.exists(&owner_slug, repo_name).await {
-                        Ok(true) => {
+                    //
+                    // `head_etag` rather than `exists`: the same request answers
+                    // both questions, and the ETag it carries is the generation
+                    // this write is based on. Carrying it to the release-side
+                    // publish is what lets the store refuse a stale PUT, which
+                    // is the only place that fence can hold: dropping an
+                    // in-flight upload's future does not stop the request the
+                    // server is already processing.
+                    match tigris.head_etag(&owner_slug, repo_name).await {
+                        Ok(Some(etag)) => {
                             debug!(repo = %repo_name, "write acquire: downloading latest from tigris");
-                            tigris
-                                .download(&owner_slug, repo_name, &local_path)
-                                .await
-                                .map_err(RefreshFailure::Download)
+                            let fence = UploadPrecondition::IfMatch(etag);
+                            match tigris.download(&owner_slug, repo_name, &local_path).await {
+                                Ok(()) => Ok(fence),
+                                Err(err) => Err(RefreshFailure::Download { err, fence }),
+                            }
                         }
-                        Ok(false) => Ok(()),
+                        Ok(None) => Ok(UploadPrecondition::IfAbsent),
                         Err(e) => Err(RefreshFailure::Unknown(e)),
                     }
                 },
@@ -534,18 +547,23 @@ impl RepoStore {
             .await;
 
             match refreshed {
-                Some(Ok(())) => {}
-                Some(Err(RefreshFailure::Download(e))) => {
+                Some(Ok(fence)) => guard.publish_fence = fence,
+                Some(Err(RefreshFailure::Download { err, fence })) => {
                     // The archive is present but unreadable: a corrupt or partial
                     // upload, or a transient GET failure. We KNOW the fetch failed,
                     // so falling back to a valid local copy is sound and
                     // release(success) re-uploads a good archive. Only hard-fail
                     // when there is no local copy to fall back to.
                     if local_path.exists() {
-                        warn!(repo = %repo_name, err = %e,
+                        warn!(repo = %repo_name, err = %err,
                             "write acquire: tigris refresh failed — falling back to local copy");
+                        // Still fence on what the HEAD saw. The download failing
+                        // says nothing about the generation stored, so publishing
+                        // unconditionally here would reintroduce exactly the
+                        // overwrite this carries the ETag to prevent.
+                        guard.publish_fence = fence;
                     } else {
-                        return Err(e).context("downloading repo from tigris for write");
+                        return Err(err).context("downloading repo from tigris for write");
                     }
                 }
                 Some(Err(RefreshFailure::Unknown(e))) => {
@@ -1031,6 +1049,11 @@ pub struct RepoWriteGuard {
     tigris: Option<TigrisClient>,
     /// Bound on the release-side upload, which runs with the lock still held.
     lock_held_transfer_timeout: Duration,
+    /// The generation of the stored archive as observed by the HEAD inside
+    /// `acquire_write`, under the lock. `release` publishes fenced on it, so a
+    /// PUT abandoned by an earlier writer's timeout cannot land on top of a
+    /// successor's acknowledged archive.
+    publish_fence: UploadPrecondition,
 }
 
 impl RepoWriteGuard {
@@ -1055,35 +1078,112 @@ impl RepoWriteGuard {
         &self.local_path
     }
 
+    /// Publish the tree this guard wrote, fenced on the generation observed
+    /// under the lock, with at most ONE supersede-retry after a definite loss.
+    ///
+    /// Hard bound of two PUT attempts per release. No loop, no recursion: a
+    /// third attempt would have no more reason to terminate than the second.
+    async fn publish(&self, tigris: &TigrisClient) -> std::result::Result<(), PublishRefusal> {
+        match tigris
+            .upload(
+                &self.owner_slug,
+                &self.repo_name,
+                &self.local_path,
+                self.publish_fence.clone(),
+            )
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(UploadError::PreconditionLost { status }) => {
+                // EPISTEMIC ASYMMETRY, and it is why one retry is sound here
+                // while the timeout arm in `release` deliberately does nothing.
+                // A refused precondition is a DEFINITE outcome: the store told
+                // us the generation we observed under the lock is gone, and that
+                // our bytes did not land. A timeout tells us nothing at all.
+                //
+                // We also still hold the advisory lock, so no successor can have
+                // acquired and published. Whatever landed underneath was written
+                // WITHOUT the lock: init's create-only upload of a freshly
+                // created empty repo, or a PUT abandoned by an earlier writer
+                // whose own release timed out. This writer's tree is the
+                // authority over both, which is what makes exactly one
+                // supersede-retry correct rather than a race.
+                //
+                // Honest residual: when the thing underneath was a genuine
+                // orphan that landed AFTER this writer's refresh, the retry
+                // supersedes it with a tree that does not contain it. That is
+                // the same outcome today's unconditional publish produces. The
+                // fence protects an acknowledged successor from an orphan; it
+                // does not protect an unlocked orphan from the lock holder.
+                warn!(
+                    repo = %self.repo_name,
+                    status,
+                    "publish fence lost: the stored archive changed under the lock, \
+                     republishing once on the current generation"
+                );
+            }
+            Err(e) => return Err(PublishRefusal::Failed(e)),
+        }
+
+        let fresh = match tigris.head_etag(&self.owner_slug, &self.repo_name).await {
+            Ok(Some(etag)) => UploadPrecondition::IfMatch(etag),
+            // Nothing is stored now, so create-only is the fence that matches
+            // what was just observed.
+            Ok(None) => UploadPrecondition::IfAbsent,
+            Err(e) => return Err(PublishRefusal::Failed(UploadError::Other(e))),
+        };
+        match tigris
+            .upload(&self.owner_slug, &self.repo_name, &self.local_path, fresh)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(UploadError::PreconditionLost { status }) => {
+                // Two definite losses in a row: something is publishing this key
+                // without the lock faster than we can fence on it. Refuse rather
+                // than escalate. The write is on local disk and in this node's
+                // tree, but it is NOT durable in object storage, so the caller
+                // must not report success.
+                warn!(
+                    repo = %self.repo_name,
+                    status,
+                    "publish fence lost again on the refreshed generation, refusing the \
+                     write rather than attempting a third publish"
+                );
+                Err(PublishRefusal::Fenced)
+            }
+            Err(e) => Err(PublishRefusal::Failed(e)),
+        }
+    }
+
     /// Upload to Tigris (only when the write succeeded) and release the advisory
     /// lock. Pass `success = false` when the write operation failed — uploading a
     /// half-applied or otherwise inconsistent repo would propagate corruption to
     /// Tigris (and to every node that later downloads it). The lock is always
     /// released regardless, to avoid stale locks blocking future writes.
-    pub async fn release(mut self, success: bool) {
+    pub async fn release(mut self, success: bool) -> ReleaseOutcome {
+        let mut outcome = ReleaseOutcome::Released;
         // Upload to Tigris only on success.
         if success {
-            if let Some(ref tigris) = self.tigris {
-                // Bounded for the same reason as the acquire-side download: this
-                // runs with the lock held and a lock-pool slot pinned.
+            if let Some(tigris) = self.tigris.clone() {
+                // ONE budget for the whole publish, covering both attempts and
+                // the HEAD between them, for the same reason the acquire-side
+                // refresh uses one for its HEAD and download together: this runs
+                // with the lock held and a lock-pool slot pinned, so bounding
+                // each attempt separately would double the worst-case occupancy.
                 match bounded_transfer(
                     "release-upload",
                     &self.repo_name,
                     self.lock_held_transfer_timeout,
-                    // Unconditional for now purely so the tree compiles. This
-                    // is THE fenced call site: the sibling unit replaces this
-                    // with the observed-ETag precondition.
-                    tigris.upload(
-                        &self.owner_slug,
-                        &self.repo_name,
-                        &self.local_path,
-                        UploadPrecondition::Unconditional,
-                    ),
+                    self.publish(&tigris),
                 )
                 .await
                 {
                     Some(Ok(())) => {}
-                    Some(Err(e)) => {
+                    // Both attempts were definitively refused. The raise site
+                    // already logged which and why, so this only has to carry
+                    // the refusal out to the caller.
+                    Some(Err(PublishRefusal::Fenced)) => outcome = ReleaseOutcome::Fenced,
+                    Some(Err(PublishRefusal::Failed(e))) => {
                         warn!(repo = %self.repo_name, err = %e, "failed to upload repo to tigris after write");
                     }
                     None => {
@@ -1152,6 +1252,8 @@ impl RepoWriteGuard {
             }
             None => {}
         }
+
+        outcome
     }
 }
 
@@ -1216,7 +1318,62 @@ const LOCK_ACQUIRE_DEADLINE: Duration = Duration::from_secs(90);
 /// copy is a sound thing to fall back to and re-upload.
 enum RefreshFailure {
     Unknown(anyhow::Error),
-    Download(anyhow::Error),
+    /// Carries the fence the HEAD observed alongside the error, because the
+    /// fallback arm still publishes later and must be fenced on the generation
+    /// it saw. `Unknown` carries none: that arm refuses the write outright.
+    Download {
+        err: anyhow::Error,
+        fence: UploadPrecondition,
+    },
+}
+
+/// What `release` was able to do with the writer's tree.
+///
+/// `#[must_use]` because dropping it is the whole defect this type exists to
+/// prevent: a publish the store refused would otherwise return 201, fire
+/// webhooks, and record a push that no successor can read.
+#[derive(Debug)]
+#[must_use = "a refused publish must reach the caller, or a write that never landed reports success"]
+pub enum ReleaseOutcome {
+    /// The lock was released and nothing definitively refused the publish.
+    /// Also the answer when there was nothing to publish (a failed write, no
+    /// storage backend) and when the outcome is unknowable (the upload
+    /// exceeded its bound), which keeps those paths behaving as they do today.
+    Released,
+    /// The store refused the publish twice. The tree is on local disk but is
+    /// NOT in object storage, so the caller must not report success.
+    Fenced,
+}
+
+impl ReleaseOutcome {
+    /// Fold into the `Result` a handler propagates with `?`.
+    ///
+    /// Call this at every publishing site IMMEDIATELY after `release`, before
+    /// any post-release effect. A refusal that short-circuits after the DB
+    /// write, the webhook, or the response body has already happened is not a
+    /// refusal at all.
+    pub fn into_result(self) -> anyhow::Result<()> {
+        match self {
+            ReleaseOutcome::Released => Ok(()),
+            // The raise site inside `publish` already logged the repo and the
+            // status, so this carries no detail: the handler layer turns it
+            // into a fixed 503 body.
+            ReleaseOutcome::Fenced => Err(anyhow::Error::new(RepoWriteFenced)
+                .context("release-side publish refused by the store on both attempts")),
+        }
+    }
+}
+
+/// Why the release-side publish did not land, split by what it leaves the
+/// caller able to claim.
+///
+/// `Fenced` is a DEFINITE refusal by the store after both attempts, so the
+/// write is not durable and the caller must not report success. `Failed` is
+/// every other upload failure, which keeps today's behavior (log it, release
+/// the lock, let the caller answer normally).
+enum PublishRefusal {
+    Fenced,
+    Failed(UploadError),
 }
 
 /// The per-repo advisory lock was not obtained within the acquire deadline.
@@ -1253,6 +1410,27 @@ impl std::fmt::Display for RepoUnavailable {
 }
 
 impl std::error::Error for RepoUnavailable {}
+
+/// The release-side publish was refused by the store on both attempts, so the
+/// write is not durable in object storage.
+///
+/// A distinct type rather than a bare `anyhow` string, for the same reason as
+/// its two siblings above: the handler layer maps it to a retryable 503 with a
+/// FIXED body, and the detail (which repo, which status) stays in the log at
+/// the raise site. Distinct FROM those siblings because the condition is
+/// different: not contention and not an unreadable store, but another writer
+/// holding the key. The client's retry re-runs the whole write against the tree
+/// that actually won.
+#[derive(Debug)]
+pub struct RepoWriteFenced;
+
+impl std::fmt::Display for RepoWriteFenced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("repository write was fenced by a concurrent publish")
+    }
+}
+
+impl std::error::Error for RepoWriteFenced {}
 
 /// Run a future under a wall-clock bound, returning `None` if it did not finish.
 ///
@@ -2563,7 +2741,7 @@ mod tests {
         let err = match store.acquire_write("did:key:z6MkU3Excl", "same-repo").await {
             Err(e) => e,
             Ok(second) => {
-                second.release(false).await;
+                let _ = second.release(false).await;
                 panic!("a second writer must NOT be admitted while the first holds the guard");
             }
         };
@@ -2585,7 +2763,7 @@ mod tests {
             .acquire_write("did:key:z6MkU3Rel", "leak-check")
             .await
             .expect("acquire");
-        guard.release(true).await;
+        let _ = guard.release(true).await;
 
         let key = advisory_lock_key("did_key_z6MkU3Rel", "leak-check");
         let held: (i64,) = sqlx::query_as(&advisory_locks_held(key))
@@ -2644,7 +2822,7 @@ mod tests {
                 .await
                 .expect("acquire");
             pids.push(guard.backend_pid_for_test().await);
-            guard.release(true).await;
+            let _ = guard.release(true).await;
         }
         assert!(
             pids.windows(2).all(|w| w[0] == w[1]),
@@ -2717,8 +2895,10 @@ mod tests {
             conn: Some(lock_pool.acquire().await.unwrap()),
             tigris: None,
             lock_held_transfer_timeout: Duration::from_secs(300),
+            // No backend, so nothing is ever published and the fence is unread.
+            publish_fence: UploadPrecondition::Unconditional,
         };
-        guard.release(true).await;
+        let _ = guard.release(true).await;
 
         // Wait for the backend to actually go away rather than sleeping a fixed
         // span, which is flaky on slow CI. The observer is a STANDALONE
@@ -2898,7 +3078,7 @@ mod tests {
         assert_eq!(alive.0, 1);
 
         for g in guards.drain(..) {
-            g.release(true).await;
+            let _ = g.release(true).await;
         }
     }
 
@@ -2957,10 +3137,10 @@ mod tests {
         .await
         .expect("an unrelated repo must not wait on someone else's contention")
         .expect("and must acquire");
-        unrelated.release(true).await;
+        let _ = unrelated.release(true).await;
 
         spinner.abort();
-        held.release(true).await;
+        let _ = held.release(true).await;
     }
 
     /// Lock contention that runs out the acquire deadline must surface as a
@@ -2988,7 +3168,7 @@ mod tests {
         {
             Err(e) => e,
             Ok(second) => {
-                second.release(false).await;
+                let _ = second.release(false).await;
                 panic!("a second writer must be shed once the deadline expires");
             }
         };
@@ -3016,7 +3196,7 @@ mod tests {
             "the 503 body must be fixed and must not name the repo, got {body}"
         );
 
-        held.release(true).await;
+        let _ = held.release(true).await;
     }
 
     /// An under-lock refresh refusal must surface as a retryable 503 with a fixed
@@ -3181,7 +3361,7 @@ mod tests {
         {
             Err(e) => e,
             Ok(guard) => {
-                guard.release(false).await;
+                let _ = guard.release(false).await;
                 panic!("a failed HEAD must refuse the write rather than proceed on a stale tree");
             }
         };
@@ -3371,7 +3551,7 @@ mod tests {
 
         // Park the upload so it is still in flight when the 200ms bound fires.
         mock.park_next_put();
-        guard.release(true).await;
+        let _ = guard.release(true).await;
         assert_eq!(
             mock.put_attempts().len(),
             1,
@@ -3417,7 +3597,7 @@ mod tests {
         seed_bare_repo(&guard.local_path);
 
         mock.park_next_put();
-        guard.release(true).await;
+        let _ = guard.release(true).await;
 
         let started = std::time::Instant::now();
         let successor = store
@@ -3429,7 +3609,7 @@ mod tests {
             "the successor waited {}ms; a timed-out upload must not park the next writer",
             started.elapsed().as_millis()
         );
-        successor.release(false).await;
+        let _ = successor.release(false).await;
 
         mock.open_gate();
         mock.shutdown();
@@ -3475,7 +3655,7 @@ mod tests {
         {
             Err(e) => e,
             Ok(guard) => {
-                guard.release(false).await;
+                let _ = guard.release(false).await;
                 panic!("with the pool exhausted, the deadline must shed, not succeed");
             }
         };
@@ -3527,6 +3707,8 @@ mod tests {
         puts: Vec<PutAttempt>,
         /// Set by `park_next_put`, consumed by the next arriving PUT.
         park_next_put: bool,
+        /// Set by `roll_generation_after_next_heads`, decremented per HEAD.
+        roll_after_heads: u32,
         captured: Option<CapturedPut>,
     }
 
@@ -3672,8 +3854,33 @@ mod tests {
                                     }
                                 }
                                 axum::http::Method::HEAD | axum::http::Method::GET => {
-                                    let st = state.lock().unwrap();
-                                    match (st.object.clone(), st.etag.clone()) {
+                                    let mut st = state.lock().unwrap();
+                                    let answered = (st.object.clone(), st.etag.clone());
+                                    // Fault injection for the two-consecutive-
+                                    // losses arm, and the only deterministic way
+                                    // to sit BETWEEN a caller's HEAD and the
+                                    // conditional PUT it derives from it. The
+                                    // gate cannot do this: a parked PUT is
+                                    // captured rather than evaluated and answers
+                                    // 200, so it can never produce a refusal.
+                                    //
+                                    // Only the generation moves, not the bytes,
+                                    // which is a real state a store reaches (two
+                                    // writers can publish byte-identical
+                                    // archives) and keeps the stored object a
+                                    // valid archive for whoever downloads next.
+                                    // `evaluate_put` is untouched, and this logs
+                                    // no PutAttempt, so attempt counts still
+                                    // count only the caller's own PUTs.
+                                    if method == axum::http::Method::HEAD
+                                        && st.roll_after_heads > 0
+                                        && st.object.is_some()
+                                    {
+                                        st.roll_after_heads -= 1;
+                                        st.next_etag += 1;
+                                        st.etag = Some(format!("\"mock-etag-{}\"", st.next_etag));
+                                    }
+                                    match answered {
                                         (Some(bytes), Some(etag)) => (
                                             axum::http::StatusCode::OK,
                                             [(axum::http::header::ETAG, etag)],
@@ -3718,6 +3925,15 @@ mod tests {
 
         fn put_attempts(&self) -> Vec<PutAttempt> {
             self.state.lock().unwrap().puts.clone()
+        }
+
+        /// Answer each of the next `n` HEADs from the current state, then
+        /// immediately move the object to a new generation. A caller that HEADs
+        /// to pick up a precondition and then PUTs on it is therefore fencing
+        /// on a generation that is already gone, which is the only way to drive
+        /// two consecutive lost preconditions deterministically.
+        fn roll_generation_after_next_heads(&self, n: u32) {
+            self.state.lock().unwrap().roll_after_heads = n;
         }
 
         /// Park the next arriving PUT so the caller's transfer bound elapses
@@ -4298,6 +4514,441 @@ mod tests {
             unquote_etag(&got),
             unquote_etag(&seeded),
             "head_etag must report the ETag the last successful PUT minted"
+        );
+
+        mock.shutdown();
+    }
+
+    // ── the fenced release publish (#279) ──────────────────────────────────
+
+    /// A store whose acquire-side refresh and release-side publish both land on
+    /// `mock`. The transfer bound is generous on purpose: these tests are about
+    /// the fence arms, and a short bound would let the timeout arm answer first.
+    async fn fenced_store(
+        mock: &S3Mock,
+        opts: &sqlx::postgres::PgConnectOptions,
+        repos_dir: &Path,
+    ) -> RepoStore {
+        RepoStore::new(
+            repos_dir.to_path_buf(),
+            Some(TigrisClient::for_testing_with_endpoint(
+                "test-bucket",
+                mock.endpoint(),
+            )),
+            no_reap_pool(opts, 2).await,
+            std::time::Duration::from_secs(30),
+        )
+    }
+
+    /// A client aimed at the same key the store under test publishes to, so a
+    /// test can seed the archive or land an interfering publish of its own.
+    fn mock_tigris(mock: &S3Mock) -> TigrisClient {
+        TigrisClient::for_testing_with_endpoint("test-bucket", mock.endpoint())
+    }
+
+    /// The slug `local_path` derives from a DID, needed because a test seeds
+    /// and reads the archive key directly.
+    fn owner_slug_of(owner_did: &str) -> String {
+        owner_did.replace([':', '/'], "_")
+    }
+
+    /// A bare-repo-shaped directory carrying `marker`, so a test can tell whose
+    /// tree is stored without comparing compressed bytes.
+    fn marked_repo(path: &Path, marker: &str) {
+        seed_bare_repo(path);
+        std::fs::write(path.join("MARKER"), marker).unwrap();
+    }
+
+    /// The marker inside whatever archive is currently stored under the key.
+    async fn stored_marker(mock: &S3Mock, owner_slug: &str, repo_name: &str) -> String {
+        let out = TempDir::new().unwrap();
+        let into = out.path().join("stored.git");
+        mock_tigris(mock)
+            .download(owner_slug, repo_name, &into)
+            .await
+            .expect("the stored archive must be readable");
+        std::fs::read_to_string(into.join("MARKER")).expect("the stored archive must be marked")
+    }
+
+    /// A process-wide sink for warn-level tracing output, installed once.
+    ///
+    /// Global rather than per test on purpose. `tracing`'s scoped default is
+    /// thread-local, and these events fire inside futures the test runtime may
+    /// move between threads, so a scoped subscriber would drop them silently
+    /// and every log assertion would go vacuous. Tests instead give their repo
+    /// a unique name and read back only the lines carrying it.
+    fn log_sink() -> Arc<std::sync::Mutex<Vec<u8>>> {
+        static LOG_SINK: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<u8>>>> =
+            std::sync::OnceLock::new();
+        LOG_SINK
+            .get_or_init(|| {
+                let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let writer = sink.clone();
+                // `try_init`, because another test may already have installed a
+                // subscriber; the assertions below fail loudly if nothing was
+                // captured, so a silent no-op here cannot pass for a green run.
+                let _ = tracing_subscriber::fmt()
+                    .with_writer(move || SinkWriter(writer.clone()))
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::WARN)
+                    .try_init();
+                sink
+            })
+            .clone()
+    }
+
+    struct SinkWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SinkWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Captured warn lines naming `repo_name`, joined back into one string.
+    fn warn_lines_for(repo_name: &str) -> String {
+        let raw = log_sink().lock().unwrap().clone();
+        String::from_utf8_lossy(&raw)
+            .lines()
+            .filter(|l| l.contains(repo_name))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// An uncontended write publishes, and what lands is the writer's tree.
+    ///
+    /// This is the must-not-spuriously-fence negative, so it asserts ONLY the
+    /// outcome and the stored bytes, never which precondition header travelled.
+    /// Forcing the carried precondition back to `Unconditional` has to leave it
+    /// green, or it is a second copy of the fix rather than a guard against it;
+    /// the header itself is pinned by
+    /// `upload_if_match_with_the_current_etag_publishes_and_sends_the_header`.
+    #[sqlx::test]
+    async fn uncontended_write_publishes_the_writers_tree(pool: PgPool) {
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let store = fenced_store(&mock, &opts, repos.path()).await;
+        let owner = "did:key:z6MkFenceUncontended";
+        let slug = owner_slug_of(owner);
+
+        // Seed an archive so the acquire takes the download arm, which is the
+        // ordinary case: the repo already exists in object storage.
+        let seed = TempDir::new().unwrap();
+        marked_repo(seed.path(), "seed");
+        mock_tigris(&mock)
+            .upload(
+                &slug,
+                "repo",
+                seed.path(),
+                UploadPrecondition::Unconditional,
+            )
+            .await
+            .expect("seeding the archive");
+
+        let guard = store.acquire_write(owner, "repo").await.expect("acquire");
+        std::fs::write(guard.local_path.join("MARKER"), "writer").unwrap();
+        guard
+            .release(true)
+            .await
+            .into_result()
+            .expect("an uncontended write must publish");
+
+        assert_eq!(
+            stored_marker(&mock, &slug, "repo").await,
+            "writer",
+            "an uncontended write must publish the writer's tree"
+        );
+
+        mock.shutdown();
+    }
+
+    /// The first write to an empty bucket, the absent-at-acquire path. Nothing
+    /// is stored when the lock is taken, so the publish is the one that creates
+    /// the key, and the writer's tree is what lands.
+    #[sqlx::test]
+    async fn first_write_to_an_empty_bucket_publishes_the_writers_tree(pool: PgPool) {
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let store = fenced_store(&mock, &opts, repos.path()).await;
+        let owner = "did:key:z6MkFenceFirstWrite";
+        let slug = owner_slug_of(owner);
+
+        let guard = store.acquire_write(owner, "repo").await.expect("acquire");
+        marked_repo(&guard.local_path, "writer");
+        guard
+            .release(true)
+            .await
+            .into_result()
+            .expect("the first write into an empty key must publish");
+
+        assert_eq!(
+            stored_marker(&mock, &slug, "repo").await,
+            "writer",
+            "the first write must publish the writer's tree into the empty key"
+        );
+
+        mock.shutdown();
+    }
+
+    /// THE INIT RACE, and the reason the fence needs a supersede-retry at all.
+    ///
+    /// `init` uploads a freshly created EMPTY repo create-only in the
+    /// background. A user who pushes immediately after creating a repo takes
+    /// the lock, sees nothing stored, and is fenced create-only too; the
+    /// background upload then wins the empty key and the push's publish loses.
+    /// A fence with no retry would turn every such push into a refusal.
+    ///
+    /// The retry is sound because the loss is DEFINITE and this writer still
+    /// holds the lock: what landed underneath was published without it, so this
+    /// tree supersedes it.
+    #[sqlx::test]
+    async fn a_lost_fence_republishes_once_and_the_writers_tree_wins(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let store = fenced_store(&mock, &opts, repos.path()).await;
+        let owner = "did:key:z6MkFenceInitRace";
+        let repo = "fence-init-race-repo";
+        let slug = owner_slug_of(owner);
+
+        // Nothing is stored yet, so the acquire records the absent case.
+        let guard = store.acquire_write(owner, repo).await.expect("acquire");
+        marked_repo(&guard.local_path, "writer");
+
+        // init's create-only background upload lands after that observation.
+        let empty = TempDir::new().unwrap();
+        marked_repo(empty.path(), "empty-init");
+        mock_tigris(&mock)
+            .upload(&slug, repo, empty.path(), UploadPrecondition::IfAbsent)
+            .await
+            .expect("the background init upload wins the empty key");
+        let before = mock.put_attempts().len();
+        assert_eq!(before, 1, "only the init upload has run so far");
+
+        guard
+            .release(true)
+            .await
+            .into_result()
+            .expect("the supersede-retry must leave the release reporting success");
+
+        let attempts = mock.put_attempts();
+        assert_eq!(
+            attempts.len(),
+            before + 2,
+            "the release must attempt exactly twice, the fenced publish and one \
+             supersede-retry, got {attempts:?}"
+        );
+        assert_eq!(
+            attempts[before].status,
+            Some(412),
+            "the create-only publish must lose to what landed underneath, got {attempts:?}"
+        );
+        assert_eq!(
+            attempts[before + 1].status,
+            Some(200),
+            "the supersede-retry must publish, got {attempts:?}"
+        );
+        assert_eq!(
+            stored_marker(&mock, &slug, repo).await,
+            "writer",
+            "the lock holder's tree must be what is stored after the retry"
+        );
+        assert!(
+            warn_lines_for(repo).contains("republishing"),
+            "the fired fence must be visible in the log, got {:?}",
+            warn_lines_for(repo)
+        );
+
+        mock.shutdown();
+    }
+
+    /// Two consecutive definite losses: the retry is bounded at ONE, so the
+    /// release refuses instead of escalating, and the refusal reaches the
+    /// caller rather than being logged and swallowed.
+    ///
+    /// The second loss is arranged by replacing the object right after the
+    /// re-HEAD answers, so the retry fences on a generation that is already
+    /// gone. That is fault injection at the only point where it can be
+    /// deterministic; the mock's PUT gate cannot do it, because a parked PUT is
+    /// captured rather than evaluated and answers 200.
+    #[sqlx::test]
+    async fn a_second_consecutive_loss_refuses_and_never_attempts_a_third(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let store = fenced_store(&mock, &opts, repos.path()).await;
+        let owner = "did:key:z6MkFenceDoubleLoss";
+        let repo = "fence-double-loss-repo";
+        let slug = owner_slug_of(owner);
+
+        let seed = TempDir::new().unwrap();
+        marked_repo(seed.path(), "seed");
+        mock_tigris(&mock)
+            .upload(&slug, repo, seed.path(), UploadPrecondition::Unconditional)
+            .await
+            .expect("seeding the archive");
+
+        let guard = store.acquire_write(owner, repo).await.expect("acquire");
+        std::fs::write(guard.local_path.join("MARKER"), "writer").unwrap();
+
+        // An unlocked publish lands after the acquire, so the carried fence is
+        // already stale before the release runs.
+        let orphan = TempDir::new().unwrap();
+        marked_repo(orphan.path(), "orphan");
+        mock_tigris(&mock)
+            .upload(
+                &slug,
+                repo,
+                orphan.path(),
+                UploadPrecondition::Unconditional,
+            )
+            .await
+            .expect("an unconditional publish always lands");
+        let before = mock.put_attempts().len();
+        assert_eq!(before, 2, "the seed and the orphan have run so far");
+
+        // ... and the generation the retry HEADs for moves on before its PUT
+        // can use it, so the second attempt loses too.
+        mock.roll_generation_after_next_heads(1);
+        let outcome = guard.release(true).await;
+
+        assert!(
+            matches!(outcome, ReleaseOutcome::Fenced),
+            "a publish refused twice must be reported to the caller, got {outcome:?}"
+        );
+        let attempts = mock.put_attempts();
+        assert_eq!(
+            attempts.len(),
+            before + 2,
+            "a release must attempt at most TWO publishes, never a third, got {attempts:?}"
+        );
+        assert_eq!(
+            (attempts[before].status, attempts[before + 1].status),
+            (Some(412), Some(412)),
+            "both attempts must have been refused by the store, got {attempts:?}"
+        );
+        let logged = warn_lines_for(repo);
+        assert!(
+            logged.contains("republishing"),
+            "the first loss must log the retry, got {logged:?}"
+        );
+        assert!(
+            logged.contains("refusing the write"),
+            "the second loss must log its own distinct refusal, got {logged:?}"
+        );
+
+        mock.shutdown();
+    }
+
+    /// Driven from the client side at a publishing site: a refused publish must
+    /// render as the retryable 503 and never as a success body.
+    ///
+    /// `create_issue` bumps the author's trust score AFTER releasing the guard,
+    /// so an unchanged score is what proves the short-circuit actually precedes
+    /// the post-release effects rather than merely being written above them. A
+    /// `?` placed after the bump would leave the status assertion green and
+    /// this one red.
+    #[sqlx::test]
+    async fn a_fenced_publish_renders_as_503_and_skips_the_post_release_effects(pool: PgPool) {
+        use tower::ServiceExt;
+
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let owner = "did:key:z6MkFenceHandlerAuthor";
+        let repo = "fence-handler-repo";
+        let slug = owner_slug_of(owner);
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store = fenced_store(&mock, &opts, repos.path()).await;
+        let now = chrono::Utc::now();
+        state
+            .db
+            .create_repo(&crate::db::RepoRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: repo.to_string(),
+                owner_did: owner.to_string(),
+                description: None,
+                is_public: true,
+                default_branch: "main".to_string(),
+                created_at: now,
+                updated_at: now,
+                disk_path: format!("/tmp/{repo}"),
+                forked_from: None,
+                machine_id: None,
+            })
+            .await
+            .expect("seed repo");
+        // The trust bump only moves a row that already exists, so the author has
+        // to be registered or the observable would be vacuously unchanged.
+        state
+            .db
+            .register_agent(owner, &[])
+            .await
+            .expect("register the author");
+        let score_before = state.db.get_trust_score(owner).await.expect("trust score");
+
+        // A real bare repo, on disk and published, so the acquire refresh has a
+        // valid archive to download and the handler's git work succeeds.
+        let local = repos.path().join(&slug).join(format!("{repo}.git"));
+        store::init_bare(&local).expect("init the bare repo");
+        mock_tigris(&mock)
+            .upload(&slug, repo, &local, UploadPrecondition::Unconditional)
+            .await
+            .expect("publish the archive");
+
+        // Move the generation on after BOTH of the handler's HEADs: the one in
+        // `acquire_write`, so the fence it carries is stale by the time it
+        // publishes, and the one the supersede-retry does, so the retry loses
+        // too and the release refuses.
+        mock.roll_generation_after_next_heads(2);
+
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/issues",
+                axum::routing::post(crate::api::issues::create_issue),
+            )
+            .with_state(state.clone());
+        let resp = router
+            .oneshot(crate::test_support::signed_request_as(
+                owner,
+                axum::http::Method::POST,
+                &format!("/api/v1/repos/{owner}/{repo}/issues"),
+                axum::body::Body::from(r#"{"title":"t","body":"b"}"#),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "a publish the store refused must be a retryable 503, not a success"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("repo_write_fenced"),
+            "the 503 must carry its own code so a client can tell it from contention, got {body}"
+        );
+        assert!(
+            !body.contains(repo) && !body.contains(&slug),
+            "the body must be fixed and must not name the repo or owner, got {body}"
+        );
+        assert_eq!(
+            state.db.get_trust_score(owner).await.expect("trust score"),
+            score_before,
+            "the post-release trust bump must not run when the publish was refused"
         );
 
         mock.shutdown();

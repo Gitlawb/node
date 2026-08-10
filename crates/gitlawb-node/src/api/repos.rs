@@ -2059,7 +2059,12 @@ pub async fn git_receive_pack(
     // Always release the advisory lock — even on error — to prevent stale locks
     // from blocking subsequent pushes. Only upload to Tigris when the push
     // succeeded; uploading a half-applied repo would propagate corruption.
-    guard.release(push_succeeded).await;
+    // Short-circuit on a refused publish BEFORE anything downstream observes
+    // the push. The pack is on local disk but not in object storage, so
+    // touching the repo, recording the push, bumping trust, issuing ref
+    // certificates or answering 200 would all be reporting a write no other
+    // node can read.
+    guard.release(receive_result.is_ok()).await.into_result()?;
     // Clean path: clone (a) already dropped inside run_git_service when the receive-pack
     // group was reaped; clone (b) held here spanned the success-only Tigris upload that
     // ran inside release() above. Drop it now so a second same-repo push proceeds the

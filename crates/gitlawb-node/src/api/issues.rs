@@ -70,7 +70,11 @@ pub async fn create_issue(
     let create_result = git_issues::create_issue(&disk_path, &issue_id, &json_str);
 
     // Always release the advisory lock — even on error; upload to Tigris only on success.
-    guard.release(create_result.is_ok()).await;
+    // A refused publish short-circuits here, before the trust bump and before
+    // the 201: the issue is on local disk but not in object storage, so no
+    // other node can read it and the client must retry rather than be told it
+    // was filed.
+    guard.release(create_result.is_ok()).await.into_result()?;
 
     create_result.map_err(|e| AppError::Git(e.to_string()))?;
 
@@ -321,14 +325,19 @@ pub async fn close_issue(
                 .as_deref()
                 .is_some_and(|a| crate::api::did_matches(&auth.0, a));
             if !is_owner && !is_author_now {
-                guard.release(false).await;
+                // Consumed, NOT propagated, and that is deliberate at all three
+                // `release(false)` sites below. These release without
+                // publishing, so there is nothing for the store to refuse, and
+                // mapping the outcome here would let a 503 shadow the
+                // authorization answer this route exists to give.
+                let _ = guard.release(false).await;
                 return Err(AppError::Forbidden(
                     "only the repo owner or the issue author can close this issue".into(),
                 ));
             }
         }
         Ok(None) => {
-            guard.release(false).await;
+            let _ = guard.release(false).await;
             // The owner keeps the informative 404; a non-owner must not learn from
             // this route whether the issue exists, matching the pre-check above.
             return Err(if is_owner {
@@ -340,7 +349,7 @@ pub async fn close_issue(
             });
         }
         Err(e) => {
-            guard.release(false).await;
+            let _ = guard.release(false).await;
             return Err(AppError::Git(e.to_string()));
         }
     }
@@ -348,7 +357,8 @@ pub async fn close_issue(
     let close_result = git_issues::close_issue(&disk_path, &issue_id);
 
     // Always release the advisory lock — even on error; upload to Tigris only on success.
-    guard.release(close_result.is_ok()).await;
+    // Same short-circuit as create_issue, and before the 200 body below.
+    guard.release(close_result.is_ok()).await.into_result()?;
 
     let updated = close_result
         .map_err(|e| AppError::Git(e.to_string()))?
