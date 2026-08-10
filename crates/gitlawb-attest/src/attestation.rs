@@ -216,6 +216,19 @@ fn verifying_key_from_did_key(did: &str) -> Result<VerifyingKey> {
             "did:key must use base58btc (z-prefix): {did}"
         )));
     }
+    // Refuse an oversized id before decoding. base58 decoding is quadratic in
+    // its input and `signer` comes off an attacker-supplied attestation, so a
+    // short request could otherwise buy a large decode. An ed25519 did:key
+    // method-id is a fixed 48 characters, so this bound is slack rather than a
+    // behavior change, and it only helps ahead of the decode. Mirrors the same
+    // cap in gitlawb-core's Did::to_verifying_key, which this crate cannot call
+    // (gitlawb-core is a dev-dependency here).
+    const MAX_METHOD_ID_LEN: usize = 64;
+    if method_id.len() > MAX_METHOD_ID_LEN {
+        return Err(Error::Did(
+            "did:key method-specific id too long".to_string(),
+        ));
+    }
     let (base, bytes) =
         multibase::decode(method_id).map_err(|e| Error::Did(format!("multibase: {e}")))?;
     if base != multibase::Base::Base58Btc {
@@ -607,6 +620,25 @@ mod tests {
             Error::Did(msg) => assert!(
                 msg.contains("small-order"),
                 "rejection must name the small-order key, got: {msg}"
+            ),
+            other => panic!("expected Error::Did, got {other:?}"),
+        }
+    }
+
+    /// base58 decoding is quadratic in its input and `signer` is attacker
+    /// controlled, so an oversized method-id must be refused BEFORE the decode
+    /// or a hostile attestation buys a large decode for a short request. The
+    /// assertion is on the length error specifically: a multibase error here
+    /// would mean the cap ran too late to matter.
+    #[test]
+    fn verifying_key_from_did_key_refuses_an_oversized_method_id_before_decoding() {
+        let oversized = format!("did:key:z{}", "1".repeat(65_536));
+        let err = verifying_key_from_did_key(&oversized)
+            .expect_err("an oversized method-id must be refused");
+        match err {
+            Error::Did(msg) => assert!(
+                msg.contains("too long"),
+                "must fail on the length cap, not after decoding: {msg}"
             ),
             other => panic!("expected Error::Did, got {other:?}"),
         }
