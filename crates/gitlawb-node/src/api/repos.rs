@@ -5691,13 +5691,15 @@ mod tests {
 
         // Reproduce acquire_write's session-level advisory-lock key exactly so the
         // second-connection lock collides with the handler's pg_try_advisory_lock
-        // (repo_store.rs: advisory_lock_key over owner_slug then repo_name).
+        // (repo_store.rs: SHA-256 advisory_lock_key over owner_slug, ':', repo_name).
         fn advisory_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            owner_slug.hash(&mut hasher);
-            repo_name.hash(&mut hasher);
-            hasher.finish() as i64
+            use sha2::Digest;
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(owner_slug.as_bytes());
+            hasher.update(b":");
+            hasher.update(repo_name.as_bytes());
+            let digest = hasher.finalize();
+            i64::from_le_bytes(digest[..8].try_into().expect("sha256 output is >= 8 bytes"))
         }
 
         let owner = "z6acqdead";
