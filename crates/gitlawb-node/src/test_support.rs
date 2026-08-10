@@ -707,6 +707,451 @@ mod tests {
         );
     }
 
+    /// Pre-assigned tasks must not be stealable: a stranger claiming a pending
+    /// task reserved for another agent must fail, and must not receive the
+    /// UCAN. The reserved assignee still claims successfully.
+    #[sqlx::test]
+    async fn claim_task_honors_preassigned_assignee(pool: PgPool) {
+        let delegator = "did:key:zCLAIMDELEGATORAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let reserved = "did:key:zCLAIMRESERVEDBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let thief = "did:key:zCLAIMTHIEFCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let state = test_state(pool).await;
+        let mut task = seed_task("task-reserved", delegator);
+        task.assignee_did = Some(reserved.to_string());
+        task.ucan_token = Some("ucan-secret-for-reserved-only".into());
+        state.db.create_task(&task).await.expect("seed");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/tasks/{id}/claim",
+                    axum::routing::post(crate::api::tasks::claim_task),
+                )
+                .with_state(state.clone())
+        };
+        let uri = "/api/v1/tasks/task-reserved/claim";
+
+        // Thief signs as themselves and asks to claim — must fail, UCAN stays put.
+        let resp = router()
+            .oneshot(signed_request_as(
+                thief,
+                Method::POST,
+                uri,
+                Body::from(format!(r#"{{"assignee_did":"{thief}"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "stranger must not steal a pre-assigned task, got {}",
+            resp.status()
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("ucan-secret-for-reserved-only"),
+            "UCAN must not leak on a failed steal: {text}"
+        );
+        let still = state.db.get_task("task-reserved").await.unwrap().unwrap();
+        assert_eq!(still.status, "pending");
+        assert_eq!(still.assignee_did.as_deref(), Some(reserved));
+
+        // Reserved assignee claims successfully and receives the UCAN.
+        let resp = router()
+            .oneshot(signed_request_as(
+                reserved,
+                Method::POST,
+                uri,
+                Body::from(format!(r#"{{"assignee_did":"{reserved}"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "reserved assignee must claim, got {}",
+            resp.status()
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("ucan-secret-for-reserved-only"),
+            "reserved assignee must receive UCAN: {text}"
+        );
+        assert!(text.contains("\"status\":\"claimed\"") || text.contains("claimed"));
+    }
+
+    /// Open (unassigned) pending tasks remain first-claimer-wins after the
+    /// pre-assignment gate.
+    #[sqlx::test]
+    async fn claim_task_open_still_first_claimer_wins(pool: PgPool) {
+        let delegator = "did:key:zOPENDELEGATORAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let claimer = "did:key:zOPENCLAIMERBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_task(&seed_task("task-open", delegator))
+            .await
+            .expect("seed");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/tasks/{id}/claim",
+                axum::routing::post(crate::api::tasks::claim_task),
+            )
+            .with_state(state.clone());
+        let resp = router
+            .oneshot(signed_request_as(
+                claimer,
+                Method::POST,
+                "/api/v1/tasks/task-open/claim",
+                Body::from(format!(r#"{{"assignee_did":"{claimer}"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "open task must still be claimable, got {}",
+            resp.status()
+        );
+        let got = state.db.get_task("task-open").await.unwrap().unwrap();
+        assert_eq!(got.status, "claimed");
+        assert_eq!(got.assignee_did.as_deref(), Some(claimer));
+    }
+
+    /// ASCII-blank assignees (`ASSIGNEE_BLANK`: space, tab, LF, CR) must be open
+    /// at the claim SQL blank branch. Seeds via raw INSERT so create_task
+    /// normalization is not in the path.
+    #[sqlx::test]
+    async fn claim_task_ascii_blank_reservations_are_open(pool: PgPool) {
+        let delegator = "did:key:zBLANKDELEGATORAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let claimer = "did:key:zBLANKCLAIMERBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool.clone()).await;
+        let now = chrono::Utc::now().to_rfc3339();
+        for (id, blank) in [
+            ("task-blank-empty", ""),
+            ("task-blank-tab", "\t"),
+            ("task-blank-space", " "),
+            ("task-blank-lf", "\n"),
+            ("task-blank-cr", "\r"),
+        ] {
+            sqlx::query(
+                "INSERT INTO agent_tasks (id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline)
+                 VALUES ($1,NULL,'build','pending',$2,$3,'repo:write',NULL,NULL,NULL,$4,$4,NULL)",
+            )
+            .bind(id)
+            .bind(delegator)
+            .bind(blank)
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("seed {id}: {e}"));
+
+            let claimed = state
+                .db
+                .claim_task(id, claimer)
+                .await
+                .unwrap_or_else(|e| panic!("{id} must be open: {e}"));
+            assert_eq!(claimed.status, "claimed", "{id}");
+            assert_eq!(claimed.assignee_did.as_deref(), Some(claimer), "{id}");
+        }
+    }
+
+    /// create_task must null whitespace-only assignees and return that shape
+    /// (fail-on-remove for the blank filter).
+    #[sqlx::test]
+    async fn create_task_normalizes_whitespace_assignee(pool: PgPool) {
+        let delegator = "did:key:zCREATENORMDELEGAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        let mut task = seed_task("task-create-norm", delegator);
+        task.assignee_did = Some(" \t\n ".into());
+        let stored = state.db.create_task(&task).await.expect("create");
+        assert!(
+            stored.assignee_did.is_none(),
+            "create_task must return normalized NULL assignee, got {:?}",
+            stored.assignee_did
+        );
+        let got = state
+            .db
+            .get_task("task-create-norm")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(got.assignee_did.is_none(), "row must store NULL assignee");
+    }
+
+    /// Claiming a reserved task must keep the stored DID form so exact-match
+    /// list filters still find it. Also covers bare→full claim + list by bare
+    /// (claimer full DID must not be required for list equality).
+    #[sqlx::test]
+    async fn claim_task_keeps_stored_assignee_did_form(pool: PgPool) {
+        let delegator = "did:key:zFORMDELEGATORAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let bare = "zFORMRESERVEDBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let full = format!("did:key:{bare}");
+        let state = test_state(pool).await;
+        let mut task = seed_task("task-form", delegator);
+        task.assignee_did = Some(bare.to_string());
+        state.db.create_task(&task).await.expect("seed");
+
+        let claimed = state
+            .db
+            .claim_task("task-form", &full)
+            .await
+            .expect("claim with full DID");
+        assert_eq!(
+            claimed.assignee_did.as_deref(),
+            Some(bare),
+            "reserved claim must keep the stored bare-key form"
+        );
+        let listed_bare = state
+            .db
+            .list_tasks(Some("claimed"), Some(bare), 10)
+            .await
+            .unwrap();
+        assert!(
+            listed_bare.iter().any(|t| t.id == "task-form"),
+            "delegator filtering by bare key must still find the task"
+        );
+        let listed_full = state
+            .db
+            .list_tasks(Some("claimed"), Some(&full), 10)
+            .await
+            .unwrap();
+        assert!(
+            !listed_full.iter().any(|t| t.id == "task-form"),
+            "exact list by claimer's full DID must miss the bare stored form"
+        );
+    }
+
+    /// Padded non-blank reservation must survive claim unchanged (exact form).
+    #[sqlx::test]
+    async fn claim_task_keeps_padded_reservation_exact(pool: PgPool) {
+        let delegator = "did:key:zPADDELEGATORAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let key = "zPADRESERVEDBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let padded = format!(" {key}\t");
+        let full = format!("did:key:{key}");
+        let state = test_state(pool.clone()).await;
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO agent_tasks (id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline)
+             VALUES ($1,NULL,'build','pending',$2,$3,'repo:write',NULL,NULL,NULL,$4,$4,NULL)",
+        )
+        .bind("task-padded")
+        .bind(delegator)
+        .bind(&padded)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("seed padded");
+
+        let claimed = state
+            .db
+            .claim_task("task-padded", &full)
+            .await
+            .expect("claim padded reservation");
+        assert_eq!(
+            claimed.assignee_did.as_deref(),
+            Some(padded.as_str()),
+            "claim must not BTRIM a non-blank reservation"
+        );
+        let listed = state
+            .db
+            .list_tasks(Some("claimed"), Some(&padded), 10)
+            .await
+            .unwrap();
+        assert!(
+            listed.iter().any(|t| t.id == "task-padded"),
+            "exact list by original padded form must still find the task"
+        );
+
+        let finished = state
+            .db
+            .finish_task("task-padded", "completed", None, &full)
+            .await
+            .expect("padded assignee must finish after trim match");
+        assert_eq!(finished.status, "completed");
+    }
+
+    /// Direct coverage for the DB-layer finish_task assignee Rust gate (handlers
+    /// 403 before calling in, so HTTP tests alone leave this unproven).
+    #[sqlx::test]
+    async fn finish_task_rejects_non_assignee_at_db(pool: PgPool) {
+        let delegator = "did:key:zFINISHDELEGATORAAAAAAAAAAAAAAAAAAAAAAAA";
+        let assignee = "did:key:zFINISHASSIGNEEBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let stranger = "did:key:zFINISHSTRANGERCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_task(&seed_task("task-finish-gate", delegator))
+            .await
+            .expect("seed");
+        state
+            .db
+            .claim_task("task-finish-gate", assignee)
+            .await
+            .expect("claim");
+
+        let err = state
+            .db
+            .finish_task("task-finish-gate", "completed", None, stranger)
+            .await
+            .expect_err("stranger must not finish");
+        assert!(
+            err.to_string().contains("assignee") || err.to_string().contains("finishable"),
+            "expected assignee denial, got {err}"
+        );
+        let still = state
+            .db
+            .get_task("task-finish-gate")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            still.status, "claimed",
+            "row must stay claimed after denial"
+        );
+
+        let done = state
+            .db
+            .finish_task("task-finish-gate", "completed", None, assignee)
+            .await
+            .expect("assignee finishes");
+        assert_eq!(done.status, "completed");
+    }
+
+    /// Fail-on-remove for `finish_task`'s `AND assignee_did=$5`: a concurrent writer
+    /// that changes the stored assignee between the production read and UPDATE must
+    /// leave the task claimed (production `Db::finish_task` path).
+    #[sqlx::test]
+    async fn finish_task_sql_assignee_predicate_is_load_bearing(pool: PgPool) {
+        let delegator = "did:key:zFINISHSQLDELEGAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let assignee = "did:key:zFINISHSQLASSIGNBBBBBBBBBBBBBBBBBBBBBBBB";
+        let other = "did:key:zFINISHSQLOTHERCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let state = test_state(pool.clone()).await;
+        let id = "task-finish-sql";
+        state
+            .db
+            .create_task(&seed_task(id, delegator))
+            .await
+            .expect("seed");
+        state.db.claim_task(id, assignee).await.expect("claim");
+
+        let pool_bg = pool.clone();
+        let id_bg = id.to_string();
+        let other_bg = other.to_string();
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let hog = tokio::spawn(async move {
+            let mut tx = pool_bg.begin().await.expect("begin");
+            sqlx::query("SELECT assignee_did FROM agent_tasks WHERE id = $1 FOR UPDATE")
+                .bind(&id_bg)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("lock row");
+            locked_tx.send(()).ok();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            sqlx::query(
+                "UPDATE agent_tasks SET assignee_did = $2 WHERE id = $1 AND status = 'claimed'",
+            )
+            .bind(&id_bg)
+            .bind(&other_bg)
+            .execute(&mut *tx)
+            .await
+            .expect("race assignee");
+            tx.commit().await.expect("commit");
+        });
+        locked_rx.await.expect("row lock held before finish");
+
+        let err = state
+            .db
+            .finish_task(id, "completed", None, assignee)
+            .await
+            .expect_err("assignee slot race must fail production finish_task");
+        hog.await.expect("hog task");
+
+        assert!(
+            err.to_string().contains("not in claimed state"),
+            "expected finish denial, got {err}"
+        );
+        let still = state.db.get_task(id).await.unwrap().unwrap();
+        assert_eq!(still.status, "claimed");
+        assert_eq!(still.assignee_did.as_deref(), Some(other));
+    }
+
+    /// Fail-on-remove for the claim UPDATE assignee-slot re-check: a concurrent
+    /// writer that changes `assignee_did` after the pre-read must block claim.
+    #[sqlx::test]
+    async fn claim_task_update_assignee_slot_recheck_is_load_bearing(pool: PgPool) {
+        let delegator = "did:key:zCLAIMSLOTDELEGAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let reserved = "did:key:zCLAIMSLOTASSIGNEEBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let other = "did:key:zCLAIMSLOTOTHERCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let state = test_state(pool.clone()).await;
+        let id = "task-claim-slot";
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO agent_tasks
+                 (id, repo_id, kind, status, delegator_did, assignee_did, capability,
+                  ucan_token, payload, result, created_at, updated_at, deadline)
+             VALUES ($1, NULL, 'build', 'pending', $2, $3, 'repo:write',
+                     NULL, NULL, NULL, $4, $4, NULL)",
+        )
+        .bind(id)
+        .bind(delegator)
+        .bind(reserved)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("seed reserved");
+
+        let pool_bg = pool.clone();
+        let id_bg = id.to_string();
+        let other_bg = other.to_string();
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let hog = tokio::spawn(async move {
+            let mut tx = pool_bg.begin().await.expect("begin");
+            sqlx::query("SELECT assignee_did FROM agent_tasks WHERE id = $1 FOR UPDATE")
+                .bind(&id_bg)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("lock row");
+            locked_tx.send(()).ok();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            sqlx::query(
+                "UPDATE agent_tasks SET assignee_did = $2 WHERE id = $1 AND status = 'pending'",
+            )
+            .bind(&id_bg)
+            .bind(&other_bg)
+            .execute(&mut *tx)
+            .await
+            .expect("race assignee");
+            tx.commit().await.expect("commit");
+        });
+        locked_rx.await.expect("row lock held before claim");
+
+        let err = state
+            .db
+            .claim_task(id, reserved)
+            .await
+            .expect_err("assignee slot race must fail production claim_task");
+        hog.await.expect("hog task");
+
+        assert!(
+            err.to_string().contains("not found or already claimed"),
+            "expected SQL re-check denial, got {err}"
+        );
+        assert!(
+            err.downcast_ref::<crate::db::TaskReservedForOtherAssignee>()
+                .is_none(),
+            "must prove the UPDATE predicate, not the Rust pre-check: {err}"
+        );
+        let still = state.db.get_task(id).await.unwrap().unwrap();
+        assert_eq!(still.status, "pending");
+        assert_eq!(still.assignee_did.as_deref(), Some(other));
+    }
+
     /// Adversarial-review GATE-2 (create_pr): opening a PR requires read access.
     /// A non-reader is denied on a private repo before any PR is created; the
     /// owner is allowed.
