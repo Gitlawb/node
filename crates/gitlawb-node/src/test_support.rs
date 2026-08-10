@@ -4963,6 +4963,71 @@ mod tests {
         );
     }
 
+    /// U4 (#173, finding 5): a pin whose DB record exhausts its retries must NOT appear
+    /// in the returned vector. Kubo really is holding the bytes (the `/add` mock is hit),
+    /// but with no `pinned_cids` row the resolver cannot serve that CID, so reporting it
+    /// as pinned overclaims. The Kubo return is log-only (`api/repos.rs` counts the pairs
+    /// and logs each one), which is what makes omitting the row safe here; the pinata
+    /// twin's return feeds the announcement `cid_map` and keeps its own contract.
+    ///
+    /// Two objects, because `with_pin_sources_broken` hides the table process-wide and
+    /// the harness cannot express per-object DB breakage. Both records fail, and the
+    /// `/add` mock being hit exactly twice is the batch-survival proof: the first
+    /// failure warns and continues instead of breaking out of the loop. The healthy
+    /// direction (a successful record IS returned) is already covered by
+    /// `pin_new_objects_records_provenance` directly above, so the two together cover
+    /// both sides without new harness machinery.
+    #[sqlx::test]
+    async fn pin_new_objects_omits_objects_whose_db_record_failed(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+            .with_status(200)
+            .with_body(r#"{"Hash":"bafyproviderhash"}"#)
+            .expect(2)
+            .create_async()
+            .await;
+
+        let fx = seed_cid_repos("provpin_u4", "ppu4", &["pinsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join("provpin_u4")
+            .join("pinsrc.git");
+
+        let pinned = with_pin_sources_broken(&pool, || async {
+            crate::ipfs_pin::pin_new_objects(
+                &server.url(),
+                &bare,
+                &state.git_bin,
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                vec![fx.public_oid.clone(), fx.secret_oid.clone()],
+                &state.db,
+                "repoU4",
+                // Far above the ~150ms per object the retry ladder spends
+                // (PIN_RECORD_ATTEMPTS x PIN_RECORD_BACKOFF), so the batch budget gate
+                // is never what truncates this run.
+                std::time::Duration::from_secs(60),
+            )
+            .await
+        })
+        .await;
+
+        assert!(
+            pinned.is_empty(),
+            "a pin with no durable index row must not be reported as pinned, got {pinned:?}"
+        );
+        // Exactly two adds: the first record failure did not break the batch.
+        m.assert_async().await;
+        for oid in [&fx.public_oid, &fx.secret_oid] {
+            assert_eq!(
+                state.db.provenance_for_oid(oid).await.unwrap(),
+                None,
+                "the record really did fail, so there is no row to report"
+            );
+        }
+    }
+
     /// #173 (grok F2): the post-push pin read is BOUNDED, so a wedged/D-state
     /// `git cat-file` (stuck NFS/Tigris backend) is reaped at `git_timeout` and
     /// `pin_new_objects` RETURNS — reaching `requeue_or_release` in production —

@@ -616,10 +616,14 @@ pub(crate) fn batch_budget_gate(
 /// the same bounded, reaped git read. It still has no per-request override, since
 /// `pinata::pin_object` takes no timeout argument and its uploads are bounded by
 /// the shared client's own ceiling. Everything else about the shape (the
-/// skip-if-pinned check, the provenance recording, the fault arms, the returned
-/// pairs) changes in lockstep.
+/// skip-if-pinned check, the provenance recording, the fault arms) changes in
+/// lockstep. The returned pairs are the one deliberate exception: this side omits
+/// an object whose DB record exhausted its retries, because the return here is
+/// consumed for logging only, while the pinata side still returns it because its
+/// return feeds the announcement `cid_map`. See the record step for the reasoning.
 ///
-/// Returns a list of `(sha256_hex, cid)` pairs for objects pinned this call.
+/// Returns a list of `(sha256_hex, cid)` pairs pinned AND durably recorded this
+/// call.
 // Eight because #173's git seam (`git_bin`, `git_timeout`) and pin provenance
 // (`repo_id`) sit alongside #174's batch budget. All four callers pass every one, and
 // grouping them into a context struct would add a type whose only job is to be
@@ -812,19 +816,32 @@ pub async fn pin_new_objects(
                 // resolver. U3 (#173): the pin and its source go down in ONE transaction.
                 // As two independent best-effort calls this path could land the pin while
                 // dropping its own source, producing a source set silently missing its
-                // first pinner; atomically there is no such window, and a total failure
-                // leaves the object unpinned so the next push retries the whole thing.
-                if let Err(e) =
-                    retry_db_record(|| db.record_pinned_cid_with_source(&sha, &raw_cid, repo_id))
-                        .await
+                // first pinner; atomically there is no such window. When the transaction
+                // still fails after every retry, Kubo is holding the bytes but the DB has
+                // no row, so nothing can resolve that CID and there is no partial state to
+                // clean up. Recovery is the next push, which re-offers the object and
+                // retries the whole record; until then the object counts as unpinned, and
+                // the returned vector says so by carrying only durably recorded pins.
+                //
+                // Returning the provider Hash rather than the resolver key is deliberate:
+                // the DB `cid` is the raw resolver key (recorded above), the returned value
+                // is the provider CID. On the record-failed case the twins DIVERGE and must
+                // stay that way. This return is log-only (`api/repos.rs` turns it into a
+                // count log plus one line per pair and consumes it nowhere else), so
+                // dropping a record-failed pin costs nothing and stops the log claiming a
+                // pin the resolver cannot serve. The pinata twin keeps its unconditional
+                // push because ITS return is a real input: `api/repos.rs` builds the
+                // sha-to-cid `cid_map` from it, which drives `upsert_branch_cid` and the
+                // p2p `publish_ref_update` gossip CID. Do not re-align them without moving
+                // that consumer first.
+                match retry_db_record(|| db.record_pinned_cid_with_source(&sha, &raw_cid, repo_id))
+                    .await
                 {
-                    tracing::warn!(sha = %sha, err = %e, "failed to record pinned CID in DB");
+                    Ok(()) => pinned.push((sha, cid)),
+                    Err(e) => {
+                        tracing::warn!(sha = %sha, err = %e, "failed to record pinned CID in DB");
+                    }
                 }
-                // Return the provider Hash (not the resolver key), mirroring the pinata
-                // twin's contract: the DB `cid` is the raw resolver key (recorded above),
-                // the returned value is the provider CID. Here the return is consumed only
-                // for logging, but keeping the twins structurally identical avoids drift.
-                pinned.push((sha, cid));
             }
             Ok(_) => {}
             Err(e) => {
