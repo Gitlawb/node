@@ -206,6 +206,49 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
 
+    /// A did:key encoding a small-order point. Well-formed, indistinguishable
+    /// from a real one by eye, and refused at resolution since the choke-point
+    /// guard landed.
+    fn weak_did_key() -> String {
+        let mut weak = [0u8; 32];
+        weak[0] = 1; // compressed identity point
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&weak).expect("decompresses");
+        Did::from_verifying_key(&vk).to_string()
+    }
+
+    /// The #47 fail-closed arm already refuses to seal to a partial recipient
+    /// set. Because a small-order did:key no longer RESOLVES, it lands in the
+    /// unresolved set and that existing arm catches it: nothing is sealed, and
+    /// no new code path was added to make that happen.
+    #[test]
+    fn weak_recipient_falls_into_the_existing_fail_closed_arm() {
+        let weak = weak_did_key();
+        let mut dids = BTreeSet::new();
+        dids.insert(did_key(9));
+        dids.insert(weak.clone());
+
+        match plan_seal(&[0u8; 32], &dids, None) {
+            SealPlan::SkipUnresolvable(unresolved) => assert!(
+                unresolved.contains(&weak),
+                "the weak DID must be named in the unresolved set, got {unresolved:?}"
+            ),
+            other => panic!("expected SkipUnresolvable, got {other:?}"),
+        }
+    }
+
+    /// Must-not-over-reject control: an all-legitimate recipient set still seals.
+    #[test]
+    fn legitimate_recipient_set_still_seals() {
+        let mut dids = BTreeSet::new();
+        dids.insert(did_key(9));
+        dids.insert(did_key(11));
+
+        match plan_seal(&[0u8; 32], &dids, None) {
+            SealPlan::Seal { keys, .. } => assert_eq!(keys.len(), 2, "both recipients resolve"),
+            other => panic!("expected Seal, got {other:?}"),
+        }
+    }
+
     fn did_key(seed: u8) -> String {
         let vk = SigningKey::from_bytes(&[seed; 32]).verifying_key();
         Did::from_verifying_key(&vk).to_string()
