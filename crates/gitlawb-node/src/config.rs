@@ -345,8 +345,8 @@ pub struct Config {
     /// CONNECTION BUDGET. A push holds a Postgres connection from the node's separate
     /// advisory-lock pool for the whole receive-pack, and that pool is sized from this
     /// knob (this value + 8, clamped to 64 in `main.rs`). The node's total ceiling is
-    /// therefore `db_max_connections` (default 20) + the lock pool (default 40), i.e.
-    /// 60 by default, and at most `db_max_connections` + 64. Size BOTH against the
+    /// therefore `db_max_connections` (default 48) + the lock pool (default 40), i.e.
+    /// 88 by default, and at most `db_max_connections` + 64. Size BOTH against the
     /// database server's `max_connections`: `db_max_connections`' own doc predates the
     /// lock pool and no longer covers most of the node's connections. The +8 headroom
     /// is shared with the three non-push `acquire_write` callers (`api/issues.rs` x2,
@@ -492,10 +492,15 @@ pub struct Config {
     /// absent with a 404. The handler still short-circuits the moment it serves.
     /// Must be between 1 and 1_048_576. Default: 64.
     ///
-    /// The effective ceiling is `max(MAX_PIN_SOURCES + 1, this)`. That floor exists
-    /// so the cap can never truncate a request before its whole bounded provenance
-    /// source set has been tried, which would falsely 503 a provenanced request, so
-    /// setting this below the floor widens nothing and is silently raised.
+    /// The effective per-request ceiling is the TIGHTER of this knob and the node's
+    /// internal per-request history-walk ceiling, `MAX_PIN_SOURCES + 1` = 17 (see
+    /// `api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST` and the `min()` that combines the
+    /// two in the resolver). Setting this above 17 changes nothing, because the
+    /// internal ceiling already binds. Setting it below 17 does lower the cap: the
+    /// constant side of the `min()` is what keeps a request from being truncated
+    /// before its whole bounded provenance source set has been tried, so an operator
+    /// who goes under it is choosing a tighter cap that can 503 a provenanced
+    /// request, which is allowed.
     #[arg(
         long,
         env = "GITLAWB_IPFS_MAX_REPOS_WALKED",

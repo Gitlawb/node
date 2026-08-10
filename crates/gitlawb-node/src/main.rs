@@ -65,7 +65,7 @@ struct DbStartupStatus {
 /// pool used to derive its size straight from that knob, so raising the push cap
 /// silently raised the node's Postgres connection ceiling with no CLI error and no
 /// relation to the server's own `max_connections` (#173 F4). The node's total budget is
-/// now bounded: `db_max_connections` (default 20) + at most this.
+/// now bounded: `db_max_connections` (default 48) + at most this.
 const LOCK_POOL_MAX_CONNECTIONS: u32 = 64;
 
 /// Connections the lock pool keeps above the push cap. Covers the three non-push
@@ -313,11 +313,14 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Repo write locks run on their own pool, never the main query pool: each
-    // push holds its connection for the whole receive-pack, and
-    // db_max_connections (20) is below max_concurrent_git_pushes (32), so sharing
-    // would starve every other query under a push burst. See build_lock_pool for
-    // the cancellation semantics (#173).
+    // Repo write locks run on their own pool, never the main query pool: each push
+    // holds its connection for the whole receive-pack, so a burst of concurrent
+    // pushes drawing from the main pool would park that many connections for the
+    // duration of their receive-packs and starve every other query. That holds
+    // whatever the two pools are sized at, which is why the separation is
+    // structural rather than a consequence of the defaults; config validate()
+    // separately requires db_max_connections >= max_concurrent_git_pushes + 8. See
+    // build_lock_pool for the cancellation semantics (#173).
     let lock_pool = git::repo_store::build_lock_pool(
         db.pool(),
         lock_pool_size(config.max_concurrent_git_pushes),

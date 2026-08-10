@@ -852,10 +852,13 @@ impl Drop for RepoWriteGuard {
 ///     drop: the lock clears shortly after the connection goes away, not
 ///     synchronously with it.
 ///   * It is a SEPARATE pool from the main query pool, not a slice of it. A push
-///     holds its lock connection for the whole receive-pack, and
-///     `db_max_connections` (default 20) is well below
-///     `max_concurrent_git_pushes` (default 32), so drawing these from the main
-///     pool would starve every other query during a push burst.
+///     holds its lock connection for the whole receive-pack, so drawing these
+///     from the main pool would let a burst of `max_concurrent_git_pushes`
+///     pushes park that many query connections for the length of their
+///     receive-packs and starve every other query. That is true at any pool
+///     size, so the separation does not rest on how the two knobs are set;
+///     `Config::validate` separately requires `db_max_connections` to clear
+///     `max_concurrent_git_pushes` by `DB_POOL_APP_HEADROOM`.
 ///
 /// `acquire_timeout` bounds the wait when every lock-pool connection is busy, so
 /// exhaustion surfaces as a clean error rather than an unbounded hang.

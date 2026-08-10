@@ -187,6 +187,8 @@ GITLAWB_ENFORCE_OWNER_PUSH=true
 
 **Node refuses to start with "strict-mode operator check failed"** — either `gl node register` first, or unset `GITLAWB_OPERATOR_STRICT_MODE`.
 
+**Node refuses to start with "GITLAWB_DB_MAX_CONNECTIONS (20) must be at least max_concurrent_git_pushes (32) + 8 headroom"**: raise `GITLAWB_DB_MAX_CONNECTIONS` to at least the push cap plus 8 (40 with the default cap of 32; 48 is the shipped default and the recommended value), or lower `GITLAWB_MAX_CONCURRENT_GIT_PUSHES`. This bites a node upgraded in place that still sets the old pool size of 20. The check is deliberate: each concurrent push pins one pooled connection for its whole receive-pack, so a pool that does not clear the push cap lets a burst of slow pushes starve every other database path.
+
 **Rewards are 0 after a week** — run `gl node onchain-status`. If `currentlyActive: false`, check your heartbeat loop (node logs for `operator heartbeat sent`).
 
 **Want to rotate operator wallet** — requires unstake → re-register with new wallet. No in-place rotation in v1.
