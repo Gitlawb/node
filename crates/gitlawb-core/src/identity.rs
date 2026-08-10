@@ -78,10 +78,9 @@ impl Keypair {
 
 /// Verify an Ed25519 signature.
 pub fn verify(verifying_key: &VerifyingKey, msg: &[u8], sig_bytes: &[u8; 64]) -> Result<()> {
-    use ed25519_dalek::Verifier;
     let sig = Signature::from_bytes(sig_bytes);
     verifying_key
-        .verify(msg, &sig)
+        .verify_strict(msg, &sig)
         .map_err(|_| Error::SignatureInvalid)
 }
 
