@@ -262,6 +262,26 @@ fn write_response(mut stream: TcpStream, status: &str, content_type: &str, body:
 /// Run `git fetch` in `clone` through the helper, with a hard timeout so a
 /// regression to the deadlock fails fast instead of hanging the suite.
 fn fetch_with_helper(clone: &Path, node_url: &str) -> (bool, std::process::Output) {
+    let mut last = fetch_with_helper_once(clone, node_url);
+    for attempt in 1..3u32 {
+        if last.0 && last.1.status.success() {
+            return last;
+        }
+        let stderr = String::from_utf8_lossy(&last.1.stderr);
+        let transient = stderr.contains("10053")
+            || stderr.contains("connection error")
+            || stderr.contains("connection was aborted")
+            || stderr.contains("error sending request");
+        if !transient {
+            return last;
+        }
+        std::thread::sleep(Duration::from_millis(250 * attempt as u64));
+        last = fetch_with_helper_once(clone, node_url);
+    }
+    last
+}
+
+fn fetch_with_helper_once(clone: &Path, node_url: &str) -> (bool, std::process::Output) {
     let helper_bin = PathBuf::from(env!("CARGO_BIN_EXE_git-remote-gitlawb"));
     let helper_dir = helper_bin.parent().unwrap().to_path_buf();
     let path_env = match std::env::var_os("PATH") {
