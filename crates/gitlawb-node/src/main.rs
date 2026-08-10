@@ -74,6 +74,13 @@ async fn main() -> Result<()> {
     // bootstrap peers. Operators can opt out via GITLAWB_BOOTSTRAP_DISABLE_SEEDS.
     bootstrap::merge_seeds(&mut config);
 
+    // Fail fast on config combinations that are individually in-range but jointly
+    // unsafe — notably a DB pool too small for the concurrent-write cap, which
+    // would let a push burst starve every other DB path (#174 F1).
+    config
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid configuration: {e}"))?;
+
     if !config.public_read {
         warn!(
             "GITLAWB_PUBLIC_READ=false is reserved; per-repository private-read enforcement is not wired in alpha"
@@ -378,7 +385,81 @@ async fn main() -> Result<()> {
         sync_trigger_rate_limiter,
         peer_write_rate_limiter,
         shutdown_tx: shutdown_tx.clone(),
+        git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_git_ops)),
+        git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_git_pushes,
+        )),
+        // Anon receive-pack advertisements get their OWN pool, same size as the
+        // write pool but disjoint, so filling it (which takes many source IPs, each
+        // capped by git_push_advert_per_caller) never occupies a permit the
+        // authenticated POST needs (#174).
+        git_push_advert_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_git_pushes,
+        )),
+        // Bounds concurrent detached post-push encryption walks, sized from the push
+        // pool (no separate knob — Q1): completed pushes cannot outnumber active
+        // encryption walks past this (#174 P1-e).
+        git_encrypt_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_git_pushes,
+        )),
+        // Bounds how many post-push pin loops run concurrently across all repos (#174 F6),
+        // independent of the per-repo encrypt-task coalescing below. Not a bound on the
+        // MB-scale object-id lists themselves: parked tasks still hold theirs (see the
+        // field doc on AppState::pin_semaphore).
+        pin_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_pin_tasks)),
+        // Coalesces the DETACHED post-push encryption tasks per repo so a rapid pusher
+        // cannot grow the outstanding parked-waiter set past one task per repo (#174
+        // P2-2). No knob: it is a natural cap (one entry per distinct repo), not a
+        // sized pool.
+        encrypt_inflight: crate::state::EncryptInflight::new(),
+        // Per-repo in-process write-lease serializer (#174 U2/F3): supplements the pg
+        // advisory lock so a disconnected push's still-reaping git group can't be raced
+        // by a second same-node push. The map is naturally capped (one entry per contended
+        // repo, freed when unreferenced); the sized knob is how many pushes may PARK on
+        // one repo, since each parked push holds a fully buffered pack.
+        repo_write_leases: crate::state::RepoWriteLeases::new(config.repo_lease_max_waiters),
+        git_read_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            config.max_concurrent_reads_per_caller,
+        ),
+        // Per-source cap on the receive-pack advertisement, sized to an eighth of the
+        // write pool (min 1): one resolved client key (rate_limit::client_key) can hold
+        // at most this many slots in the DEDICATED advert pool (git_push_advert_semaphore,
+        // disjoint from the write pool), so saturating that pool takes ~8 distinct keys
+        // (#174). That bounds an IPv4 or single-address caller; a caller controlling many
+        // addresses (an IPv6 /64 is 2^64 keys) still gets one cap per address, since
+        // client_key uses the full IP with no prefix folding. Narrowing the keying is a
+        // deferred design call, not something these caps claim to solve. Sized off the
+        // write pool only because the advert pool is created at the same size; an advert
+        // flood cannot touch a write permit.
+        git_push_advert_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            rate_limit::per_source_push_cap(config.max_concurrent_git_pushes),
+        ),
+        // Per-source cap on the authenticated receive-pack POST, sized like the advert
+        // cap: one resolved client key can hold at most this many write-pool slots, so
+        // monopolizing the pool takes ~8 distinct keys (#174 P1-d). Same residual as
+        // above: keys are full IPs, so a caller with many addresses has many caps.
+        git_write_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            rate_limit::per_source_push_cap(config.max_concurrent_git_pushes),
+        ),
+        // Bounds concurrent /ipfs visibility walks — a distinct public cost center, so
+        // its own pool + per-source sub-cap + per-IP rate limiter, never a git pool
+        // (#174 P1-3). The per-source map is bounded (reject-before-insert, INV-15).
+        git_ipfs_walk_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_ipfs_walks,
+        )),
+        git_ipfs_walk_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            config.ipfs_walk_per_source,
+        ),
+        ipfs_rate_limiter: rate_limit::RateLimiter::new_bounded(
+            config.ipfs_rate_limit,
+            std::time::Duration::from_secs(3600),
+            200_000,
+        ),
+        git_bin: "git".to_string(),
     };
+    if config.ipfs_rate_limit == 0 {
+        tracing::warn!("GITLAWB_IPFS_RATE_LIMIT=0 — per-IP /ipfs rate limiting disabled");
+    }
 
     // Periodic peer-count poll for the metrics gauge. If p2p is disabled
     // we still set the gauge to 0 so dashboards don't show "no data".
@@ -408,22 +489,14 @@ async fn main() -> Result<()> {
 
     // Periodic cleanup of expired rate limit entries + consumed-proof ledger
     {
-        let rl = state.rate_limiter.clone();
-        let create_ip_rl = state.create_ip_rate_limiter.clone();
-        let push_rl = state.push_rate_limiter.clone();
-        let sync_trigger_rl = state.sync_trigger_rate_limiter.clone();
-        let peer_write_rl = state.peer_write_rate_limiter.clone();
+        let sweep_state = state.clone();
         let db = state.db.clone();
         let mut shutdown_rx = state.subscribe_shutdown();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                        rl.cleanup().await;
-                        create_ip_rl.cleanup().await;
-                        push_rl.cleanup().await;
-                        sync_trigger_rl.cleanup().await;
-                        peer_write_rl.cleanup().await;
+                        sweep_rate_limiters(&sweep_state).await;
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs() as i64)
@@ -957,6 +1030,65 @@ async fn gossip_task(
             }
         }
     }
+}
+
+#[cfg(test)]
+mod rate_limiter_sweep_tests {
+    use crate::rate_limit::RateLimiter;
+    use std::time::Duration;
+
+    // Every per-key limiter the router mounts must be swept by the periodic
+    // task, the `/ipfs` one included: a limiter left out keeps expired keys
+    // until its map fills and the inline capacity sweep fires. Fails on the
+    // pre-fix sweeper, which skipped `ipfs_rate_limiter`.
+    #[tokio::test]
+    async fn sweep_evicts_expired_keys_from_every_limiter() {
+        let window = Duration::from_millis(30);
+        let mut state = crate::test_support::test_state_lazy();
+        state.rate_limiter = RateLimiter::new(10, window);
+        state.create_ip_rate_limiter = RateLimiter::new(10, window);
+        state.push_rate_limiter = RateLimiter::new(10, window);
+        state.sync_trigger_rate_limiter = RateLimiter::new(10, window);
+        state.peer_write_rate_limiter = RateLimiter::new(10, window);
+        state.ipfs_rate_limiter = RateLimiter::new(10, window);
+
+        let limiters = |s: &crate::state::AppState| {
+            [
+                s.rate_limiter.clone(),
+                s.create_ip_rate_limiter.clone(),
+                s.push_rate_limiter.clone(),
+                s.sync_trigger_rate_limiter.clone(),
+                s.peer_write_rate_limiter.clone(),
+                s.ipfs_rate_limiter.clone(),
+            ]
+        };
+        for l in limiters(&state) {
+            assert!(l.check("1.2.3.4").await);
+            assert_eq!(l.tracked_keys().await, 1);
+        }
+
+        tokio::time::sleep(window * 3).await;
+        super::sweep_rate_limiters(&state).await;
+
+        for (i, l) in limiters(&state).into_iter().enumerate() {
+            assert_eq!(l.tracked_keys().await, 0, "limiter {i} was not swept");
+        }
+    }
+}
+
+/// Evict expired entries from every per-key rate limiter on the state.
+///
+/// Named and driven off `AppState` so the periodic sweeper stays in step with
+/// the limiters the router actually mounts: adding a limiter field and
+/// forgetting it here leaves its keys pinned until the map hits `max_keys` and
+/// the inline capacity sweep runs (the `/ipfs` limiter was missed this way).
+async fn sweep_rate_limiters(state: &AppState) {
+    state.rate_limiter.cleanup().await;
+    state.create_ip_rate_limiter.cleanup().await;
+    state.push_rate_limiter.cleanup().await;
+    state.sync_trigger_rate_limiter.cleanup().await;
+    state.peer_write_rate_limiter.cleanup().await;
+    state.ipfs_rate_limiter.cleanup().await;
 }
 
 /// Build the shared node HTTP client used for every outbound fan-out (sync
