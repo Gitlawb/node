@@ -902,16 +902,17 @@ async fn gate_and_serve(
         // (#173 round-10, KTD2). No outer timeout, mirroring the bounded walk below. The
         // child's own deadline is the lesser of `git_service_timeout_secs` and the
         // remaining request budget (#174 F3), so a started probe cannot finish past it.
-        let probe_timeout = std::cmp::min(
-            std::time::Duration::from_secs(state.config.git_service_timeout_secs),
-            probe_budget,
-        );
+        let probe_deadline = std::time::Instant::now()
+            + std::cmp::min(
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                probe_budget,
+            );
         let probe_admission = std::sync::Arc::clone(ctx.admission);
         match tokio::task::spawn_blocking(move || {
             // Admission clone (#174 U1): the slot stays taken until this blocking work
             // returns, even if the handler future was dropped or this closure panics.
             let _admission = probe_admission;
-            store::object_type_bounded(&git_bin, &rp, &sha, probe_timeout)
+            store::object_type_bounded(&git_bin, &rp, &sha, probe_deadline)
         })
         .await
         {
@@ -1157,8 +1158,7 @@ async fn gate_and_serve(
         // Admission clone (#174 U1): the slot stays taken until this blocking work
         // returns, even if the handler future was dropped or this closure panics.
         let _admission = read_admission;
-        let size_budget = read_deadline.saturating_duration_since(std::time::Instant::now());
-        match store::object_size_bounded(&git_bin, &read_repo, &read_sha, size_budget) {
+        match store::object_size_bounded(&git_bin, &read_repo, &read_sha, read_deadline) {
             Ok(Some(size)) if size > max_bytes => return ServedRead::TooLarge(size),
             Ok(Some(_)) => {}
             // git ran and reported no such object (or an unparseable size): genuine
@@ -1168,13 +1168,12 @@ async fn gate_and_serve(
             // infra/timeout failure, not a not-found.
             Err(e) => return ServedRead::ReadErr(e.to_string()),
         }
-        let content_budget = read_deadline.saturating_duration_since(std::time::Instant::now());
         let content = match store::read_object_content_bounded(
             &git_bin,
             &read_repo,
             &read_sha,
             &read_type,
-            content_budget,
+            read_deadline,
         ) {
             Ok(c) => c,
             Err(e) => return ServedRead::ReadErr(e.to_string()),

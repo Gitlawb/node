@@ -90,8 +90,12 @@ async fn repair_legacy_provider_cid(
         let repo_path = repo_path.to_path_buf();
         let git_bin = git_bin.to_string();
         let sha = sha.to_string();
+        // The shared-deadline form: `read_object_bounded` composes its type probe and
+        // content read under ONE `git_timeout`, rather than granting each stage a full
+        // one, so a legacy row's repair read is bounded by the configured budget total.
+        let deadline = std::time::Instant::now() + git_timeout;
         tokio::task::spawn_blocking(move || {
-            crate::git::store::read_object_bounded(&git_bin, &repo_path, &sha, git_timeout)
+            crate::git::store::read_object_bounded(&git_bin, &repo_path, &sha, deadline)
         })
         .await
     };
@@ -391,6 +395,19 @@ fn note_legacy_repair_read() {
 /// have to be documented, validated, and kept meaningful.
 pub const PIN_BATCH_BUDGET: Duration = Duration::from_secs(120);
 
+/// The smallest remainder worth starting a bounded git read (or an add) with.
+///
+/// A 1ms remainder otherwise buys a child spawned already past its deadline, which
+/// can only be reaped: the watchdog's SIGTERM grace plus its post-SIGKILL settle are
+/// paid in full for work that produces nothing, once per remaining object. Breaking
+/// the batch instead is the same spawn-to-reap amplification the bounded type probe
+/// already refuses when it declines a confirming re-probe it cannot afford.
+///
+/// ~1100ms tracks `visibility_pack`'s 1s SIGTERM grace plus its 20ms settle plus
+/// margin. Both of those are private to that module, so the value is named once here
+/// and documented rather than guessed separately in each loop.
+pub(crate) const PIN_READ_FLOOR: Duration = Duration::from_millis(1100);
+
 /// The shared outbound client for both IPFS sinks.
 ///
 /// `pin_new_objects` runs while holding a `pin_semaphore` permit and that pool
@@ -505,20 +522,35 @@ pub async fn cat(ipfs_api: &str, cid: &str) -> Result<Vec<u8>> {
     Ok(resp.bytes().await?.to_vec())
 }
 
-/// The batch's remaining wall-clock, or `None` once it is spent, after logging
-/// the truncation exactly once.
+/// The batch's remaining wall-clock, or `None` once too little is left to be worth
+/// starting an object's work with, after logging the truncation exactly once.
+///
+/// "Too little" is [`PIN_READ_FLOOR`], not zero: a remainder that cannot cover a
+/// bounded git read's teardown buys a child spawned already past its deadline, and a
+/// sub-millisecond per-request timeout buys a doomed add whose failure reads as an
+/// endpoint fault rather than as budget truncation.
 ///
 /// Shaped like `api::ipfs`'s `budget_gate` on purpose: the nonzero-ness rides in
 /// the returned value, so every call site must consume it as
 /// `let Some(x) = ... else { break }` and a zero `Duration` can never reach a
 /// request as its timeout.
-fn batch_budget_gate(deadline: Instant, pinned: usize, unattempted: usize) -> Option<Duration> {
+///
+/// `sink` labels the backend in the truncation warn ("IPFS" or "Pinata"). The gate
+/// is shared by both pin loops rather than copied per loop, so the two cannot drift
+/// apart in how they report a truncated batch.
+pub(crate) fn batch_budget_gate(
+    sink: &str,
+    deadline: Instant,
+    pinned: usize,
+    unattempted: usize,
+) -> Option<Duration> {
     let left = deadline.saturating_duration_since(Instant::now());
-    if left.is_zero() {
+    if left < PIN_READ_FLOOR {
         tracing::warn!(
+            sink,
             pinned,
             unattempted,
-            "IPFS pin batch deadline reached; the remaining objects are left unpinned"
+            "pin batch deadline reached; the remaining objects are left unpinned"
         );
         return None;
     }
@@ -532,38 +564,44 @@ fn batch_budget_gate(deadline: Instant, pinned: usize, unattempted: usize) -> Op
 /// applies `visibility_pack::replicable_objects` on the delta path or the
 /// `..._fail_closed` filter on the full-scan path before calling, so this
 /// function never sees a withheld blob. `repo_path` is still needed to read each
-/// object's bytes. `repo_id` records the pin's provenance so `GET /ipfs/{cid}`
-/// resolves straight to this repo instead of scanning every repo (#173).
+/// object's bytes, and `git_bin` names the binary those reads run: the production
+/// callers pass the literal `"git"`, and a test passes a fake so the loop's own bound
+/// can be driven with a git that never answers. `repo_id` records the pin's provenance
+/// so `GET /ipfs/{cid}` resolves straight to this repo instead of scanning every repo
+/// (#173).
 ///
 /// # What `batch_budget` does and does not bound
 ///
 /// The loop holds a `pin_semaphore` permit and that pool defers rather than
 /// sheds, so the hold has to be bounded by something other than the pusher's
-/// object count. Two things here are:
+/// object count. Three things here are:
 ///
 /// - this loop's own wall-clock: the deadline is taken once at loop start and
-///   checked at the top of every iteration, so no object's work begins with zero
-///   budget left. It is a gate, not a hard ceiling, since a started iteration
-///   still runs to completion;
-/// - each HTTP add: `pin_git_object` is handed the remainder measured at the top
-///   of the iteration as its per-request timeout, which is what lets one large
-///   healthy upload run past the shared client's 10s default without letting the
-///   batch run forever. The DB check and the git read spend a little of that
-///   remainder before the request starts, so the add can finish marginally after
-///   the deadline.
+///   checked at the top of every iteration, so no object's work begins with less
+///   than [`PIN_READ_FLOOR`] left. It is a gate, not a hard ceiling, since a started
+///   iteration still runs to completion;
+/// - the git read: `store::read_object_bounded` runs under `spawn_blocking` against the
+///   ABSOLUTE batch deadline (not the loop-top remainder, which the `is_pinned` round-trip
+///   sitting between the two would push past it), with SIGTERM-then-SIGKILL
+///   process-group teardown, so a hung `git cat-file` costs this batch its remaining
+///   budget plus one watchdog teardown instead of holding the permit for the child's
+///   whole lifetime and blocking a runtime worker while it does;
+/// - each HTTP add: `pin_git_object` is handed the remainder measured AFTER the read
+///   as its per-request timeout, which is what lets one large healthy upload run past
+///   the shared client's 10s default without letting the batch run forever. Measuring
+///   it after the read is what keeps the read-plus-add pair inside one budget rather
+///   than up to two of them.
 ///
-/// Three things are NOT bounded, and the gate cannot fix any of them:
+/// So the LOOP's hold is bounded by roughly `batch_budget` plus one teardown. Two
+/// things inside that region still are not, and the gate cannot fix either:
 ///
-/// - the git read. `store::read_object` composes two bare
-///   `std::process::Command::output()` calls with no timeout and no
-///   process-group reaping, and this loop does not run it under
-///   `spawn_blocking`, so one hung `git cat-file` overruns the deadline and
-///   blocks a runtime worker thread while it does.
 /// - the DB round-trips (`is_pinned`, `record_pinned_cid`).
 /// - the pool. `api::repos` acquires the same `pin_semaphore` for the Pinata
-///   replication task and holds it across a full git re-derivation plus
-///   `pinata::pin_new_objects`, neither of which has a deadline. This change
-///   bounds this loop's hold, not the semaphore's worst-case queue.
+///   replication task and holds it across `pinata_object_list_for_refs`, a full git
+///   re-derivation that runs BEFORE `pinata::pin_new_objects` is entered and whose
+///   per-child timeouts carry no aggregate deadline. What is bounded is each pin
+///   loop's own hold, not the permit's total hold and not the semaphore's worst-case
+///   queue.
 ///
 /// # Truncation semantics
 ///
@@ -573,11 +611,13 @@ fn batch_budget_gate(deadline: Instant, pinned: usize, unattempted: usize) -> Op
 /// on the repo takes the full-scan fallback (`push_delta::list_all_objects`) and
 /// re-derives the whole object set, which then re-offers the skipped OIDs.
 ///
-/// The twin in `pinata.rs` mirrors this loop's shape but NOT its bound: it has
-/// no batch deadline and no per-request override, so the two are no longer at
-/// parity here. Everything else about the shape (the skip-if-pinned check, the
-/// provenance recording, the warn-and-continue arm, the returned pairs) still
-/// changes in lockstep.
+/// The twin in `pinata.rs` is back at parity on the two things that bound a
+/// batch: it runs the same shared budget gate at the top of every iteration and
+/// the same bounded, reaped git read. It still has no per-request override, since
+/// `pinata::pin_object` takes no timeout argument and its uploads are bounded by
+/// the shared client's own ceiling. Everything else about the shape (the
+/// skip-if-pinned check, the provenance recording, the fault arms, the returned
+/// pairs) changes in lockstep.
 ///
 /// Returns a list of `(sha256_hex, cid)` pairs for objects pinned this call.
 // Eight because #173's git seam (`git_bin`, `git_timeout`) and pin provenance
@@ -605,11 +645,13 @@ pub async fn pin_new_objects(
 
     for (attempted, sha) in object_list.into_iter().enumerate() {
         // Top of the iteration, before any of this object's work: an object is
-        // never started with zero budget left. The remainder becomes this add's
-        // request timeout below.
-        let Some(budget_left) = batch_budget_gate(deadline, pinned.len(), total - attempted) else {
+        // never started with a remainder too small to cover a bounded read's
+        // teardown. Consumed as a guard only: the read below runs against the
+        // absolute batch deadline, and the add's timeout is measured again after
+        // the read, so this remainder has no other consumer here.
+        if batch_budget_gate("IPFS", deadline, pinned.len(), total - attempted).is_none() {
             break;
-        };
+        }
         // Skip if already pinned, but first backfill provenance if the existing
         // pin has none. A legacy pin (recorded before repo_id existed, #173, jatmn)
         // is skipped here before record_pinned_cid ever runs, so its NULL provenance
@@ -665,23 +707,97 @@ pub async fn pin_new_objects(
             }
         }
 
-        // Read raw object content under a bounded read so a wedged/D-state `git
-        // cat-file` (stuck NFS/Tigris backend) is reaped at `git_timeout` instead of
-        // hanging pin_new_objects forever — which would pin the post-push coalescing
-        // key until process death (grok F2, #173). On Err the object is simply not
-        // pinned this pass; a later pass/push retries.
-        let data =
-            match crate::git::store::read_object_bounded(git_bin, repo_path, &sha, git_timeout) {
-                Ok(Some((_obj_type, bytes))) => bytes,
-                Ok(None) => continue,
-                Err(e) => {
-                    tracing::warn!(sha = %sha, err = %e, "failed to read git object for pinning");
-                    continue;
+        // Read raw object content, bounded and reaped, under `spawn_blocking`: this is
+        // synchronous blocking work (child spawn, pipe drain, watchdog join), so
+        // calling it from the runtime task would block a worker thread for its whole
+        // duration. Placement mirrors the `/ipfs` serve path; the admission guard is
+        // deliberately NOT moved into the closure there, since the pin permit is not
+        // held by a future a client disconnect can drop and the child is reaped on its
+        // own deadline regardless.
+        //
+        // The read runs against the ABSOLUTE batch deadline, not against the remainder
+        // measured at the top of the iteration: the `is_pinned` round-trip above sits
+        // between the two, so `Instant::now() + budget_left` would land past `deadline`
+        // by however long the DB took, and under a saturated pool that is the dominant
+        // term. A slow DB check must not push the read's own bound out.
+        //
+        // Bounded by the EARLIER of the batch deadline (#174) and this object's own
+        // `git_timeout` (#173). Both bounds are load-bearing and neither implies the
+        // other: the batch deadline alone would let ONE wedged `cat-file` hold the pin
+        // permit for the whole 120s budget (the failure #173's reaper test drives), while
+        // `git_timeout` alone would let a batch of merely-slow reads run past the budget.
+        let read_deadline = std::cmp::min(deadline, std::time::Instant::now() + git_timeout);
+        let read_path = repo_path.to_path_buf();
+        let read_sha = sha.clone();
+        let read_git = git_bin.to_string();
+        let read = tokio::task::spawn_blocking(move || {
+            crate::git::store::read_object_bounded(&read_git, &read_path, &read_sha, read_deadline)
+        })
+        .await;
+        let data = match read {
+            Ok(Ok(Some((_obj_type, bytes)))) => bytes,
+            // A verified absence, and the only outcome that is not a fault.
+            Ok(Ok(None)) => continue,
+            // A Transient fault does NOT by itself mean the store is gone. It also
+            // covers a spawn or watchdog-timeout failure of the reaped child, an
+            // unaffordable confirming re-probe, and, because readability is judged FOR
+            // one oid, a single unreadable `objects/<xx>` fan-out, which is 1/256 of the
+            // store. So re-check store-wide before deciding what the fault costs.
+            Ok(Err(e @ crate::git::store::ProbeError::Transient(_))) => {
+                if !crate::git::store::object_store_readable_store_wide(repo_path) {
+                    // Genuinely store-wide: every remaining object fails identically, and
+                    // continuing would spawn one doomed bounded child per object and spend
+                    // the batch budget reaping them.
+                    tracing::warn!(
+                        sha = %sha,
+                        err = %e,
+                        unattempted = total - attempted,
+                        "object store unreadable while pinning; stopping the batch"
+                    );
+                    break;
                 }
-            };
+                // The store still reads store-wide, so the fault is object-scoped or
+                // transient to this read. Breaking would forfeit a healthy store's
+                // remaining objects permanently: the documented recovery re-derives the
+                // same list and breaks at the same index.
+                tracing::warn!(
+                    sha = %sha,
+                    err = %e,
+                    "transient fault reading git object for pinning; the object store is \
+                     still readable store-wide, so this costs only this object"
+                );
+                continue;
+            }
+            // The store is readable and git still failed: a corrupt object, or a
+            // repo-wide fault git reports immediately. Either way it is per-object
+            // work that stays inside the budget, and breaking would forfeit a healthy
+            // store's remaining objects over one bad one, permanently (a later
+            // full-scan push re-offers the same object and breaks in the same place).
+            Ok(Err(e)) => {
+                tracing::warn!(sha = %sha, err = %e, "failed to read git object for pinning");
+                continue;
+            }
+            // A panic in the read closure leaves no evidence that the failure is
+            // object-scoped, so fail toward the conservative arm.
+            Err(e) => {
+                tracing::warn!(sha = %sha, err = %e, "bounded git read task failed; stopping the batch");
+                break;
+            }
+        };
+
+        // Recompute the remainder AFTER the read rather than reusing `budget_left`:
+        // the read is now allowed to spend the whole remainder, so handing the add the
+        // loop-top value would make the pair a hold of up to 2x the batch budget. The
+        // same gate, so a remainder too small to be worth a request truncates the batch
+        // with one warn instead of shedding a doomed add that logs as an endpoint fault.
+        let Some(add_timeout) =
+            batch_budget_gate("IPFS", deadline, pinned.len(), total - attempted)
+        else {
+            break;
+        };
 
         // Pin to IPFS
-        match pin_git_object(ipfs_api, &sha, &data, Some(budget_left)).await {
+        match pin_git_object(ipfs_api, &sha, &data, Some(add_timeout)).await {
             Ok(cid) if !cid.is_empty() => {
                 // The resolver key (`pinned_cids.cid`) must be the locally-computed
                 // raw-content CID, never the provider Hash: Kubo returns a dag-pb/UnixFS
@@ -1192,6 +1308,410 @@ mod tests {
             requests.load(std::sync::atomic::Ordering::SeqCst),
             4,
             "a non-2xx rejection is per-object: all four objects must still be attempted"
+        );
+    }
+
+    /// Write an executable `/bin/sh` script. Copied per module rather than shared:
+    /// `store.rs` and `visibility_pack.rs` each keep their own, since their test mods
+    /// are private and not reachable from here.
+    #[cfg(unix)]
+    fn write_script(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).expect("write fake git");
+        let mut perm = std::fs::metadata(path).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(path, perm).unwrap();
+    }
+
+    /// A `git_bin` wrapper that records every invocation's arguments and then execs
+    /// the real git, so a test can tell which objects the loop actually attempted.
+    /// The returned pin list cannot: it is empty both when the loop broke after one
+    /// object and when it continued past all of them.
+    #[cfg(unix)]
+    fn counting_git(dir: &std::path::Path, log: &std::path::Path) -> String {
+        let fake = dir.join("counting-git");
+        write_script(
+            &fake,
+            &format!(
+                "#!/bin/sh\necho \"$*\" >> {}\nexec git \"$@\"\n",
+                log.display()
+            ),
+        );
+        fake.to_str().unwrap().to_string()
+    }
+
+    /// How many objects the loop actually attempted, read off the invocation log.
+    ///
+    /// Counts `--batch-check` invocations, not log lines and not oid occurrences: the
+    /// type probe carries its oid on stdin rather than in argv, so an oid appears in
+    /// the log only once an object has already got past its probe, and a healthy
+    /// object costs two invocations to a faulting one's one.
+    fn objects_attempted(log: &std::path::Path) -> usize {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("--batch-check"))
+            .count()
+    }
+
+    /// #174 F3, the finding itself: the git read runs while the `pin_semaphore`
+    /// permit is held, so a wedged `git cat-file` used to hold that permit for as
+    /// long as the child lived, with no deadline and no reaping, on a path a pusher
+    /// drives. With the read bounded, a git that never answers costs the batch its
+    /// budget plus one watchdog teardown and no more.
+    ///
+    /// The fake traps SIGTERM and sleeps a BOUNDED 30s, following the fixture in
+    /// `visibility_pack.rs`: with the deadline neutralized the read would otherwise
+    /// leave the blocking closure and its child alive long after the test-level
+    /// timeout fires, wedging the run instead of reporting a failure. The endpoint is
+    /// never reached, since no object's bytes are ever produced.
+    ///
+    /// The batch ends on the BUDGET, not on the fault arm: the repo is a healthy bare
+    /// store, so the timeout's `Transient` verdict is object-scoped and the loop moves on,
+    /// only to find the budget spent. Capturing that warn is not decoration. `tracing`
+    /// caches a callsite's interest globally the first time it is hit, and a hit from a
+    /// thread with no subscriber caches it as never-interested for the whole binary, which
+    /// silently blinds the deadline tests running beside this one.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn pin_new_objects_returns_by_budget_with_a_hung_git(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("wedged.git");
+        let oids = seed_loose_blobs(&repo_path, 3);
+        let fake = tmp.path().join("hanging-git");
+        write_script(&fake, "#!/bin/sh\ntrap '' TERM\necho $$ > pid\nsleep 30\n");
+
+        let (logs, _guard) = capture_logs();
+        let started = std::time::Instant::now();
+        let pinned = tokio::time::timeout(
+            Duration::from_secs(25),
+            pin_new_objects(
+                "http://127.0.0.1:9",
+                &repo_path,
+                fake.to_str().unwrap(),
+                Duration::from_secs(30),
+                oids,
+                &db,
+                "repo-merge-test",
+                Duration::from_secs(2),
+            ),
+        )
+        .await
+        .expect(
+            "a wedged git must not hold the pin permit past the batch budget: the read is \
+             bounded and reaped, so this cannot reach the outer timeout",
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            pinned.is_empty(),
+            "a git that never answers cannot produce a pinned object: {pinned:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "elapsed {elapsed:?} must stay inside the budget plus one watchdog teardown"
+        );
+        let text = logs.text();
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.contains("pin batch deadline reached"))
+                .count(),
+            1,
+            "one wedged read must spend the whole budget and stop the batch there, exactly \
+             once: {text}"
+        );
+
+        // The child's process group must be gone once the call returns; a bounded read
+        // that leaves the child running has only moved the hold somewhere else.
+        let pid: i32 = std::fs::read_to_string(repo_path.join("pid"))
+            .expect("the fake git must have recorded its pid, or it was never on the read path")
+            .trim()
+            .parse()
+            .unwrap();
+        let mut gone = false;
+        for _ in 0..200 {
+            // SAFETY: kill(2) with signal 0 only probes existence; ESRCH means gone.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            gone,
+            "the reaped fake git ({pid}) must not outlive the call"
+        );
+    }
+
+    /// [`PIN_READ_FLOOR`] itself, which nothing else in the suite makes load-bearing: with
+    /// the floor at zero every test here still passes, because they all either finish
+    /// inside their budget or run it down to nothing. The dead zone is the interesting
+    /// region, a remainder that is nonzero but too small to cover a bounded read's
+    /// teardown, and it takes a fixture built to land in it.
+    ///
+    /// The arithmetic, with `r` the time one healthy read costs: a 1500ms budget and a
+    /// 700ms upload leave `800 - r` at the top of the second iteration, which is below the
+    /// 1100ms floor for every `r`, while the first iteration's post-read gate needs only
+    /// `r <= 400ms`. So the batch must stop after exactly one object, and it stops on the
+    /// FLOOR rather than on exhaustion: 800ms is still a perfectly nonzero remainder, and a
+    /// zero-floor gate would happily spend it spawning a child it cannot afford to reap.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn pin_new_objects_stops_when_the_remainder_falls_below_the_read_floor(
+        pool: sqlx::PgPool,
+    ) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("floor.git");
+        let oids = seed_loose_blobs(&repo_path, 3);
+        let log = tmp.path().join("calls.log");
+        let git_bin = counting_git(tmp.path(), &log);
+        let endpoint = delaying_endpoint(vec![Duration::from_millis(700)]).await;
+
+        let (logs, _guard) = capture_logs();
+        let pinned = tokio::time::timeout(
+            Duration::from_secs(30),
+            pin_new_objects(
+                &endpoint,
+                &repo_path,
+                &git_bin,
+                Duration::from_secs(30),
+                oids,
+                &db,
+                "repo-merge-test",
+                Duration::from_millis(1500),
+            ),
+        )
+        .await
+        .expect("wedge guard: a 1.5s budget cannot take 30s");
+
+        // The named property first, so a regression reddens on it rather than on a
+        // downstream count that a zero floor also happens to change.
+        assert_eq!(
+            objects_attempted(&log),
+            1,
+            "a remainder below the read floor must stop the batch, not buy a bounded child \
+             that can only be spawned and reaped"
+        );
+        assert_eq!(
+            pinned.len(),
+            1,
+            "the first object is inside the budget and must pin: {pinned:?}"
+        );
+        let text = logs.text();
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.contains("pin batch deadline reached"))
+                .count(),
+            1,
+            "the truncation must be reported exactly once: {text}"
+        );
+    }
+
+    /// A store-wide fault breaks the batch instead of amplifying it. When the object
+    /// store itself cannot be read every remaining object fails identically, so
+    /// continuing would spawn one doomed bounded child per object and burn the budget
+    /// on reaping them.
+    ///
+    /// The fixture looks wrong and is not: with the objects LOOSE and only
+    /// `objects/pack` unreadable, git still resolves each object, but it prints an
+    /// `error:` diagnostic that the probe routes to a fault before the present/missing
+    /// parse, so the read reaches `classify_store_fault` and (the store being
+    /// unreadable) returns `Transient`.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn pin_new_objects_breaks_the_batch_on_an_unreadable_store(pool: sqlx::PgPool) {
+        use std::os::unix::fs::PermissionsExt;
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("unreadable.git");
+        let oids = seed_loose_blobs(&repo_path, 5);
+        let log = tmp.path().join("calls.log");
+        let git_bin = counting_git(tmp.path(), &log);
+        let endpoint = delaying_endpoint(vec![Duration::ZERO]).await;
+
+        let pack_dir = repo_path.join("objects").join("pack");
+        let chmod = |mode: u32| {
+            let mut perms = std::fs::metadata(&pack_dir).unwrap().permissions();
+            perms.set_mode(mode);
+            std::fs::set_permissions(&pack_dir, perms).unwrap();
+        };
+        chmod(0o000);
+        // Root bypasses permission bits, so witness the exact operation the probe
+        // performs and skip rather than falsely fail.
+        let genuinely_unreadable = std::fs::read_dir(&pack_dir).is_err();
+
+        let pinned = tokio::time::timeout(
+            Duration::from_secs(30),
+            pin_new_objects(
+                &endpoint,
+                &repo_path,
+                &git_bin,
+                Duration::from_secs(30),
+                oids.clone(),
+                &db,
+                "repo-merge-test",
+                Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("an immediately-faulting store cannot take 30s");
+        let attempted = objects_attempted(&log);
+        chmod(0o755); // restore BEFORE any assertion that can panic, so TempDir cleans up
+
+        if genuinely_unreadable {
+            assert!(
+                pinned.is_empty(),
+                "nothing can be pinned through a store that cannot be read: {pinned:?}"
+            );
+            assert_eq!(
+                attempted, 1,
+                "a store-wide fault must break the batch after the first object, not spawn \
+                 one doomed bounded child per object: {attempted} of 5 objects were read"
+            );
+        }
+    }
+
+    /// The failure mode the store-wide re-check exists for. A `Transient` fault does not
+    /// prove the store is gone: the readability verdict is judged FOR one oid, so a single
+    /// unreadable `objects/<xx>` fan-out (1/256 of the store) taints only the objects that
+    /// live in it. Breaking there forfeits every remaining object over a fault that costs
+    /// at most a few of them, and permanently: the documented recovery re-derives the same
+    /// list and breaks at the same index.
+    ///
+    /// Exactly ONE fan-out dir is chmod'd, and the expected pin count is derived from the
+    /// oids that actually land in it rather than assumed to be one: two seeded blobs can
+    /// share a fan-out prefix, and hardcoding "four must pin" would make this test flap on
+    /// a collision instead of reporting it.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn pin_new_objects_continues_past_one_unreadable_fanout_dir(pool: sqlx::PgPool) {
+        use std::os::unix::fs::PermissionsExt;
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("one_bad_fanout.git");
+        let oids = seed_loose_blobs(&repo_path, 5);
+        let log = tmp.path().join("calls.log");
+        let git_bin = counting_git(tmp.path(), &log);
+        let endpoint = delaying_endpoint(vec![Duration::ZERO]).await;
+
+        let prefix = oids[0][0..2].to_string();
+        let tainted: Vec<String> = oids.iter().filter(|o| o[0..2] == prefix).cloned().collect();
+        assert!(
+            tainted.len() < oids.len(),
+            "the fixture must leave healthy objects outside the tainted fan-out, or this \
+             test cannot tell an object-scoped fault from a store-wide one"
+        );
+
+        let fanout = repo_path.join("objects").join(&prefix);
+        let chmod = |mode: u32| {
+            let mut perms = std::fs::metadata(&fanout).unwrap().permissions();
+            perms.set_mode(mode);
+            std::fs::set_permissions(&fanout, perms).unwrap();
+        };
+        chmod(0o000);
+        // Root bypasses permission bits, so witness the exact operation the probe performs
+        // (an open of this oid's loose path) and skip rather than falsely fail.
+        let genuinely_unreadable = std::fs::File::open(fanout.join(&oids[0][2..])).is_err();
+
+        let pinned = tokio::time::timeout(
+            Duration::from_secs(30),
+            pin_new_objects(
+                &endpoint,
+                &repo_path,
+                &git_bin,
+                Duration::from_secs(30),
+                oids.clone(),
+                &db,
+                "repo-merge-test",
+                Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("an immediate endpoint and four healthy objects cannot take 30s");
+        let attempted = objects_attempted(&log);
+        chmod(0o755); // restore BEFORE any assertion that can panic, so TempDir cleans up
+
+        if genuinely_unreadable {
+            assert_eq!(
+                attempted,
+                oids.len(),
+                "one unreadable fan-out is 1/256 of the store, not the store: every object \
+                 must still be attempted, got {attempted} of {}",
+                oids.len()
+            );
+            let pinned_shas: Vec<&String> = pinned.iter().map(|(sha, _)| sha).collect();
+            let expected: Vec<&String> = oids.iter().filter(|o| !tainted.contains(o)).collect();
+            assert_eq!(
+                pinned_shas, expected,
+                "every object outside the tainted fan-out must pin, and only those"
+            );
+        }
+    }
+
+    /// The must-not direction of the arm above: an object-scoped fault must NOT break
+    /// the batch. One corrupt loose object among healthy ones is a `Deterministic`
+    /// fault (the store is readable, git still fails), and the documented recovery path
+    /// cannot repair it: a later full-scan push re-offers the same object and would
+    /// break at the same place, so breaking here stops the repo pinning permanently.
+    ///
+    /// Deliberately not the bad-config corruption, which is repo-wide: all five objects
+    /// would fault and the test would pin the store-wide case rather than the
+    /// object-scoped one this arm rests on.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn pin_new_objects_continues_past_a_deterministic_fault(pool: sqlx::PgPool) {
+        use std::os::unix::fs::PermissionsExt;
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("corrupt.git");
+        let oids = seed_loose_blobs(&repo_path, 5);
+        let log = tmp.path().join("calls.log");
+        let git_bin = counting_git(tmp.path(), &log);
+        let endpoint = delaying_endpoint(vec![Duration::ZERO]).await;
+
+        // Overwrite exactly one loose object with non-zlib garbage (0o444 by default).
+        let victim = repo_path
+            .join("objects")
+            .join(&oids[0][0..2])
+            .join(&oids[0][2..]);
+        assert!(victim.is_file(), "fixture must leave the blob loose");
+        let mut perms = std::fs::metadata(&victim).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&victim, perms).unwrap();
+        std::fs::write(&victim, b"garbage not a zlib stream").unwrap();
+
+        let pinned = tokio::time::timeout(
+            Duration::from_secs(30),
+            pin_new_objects(
+                &endpoint,
+                &repo_path,
+                &git_bin,
+                Duration::from_secs(30),
+                oids.clone(),
+                &db,
+                "repo-merge-test",
+                Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("an immediate endpoint and four healthy objects cannot take 30s");
+
+        assert_eq!(
+            objects_attempted(&log),
+            5,
+            "an object-scoped fault must not stop the batch: every object must be read"
+        );
+        assert_eq!(
+            pinned.len(),
+            4,
+            "one corrupt object must cost only itself: the other four must still pin"
         );
     }
 }

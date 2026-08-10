@@ -1466,6 +1466,17 @@ esac\n";
         // rev-list records its (leader) pid, closes stdout+stderr so the drain EOFs
         // immediately, then sleeps without trapping TERM. `sleep 30` bounds the worst
         // case so a RED run cannot wedge the suite; the recv budget fires first.
+        //
+        // The deadline below is deliberately far larger than the work it bounds: the
+        // watchdog tears the whole group down at the deadline, so a deadline tight
+        // enough to race `/bin/sh` reaching its first statement kills the leader
+        // BEFORE it records its pid, and the `leader.pid` read below then fails with
+        // NotFound. That is a harness race, not a product failure, and it is exactly
+        // what a loaded CI runner reproduced (test (beta), 2026-08-04). Sizing it at
+        // 2s keeps the property under test intact, since the pre-fix build blocks on
+        // `child.wait()` for the child's full `sleep 30` and still trips the 10s recv
+        // budget below (RED), while leaving a 20x margin over the ~100ms that a
+        // healthy start actually needs.
         let body = "#!/bin/sh\ncase \"$1\" in\n  rev-list) echo $$ > leader.pid; exec 1>&- 2>&-; sleep 30 ;;\n  *) : ;;\nesac\nexit 0\n";
         let git_bin = write_fake_git(tmp.path(), body);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1476,7 +1487,7 @@ esac\n";
                 &["rev-list"],
                 &path,
                 b"",
-                Instant::now() + Duration::from_millis(100),
+                Instant::now() + Duration::from_secs(2),
             ));
         });
         let out = rx.recv_timeout(Duration::from_secs(10)).expect(

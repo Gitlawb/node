@@ -4345,9 +4345,14 @@ mod tests {
                     &server.url(),
                     "test-jwt",
                     &bare,
+                    "git",
                     vec![oid],
                     &state.db,
                     &repo_id,
+                    // Far above the ~150ms the retry ladder spends, so the batch gate
+                    // never truncates the one object under test: what is being measured
+                    // is the retry backoff, not the budget.
+                    std::time::Duration::from_secs(60),
                 )
                 .await;
                 m.assert_async().await; // the upload is skipped: DB-only path
