@@ -163,6 +163,14 @@ fn start_shim(repo: PathBuf, mode: ShimMode) -> Shim {
 }
 
 fn handle_conn(stream: TcpStream, repo: &Path, mode: ShimMode, posts: &AtomicUsize) {
+    // `start_shim` makes the LISTENER non-blocking to poll its stop flag. On
+    // Windows the accepted socket inherits that (Winsock FIONBIO inheritance;
+    // std's `accept` does not reset it), on unix it does not. Every read below
+    // is a blocking read whose errors collapse to "peer closed", so an inherited
+    // WouldBlock would drop the connection with no response and abort the client
+    // mid-request. Normalize before reading; this also restores the read timeout
+    // on the next line, which a non-blocking socket silently makes meaningless.
+    stream.set_nonblocking(false).ok();
     stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
     let mut reader = BufReader::new(stream);
 
@@ -747,6 +755,86 @@ fn build_divergent_repos(shared_commits: usize) -> Repos {
         clone,
         _tmp: tmp,
     }
+}
+
+/// The shim must answer a connection that arrives in non-blocking mode.
+///
+/// `start_shim` sets the LISTENER non-blocking so the accept loop can poll the
+/// stop flag. On unix the socket handed back by `accept()` is blocking, so that
+/// is invisible; on Windows, Winsock has the accepted socket inherit the
+/// listener's FIONBIO state and std does not reset it (`accept` is a bare
+/// `c::accept`), so every accepted connection is non-blocking there. The shim
+/// reads with `read_line(..).unwrap_or(0)`, which collapses `WouldBlock` into
+/// "peer closed" and returns WITHOUT writing a response, aborting the client
+/// mid-request. Because the shim accepts as soon as the handshake completes,
+/// strictly before the request bytes arrive, that window is open on every
+/// connection and closes only because the accept poll usually lags the client.
+///
+/// Force the Windows shape explicitly so this is checked on every platform
+/// rather than only the one that exhibits it. The accept-before-request
+/// interleaving is the losing one, so it is established by a handshake rather
+/// than a sleep: a timing-based version cannot flake RED, but it CAN flake
+/// GREEN on a loaded runner (bytes already buffered, so the read succeeds even
+/// while non-blocking), which would make this guard vacuous exactly where it
+/// is supposed to bite.
+#[test]
+fn shim_answers_a_connection_that_arrives_non_blocking() {
+    let repos = build_divergent_repos(1);
+    let repo = repos.server.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        let posts = AtomicUsize::new(0);
+        let stream = loop {
+            match listener.accept() {
+                Ok((s, _)) => break s,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(e) => panic!("accept failed: {e}"),
+            }
+        };
+        // What Windows hands the shim. On unix this is the only way to reach
+        // that state, so the assertion below is load-bearing here too.
+        stream.set_nonblocking(true).unwrap();
+        accepted_tx.send(()).unwrap();
+        handle_conn(stream, &repo, ShimMode::Normal, &posts);
+    });
+
+    let mut client = TcpStream::connect(addr).unwrap();
+    // Send only once the shim has the connection in hand, so its first read is
+    // guaranteed to run against an empty receive buffer.
+    accepted_rx.recv().unwrap();
+    client
+        .write_all(b"GET /x/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+
+    let mut got = Vec::new();
+    let read = client.read_to_end(&mut got);
+    server.join().unwrap();
+
+    assert!(
+        read.is_ok(),
+        "client read failed instead of receiving a response: {:?} \
+         (a non-blocking accepted socket makes the shim drop the connection \
+         with no reply, which surfaces as a connection abort on the client)",
+        read.unwrap_err().kind()
+    );
+    assert!(
+        got.starts_with(b"HTTP/1.1 200 OK"),
+        "shim closed the connection without a response ({} bytes read); \
+         a WouldBlock on the request-line read was swallowed as EOF",
+        got.len()
+    );
+    assert!(
+        got.windows(b"# service=git-upload-pack".len())
+            .any(|w| w == b"# service=git-upload-pack"),
+        "response reached the client but is not the upload-pack advertisement"
+    );
 }
 
 /// Matrix item 7, bridging half: a real multi-round `git fetch` through the
