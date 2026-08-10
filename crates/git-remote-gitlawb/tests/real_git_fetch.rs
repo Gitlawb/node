@@ -788,21 +788,22 @@ fn build_divergent_repos(shared_commits: usize) -> Repos {
 /// state follows the new descriptor is a question this test would then depend on
 /// and could not answer. Owning the original removes the question.
 ///
-/// The `Started` handshake is load-bearing and must not be removed. Without it,
-/// "no outcome arrived within the window" would be satisfied by two different
-/// states: the reader parked inside its read, and the reader thread not yet
-/// scheduled to reach the read at all. A slow spawn would then pass this test
-/// with the helper's normalization deleted, which is the vacuous-guard failure
-/// this test exists to avoid.
+/// The `Started` handshake is load-bearing and must not be removed. It SHRINKS
+/// the vacuity window; it does not close it. Read that literally, because the
+/// looser version of this sentence is the mistake this whole test exists to
+/// correct. Without the handshake the window includes thread spawn itself, which
+/// is unbounded and can be very slow on a loaded runner. With it, spawn is out of
+/// the window entirely and what remains is the cross-thread round trip: the
+/// signal, the read call, its `WouldBlock` return, the channel send, and this
+/// thread waking from `recv_timeout`.
 ///
-/// What the handshake buys is that thread-spawn latency is out of the window
-/// entirely. What remains is a full cross-thread round trip: the signal, the read
-/// call, its `WouldBlock` return, the channel send, and this thread waking from
-/// `recv_timeout`. All of that must exceed 250ms for a false green, so the guard
-/// cannot flake RED and its false-green path is a scheduling stall, not a byte
-/// race. Measured 50 of 50 RED under a mutation deleting the normalization, at
-/// full-suite parallelism; that bounds the false-green rate, it does not make it
-/// zero.
+/// So the residual false-green path is a reader descheduled anywhere along that
+/// round trip for more than 250ms, notably between its own `Started` send and its
+/// `read`. That path is real and this comment does not claim otherwise. What the
+/// design does buy is that the guard cannot flake RED, and that no arrangement of
+/// bytes on the wire can fool it, only the scheduler. Measured 50 of 50 RED under
+/// a mutation deleting the normalization, at full-suite parallelism; that bounds
+/// the false-green rate, it does not make it zero.
 ///
 /// Teardown order is a constraint, not a preference: the peer close must come
 /// AFTER the timeout assertion. Closing first unblocks the parked read, the
@@ -843,9 +844,13 @@ fn normalize_accepted_stream_leaves_the_socket_blocking() {
         let _ = tx.send(Probe::Outcome(outcome));
     });
 
+    // Bounded, not `recv()`. A bare recv here turns "the reader never ran" into a
+    // hung test binary rather than a failing test, and cargo test has no per-test
+    // timeout to rescue it. The bound is far above any real scheduling delay, so
+    // hitting it is a genuine defect report, never a flake.
     match rx
-        .recv()
-        .expect("reader thread died before signalling Started")
+        .recv_timeout(Duration::from_secs(30))
+        .expect("reader thread never signalled Started (died, or never scheduled)")
     {
         Probe::Started => {}
         Probe::Outcome(_) => panic!("reader reported an outcome before its Started signal"),
@@ -874,11 +879,13 @@ fn normalize_accepted_stream_leaves_the_socket_blocking() {
         }
     }
 
-    // Only now: EOF unblocks the parked read so the thread can be joined.
+    // Only now: EOF unblocks the parked read so the thread can be joined. Bounded
+    // for the same reason as the handshake wait above; the socket's own 30s read
+    // timeout is the other backstop, and it is asserted rather than assumed.
     drop(client);
     match rx
-        .recv()
-        .expect("reader thread died instead of returning after EOF")
+        .recv_timeout(Duration::from_secs(60))
+        .expect("reader did not return after the peer closed")
     {
         Probe::Outcome(outcome) => assert_eq!(
             outcome.ok(),
