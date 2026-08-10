@@ -242,13 +242,16 @@ mod authz_guard {
             // PRE-GATED — already owner-gated, in-scope group; guard the gate itself
             (protect, "protect_branch", "did_matches("),
             (protect, "unprotect_branch", "did_matches("),
+            (visibility, "set_visibility", "authorize_repo_read("),
             (visibility, "set_visibility", "require_owner("),
+            (visibility, "remove_visibility", "authorize_repo_read("),
             (visibility, "remove_visibility", "require_owner("),
+            (visibility, "list_visibility", "authorize_repo_read("),
             (visibility, "list_visibility", "require_owner("),
         ];
 
-        // The visibility rows prove require_owner is CALLED; this proves the helper
-        // itself does DID-safe matching, not a raw/trailing-segment compare.
+        // Rows above prove each visibility handler calls authorize_repo_read and
+        // require_owner; this proves the helper itself does DID-safe matching.
         assert!(
             fn_body(visibility, "require_owner").contains("did_matches("),
             "visibility::require_owner must use did_matches for DID-safe owner matching"
