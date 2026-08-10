@@ -177,7 +177,7 @@ GITLAWB_ENFORCE_OWNER_PUSH=true
 | Missed heartbeats | After 3 days without one, you're excluded from rewards until you beat again |
 | Operator key | Dedicated wallet, small ETH balance, not your main treasury |
 | Monitoring | Watch `lastHeartbeat` on-chain; alert if > 22h since last beat |
-| Public URL | Must resolve and serve `/health` — peers will ping it |
+| Public URL | Must resolve and serve `/health` for liveness and DB-aware `/ready` for peer readiness |
 
 ---
 

@@ -498,21 +498,15 @@ pub async fn ping_peer(
         .find(|p| p.did == did)
         .ok_or_else(|| AppError::RepoNotFound(format!("peer {did} not found")))?;
 
-    // Async ping
-    let url = format!("{}/health", peer.http_url.trim_end_matches('/'));
-    // Use the shared no-redirect client: bare `reqwest::get` follows redirects,
-    // so a peer could answer with `302 -> http://127.0.0.1/` and turn the ping
-    // into an SSRF probe.
-    let ok = state
-        .http_client
-        .get(&url)
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
+    // Use DB-aware readiness rather than process liveness: `/health` stays 200
+    // during a mid-life database outage, while `/ready` reports 503. A 404-only
+    // fallback keeps pre-readiness peers compatible. The shared helper also
+    // preserves the no-redirect SSRF guard on peer-controlled URLs.
+    let ok = crate::ping_peer_readiness(&state.http_client, &peer.http_url).await;
 
-    let _ = state.db.mark_peer_ping(&did, ok).await;
-
+    // This anonymous diagnostic endpoint is intentionally read-only. The
+    // periodic gossip loop owns the persisted federation-reachability gate and
+    // requires consecutive failures before marking a peer unreachable.
     Ok(Json(serde_json::json!({
         "did": did,
         "http_url": peer.http_url,
@@ -619,7 +613,7 @@ mod tests {
     use axum::body::Body;
     use axum::extract::ConnectInfo;
     use axum::http::{header, Method, Request, StatusCode};
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use axum::{middleware, Extension, Router};
     use gitlawb_core::http_sig::sign_request;
     use gitlawb_core::identity::Keypair;
@@ -833,6 +827,74 @@ mod tests {
             .await
             .unwrap();
         did
+    }
+
+    #[sqlx::test]
+    async fn manual_ping_uses_readiness_without_mutating_federation_gate(pool: PgPool) {
+        let mut server = mockito::Server::new_async().await;
+        let ready = server
+            .mock("GET", "/ready")
+            .with_status(503)
+            .expect(1)
+            .create_async()
+            .await;
+        let health = server
+            .mock("GET", "/health")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mut state = test_state(pool.clone()).await;
+        state.http_client =
+            Arc::new(crate::build_http_client().expect("production HTTP client should build"));
+        let did = Keypair::generate().did().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
+             VALUES ($1, $2, $3, TRUE, $3)",
+        )
+        .bind(&did)
+        .bind(server.url())
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = Router::new()
+            .route("/api/v1/peers/{did}/ping", get(super::ping_peer))
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/peers/{did}/ping"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["reachable"], false);
+        ready.assert_async().await;
+        health.assert_async().await;
+
+        let peer = state
+            .db
+            .list_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|peer| peer.did == did)
+            .unwrap();
+        assert!(
+            peer.last_ping_ok,
+            "an anonymous manual sample must not rewrite the federation gate"
+        );
     }
 
     #[sqlx::test]

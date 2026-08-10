@@ -31,6 +31,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use clap::Parser;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -806,8 +807,8 @@ fn build_degraded_router(node_did: String, db_startup: Arc<DbStartupStatus>) -> 
         db_startup,
     };
     // Everything answers 503 with the same body — including /health and
-    // /ready, so peer pings (which treat any 2xx /health as alive) and
-    // uptime monitors correctly see a node that cannot serve traffic.
+    // /ready, so peer readiness probes and uptime monitors correctly see a
+    // node that cannot serve traffic.
     // `/` additionally carries the node identity for probing peers.
     Router::new()
         .route("/", get(degraded_node_info))
@@ -939,7 +940,7 @@ async fn gossip_task(
     }
 
     // Reuse the shared no-redirect client for every gossip outbound call (the
-    // bootstrap announce POST and the periodic peer /health ping). Peer URLs are
+    // bootstrap announce POST and the periodic peer /ready ping). Peer URLs are
     // attacker-influenceable, so a 3xx to a private address must not be followed.
     // Do NOT fall back to reqwest::Client::new(): its default follows redirects
     // and would reintroduce the SSRF closed here (#93).
@@ -1035,6 +1036,8 @@ async fn gossip_task(
 
     // Periodic ping every 5 minutes — exit on shutdown.
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut failed_once: HashSet<String> = HashSet::new();
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -1042,10 +1045,13 @@ async fn gossip_task(
                     Ok(p) => p,
                     Err(_) => continue,
                 };
-                for peer in peers {
-                    let ok = ping_peer_health(&client, &peer.http_url).await;
-                    let _ = state.db.mark_peer_ping(&peer.did, ok).await;
-                }
+                gossip_ping_round(
+                    state.db.as_ref(),
+                    client.as_ref(),
+                    &mut failed_once,
+                    peers,
+                )
+                .await;
             }
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
@@ -1116,6 +1122,47 @@ async fn sweep_rate_limiters(state: &AppState) {
     state.ipfs_rate_limiter.cleanup().await;
 }
 
+async fn gossip_ping_round(
+    db: &Db,
+    client: &reqwest::Client,
+    failed_once: &mut HashSet<String>,
+    peers: Vec<db::PeerRecord>,
+) {
+    {
+        let current_dids: HashSet<&str> = peers.iter().map(|peer| peer.did.as_str()).collect();
+        failed_once.retain(|did| current_dids.contains(did.as_str()));
+    }
+    for peer in peers {
+        let ok = ping_peer_readiness(client, &peer.http_url).await;
+        match peer_ping_db_update(failed_once, &peer.did, ok) {
+            Some(reachable) => {
+                if let Err(error) = db.mark_peer_ping(&peer.did, reachable).await {
+                    warn!(did = %peer.did, err = %error, "failed to persist peer readiness");
+                }
+            }
+            None => warn!(
+                did = %peer.did,
+                "peer readiness probe failed once; preserving previous federation status"
+            ),
+        }
+    }
+}
+
+/// Decide whether one readiness sample should update the persisted federation
+/// gate. A success is authoritative immediately. A failure must repeat on the
+/// next gossip tick before it can mark a peer unreachable, so one transient
+/// database hiccup does not hide the peer's repositories for five minutes.
+fn peer_ping_db_update(failed_once: &mut HashSet<String>, did: &str, ready: bool) -> Option<bool> {
+    if ready {
+        failed_once.remove(did);
+        Some(true)
+    } else if failed_once.insert(did.to_owned()) {
+        None
+    } else {
+        Some(false)
+    }
+}
+
 /// Build the shared node HTTP client used for every outbound fan-out (sync
 /// trigger, profile/repo fetches, gossip announce + peer pings).
 ///
@@ -1126,26 +1173,96 @@ async fn sweep_rate_limiters(state: &AppState) {
 /// runs, not a hand-rolled equivalent.
 fn build_http_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(OUTBOUND_HTTP_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()
 }
 
-/// Ping a peer's `/health` endpoint and report whether it answered 2xx.
+const OUTBOUND_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ping a peer's DB-aware `/ready` endpoint and report whether it answered 2xx.
+///
+/// A 404 falls back to `/health` for compatibility with nodes released before
+/// `/ready` existed. Other readiness failures, including 503 during a database
+/// outage, fail closed and must not use the liveness-only endpoint. The complete
+/// `/ready`-then-`/health` probe shares one timeout budget.
 ///
 /// Takes the client by reference so callers supply the shared, no-redirect
 /// `state.http_client`. Peer URLs are attacker-influenceable, so a `3xx` to a
 /// private address must not be followed. Do NOT call this with a bare
 /// `reqwest::Client::new()`: its default follows redirects and would
 /// reintroduce the SSRF this guards against (#93).
-async fn ping_peer_health(client: &reqwest::Client, http_url: &str) -> bool {
-    let url = format!("{}/health", http_url.trim_end_matches('/'));
-    client
-        .get(&url)
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
+pub(crate) async fn ping_peer_readiness(client: &reqwest::Client, http_url: &str) -> bool {
+    ping_peer_readiness_with_timeout(client, http_url, OUTBOUND_HTTP_TIMEOUT).await
+}
+
+async fn ping_peer_readiness_with_timeout(
+    client: &reqwest::Client,
+    http_url: &str,
+    timeout: std::time::Duration,
+) -> bool {
+    let base_url = http_url.trim_end_matches('/');
+    let result = tokio::time::timeout(timeout, async {
+        let readiness = client.get(format!("{base_url}/ready")).send().await;
+
+        match readiness {
+            Ok(response) if response.status().is_success() => true,
+            Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
+                info!(
+                    peer_url = %http_url,
+                    "peer has no readiness endpoint; falling back to legacy health probe"
+                );
+                match client.get(format!("{base_url}/health")).send().await {
+                    Ok(response) if response.status().is_success() => true,
+                    Ok(response) => {
+                        warn!(
+                            peer_url = %http_url,
+                            status = %response.status(),
+                            "legacy peer health probe reported unhealthy"
+                        );
+                        false
+                    }
+                    Err(error) => {
+                        warn!(
+                            peer_url = %http_url,
+                            err = %error,
+                            "legacy peer health probe failed"
+                        );
+                        false
+                    }
+                }
+            }
+            Ok(response) => {
+                warn!(
+                    peer_url = %http_url,
+                    status = %response.status(),
+                    "peer readiness probe reported unready"
+                );
+                false
+            }
+            Err(error) => {
+                warn!(
+                    peer_url = %http_url,
+                    err = %error,
+                    "peer readiness probe failed"
+                );
+                false
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(ready) => ready,
+        Err(_) => {
+            warn!(
+                peer_url = %http_url,
+                timeout_ms = timeout.as_millis(),
+                "peer readiness probe timed out"
+            );
+            false
+        }
+    }
 }
 
 fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
@@ -1183,25 +1300,283 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
 
 #[cfg(test)]
 mod gossip_ssrf_tests {
-    use super::ping_peer_health;
+    use super::{
+        gossip_ping_round, peer_ping_db_update, ping_peer_readiness,
+        ping_peer_readiness_with_timeout,
+    };
+    use axum::{http::StatusCode, routing::get, Router};
+    use sqlx::PgPool;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     // Build the client exactly as production does (super::build_http_client) so
     // these tests bind the redirect guarantee to the real shared client the
     // node runs. A regression that makes build_http_client follow redirects
-    // fails ping_peer_health_does_not_follow_redirect.
+    // fails ping_peer_readiness_does_not_follow_redirect.
     fn production_http_client() -> reqwest::Client {
         super::build_http_client().expect("failed to build production http client")
     }
 
-    // A peer answering `/health` with a 302 toward an internal address must not
+    #[test]
+    fn peer_ping_requires_two_failures_before_marking_unreachable() {
+        let mut failed_once = HashSet::new();
+        let did = "did:key:z6MkPeer";
+
+        assert_eq!(
+            peer_ping_db_update(&mut failed_once, did, false),
+            None,
+            "one transient failure must preserve the persisted federation gate"
+        );
+        assert_eq!(
+            peer_ping_db_update(&mut failed_once, did, false),
+            Some(false),
+            "a sustained failure must mark the peer unreachable"
+        );
+        assert_eq!(
+            peer_ping_db_update(&mut failed_once, did, true),
+            Some(true),
+            "a success must restore reachability immediately"
+        );
+        assert_eq!(
+            peer_ping_db_update(&mut failed_once, did, false),
+            None,
+            "a success must reset the consecutive-failure state"
+        );
+    }
+
+    #[sqlx::test]
+    async fn gossip_ping_round_requires_two_failures_before_persisting_unreachable(pool: PgPool) {
+        let mut server = mockito::Server::new_async().await;
+        let ready = server
+            .mock("GET", "/ready")
+            .with_status(503)
+            .expect(2)
+            .create_async()
+            .await;
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let did = "did:key:z6MkGossipHysteresis";
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
+             VALUES ($1, $2, $3, TRUE, $3)",
+        )
+        .bind(did)
+        .bind(server.url())
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut failed_once = HashSet::from(["did:key:z6MkRemovedPeer".to_owned()]);
+        gossip_ping_round(
+            state.db.as_ref(),
+            &production_http_client(),
+            &mut failed_once,
+            state.db.list_peers().await.unwrap(),
+        )
+        .await;
+        assert!(
+            !failed_once.contains("did:key:z6MkRemovedPeer"),
+            "failure tracking must prune peers outside the current snapshot"
+        );
+        assert!(
+            failed_once.contains(did),
+            "the first failed sample must be retained for the next round"
+        );
+        assert!(
+            state
+                .db
+                .list_peers()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|peer| peer.did == did)
+                .unwrap()
+                .last_ping_ok,
+            "one transient failure must preserve the persisted federation gate"
+        );
+
+        gossip_ping_round(
+            state.db.as_ref(),
+            &production_http_client(),
+            &mut failed_once,
+            state.db.list_peers().await.unwrap(),
+        )
+        .await;
+        assert!(
+            !state
+                .db
+                .list_peers()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|peer| peer.did == did)
+                .unwrap()
+                .last_ping_ok,
+            "two consecutive failed rounds must persist the peer as unreachable"
+        );
+        ready.assert_async().await;
+    }
+
+    // A peer answering `/ready` with a 302 toward an internal address must not
     // be followed: the redirect target must never be requested (#93).
     #[tokio::test]
-    async fn ping_peer_health_does_not_follow_redirect() {
+    async fn ping_peer_readiness_does_not_follow_redirect() {
         let mut server = mockito::Server::new_async().await;
         let internal = server
             .mock("GET", "/internal-metadata")
             .with_status(200)
             .expect(0)
+            .create_async()
+            .await;
+        let _ready = server
+            .mock("GET", "/ready")
+            .with_status(302)
+            .with_header("location", &format!("{}/internal-metadata", server.url()))
+            .create_async()
+            .await;
+
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
+
+        assert!(!ok, "a 302 must not count as a healthy peer");
+        // expect(0) is enforced only at assert time; this fails if the redirect
+        // was followed to the internal target.
+        internal.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_reports_success_on_200() {
+        let mut server = mockito::Server::new_async().await;
+        let _ready = server
+            .mock("GET", "/ready")
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
+
+        assert!(ok, "a 200 /ready must count as a ready peer");
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_ignores_liveness_only_health() {
+        let mut server = mockito::Server::new_async().await;
+        let health = server
+            .mock("GET", "/health")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let ready = server
+            .mock("GET", "/ready")
+            .with_status(503)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
+
+        assert!(!ok, "a peer with an unavailable database must not be ready");
+        health.assert_async().await;
+        ready.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_falls_back_for_legacy_peer() {
+        let mut server = mockito::Server::new_async().await;
+        let ready = server
+            .mock("GET", "/ready")
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        let health = server
+            .mock("GET", "/health")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
+
+        assert!(
+            ok,
+            "a legacy peer with a healthy /health must remain reachable"
+        );
+        ready.assert_async().await;
+        health.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_legacy_fallback_shares_deadline() {
+        let health_requests = Arc::new(AtomicUsize::new(0));
+        let health_requests_for_route = Arc::clone(&health_requests);
+        let app = Router::new()
+            .route(
+                "/ready",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    StatusCode::NOT_FOUND
+                }),
+            )
+            .route(
+                "/health",
+                get(move || {
+                    let health_requests = Arc::clone(&health_requests_for_route);
+                    async move {
+                        health_requests.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        StatusCode::OK
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind delayed legacy peer");
+        let peer_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("delayed legacy peer has no local address")
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("delayed legacy peer failed");
+        });
+
+        let ok = ping_peer_readiness_with_timeout(
+            &production_http_client(),
+            &peer_url,
+            // Each response arrives within 350 ms, but the two serial requests
+            // cannot both finish within one 350 ms probe budget.
+            Duration::from_millis(350),
+        )
+        .await;
+
+        assert!(!ok, "the fallback must not start a fresh timeout budget");
+        assert_eq!(
+            health_requests.load(Ordering::Relaxed),
+            1,
+            "the delayed 404 should reach the legacy fallback"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_legacy_fallback_does_not_follow_redirect() {
+        let mut server = mockito::Server::new_async().await;
+        let internal = server
+            .mock("GET", "/internal-metadata")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let _ready = server
+            .mock("GET", "/ready")
+            .with_status(404)
             .create_async()
             .await;
         let _health = server
@@ -1211,33 +1586,17 @@ mod gossip_ssrf_tests {
             .create_async()
             .await;
 
-        let ok = ping_peer_health(&production_http_client(), &server.url()).await;
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
 
-        assert!(!ok, "a 302 must not count as a healthy peer");
-        // expect(0) is enforced only at assert time; this fails if the redirect
-        // was followed to the internal target.
+        assert!(!ok, "the legacy fallback must not follow redirects");
         internal.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn ping_peer_health_reports_success_on_200() {
-        let mut server = mockito::Server::new_async().await;
-        let _health = server
-            .mock("GET", "/health")
-            .with_status(200)
-            .create_async()
-            .await;
-
-        let ok = ping_peer_health(&production_http_client(), &server.url()).await;
-
-        assert!(ok, "a 200 /health must count as a healthy peer");
     }
 
     // A transport error (nothing listening) must map to unhealthy, never a
     // spurious healthy — the .unwrap_or(false) arm.
     #[tokio::test]
-    async fn ping_peer_health_reports_unhealthy_on_connection_error() {
-        let ok = ping_peer_health(&production_http_client(), "http://127.0.0.1:1").await;
-        assert!(!ok, "a connection error must count as an unhealthy peer");
+    async fn ping_peer_readiness_reports_unready_on_connection_error() {
+        let ok = ping_peer_readiness(&production_http_client(), "http://127.0.0.1:1").await;
+        assert!(!ok, "a connection error must count as an unready peer");
     }
 }
