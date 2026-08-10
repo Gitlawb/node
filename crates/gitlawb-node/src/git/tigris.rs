@@ -8,8 +8,41 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
+use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::Client as S3Client;
 use tracing::{debug, info};
+
+/// The precondition an upload is fenced on.
+///
+/// Object storage is the only place a fence can hold. Dropping the future of an
+/// in-flight PUT does not cancel the request the server is already processing,
+/// so no amount of local locking stops an abandoned writer's bytes from landing
+/// after a successor has published. A conditional PUT the store itself refuses
+/// is what actually stops it.
+#[derive(Clone, Debug)]
+pub enum UploadPrecondition {
+    /// Publish only if the stored object is still the generation we observed.
+    ///
+    /// Only tests construct this so far. The write guard's release path is the
+    /// production caller, and it is wired up in a follow-up change.
+    #[allow(dead_code)]
+    IfMatch(String),
+    /// Publish only if nothing is stored under the key yet.
+    IfAbsent,
+    /// No fence. Last writer wins.
+    Unconditional,
+}
+
+/// Why an upload failed, split so a caller can tell "someone else already
+/// published this key" (expected, and dropping our bytes is the correct
+/// outcome) from a real storage failure.
+#[derive(Debug, thiserror::Error)]
+pub enum UploadError {
+    #[error("upload precondition lost (HTTP {status})")]
+    PreconditionLost { status: u16 },
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
 
 /// Wrapper around the S3 client with the configured bucket.
 #[derive(Clone)]
@@ -85,8 +118,51 @@ impl TigrisClient {
         }
     }
 
-    /// Upload a local bare repo directory to Tigris as a tar.zst archive.
-    pub async fn upload(&self, owner_slug: &str, repo_name: &str, local_path: &Path) -> Result<()> {
+    /// Read the ETag of a repo archive, or `None` when nothing is stored under
+    /// the key. The ETag identifies the generation a later conditional upload
+    /// can fence itself on.
+    ///
+    /// Separate from `exists` rather than folded into it: `exists` has callers
+    /// that only want the boolean, and widening its return type would churn
+    /// every one of them for no benefit.
+    ///
+    /// Only tests call this so far; the write guard reads the ETag here before
+    /// it publishes, and that wiring is a follow-up change.
+    #[allow(dead_code)]
+    pub async fn head_etag(&self, owner_slug: &str, repo_name: &str) -> Result<Option<String>> {
+        let key = Self::repo_key(owner_slug, repo_name);
+        match self
+            .s3
+            .head_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+        {
+            Ok(out) => Ok(Some(
+                out.e_tag()
+                    .context(format!("tigris HEAD {key}: hit carried no ETag"))?
+                    .to_string(),
+            )),
+            Err(e) => {
+                if e.as_service_error().is_some_and(|e| e.is_not_found()) {
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!("tigris HEAD {key}: {e}"))
+                }
+            }
+        }
+    }
+
+    /// Upload a local bare repo directory to Tigris as a tar.zst archive,
+    /// fenced by `precondition`.
+    pub async fn upload(
+        &self,
+        owner_slug: &str,
+        repo_name: &str,
+        local_path: &Path,
+        precondition: UploadPrecondition,
+    ) -> std::result::Result<(), UploadError> {
         let key = Self::repo_key(owner_slug, repo_name);
         debug!(key = %key, path = %local_path.display(), "uploading repo to tigris");
 
@@ -101,15 +177,51 @@ impl TigrisClient {
 
         let body = aws_sdk_s3::primitives::ByteStream::from(archive_bytes);
 
-        self.s3
+        let mut req = self
+            .s3
             .put_object()
             .bucket(&self.bucket)
             .key(&key)
             .body(body)
-            .content_type("application/zstd")
-            .send()
-            .await
-            .context(format!("tigris PUT {key}"))?;
+            .content_type("application/zstd");
+        match &precondition {
+            UploadPrecondition::IfMatch(etag) => req = req.if_match(etag),
+            UploadPrecondition::IfAbsent => req = req.if_none_match("*"),
+            UploadPrecondition::Unconditional => {}
+        }
+
+        if let Err(e) = req.send().await {
+            // `PutObjectError` models no PreconditionFailed variant (its arms are
+            // EncryptionTypeMismatch, InvalidRequest, InvalidWriteOffset,
+            // TooManyParts, Unhandled), so a refused precondition arrives as
+            // `Unhandled` and matching the enum would classify it as a generic
+            // failure. The raw HTTP status off the service-error response is the
+            // only place the answer actually lives.
+            let status = match &e {
+                SdkError::ServiceError(ctx) => Some(ctx.raw().status().as_u16()),
+                _ => None,
+            };
+            // 412 is always a lost precondition. 409 is one only when we asked
+            // for create-only, which is how S3-compatible stores report "the key
+            // already exists". Everything else, 404 included, is a real failure:
+            // archive keys are never deleted (`delete` has no callers), so a 404
+            // here means something permanent like a missing bucket or a
+            // misrouted endpoint, and reporting that as a lost precondition
+            // would tell a caller to expect a successor that does not exist.
+            let lost = match status {
+                Some(412) => true,
+                Some(409) => matches!(precondition, UploadPrecondition::IfAbsent),
+                _ => false,
+            };
+            if lost {
+                return Err(UploadError::PreconditionLost {
+                    status: status.expect("a lost precondition came from a status"),
+                });
+            }
+            return Err(UploadError::Other(
+                anyhow::Error::new(e).context(format!("tigris PUT {key}")),
+            ));
+        }
 
         info!(key = %key, "uploaded repo to tigris");
         Ok(())

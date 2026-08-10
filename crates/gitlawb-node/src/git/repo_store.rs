@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use super::store;
-use super::tigris::TigrisClient;
+use super::tigris::{TigrisClient, UploadError, UploadPrecondition};
 
 /// Centralized repo storage: local disk cache + optional Tigris backend.
 #[derive(Clone)]
@@ -128,11 +128,34 @@ impl RepoStore {
                             }
                             Ok(false) => {
                                 info!(repo = %name, "migrating local repo to tigris");
-                                if let Err(e) = tigris.upload(&slug, &name, &path).await {
-                                    warn!(repo = %name, err = %e, "lazy migration to tigris failed");
-                                    return;
+                                // Create-only. This backfill was decided on a
+                                // negative existence check that is already
+                                // stale, so a refusal means someone else
+                                // published this key in between and dropping
+                                // our bytes is the correct outcome. An
+                                // unconditional PUT here would overwrite their
+                                // archive, which is the exact bug this fence
+                                // exists to close.
+                                match tigris
+                                    .upload(&slug, &name, &path, UploadPrecondition::IfAbsent)
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        info!(repo = %name, "lazy migration to tigris complete");
+                                    }
+                                    // Logged apart from the warn arm below so a
+                                    // refusal, which is the fence working, does
+                                    // not read as a storage failure. The key is
+                                    // populated either way, so this still
+                                    // counts as migrated.
+                                    Err(UploadError::PreconditionLost { status }) => {
+                                        info!(repo = %name, status, "lazy migration dropped: another writer already published this repo");
+                                    }
+                                    Err(e) => {
+                                        warn!(repo = %name, err = %e, "lazy migration to tigris failed");
+                                        return;
+                                    }
                                 }
-                                info!(repo = %name, "lazy migration to tigris complete");
                             }
                             Err(e) => {
                                 warn!(repo = %name, err = %e, "tigris existence check failed");
@@ -588,8 +611,25 @@ impl RepoStore {
             let repo_name = repo_name.to_string();
             let path = local_path.clone();
             tokio::spawn(async move {
-                if let Err(e) = tigris.upload(&owner_slug, &repo_name, &path).await {
-                    warn!(repo = %repo_name, err = %e, "failed to upload new repo to tigris");
+                // Create-only, and load-bearing: this uploads a freshly
+                // initialized EMPTY repo, so a user who pushes immediately
+                // after creating one would have their archive replaced by this
+                // background PUT if it were unconditional. A refusal means
+                // someone else already published this key and dropping our
+                // bytes is the correct outcome.
+                match tigris
+                    .upload(&owner_slug, &repo_name, &path, UploadPrecondition::IfAbsent)
+                    .await
+                {
+                    Ok(()) => {}
+                    // Distinct from the warn arm: the fence refusing is the
+                    // design working, not a storage failure.
+                    Err(UploadError::PreconditionLost { status }) => {
+                        info!(repo = %repo_name, status, "dropped the empty-repo upload: another writer already published this repo");
+                    }
+                    Err(e) => {
+                        warn!(repo = %repo_name, err = %e, "failed to upload new repo to tigris");
+                    }
                 }
             });
         }
@@ -608,8 +648,29 @@ impl RepoStore {
                     return;
                 }
             };
-            if let Err(e) = tigris.upload(&owner_slug, repo_name, &local_path).await {
-                warn!(repo = %repo_name, err = %e, "failed to upload repo to tigris after write");
+            // Create-only. The sole caller is fork creation, which rejects a
+            // name conflict in the database before it clones anything, so the
+            // key is expected absent here (and archive keys are never deleted:
+            // `delete` has no callers). A refusal therefore means someone else
+            // already published this key, and dropping our bytes is correct.
+            match tigris
+                .upload(
+                    &owner_slug,
+                    repo_name,
+                    &local_path,
+                    UploadPrecondition::IfAbsent,
+                )
+                .await
+            {
+                Ok(()) => {}
+                // Kept apart from the warn arm so the fence working does not
+                // read as a storage failure.
+                Err(UploadError::PreconditionLost { status }) => {
+                    info!(repo = %repo_name, status, "dropped the post-write upload: another writer already published this repo");
+                }
+                Err(e) => {
+                    warn!(repo = %repo_name, err = %e, "failed to upload repo to tigris after write");
+                }
             }
         }
     }
@@ -1009,7 +1070,15 @@ impl RepoWriteGuard {
                     "release-upload",
                     &self.repo_name,
                     self.lock_held_transfer_timeout,
-                    tigris.upload(&self.owner_slug, &self.repo_name, &self.local_path),
+                    // Unconditional for now purely so the tree compiles. This
+                    // is THE fenced call site: the sibling unit replaces this
+                    // with the observed-ETag precondition.
+                    tigris.upload(
+                        &self.owner_slug,
+                        &self.repo_name,
+                        &self.local_path,
+                        UploadPrecondition::Unconditional,
+                    ),
                 )
                 .await
                 {
@@ -3957,6 +4026,280 @@ mod tests {
         );
 
         mock.open_gate();
+        mock.shutdown();
+    }
+
+    // ── conditional upload through TigrisClient (#279) ─────────────────────
+
+    /// A tiny directory for `upload` to compress. What is inside does not
+    /// matter to a precondition test, only that a PUT carrying a body happens.
+    fn payload_dir(marker: &str) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("HEAD"), marker.as_bytes()).unwrap();
+        dir
+    }
+
+    /// A router that answers every request with one fixed status. This is NOT a
+    /// second semantics mock: it exists only to pin how a status the real mock
+    /// never produces (409, 404, 500) is classified.
+    async fn start_fixed_status_stub(status: u16) -> (String, tokio::task::JoinHandle<()>) {
+        let app = axum::Router::new().route(
+            "/{*key}",
+            axum::routing::any(
+                move || async move { axum::http::StatusCode::from_u16(status).unwrap() },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (endpoint, server)
+    }
+
+    /// The one place the header itself is asserted: a matching If-Match must
+    /// succeed AND must actually have travelled as an If-Match header. The
+    /// store-level tests deliberately assert behavior rather than headers, so
+    /// if this assertion is not here, nothing pins the wire format.
+    #[tokio::test]
+    async fn upload_if_match_with_the_current_etag_publishes_and_sends_the_header() {
+        let mock = S3Mock::start().await;
+        let client = TigrisClient::for_testing_with_endpoint("test-bucket", mock.endpoint());
+        let seeded = mock_put(&mock_s3_client(mock.endpoint()), b"seed", None, None)
+            .await
+            .expect("seeding PUT");
+
+        let dir = payload_dir("winner");
+        client
+            .upload(
+                "owner",
+                "repo",
+                dir.path(),
+                UploadPrecondition::IfMatch(seeded.clone()),
+            )
+            .await
+            .expect("a matching If-Match must publish");
+
+        let last = mock
+            .put_attempts()
+            .last()
+            .cloned()
+            .expect("the upload must reach the mock");
+        assert_eq!(
+            last.if_match.as_deref().map(unquote_etag),
+            Some(unquote_etag(&seeded)),
+            "the upload must carry the ETag it was fenced on as If-Match"
+        );
+        assert_eq!(last.if_none_match, None);
+        assert_eq!(last.status, Some(200));
+
+        mock.shutdown();
+    }
+
+    #[tokio::test]
+    async fn upload_if_match_with_a_stale_etag_is_precondition_lost() {
+        let mock = S3Mock::start().await;
+        let client = TigrisClient::for_testing_with_endpoint("test-bucket", mock.endpoint());
+        mock_put(&mock_s3_client(mock.endpoint()), b"seed", None, None)
+            .await
+            .expect("seeding PUT");
+
+        let dir = payload_dir("loser");
+        let err = client
+            .upload(
+                "owner",
+                "repo",
+                dir.path(),
+                UploadPrecondition::IfMatch("\"stale\"".to_string()),
+            )
+            .await
+            .expect_err("a stale If-Match must be refused");
+        assert!(
+            matches!(err, UploadError::PreconditionLost { status: 412 }),
+            "a stale If-Match must classify as a lost precondition, got {err:?}"
+        );
+        assert_eq!(
+            mock.object().as_deref(),
+            Some(b"seed".as_slice()),
+            "the refused upload must not have written"
+        );
+
+        mock.shutdown();
+    }
+
+    #[tokio::test]
+    async fn upload_if_absent_into_an_empty_store_publishes() {
+        let mock = S3Mock::start().await;
+        let client = TigrisClient::for_testing_with_endpoint("test-bucket", mock.endpoint());
+
+        let dir = payload_dir("first");
+        client
+            .upload("owner", "repo", dir.path(), UploadPrecondition::IfAbsent)
+            .await
+            .expect("create-only into an empty store must publish");
+
+        let last = mock.put_attempts().last().cloned().expect("one attempt");
+        assert_eq!(last.if_none_match.as_deref(), Some("*"));
+        assert_eq!(last.if_match, None);
+        assert!(mock.object().is_some(), "the create must have stored bytes");
+
+        mock.shutdown();
+    }
+
+    #[tokio::test]
+    async fn upload_if_absent_over_an_existing_object_is_precondition_lost() {
+        let mock = S3Mock::start().await;
+        let client = TigrisClient::for_testing_with_endpoint("test-bucket", mock.endpoint());
+        mock_put(&mock_s3_client(mock.endpoint()), b"seed", None, None)
+            .await
+            .expect("seeding PUT");
+
+        let dir = payload_dir("late-backfill");
+        let err = client
+            .upload("owner", "repo", dir.path(), UploadPrecondition::IfAbsent)
+            .await
+            .expect_err("create-only over an existing object must be refused");
+        assert!(
+            matches!(err, UploadError::PreconditionLost { status: 412 }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            mock.object().as_deref(),
+            Some(b"seed".as_slice()),
+            "a refused backfill must not clobber what is already published"
+        );
+
+        mock.shutdown();
+    }
+
+    #[tokio::test]
+    async fn upload_unconditional_overwrites_regardless() {
+        let mock = S3Mock::start().await;
+        let client = TigrisClient::for_testing_with_endpoint("test-bucket", mock.endpoint());
+        mock_put(&mock_s3_client(mock.endpoint()), b"seed", None, None)
+            .await
+            .expect("seeding PUT");
+
+        let dir = payload_dir("overwrite");
+        client
+            .upload(
+                "owner",
+                "repo",
+                dir.path(),
+                UploadPrecondition::Unconditional,
+            )
+            .await
+            .expect("an unconditional upload must succeed regardless of state");
+
+        let last = mock.put_attempts().last().cloned().expect("one attempt");
+        assert_eq!(last.if_match, None, "no precondition may be sent");
+        assert_eq!(last.if_none_match, None);
+        assert_ne!(
+            mock.object().as_deref(),
+            Some(b"seed".as_slice()),
+            "the unconditional upload must have replaced the seed"
+        );
+
+        mock.shutdown();
+    }
+
+    /// Tigris answers a create-only conflict with 409 rather than 412, so that
+    /// status has to classify as a lost precondition too, but ONLY when the
+    /// request was create-only.
+    #[tokio::test]
+    async fn upload_classifies_409_under_if_absent_as_precondition_lost() {
+        let (endpoint, server) = start_fixed_status_stub(409).await;
+        let client = TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint);
+        let dir = payload_dir("conflict");
+
+        let err = client
+            .upload("owner", "repo", dir.path(), UploadPrecondition::IfAbsent)
+            .await
+            .expect_err("409 must be an error");
+        assert!(
+            matches!(err, UploadError::PreconditionLost { status: 409 }),
+            "409 under IfAbsent is a lost precondition, got {err:?}"
+        );
+
+        server.abort();
+    }
+
+    /// MUST-NOT. A 404 is permanent (no such bucket, a misrouted endpoint), so
+    /// reporting it as a lost precondition would tell a client to retry
+    /// something that can never succeed. `delete` has no callers, so a racing
+    /// delete cannot produce this.
+    #[tokio::test]
+    async fn upload_classifies_404_as_other_under_either_precondition() {
+        let (endpoint, server) = start_fixed_status_stub(404).await;
+        let client = TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint);
+
+        for precondition in [
+            UploadPrecondition::IfAbsent,
+            UploadPrecondition::IfMatch("\"whatever\"".to_string()),
+        ] {
+            let dir = payload_dir("gone");
+            let err = client
+                .upload("owner", "repo", dir.path(), precondition.clone())
+                .await
+                .expect_err("404 must be an error");
+            assert!(
+                matches!(err, UploadError::Other(_)),
+                "404 under {precondition:?} must NOT be a lost precondition, got {err:?}"
+            );
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn upload_classifies_500_as_other() {
+        let (endpoint, server) = start_fixed_status_stub(500).await;
+        let client = TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint);
+
+        for precondition in [
+            UploadPrecondition::IfAbsent,
+            UploadPrecondition::IfMatch("\"whatever\"".to_string()),
+            UploadPrecondition::Unconditional,
+        ] {
+            let dir = payload_dir("boom");
+            let err = client
+                .upload("owner", "repo", dir.path(), precondition.clone())
+                .await
+                .expect_err("500 must be an error");
+            assert!(
+                matches!(err, UploadError::Other(_)),
+                "500 under {precondition:?} must be Other, got {err:?}"
+            );
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn head_etag_reports_the_current_etag_and_none_when_absent() {
+        let mock = S3Mock::start().await;
+        let client = TigrisClient::for_testing_with_endpoint("test-bucket", mock.endpoint());
+
+        assert_eq!(
+            client.head_etag("owner", "repo").await.expect("HEAD"),
+            None,
+            "an absent object must read as None, not an error"
+        );
+
+        let seeded = mock_put(&mock_s3_client(mock.endpoint()), b"seed", None, None)
+            .await
+            .expect("seeding PUT");
+        let got = client
+            .head_etag("owner", "repo")
+            .await
+            .expect("HEAD")
+            .expect("a present object must report an ETag");
+        assert_eq!(
+            unquote_etag(&got),
+            unquote_etag(&seeded),
+            "head_etag must report the ETag the last successful PUT minted"
+        );
+
         mock.shutdown();
     }
 }
