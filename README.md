@@ -309,7 +309,7 @@ POST /api/v1/peers/announce
 POST /api/v1/sync/notify
 ```
 
-When `GITLAWB_REQUIRE_SIGNED_PEER_WRITES=false`, unsigned legacy peers are accepted on those two routes, but signed requests are verified when signature headers are present. Once all live peers upgrade, operators can set:
+When `GITLAWB_REQUIRE_SIGNED_PEER_WRITES=false`, unsigned legacy peers are accepted on those two routes, but signed requests are verified when signature headers are present. Staged rollout relaxes who may announce, not who owns a peer row. An unsigned announce may register a previously unseen peer, and it may refresh an existing row whose `http_url` is unchanged, but changing an existing peer's `http_url` requires an RFC 9421 signature from that peer's own DID and is refused with 403 otherwise. An unsigned announce can only register a `did:key`, since that is the only method whose verifying key can be resolved and therefore the only kind of row anyone could ever correct through the signed path; any other DID is refused with 400. Once all live peers upgrade, operators can set:
 
 ```bash
 GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true

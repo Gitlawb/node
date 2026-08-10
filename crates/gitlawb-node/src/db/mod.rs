@@ -2133,8 +2133,85 @@ impl Db {
 
 // ── Peers ─────────────────────────────────────────────────────────────────────
 
+/// What a caller of [`Db::upsert_peer`] can prove about the DID it is writing.
+///
+/// An enum rather than a bool, and the proven variant carries a payload rather
+/// than being a bare unit, for two separate reasons.
+///
+/// It is not a bool because a bool at a call site reads as `true`/`false` with
+/// nothing at the call site saying what was proven, and because the default a
+/// bool invites (`false` meaning "no proof") is exactly the permissive value
+/// this gate exists to withhold. Passed as a real parameter with no default, so
+/// a new writer of the peers table cannot reach the update path by omission.
+///
+/// It carries the DID because "something was proven" is not the question. The
+/// boundary needs to know WHICH DID was proven, and compare it against the row
+/// being written. A bare proven/unproven flag leaves that comparison in the
+/// handler, which is the shape of RUSTSEC-2022-0009 (libp2p-core accepted a
+/// valid signature without checking it derived the claimed peer id) and leaves
+/// the second writer, the bootstrap announce-back in main.rs, outside the gate
+/// entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerWriteAuthority<'a> {
+    /// The caller has no proof of control over the DID it is writing. May
+    /// insert an unseen `did:key` row; may never change an existing row's
+    /// `http_url`.
+    Unproven,
+    /// The caller verified a signature, and the DID carried here is the one
+    /// that signature proved control of. `upsert_peer` checks it against the
+    /// row being written; a mismatch is a denial, not a warning.
+    Proven(&'a str),
+}
+
+/// A write refused by [`Db::upsert_peer`]'s authority gate.
+///
+/// A distinct type rather than a bare `anyhow::bail!` because `upsert_peer`
+/// returns `anyhow::Result` and `From<anyhow::Error> for AppError` routes
+/// anything it cannot downcast to `AppError::Internal`, so an untyped rejection
+/// would reach the client as a 500. The announce handler downcasts this out of
+/// the anyhow chain the same way the error module already recovers sqlx errors.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PeerWriteDenied {
+    /// An unproven write tried to change an existing row's `http_url`.
+    #[error("unproven announce cannot change an existing peer's http_url: {did}")]
+    UnprovenRepoint { did: String },
+
+    /// The signature proved control of one DID and the write targeted another.
+    #[error("signature proves control of {proven}, but the write targets {target}")]
+    ProofDidMismatch { proven: String, target: String },
+
+    /// An unproven write named a DID method that can never authenticate, so the
+    /// row it would create could never be corrected by anyone.
+    #[error(
+        "methodNotSupported: only did:key peers can be registered without a proof of control: {did}"
+    )]
+    UnsupportedDidMethod { did: String },
+
+    /// The value is a did:key (or never parsed as a DID at all), but no
+    /// verifying key can be resolved from it. Distinct from
+    /// `UnsupportedDidMethod`, which is a true statement about a foreign
+    /// method; this one carries the underlying resolution failure instead of
+    /// claiming did:key is unsupported. The wording mirrors the signed path in
+    /// auth/mod.rs, and peer_write_error maps it to the same `unresolvable_did`
+    /// code that path returns, so the two surfaces that judge the same input
+    /// answer with the same sentence under the same name.
+    #[error("cannot resolve DID '{did}': {reason}")]
+    UnresolvableDid { did: String, reason: String },
+}
+
 impl Db {
-    pub async fn upsert_peer(&self, did: &str, http_url: &str) -> Result<()> {
+    /// Insert or refresh a peer row, bounded by what the caller can prove.
+    ///
+    /// See [`PeerWriteAuthority`] for why the authority is a parameter with no
+    /// default. The rule: an unproven caller may INSERT an unseen `did:key`
+    /// row, but may never UPDATE an existing row's `http_url`. Changing an
+    /// existing row requires a verified signature from that row's own DID.
+    pub async fn upsert_peer(
+        &self,
+        did: &str,
+        http_url: &str,
+        authority: PeerWriteAuthority<'_>,
+    ) -> Result<()> {
         // Defense-in-depth at the DB boundary: both writers funnel through here
         // — the announce handler and the bootstrap announce-back in main.rs.
         // The latter has no announce-time check, so validating here is what
@@ -2142,6 +2219,89 @@ impl Db {
         // right after prune_non_public_peers cleaned it.
         if !crate::api::peers::is_public_http_url(http_url) {
             anyhow::bail!("refusing to register non-public peer http_url: {http_url}");
+        }
+        match authority {
+            // The proof has to name the row being written. Checking it here and
+            // not only in the announce handler is the whole point of putting
+            // the gate at this boundary: a caller could otherwise hold a valid
+            // signature for its own DID and spend it on someone else's row,
+            // which is RUSTSEC-2022-0009 exactly.
+            PeerWriteAuthority::Proven(proven) if proven != did => {
+                return Err(PeerWriteDenied::ProofDidMismatch {
+                    proven: proven.to_string(),
+                    target: did.to_string(),
+                }
+                .into());
+            }
+            // Only a DID whose verifying key resolves can ever authenticate:
+            // auth/mod.rs resolves the key from the keyid DID itself and
+            // rejects everything else. A row seeded here that cannot yield a
+            // key would therefore be unwritable by anyone forever, since no
+            // proof could ever satisfy the branch above, while still steering
+            // the sync origin resolve, the notify fan-out, and the public
+            // resolve route.
+            //
+            // The check is key derivability, NOT the method label. `Did`'s
+            // FromStr only runs validate(), which accepts key/web/gitlawb and
+            // never looks at the key material, so `did:key:notarealkey` passes
+            // is_did_key() and creates exactly the permanently uncorrectable
+            // row this gate exists to prevent. to_verifying_key() is the same
+            // resolution auth/mod.rs performs on the keyid.
+            //
+            // The refusal is split by cause, because methodNotSupported is only
+            // a true statement about a foreign method: a did:key whose key
+            // material does not resolve gets the resolution failure instead.
+            // Scoped to the INSERT, not to the DID. The check exists to stop a
+            // permanently uncorrectable row being CREATED; applied to a row that
+            // already exists it prevents nothing and freezes it instead. Before
+            // this gate, upsert_peer validated nothing and the handler accepted
+            // any parseable DID, so deployed tables hold did:web rows and
+            // did:key rows whose key never resolved. Judging the DID first made
+            // every one of those permanently unrefreshable: the unsigned
+            // announce is refused, and a signed one cannot exist because no key
+            // resolves. The row stays and keeps steering fan-out either way.
+            //
+            // The read-then-write race is benign: if a row appears in between,
+            // this write becomes an UPDATE and the UnprovenRepoint guard below
+            // still refuses any http_url change.
+            PeerWriteAuthority::Unproven
+                if !sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM peers WHERE did = $1)",
+                )
+                .bind(did)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(false) =>
+            {
+                match did.parse::<gitlawb_core::did::Did>() {
+                    // Only reachable from the bootstrap announce-back in main.rs,
+                    // which passes the contacted peer's raw JSON string; the
+                    // announce handler parses req.did before calling here.
+                    Err(e) => {
+                        return Err(PeerWriteDenied::UnresolvableDid {
+                            did: did.to_string(),
+                            reason: e.to_string(),
+                        }
+                        .into());
+                    }
+                    Ok(d) if !d.is_did_key() => {
+                        return Err(PeerWriteDenied::UnsupportedDidMethod {
+                            did: did.to_string(),
+                        }
+                        .into());
+                    }
+                    Ok(d) => {
+                        if let Err(e) = d.to_verifying_key() {
+                            return Err(PeerWriteDenied::UnresolvableDid {
+                                did: did.to_string(),
+                                reason: e.to_string(),
+                            }
+                            .into());
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
         let now = Utc::now().to_rfc3339();
         // A changed URL drops the reachability gate, so a repointed peer does
@@ -2174,22 +2334,61 @@ impl Db {
         // becomes externally visible. So this bounds the automatic inheritance
         // rather than closing the rewrite. Binding a DID to its first-seen
         // announcing key is what closes it: #273.
-        sqlx::query(
-            "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
-             VALUES ($1, $2, $3, FALSE, $3)
-             ON CONFLICT(did) DO UPDATE SET
-               http_url = $2,
-               last_seen = $3,
-               last_ping_ok = CASE
-                 WHEN peers.http_url IS DISTINCT FROM $2 THEN FALSE
-                 ELSE peers.last_ping_ok
-               END",
-        )
-        .bind(did)
-        .bind(http_url)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
+        //
+        // The two statements below differ only in what the conflict branch may
+        // touch. The proven one keeps the form above verbatim. The unproven one
+        // never assigns http_url at all and guards the whole DO UPDATE on the
+        // stored URL being byte-identical, so an unproven caller can refresh
+        // liveness and nothing else. last_ping_ok needs no CASE there, because
+        // the guard already restricts the branch to the URL-unchanged case the
+        // CASE would have preserved.
+        match authority {
+            PeerWriteAuthority::Proven(_) => {
+                sqlx::query(
+                    "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
+                     VALUES ($1, $2, $3, FALSE, $3)
+                     ON CONFLICT(did) DO UPDATE SET
+                       http_url = $2,
+                       last_seen = $3,
+                       last_ping_ok = CASE
+                         WHEN peers.http_url IS DISTINCT FROM $2 THEN FALSE
+                         ELSE peers.last_ping_ok
+                       END",
+                )
+                .bind(did)
+                .bind(http_url)
+                .bind(&now)
+                .execute(&self.pool)
+                .await?;
+            }
+            PeerWriteAuthority::Unproven => {
+                let rows = sqlx::query(
+                    "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
+                     VALUES ($1, $2, $3, FALSE, $3)
+                     ON CONFLICT(did) DO UPDATE SET
+                       last_seen = $3
+                     WHERE peers.http_url IS NOT DISTINCT FROM $2",
+                )
+                .bind(did)
+                .bind(http_url)
+                .bind(&now)
+                .execute(&self.pool)
+                .await?;
+                // A guarded ON CONFLICT DO UPDATE whose WHERE fails reports
+                // zero rows affected; it does NOT raise. So the refusal has to
+                // be derived from rows_affected, or the "an unproven repoint is
+                // an error, not a silent no-op" decision quietly becomes the
+                // no-op it was chosen to avoid. Zero rows here means exactly
+                // one thing, since the insert branch always affects a row: the
+                // DID exists and the announced URL is not the stored one.
+                if rows.rows_affected() == 0 {
+                    return Err(PeerWriteDenied::UnprovenRepoint {
+                        did: did.to_string(),
+                    }
+                    .into());
+                }
+            }
+        }
         Ok(())
     }
 
@@ -6111,10 +6310,12 @@ mod ref_update_db_tests {
 
 #[cfg(test)]
 mod peer_reachability_tests {
-    use super::Db;
+    use super::{Db, PeerWriteAuthority};
     use sqlx::PgPool;
 
-    const VICTIM_DID: &str = "did:key:z6MkvictimPeerFixture";
+    // Real derivable did:key fixtures. The unproven arm resolves the verifying
+    // key, so a made-up method-id is refused before any SQL runs.
+    const VICTIM_DID: &str = "did:key:z6Mkrmsd28nDTPBjk55EJCSjtJLVJDZffyczjBEHvywhutM4";
     const HONEST_URL: &str = "https://honest-peer.example.com";
     const ATTACKER_URL: &str = "https://attacker.example.com";
 
@@ -6155,7 +6356,9 @@ mod peer_reachability_tests {
     /// Seed a peer that has earned reachability, asserting the seed took so a
     /// later case cannot pass vacuously on a row that was never written.
     async fn seed_reachable(db: &Db) {
-        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
         db.mark_peer_ping(VICTIM_DID, true).await.unwrap();
         assert_eq!(
             peer(db, VICTIM_DID).await,
@@ -6172,7 +6375,16 @@ mod peer_reachability_tests {
         let db = db(pool).await;
         seed_reachable(&db).await;
 
-        db.upsert_peer(VICTIM_DID, ATTACKER_URL).await.unwrap();
+        // Proven: the repoint is the row's own key announcing a new host, which
+        // is the case #270's reset is about. An unproven repoint is refused
+        // outright now, so it cannot express this property.
+        db.upsert_peer(
+            VICTIM_DID,
+            ATTACKER_URL,
+            PeerWriteAuthority::Proven(VICTIM_DID),
+        )
+        .await
+        .unwrap();
 
         let (url, reachable) = peer(&db, VICTIM_DID).await;
         assert_eq!(url, ATTACKER_URL, "the URL should still be rewritten");
@@ -6190,7 +6402,9 @@ mod peer_reachability_tests {
         let db = db(pool).await;
         seed_reachable(&db).await;
 
-        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
 
         let (url, reachable) = peer(&db, VICTIM_DID).await;
         assert_eq!(url, HONEST_URL);
@@ -6208,10 +6422,14 @@ mod peer_reachability_tests {
     #[sqlx::test]
     async fn same_url_reannounce_does_not_grant_reachability(pool: PgPool) {
         let db = db(pool).await;
-        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
         assert_eq!(peer(&db, VICTIM_DID).await, (HONEST_URL.to_string(), false));
 
-        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
 
         let (_, reachable) = peer(&db, VICTIM_DID).await;
         assert!(
@@ -6226,11 +6444,19 @@ mod peer_reachability_tests {
     async fn fresh_peer_inserts_unreachable(pool: PgPool) {
         let db = db(pool).await;
 
-        db.upsert_peer("did:key:z6MkfreshPeerFixture", HONEST_URL)
-            .await
-            .unwrap();
+        db.upsert_peer(
+            "did:key:z6MkfGVENKztfeXa631WYVqyAGaXeP8AnN6nTkfogHn9vaaQ",
+            HONEST_URL,
+            PeerWriteAuthority::Unproven,
+        )
+        .await
+        .unwrap();
 
-        let (_, reachable) = peer(&db, "did:key:z6MkfreshPeerFixture").await;
+        let (_, reachable) = peer(
+            &db,
+            "did:key:z6MkfGVENKztfeXa631WYVqyAGaXeP8AnN6nTkfogHn9vaaQ",
+        )
+        .await;
         assert!(!reachable, "a never-probed peer must insert unreachable");
     }
 
@@ -6245,7 +6471,13 @@ mod peer_reachability_tests {
         seed_reachable(&db).await;
 
         let with_slash = format!("{HONEST_URL}/");
-        db.upsert_peer(VICTIM_DID, &with_slash).await.unwrap();
+        db.upsert_peer(
+            VICTIM_DID,
+            &with_slash,
+            PeerWriteAuthority::Proven(VICTIM_DID),
+        )
+        .await
+        .unwrap();
 
         let (url, reachable) = peer(&db, VICTIM_DID).await;
         assert_eq!(url, with_slash);
@@ -6262,16 +6494,657 @@ mod peer_reachability_tests {
     #[sqlx::test]
     async fn same_url_reannounce_still_advances_last_seen(pool: PgPool) {
         let db = db(pool).await;
-        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
         let first = last_seen(&db, VICTIM_DID).await;
 
-        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
 
         let second = last_seen(&db, VICTIM_DID).await;
         assert!(
             second > first,
             "a same-URL re-announce is a liveness signal and must still \
              advance last_seen: {first} then {second}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod peer_authority_tests {
+    use super::{Db, PeerWriteAuthority, PeerWriteDenied};
+    use sqlx::PgPool;
+
+    // Real derivable did:key fixtures. The unproven arm resolves the verifying
+    // key, so a made-up method-id is refused before any SQL runs.
+    const VICTIM_DID: &str = "did:key:z6MkuMqUm4i228K9qXidJ57zqSWAcQLgrcbMxB8RKVLuqitj";
+    const OTHER_DID: &str = "did:key:z6MkuzEVwHSWSCLq6xAkgTAJxHMa24KuBtgozce77TEihnWD";
+    const WEB_DID: &str = "did:web:squatter.example.com";
+    const HONEST_URL: &str = "https://honest-peer.example.com";
+    const ATTACKER_URL: &str = "https://attacker.example.com";
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    /// The whole row, read back through `list_peers` rather than raw SQL, so a
+    /// case that claims "unchanged" is comparing every column a consumer sees.
+    async fn row(db: &Db, did: &str) -> Option<(String, String, Option<String>, bool, String)> {
+        db.list_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.did == did)
+            .map(|p| {
+                (
+                    p.did,
+                    p.http_url,
+                    p.last_seen,
+                    p.last_ping_ok,
+                    p.announced_at,
+                )
+            })
+    }
+
+    /// Seed a row and assert the seed took, so no case below can pass
+    /// vacuously against a row that was never written.
+    async fn seed(db: &Db) -> (String, String, Option<String>, bool, String) {
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
+        db.mark_peer_ping(VICTIM_DID, true).await.unwrap();
+        let seeded = row(db, VICTIM_DID).await.expect("seed did not take");
+        assert_eq!(seeded.1, HONEST_URL, "seed did not take");
+        assert!(seeded.3, "seed did not earn reachability");
+        seeded
+    }
+
+    fn denial(err: anyhow::Error) -> PeerWriteDenied {
+        err.downcast::<PeerWriteDenied>()
+            .expect("rejection must be the typed denial, or the handler renders it as a 500")
+    }
+
+    /// A row a deployed database ALREADY holds must keep refreshing its
+    /// liveness. Before this gate existed `upsert_peer` did no DID validation
+    /// at all and the handler accepted any parseable DID, so live peer tables
+    /// carry did:web rows and did:key rows whose key never resolved. Judging
+    /// the DID before looking at whether the row exists freezes those forever:
+    /// the unsigned refresh is refused, and a signed one is impossible because
+    /// no key resolves. Nothing is protected by that, since the row is already
+    /// there and an identical-URL refresh changes no authority. Kills a gate
+    /// scoped to the DID instead of to the INSERT.
+    #[sqlx::test]
+    async fn a_legacy_row_can_still_refresh_its_liveness(pool: PgPool) {
+        let db = db(pool).await;
+
+        for legacy in [WEB_DID, "did:key:znotarealkeymaterial"] {
+            sqlx::query(
+                "INSERT INTO peers (did, http_url, last_seen, announced_at) \
+                 VALUES ($1, $2, $3, $3)",
+            )
+            .bind(legacy)
+            .bind(HONEST_URL)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&db.pool)
+            .await
+            .expect("seeding a pre-gate row must succeed");
+
+            db.upsert_peer(legacy, HONEST_URL, PeerWriteAuthority::Unproven)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("a legacy row must keep refreshing its liveness: {legacy} -> {e}")
+                });
+        }
+    }
+
+    /// The other half: the gate still refuses to CREATE such a row. Without
+    /// this, scoping the check to the insert path could be satisfied by
+    /// dropping the check altogether.
+    #[sqlx::test]
+    async fn a_legacy_did_still_cannot_be_created_fresh(pool: PgPool) {
+        let db = db(pool).await;
+
+        let err = db
+            .upsert_peer(WEB_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .expect_err("an unseen non-did:key must still be refused at insert");
+        assert!(
+            matches!(denial(err), PeerWriteDenied::UnsupportedDidMethod { .. }),
+            "the insert refusal must survive the insert-scoping"
+        );
+    }
+
+    /// Discovery stays open: an unproven caller may still seed an unseen
+    /// did:key row. Kills a gate widened until it rejects inserts too.
+    #[sqlx::test]
+    async fn unproven_insert_of_an_unseen_did_key_is_allowed(pool: PgPool) {
+        let db = db(pool).await;
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
+
+        let (_, url, last_seen, reachable, _) = row(&db, VICTIM_DID).await.expect("row missing");
+        assert_eq!(url, HONEST_URL);
+        assert!(last_seen.is_some());
+        assert!(!reachable, "a never-probed peer must insert unreachable");
+    }
+
+    /// The defect this change exists to close. Kills the unconditional
+    /// `ON CONFLICT(did) DO UPDATE SET http_url = $2`.
+    #[sqlx::test]
+    async fn unproven_repoint_of_an_existing_row_is_rejected(pool: PgPool) {
+        let db = db(pool).await;
+        let before = seed(&db).await;
+
+        let err = db
+            .upsert_peer(VICTIM_DID, ATTACKER_URL, PeerWriteAuthority::Unproven)
+            .await
+            .expect_err("an unproven repoint must be an error, never a silent no-op");
+
+        assert!(
+            matches!(denial(err), PeerWriteDenied::UnprovenRepoint { .. }),
+            "the denial must be the typed repoint refusal"
+        );
+        assert_eq!(
+            row(&db, VICTIM_DID).await.expect("row vanished"),
+            before,
+            "the stored row must be byte-identical after a refused repoint"
+        );
+    }
+
+    /// Honest peers re-announce, so the identical-URL case is a liveness
+    /// refresh, not a denial. The URL string is reused byte for byte: the
+    /// comparison inherited from #270 is exact, so a trailing slash would make
+    /// this pass as a repoint rejection instead. Kills a too-wide gate.
+    #[sqlx::test]
+    async fn unproven_reannounce_of_the_identical_url_refreshes_last_seen(pool: PgPool) {
+        let db = db(pool).await;
+        let before = seed(&db).await;
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .expect("an identical-URL re-announce cannot change the URL, so it is allowed");
+
+        let after = row(&db, VICTIM_DID).await.expect("row vanished");
+        assert_eq!(after.1, HONEST_URL, "URL untouched");
+        assert_eq!(after.3, before.3, "reachability untouched");
+        assert_eq!(after.4, before.4, "announced_at untouched");
+        let parse = |s: &Option<String>| {
+            chrono::DateTime::parse_from_rfc3339(s.as_deref().expect("last_seen is set")).unwrap()
+        };
+        assert!(
+            parse(&after.2) > parse(&before.2),
+            "a same-URL re-announce is a liveness signal and must advance last_seen"
+        );
+    }
+
+    /// A signed repoint from the row's own key is the allowed case, and it must
+    /// still clear reachability per #270: a proven repoint is still an unprobed
+    /// URL. Kills a gate that rejects proven writes, and kills dropping the
+    /// #270 CASE.
+    #[sqlx::test]
+    async fn proven_repoint_by_the_rows_own_did_updates_and_clears_reachability(pool: PgPool) {
+        let db = db(pool).await;
+        seed(&db).await;
+
+        db.upsert_peer(
+            VICTIM_DID,
+            ATTACKER_URL,
+            PeerWriteAuthority::Proven(VICTIM_DID),
+        )
+        .await
+        .unwrap();
+
+        let (_, url, _, reachable, _) = row(&db, VICTIM_DID).await.expect("row missing");
+        assert_eq!(url, ATTACKER_URL, "a proven repoint must land");
+        assert!(
+            !reachable,
+            "a repointed peer must re-earn reachability, even when the repoint is signed"
+        );
+    }
+
+    /// The RUSTSEC-2022-0009 shape at the boundary: a valid proof of control
+    /// over one DID must not authorize a write to a different DID's row. Kills
+    /// a bare proven/unproven flag that never checks WHICH DID was proven, and
+    /// kills neutralizing the boundary's comparison.
+    #[sqlx::test]
+    async fn proof_of_another_did_cannot_write_this_row(pool: PgPool) {
+        let db = db(pool).await;
+        let before = seed(&db).await;
+
+        let err = db
+            .upsert_peer(
+                VICTIM_DID,
+                ATTACKER_URL,
+                PeerWriteAuthority::Proven(OTHER_DID),
+            )
+            .await
+            .expect_err("a proof naming another DID must not authorize this row");
+
+        assert!(
+            matches!(denial(err), PeerWriteDenied::ProofDidMismatch { .. }),
+            "the denial must name the proof/target mismatch"
+        );
+        assert_eq!(
+            row(&db, VICTIM_DID).await.expect("row vanished"),
+            before,
+            "the stored row must be byte-identical after a mismatched proof"
+        );
+    }
+
+    /// Signed first contact must not regress: a proven write for an unseen DID
+    /// still inserts.
+    #[sqlx::test]
+    async fn proven_insert_of_an_unseen_did_is_allowed(pool: PgPool) {
+        let db = db(pool).await;
+
+        db.upsert_peer(
+            VICTIM_DID,
+            HONEST_URL,
+            PeerWriteAuthority::Proven(VICTIM_DID),
+        )
+        .await
+        .unwrap();
+
+        let (_, url, _, reachable, _) = row(&db, VICTIM_DID).await.expect("row missing");
+        assert_eq!(url, HONEST_URL);
+        assert!(!reachable, "a never-probed peer must insert unreachable");
+    }
+
+    /// R8. A DID whose method can never authenticate is refused in the
+    /// validation class, with nothing written. Kills a method gate applied only
+    /// to the update path. This case is about the METHOD LABEL alone, which is
+    /// the one thing methodNotSupported can truthfully say; a did:key whose key
+    /// material does not resolve is a different refusal and is covered by the
+    /// unresolvable tests below, so it is deliberately not in this loop.
+    #[sqlx::test]
+    async fn unproven_insert_of_a_non_did_key_is_rejected(pool: PgPool) {
+        let db = db(pool).await;
+
+        for did in [WEB_DID, "did:gitlawb:z6MkSomeKey"] {
+            let err = db
+                .upsert_peer(did, HONEST_URL, PeerWriteAuthority::Unproven)
+                .await
+                .expect_err("a DID method that can never authenticate must not be insertable");
+
+            let denied = denial(err);
+            assert!(
+                matches!(denied, PeerWriteDenied::UnsupportedDidMethod { .. }),
+                "the denial must be the typed method refusal: {did}"
+            );
+            assert!(
+                denied
+                    .to_string()
+                    .contains("methodNotSupported: only did:key peers"),
+                "the denial must name the unsupported method"
+            );
+            assert!(
+                row(&db, did).await.is_none(),
+                "a rejected announce must leave no row behind: {did}"
+            );
+        }
+    }
+
+    /// The oversized method-id is refused ahead of the quadratic base58 decode,
+    /// and the caller is told THAT, not that did:key is unsupported. Kills
+    /// folding the key-resolution failure back into the method class.
+    #[sqlx::test]
+    async fn unproven_insert_of_an_oversized_did_key_reports_the_cause(pool: PgPool) {
+        let db = db(pool).await;
+        let did = format!("did:key:z{}", "a".repeat(70));
+
+        let err = db
+            .upsert_peer(&did, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .expect_err("a did:key whose key cannot be resolved must not be insertable");
+
+        let denied = denial(err);
+        assert!(
+            matches!(denied, PeerWriteDenied::UnresolvableDid { .. }),
+            "the denial must be the typed resolution refusal"
+        );
+        let denied = denied.to_string();
+        assert!(
+            denied.contains("cannot resolve DID"),
+            "an unresolvable did:key must report resolution, not method support, got {denied:?}"
+        );
+        assert!(
+            denied.contains("method-specific id too long"),
+            "the denial must carry the underlying cause, got {denied:?}"
+        );
+        assert!(
+            row(&db, &did).await.is_none(),
+            "a rejected announce must leave no row behind: {did}"
+        );
+    }
+
+    /// The remaining resolution failures, one input class per entry, each
+    /// pinned to its own cause. The multibase entry asserts only the class
+    /// message: its sub-reason is multibase's own Display and a dependency bump
+    /// can reword it.
+    #[sqlx::test]
+    async fn unproven_insert_of_an_unresolvable_did_key_reports_the_cause(pool: PgPool) {
+        let db = db(pool).await;
+
+        // "0" is not in the base58btc alphabet, so the decode itself fails.
+        // "notarealkey" carries the right method label and no decodable key,
+        // which is the permanently uncorrectable row this gate prevents.
+        // The secp256k1 vector is the W3C did:key test vector: it decodes
+        // cleanly and is simply not an ed25519 key.
+        // The wrong-length vector is base58btc(0xed 0x01 || sixteen bytes
+        // 0x00..0x0f) with the multibase 'z' prefix: the right multicodec, half
+        // the key.
+        for (did, cause) in [
+            ("did:key:z0", None),
+            ("did:key:notarealkey", None),
+            (
+                "did:key:zQ3shokFTS3brHcDQrn82RUDfCZESWL1ZdCEJwekUDPQiYBme",
+                Some("not an ed25519 multicodec key"),
+            ),
+            (
+                "did:key:zAq9r99PUfP1Xyitb5n8V9sxht",
+                Some("ed25519 key must be 32 bytes"),
+            ),
+        ] {
+            let err = db
+                .upsert_peer(did, HONEST_URL, PeerWriteAuthority::Unproven)
+                .await
+                .expect_err("a did:key whose key cannot be resolved must not be insertable");
+
+            let denied = denial(err);
+            assert!(
+                matches!(denied, PeerWriteDenied::UnresolvableDid { .. }),
+                "the denial must be the typed resolution refusal: {did}"
+            );
+            let denied = denied.to_string();
+            assert!(
+                denied.contains("cannot resolve DID"),
+                "an unresolvable did:key must report resolution, not method support: \
+                 {did} got {denied:?}"
+            );
+            if let Some(cause) = cause {
+                assert!(
+                    denied.contains(cause),
+                    "the denial must carry the underlying cause {cause:?}: {did} got {denied:?}"
+                );
+            }
+            assert!(
+                row(&db, did).await.is_none(),
+                "a rejected announce must leave no row behind: {did}"
+            );
+        }
+    }
+
+    /// The bootstrap announce-back in main.rs hands this boundary the contacted
+    /// peer's raw JSON string, so a value that never parses as a DID reaches
+    /// here; the announce handler cannot produce it, since it parses req.did
+    /// first. The parse error is what an operator reading that loop's warning
+    /// needs, and methodNotSupported would be a false claim about a string that
+    /// names no method at all.
+    #[sqlx::test]
+    async fn unproven_insert_of_an_unparseable_string_reports_the_parse_failure(pool: PgPool) {
+        let db = db(pool).await;
+
+        for (did, cause) in [
+            ("not-a-did", "does not start with 'did:'"),
+            ("did:foo:x", "unsupported DID method: foo"),
+        ] {
+            let err = db
+                .upsert_peer(did, HONEST_URL, PeerWriteAuthority::Unproven)
+                .await
+                .expect_err("a string that is not a DID must not be insertable");
+
+            let denied = denial(err);
+            assert!(
+                matches!(denied, PeerWriteDenied::UnresolvableDid { .. }),
+                "the denial must be the typed resolution refusal: {did}"
+            );
+            let denied = denied.to_string();
+            assert!(
+                denied.contains("cannot resolve DID"),
+                "an unparseable DID must report resolution, not method support: \
+                 {did} got {denied:?}"
+            );
+            assert!(
+                denied.contains(cause),
+                "the denial must carry the parse failure {cause:?}: {did} got {denied:?}"
+            );
+            assert!(
+                row(&db, did).await.is_none(),
+                "a rejected announce must leave no row behind: {did}"
+            );
+        }
+    }
+}
+
+/// #273 completeness ledger: every writer of the `peers` table.
+///
+/// The required set is derived from the authority that DEFINES membership, the
+/// write statements themselves, not from the set of `upsert_peer` callers. A
+/// caller scan is structurally blind to a future writer that issues its own SQL
+/// and bypasses `upsert_peer`, which is precisely the case the type system
+/// cannot see.
+///
+/// The type system carries the real weight: `upsert_peer`'s authority parameter
+/// has no default, so a new caller cannot omit its declaration, compile-enforced
+/// and exhaustive by construction. This scan is the backstop for the bypass case
+/// alone, which is why it is one equality assertion rather than a framework.
+///
+/// The ledger, one row per function that writes the table:
+///
+/// | Writer | Disposition |
+/// | --- | --- |
+/// | `upsert_peer` (db/mod.rs) | guarded by the authority parameter |
+/// | `mark_peer_ping` (db/mod.rs) | benign for `http_url`: it writes only `last_seen` and `last_ping_ok`. It IS the table's other production writer, and its unauthenticated reachability is tracked separately as issue #269 |
+/// | `prune_self_peers` (db/mod.rs) | a delete keyed on `http_url`; cannot repoint; boot-only caller in main.rs |
+/// | `prune_non_public_peers` (db/mod.rs) | a delete keyed on a computed bad-DID array; cannot repoint; boot-only caller in main.rs |
+/// | `seed_local_peer` (sync.rs) | excluded by test-module location: a deliberate `upsert_peer` bypass for `file://` fixtures, which the public-URL gate rejects |
+/// | `a_legacy_row_can_still_refresh_its_liveness` (db/mod.rs) | test-only. Seeds a PRE-GATE row by raw SQL on purpose: `upsert_peer` cannot create one, since the gate it is testing refuses exactly that DID. The fixture models what a deployed table already holds |
+///
+/// And the `upsert_peer` CALL-SITE authority table, which the ledger above
+/// structurally cannot hold, because the bootstrap site issues no SQL of its own
+/// and therefore can never appear in a scan of write statements:
+///
+/// | Call site | Authority declared |
+/// | --- | --- |
+/// | api/peers.rs (announce) | proven if and only if the `AuthenticatedDid` extension is present, carrying that extension's DID |
+/// | main.rs (bootstrap announce-back) | unproven, unconditionally. Reasoned-not-run: no runtime test reaches that site in this change |
+#[cfg(test)]
+mod peers_table_writer_guard {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    /// The per-file scan, split out so the multi-line-SQL property can be
+    /// asserted against a synthetic source rather than only against the real
+    /// tree, which happens to contain no multi-line peers write today. A guard
+    /// whose blind spot is invisible because the tree does not currently
+    /// exercise it is one that fails the moment somebody writes normal code.
+    fn scan_source(src: &str) -> BTreeMap<String, usize> {
+        let needles: Vec<String> = needles().iter().map(|n| n.to_lowercase()).collect();
+        let mut found: BTreeMap<String, usize> = BTreeMap::new();
+        // Normalize the WHOLE file before matching, not each line on its
+        // own. Per-line `contains` is whitespace- and case-sensitive, so
+        // `sqlx::query(r#"UPDATE\n  peers SET ..."#)` walked straight past
+        // it, and that multi-line form is how the longer queries in this
+        // file are already written. Verified both ways: the single-line
+        // bypass went RED, the identical statement split across lines
+        // stayed GREEN. Offsets are mapped back to line numbers so each
+        // statement is still attributed to the function that issues it.
+        let mut flat = String::with_capacity(src.len());
+        let mut starts: Vec<(usize, usize)> = Vec::new(); // (offset, line index)
+        for (idx, line) in src.lines().enumerate() {
+            starts.push((flat.len(), idx));
+            flat.push_str(&line.trim().to_lowercase());
+            flat.push(' ');
+        }
+        let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // Re-derive offsets against the collapsed text by walking it once.
+        let mut collapsed = String::with_capacity(flat.len());
+        let mut owners: Vec<usize> = Vec::new(); // line index per byte
+        for (idx, line) in src.lines().enumerate() {
+            for tok in line.trim().to_lowercase().split_whitespace() {
+                if !collapsed.is_empty() {
+                    collapsed.push(' ');
+                    owners.push(idx);
+                }
+                for _ in 0..tok.len() {
+                    owners.push(idx);
+                }
+                collapsed.push_str(tok);
+            }
+        }
+
+        let fn_at: Vec<&str> = {
+            let mut current = "<module level>";
+            src.lines()
+                .map(|line| {
+                    if let Some(name) = declared_fn(line) {
+                        current = name;
+                    }
+                    current
+                })
+                .collect()
+        };
+
+        for needle in &needles {
+            let mut from = 0usize;
+            while let Some(rel) = collapsed[from..].find(needle.as_str()) {
+                let at = from + rel;
+                let line_idx = owners.get(at).copied().unwrap_or(0);
+                let owner = fn_at.get(line_idx).copied().unwrap_or("<module level>");
+                *found.entry(owner.to_string()).or_default() += 1;
+                from = at + needle.len();
+            }
+        }
+        found
+    }
+
+    /// Each dispositioned writer and the number of statements it issues against
+    /// the table. Bidirectional: an undispositioned hit fails, and so does a
+    /// listed function that no longer has one.
+    const LEDGER: &[(&str, usize)] = &[
+        ("a_legacy_row_can_still_refresh_its_liveness", 1),
+        ("mark_peer_ping", 1),
+        ("prune_non_public_peers", 1),
+        ("prune_self_peers", 1),
+        ("seed_local_peer", 1),
+        ("upsert_peer", 2),
+    ];
+
+    /// Assembled at runtime rather than written as literals, so this module's
+    /// own source does not match the scan it performs.
+    fn needles() -> Vec<String> {
+        ["INSERT INTO ", "UPDATE ", "DELETE FROM "]
+            .iter()
+            .map(|verb| format!("{verb}peers"))
+            .collect()
+    }
+
+    fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("the crate source tree must be readable") {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The function a line declares, if it declares one.
+    fn declared_fn(line: &str) -> Option<&str> {
+        let trimmed = line.trim_start();
+        let rest = [
+            "pub(crate) async fn ",
+            "pub(crate) fn ",
+            "pub async fn ",
+            "pub fn ",
+            "async fn ",
+            "fn ",
+        ]
+        .iter()
+        .find_map(|p| trimmed.strip_prefix(p))?;
+        rest.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .next()
+            .filter(|name| !name.is_empty())
+    }
+
+    /// The backstop the authority parameter cannot provide: a new raw write
+    /// against the table from outside `upsert_peer` is invisible to the type
+    /// system, so it is caught here or not at all.
+    /// The blind spot this guard shipped with: matching a verb-plus-table needle
+    /// per line is whitespace- and case-sensitive, so the identical statement split
+    /// across lines walked past it. That form is how the longer queries in this
+    /// file are already written, so it is the shape a future writer most likely
+    /// takes. Both directions asserted, plus lowercase.
+    ///
+    /// The fixtures are DERIVED from `needles()` at runtime for the same reason
+    /// the needles themselves are: a literal here would be found by the scan of
+    /// this very file and counted against this test function. Deriving them
+    /// also means the test follows if the needle set ever changes.
+    #[test]
+    fn the_scan_sees_a_write_whose_verb_and_table_are_on_different_lines() {
+        for needle in needles() {
+            let (verb, table) = needle.rsplit_once(' ').expect("a needle is '<VERB> peers'");
+            let cases = [
+                ("single-line", format!("{verb} {table} SET x = $1")),
+                (
+                    "split across lines",
+                    format!("{verb}\n             {table}\n             SET x = $1"),
+                ),
+                (
+                    "lowercase, double-spaced",
+                    format!("{}  {} set x = $1", verb.to_lowercase(), table),
+                ),
+            ];
+            for (label, sql) in cases {
+                let src = format!("fn sneaky() {{\n    sqlx::query(\"{sql}\");\n}}\n");
+                let found = scan_source(&src);
+                assert_eq!(
+                    found.get("sneaky").copied(),
+                    Some(1),
+                    "the scan missed a peers write written {label} with needle {needle:?}: {found:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_peers_table_write_is_dispositioned() {
+        let mut files = Vec::new();
+        rust_sources(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        // Anti-vacuity: a scrape that walked nothing would report a clean tree.
+        assert!(
+            files.len() > 10,
+            "the scan found only {} source files, so a clean result proves nothing",
+            files.len()
+        );
+
+        let mut found: BTreeMap<String, usize> = BTreeMap::new();
+        for file in &files {
+            let src = std::fs::read_to_string(file).expect("source file must be readable");
+
+            for (owner, n) in scan_source(&src) {
+                *found.entry(owner).or_default() += n;
+            }
+        }
+
+        let expected: BTreeMap<String, usize> =
+            LEDGER.iter().map(|(f, n)| ((*f).to_string(), *n)).collect();
+        assert_eq!(
+            found, expected,
+            "the peers-table writers no longer match the ledger. A new writer must \
+             be dispositioned in the table above (and gated), and a removed one \
+             dropped from LEDGER"
         );
     }
 }

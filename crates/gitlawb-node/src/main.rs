@@ -994,8 +994,33 @@ async fn gossip_task(
                             json.get("node_url").and_then(|v| v.as_str()),
                         ) {
                             if !their_url.is_empty() {
-                                let _ = state.db.upsert_peer(their_did, their_url).await;
-                                tracing::info!(did = %their_did, url = %their_url, "bootstrap peer added");
+                                // Unproven, unconditionally: their_did and
+                                // their_url come straight out of the contacted
+                                // peer's JSON response body, with no signature
+                                // and no proof the claimed DID belongs to the
+                                // peer we reached. This path therefore seeds
+                                // new peers and can never repoint an existing
+                                // row. The upsert's result is matched rather
+                                // than discarded, because "bootstrap peer
+                                // added" printed over a refused write is a
+                                // denial rendering as success. Non-fatal to the
+                                // loop either way.
+                                match state
+                                    .db
+                                    .upsert_peer(
+                                        their_did,
+                                        their_url,
+                                        db::PeerWriteAuthority::Unproven,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        tracing::info!(did = %their_did, url = %their_url, "bootstrap peer added")
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(did = %their_did, url = %their_url, err = %e, "bootstrap peer announce-back rejected")
+                                    }
+                                }
                             }
                         }
                     }
