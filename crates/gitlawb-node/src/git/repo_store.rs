@@ -1019,11 +1019,21 @@ impl RepoWriteGuard {
                     }
                     None => {
                         // Timed out is UNKNOWABLE, not failed: the PUT may well
-                        // have landed, so there is deliberately no compensating
-                        // action. The lock releases either way, so the repo is not
-                        // wedged behind a stalled transfer. The tradeoff is a narrow
-                        // last-writer-wins window if the slow PUT lands after
-                        // another writer takes the lock.
+                        // still land after this returns, so there is deliberately
+                        // no compensating action here. The lock is released
+                        // normally regardless. Holding it would fence nothing,
+                        // because `release` takes `mut self`: the guard drops the
+                        // moment this function returns and `Drop` closes the
+                        // session, so the lock would free within milliseconds
+                        // either way. What actually protects a successor from a
+                        // late publish is the conditional PUT on the upload, not
+                        // the lifetime of this lock.
+                        warn!(
+                            repo = %self.repo_name,
+                            "release upload exceeded its bound; the PUT may still land, so the \
+                             outcome is unknowable and the conditional upload is what keeps a \
+                             late publish from overwriting a successor's archive"
+                        );
                     }
                 }
             }
@@ -3238,6 +3248,122 @@ mod tests {
         let _ = owner_slug;
 
         server.abort();
+    }
+
+    /// Build a store whose release-side upload lands on `mock` and gives up
+    /// after 200ms, so a parked PUT reliably exceeds the bound. One lock-pool
+    /// connection on purpose: with a single slot the backend pid is a direct
+    /// observable for whether `release` pooled its session or closed it.
+    async fn timed_out_upload_store(
+        mock: &S3Mock,
+        opts: &sqlx::postgres::PgConnectOptions,
+        repos_dir: &str,
+    ) -> RepoStore {
+        RepoStore::new(
+            PathBuf::from(repos_dir),
+            Some(TigrisClient::for_testing_with_endpoint(
+                "test-bucket",
+                mock.endpoint(),
+            )),
+            no_reap_pool(opts, 1).await,
+            std::time::Duration::from_millis(200),
+        )
+    }
+
+    /// Seed the minimum bare-repo shape so the upload has something to archive.
+    fn seed_bare_repo(path: &Path) {
+        std::fs::create_dir_all(path.join("objects/info")).unwrap();
+        std::fs::create_dir_all(path.join("refs/heads")).unwrap();
+        std::fs::write(path.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
+    /// A timed-out release upload must still unlock on its OWN session and hand
+    /// that session back to the pool. The timeout says nothing about the lock:
+    /// holding it cannot fence a late PUT (`release` takes `mut self`, so the
+    /// guard drops and `Drop` frees the session the moment `release` returns),
+    /// and what actually protects a successor is the conditional PUT.
+    ///
+    /// Observable: the backend pid. On a one-connection pool a session that was
+    /// closed forces the next checkout onto a fresh backend, while a confirmed
+    /// unlock returns the same one. So an equal pid is the proof that the unlock
+    /// ran, returned true, and the connection was pooled rather than torn down.
+    #[sqlx::test]
+    async fn timed_out_release_upload_unlocks_on_its_own_session(pool: PgPool) {
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let store = timed_out_upload_store(&mock, &opts, "/tmp/gitlawb-u4-timeout-session").await;
+
+        let mut guard = store
+            .acquire_write("did:key:z6MkU4TimeoutSess", "timedrepo")
+            .await
+            .expect("acquire");
+        seed_bare_repo(&guard.local_path);
+        let pid_before = guard.backend_pid_for_test().await;
+
+        // Park the upload so it is still in flight when the 200ms bound fires.
+        mock.park_next_put();
+        guard.release(true).await;
+        assert_eq!(
+            mock.put_attempts().len(),
+            1,
+            "the release upload must have reached the mock and parked, got {:?}",
+            mock.put_attempts()
+        );
+
+        let pid_after = {
+            let mut c = store.lock_pool.acquire().await.unwrap();
+            let pid: (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
+                .fetch_one(&mut *c)
+                .await
+                .unwrap();
+            pid.0
+        };
+        assert_eq!(
+            pid_before, pid_after,
+            "a timed-out upload must not change the unlock decision: the guard must \
+             unlock on its own session and return that connection to the pool, so the \
+             next checkout lands on the same backend"
+        );
+
+        mock.open_gate();
+        mock.shutdown();
+    }
+
+    /// Admission after the same timed-out upload: a successor must be let in
+    /// promptly. Useful as a property, but it is NOT what pins the removal of
+    /// the skip-unlock branch, because the lock frees within milliseconds under
+    /// either shape (the session closes as soon as `release` returns).
+    #[sqlx::test]
+    async fn successor_is_admitted_promptly_after_a_timed_out_release(pool: PgPool) {
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let store = timed_out_upload_store(&mock, &opts, "/tmp/gitlawb-u4-timeout-admit")
+            .await
+            .with_lock_acquire_deadline(std::time::Duration::from_secs(10));
+
+        let guard = store
+            .acquire_write("did:key:z6MkU4TimeoutAdmit", "timedrepo")
+            .await
+            .expect("acquire");
+        seed_bare_repo(&guard.local_path);
+
+        mock.park_next_put();
+        guard.release(true).await;
+
+        let started = std::time::Instant::now();
+        let successor = store
+            .acquire_write("did:key:z6MkU4TimeoutAdmit", "timedrepo")
+            .await
+            .expect("a successor must be admitted after a timed-out release");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the successor waited {}ms; a timed-out upload must not park the next writer",
+            started.elapsed().as_millis()
+        );
+        successor.release(false).await;
+
+        mock.open_gate();
+        mock.shutdown();
     }
 
     /// P2: the lock-acquire deadline must bound EVERY await in the retry loop,
