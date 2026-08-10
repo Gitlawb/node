@@ -318,4 +318,13 @@ mod tests {
             })
         );
     }
+
+    /// #251: bare `?` on anyhow-wrapped sqlx relies on this downcast so a
+    /// closed pool becomes 503 `db_unavailable`, not 500 `internal_error`.
+    #[test]
+    fn pool_closed_via_anyhow_from_is_503_db_unavailable() {
+        let err: AppError = anyhow::Error::from(sqlx::Error::PoolClosed).into();
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 }
