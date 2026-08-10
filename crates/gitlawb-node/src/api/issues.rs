@@ -239,27 +239,32 @@ pub async fn close_issue(
         // Not the owner, so the author fallback decides it, and the author lives in
         // the issue's git-JSON blob rather than a DB column.
         //
-        // Read it WITHOUT the write lock. The justification is NOT that authorship
-        // is immutable — it is not: `refs/gitlawb/**` is pushable, so a forged
-        // author blob can be pushed (tracked separately; it is what makes this
-        // fallback only as trustworthy as push authorization). The justification is
-        // that this read is only a PRE-CHECK, deciding whether to take the lock at
-        // all. It is NOT the authorization decision: `acquire_write` re-downloads the
-        // archive after locking, so the tree that gets mutated is routinely not this
-        // one, and the authoritative owner-or-author check runs again under the guard
-        // below. Refusing here early just keeps a caller who is already visibly
+        // Read it WITHOUT the write lock, from a NON-MUTATING SNAPSHOT. The
+        // justification is NOT that authorship is immutable — it is not:
+        // `refs/gitlawb/**` is pushable, so a forged author blob can be pushed
+        // (tracked separately; it is what makes this fallback only as trustworthy
+        // as push authorization). The justification is that this read is only a
+        // PRE-CHECK, deciding whether to take the lock at all. It is NOT the
+        // authorization decision: `acquire_write` re-downloads the archive after
+        // locking, so the tree that gets mutated is routinely not this one, and the
+        // authoritative owner-or-author check runs again under the guard below.
+        // Refusing here early just keeps a caller who is already visibly
         // unauthorized from reaching the lock.
         //
-        // `acquire_fresh`, not `acquire`: acquire's fast path returns as soon as the
-        // directory exists and never contacts object storage, so on a node with a
-        // stale copy the author's own issue would be invisible and the
+        // `read_snapshot`, not `acquire_fresh`: acquire's fast path returns as soon
+        // as the directory exists and never contacts object storage, so on a node
+        // with a stale copy the author's own issue would be invisible and the
         // cannot-establish-authorship arm below would 403 a legitimate author.
-        // acquire_fresh refreshes first and still takes no lock.
-        let disk_path = state
+        // read_snapshot refreshes the same way, but unpacks into a throwaway temp
+        // dir instead of publishing into the live repo path — an unlocked
+        // pre-check must not delete or swap the directory under a concurrent
+        // guarded write on the same path.
+        let snapshot = state
             .repo_store
-            .acquire_fresh(&record.owner_did, &record.name)
+            .read_snapshot(&record.owner_did, &record.name)
             .await?;
-        let author_did: Option<String> = match git_issues::get_issue(&disk_path, &issue_id) {
+        let snapshot_path = snapshot.path().to_path_buf();
+        let author_did: Option<String> = match git_issues::get_issue(&snapshot_path, &issue_id) {
             Ok(Some(raw)) => serde_json::from_str::<IssueRecord>(&raw)
                 .ok()
                 .and_then(|i| i.author),

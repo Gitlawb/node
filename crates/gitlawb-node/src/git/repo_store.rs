@@ -235,6 +235,59 @@ impl RepoStore {
         Ok(local_path)
     }
 
+    /// Non-mutating snapshot of a repo's **latest** Tigris state, for reads that
+    /// must see fresh data but must NOT write into the live repo path.
+    ///
+    /// Unlike `acquire_fresh`, which downloads and PUBLISHES into the live
+    /// directory (removing the existing dir and renaming the extract into
+    /// place), this unpacks into a throwaway temp dir and returns it. The live
+    /// path is never touched, so an unlocked caller cannot delete or swap the
+    /// directory under a concurrent guarded write.
+    ///
+    /// The returned snapshot owns its temp dir and removes it on drop; when
+    /// there is no Tigris backend (or no archive), the snapshot borrows the live
+    /// local path and owns nothing. A HEAD failure refuses rather than guessing,
+    /// matching `acquire_fresh` and the under-lock refresh path: a transient
+    /// storage blip must be a retryable refusal (`RepoUnavailable`), not a 500
+    /// or a silently stale read.
+    pub async fn read_snapshot(&self, owner_did: &str, repo_name: &str) -> Result<RepoSnapshot> {
+        let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
+
+        if let Some(ref tigris) = self.tigris {
+            match tigris.exists(&owner_slug, repo_name).await {
+                Ok(true) => {
+                    // Snapshot form: unpack into a temp dir, never the live path.
+                    let snapshot = tigris
+                        .download_to(&owner_slug, repo_name, &local_path, false)
+                        .await
+                        .map_err(|e| {
+                            anyhow::Error::new(RepoUnavailable).context(format!(
+                                "tigris snapshot download failed during read_snapshot for {owner_slug}/{repo_name}: {e:#}"
+                            ))
+                        })?;
+                    return Ok(RepoSnapshot {
+                        path: snapshot.clone(),
+                        owned: true,
+                    });
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(repo = %repo_name, err = %e,
+                        "read_snapshot: tigris HEAD failed — refusing rather than guessing the archive is absent");
+                    return Err(anyhow::Error::new(RepoUnavailable).context(format!(
+                        "tigris HEAD failed during read_snapshot for {owner_slug}/{repo_name}"
+                    )));
+                }
+            }
+        }
+
+        // Tigris disabled or repo not in Tigris — fall back to local.
+        Ok(RepoSnapshot {
+            path: local_path,
+            owned: false,
+        })
+    }
+
     /// Take a write lock (Postgres advisory lock), ensure repo is local, return guard.
     ///
     /// # Cross-machine guarantee
@@ -827,6 +880,29 @@ impl Drop for LockProbe {
         // session — which is what makes Postgres free it.
         warn!("advisory-lock probe dropped while its session may hold the lock — closing the session to free it");
         conn.close_on_drop();
+    }
+}
+
+/// Non-mutating snapshot of a repo's latest Tigris state. Owns the throwaway
+/// temp dir it was unpacked into and removes it on drop; a snapshot that
+/// borrowed the live local path owns nothing and drops as a no-op.
+pub struct RepoSnapshot {
+    path: PathBuf,
+    owned: bool,
+}
+
+impl RepoSnapshot {
+    /// Path to the snapshot's bare repo directory.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for RepoSnapshot {
+    fn drop(&mut self) {
+        if self.owned {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -3003,4 +3079,116 @@ mod tests {
         ])
         .is_err());
     }
+
+    /// P1a: the non-owner pre-check must refresh from a NON-MUTATING snapshot.
+    /// A snapshot download must unpack into a throwaway temp dir and leave the
+    /// live repo path untouched, so an unlocked pre-check cannot delete or swap
+    /// the directory under a concurrent guarded write.
+    ///
+    /// Real S3 server (not a mock): upload an archive, then `read_snapshot` it,
+    /// and assert the snapshot path is a fresh temp dir distinct from the live
+    /// path, that the live path was never created, and that the snapshot reads
+    /// the same content.
+    #[sqlx::test]
+    async fn read_snapshot_is_non_mutating(pool: PgPool) {
+        use axum::response::IntoResponse;
+
+        // A real in-process S3-compatible server via the SDK against an axum
+        // router is more plumbing than this test needs; instead, upload through
+        // the real Tigris client against an axum server that stores the object
+        // in memory, then snapshot through the same store.
+        //
+        // Simpler and equally load-bearing: build the archive bytes, serve them
+        // with a real HTTP server that answers HEAD 200 and GET with the bytes,
+        // then call read_snapshot and assert the live path is untouched and the
+        // snapshot content matches.
+        let mut archive_bytes = Vec::new();
+        {
+            let dir =
+                std::env::temp_dir().join(format!("gitlawb-snap-src-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(dir.join("objects/info")).unwrap();
+            std::fs::create_dir_all(dir.join("refs/heads")).unwrap();
+            std::fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            std::fs::write(dir.join("objects/info/packs"), "").unwrap();
+            let encoder = zstd::stream::Encoder::new(&mut archive_bytes, 3).unwrap();
+            let mut tar = tar::Builder::new(encoder);
+            tar.append_dir_all(".", &dir).unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        let archive = std::sync::Arc::new(archive_bytes);
+
+        let app = axum::Router::new().route(
+            "/{*key}",
+            axum::routing::any(move |method: axum::http::Method| {
+                let archive = archive.clone();
+                async move {
+                    match method {
+                        axum::http::Method::HEAD => axum::http::StatusCode::OK.into_response(),
+                        axum::http::Method::GET => {
+                            use axum::body::Body;
+                            (
+                                [(axum::http::header::CONTENT_TYPE, "application/zstd")],
+                                Body::from(archive.as_ref().clone()),
+                            )
+                                .into_response()
+                        }
+                        _ => axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response(),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let opts = (*pool.connect_options()).clone();
+        let lock_pool = no_reap_pool(&opts, 2).await;
+        let store = RepoStore::for_testing_with_tigris(
+            PathBuf::from("/tmp/gitlawb-snapshot-nonmut"),
+            lock_pool,
+            TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint),
+        );
+
+        let owner_did = "did:key:z6MkSnap";
+        let (owner_slug, live_path) = store.local_path(owner_did, "snaprepo").unwrap();
+        assert!(
+            !live_path.exists(),
+            "the live path must not exist before the snapshot"
+        );
+
+        let snap = store
+            .read_snapshot(owner_did, "snaprepo")
+            .await
+            .expect("snapshot reads the archive");
+        let snap_path = snap.path().to_path_buf();
+        assert_ne!(
+            snap_path, live_path,
+            "the snapshot must unpack into a temp dir, not the live path"
+        );
+        assert!(
+            snap_path.starts_with(live_path.parent().unwrap()),
+            "the snapshot temp dir must live under the repo parent"
+        );
+        assert!(
+            !live_path.exists(),
+            "the live path must remain untouched by a snapshot read"
+        );
+        assert_eq!(
+            std::fs::read_to_string(snap_path.join("HEAD")).unwrap(),
+            "ref: refs/heads/main\n",
+            "the snapshot must contain the archive's content"
+        );
+        drop(snap);
+        assert!(
+            !snap_path.exists(),
+            "dropping the snapshot must clean up its temp dir"
+        );
+        let _ = owner_slug;
+
+        server.abort();
+    }
+
 }

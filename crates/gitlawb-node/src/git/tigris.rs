@@ -122,8 +122,28 @@ impl TigrisClient {
         repo_name: &str,
         local_path: &Path,
     ) -> Result<()> {
+        self.download_to(owner_slug, repo_name, local_path, true)
+            .await
+            .map(|_| ())
+    }
+
+    /// Download a repo archive from Tigris and extract it, returning the
+    /// directory that was populated.
+    ///
+    /// `publish` controls whether the extract is swapped into `target` in place
+    /// (the live-path mutation used by writes; returns `target`) or unpacked
+    /// into a fresh temp directory under `target`'s parent (a non-mutating
+    /// snapshot read; returns the temp dir, which the caller owns and cleans
+    /// up). The snapshot form never touches the live repo path.
+    pub async fn download_to(
+        &self,
+        owner_slug: &str,
+        repo_name: &str,
+        target: &Path,
+        publish: bool,
+    ) -> Result<PathBuf> {
         let key = Self::repo_key(owner_slug, repo_name);
-        debug!(key = %key, path = %local_path.display(), "downloading repo from tigris");
+        debug!(key = %key, path = %target.display(), "downloading repo from tigris");
 
         let resp = self
             .s3
@@ -141,17 +161,46 @@ impl TigrisClient {
             .context("reading tigris response body")?
             .into_bytes();
 
-        // Extract tar.zst to local path
-        tokio::task::spawn_blocking({
-            let local_path = local_path.to_path_buf();
-            move || decompress_repo(&data, &local_path)
+        // Extract tar.zst to a directory.
+        let extracted = tokio::task::spawn_blocking({
+            let target = target.to_path_buf();
+            move || -> Result<PathBuf> {
+                if publish {
+                    decompress_repo(&data, &target)?;
+                    return Ok(target);
+                }
+                // Non-mutating snapshot: unpack into a fresh temp dir under the
+                // target's parent. The live repo path is never touched.
+                let parent = target.parent().context("snapshot path has no parent")?;
+                std::fs::create_dir_all(parent).context("creating parent dir")?;
+                let file_name = target
+                    .file_name()
+                    .context("snapshot path has no file name")?
+                    .to_string_lossy();
+                let tmp_dir = parent.join(format!(
+                    ".{file_name}.tmp-snapshot.{}",
+                    uuid::Uuid::new_v4()
+                ));
+                std::fs::create_dir_all(&tmp_dir).context("creating temp extract dir")?;
+                let unpack = (|| -> Result<()> {
+                    let decoder = zstd::stream::Decoder::new(&data[..])?;
+                    let mut archive = tar::Archive::new(decoder);
+                    archive.unpack(&tmp_dir).context("unpacking tar.zst")?;
+                    Ok(())
+                })();
+                if let Err(e) = unpack {
+                    let _ = std::fs::remove_dir_all(&tmp_dir);
+                    return Err(e);
+                }
+                Ok(tmp_dir)
+            }
         })
         .await
         .context("extract task panicked")?
         .context("extracting repo")?;
 
-        info!(key = %key, path = %local_path.display(), "downloaded repo from tigris");
-        Ok(())
+        info!(key = %key, path = %target.display(), "downloaded repo from tigris");
+        Ok(extracted)
     }
 
     /// Delete a repo archive from Tigris.
