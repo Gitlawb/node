@@ -771,24 +771,38 @@ fn build_divergent_repos(shared_commits: usize) -> Repos {
 
 /// `normalize_accepted_stream` must leave the socket in blocking mode.
 ///
-/// This is the deterministic half of the non-blocking-accept guard. It asserts
-/// the helper's postcondition directly: no client, no request, no race over
-/// whether bytes arrive before the shim reads them.
+/// This asserts the helper's postconditions directly: no client, no request, and
+/// no race over whether bytes arrive before the shim reads them. It removes the
+/// byte-arrival race entirely, which is what the end-to-end test cannot do. It is
+/// not literally deterministic, and the paragraph below says exactly what is left.
 ///
-/// Blocking mode has no getter. std exposes none, and Winsock has no FIONBIO
-/// getter at all (`ioctlsocket` documents FIONBIO with no output type, so it is
-/// set-only), so the property has to be observed through behavior: a blocking
-/// socket with no data pending parks its reader, a non-blocking one returns
-/// `WouldBlock` at once.
+/// The read timeout has a getter, so it is checked exactly. Blocking mode does
+/// not: std exposes none, and Winsock has no FIONBIO getter at all (`ioctlsocket`
+/// documents FIONBIO with no output type, so it is set-only), so that half has to
+/// be observed through behavior: a blocking socket with no data pending parks its
+/// reader, a non-blocking one returns `WouldBlock` at once.
+///
+/// The reader owns the very socket the helper normalized. Do not reintroduce a
+/// `try_clone` here: on Windows that mints a new descriptor through
+/// `WSADuplicateSocketW` rather than duplicating a handle, and whether FIONBIO
+/// state follows the new descriptor is a question this test would then depend on
+/// and could not answer. Owning the original removes the question.
 ///
 /// The `Started` handshake is load-bearing and must not be removed. Without it,
 /// "no outcome arrived within the window" would be satisfied by two different
 /// states: the reader parked inside its read, and the reader thread not yet
 /// scheduled to reach the read at all. A slow spawn would then pass this test
 /// with the helper's normalization deleted, which is the vacuous-guard failure
-/// this test exists to avoid. With the handshake, the window opens only once the
-/// reader is about to call `read`, so the residual gap is the few instructions
-/// between the signal and the call rather than thread-spawn latency.
+/// this test exists to avoid.
+///
+/// What the handshake buys is that thread-spawn latency is out of the window
+/// entirely. What remains is a full cross-thread round trip: the signal, the read
+/// call, its `WouldBlock` return, the channel send, and this thread waking from
+/// `recv_timeout`. All of that must exceed 250ms for a false green, so the guard
+/// cannot flake RED and its false-green path is a scheduling stall, not a byte
+/// race. Measured 50 of 50 RED under a mutation deleting the normalization, at
+/// full-suite parallelism; that bounds the false-green rate, it does not make it
+/// zero.
 ///
 /// Teardown order is a constraint, not a preference: the peer close must come
 /// AFTER the timeout assertion. Closing first unblocks the parked read, the
@@ -810,8 +824,18 @@ fn normalize_accepted_stream_leaves_the_socket_blocking() {
     accepted.set_nonblocking(true).unwrap();
     normalize_accepted_stream(&accepted);
 
+    // The helper's other postcondition, and the one std lets us check exactly.
+    // Without this, deleting the timeout leaves every test here green while a
+    // stalled peer parks the shim's only accept-loop thread forever.
+    assert_eq!(
+        accepted.read_timeout().unwrap(),
+        Some(Duration::from_secs(30)),
+        "normalize_accepted_stream must restore the read timeout, not only blocking mode"
+    );
+
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut reader = accepted.try_clone().unwrap();
+    // Move, never clone: see the try_clone note above.
+    let mut reader = accepted;
     let probe = std::thread::spawn(move || {
         let mut buf = [0u8; 1];
         tx.send(Probe::Started).unwrap();
@@ -882,11 +906,11 @@ fn normalize_accepted_stream_leaves_the_socket_blocking() {
 /// accept-before-request window without closing it: the request bytes can
 /// already be buffered by the time the shim reads, and the read then succeeds
 /// even with the normalization removed. Against a deleted
-/// `set_nonblocking(false)` it caught the defect in 43 and 47 of 50 across two
-/// full-suite samples of 50 runs. Two samples do not pin a rate, which is the
-/// point: it is a sampled tendency, not a property, so do not quote a percentage
-/// off it. Running it alone on an idle machine flattered it to 48 of 50; the
-/// full-suite numbers are the honest ones, because that is how it ships.
+/// `set_nonblocking(false)` it caught the defect in 39, 43, and 47 of 50 across
+/// three full-suite samples. The spread is the point: it is a sampled tendency,
+/// not a property, so do not quote a percentage off it. Running it alone on an
+/// idle machine flattered it to 48 of 50; the full-suite numbers are the honest
+/// ones, because that is how it ships.
 ///
 /// It is still the only coverage for the helper's CALL SITE. The deterministic
 /// probe calls `normalize_accepted_stream` directly, so deleting the call from
