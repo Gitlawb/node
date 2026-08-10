@@ -128,6 +128,19 @@ impl Drop for Shim {
     }
 }
 
+/// Wait until the shim accept loop is polling. Without this, Windows CI can
+/// race: `git fetch` connects before the spawned thread enters `accept()`.
+fn wait_for_shim_ready(addr: std::net::SocketAddr) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("shim at {addr} did not accept connections within 10s");
+}
+
 /// Start a minimal smart-HTTP shim serving `repo` on 127.0.0.1. Handles the
 /// upload-pack advertisement (GET) and pack negotiation (POST), counting POSTs.
 fn start_shim(repo: PathBuf, mode: ShimMode) -> Shim {
@@ -153,6 +166,8 @@ fn start_shim(repo: PathBuf, mode: ShimMode) -> Shim {
             }
         }
     });
+
+    wait_for_shim_ready(addr);
 
     Shim {
         base_url,
