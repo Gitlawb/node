@@ -404,3 +404,207 @@ fn decompress_repo(data: &[u8], local_path: &Path) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_sdk_s3::primitives::ByteStream;
+    use futures::FutureExt;
+
+    /// The envs the probe needs, all of them, or it does not run.
+    ///
+    /// `AWS_ENDPOINT_URL_S3` is included on purpose: without it the SDK resolves
+    /// to real AWS S3, and a probe that passed there would say nothing about
+    /// Tigris.
+    fn probe_env() -> Option<String> {
+        if std::env::var("GITLAWB_TIGRIS_PROBE").ok().as_deref() != Some("1") {
+            return None;
+        }
+        for name in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_ENDPOINT_URL_S3",
+        ] {
+            if std::env::var(name).is_err() {
+                eprintln!("tigris conditional-write probe: {name} is unset, skipping");
+                return None;
+            }
+        }
+        match std::env::var("GITLAWB_TIGRIS_BUCKET") {
+            Ok(b) if !b.is_empty() => Some(b),
+            _ => {
+                eprintln!(
+                    "tigris conditional-write probe: GITLAWB_TIGRIS_BUCKET is unset, skipping"
+                );
+                None
+            }
+        }
+    }
+
+    /// One conditional PUT, reported as the status that REFUSED it, or `None`
+    /// when the store accepted the write.
+    ///
+    /// Accepted is the interesting answer here, not an error: it means the
+    /// endpoint ignored the header we fenced on.
+    async fn conditional_put(
+        s3: &S3Client,
+        bucket: &str,
+        key: &str,
+        body: &'static [u8],
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> Result<Option<u16>, String> {
+        let mut req = s3
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(body));
+        if let Some(v) = if_match {
+            req = req.if_match(v);
+        }
+        if let Some(v) = if_none_match {
+            req = req.if_none_match(v);
+        }
+        match req.send().await {
+            Ok(_) => Ok(None),
+            Err(e) => match &e {
+                SdkError::ServiceError(ctx) => Ok(Some(ctx.raw().status().as_u16())),
+                _ => Err(format!("conditional PUT {key}: no HTTP response: {e}")),
+            },
+        }
+    }
+
+    /// The probe body, written to RETURN its failures rather than panic on
+    /// them, so the caller's cleanup is reached on every arm.
+    async fn conditional_write_probe(s3: &S3Client, bucket: &str, key: &str) -> Result<(), String> {
+        // 1. A plain PUT under a throwaway key.
+        let seeded = s3
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"probe-one"))
+            .send()
+            .await
+            .map_err(|e| format!("seeding PUT {key}: {e}"))?;
+
+        // 2. Its ETag, which is the generation the next arm fences against.
+        let etag = seeded
+            .e_tag()
+            .ok_or_else(|| format!("seeding PUT {key} returned no ETag"))?
+            .to_string();
+
+        // 3. A deliberately wrong If-Match. A store honoring it answers 412.
+        let wrong = format!("\"{}\"", "0".repeat(32));
+        if etag.trim_matches('"') == wrong.trim_matches('"') {
+            return Err(format!(
+                "the seeded ETag {etag} collides with the deliberately wrong one, \
+                 so this arm would prove nothing"
+            ));
+        }
+        match conditional_put(s3, bucket, key, b"probe-two", Some(&wrong), None).await? {
+            Some(412) => {}
+            Some(status) => {
+                return Err(format!(
+                    "a stale If-Match must be refused with 412, the endpoint answered {status}"
+                ))
+            }
+            None => {
+                return Err(
+                    "a stale If-Match was ACCEPTED: this endpoint does not honor If-Match, so \
+                     the release fence cannot hold here"
+                        .to_string(),
+                )
+            }
+        }
+
+        // 4. If-None-Match `*` over the object that now exists. This arm matters
+        // MORE than the one above. An ignored If-Match eventually surfaces as
+        // odd behavior, because a stale writer overwrites and someone notices
+        // the lost tree. An ignored If-None-Match just returns 200, so a publish
+        // that should have been fenced lands with no error anywhere: the silent
+        // no-op the bucket-type caveat on this test describes.
+        match conditional_put(s3, bucket, key, b"probe-three", None, Some("*")).await? {
+            // Either status is a pass, and the asymmetry with the If-Match arm
+            // above mirrors `upload`'s classifier exactly: 412 is always a lost
+            // precondition, and 409 is one too when we asked for create-only.
+            // AWS documents 409 for a create-only conflict racing a delete, so a
+            // store answering it is enforcing the precondition and we already
+            // handle it. Pinning 412 alone here would fail the probe against a
+            // backend that is behaving correctly, which sends whoever runs it
+            // chasing a fault that is not there.
+            Some(412) | Some(409) => {}
+            Some(status) => {
+                return Err(format!(
+                    "create-only over an existing object must be refused with 412 or 409, \
+                     the endpoint answered {status}"
+                ))
+            }
+            None => {
+                return Err(
+                    "If-None-Match * was ACCEPTED over an existing object: this endpoint does \
+                     not honor create-only, so a fenced publish lands silently"
+                        .to_string(),
+                )
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Probe the REAL Tigris endpoint for the conditional-write semantics the
+    /// release fence depends on.
+    ///
+    /// UNTIL THIS IS RUN AGAINST REAL CREDENTIALS, the fence is verified against
+    /// vendor documentation and an in-process mock, not against the backend it
+    /// runs on. The mock implements the semantics we believe Tigris has; it
+    /// cannot tell us whether Tigris actually has them.
+    ///
+    /// The bucket matters, not just the endpoint. Tigris documents conditional
+    /// operations as supported on Single-region and Multi-region buckets only.
+    /// Global and Dual-region buckets are eventually consistent, and a
+    /// conditional PUT evaluated against a stale replica would make the fence a
+    /// silent no-op rather than an error. So point `GITLAWB_TIGRIS_BUCKET` at a
+    /// throwaway bucket of the SAME type production uses.
+    ///
+    /// Ignored by default and additionally gated on `GITLAWB_TIGRIS_PROBE=1`,
+    /// because it writes to a real bucket and costs real requests. Run with:
+    /// `GITLAWB_TIGRIS_PROBE=1 cargo test -p gitlawb-node --bin gitlawb-node
+    /// tigris_honors_conditional_writes -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "writes to a real Tigris bucket; needs GITLAWB_TIGRIS_PROBE=1 plus credentials"]
+    async fn tigris_honors_conditional_writes() {
+        let Some(bucket) = probe_env() else {
+            eprintln!(
+                "tigris conditional-write probe: skipped. Set GITLAWB_TIGRIS_PROBE=1, \
+                 GITLAWB_TIGRIS_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and \
+                 AWS_ENDPOINT_URL_S3 to run it."
+            );
+            return;
+        };
+
+        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let s3 = S3Client::new(&config);
+        // A fresh key per run, so a probe that somehow orphaned an object on an
+        // earlier run cannot change what this one observes.
+        let key = format!("probe/conditional-write-{}.bin", uuid::Uuid::new_v4());
+
+        // CLEANUP MUST RUN ON EVERY ARM, and a failing assertion is precisely
+        // the case this probe exists to catch, so the delete cannot sit after
+        // the checks. The body returns its failures rather than panicking, and
+        // `catch_unwind` covers the panic an SDK call could still raise; either
+        // way the delete below is reached before the verdict is re-raised.
+        let outcome = std::panic::AssertUnwindSafe(conditional_write_probe(&s3, &bucket, &key))
+            .catch_unwind()
+            .await;
+
+        if let Err(e) = s3.delete_object().bucket(&bucket).key(&key).send().await {
+            eprintln!("tigris conditional-write probe: cleanup of {key} failed: {e}");
+        }
+
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(msg)) => panic!("tigris conditional-write probe: {msg}"),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+}

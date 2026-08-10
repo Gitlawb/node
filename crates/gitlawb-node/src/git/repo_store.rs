@@ -4953,4 +4953,294 @@ mod tests {
 
         mock.shutdown();
     }
+
+    // ── the abandoned writer's late PUT (#279) ─────────────────────────────
+
+    /// A store whose under-lock transfer bound is short, so a parked PUT
+    /// actually runs the release past its budget instead of making the test sit
+    /// out `fenced_store`'s 30s. The acquire-side refresh shares the bound,
+    /// which is fine here: it moves a few KiB against an in-process mock.
+    async fn fenced_store_with_bound(
+        mock: &S3Mock,
+        opts: &sqlx::postgres::PgConnectOptions,
+        repos_dir: &Path,
+        bound: std::time::Duration,
+    ) -> RepoStore {
+        RepoStore::new(
+            repos_dir.to_path_buf(),
+            Some(TigrisClient::for_testing_with_endpoint(
+                "test-bucket",
+                mock.endpoint(),
+            )),
+            no_reap_pool(opts, 2).await,
+            bound,
+        )
+    }
+
+    /// The statuses of every logged PUT attempt, which is what the
+    /// abandoned-writer tests assert their attempt counts on.
+    fn attempt_statuses(mock: &S3Mock) -> Vec<Option<u16>> {
+        mock.put_attempts().iter().map(|a| a.status).collect()
+    }
+
+    /// THE HEADLINE ARM. An abandoned writer's PUT that lands after a successor
+    /// has published must be refused by the store, and the successor's archive
+    /// must survive it.
+    ///
+    /// This is the whole point of the change. Dropping the future of an
+    /// in-flight PUT does not cancel the request the server is already
+    /// processing, so the advisory lock cannot fence it: A's release returns,
+    /// the lock frees, B acquires and publishes, and A's bytes are still on
+    /// their way to a store that has already moved on. Only the conditional PUT
+    /// decides that race, and it decides it at COMMIT time, not at arrival.
+    ///
+    /// The mock models that by capturing A's PUT when it arrives and evaluating
+    /// it on replay, against the state as of the replay. That is deliberately
+    /// not a timing test: a parked handler whose client has gone away is
+    /// cancelled with the connection, so a test that waited for it to resume on
+    /// its own would be waiting on nothing.
+    #[sqlx::test]
+    async fn an_abandoned_writers_late_put_loses_to_the_successor(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let bound = std::time::Duration::from_millis(750);
+        let store = fenced_store_with_bound(&mock, &opts, repos.path(), bound).await;
+        let owner = "did:key:z6MkFenceLatePut";
+        let repo = "fence-late-put-repo";
+        let slug = owner_slug_of(owner);
+
+        // Seed the key, so A's acquire observes a generation and carries
+        // If-Match on it. This is the ordinary case: the repo already exists.
+        let seed = TempDir::new().unwrap();
+        marked_repo(seed.path(), "seed");
+        mock_tigris(&mock)
+            .upload(&slug, repo, seed.path(), UploadPrecondition::Unconditional)
+            .await
+            .expect("seeding the archive");
+        let seeded = mock.current_etag().expect("the seed minted an ETag");
+
+        // Writer A takes the lock, writes its tree, and has its publish parked
+        // past the transfer bound.
+        let guard_a = store.acquire_write(owner, repo).await.expect("A acquires");
+        std::fs::write(guard_a.local_path.join("MARKER"), "writer-a").unwrap();
+        mock.park_next_put();
+        let started = std::time::Instant::now();
+        let outcome_a = guard_a.release(true).await;
+        assert!(
+            started.elapsed() >= bound,
+            "A's release must have run out its transfer bound with the PUT in flight"
+        );
+        // A timeout is UNKNOWABLE rather than failed, so the release reports an
+        // ordinary success and the lock frees. That is exactly why the fence has
+        // to live in the store: nothing here knows A's bytes are still coming.
+        assert!(
+            matches!(outcome_a, ReleaseOutcome::Released),
+            "an abandoned publish reports a plain release, got {outcome_a:?}"
+        );
+
+        assert!(
+            mock.captured_put().is_some(),
+            "A's PUT must have arrived and been captured before the bound elapsed"
+        );
+
+        // Writer B acquires the freed lock and publishes for real.
+        let b_started = std::time::Instant::now();
+        let guard_b = store
+            .acquire_write(owner, repo)
+            .await
+            .expect("B must acquire once A's release frees the lock");
+        assert!(
+            b_started.elapsed() < std::time::Duration::from_secs(5),
+            "B's acquire must be prompt, not blocked behind A's abandoned transfer"
+        );
+        std::fs::write(guard_b.local_path.join("MARKER"), "writer-b").unwrap();
+        guard_b
+            .release(true)
+            .await
+            .into_result()
+            .expect("B's publish is the one that must land");
+        let after_b = mock.current_etag().expect("B's publish minted an ETag");
+        assert_ne!(
+            unquote_etag(&after_b),
+            unquote_etag(&seeded),
+            "B's publish must have moved the generation on"
+        );
+
+        // NOW A's bytes reach the store's commit point.
+        assert_eq!(
+            mock.replay_captured(),
+            412,
+            "A's late PUT must be refused: the generation it fenced on is gone"
+        );
+        assert_eq!(
+            stored_marker(&mock, &slug, repo).await,
+            "writer-b",
+            "the successor's archive must survive the abandoned writer's late PUT"
+        );
+        assert_eq!(
+            mock.current_etag().as_deref().map(unquote_etag),
+            Some(unquote_etag(&after_b)),
+            "a refused PUT must not rotate the generation either"
+        );
+
+        // Seed, A's parked PUT, B's publish, the deliberate replay. A never
+        // attempted a second PUT of its own: the timeout arm takes no
+        // compensating action precisely because the outcome is unknowable.
+        assert_eq!(
+            attempt_statuses(&mock),
+            vec![Some(200), None, Some(200), Some(412)],
+            "got {:?}",
+            mock.put_attempts()
+        );
+
+        // The header detail comes LAST on purpose. Asserting it up front would
+        // make a lost fence red here, on a wire-format check, rather than on the
+        // outcome above, and the outcome is what this test is for.
+        let captured = mock.captured_put().expect("A's PUT was captured");
+        assert_eq!(
+            captured.if_match.as_deref().map(unquote_etag),
+            Some(unquote_etag(&seeded)),
+            "A's in-flight PUT must carry the generation it observed under the lock"
+        );
+        assert_eq!(captured.if_none_match, None);
+
+        mock.open_gate();
+        mock.shutdown();
+    }
+
+    /// The create-only arm of the same race, and the one whose real-world
+    /// failure mode is SILENT: an ignored If-None-Match just returns 200, so a
+    /// publish that should have been fenced lands with no error anywhere.
+    #[sqlx::test]
+    async fn an_abandoned_writers_late_create_only_put_loses_to_the_successor(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let bound = std::time::Duration::from_millis(750);
+        let store = fenced_store_with_bound(&mock, &opts, repos.path(), bound).await;
+        let owner = "did:key:z6MkFenceLateCreate";
+        let repo = "fence-late-create-repo";
+        let slug = owner_slug_of(owner);
+
+        // Nothing stored, so A's acquire records the absent case and is fenced
+        // create-only.
+        let guard_a = store.acquire_write(owner, repo).await.expect("A acquires");
+        marked_repo(&guard_a.local_path, "writer-a");
+        mock.park_next_put();
+        let outcome_a = guard_a.release(true).await;
+        assert!(
+            matches!(outcome_a, ReleaseOutcome::Released),
+            "an abandoned publish reports a plain release, got {outcome_a:?}"
+        );
+
+        assert!(
+            mock.captured_put().is_some(),
+            "A's PUT must have arrived and been captured before the bound elapsed"
+        );
+
+        // B wins the empty key.
+        let guard_b = store
+            .acquire_write(owner, repo)
+            .await
+            .expect("B must acquire once A's release frees the lock");
+        std::fs::write(guard_b.local_path.join("MARKER"), "writer-b").unwrap();
+        guard_b
+            .release(true)
+            .await
+            .into_result()
+            .expect("B's create must land");
+
+        assert_eq!(
+            mock.replay_captured(),
+            412,
+            "A's late create-only PUT must be refused now that the key exists"
+        );
+        assert_eq!(
+            stored_marker(&mock, &slug, repo).await,
+            "writer-b",
+            "the successor's archive must survive the abandoned create-only PUT"
+        );
+        assert_eq!(
+            attempt_statuses(&mock),
+            vec![None, Some(200), Some(412)],
+            "got {:?}",
+            mock.put_attempts()
+        );
+
+        // Last, for the same reason as the If-Match arm: the outcome is the
+        // claim, the header is the detail.
+        let captured = mock.captured_put().expect("A's PUT was captured");
+        assert_eq!(
+            captured.if_none_match.as_deref(),
+            Some("*"),
+            "A's in-flight PUT must carry the create-only fence it observed"
+        );
+        assert_eq!(captured.if_match, None);
+
+        mock.open_gate();
+        mock.shutdown();
+    }
+
+    /// THE CONTROL, and it is what makes the two arms above attributable.
+    ///
+    /// Same abandonment, same replay, but no successor publishes in between, so
+    /// the generation A fenced on is still current when its bytes commit and
+    /// the PUT must LAND. Without this, a green headline test would prove only
+    /// that replays are rejected, not that STALENESS is what rejects them.
+    ///
+    /// It must therefore stay green when the carried precondition is forced
+    /// back to `Unconditional`: it asserts an outcome the fence does not
+    /// change, which is the whole reason it can attribute the others' red.
+    #[sqlx::test]
+    async fn an_abandoned_put_still_on_the_current_generation_lands(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let bound = std::time::Duration::from_millis(750);
+        let store = fenced_store_with_bound(&mock, &opts, repos.path(), bound).await;
+        let owner = "did:key:z6MkFenceControl";
+        let repo = "fence-control-repo";
+        let slug = owner_slug_of(owner);
+
+        let seed = TempDir::new().unwrap();
+        marked_repo(seed.path(), "seed");
+        mock_tigris(&mock)
+            .upload(&slug, repo, seed.path(), UploadPrecondition::Unconditional)
+            .await
+            .expect("seeding the archive");
+
+        let guard_a = store.acquire_write(owner, repo).await.expect("A acquires");
+        std::fs::write(guard_a.local_path.join("MARKER"), "writer-a").unwrap();
+        mock.park_next_put();
+        let outcome_a = guard_a.release(true).await;
+        assert!(
+            matches!(outcome_a, ReleaseOutcome::Released),
+            "an abandoned publish reports a plain release, got {outcome_a:?}"
+        );
+
+        assert_eq!(
+            mock.replay_captured(),
+            200,
+            "with nothing published in between, the abandoned PUT is still current \
+             and must be accepted"
+        );
+        assert_eq!(
+            stored_marker(&mock, &slug, repo).await,
+            "writer-a",
+            "the accepted late PUT must be what is stored"
+        );
+        assert_eq!(
+            attempt_statuses(&mock),
+            vec![Some(200), None, Some(200)],
+            "got {:?}",
+            mock.put_attempts()
+        );
+
+        mock.open_gate();
+        mock.shutdown();
+    }
 }
