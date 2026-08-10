@@ -76,6 +76,8 @@ pub async fn pin_object(
 /// still needed to read each object's bytes, and `git_bin` names the binary those
 /// reads run: the production caller passes the literal `"git"`, and a test passes a
 /// fake so the loop's own bound can be driven with a git that never answers.
+/// `git_timeout` is the per-object read bound, the same value and the same role it has
+/// in the twin: it bounds both the pin read and the skip branch's opportunistic repair.
 /// Objects already recorded with a `pinata_cid` are skipped, and `repo_id` records the
 /// pin's provenance (#173). Returns `(sha_hex, provider_cid)` pairs for each newly
 /// pinned object: the provider CID is the Pinata gateway CID (used for branch->CID
@@ -93,11 +95,12 @@ pub async fn pin_object(
 ///   than the read floor left. It is a gate, not a hard ceiling, since a started
 ///   iteration still runs to completion;
 /// - the git read: `store::read_object_bounded` runs under `spawn_blocking` against the
-///   ABSOLUTE batch deadline (not the loop-top remainder, which the `has_pinata_cid`
-///   round-trip sitting between the two would push past it), with SIGTERM-then-SIGKILL
-///   process-group teardown, so a hung `git cat-file` costs this batch its remaining
-///   budget plus one watchdog teardown instead of holding the permit for the child's
-///   whole lifetime and blocking a runtime worker while it does.
+///   earlier of the ABSOLUTE batch deadline (not the loop-top remainder, which the
+///   `has_pinata_cid` round-trip sitting between the two would push past it) and this
+///   object's own `git_timeout`, with SIGTERM-then-SIGKILL process-group teardown, so a
+///   hung `git cat-file` costs this batch one `git_timeout` plus one watchdog teardown
+///   instead of holding the permit for the child's whole lifetime and blocking a runtime
+///   worker while it does.
 ///
 /// So the LOOP's hold is bounded by roughly `batch_budget`, plus one watchdog
 /// teardown and one upload (the shared client's whole-request timeout bounds the
@@ -108,13 +111,23 @@ pub async fn pin_object(
 /// (`has_pinata_cid`, `record_pinata_cid`) are untimed inside the budgeted region
 /// too.
 ///
-/// The twin in `ipfs_pin.rs` shares the budget gate and the bounded read with this
-/// loop, so both are at parity again. Change them in lockstep: the skip-if-pinned
-/// check, the fault arms, the returned pairs, and the budget handling.
-// Nine arguments, over clippy's threshold: the two the budget adds (`git_bin`,
-// `batch_budget`) plus #173's `repo_id` are what put the read under test injection and under a deadline, and
-// grouping them into a struct would only move the same values behind a name the twin in
-// `ipfs_pin.rs` does not use. Same allow as the sibling call sites in `api::repos`.
+/// The twin in `ipfs_pin.rs` is at parity with this loop on everything that bounds or
+/// repairs an object: the shared budget gate, the read bounded by the earlier of the
+/// batch deadline and `git_timeout`, and the skip branch's opportunistic legacy
+/// provider-CID repair. Change them in lockstep: the skip-if-pinned check, the
+/// provenance and source recording, the fault arms, and the budget handling.
+///
+/// The RETURNED PAIRS are the one deliberate divergence, and it is not drift. This side
+/// pushes a pin whose DB record exhausted its retries, because this return is a real
+/// input: `api::repos` builds the sha-to-cid `cid_map` from it, which drives
+/// `upsert_branch_cid` and the p2p `publish_ref_update` gossip CID. The twin's return is
+/// log-only, so it omits a record-failed pin rather than logging a pin the resolver
+/// cannot serve. Moving this side to match would need that consumer moved first.
+// Ten arguments, over clippy's threshold: the three the budget and the git seam add
+// (`git_bin`, `git_timeout`, `batch_budget`) plus #173's `repo_id` are what put the read
+// under test injection and under a deadline, and grouping them into a struct would only
+// move the same values behind a name the twin in `ipfs_pin.rs` does not use. Same allow
+// as the sibling call sites in `api::repos`.
 #[allow(clippy::too_many_arguments)]
 pub async fn pin_new_objects(
     client: &reqwest::Client,
@@ -122,6 +135,7 @@ pub async fn pin_new_objects(
     jwt: &str,
     repo_path: &std::path::Path,
     git_bin: &str,
+    git_timeout: Duration,
     object_list: Vec<String>,
     db: &crate::db::Db,
     repo_id: &str,
@@ -180,6 +194,23 @@ pub async fn pin_new_objects(
                         tracing::warn!(sha = %sha, err = %e, "failed to mark pin sources incomplete");
                     }
                 }
+                // R8 (#173 round 10), in lockstep with the ipfs_pin skip branch:
+                // opportunistically repair a legacy provider-CID row (Kubo dag-pb /
+                // Pinata) to the raw-content resolver key on this re-push. Cost-gated on
+                // the stored key's codec, so a non-legacy row reads no bytes. Warn-only:
+                // a failure leaves the row as-is for a later re-push or the deferred
+                // one-shot sweep.
+                if let Err(e) = crate::ipfs_pin::repair_legacy_provider_cid(
+                    repo_path,
+                    git_bin,
+                    git_timeout,
+                    &sha,
+                    db,
+                )
+                .await
+                {
+                    tracing::warn!(sha = %sha, err = %e, "failed to repair legacy provider CID");
+                }
                 continue;
             }
             Ok(false) => {}
@@ -199,7 +230,13 @@ pub async fn pin_new_objects(
         // between the two, so `Instant::now() + budget_left` would land past `deadline` by
         // however long the DB took, and under a saturated pool that is the dominant term.
         // A slow DB check must not push the read's own bound out.
-        let read_deadline = deadline;
+        //
+        // Bounded by the EARLIER of the batch deadline (#174) and this object's own
+        // `git_timeout` (#173), the same pair the ipfs_pin twin uses. Both bounds are
+        // load-bearing and neither implies the other: the batch deadline alone would let
+        // ONE wedged `cat-file` hold the pin permit for the whole budget, while
+        // `git_timeout` alone would let a batch of merely-slow reads run past the budget.
+        let read_deadline = std::cmp::min(deadline, std::time::Instant::now() + git_timeout);
         let read_path = repo_path.to_path_buf();
         let read_sha = sha.clone();
         let read_git = git_bin.to_string();
@@ -492,6 +529,7 @@ mod tests {
                 "test-jwt",
                 &repo_path,
                 "git",
+                Duration::from_secs(60),
                 oids,
                 &db,
                 "repo-merge-test",
@@ -582,6 +620,7 @@ mod tests {
                 "test-jwt",
                 &repo_path,
                 fake.to_str().unwrap(),
+                Duration::from_secs(60),
                 oids,
                 &db,
                 "repo-merge-test",
@@ -632,6 +671,66 @@ mod tests {
         assert!(
             gone,
             "the reaped fake git ({pid}) must not outlive the call"
+        );
+    }
+
+    /// U3 scenario 5 (#173): the read is bounded by the EARLIER of the batch deadline and
+    /// this object's own `git_timeout`, the same pair the ipfs_pin twin uses. The batch
+    /// budget here is generous (60s) so the budget gate cannot be what ends the call: only
+    /// the 1s `git_timeout` can. A wedged `git cat-file` that traps SIGTERM and sleeps 30s
+    /// must therefore be reaped in the `git_timeout` order and the call must return, rather
+    /// than holding the pin permit for the whole budget.
+    ///
+    /// RED with `let read_deadline = deadline;` (the pre-U3 bare batch deadline): the read
+    /// waits out the wedged child, the call runs ~30s, and the outer 20s timeout fires.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn pin_new_objects_bounds_the_read_by_git_timeout_not_the_batch_budget(
+        pool: sqlx::PgPool,
+    ) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("git-timeout.git");
+        let oids = seed_loose_blobs(&repo_path, 1);
+        let fake = tmp.path().join("hanging-git");
+        write_script(&fake, "#!/bin/sh\ntrap '' TERM\necho $$ > pid\nsleep 30\n");
+
+        let (_logs, _guard) = capture_logs();
+        let client = reqwest::Client::new();
+        let started = std::time::Instant::now();
+        let pinned = tokio::time::timeout(
+            Duration::from_secs(20),
+            pin_new_objects(
+                &client,
+                "http://127.0.0.1:9",
+                "test-jwt",
+                &repo_path,
+                fake.to_str().unwrap(),
+                // The bound under test.
+                Duration::from_secs(1),
+                oids,
+                &db,
+                "repo-git-timeout",
+                // Generous, so a call that ends on time ended on `git_timeout`.
+                Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect(
+            "the read must be bounded by git_timeout, not by the batch budget: a wedged git \
+             cannot hold the pin permit for the whole 60s budget",
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            pinned.is_empty(),
+            "a git that never answers cannot produce a pinned object: {pinned:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "elapsed {elapsed:?} must stay in the git_timeout order (1s plus one watchdog \
+             teardown), not the 60s batch budget"
         );
     }
 
@@ -711,6 +810,7 @@ mod tests {
                 "test-jwt",
                 &repo_path,
                 &git_bin,
+                Duration::from_secs(60),
                 oids,
                 &db,
                 "repo-merge-test",
@@ -784,6 +884,7 @@ mod tests {
                 "test-jwt",
                 &repo_path,
                 &git_bin,
+                Duration::from_secs(60),
                 oids,
                 &db,
                 "repo-merge-test",
@@ -834,6 +935,7 @@ mod tests {
                 "test-jwt",
                 &repo_path,
                 "git",
+                Duration::from_secs(60),
                 oids.clone(),
                 &db,
                 "repo-merge-test",
@@ -862,6 +964,7 @@ mod tests {
                 "test-jwt",
                 &repo_path,
                 "git",
+                Duration::from_secs(60),
                 oids,
                 &db,
                 "repo-merge-test",
@@ -914,6 +1017,7 @@ mod tests {
                 "",
                 &repo_path,
                 fake.to_str().unwrap(),
+                Duration::from_secs(60),
                 oids,
                 &db,
                 "repo-merge-test",

@@ -4346,6 +4346,9 @@ mod tests {
                     "test-jwt",
                     &bare,
                     "git",
+                    // Generous: this test measures the record retry backoff, not the
+                    // read bound, so the git_timeout must never be what fires.
+                    std::time::Duration::from_secs(60),
                     vec![oid],
                     &state.db,
                     &repo_id,
@@ -4390,6 +4393,332 @@ mod tests {
             state.db.pin_sources_for_oid(&fx.public_oid).await.unwrap(),
             vec![repo.id.clone()],
             "the recovered record actually landed the source row"
+        );
+    }
+
+    /// A Pinata upload mock that must never fire, for the skip-branch tests below: an
+    /// object already carrying a `pinata_cid` is skipped before the upload, so a call
+    /// here means the branch under test was not the one taken.
+    async fn pinata_upload_mock_never(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"data":{"cid":"QmShouldNotHappen"}}"#)
+            .expect(0)
+            .create_async()
+            .await
+    }
+
+    /// The raw-content resolver key for an object in a bare repo, computed the way the
+    /// pin path computes it.
+    fn raw_key_for(bare: &std::path::Path, oid: &str) -> String {
+        gitlawb_core::cid::Cid::from_git_object_bytes(
+            &crate::git::store::read_object(bare, oid)
+                .expect("read object bytes")
+                .expect("object exists")
+                .1,
+        )
+        .to_string()
+    }
+
+    /// Seed a `pinned_cids` row by hand: the production helpers always store the raw
+    /// key, so a legacy provider-CID row can only be written with raw SQL.
+    async fn seed_pinned_row(
+        pool: &PgPool,
+        oid: &str,
+        cid: &str,
+        pinata_cid: Option<&str>,
+        repo_id: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid, repo_id)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(oid)
+        .bind(cid)
+        .bind("2020-01-01T00:00:00Z")
+        .bind(pinata_cid)
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("seed pinned_cids row");
+    }
+
+    /// The stored resolver key and the stashed old provider value for a pinned object.
+    async fn stored_key_and_stash(pool: &PgPool, oid: &str) -> (String, Option<String>) {
+        sqlx::query_as("SELECT cid, legacy_provider_cid FROM pinned_cids WHERE sha256_hex = $1")
+            .bind(oid)
+            .fetch_one(pool)
+            .await
+            .expect("the pinned row exists")
+    }
+
+    /// U3 scenario 1 (#173, Finding 2 lockstep): the PINATA skip branch runs the same
+    /// opportunistic legacy provider-CID repair the ipfs_pin skip branch runs. A row keyed
+    /// on a legacy provider CID that already carries a `pinata_cid` (so `has_pinata_cid`
+    /// answers true and the skip branch is taken) is rewritten to the raw-content resolver
+    /// key, stashing the old provider value in `legacy_provider_cid`.
+    ///
+    /// This drives `pinata::pin_new_objects`, never the ipfs_pin twin: the repair call
+    /// being PRESENT in `pinata.rs` proves nothing, only its execution through this lane
+    /// does. RED before the skip-branch call lands (the key stays the provider CID).
+    #[sqlx::test]
+    async fn pinata_skip_branch_repairs_legacy_provider_cid(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let fx = seed_cid_repos("pinatarepair", "pr", &["pinsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join("pinatarepair")
+            .join("pinsrc.git");
+
+        let raw_cid = raw_key_for(&bare, &fx.public_oid);
+        let provider_cid = legacy_dagpb_cid(&raw_cid);
+        assert_ne!(
+            provider_cid, raw_cid,
+            "the provider CID differs from the raw resolver key"
+        );
+        seed_pinned_row(
+            &pool,
+            &fx.public_oid,
+            &provider_cid,
+            Some("QmPinataProvider"),
+            "repoPinataRepair",
+        )
+        .await;
+
+        let mut server = mockito::Server::new_async().await;
+        let m = pinata_upload_mock_never(&mut server).await;
+        let client = reqwest::Client::new();
+        crate::pinata::pin_new_objects(
+            &client,
+            &server.url(),
+            "test-jwt",
+            &bare,
+            "git",
+            std::time::Duration::from_secs(60),
+            vec![fx.public_oid.clone()],
+            &state.db,
+            "repoPinataRepair",
+            crate::ipfs_pin::PIN_BATCH_BUDGET,
+        )
+        .await;
+        m.assert_async().await;
+
+        let (stored_cid, stashed) = stored_key_and_stash(&pool, &fx.public_oid).await;
+        assert_eq!(
+            stored_cid, raw_cid,
+            "the pinata skip branch repairs the key to the raw-content CID"
+        );
+        assert_eq!(
+            stashed.as_deref(),
+            Some(provider_cid.as_str()),
+            "the old provider CID is stashed in legacy_provider_cid"
+        );
+    }
+
+    /// U3 scenario 2 (#173, cost gate): a canonical raw-CIDv1 row on the pinata skip
+    /// branch reads NO object bytes. Candidacy is decided from the stored key's codec
+    /// alone, so the steady-state skip cost stays DB-only on this lane too. The counter
+    /// lives inside `repair_legacy_provider_cid`, so it counts for whichever lane calls
+    /// it; this is the both-ways guard (removing the codec gate reads the raw row).
+    #[sqlx::test]
+    async fn pinata_skip_branch_repair_codec_gate_skips_raw_row(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let fx = seed_cid_repos("pinatagate", "pg", &["pinsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join("pinatagate")
+            .join("pinsrc.git");
+
+        let raw_cid = raw_key_for(&bare, &fx.public_oid);
+        assert!(
+            gitlawb_core::cid::is_raw_cidv1(&raw_cid),
+            "the steady-state key is a CIDv1/raw key"
+        );
+        seed_pinned_row(
+            &pool,
+            &fx.public_oid,
+            &raw_cid,
+            Some("QmPinataProvider"),
+            "repoPinataGate",
+        )
+        .await;
+
+        let mut server = mockito::Server::new_async().await;
+        let m = pinata_upload_mock_never(&mut server).await;
+        let client = reqwest::Client::new();
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        crate::pinata::pin_new_objects(
+            &client,
+            &server.url(),
+            "test-jwt",
+            &bare,
+            "git",
+            std::time::Duration::from_secs(60),
+            vec![fx.public_oid.clone()],
+            &state.db,
+            "repoPinataGate",
+            crate::ipfs_pin::PIN_BATCH_BUDGET,
+        )
+        .await;
+        m.assert_async().await;
+
+        assert_eq!(
+            crate::ipfs_pin::legacy_repair_reads(),
+            0,
+            "a CIDv1/raw row triggers no object read on the pinata skip path (cost gate)"
+        );
+        assert_eq!(
+            state
+                .db
+                .cid_for_oid(&fx.public_oid)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(raw_cid.as_str()),
+            "the raw row is left as-is"
+        );
+    }
+
+    /// U3 scenario 3 (#173): a repair that cannot complete is warn-only. It neither
+    /// aborts the batch nor loses the pin. The first object is a legacy row whose bytes
+    /// are NOT in the repo, so the read verifies an absence and the row stays withheld
+    /// rather than being destructively rewritten; the skip branch's own source record
+    /// still lands for it, and the SECOND object's legacy row is still repaired, which is
+    /// what proves the batch ran past the failure.
+    #[sqlx::test]
+    async fn pinata_skip_branch_repair_failure_is_warn_only(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let fx = seed_cid_repos("pinatawarn", "pw", &["pinsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join("pinatawarn")
+            .join("pinsrc.git");
+
+        // Object A: bytes absent from this repo, so its repair cannot complete.
+        let absent_oid = "a".repeat(64);
+        let absent_provider = legacy_dagpb_cid(&raw_key_for(&bare, &fx.secret_oid));
+        seed_pinned_row(
+            &pool,
+            &absent_oid,
+            &absent_provider,
+            Some("QmPinataProviderA"),
+            "repoPinataWarn",
+        )
+        .await;
+        // Object B: a repairable legacy row, queued behind A.
+        let raw_cid = raw_key_for(&bare, &fx.public_oid);
+        let provider_cid = legacy_dagpb_cid(&raw_cid);
+        seed_pinned_row(
+            &pool,
+            &fx.public_oid,
+            &provider_cid,
+            Some("QmPinataProviderB"),
+            "repoPinataWarn",
+        )
+        .await;
+
+        let mut server = mockito::Server::new_async().await;
+        let m = pinata_upload_mock_never(&mut server).await;
+        let client = reqwest::Client::new();
+        crate::pinata::pin_new_objects(
+            &client,
+            &server.url(),
+            "test-jwt",
+            &bare,
+            "git",
+            std::time::Duration::from_secs(60),
+            vec![absent_oid.clone(), fx.public_oid.clone()],
+            &state.db,
+            "repoPinataWarn",
+            crate::ipfs_pin::PIN_BATCH_BUDGET,
+        )
+        .await;
+        m.assert_async().await;
+
+        let (a_cid, a_stash) = stored_key_and_stash(&pool, &absent_oid).await;
+        assert_eq!(
+            a_cid, absent_provider,
+            "an unrepairable row is never destructively rewritten"
+        );
+        assert_eq!(a_stash, None, "nothing is stashed for an unrepaired row");
+        assert_eq!(
+            state.db.pin_sources_for_oid(&absent_oid).await.unwrap(),
+            vec!["repoPinataWarn".to_string()],
+            "the skip branch's source record still lands: a failed repair loses no pin"
+        );
+
+        let (b_cid, b_stash) = stored_key_and_stash(&pool, &fx.public_oid).await;
+        assert_eq!(
+            b_cid, raw_cid,
+            "the batch ran past the failed repair and repaired the later object"
+        );
+        assert_eq!(b_stash.as_deref(), Some(provider_cid.as_str()));
+    }
+
+    /// U3 scenario 4 (#173, the must-not case): the repair is inside the `has_pinata_cid`
+    /// skip branch and nowhere else. An object with NO `pinata_cid` takes the upload path,
+    /// so it must run NO repair read and its (legacy-shaped) key must be left exactly as
+    /// stored, even though the row would be a repair candidate on the skip branch. Moving
+    /// the call out of the `Ok(true)` arm reads bytes here and trips the counter.
+    #[sqlx::test]
+    async fn pinata_upload_path_never_runs_the_legacy_repair(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let fx = seed_cid_repos("pinatanoskip", "pn", &["pinsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join("pinatanoskip")
+            .join("pinsrc.git");
+
+        // Legacy-shaped row with NO pinata_cid: `has_pinata_cid` is false, so the skip
+        // branch is not taken and the object goes to the upload path.
+        let raw_cid = raw_key_for(&bare, &fx.public_oid);
+        let provider_cid = legacy_dagpb_cid(&raw_cid);
+        seed_pinned_row(
+            &pool,
+            &fx.public_oid,
+            &provider_cid,
+            None,
+            "repoPinataNoSkip",
+        )
+        .await;
+
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"data":{"cid":"QmPinataUploaded"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let client = reqwest::Client::new();
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        let pinned = crate::pinata::pin_new_objects(
+            &client,
+            &server.url(),
+            "test-jwt",
+            &bare,
+            "git",
+            std::time::Duration::from_secs(60),
+            vec![fx.public_oid.clone()],
+            &state.db,
+            "repoPinataNoSkip",
+            crate::ipfs_pin::PIN_BATCH_BUDGET,
+        )
+        .await;
+        m.assert_async().await;
+
+        assert_eq!(
+            crate::ipfs_pin::legacy_repair_reads(),
+            0,
+            "the upload path must never run the skip-branch repair"
+        );
+        let (stored_cid, stashed) = stored_key_and_stash(&pool, &fx.public_oid).await;
+        assert_eq!(
+            stored_cid, provider_cid,
+            "an object that never reached the skip branch keeps its stored key untouched"
+        );
+        assert_eq!(stashed, None, "and nothing is stashed for it");
+        assert_eq!(
+            pinned,
+            vec![(fx.public_oid.clone(), "QmPinataUploaded".to_string())],
+            "the pinata return still carries the provider CID for the announcement cid_map"
         );
     }
 

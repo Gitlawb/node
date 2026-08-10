@@ -60,7 +60,7 @@ where
 /// CIDv1/raw key is already the resolver key and reads NO bytes, keeping the
 /// steady-state skip cost DB-only. Only a legacy-codec row reads the object to
 /// recompute. A row whose bytes are gone stays withheld (no destructive rewrite).
-async fn repair_legacy_provider_cid(
+pub(crate) async fn repair_legacy_provider_cid(
     repo_path: &std::path::Path,
     git_bin: &str,
     git_timeout: Duration,
@@ -611,16 +611,18 @@ pub(crate) fn batch_budget_gate(
 /// on the repo takes the full-scan fallback (`push_delta::list_all_objects`) and
 /// re-derives the whole object set, which then re-offers the skipped OIDs.
 ///
-/// The twin in `pinata.rs` is back at parity on the two things that bound a
-/// batch: it runs the same shared budget gate at the top of every iteration and
-/// the same bounded, reaped git read. It still has no per-request override, since
-/// `pinata::pin_object` takes no timeout argument and its uploads are bounded by
-/// the shared client's own ceiling. Everything else about the shape (the
-/// skip-if-pinned check, the provenance recording, the fault arms) changes in
-/// lockstep. The returned pairs are the one deliberate exception: this side omits
-/// an object whose DB record exhausted its retries, because the return here is
-/// consumed for logging only, while the pinata side still returns it because its
-/// return feeds the announcement `cid_map`. See the record step for the reasoning.
+/// The twin in `pinata.rs` is back at parity on everything that bounds or repairs an
+/// object: it runs the same shared budget gate at the top of every iteration, the same
+/// bounded and reaped git read against the earlier of the batch deadline and
+/// `git_timeout`, and the same opportunistic legacy provider-CID repair on its skip
+/// branch. It still has no per-request override, since `pinata::pin_object` takes no
+/// timeout argument and its uploads are bounded by the shared client's own ceiling.
+/// Everything else about the shape (the skip-if-pinned check, the provenance recording,
+/// the fault arms) changes in lockstep. The returned pairs are the one deliberate
+/// exception: this side omits an object whose DB record exhausted its retries, because
+/// the return here is consumed for logging only, while the pinata side still returns it
+/// because its return feeds the announcement `cid_map`. See the record step for the
+/// reasoning.
 ///
 /// Returns a list of `(sha256_hex, cid)` pairs pinned AND durably recorded this
 /// call.

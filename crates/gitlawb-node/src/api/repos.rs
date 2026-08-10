@@ -2715,6 +2715,7 @@ async fn post_receive_replication_tail(
                         // The literal, not `state.git_bin`: tests point that at a fake
                         // walk git, and this read must run the real one.
                         "git",
+                        pinata_git_timeout,
                         object_list,
                         &db_clone,
                         &repo_id,
