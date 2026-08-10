@@ -4453,6 +4453,163 @@ mod tests {
             .expect("the pinned row exists")
     }
 
+    /// The skip-branch repair runs while the caller holds a `pin_semaphore` permit, so it
+    /// must be bounded by the BATCH deadline and not by `git_timeout` alone.
+    /// `repair_legacy_provider_cid` builds its own deadline, and at shipped defaults that
+    /// is `git_service_timeout_secs` (600s) against a `PIN_BATCH_BUDGET` of 120s: one
+    /// legacy row whose `cat-file` wedges would hold a GLOBAL pin slot for five times the
+    /// budget the batch is supposed to cost, starving every other repo's pin work. The
+    /// loop's own budget gate cannot help, since it only runs at the top of the NEXT
+    /// iteration and cannot preempt a call already in flight.
+    ///
+    /// A wedged `cat-file`, a generous 60s `git_timeout`, and a 2s batch budget: the call
+    /// must return on the batch order. Both pin-permit-holding callers of the repair share
+    /// this clamp; the boot sweep keeps the plain `git_timeout`, since it holds no permit
+    /// and has no batch to overrun.
+    ///
+    /// REVERT PROOF (RED): pass `Instant::now() + git_timeout` to the repair instead of the
+    /// batch-clamped deadline and the wedged child runs the full 60s, blowing the outer
+    /// timeout below.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn pinata_skip_branch_repair_is_bounded_by_the_batch_deadline(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let fx = seed_cid_repos("pinatabound", "pb", &["pinsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join("pinatabound")
+            .join("pinsrc.git");
+
+        // Resolve the real key with the real git BEFORE the fake is wired in, so the row
+        // is genuinely legacy-shaped and the repair has real work to attempt.
+        let raw_cid = raw_key_for(&bare, &fx.public_oid);
+        let provider_cid = legacy_dagpb_cid(&raw_cid);
+        seed_pinned_row(
+            &pool,
+            &fx.public_oid,
+            &provider_cid,
+            Some("QmPinataProvider"),
+            "repoPinataBound",
+        )
+        .await;
+
+        // `cat-file` never answers and ignores SIGTERM, so only the watchdog's group
+        // SIGKILL at the deadline can end it. Which deadline that is, is the whole test.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = tmp.path().join("wedged-git");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\ntrap '' TERM\ncase \"$1\" in\n  cat-file) sleep 60 ;;\n  *) : ;;\nesac\nexit 0\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&fake, perm).unwrap();
+        }
+
+        let mut server = mockito::Server::new_async().await;
+        let m = pinata_upload_mock_never(&mut server).await;
+        let client = reqwest::Client::new();
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            crate::pinata::pin_new_objects(
+                &client,
+                &server.url(),
+                "test-jwt",
+                &bare,
+                fake.to_str().unwrap(),
+                // Generous: if the call ends on time it ended on the batch deadline.
+                std::time::Duration::from_secs(60),
+                vec![fx.public_oid.clone()],
+                &state.db,
+                "repoPinataBound",
+                // The bound under test.
+                std::time::Duration::from_secs(2),
+            ),
+        )
+        .await
+        .expect(
+            "a wedged skip-branch repair must be reaped on the batch deadline, not held for \
+             the whole git_timeout while it pins a global pin permit",
+        );
+        m.assert_async().await;
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "elapsed {elapsed:?} must stay in the 2s batch-budget order (plus one watchdog \
+             teardown), not the 60s git_timeout order"
+        );
+    }
+
+    /// The ipfs_pin twin of the clamp above, and the one that has been shipping: the Kubo
+    /// skip branch has always called the repair with a bare `git_timeout` while holding the
+    /// pin permit. Same wedged `cat-file`, same 60s `git_timeout` against a 2s batch
+    /// budget, same requirement that the call return on the batch order.
+    ///
+    /// REVERT PROOF (RED): drop the `min(deadline, ...)` clamp at the ipfs_pin skip-branch
+    /// call and this blows its outer timeout.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn kubo_skip_branch_repair_is_bounded_by_the_batch_deadline(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let fx = seed_cid_repos("kubobound", "kb", &["pinsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join("kubobound")
+            .join("pinsrc.git");
+
+        let raw_cid = raw_key_for(&bare, &fx.public_oid);
+        let provider_cid = legacy_dagpb_cid(&raw_cid);
+        // A row in pinned_cids makes `is_pinned` true, so the Kubo loop takes the skip
+        // branch and reaches the repair without ever attempting an add.
+        seed_pinned_row(&pool, &fx.public_oid, &provider_cid, None, "repoKuboBound").await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = tmp.path().join("wedged-git");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\ntrap '' TERM\ncase \"$1\" in\n  cat-file) sleep 60 ;;\n  *) : ;;\nesac\nexit 0\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&fake, perm).unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            crate::ipfs_pin::pin_new_objects(
+                // Empty endpoint would return before the loop, so point at a closed port:
+                // the skip branch is reached and no add is ever attempted anyway.
+                "http://127.0.0.1:9",
+                &bare,
+                fake.to_str().unwrap(),
+                std::time::Duration::from_secs(60),
+                vec![fx.public_oid.clone()],
+                &state.db,
+                "repoKuboBound",
+                std::time::Duration::from_secs(2),
+            ),
+        )
+        .await
+        .expect(
+            "a wedged skip-branch repair must be reaped on the batch deadline, not held for \
+             the whole git_timeout while it pins a global pin permit",
+        );
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "elapsed {elapsed:?} must stay in the 2s batch-budget order, not the 60s \
+             git_timeout order"
+        );
+    }
+
     /// U3 scenario 1 (#173, Finding 2 lockstep): the PINATA skip branch runs the same
     /// opportunistic legacy provider-CID repair the ipfs_pin skip branch runs. A row keyed
     /// on a legacy provider CID that already carries a `pinata_cid` (so `has_pinata_cid`

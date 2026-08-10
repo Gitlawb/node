@@ -60,10 +60,18 @@ where
 /// CIDv1/raw key is already the resolver key and reads NO bytes, keeping the
 /// steady-state skip cost DB-only. Only a legacy-codec row reads the object to
 /// recompute. A row whose bytes are gone stays withheld (no destructive rewrite).
+///
+/// The read's `deadline` is the CALLER's to set, because the two kinds of caller can
+/// afford very different holds. Both pin loops run this while holding a `pin_semaphore`
+/// permit, so they clamp it to the batch deadline: left at `git_service_timeout_secs`
+/// (600s by default) one wedged `cat-file` would hold a GLOBAL pin slot for five times
+/// `PIN_BATCH_BUDGET` and starve every other repo's pin work, and the loop's own budget
+/// gate cannot preempt a call already in flight. The boot sweep holds no permit and has
+/// no batch to overrun, so it passes the plain `git_timeout`.
 pub(crate) async fn repair_legacy_provider_cid(
     repo_path: &std::path::Path,
     git_bin: &str,
-    git_timeout: Duration,
+    deadline: std::time::Instant,
     sha: &str,
     db: &crate::db::Db,
 ) -> Result<RepairOutcome> {
@@ -91,9 +99,8 @@ pub(crate) async fn repair_legacy_provider_cid(
         let git_bin = git_bin.to_string();
         let sha = sha.to_string();
         // The shared-deadline form: `read_object_bounded` composes its type probe and
-        // content read under ONE `git_timeout`, rather than granting each stage a full
-        // one, so a legacy row's repair read is bounded by the configured budget total.
-        let deadline = std::time::Instant::now() + git_timeout;
+        // content read under ONE deadline, rather than granting each stage a full budget,
+        // so a legacy row's repair read is bounded in total by whatever the caller set.
         tokio::task::spawn_blocking(move || {
             crate::git::store::read_object_bounded(&git_bin, &repo_path, &sha, deadline)
         })
@@ -249,7 +256,17 @@ async fn sweep_pass(
                 row_retryable = true;
                 continue;
             }
-            match repair_legacy_provider_cid(&repo_path, git_bin, git_timeout, &sha, db).await {
+            // The sweep holds no pin permit and has no batch to overrun, so the plain
+            // `git_timeout` is the right budget here.
+            match repair_legacy_provider_cid(
+                &repo_path,
+                git_bin,
+                std::time::Instant::now() + git_timeout,
+                &sha,
+                db,
+            )
+            .await
+            {
                 Ok(RepairOutcome::Repaired) => {
                     repaired += 1;
                     row_repaired = true;
@@ -699,8 +716,17 @@ pub async fn pin_new_objects(
                 // re-push. Cost-gated on the stored key's codec — a non-legacy row
                 // reads no bytes. Warn-only: a failure leaves the row as-is for a
                 // later re-push or the deferred one-shot sweep.
-                if let Err(e) =
-                    repair_legacy_provider_cid(repo_path, git_bin, git_timeout, &sha, db).await
+                // Clamped to the batch deadline: this runs with the pin permit held, so
+                // an unclamped `git_timeout` would let one wedged read hold a global pin
+                // slot for 600s against a 120s budget.
+                if let Err(e) = repair_legacy_provider_cid(
+                    repo_path,
+                    git_bin,
+                    std::cmp::min(deadline, std::time::Instant::now() + git_timeout),
+                    &sha,
+                    db,
+                )
+                .await
                 {
                     tracing::warn!(sha = %sha, err = %e, "failed to repair legacy provider CID");
                 }
@@ -732,6 +758,11 @@ pub async fn pin_new_objects(
         // other: the batch deadline alone would let ONE wedged `cat-file` hold the pin
         // permit for the whole 120s budget (the failure #173's reaper test drives), while
         // `git_timeout` alone would let a batch of merely-slow reads run past the budget.
+        // Which arm actually binds depends on configuration, and at SHIPPED DEFAULTS it is
+        // always the batch deadline: `git_service_timeout_secs` is 600 against a 120s
+        // PIN_BATCH_BUDGET. The `git_timeout` arm is what an operator who tightens that
+        // knob below the remaining budget gets, so do not read this as two bounds both
+        // firing in a default deployment.
         let read_deadline = std::cmp::min(deadline, std::time::Instant::now() + git_timeout);
         let read_path = repo_path.to_path_buf();
         let read_sha = sha.clone();

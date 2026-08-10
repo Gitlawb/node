@@ -200,10 +200,13 @@ pub async fn pin_new_objects(
                 // the stored key's codec, so a non-legacy row reads no bytes. Warn-only:
                 // a failure leaves the row as-is for a later re-push or the deferred
                 // one-shot sweep.
+                // Clamped to the batch deadline, in lockstep with the ipfs_pin twin: this
+                // runs with the pin permit held, so an unclamped `git_timeout` would let
+                // one wedged read hold a global pin slot for 600s against a 120s budget.
                 if let Err(e) = crate::ipfs_pin::repair_legacy_provider_cid(
                     repo_path,
                     git_bin,
-                    git_timeout,
+                    std::cmp::min(deadline, std::time::Instant::now() + git_timeout),
                     &sha,
                     db,
                 )
@@ -236,6 +239,9 @@ pub async fn pin_new_objects(
         // load-bearing and neither implies the other: the batch deadline alone would let
         // ONE wedged `cat-file` hold the pin permit for the whole budget, while
         // `git_timeout` alone would let a batch of merely-slow reads run past the budget.
+        // As on the twin, at SHIPPED DEFAULTS the batch deadline is the arm that binds
+        // (600s git timeout against a 120s budget); the `git_timeout` arm is for an
+        // operator who tightens that knob below the remaining budget.
         let read_deadline = std::cmp::min(deadline, std::time::Instant::now() + git_timeout);
         let read_path = repo_path.to_path_buf();
         let read_sha = sha.clone();
