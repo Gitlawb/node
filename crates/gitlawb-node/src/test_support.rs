@@ -4235,30 +4235,26 @@ mod tests {
         );
     }
 
-    /// U3 residual (#173): pins the ACCEPTED cost of a single boolean, and is NOT a bug
-    /// report. `pinned_cids.pin_sources_incomplete` is one flag per OBJECT, not per
-    /// (object, repo), so a GENUINE record from a third repo C clears a marker that repo
-    /// B's FAILED record set, and the resolver then reads a non-empty below-cap source
-    /// set as fully enumerated and stops running the scan fallback. The decision of
-    /// record is the `record_pin_source` doc comment in `db/mod.rs`, which names this
-    /// exact case and calls it the deliberate cost of a single boolean; closing it needs
-    /// a per-(oid, repo) marker table.
+    /// U3 residual, CLOSED (#173 round 12): the incompleteness marker is per
+    /// `(object, repo)`, so a GENUINE record from a third repo C no longer clears the
+    /// marker repo B's FAILED record set, and the resolver keeps the scan fallback that
+    /// finds B's unrecorded public copy.
     ///
-    /// Why it is acceptable: the residual fails CLOSED. The provenance loop and the scan
-    /// fallback both serve through the same `gate_and_serve`, so clearing the marker only
-    /// ever removes a gated search and can never serve something a caller may not read.
-    /// The window is exactly `1 <= sources < MAX_PIN_SOURCES`: an empty set always scans,
-    /// and at cap the insert is a no-op so the marker survives.
+    /// This test asserted the opposite until the marker moved to `pin_source_failures`.
+    /// It was written as a deliberate pin on an accepted cost of the single boolean, with
+    /// a note saying that implementing the per-(oid, repo) marker should turn it red and
+    /// that it should then be updated rather than deleted. That is what happened, so the
+    /// assertions are inverted here and the fixture is unchanged.
     ///
     /// The BEFORE request is what makes the AFTER assertion mean anything: it proves the
-    /// unrecorded public holder IS reachable while the marker stands, so the later 404 is
-    /// caused by the clear and by nothing else in the fixture.
-    ///
-    /// If someone implements the per-(oid, repo) marker, this test is EXPECTED to go red.
-    /// Update it to assert the new behavior rather than deleting it: a red here is the
-    /// residual being closed, not a regression.
+    /// unrecorded public holder IS reachable while the marker stands, so an AFTER 404
+    /// would be caused by the clear and by nothing else in the fixture. The window this
+    /// covers is exactly `1 <= sources < MAX_PIN_SOURCES`: an empty set always scans, and
+    /// at cap the insert is a no-op so the marker survives regardless.
     #[sqlx::test]
-    async fn ipfs_cid_third_repo_record_clears_marker_and_hides_an_unrecorded_holder(pool: PgPool) {
+    async fn ipfs_cid_third_repo_record_keeps_the_marker_and_still_serves_an_unrecorded_holder(
+        pool: PgPool,
+    ) {
         use gitlawb_core::identity::Keypair;
         let owner = Keypair::generate();
         let owner_did = owner.did().to_string();
@@ -4318,19 +4314,20 @@ mod tests {
         );
 
         // Repo C (private) pushes the same object. Its record is a GENUINE insert (C is
-        // not yet a source), so it clears the marker B set, even though B is still missing.
+        // not yet a source), and it must NOT clear the marker B set, because B is still
+        // missing and C's record says nothing about B.
         let mut c_repo = seed_repo(&owner_did, "u3tc");
         c_repo.is_public = false;
         state.db.create_repo(&c_repo).await.expect("seed C private");
         repin_via_skip_branch(&state, &c_bare, &fx.public_oid, &c_repo.id).await;
 
         assert!(
-            !state
+            state
                 .db
                 .pin_sources_incomplete(&fx.public_oid)
                 .await
                 .unwrap(),
-            "a third repo's genuine record clears the per-object marker"
+            "a third repo's record clears only its own pair, so B's marker survives"
         );
         assert!(
             !state.db.pin_sources_at_cap(&fx.public_oid).await.unwrap(),
@@ -4343,23 +4340,23 @@ mod tests {
             "B is still missing from the set it was marked for: {sources:?}"
         );
 
-        // AFTER: the identical request now reads the set as complete and 404s the public
-        // copy it served a moment ago, without ever arming the scan.
+        // AFTER: the identical request still serves B's copy, because the surviving
+        // marker keeps the fallback armed. The scan is asserted to have RUN, so the 200
+        // is the fallback finding B and not the provenance loop reaching it some other way.
         crate::api::ipfs::reset_preload_queries();
         let (st, body) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
         assert_eq!(
             st,
-            StatusCode::NOT_FOUND,
-            "the cleared marker hides B: the same anonymous request now 404s"
+            StatusCode::OK,
+            "B's marker survived C's record, so the unrecorded public holder is still reachable"
         );
         assert!(
-            !body.contains("public bytes"),
-            "the 404 body must not carry the object it declined to serve"
+            body.contains("public bytes"),
+            "the served body is the public object's bytes"
         );
-        assert_eq!(
-            crate::api::ipfs::preload_queries(),
-            0,
-            "the fallback scan provably did not run, so the 404 is the cleared marker and not a failed search"
+        assert!(
+            crate::api::ipfs::preload_queries() > 0,
+            "the fallback scan ran, so the 200 came from the armed fallback"
         );
     }
 
@@ -7772,12 +7769,16 @@ mod tests {
     /// F1 scenario 4 (#173, MUST-NOT): a candidate that is not on local disk is COLD.
     /// Discovery must not pull it back from remote storage (the sweep is opportunistic
     /// background maintenance, not a bulk restore), and it must not mark the row
-    /// retryable either. The candidate list is every repo on the node rather than the
-    /// row's holders, so on a Tigris-backed node where most repos are cold a
-    /// cold-candidate retryable would rewind the cursor
-    /// (`sweep_legacy_provider_cids` rewinds whenever `retryable_skips > 0`) on every
-    /// run: the sweep would never drain while paying full discovery cost each pass. The
-    /// second run's `scanned` is what proves the cursor was not rewound.
+    /// retryable either.
+    ///
+    /// The retryable half was originally about the cursor: a cold-candidate retryable
+    /// would rewind it, and the second run's `scanned` proved it had not. Round 12 made
+    /// the rewind unconditional on reaching the end of the table, so every completed run
+    /// rewinds and the second run re-reads the row whatever this one does. What still
+    /// holds, and what is asserted below, is the COST: a cold candidate is filtered at
+    /// load, so re-walking the row reads no object bytes and restores nothing. The
+    /// retryable-skip assertion also still stands on its own terms, since a cold
+    /// candidate is not evidence about the row.
     ///
     /// The no-fetch half is asserted here on the EFFECT rather than on the call: the
     /// cold candidate's disk path must still not exist after two full runs, which is
@@ -7871,9 +7872,15 @@ mod tests {
         .await
         .expect("the second run terminates");
         assert_eq!(
-            (second.scanned, second.retryable_skips),
-            (0, 0),
-            "the cursor was not rewound: the second run re-reads nothing"
+            second.retryable_skips, 0,
+            "the re-walk still finds nothing retryable about the row"
+        );
+        assert_eq!(
+            crate::ipfs_pin::legacy_repair_reads(),
+            0,
+            "the re-walk costs no object read either: the cold candidate is filtered at \
+             load on every run, so an unconditional rewind does not turn into repeated \
+             discovery reads for this row"
         );
         assert_eq!(
             stored_pin(&pool, &fx.public_oid).await.0,
@@ -8641,28 +8648,21 @@ mod tests {
         );
     }
 
-    /// GAP 2, the residual this pair does NOT close, pinned here so it is a known
-    /// property rather than an assumption.
+    /// GAP 2, CLOSED (#173 round 12), kept as the regression that proves it stays closed.
     ///
-    /// `pin_sources_incomplete` is one boolean per OBJECT, not per `(object, repo)`, so
-    /// any later `record_pin_source` that actually inserts clears it, including one from
-    /// a repo that has nothing to do with discovery. A concurrent writer whose record
-    /// commits strictly AFTER discovery's mark therefore leaves the row with a non-empty
-    /// source set and no marker, which is the combination that stops the resolver's
-    /// fallback scan. Discovery's ordering cannot prevent that: the clear happens inside
-    /// the other writer's transaction, after discovery has already finished the row.
+    /// This documented a residual: `pin_sources_incomplete` was one boolean per OBJECT, so
+    /// any later inserting `record_pin_source` cleared it, including one from a repo with
+    /// nothing to do with discovery, leaving a non-empty source set and no marker, which
+    /// is the combination that stops the resolver's fallback scan. The marker is now per
+    /// `(object, repo)` and a record clears only its own pair, so a later writer cannot
+    /// clear what discovery set.
     ///
-    /// It is bounded, and the bound is why this is documented rather than fixed here.
-    /// The clearing writer is a real pusher of the same object, so every source in the
-    /// set genuinely holds the bytes and the row stays servable through them. And for
-    /// these rows specifically the state cannot be a regression: before discovery ran,
-    /// the row was keyed on a provider CID, so the resolver withheld it and
-    /// `list_pinned_cids` did not advertise it. Closing the residual properly needs a
-    /// per-`(oid, repo)` marker, which is a change to the marker's shape and not to this
-    /// sweep. See `Db::record_pin_source`, which states the same residual for the four
-    /// pre-existing call sites.
+    /// Discovery marks against the unknown-repo sentinel rather than a real repo id,
+    /// because what it knows is that its bounded warm-only probe may have missed a holder,
+    /// not that any particular repo failed to record. No real record equals that sentinel,
+    /// which is what makes the marker survive here.
     #[sqlx::test]
-    async fn sweep_discovery_marker_is_cleared_by_a_later_record_from_another_repo(pool: PgPool) {
+    async fn sweep_discovery_marker_survives_a_later_record_from_another_repo(pool: PgPool) {
         use gitlawb_core::identity::Keypair;
         let owner = Keypair::generate();
         let owner_did = owner.did().to_string();
@@ -8711,13 +8711,13 @@ mod tests {
             .expect("the later record lands");
 
         assert!(
-            !state
+            state
                 .db
                 .pin_sources_incomplete(&fx.public_oid)
                 .await
                 .unwrap(),
-            "the residual: a per-object marker is cleared by any later inserting record, \
-             so discovery's marker does not survive one"
+            "a later record from another repo clears only its own pair, so discovery's \
+             marker survives and the resolver keeps its fallback"
         );
         let mut sources = state.db.pin_sources_for_oid(&fx.public_oid).await.unwrap();
         sources.sort();

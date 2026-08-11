@@ -464,9 +464,21 @@ async fn discover_legacy_row(
                 if let Err(e) = db.record_pin_source(sha, &repo.id).await {
                     tracing::warn!(sha = %sha, repo_id = %repo.id, err = %e, "sweep discovery: failed to record the discovered pin source");
                 }
-                // After the record, never before: a successful `record_pin_source`
-                // clears this marker.
-                if let Err(e) = db.mark_pin_sources_incomplete(sha).await {
+                // Discovery found ONE holder out of a bounded, warm-only candidate set,
+                // so the source set is still not known complete and the resolver must
+                // keep its scan fallback for this row.
+                //
+                // Marked against the UNKNOWN-repo sentinel rather than the repo just
+                // recorded, which would be a lie (that repo IS recorded). The sentinel is
+                // the same one the v24 migration carries pre-upgrade markers under, and it
+                // means what it means here: a source may be missing and nobody knows
+                // which, so no real record clears it.
+                //
+                // Rebase note (#321 onto the per-(oid, repo) marker): the original wrote
+                // this marker because `record_pin_source` used to clear the whole
+                // per-object boolean. It no longer does, so this call went from
+                // compensating for a clear to being the only thing arming the fallback.
+                if let Err(e) = db.mark_pin_sources_incomplete(sha, "").await {
                     tracing::warn!(sha = %sha, err = %e, "sweep discovery: failed to mark the pin-source set incomplete");
                 }
                 return DiscoveryOutcome::Repaired;
