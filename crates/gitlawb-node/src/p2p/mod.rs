@@ -185,8 +185,13 @@ fn verify_ref_update(event: &RefUpdateEvent) -> Result<(), String> {
 /// What the ingest path decided about one inbound gossip message.
 #[derive(Debug)]
 pub(crate) enum IngestOutcome {
-    /// The event was authenticated and written.
+    /// The event was authenticated AND every write it implies landed.
     Accepted,
+    /// The event passed every guard, but a durable write failed. The decision
+    /// was still "admit it", so this is not a refusal; it exists because
+    /// returning `Accepted` for an event whose row never landed would make the
+    /// outcome an observability lie.
+    WriteFailed(String),
     /// The event was dropped. Nothing is stored, so the reason exists only to
     /// be logged and counted.
     Rejected(String),
@@ -256,7 +261,15 @@ pub(crate) async fn ingest_ref_update(
     }
 
     // Authentication is not authorization: a freshly minted did:key signs its
-    // own events perfectly well. Only registered peers may write.
+    // own events perfectly well, so the signature alone says nothing about who
+    // this peer is to us. Be precise about what this check buys, because it is
+    // NOT a closed membership boundary: `upsert_peer` accepts an
+    // `PeerWriteAuthority::Unproven` announce for an unseen did:key, so an
+    // attacker can self-register a fresh DID through the announce path and then
+    // pass this gate. What it does buy is that an unregistered DID cannot write
+    // at all, and that combined with the signature check above, an existing
+    // peer cannot be impersonated: claiming a registered DID now requires the
+    // key behind it.
     match db.list_peers().await {
         Ok(peers) => {
             if !peers.iter().any(|p| p.did == event.node_did) {
@@ -296,8 +309,13 @@ pub(crate) async fn ingest_ref_update(
         // author. The authenticated author is `node_did` beside it.
         from_peer: propagation_source.to_string(),
     };
+    // Both writes are still attempted independently: a failed row must not cost
+    // the queue entry, and a failed queue entry must not undo the row. Only the
+    // OUTCOME changes, so `Accepted` keeps meaning "authenticated AND stored".
+    let mut write_error: Option<String> = None;
     if let Err(e) = db.insert_ref_update(&update).await {
         warn!(err = %e, "failed to store received ref-update");
+        write_error = Some(format!("failed to store received ref-update: {e}"));
     }
     if auto_sync {
         if let Err(e) = db
@@ -311,9 +329,13 @@ pub(crate) async fn ingest_ref_update(
             .await
         {
             warn!(err = %e, "failed to enqueue sync for received ref-update");
+            write_error.get_or_insert(format!("failed to enqueue sync: {e}"));
         }
     }
-    IngestOutcome::Accepted
+    match write_error {
+        Some(reason) => IngestOutcome::WriteFailed(reason),
+        None => IngestOutcome::Accepted,
+    }
 }
 
 /// A DID record stored in the Kademlia DHT — maps a gitlawb DID to a node.
@@ -575,6 +597,11 @@ pub async fn start(
                                 &propagation_source,
                             ).await {
                                 IngestOutcome::Accepted => {}
+                                IngestOutcome::WriteFailed(reason) => warn!(
+                                    from = %propagation_source,
+                                    reason = %reason,
+                                    "admitted gossip ref-update but a write failed"
+                                ),
                                 IngestOutcome::Rejected(reason) => warn!(
                                     from = %propagation_source,
                                     reason = %reason,
@@ -802,6 +829,31 @@ mod tests {
             cid: Option<String>,
         }
 
+        /// The same field set with unknown keys REFUSED. The permissive struct
+        /// above is serde's default, which drops keys it does not know, so it
+        /// is structurally blind to an ADDED field and would stay green against
+        /// the `"sig": null` regression `unsigned_event_serializes_with_no_sig_key`
+        /// warns about. This one sees the addition, which is what lets the two
+        /// assertions below state the intent: `sig` is a deliberate new key, so
+        /// an unsigned event is byte-compatible with the old wire form and a
+        /// signed one is not.
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        #[serde(deny_unknown_fields)]
+        struct StrictLegacyRefUpdateEvent {
+            node_did: String,
+            pusher_did: String,
+            repo: String,
+            #[serde(default)]
+            owner_did: Option<String>,
+            ref_name: String,
+            old_sha: String,
+            new_sha: String,
+            timestamp: String,
+            cert_id: Option<String>,
+            cid: Option<String>,
+        }
+
         let mut event = populated_event();
         event.sig = Some("c2lnbmF0dXJl".into());
         let bytes = serde_json::to_vec(&event).unwrap();
@@ -810,6 +862,22 @@ mod tests {
             .expect("new-code bytes must deserialize under the old field set");
         assert_eq!(legacy.repo, "zOwner/myrepo");
         assert_eq!(legacy.owner_did, Some("did:key:zOwner".into()));
+
+        // An UNSIGNED event carries no `sig` key at all, so it is byte-identical
+        // in shape to the pre-change wire form and parses even under the strict
+        // reader. This is what `skip_serializing_if` buys; drop it and a
+        // `"sig": null` key appears here and this goes red.
+        let unsigned_bytes = serde_json::to_vec(&populated_event()).unwrap();
+        let strict: StrictLegacyRefUpdateEvent = serde_json::from_slice(&unsigned_bytes)
+            .expect("an unsigned event must carry no field the pre-change reader did not know");
+        assert_eq!(strict.repo, "zOwner/myrepo");
+
+        // A SIGNED event does carry the new key, and that is intentional, not a
+        // compatibility bug: the permissive reader above is what makes it
+        // harmless. Pinning the refusal here documents `sig` as the one added
+        // field, so a SECOND addition cannot slip in unnoticed.
+        serde_json::from_slice::<StrictLegacyRefUpdateEvent>(&bytes)
+            .expect_err("a signed event must be visibly carrying the added `sig` key");
     }
 
     #[test]
@@ -1071,6 +1139,9 @@ mod tests {
         match outcome {
             IngestOutcome::Rejected(reason) => reason,
             IngestOutcome::Accepted => panic!("{context}: the event must be rejected"),
+            IngestOutcome::WriteFailed(reason) => {
+                panic!("{context}: the event must be rejected by a guard, not admitted and then failed to write: {reason}")
+            }
             IngestOutcome::RateLimited => {
                 panic!("{context}: the event must be rejected by a guard, not by the rate brake")
             }
@@ -1147,9 +1218,14 @@ mod tests {
     }
 
     /// R11: a non-did:key `node_did` cannot be authenticated by design, and the
-    /// refusal answers in the SAME sentence as the peers-table gate. The DID is
-    /// seeded as a known peer on purpose, so the known-peer gate would admit it
-    /// and only the did-method gate can be what rejects it.
+    /// refusal answers in the SAME sentence as the peers-table gate.
+    ///
+    /// What this test guards is the REFUSAL WORDING, not the pre-parse
+    /// did-method gate. The event here is signed, so with that gate deleted
+    /// `verify_ref_update` resolves `node_did` itself and returns the identical
+    /// sentence; the assertion below cannot tell the two apart. The test that
+    /// isolates the gate is
+    /// `an_unsigned_non_did_key_event_from_a_known_peer_is_rejected_by_the_did_method_gate`.
     #[sqlx::test]
     async fn a_non_did_key_node_did_is_rejected_in_both_modes(pool: PgPool) {
         let db = ingest_db(&pool).await;
@@ -1176,6 +1252,42 @@ mod tests {
                 "{context}: the gossip surface must reuse the peers-table refusal sentence"
             );
         }
+    }
+
+    /// The load-bearing test for the pre-parse did-method gate, and the ONLY
+    /// combination that isolates it.
+    ///
+    /// Three inputs, each chosen to take one of the other guards out of the
+    /// picture. The event is UNSIGNED, so `verify_ref_update` is never called
+    /// and cannot resolve `node_did` on the gate's behalf. `require_signed` is
+    /// FALSE, so the unsigned branch admits it rather than refusing it for a
+    /// missing signature. The did:web DID is seeded into `peers`, so the
+    /// known-peer gate admits it too. Everything downstream (the repo slug) is
+    /// valid. With the gate present this is refused with the shared sentence;
+    /// delete the gate and this exact event is accepted and written.
+    #[sqlx::test]
+    async fn an_unsigned_non_did_key_event_from_a_known_peer_is_rejected_by_the_did_method_gate(
+        pool: PgPool,
+    ) {
+        let db = ingest_db(&pool).await;
+        let mut event = populated_event();
+        event.node_did = "did:web:example.com".into();
+        assert_eq!(
+            event.sig, None,
+            "the gate must be what decides, not the sig"
+        );
+        seed_peer(&pool, &event.node_did).await;
+
+        let context = "unsigned did:web event from a seeded peer, require_signed=false";
+        let outcome =
+            ingest_with_fresh_limiter(&db, false, true, &bytes_of(&event), &PeerId::random()).await;
+
+        assert_nothing_written(&pool, context).await;
+        assert_eq!(
+            rejection_reason(outcome, context),
+            "methodNotSupported: only did:key peers can be registered without a proof of control: did:web:example.com",
+            "{context}: only the did-method gate can refuse this, so this is what goes red if it is removed"
+        );
     }
 
     /// R3: authentication is not authorization. A correctly signed event from a
@@ -1291,9 +1403,14 @@ mod tests {
     }
 
     /// R7, the rolling-upgrade window: with enforcement off, an unsigned event
-    /// from a KNOWN peer is still accepted (and warned about, per the HTTP
-    /// twin's wording). Turning the flag on is the operator's step, not a code
-    /// change, so this path has to keep working until they take it.
+    /// from a KNOWN peer is still accepted. Turning the flag on is the
+    /// operator's step, not a code change, so this path has to keep working
+    /// until they take it.
+    ///
+    /// The ingest path also emits a `warn!` pointing at the flag on this
+    /// branch. Nothing here asserts that, so the log line is uncovered:
+    /// deleting it leaves this test green. Say so rather than implying the
+    /// wording is pinned.
     #[sqlx::test]
     async fn flag_off_unsigned_known_peer_event_is_accepted(pool: PgPool) {
         let db = ingest_db(&pool).await;
@@ -1355,6 +1472,25 @@ mod tests {
     fn gossip_ingest_budget_is_sixty_per_minute() {
         assert_eq!(GOSSIP_INGEST_MAX_EVENTS, 60);
         assert_eq!(GOSSIP_INGEST_WINDOW, Duration::from_secs(60));
+        assert_eq!(GOSSIP_INGEST_MAX_SOURCES, 200_000);
+    }
+
+    /// The source ceiling has to reach the limiter production builds, not just
+    /// exist as a constant. Asserting the constant alone leaves
+    /// `new_ingest_rate_limiter` free to call the unbounded-ish `new`, which
+    /// silently swaps in `DEFAULT_MAX_KEYS` and passes every other test here.
+    ///
+    /// Driving 200_000 distinct source keys to observe the cap by behavior
+    /// would cost more than it proves, so this reads the wired value through
+    /// the test-only accessor instead. What it does NOT cover is the eviction
+    /// behavior at the cap; that is `rate_limit`'s own test's job.
+    #[test]
+    fn gossip_ingest_limiter_carries_the_source_ceiling() {
+        assert_eq!(
+            new_ingest_rate_limiter().max_keys(),
+            GOSSIP_INGEST_MAX_SOURCES,
+            "the gossip limiter must be built bounded by GOSSIP_INGEST_MAX_SOURCES"
+        );
     }
 
     /// The ordering test, and the reason the brake exists at all. Signature

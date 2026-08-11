@@ -128,6 +128,14 @@ impl RateLimiter {
         self.state.lock().await.len()
     }
 
+    /// The configured key ceiling. Tests use it to assert that a limiter a
+    /// production factory builds is actually bounded, which flooding the real
+    /// ceiling in distinct keys would be far too slow to show.
+    #[cfg(test)]
+    pub fn max_keys(&self) -> usize {
+        self.max_keys
+    }
+
     pub async fn cleanup(&self) {
         let now = Instant::now();
         let mut state = self.state.lock().await;
