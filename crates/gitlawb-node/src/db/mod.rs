@@ -7116,6 +7116,7 @@ mod peer_authority_tests {
 /// | `a_legacy_row_can_still_refresh_its_liveness` (db/mod.rs) | test-only. Seeds a PRE-GATE row by raw SQL on purpose: `upsert_peer` cannot create one, since the gate it is testing refuses exactly that DID. The fixture models what a deployed table already holds |
 /// | `gossip_ping_round_requires_two_failures_before_persisting_unreachable` (main.rs) | test-only. Seeds a peer row by raw SQL so the gossip ping round can probe readiness hysteresis without going through `upsert_peer` |
 /// | `manual_ping_uses_readiness_without_mutating_federation_gate` (api/peers.rs) | test-only. Seeds a peer row by raw SQL so the manual ping route can assert readiness probing without mutating federation gate state |
+/// | `seed_peer` (p2p/mod.rs) | test-only. Seeds a peer row by raw SQL so the gossip ingest tests can drive the known-peer gate directly, including the did:web case `upsert_peer` would refuse |
 ///
 /// And the `upsert_peer` CALL-SITE authority table, which the ledger above
 /// structurally cannot hold, because the bootstrap site issues no SQL of its own
@@ -7213,6 +7214,7 @@ mod peers_table_writer_guard {
         ("prune_non_public_peers", 1),
         ("prune_self_peers", 1),
         ("seed_local_peer", 1),
+        ("seed_peer", 1),
         ("upsert_peer", 2),
     ];
 

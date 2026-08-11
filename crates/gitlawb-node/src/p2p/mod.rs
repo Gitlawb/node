@@ -82,7 +82,6 @@ pub struct RefUpdateEvent {
 /// the output byte-identical to the legacy wire form (no `"sig": null`), and
 /// serde's derive serializes in declaration order, so both sides re-serializing
 /// the same struct definition agree regardless of the order fields arrived in.
-#[allow(dead_code)] // consumed by the emit and ingest paths in later units
 fn signing_bytes(event: &RefUpdateEvent) -> serde_json::Result<Vec<u8>> {
     let mut unsigned = event.clone();
     unsigned.sig = None;
@@ -98,46 +97,50 @@ fn sign_ref_update(keypair: &Keypair, event: &mut RefUpdateEvent) -> serde_json:
     Ok(())
 }
 
+/// Resolve the public key behind a claimed `node_did`, refusing anything that
+/// is not a resolvable `did:key`.
+///
+/// The did-method and resolution refusals answer in the SAME words as the
+/// peers-table gate in db/mod.rs, so the two surfaces that judge the same input
+/// do not drift into separate vocabularies. The sentences are built from
+/// `PeerWriteDenied` itself rather than retyped, so they cannot.
+fn resolve_node_did(node_did: &str) -> Result<ed25519_dalek::VerifyingKey, String> {
+    let unresolvable = |reason: String| {
+        PeerWriteDenied::UnresolvableDid {
+            did: node_did.to_string(),
+            reason,
+        }
+        .to_string()
+    };
+
+    let did = node_did
+        .parse::<gitlawb_core::did::Did>()
+        .map_err(|e| unresolvable(e.to_string()))?;
+    if !did.is_did_key() {
+        return Err(PeerWriteDenied::UnsupportedDidMethod {
+            did: node_did.to_string(),
+        }
+        .to_string());
+    }
+    did.to_verifying_key()
+        .map_err(|e| unresolvable(e.to_string()))
+}
+
 /// Verify that `event.sig` is an Ed25519 signature over [`signing_bytes`] by
 /// the key behind `event.node_did`.
 ///
 /// The signature is bound to the claimed identity structurally: the key comes
 /// from `node_did` and nowhere else, so a valid signature by some other key
 /// never passes.
-#[allow(dead_code)] // wired into the ingest path in a later unit
 fn verify_ref_update(event: &RefUpdateEvent) -> Result<(), String> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    let verifying_key = resolve_node_did(&event.node_did)?;
 
     let sig_b64 = event
         .sig
         .as_deref()
         .ok_or_else(|| "event carries no signature".to_string())?;
-
-    // The did-method and resolution refusals answer in the SAME words as the
-    // peers-table gate in db/mod.rs, so the two surfaces that judge the same
-    // input do not drift into separate vocabularies. The sentences are built
-    // from PeerWriteDenied itself rather than retyped, so they cannot.
-    let unresolvable = |reason: String| {
-        PeerWriteDenied::UnresolvableDid {
-            did: event.node_did.clone(),
-            reason,
-        }
-        .to_string()
-    };
-
-    let did = event
-        .node_did
-        .parse::<gitlawb_core::did::Did>()
-        .map_err(|e| unresolvable(e.to_string()))?;
-    if !did.is_did_key() {
-        return Err(PeerWriteDenied::UnsupportedDidMethod {
-            did: event.node_did.clone(),
-        }
-        .to_string());
-    }
-    let verifying_key = did
-        .to_verifying_key()
-        .map_err(|e| unresolvable(e.to_string()))?;
 
     let sig_bytes: [u8; 64] = URL_SAFE_NO_PAD
         .decode(sig_b64)
@@ -148,6 +151,127 @@ fn verify_ref_update(event: &RefUpdateEvent) -> Result<(), String> {
     let bytes = signing_bytes(event).map_err(|e| e.to_string())?;
     gitlawb_core::identity::verify(&verifying_key, &bytes, &sig_bytes)
         .map_err(|_| "signature does not verify against node_did".to_string())
+}
+
+/// What the ingest path decided about one inbound gossip message.
+#[derive(Debug)]
+pub(crate) enum IngestOutcome {
+    /// The event was authenticated and written.
+    Accepted,
+    /// The event was dropped. Nothing is stored, so the reason exists only to
+    /// be logged and counted.
+    Rejected(String),
+}
+
+/// Handle one inbound gossip ref-update: authenticate it, then write it.
+///
+/// The swarm loop and the tests share this one path, so a guard cannot hold in
+/// one and not the other. The guards are the same trio the HTTP twin
+/// (`api::peers::notify_sync`) applies, carried by a payload signature because
+/// gossip has no HTTP signature to key off: the sender proves the `node_did` it
+/// claims, that DID is a known peer, and the repo slug is well formed. Every
+/// refusal drops the event; nothing is stored (KTD-4), so an unauthenticated
+/// sender cannot grow a table.
+pub(crate) async fn ingest_ref_update(
+    db: &Db,
+    require_signed: bool,
+    auto_sync: bool,
+    data: &[u8],
+    propagation_source: &PeerId,
+) -> IngestOutcome {
+    let event = match serde_json::from_slice::<RefUpdateEvent>(data) {
+        Ok(event) => event,
+        Err(e) => return IngestOutcome::Rejected(format!("malformed ref-update event: {e}")),
+    };
+
+    // did-method gate first, and in BOTH enforcement modes: a non-did:key peer
+    // is unauthenticatable by design, and running this before the flag branch
+    // is what keeps the answer independent of flag state.
+    if let Err(reason) = resolve_node_did(&event.node_did) {
+        return IngestOutcome::Rejected(reason);
+    }
+
+    match event.sig {
+        // A signature that is present must verify. A present-but-invalid one is
+        // forgery, never a peer that has not upgraded yet, so the flag does not
+        // enter into it.
+        Some(_) => {
+            if let Err(reason) = verify_ref_update(&event) {
+                return IngestOutcome::Rejected(reason);
+            }
+        }
+        None if require_signed => {
+            return IngestOutcome::Rejected("unsigned ref-update event".to_string());
+        }
+        // Rolling-upgrade window, same posture and same pointer at the flag as
+        // the HTTP twin's unsigned-notify warning.
+        None => {
+            warn!(
+                did = %event.node_did,
+                "accepted unsigned gossip ref-update; set GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true after all peers upgrade"
+            );
+        }
+    }
+
+    // Authentication is not authorization: a freshly minted did:key signs its
+    // own events perfectly well. Only registered peers may write.
+    match db.list_peers().await {
+        Ok(peers) => {
+            if !peers.iter().any(|p| p.did == event.node_did) {
+                return IngestOutcome::Rejected(format!("unknown peer DID: {}", event.node_did));
+            }
+        }
+        Err(e) => return IngestOutcome::Rejected(format!("peer lookup failed: {e}")),
+    }
+
+    // #272: the slug reaches a `PathBuf::join` in the sync worker, so it is
+    // rejected here, before the ref-update row and the queue row.
+    if let Err(e) = crate::git::repo_store::validate_repo_slug(&event.repo) {
+        return IngestOutcome::Rejected(format!("invalid repo field: {e}"));
+    }
+
+    info!(
+        from = %propagation_source,
+        repo = %event.repo,
+        ref_name = %event.ref_name,
+        new_sha = %event.new_sha,
+        "ref-update received via gossipsub"
+    );
+
+    let update = ReceivedRefUpdate {
+        id: Uuid::new_v4().to_string(),
+        node_did: event.node_did.clone(),
+        pusher_did: event.pusher_did.clone(),
+        repo: event.repo.clone(),
+        owner_did: event.owner_did.clone(),
+        ref_name: event.ref_name.clone(),
+        old_sha: event.old_sha.clone(),
+        new_sha: event.new_sha.clone(),
+        timestamp: event.timestamp.clone(),
+        cert_id: event.cert_id.clone(),
+        received_at: Utc::now().to_rfc3339(),
+        // The peer that FORWARDED this message through the mesh, not the
+        // author. The authenticated author is `node_did` beside it.
+        from_peer: propagation_source.to_string(),
+    };
+    if let Err(e) = db.insert_ref_update(&update).await {
+        warn!(err = %e, "failed to store received ref-update");
+    }
+    if auto_sync {
+        if let Err(e) = db
+            .enqueue_sync(
+                &event.repo,
+                &event.node_did,
+                &event.ref_name,
+                &event.new_sha,
+                event.cid.as_deref(),
+            )
+            .await
+        {
+            warn!(err = %e, "failed to enqueue sync for received ref-update");
+        }
+    }
+    IngestOutcome::Accepted
 }
 
 /// A DID record stored in the Kademlia DHT — maps a gitlawb DID to a node.
@@ -259,6 +383,9 @@ struct GitlawbBehaviour {
 /// Start the libp2p swarm. Returns a handle for sending commands and the
 /// listening multiaddrs. Runs the event loop as a background tokio task
 /// that exits cleanly when `shutdown_rx` flips to `true`.
+// Wide, but each argument is a distinct piece of node configuration and there
+// is exactly one call site; bundling them would buy nothing.
+#[allow(clippy::too_many_arguments)]
 pub async fn start(
     node_did: &str,
     listen_port: u16,
@@ -266,6 +393,8 @@ pub async fn start(
     db: Arc<Db>,
     auto_sync: bool,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    keypair: Arc<Keypair>,
+    require_signed: bool,
 ) -> Result<P2pHandle> {
     // Derive a stable libp2p Ed25519 key from a seed based on the node DID.
     // In production you'd load/persist this key alongside the identity PEM.
@@ -287,6 +416,10 @@ pub async fn start(
     let local_peer_id = PeerId::from(local_key.public());
 
     info!(peer_id = %local_peer_id, "libp2p identity");
+
+    // The node identity that signs outgoing publishes. The emit path is wired
+    // in a later unit; ingest only ever resolves keys from the claimed DID.
+    let _keypair = keypair;
 
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<P2pCommand>(64);
 
@@ -391,38 +524,18 @@ pub async fn start(
                         SwarmEvent::Behaviour(GitlawbBehaviourEvent::Gossipsub(
                             gossipsub::Event::Message { propagation_source, message, .. }
                         )) => {
-                            if let Ok(event) = serde_json::from_slice::<RefUpdateEvent>(&message.data) {
-                                info!(
+                            if let IngestOutcome::Rejected(reason) = ingest_ref_update(
+                                &db,
+                                require_signed,
+                                auto_sync,
+                                &message.data,
+                                &propagation_source,
+                            ).await {
+                                warn!(
                                     from = %propagation_source,
-                                    repo = %event.repo,
-                                    ref_name = %event.ref_name,
-                                    new_sha = %event.new_sha,
-                                    "ref-update received via gossipsub"
+                                    reason = %reason,
+                                    "dropped gossip ref-update"
                                 );
-                                let update = ReceivedRefUpdate {
-                                    id: Uuid::new_v4().to_string(),
-                                    node_did: event.node_did.clone(),
-                                    pusher_did: event.pusher_did.clone(),
-                                    repo: event.repo.clone(),
-                                    owner_did: event.owner_did.clone(),
-                                    ref_name: event.ref_name.clone(),
-                                    old_sha: event.old_sha.clone(),
-                                    new_sha: event.new_sha.clone(),
-                                    timestamp: event.timestamp.clone(),
-                                    cert_id: event.cert_id.clone(),
-                                    received_at: Utc::now().to_rfc3339(),
-                                    from_peer: propagation_source.to_string(),
-                                };
-                                let _ = db.insert_ref_update(&update).await;
-                                if auto_sync {
-                                    let _ = db.enqueue_sync(
-                                        &event.repo,
-                                        &event.node_did,
-                                        &event.ref_name,
-                                        &event.new_sha,
-                                        event.cid.as_deref(),
-                                    ).await;
-                                }
                             }
                         }
                         // ── Kademlia results ──────────────────────────
@@ -821,6 +934,304 @@ mod tests {
             err,
             "methodNotSupported: only did:key peers can be registered without a proof of control: did:web:example.com"
         );
+    }
+
+    // ── Ingest-path tests ─────────────────────────────────────────────────
+    //
+    // Every rejection case asserts BOTH sinks are empty: `received_ref_updates`
+    // and `sync_queue`. They are two separate writes, so a guard that stops one
+    // and not the other is exactly the bug this path is being fixed for, and a
+    // row-count-only assertion would pass against that half-fix.
+
+    use sqlx::PgPool;
+
+    async fn ingest_db(pool: &PgPool) -> Db {
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations()
+            .await
+            .expect("test schema migrations should apply");
+        db
+    }
+
+    async fn seed_peer(pool: &PgPool, did: &str) {
+        sqlx::query(
+            "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
+             VALUES ($1, $2, $3, FALSE, $3)",
+        )
+        .bind(did)
+        .bind("https://peer.example.com")
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .expect("seed peer");
+    }
+
+    async fn count(pool: &PgPool, table: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(pool)
+            .await
+            .expect("count rows")
+    }
+
+    /// Both sinks, asserted separately. `context` names the case so a failure
+    /// says which mode and which guard let the write through.
+    async fn assert_nothing_written(pool: &PgPool, context: &str) {
+        assert_eq!(
+            count(pool, "received_ref_updates").await,
+            0,
+            "{context}: a rejected event must write no received_ref_updates row"
+        );
+        assert_eq!(
+            count(pool, "sync_queue").await,
+            0,
+            "{context}: a rejected event must enqueue no sync_queue row"
+        );
+    }
+
+    fn bytes_of(event: &RefUpdateEvent) -> Vec<u8> {
+        serde_json::to_vec(event).expect("serialize event")
+    }
+
+    fn rejection_reason(outcome: IngestOutcome, context: &str) -> String {
+        match outcome {
+            IngestOutcome::Rejected(reason) => reason,
+            IngestOutcome::Accepted => panic!("{context}: the event must be rejected"),
+        }
+    }
+
+    /// R1, the core must-not: enforcement on, an unsigned event that merely
+    /// CLAIMS a known peer's DID writes nothing. Anyone on the open mesh can
+    /// send these, so this is the whole point of the unit.
+    #[sqlx::test]
+    async fn flag_on_unsigned_event_claiming_a_known_peer_writes_nothing(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        let event = event_for(&keypair);
+        seed_peer(&pool, &event.node_did).await;
+
+        let outcome =
+            ingest_ref_update(&db, true, true, &bytes_of(&event), &PeerId::random()).await;
+
+        assert_nothing_written(&pool, "unsigned event with enforcement on").await;
+        rejection_reason(outcome, "unsigned event with enforcement on");
+    }
+
+    /// R2: a cryptographically valid signature that does not bind the claimed
+    /// identity (the RUSTSEC-2022-0009 shape). Rejected in BOTH modes, because
+    /// a present-but-wrong signature is forgery, never a legacy peer.
+    #[sqlx::test]
+    async fn a_signature_by_another_key_is_rejected_in_both_modes(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let signer = Keypair::generate();
+        let claimed = Keypair::generate();
+        let mut event = event_for(&claimed);
+        sign_ref_update(&signer, &mut event).unwrap();
+        seed_peer(&pool, &event.node_did).await;
+
+        for require_signed in [true, false] {
+            let context = format!("foreign-key signature, require_signed={require_signed}");
+            let outcome = ingest_ref_update(
+                &db,
+                require_signed,
+                true,
+                &bytes_of(&event),
+                &PeerId::random(),
+            )
+            .await;
+            assert_nothing_written(&pool, &context).await;
+            rejection_reason(outcome, &context);
+        }
+    }
+
+    /// R2: a signed event whose payload was edited after signing.
+    #[sqlx::test]
+    async fn a_tampered_signed_event_is_rejected_in_both_modes(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        seed_peer(&pool, &event.node_did).await;
+        event.new_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+
+        for require_signed in [true, false] {
+            let context = format!("tampered event, require_signed={require_signed}");
+            let outcome = ingest_ref_update(
+                &db,
+                require_signed,
+                true,
+                &bytes_of(&event),
+                &PeerId::random(),
+            )
+            .await;
+            assert_nothing_written(&pool, &context).await;
+            rejection_reason(outcome, &context);
+        }
+    }
+
+    /// R11: a non-did:key `node_did` cannot be authenticated by design, and the
+    /// refusal answers in the SAME sentence as the peers-table gate. The DID is
+    /// seeded as a known peer on purpose, so the known-peer gate would admit it
+    /// and only the did-method gate can be what rejects it.
+    #[sqlx::test]
+    async fn a_non_did_key_node_did_is_rejected_in_both_modes(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        let mut event = populated_event();
+        event.node_did = "did:web:example.com".into();
+        sign_ref_update(&keypair, &mut event).unwrap();
+        seed_peer(&pool, &event.node_did).await;
+
+        for require_signed in [true, false] {
+            let context = format!("did:web node_did, require_signed={require_signed}");
+            let outcome = ingest_ref_update(
+                &db,
+                require_signed,
+                true,
+                &bytes_of(&event),
+                &PeerId::random(),
+            )
+            .await;
+            assert_nothing_written(&pool, &context).await;
+            assert_eq!(
+                rejection_reason(outcome, &context),
+                "methodNotSupported: only did:key peers can be registered without a proof of control: did:web:example.com",
+                "{context}: the gossip surface must reuse the peers-table refusal sentence"
+            );
+        }
+    }
+
+    /// R3: authentication is not authorization. A correctly signed event from a
+    /// DID nobody registered is still refused, mirroring the HTTP twin's
+    /// unconditional known-peer gate.
+    #[sqlx::test]
+    async fn a_signed_event_from_an_unknown_peer_is_rejected_in_both_modes(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        // Deliberately NOT seeded into the peers table.
+
+        for require_signed in [true, false] {
+            let context = format!("unknown peer DID, require_signed={require_signed}");
+            let outcome = ingest_ref_update(
+                &db,
+                require_signed,
+                true,
+                &bytes_of(&event),
+                &PeerId::random(),
+            )
+            .await;
+            assert_nothing_written(&pool, &context).await;
+            rejection_reason(outcome, &context);
+        }
+    }
+
+    /// R4: the #272 slug guard, on this transport too. The slug reaches a
+    /// `PathBuf::join` in the sync worker, so it is rejected before the row and
+    /// before the queue entry.
+    #[sqlx::test]
+    async fn a_traversal_slug_is_rejected_before_any_write(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        event.repo = "../../x".into();
+        sign_ref_update(&keypair, &mut event).unwrap();
+        seed_peer(&pool, &event.node_did).await;
+
+        for require_signed in [true, false] {
+            let context = format!("traversal slug, require_signed={require_signed}");
+            let outcome = ingest_ref_update(
+                &db,
+                require_signed,
+                true,
+                &bytes_of(&event),
+                &PeerId::random(),
+            )
+            .await;
+            assert_nothing_written(&pool, &context).await;
+            rejection_reason(outcome, &context);
+        }
+    }
+
+    /// R6: the acceptance path, which is what keeps federation alive. A guard
+    /// that rejects everything would pass every test above and fail here.
+    #[sqlx::test]
+    async fn flag_on_signed_known_peer_event_is_accepted_end_to_end(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        seed_peer(&pool, &event.node_did).await;
+        let source = PeerId::random();
+
+        let outcome = ingest_ref_update(&db, true, true, &bytes_of(&event), &source).await;
+        assert!(
+            matches!(outcome, IngestOutcome::Accepted),
+            "a correctly signed event from a known peer must be accepted, got {outcome:?}"
+        );
+
+        let row: (String, String, String, String, String) = sqlx::query_as(
+            "SELECT node_did, pusher_did, repo, ref_name, from_peer FROM received_ref_updates",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("exactly one ref-update row");
+        assert_eq!(row.0, event.node_did);
+        assert_eq!(row.1, "did:key:zPusher");
+        assert_eq!(row.2, "zOwner/myrepo");
+        assert_eq!(row.3, "refs/heads/main");
+        // R9: from_peer records the FORWARDER, not the author.
+        assert_eq!(row.4, source.to_string());
+
+        assert_eq!(
+            count(&pool, "sync_queue").await,
+            1,
+            "auto_sync on must enqueue the accepted event"
+        );
+    }
+
+    /// The auto_sync=false half: the row lands, the queue stays empty. Without
+    /// it, an ingest that enqueued unconditionally would go unnoticed.
+    #[sqlx::test]
+    async fn accepted_event_does_not_enqueue_when_auto_sync_is_off(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        seed_peer(&pool, &event.node_did).await;
+
+        let outcome =
+            ingest_ref_update(&db, true, false, &bytes_of(&event), &PeerId::random()).await;
+        assert!(matches!(outcome, IngestOutcome::Accepted));
+
+        assert_eq!(count(&pool, "received_ref_updates").await, 1);
+        assert_eq!(
+            count(&pool, "sync_queue").await,
+            0,
+            "auto_sync off must not enqueue"
+        );
+    }
+
+    /// R7, the rolling-upgrade window: with enforcement off, an unsigned event
+    /// from a KNOWN peer is still accepted (and warned about, per the HTTP
+    /// twin's wording). Turning the flag on is the operator's step, not a code
+    /// change, so this path has to keep working until they take it.
+    #[sqlx::test]
+    async fn flag_off_unsigned_known_peer_event_is_accepted(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        let event = event_for(&keypair);
+        assert_eq!(event.sig, None);
+        seed_peer(&pool, &event.node_did).await;
+
+        let outcome =
+            ingest_ref_update(&db, false, true, &bytes_of(&event), &PeerId::random()).await;
+        assert!(
+            matches!(outcome, IngestOutcome::Accepted),
+            "an unsigned known-peer event must survive the rolling-upgrade window, got {outcome:?}"
+        );
+        assert_eq!(count(&pool, "received_ref_updates").await, 1);
+        assert_eq!(count(&pool, "sync_queue").await, 1);
     }
 
     #[test]
