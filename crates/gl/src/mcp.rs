@@ -1940,6 +1940,52 @@ mod tests {
         assert!(result.contains("webhooks"), "got: {result}");
     }
 
+    /// The MCP tool deliberately diverges from the CLI here: `gl webhook list`
+    /// requires a local identity and fails client-side without one, while the MCP
+    /// tool issues the request unsigned and lets the node answer. Pin that path,
+    /// since the divergence is only defensible if the denial actually reaches the
+    /// caller as an error rather than as an empty webhook list.
+    #[tokio::test]
+    async fn test_webhook_list_unsigned_without_identity_surfaces_the_node_denial() {
+        let mut server = mockito::Server::new_async().await;
+
+        // No identity dir, and an explicit `owner`, so the tool cannot sign and
+        // does not fall back to the keypair for the owner segment. The node
+        // owner-gates /hooks and answers a headerless caller with 401.
+        let m = server
+            .mock("GET", mockito::Matcher::Regex(r"/hooks$".to_string()))
+            .match_header("signature", mockito::Matcher::Missing)
+            .with_status(401)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"signature required"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        // Point at an EMPTY dir rather than passing `None`: `None` falls back to
+        // the ambient ~/.gitlawb/identity.pem, which exists on a dev box and not
+        // on CI, so the request would be signed here and unsigned there.
+        let empty = tempfile::TempDir::new().unwrap();
+        let err = call_tool(
+            "webhook_list",
+            json!({"owner": "alice", "repo": "myrepo"}),
+            &server.url(),
+            Some(empty.path()),
+        )
+        .await
+        .expect_err("a 401 must surface as an error, not an empty webhook list");
+
+        let err = err.to_string();
+        assert!(err.contains("401"), "must name the status: {err}");
+        assert!(
+            err.contains("signature required"),
+            "must carry the node's own reason: {err}"
+        );
+        // The request must actually have been issued unsigned; failing
+        // client-side before contacting the node would leave this unmatched.
+        m.assert_async().await;
+    }
+
     #[tokio::test]
     async fn test_webhook_list_default_owner_is_keypair_not_node_did() {
         // When `owner` is omitted, the owner segment must come from the signing

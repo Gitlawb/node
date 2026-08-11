@@ -524,11 +524,12 @@ mod tests {
     #[tokio::test]
     async fn cmd_stats_surfaces_denial_not_fake_result() {
         let mut server = mockito::Server::new_async().await;
-        let _m = server
+        let m = server
             .mock("GET", mockito::Matcher::Regex(r"/stats$".to_string()))
             .with_status(403)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"forbidden"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -536,6 +537,12 @@ mod tests {
             .await
             .expect_err("a 403 must be an error, not a zeroed fake result");
         assert!(err.to_string().contains("403"), "err={err}");
+        // Pin the mock hit explicitly. The status assertion above already fails
+        // when the route does not match (mockito answers an unmatched route with
+        // 501, so "403" is absent), but that proof is incidental to mockito's
+        // fallback status; assert the hit directly so it survives a reworded
+        // assertion.
+        m.assert_async().await;
     }
 
     /// #186 (F1): the same denial-as-error behavior across the non-2xx response
@@ -555,13 +562,14 @@ mod tests {
             if json {
                 m = m.with_header("content-type", "application/json");
             }
-            let _m = m.create_async().await;
+            let m = m.expect(1).create_async().await;
 
             let err = cmd_stats(server.url()).await.unwrap_err().to_string();
             assert!(
                 err.contains(&status.to_string()),
                 "status {status} must surface as an error, got: {err}"
             );
+            m.assert_async().await;
         }
     }
 
