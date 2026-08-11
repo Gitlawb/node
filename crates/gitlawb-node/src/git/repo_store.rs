@@ -762,7 +762,7 @@ impl Drop for RepoWriteGuard {
 /// produces the same `i64` key across every Rust toolchain version, operating
 /// system, and machine — the algorithm is frozen by the SHA-2 standard rather
 /// than by a std-internal implementation detail.
-fn advisory_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
+pub(crate) fn advisory_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     hasher.update(owner_slug.as_bytes());
@@ -771,7 +771,6 @@ fn advisory_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
     let digest = hasher.finalize();
     i64::from_le_bytes(digest[..8].try_into().expect("sha256 output is >= 8 bytes"))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
