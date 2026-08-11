@@ -438,7 +438,8 @@ async fn discover_legacy_row(
     git_bin: &str,
     git_timeout: Duration,
     db: &crate::db::Db,
-) -> DiscoveryOutcome {
+) -> (DiscoveryOutcome, usize) {
+    let mut reads = 0usize;
     if ctx.is_none() {
         *ctx = Some(match load_discovery_ctx(repos_dir, git_timeout, db).await {
             Ok(c) => Some(c),
@@ -451,7 +452,7 @@ async fn discover_legacy_row(
     let ctx = match ctx.as_ref().expect("the candidate list was just loaded") {
         Some(c) => c,
         // A failed load says nothing about the row, so a later run retries it.
-        None => return DiscoveryOutcome::Retryable,
+        None => return (DiscoveryOutcome::Retryable, reads),
     };
 
     let mut retryable = false;
@@ -459,6 +460,9 @@ async fn discover_legacy_row(
     // MAX_LEGACY_DISCOVERY_PROBES bounds the expensive work exactly. Candidates the
     // filters already rejected never reach here and so cost nothing against the cap.
     for (repo, repo_path) in ctx.candidates.iter().take(MAX_LEGACY_DISCOVERY_PROBES) {
+        // Counted before the match, because the read is spent whatever it returns. This
+        // is the quantity the caller charges against the per-run budget.
+        reads += 1;
         match repair_legacy_provider_cid(repo_path, git_bin, ctx.deadline, sha, db).await {
             Ok(RepairOutcome::Repaired) => {
                 if let Err(e) = db.record_pin_source(sha, &repo.id).await {
@@ -481,7 +485,7 @@ async fn discover_legacy_row(
                 if let Err(e) = db.mark_pin_sources_incomplete(sha, "").await {
                     tracing::warn!(sha = %sha, err = %e, "sweep discovery: failed to mark the pin-source set incomplete");
                 }
-                return DiscoveryOutcome::Repaired;
+                return (DiscoveryOutcome::Repaired, reads);
             }
             // The bytes could not be read from this WARM candidate right now, which IS
             // evidence about the row: try the next one and walk the row again later.
@@ -501,12 +505,12 @@ async fn discover_legacy_row(
         // from grindable owner DIDs, so a terminal verdict would let an attacker bury
         // the true holder past the cap permanently. The oldest-first order makes that
         // expensive, and this arm makes it non-permanent.
-        return DiscoveryOutcome::Retryable;
+        return (DiscoveryOutcome::Retryable, reads);
     }
     if retryable {
-        DiscoveryOutcome::Retryable
+        (DiscoveryOutcome::Retryable, reads)
     } else {
-        DiscoveryOutcome::Settled
+        (DiscoveryOutcome::Settled, reads)
     }
 }
 
@@ -572,15 +576,28 @@ async fn sweep_pass(
         // what makes an unrepairable row COST something rather than just being skipped.
         let mut row_read_attempted = false;
         if sources.is_empty() {
-            match discover_legacy_row(&sha, &mut discovery, repos_dir, git_bin, git_timeout, db)
-                .await
-            {
+            let (outcome, reads) =
+                discover_legacy_row(&sha, &mut discovery, repos_dir, git_bin, git_timeout, db)
+                    .await;
+            match outcome {
                 DiscoveryOutcome::Repaired => {
                     repaired += 1;
                     row_repaired = true;
                 }
                 DiscoveryOutcome::Retryable => row_retryable = true,
                 DiscoveryOutcome::Settled => {}
+            }
+            // Charge every probe that did not end in a repair, INCLUDING a retryable
+            // one, which is where discovery differs from the provenance loop below.
+            // There a retryable read is against a repo the row names as a holder, so it
+            // is expected to succeed once that repo warms. Discovery probes repos the
+            // row does not name, re-derives its candidate list from scratch on every
+            // run, and re-probes from the top, so a row that stays unrepaired costs the
+            // same reads again on the next boot whatever its outcome was. Leaving the
+            // retryable arm uncharged would also leave the cost open to steering, since
+            // the cap-reached arm is retryable by design and repo ids are grindable.
+            if !row_repaired {
+                dead_row_reads += reads;
             }
         }
         for repo_id in sources {

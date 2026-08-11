@@ -7893,6 +7893,170 @@ mod tests {
         );
     }
 
+    /// #173 round 12 (rebase interaction): discovery's probes count against the per-run
+    /// fruitless-read budget, PER PROBE rather than per row.
+    ///
+    /// The two changes met badly. Round 12 made the cursor rewind unconditional on
+    /// reaching the end of the table, so every completed run re-walks every row; the
+    /// budget is what stops a node from paying `O(dead rows)` object reads on every boot.
+    /// But `row_read_attempted` was only ever set in the provenance loop, so a
+    /// source-less row, the one shape discovery exists for, spent up to
+    /// `MAX_LEGACY_DISCOVERY_PROBES` reads and contributed nothing to the budget. The
+    /// per-row cap bounds one row; nothing bounded the run.
+    ///
+    /// Counting per row instead of per probe would not do: at 16 probes a row the budget
+    /// would admit 16 times the reads it names. Several warm candidates here are what
+    /// distinguishes the two, since the run must stop after far fewer ROWS than the
+    /// budget's own number.
+    #[sqlx::test]
+    async fn sweep_discovery_probes_count_against_the_fruitless_read_budget(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+        let cap = crate::ipfs_pin::MAX_DEAD_ROW_READS_PER_RUN;
+        let batch: i64 = 8;
+
+        // Three warm repos, none of which holds the objects below, so every probe reads
+        // and finds nothing: three fruitless reads per source-less row.
+        let names = ["u3bdga", "u3bdgb", "u3bdgc"];
+        let _fx = seed_cid_repos(&slug, &short, &names);
+        for n in names {
+            let repo = seed_repo(&owner_did, n);
+            state.db.create_repo(&repo).await.expect("seed repo");
+        }
+        let probes_per_row = names.len();
+
+        // Source-less legacy rows (no repo_id, no pin_repo_sources) for objects that live
+        // in none of the repos, which is the shape discovery probes and cannot repair.
+        let raw_cid =
+            gitlawb_core::cid::Cid::from_git_object_bytes(b"bytes that live nowhere").to_string();
+        let rows = cap; // more than the budget allows once each row costs three probes
+        for i in 0..rows {
+            sqlx::query("INSERT INTO pinned_cids (sha256_hex, cid, pinned_at) VALUES ($1, $2, $3)")
+                .bind(format!("{:064x}", i))
+                .bind(legacy_dagpb_cid(&raw_cid))
+                .bind("2020-01-01T00:00:00Z")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(180),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                batch,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the run terminates");
+
+        assert!(
+            stats.dead_row_reads >= cap,
+            "discovery's fruitless probes reach the budget (spent {})",
+            stats.dead_row_reads
+        );
+        // Per PROBE, not per row: at three probes a row the run must stop after roughly a
+        // third of the budget's worth of rows, plus at most one batch of overshoot.
+        // Asserted BEFORE the coarser bound below so that a per-row implementation
+        // reddens on the property this test is named for. The fixture deliberately holds
+        // exactly `cap` rows, so per-row counting walks the whole table and would
+        // otherwise trip the coarse assertion first, reporting the wrong reason.
+        assert!(
+            stats.scanned <= cap / probes_per_row + batch as usize,
+            "the budget counts probes, not rows: scanned {} with a cap of {cap} at \
+             {probes_per_row} probes per row",
+            stats.scanned
+        );
+        assert!(
+            stats.scanned < rows,
+            "the run stops short of the table instead of walking all {rows} rows \
+             (scanned {})",
+            stats.scanned
+        );
+        assert_ne!(
+            state.db.pin_repair_cursor().await.unwrap(),
+            "",
+            "a run that stops on its budget keeps its place for the next one"
+        );
+    }
+
+    /// #173 round 12: the RETRYABLE arm of discovery is charged to the budget too, which
+    /// is the half that differs from the provenance loop and the half an attacker can
+    /// steer.
+    ///
+    /// The cap-reached outcome is retryable BY DESIGN, so that a grindable repo id cannot
+    /// bury the true holder past the cap permanently. That same design makes it the arm a
+    /// hostile registrant can hold a row in: register more than the cap's worth of warm
+    /// repos and every source-less row costs a full cap of reads, on every boot, forever.
+    /// Charging only the settled arm would leave exactly that uncharged.
+    #[sqlx::test]
+    async fn sweep_discovery_charges_a_retryable_cap_reached_row(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+        let probe_cap = crate::ipfs_pin::MAX_LEGACY_DISCOVERY_PROBES;
+
+        // One more warm repo than the probe cap, so the walk stops with candidates left
+        // and classifies the row RETRYABLE rather than settled. None holds the object.
+        let names: Vec<String> = (0..probe_cap + 1).map(|i| format!("u3ret{i}")).collect();
+        let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let _fx = seed_cid_repos(&slug, &short, &name_refs);
+        for n in &names {
+            let repo = seed_repo(&owner_did, n);
+            state.db.create_repo(&repo).await.expect("seed repo");
+        }
+
+        let raw_cid =
+            gitlawb_core::cid::Cid::from_git_object_bytes(b"bytes that live nowhere").to_string();
+        sqlx::query("INSERT INTO pinned_cids (sha256_hex, cid, pinned_at) VALUES ($1, $2, $3)")
+            .bind("a".repeat(64))
+            .bind(legacy_dagpb_cid(&raw_cid))
+            .bind("2020-01-01T00:00:00Z")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the run terminates");
+
+        assert_eq!(
+            stats.retryable_skips, 1,
+            "the cap was reached with candidates left, so the row is retryable"
+        );
+        assert_eq!(
+            stats.repaired, 0,
+            "no candidate holds the object, so nothing is repaired"
+        );
+        assert_eq!(
+            stats.dead_row_reads, probe_cap,
+            "a retryable cap-reached row is charged its full cap of probes, not zero"
+        );
+    }
+
     /// F1 scenario 5 (#173, BOUND plus anti-burial): the probe cap counts the expensive
     /// unit, a bounded object read from a warm repo, so a row costs at most
     /// `MAX_LEGACY_DISCOVERY_PROBES` reads however many candidates the node holds. With
