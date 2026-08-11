@@ -258,22 +258,30 @@ async fn main() -> Result<()> {
             .filter_map(|s| s.parse().ok())
             .collect();
         let shutdown_rx = shutdown_tx.subscribe();
-        match p2p::start(
-            &node_did.to_string(),
-            config.p2p_port,
-            bootstrap_addrs,
-            Arc::clone(&db),
-            config.auto_sync,
-            shutdown_rx,
-        )
-        .await
-        {
-            Ok(handle) => {
-                info!(port = config.p2p_port, peer_id = %handle.local_peer_id, "libp2p swarm started");
-                Some(Arc::new(handle))
+        match p2p::load_or_create_p2p_keypair(&config.resolved_p2p_key_path()) {
+            Ok(local_key) => {
+                match p2p::start(
+                    local_key,
+                    config.p2p_port,
+                    bootstrap_addrs,
+                    Arc::clone(&db),
+                    config.auto_sync,
+                    shutdown_rx,
+                )
+                .await
+                {
+                    Ok(handle) => {
+                        info!(port = config.p2p_port, peer_id = %handle.local_peer_id, "libp2p swarm started");
+                        Some(Arc::new(handle))
+                    }
+                    Err(e) => {
+                        tracing::warn!(err = %e, "failed to start libp2p swarm — continuing without p2p");
+                        None
+                    }
+                }
             }
             Err(e) => {
-                tracing::warn!(err = %e, "failed to start libp2p swarm — continuing without p2p");
+                tracing::warn!(err = %e, "failed to load p2p identity key — continuing without p2p");
                 None
             }
         }
