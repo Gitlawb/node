@@ -2139,7 +2139,7 @@ mod tests {
         assert_eq!(count, 40, "expected 40 tools, got {count}");
     }
 
-    // ── Gated read arms surface node denials, not fabricated results (#123 / INV-8) ──
+    // ── Gated read arms surface node denials, not fabricated results (#123) ──
 
     #[tokio::test]
     async fn repo_get_surfaces_denial_not_fabricated_repo() {
@@ -2359,7 +2359,7 @@ mod tests {
         _m.assert_async().await;
     }
 
-    // ── INV-8 across the MCP twin: every tool that renders a node response must
+    // ── Across the MCP twin: every tool that renders a node response must
     //    surface a denial as an Err, not print the 4xx/5xx body as a success. ──
 
     /// Drive one MCP tool against a node returning a 404 and assert it Errs

@@ -344,7 +344,7 @@ async fn cmd_info(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
         anyhow::bail!("repository '{owner}/{name}' not found");
     }
     // Every other status routes through read_json: a 2xx yields the parsed body,
-    // any other non-2xx yields the node's capped + sanitized message (INV-6), and
+    // any other non-2xx yields the node's capped + sanitized message, and
     // the error read is bounded rather than buffering the whole hostile body.
     let r = crate::http::read_json(resp, "repo info").await?;
 
@@ -893,7 +893,7 @@ mod tests {
     #[tokio::test]
     async fn cmd_list_repos_surfaces_denial() {
         // A node error must Err with the status, not trip the vague "expected
-        // array" fallback that hides the node's actual response (INV-8).
+        // array" fallback that hides the node's actual response.
         let dir = TempDir::new().unwrap();
         write_identity(&dir);
 
@@ -1423,7 +1423,7 @@ mod tests {
         _repo.assert_async().await;
     }
 
-    // ── Gated CLI reads surface node denials, not empty renders (#123 / INV-8) ──
+    // ── Gated CLI reads surface node denials, not empty renders (#123) ──
 
     #[tokio::test]
     async fn cmd_commits_surfaces_denial_not_empty() {
@@ -1717,7 +1717,7 @@ mod vet_merge_deny_arms {
     }
 
     // An authenticated caller DENIED with a 403 must surface an error, never
-    // render a repo card (deny-as-success is the INV-8 client-contract break).
+    // render a repo card (deny-as-success is the client-contract break).
     #[tokio::test]
     async fn cmd_info_403_denied_surfaces_error_not_card() {
         let dir = TempDir::new().unwrap();

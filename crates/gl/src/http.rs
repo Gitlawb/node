@@ -206,7 +206,7 @@ async fn obtain_proof(cfg: IcaptchaCfg) -> Result<String> {
 
 /// Read at most `cap` bytes of a response body. Bounds the allocation from a
 /// hostile or broken node returning a huge error body — the display is capped
-/// separately, but the read itself must not be unbounded (INV-6, read half).
+/// separately, but the read itself must not be unbounded either.
 pub(crate) async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> String {
     let mut buf: Vec<u8> = Vec::new();
     while buf.len() < cap {
@@ -227,7 +227,7 @@ pub(crate) async fn read_body_capped(mut resp: reqwest::Response, cap: usize) ->
 /// Strip terminal-dangerous characters from (and cap the length of) a
 /// node-supplied error string before surfacing it. The node a caller talks to
 /// could be hostile and embed escape sequences in its error body; those must not
-/// reach the terminal verbatim (INV-6). We drop the C0/C1 control bytes (which
+/// reach the terminal verbatim. We drop the C0/C1 control bytes (which
 /// defangs ANSI/OSC escapes) AND the Unicode bidi/format controls (which
 /// `char::is_control` does not cover — they can reorder the displayed line).
 pub(crate) fn sanitize_node_msg(s: &str) -> String {
@@ -239,13 +239,13 @@ pub(crate) fn sanitize_node_msg(s: &str) -> String {
 
 /// Read a JSON response, surfacing a node denial/error instead of parsing it as
 /// the requested resource. On a non-2xx status it returns an `Err` carrying the
-/// node's sanitized `message` (INV-6) plus the status; on success it parses the
+/// node's sanitized `message` plus the status; on success it parses the
 /// body and propagates a parse error, so a truncated/garbage 2xx body is an error
 /// rather than a silently-empty success (the denial-as-success bug #123 fixes).
 /// `what` names the resource for the error text (e.g. "repo", "commits").
 ///
 /// Callers must route gated reads through this rather than `resp.json().await?`:
-/// the bare parse renders a gated 404/5xx body back as the resource (INV-8).
+/// the bare parse renders a gated 404/5xx body back as the resource.
 /// Cap on the error body `read_json` reads before parsing a node's `message`.
 /// Matches the capped-read bound used on the sync error path; large enough for any
 /// legitimate error, small enough that a hostile node cannot exhaust memory.
@@ -707,7 +707,7 @@ mod tests {
         assert_eq!(out, "ok \u{0627}\u{200D}b");
     }
 
-    // ── read_json (status-checked read; #123 / INV-8 / INV-6) ────────────
+    // ── read_json (status-checked, bounded, sanitized read; #123) ────────
 
     /// Drive a real `reqwest::Response` off a mockito mock so `read_json` sees an
     /// actual HTTP status + body, the same shape the gated read arms produce.
@@ -775,7 +775,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_json_sanitizes_control_and_bidi_in_message() {
-        // INV-6: a hostile node embeds ESC, BEL, and a right-to-left override in
+        // A hostile node embeds ESC, BEL, and a right-to-left override in
         // the error message; none may reach the terminal verbatim.
         let mut server = Server::new_async().await;
         let resp = response_for(

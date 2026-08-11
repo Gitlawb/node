@@ -853,7 +853,7 @@ mod tests {
         .unwrap();
     }
 
-    // ── Gated PR reads surface node denials, not empty/stub renders (#123 / INV-8) ──
+    // ── Gated PR reads surface node denials, not empty/stub renders (#123) ──
 
     #[tokio::test]
     async fn cmd_list_surfaces_denial_not_empty() {

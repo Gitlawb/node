@@ -45,7 +45,7 @@ pub async fn run(args: SyncArgs) -> Result<()> {
             let status = resp.status();
             if !status.is_success() {
                 // Bound the read: a hostile or broken node must not force an
-                // unbounded allocation just to surface a denial (INV-6, read half).
+                // unbounded allocation just to surface a denial.
                 let raw = read_body_capped(resp, 8 * 1024).await;
                 let msg = serde_json::from_str::<serde_json::Value>(&raw)
                     .ok()

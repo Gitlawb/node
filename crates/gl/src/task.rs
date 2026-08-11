@@ -613,7 +613,7 @@ mod tests {
         .unwrap();
     }
 
-    // ── denial surfaces (INV-8): a node 4xx/5xx must Err, not render as success ──
+    // ── denial surfaces: a node 4xx/5xx must Err, not render as success ──
 
     #[tokio::test]
     async fn test_list_tasks_surfaces_denial() {

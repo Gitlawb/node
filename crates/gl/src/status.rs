@@ -133,7 +133,7 @@ pub async fn run(args: StatusArgs) -> Result<()> {
 }
 
 /// The status line for a repo section (PRs / issues) whose gated read returned a
-/// non-2xx: the denial must surface, never render as "no open ..." (INV-8).
+/// non-2xx: the denial must surface, never render as "no open ...".
 /// Returns `None` for a success (the caller renders the body) or a transport error
 /// (the section degrades silently — R5 — so the multi-section `gl status` never
 /// hard-fails on one denied read).
@@ -149,7 +149,7 @@ fn section_unavailable_line(label: &str, resp: &Result<reqwest::Response>) -> Op
 /// The `trust` status line for the caller's own identity. A genuine 404 means the
 /// identity is not registered; any OTHER non-2xx (403/429/5xx) is a failed lookup
 /// and must surface as unavailable rather than fabricating an unregistered state
-/// (INV-8). A transport error degrades silently — the node-unreachable line below
+/// A transport error degrades silently — the node-unreachable line below
 /// already surfaces it — matching `section_unavailable_line`.
 async fn trust_line(resp: Result<reqwest::Response>) -> Option<String> {
     match resp {
@@ -407,7 +407,7 @@ mod tests {
         assert_eq!(trust_bar(0.25), "█░░░");
     }
 
-    // ── gl status section denial surfacing (#123 / INV-8, R5) ────────────
+    // ── gl status section denial surfacing (#123, R5) ────────────────────
 
     async fn get_response(
         server: &mut mockito::Server,
@@ -426,7 +426,7 @@ mod tests {
     #[tokio::test]
     async fn gated_section_surfaces_unavailable_not_empty() {
         // A gated 404 on a status section must surface "unavailable", never be
-        // treated as "no open PRs" (INV-8).
+        // treated as "no open PRs".
         let mut server = mockito::Server::new_async().await;
         let resp = get_response(&mut server, 404).await;
         assert_eq!(
@@ -452,7 +452,7 @@ mod tests {
     }
 
     // ── trust_line: a 404 means unregistered; any OTHER failure must surface as
-    //    unavailable, never fabricate an unregistered verdict (INV-8). ──────────
+    //    unavailable, never fabricate an unregistered verdict. ───────────────
     async fn agents_resp(
         server: &mut mockito::Server,
         status: usize,

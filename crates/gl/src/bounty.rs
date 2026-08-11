@@ -576,7 +576,7 @@ mod tests {
     #[tokio::test]
     async fn cmd_list_repo_scoped_surfaces_denial_not_empty() {
         // `gl bounty list --repo owner/name` hits the gated /repos/{o}/{n}/bounties;
-        // a 404 must Err, not silently print nothing (INV-8).
+        // a 404 must Err, not silently print nothing.
         let mut server = mockito::Server::new_async().await;
         let _m = server
             .mock(

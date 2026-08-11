@@ -1,4 +1,5 @@
-//! INV-21 completeness gate for #186.
+//! Completeness gate for #186, itself proven load-bearing by reverting a
+//! converted handler and watching this go red.
 //!
 //! The client handlers converted in #186 must read node responses through
 //! `crate::http::read_json` — status-first, capped error read, sanitized message.
