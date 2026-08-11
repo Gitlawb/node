@@ -1359,10 +1359,16 @@ async fn pinata_object_list_for_refs(
 /// retained list memory is not bounded by this pool. Bounding that is a real change to
 /// the capture shape and is deliberately not attempted here; the Pinata twin below
 /// avoids it by acquiring BEFORE it derives its list.
-// Eight because the merge of #173 and #174 landed both sets of arguments on one
+// Nine because the merge of #173 and #174 landed both sets of arguments on one
 // signature: #174's pin-admission permit plus #173's git seam and pin provenance.
 // Each is a distinct value the pin loop needs and none is derivable from another, so
-// a wrapper struct here would only rename the same eight fields.
+// a wrapper struct here would only rename the same nine fields.
+//
+// `batch_budget` is the ninth and is passed rather than read from the constant so the
+// permit-release regression can drive a short budget. Hardcoding `PIN_BATCH_BUDGET`
+// here made that test cost 120s of wall clock, and the only cheaper shapes were
+// vacuous: a lock released before the budget returns at the same time whether or not
+// the loop is bounded, which proves nothing. Production passes the constant.
 #[allow(clippy::too_many_arguments)]
 async fn pin_new_objects_gated(
     pin_sem: &Arc<tokio::sync::Semaphore>,
@@ -1373,6 +1379,7 @@ async fn pin_new_objects_gated(
     object_list: Vec<String>,
     db: &Arc<crate::db::Db>,
     repo_id: &str,
+    batch_budget: std::time::Duration,
 ) -> Vec<(String, String)> {
     // Nothing to pin: answer before taking a permit (#174 F2b). The permit bounds how
     // many pin loops run concurrently, and an empty list does no pinning, so parking
@@ -1395,7 +1402,7 @@ async fn pin_new_objects_gated(
         object_list,
         db,
         repo_id,
-        crate::ipfs_pin::PIN_BATCH_BUDGET,
+        batch_budget,
     )
     .await
 }
@@ -1427,6 +1434,7 @@ async fn pin_and_encrypt_objects(
         // The drain's repo id, never `ctx.repo_id` frozen at spawn (#174 U3): pin
         // provenance must name the row the reader will resolve against.
         repo_id,
+        crate::ipfs_pin::PIN_BATCH_BUDGET,
     )
     .await;
     if !pinned.is_empty() {
@@ -6897,6 +6905,7 @@ mod tests {
                 objects.clone(),
                 &db,
                 "repo-gated-a",
+                crate::ipfs_pin::PIN_BATCH_BUDGET,
             ),
         )
         .await;
@@ -6918,11 +6927,95 @@ mod tests {
                 objects,
                 &db,
                 "repo-gated-b",
+                crate::ipfs_pin::PIN_BATCH_BUDGET,
             ),
         )
         .await
         .expect("the pin loop completes once admission frees");
         assert!(out.is_empty(), "an empty ipfs_api pins nothing");
+    }
+
+    /// #173 F3, at the layer that actually owns the permit. `pin_new_objects_gated`
+    /// holds the global `pin_semaphore` across the whole `ipfs_pin::pin_new_objects`
+    /// call, so a DB call inside that loop with no deadline parked a global pin slot
+    /// for as long as the query was stuck; once every slot was so held, post-push
+    /// replication stopped for every repo on the node. With the loop's DB calls
+    /// bounded by the batch deadline the call returns at ~the batch budget and the
+    /// permit comes back, even though the table is still locked.
+    ///
+    /// The endpoint is a LIVE mockito server, not the `""` the sibling test above
+    /// uses. `ipfs_pin::pin_new_objects` returns `vec![]` immediately on an empty
+    /// `ipfs_api`, so an empty-string copy would never reach `is_pinned`, never touch
+    /// the locked table, and pass identically with the bound deleted. The mock is at
+    /// `.expect(0)` because a stalled pinned-status check must not fall through to an
+    /// add.
+    ///
+    /// The budget is passed in (1500ms) rather than read from `PIN_BATCH_BUDGET`.
+    /// Before that seam existed this test cost 120s of wall clock, because the bound
+    /// it asserts IS the batch budget and the gate hardcoded the production constant.
+    /// 1500ms is deliberately above `PIN_READ_FLOOR` (1100ms): below the floor
+    /// `batch_budget_gate` breaks the loop as its first statement, so the run would
+    /// never reach a DB call and would pass with the bound deleted.
+    #[sqlx::test]
+    async fn pin_new_objects_gated_frees_permit_after_stalled_db(pool: sqlx::PgPool) {
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let db = state.db.clone();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pin_sem = Arc::new(Semaphore::new(1));
+
+        let mut server = mockito::Server::new_async().await;
+        let add = server
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"Hash":"QmShouldNotHappen"}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        // `ACCESS EXCLUSIVE` conflicts with the `ACCESS SHARE` every SELECT needs, so
+        // `is_pinned` blocks at lock acquisition regardless of row count. Held for the
+        // whole call: a lock released early would let the pre-fix bare await finish too,
+        // and the test would prove nothing.
+        let mut lock = pool.acquire().await.unwrap();
+        sqlx::raw_sql("BEGIN; LOCK TABLE pinned_cids IN ACCESS EXCLUSIVE MODE;")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+
+        let objects = vec!["0123456789abcdef0123456789abcdef01234567".to_string()];
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(150),
+            pin_new_objects_gated(
+                &pin_sem,
+                &server.url(),
+                tmp.path(),
+                "git",
+                std::time::Duration::from_secs(30),
+                objects,
+                &db,
+                "repo-gated-stalled-db",
+                std::time::Duration::from_millis(1500),
+            ),
+        )
+        .await
+        .expect(
+            "a stalled DB must cost the pin loop its batch budget, not the lock's \
+             lifetime: an unbounded await inside the loop holds this permit past every \
+             budget",
+        );
+
+        assert!(out.is_empty(), "a stalled pinned-status check pins nothing");
+        assert_eq!(
+            pin_sem.available_permits(),
+            1,
+            "the global pin permit must be back once the bounded loop returns"
+        );
+        add.assert_async().await;
+
+        sqlx::raw_sql("ROLLBACK").execute(&mut *lock).await.unwrap();
     }
 
     /// #174 F2b: the pin permit bounds how many pin loops run concurrently, so a call
@@ -6956,6 +7049,7 @@ mod tests {
                 vec![],
                 &db,
                 "repo-gated-empty",
+                crate::ipfs_pin::PIN_BATCH_BUDGET,
             ),
         )
         .await

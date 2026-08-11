@@ -88,7 +88,7 @@ pub async fn pin_object(
 ///
 /// The loop runs under a `pin_semaphore` permit and that pool defers rather than
 /// sheds, so the hold has to be bounded by something other than the pusher's object
-/// count. Two things here are:
+/// count. Three things here are:
 ///
 /// - this loop's own wall-clock: the deadline is taken once at loop start and
 ///   checked at the top of every iteration, so no object's work begins with less
@@ -100,22 +100,51 @@ pub async fn pin_object(
 ///   object's own `git_timeout`, with SIGTERM-then-SIGKILL process-group teardown, so a
 ///   hung `git cat-file` costs this batch one `git_timeout` plus one watchdog teardown
 ///   instead of holding the permit for the child's whole lifetime and blocking a runtime
-///   worker while it does.
+///   worker while it does;
+/// - the DB round-trips: every DB operation reachable from inside the region is
+///   bounded by the same absolute deadline through `crate::ipfs_pin::db_bounded`,
+///   including the two inside `repair_legacy_provider_cid`, which this loop body's own
+///   call sites do not show. `retry_db_record` is wrapped as a whole so its ladder
+///   cannot multiply one remainder, and the durability writes (the post-upload
+///   `record_pinata_cid` and source record, the skip branch's source record, and both
+///   incomplete markers) take the floored remainder `max(remaining, DB_RECORD_GRACE)`
+///   so a spent budget delays the permit release rather than dropping a write. That
+///   floor matters more here than on the twin: `pinned.push` is unconditional, so a
+///   dropped record would leave `api::repos` advertising a CID the resolver 404s. A
+///   bound is not a rollback, and what an elapsed bound MEANS is a property of the
+///   operation, so each site maps that arm from the shape of the call it wrapped. Both
+///   source-record sites wrap `record_pin_source`, an explicit transaction whose
+///   `tx.commit()` a cancelled future never reaches, so a timeout there definitely did
+///   not land and both write the incomplete marker exactly as the definite-error arm
+///   does. `record_pinata_cid` is a single autocommit upsert, so ITS timeout is a
+///   genuine unknown outcome and is never treated as a failed write. See
+///   `crate::ipfs_pin::BoundedDbError::Elapsed`.
 ///
 /// So the LOOP's hold is bounded by roughly `batch_budget`, plus one watchdog
-/// teardown and one upload (the shared client's whole-request timeout bounds the
-/// upload; `pin_object` takes no per-request override). The PERMIT's hold is NOT
-/// bounded by any of this: `api::repos` acquires the permit and then re-derives the
-/// object list with `pinata_object_list_for_refs` BEFORE this function is entered,
-/// and that walk carries no aggregate deadline. The DB round-trips
-/// (`has_pinata_cid`, `record_pinata_cid`) are untimed inside the budgeted region
-/// too.
+/// teardown, one upload (the shared client's whole-request timeout bounds the
+/// upload; `pin_object` takes no per-request override), and the record graces one
+/// iteration can chain. `db_record_deadline` re-floors from `Instant::now()` at EVERY
+/// call, so the graces inside a single iteration add up rather than sharing one floor:
+/// the worst case here is the add path at `deadline + 6s` (`record_pinata_cid`, then
+/// `record_pin_source`, then its incomplete marker), against the skip branch's
+/// `deadline + 4s`. It does NOT stack per object, because the next iteration's first
+/// statement is `batch_budget_gate`, which breaks the batch, so the overrun is one
+/// iteration's worth however many objects the push carried. Against the 120s
+/// `PIN_BATCH_BUDGET` that is roughly a 5% overrun for the batch, not an unbounded
+/// hold. The PERMIT's hold is NOT bounded by any of this, and that stays out of
+/// scope: `api::repos` acquires the permit (repos.rs ~2688) and only then re-derives
+/// the object list with `pinata_object_list_for_refs` (~2697), BEFORE this function is
+/// entered, and that walk carries no aggregate deadline. What is bounded is this
+/// loop's own hold, not the permit's total hold and not the semaphore's worst-case
+/// queue.
 ///
 /// The twin in `ipfs_pin.rs` is at parity with this loop on everything that bounds or
 /// repairs an object: the shared budget gate, the read bounded by the earlier of the
-/// batch deadline and `git_timeout`, and the skip branch's opportunistic legacy
-/// provider-CID repair. Change them in lockstep: the skip-if-pinned check, the
-/// provenance and source recording, the fault arms, and the budget handling.
+/// batch deadline and `git_timeout`, the skip branch's opportunistic legacy
+/// provider-CID repair, and the DB bound above, which is the SAME helper and the same
+/// floor on both sides rather than a copy. Change them in lockstep: the
+/// skip-if-pinned check, the provenance and source recording, the fault arms, and the
+/// budget handling.
 ///
 /// The RETURNED PAIRS are the one deliberate divergence, and it is not drift. This side
 /// pushes a pin whose DB record exhausted its retries, because this return is a real
@@ -162,16 +191,32 @@ pub async fn pin_new_objects(
             break;
         }
 
-        match db.has_pinata_cid(&sha).await {
+        // Every DB call from here to the end of the iteration is bounded by the
+        // ABSOLUTE batch deadline (F3, #173), through the same `db_bounded` helper the
+        // ipfs_pin twin routes through: this loop runs under the same global pin permit
+        // and a bare await parked it for the whole stall. The elapsed arm is mapped per
+        // site below, never as a blanket "existing error arm": a timeout cancels the
+        // client future but not the statement Postgres is running, so it reports an
+        // UNKNOWN outcome, not a failed write.
+        match crate::ipfs_pin::db_bounded(deadline, db.has_pinata_cid(&sha)).await {
             Ok(true) => {
                 // Backfill NULL first-pinner provenance from a known source, in lockstep
                 // with the ipfs_pin skip branch: a pinata-only node otherwise leaves
                 // pre-provenance rows' `pinned_cids.repo_id` NULL forever (grok P2-D). The
                 // resolver still finds the object via the pin_repo_sources union below, so
                 // this is a consistency backfill, not a correctness fix.
-                match db.provenance_for_oid(&sha).await {
+                //
+                // Elapsed here is free to skip: the read costs nothing when it lands late,
+                // and the backfill's own `AND repo_id IS NULL` guard makes a late-landing
+                // write idempotent.
+                match crate::ipfs_pin::db_bounded(deadline, db.provenance_for_oid(&sha)).await {
                     Ok(None) => {
-                        if let Err(e) = db.backfill_pin_provenance(&sha, repo_id).await {
+                        if let Err(e) = crate::ipfs_pin::db_bounded(
+                            deadline,
+                            db.backfill_pin_provenance(&sha, repo_id),
+                        )
+                        .await
+                        {
                             tracing::warn!(sha = %sha, err = %e, "failed to backfill pin provenance");
                         }
                     }
@@ -186,12 +231,60 @@ pub async fn pin_new_objects(
                 // retried through the SHARED helper (this was a bare call, so a single
                 // transient error dropped the source outright) and, on exhaustion, marked
                 // durably so the resolver keeps the bounded scan fallback for the object.
-                if let Err(e) =
-                    crate::ipfs_pin::retry_db_record(|| db.record_pin_source(&sha, repo_id)).await
+                // The retry ladder is bounded AS A WHOLE, not per attempt: three stalls
+                // plus their backoff otherwise multiply one remainder by three. Floored at
+                // DB_RECORD_GRACE because this is a durability write.
+                match crate::ipfs_pin::db_bounded(
+                    crate::ipfs_pin::db_record_deadline(deadline),
+                    crate::ipfs_pin::retry_db_record(|| db.record_pin_source(&sha, repo_id)),
+                )
+                .await
                 {
-                    tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
-                    if let Err(e) = db.mark_pin_sources_incomplete(&sha).await {
-                        tracing::warn!(sha = %sha, err = %e, "failed to mark pin sources incomplete");
+                    Ok(()) => {}
+                    // Elapsed here is a DEFINITE non-write, in lockstep with the twin,
+                    // and for a reason that comes from the operation rather than the
+                    // timeout: `record_pin_source` is an explicit transaction whose
+                    // `tx.commit()` a cancelled future never reaches, so no COMMIT is
+                    // sent and the row cannot have landed. Mark the set incomplete
+                    // exactly as the definite-error arm does; an incomplete-and-unmarked
+                    // set is read as COMPLETE and 404s a copy this repo would serve. The
+                    // marker's cost is bounded (the fallback scan is capped at
+                    // `ipfs_max_legacy_probes` and charges the per-IP work rate limiter
+                    // per probe). The arm stays separate only so the warn tells an
+                    // operator a stalled batch from a scattered per-object failure.
+                    Err(e @ crate::ipfs_pin::BoundedDbError::Elapsed) => {
+                        tracing::warn!(
+                            sha = %sha,
+                            err = %e,
+                            "pin source record did not complete inside the batch deadline; \
+                             a cancelled multi-statement transaction never commits, so the \
+                             source is definitely missing and the set is marked incomplete"
+                        );
+                        if let Err(e) = crate::ipfs_pin::db_bounded(
+                            crate::ipfs_pin::db_record_deadline(deadline),
+                            db.mark_pin_sources_incomplete(&sha),
+                        )
+                        .await
+                        {
+                            tracing::warn!(sha = %sha, err = %e, "failed to mark pin sources incomplete");
+                        }
+                    }
+                    // The retries are spent on REAL errors, so this repo is definitely NOT
+                    // in the source set and the set is known incomplete. Floored for the
+                    // same reason the record above is: a spent budget must not drop the
+                    // compensation. The marker write is a single autocommit statement, so
+                    // ITS own elapsed arm is a genuine unknown outcome; nothing branches
+                    // on it, which is why warn-only is right there.
+                    Err(e) => {
+                        tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
+                        if let Err(e) = crate::ipfs_pin::db_bounded(
+                            crate::ipfs_pin::db_record_deadline(deadline),
+                            db.mark_pin_sources_incomplete(&sha),
+                        )
+                        .await
+                        {
+                            tracing::warn!(sha = %sha, err = %e, "failed to mark pin sources incomplete");
+                        }
                     }
                 }
                 // R8 (#173 round 10), in lockstep with the ipfs_pin skip branch:
@@ -311,9 +404,28 @@ pub async fn pin_new_objects(
                 // U3 (#173): both records go through the shared retry helper, at parity
                 // with the ipfs_pin twin. These were bare calls, so one transient DB error
                 // permanently dropped a pin source.
-                if let Err(e) = crate::ipfs_pin::retry_db_record(|| {
-                    db.record_pinata_cid(&sha, &raw_cid, &cid, Some(repo_id))
-                })
+                //
+                // Both bounds here are FLOORED at DB_RECORD_GRACE (F3, #173). The upload
+                // runs under the shared client's own ceiling, so a successful one can
+                // return with ~0 of the batch budget left, and an unfloored bound would
+                // fail a write that today completes in milliseconds. That costs more on
+                // this side than on the twin: `pinned.push` below is UNCONDITIONAL, so
+                // `api/repos.rs` builds its `cid_map` from the pair either way and drives
+                // `upsert_branch_cid` plus the p2p `publish_ref_update` gossip from it. A
+                // dropped record therefore makes the node ADVERTISE a CID whose `/ipfs`
+                // read 404s. If the floored bound still fires, THIS site's outcome really
+                // is unknown, and unlike the source record below that is a property of
+                // the operation: `record_pinata_cid` is a single autocommit upsert, so
+                // the statement Postgres already started can still land after the client
+                // future is cancelled. The warn names the arm through the error's own
+                // Display and the site keeps its existing behavior: the pair is still
+                // returned, and the row may or may not exist.
+                if let Err(e) = crate::ipfs_pin::db_bounded(
+                    crate::ipfs_pin::db_record_deadline(deadline),
+                    crate::ipfs_pin::retry_db_record(|| {
+                        db.record_pinata_cid(&sha, &raw_cid, &cid, Some(repo_id))
+                    }),
+                )
                 .await
                 {
                     tracing::warn!(sha = %sha, err = %e, "failed to record pinata_cid in DB");
@@ -321,12 +433,47 @@ pub async fn pin_new_objects(
                 // F1 (#173 round 8): also record the first pinner in pin_repo_sources.
                 // U3: an exhausted retry marks the set incomplete so the resolver keeps
                 // the scan fallback rather than 404ing a copy it could serve.
-                if let Err(e) =
-                    crate::ipfs_pin::retry_db_record(|| db.record_pin_source(&sha, repo_id)).await
+                match crate::ipfs_pin::db_bounded(
+                    crate::ipfs_pin::db_record_deadline(deadline),
+                    crate::ipfs_pin::retry_db_record(|| db.record_pin_source(&sha, repo_id)),
+                )
+                .await
                 {
-                    tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
-                    if let Err(e) = db.mark_pin_sources_incomplete(&sha).await {
-                        tracing::warn!(sha = %sha, err = %e, "failed to mark pin sources incomplete");
+                    Ok(()) => {}
+                    // Same rule as the skip branch above, and the same reason: this
+                    // wraps `record_pin_source`, an explicit transaction, so a timed-out
+                    // call definitely never committed and the source is definitely
+                    // missing. Mark the set incomplete rather than leaving it incomplete
+                    // and unmarked. Note the contrast with `record_pinata_cid` a few
+                    // lines up: that one is a single autocommit statement, so its
+                    // timeout genuinely is an unknown outcome and it is warn-only.
+                    Err(e @ crate::ipfs_pin::BoundedDbError::Elapsed) => {
+                        tracing::warn!(
+                            sha = %sha,
+                            err = %e,
+                            "pin source record did not complete inside the batch deadline; \
+                             a cancelled multi-statement transaction never commits, so the \
+                             source is definitely missing and the set is marked incomplete"
+                        );
+                        if let Err(e) = crate::ipfs_pin::db_bounded(
+                            crate::ipfs_pin::db_record_deadline(deadline),
+                            db.mark_pin_sources_incomplete(&sha),
+                        )
+                        .await
+                        {
+                            tracing::warn!(sha = %sha, err = %e, "failed to mark pin sources incomplete");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
+                        if let Err(e) = crate::ipfs_pin::db_bounded(
+                            crate::ipfs_pin::db_record_deadline(deadline),
+                            db.mark_pin_sources_incomplete(&sha),
+                        )
+                        .await
+                        {
+                            tracing::warn!(sha = %sha, err = %e, "failed to mark pin sources incomplete");
+                        }
                     }
                 }
                 pinned.push((sha, cid));
@@ -1039,6 +1186,406 @@ mod tests {
             "no git child may be spawned when the sink is not configured"
         );
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    // ── Stalled-DB bound (F3, #173) ───────────────────────────────────────
+    //
+    // `api/repos.rs` acquires the GLOBAL `pin_semaphore` for the Pinata
+    // replication task and holds it across this whole function, the same permit
+    // the IPFS lane takes. `batch_budget_gate` only gates BETWEEN objects and the
+    // git read is already clamped, so a bare DB await in the region parked that
+    // permit for as long as the query was stuck. The tests below drive the stall
+    // with a `LOCK TABLE .. IN ACCESS EXCLUSIVE MODE` held on a dedicated pooled
+    // connection, the same technique the ipfs_pin twin's stall tests use, and copy
+    // their tolerances (a 1.5s budget, an `elapsed < 3s` assertion, a 10s outer
+    // wrap). The budget is above `PIN_READ_FLOOR` on purpose: below it
+    // `batch_budget_gate` breaks the batch as the loop body's FIRST statement, so a
+    // ~1s budget would never reach a DB call and the test would pass with the bound
+    // deleted.
+    // ---------------------------------------------------------------------
+
+    /// Take an `ACCESS EXCLUSIVE` lock on `table` on a dedicated pooled connection.
+    /// Every SELECT needs `ACCESS SHARE`, which conflicts, so the next statement
+    /// touching the table blocks at lock acquisition regardless of row count.
+    /// Copied from `ipfs_pin.rs`'s test mod rather than shared, since test mods are
+    /// private, the same way `seed_loose_blobs` and `capture_logs` are.
+    async fn lock_table(
+        pool: &sqlx::PgPool,
+        table: &str,
+    ) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::raw_sql(&format!(
+            "BEGIN; LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE;"
+        ))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        conn
+    }
+
+    async fn rollback(conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>) {
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut **conn)
+            .await
+            .unwrap();
+    }
+
+    /// Scenario 3: the FIRST DB call in this lane's budgeted region
+    /// (`has_pinata_cid`) stalls. With the batch deadline bounding it the loop
+    /// abandons the object, the budget gate then breaks the batch, and the call
+    /// returns at ~budget having uploaded nothing. Pre-fix the bare await blocks for
+    /// the lock's whole lifetime, holding the caller's global pin permit with it.
+    ///
+    /// The upload mock is at `.expect(0)`: a stalled pinned-status check must never
+    /// fall through to an upload, since that would re-send bytes Pinata may already
+    /// hold and, worse, return a CID this node then advertises.
+    #[sqlx::test]
+    async fn pinata_pin_new_objects_stalled_db_returns_by_budget(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool.clone());
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("pinata_stalled.git");
+        let oids = seed_loose_blobs(&repo_path, 1);
+
+        let mut server = mockito::Server::new_async().await;
+        let upload = server
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"data":{"cid":"QmShouldNotHappen"}}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        // Install a log capture even though nothing here asserts on it: `tracing`
+        // caches a callsite's interest globally the first time it is hit, and a hit
+        // from a thread with no subscriber caches it as never-interested for the whole
+        // binary, which silently blinds the sibling tests that DO assert on the batch
+        // deadline warn.
+        let (_logs, _log_guard) = capture_logs();
+
+        let mut lock = lock_table(&pool, "pinned_cids").await;
+
+        let client = reqwest::Client::new();
+        let started = std::time::Instant::now();
+        let pinned = tokio::time::timeout(
+            Duration::from_secs(10),
+            pin_new_objects(
+                &client,
+                &server.url(),
+                "test-jwt",
+                &repo_path,
+                "git",
+                Duration::from_secs(30),
+                oids,
+                &db,
+                "repo-pinata-stalled",
+                Duration::from_millis(1500),
+            ),
+        )
+        .await
+        .expect(
+            "a stalled DB must cost the batch its budget, not the lock's lifetime: the \
+             bare await hangs past this wrap",
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            pinned.is_empty(),
+            "a stalled pinata-status check cannot produce a pinned object: {pinned:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the batch deadline must end the call at ~budget (1.5s); got {elapsed:?}"
+        );
+        upload.assert_async().await;
+
+        rollback(&mut lock).await;
+    }
+
+    /// The Pinata half of the timed-out source record, driven rather than argued: the
+    /// twin's `pin_new_objects_skip_branch_stalled_record_returns_by_budget` covers the
+    /// Kubo lane and this covers the site that has to change in lockstep with it.
+    ///
+    /// The object already has a `pinata_cid`, so the loop takes the skip branch and
+    /// tries to record this repo as an additional source; `pin_repo_sources` is locked
+    /// for the whole run, so that insert stalls inside `retry_db_record` and the whole
+    /// ladder elapses against one floored remainder. Two properties:
+    ///
+    /// - the call still returns promptly, at the record floor rather than the lock's
+    ///   lifetime;
+    /// - on the TIMEOUT arm the incomplete marker IS written. `record_pin_source` is an
+    ///   explicit transaction, so the cancelled future never reaches `tx.commit()`, no
+    ///   COMMIT is ever sent, and the source definitely did not land. Withholding the
+    ///   marker there would leave the set incomplete AND unmarked, which the resolver
+    ///   reads as complete and 404s a copy this repo would serve.
+    ///
+    /// `pinned_cids` is deliberately NOT locked, so the marker write itself is free to
+    /// land and the assertion below is about the branch, not about lock contention.
+    #[sqlx::test]
+    async fn pinata_skip_branch_stalled_record_marks_incomplete(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool.clone());
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("pinata_skip_stalled.git");
+        let oids = seed_loose_blobs(&repo_path, 1);
+        let sha = oids[0].clone();
+        // Seed the object as already Pinata-pinned, by a DIFFERENT repo, so the skip
+        // branch is taken and the source record below is a genuine additional-source
+        // insert rather than a no-op on the conflict. The resolver key is a canonical
+        // raw CIDv1 so the opportunistic legacy repair takes its cost gate and reads no
+        // bytes.
+        let raw_cid =
+            gitlawb_core::cid::Cid::from_git_object_bytes(b"pinata skip seed").to_string();
+        db.record_pinata_cid(&sha, &raw_cid, "QmSeedProviderCid", Some("repo-seed"))
+            .await
+            .unwrap();
+        db.record_pin_source(&sha, "repo-seed").await.unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let endpoint = delaying_pinata_endpoint(
+            vec![Duration::from_millis(0)],
+            std::sync::Arc::clone(&requests),
+        )
+        .await;
+        // Install a log capture even though nothing here asserts on it: `tracing`
+        // caches a callsite's interest globally the first time it is hit, and a hit
+        // from a thread with no subscriber caches it as never-interested for the whole
+        // binary, which silently blinds the sibling tests that DO assert on the batch
+        // deadline warn.
+        let (_logs, _log_guard) = capture_logs();
+
+        let mut lock = lock_table(&pool, "pin_repo_sources").await;
+
+        let client = reqwest::Client::new();
+        let started = std::time::Instant::now();
+        let pinned = tokio::time::timeout(
+            Duration::from_secs(15),
+            pin_new_objects(
+                &client,
+                &endpoint,
+                "test-jwt",
+                &repo_path,
+                "git",
+                Duration::from_secs(30),
+                oids,
+                &db,
+                "repo-pinata-skip-stalled",
+                Duration::from_millis(1500),
+            ),
+        )
+        .await
+        .expect(
+            "the wrapped retry ladder must fit inside one floored remainder: the bare \
+             retry_db_record hangs past this wrap",
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            pinned.is_empty(),
+            "an already-pinned object is skipped, never re-uploaded: {pinned:?}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the skip branch must not reach the upload at all"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the record's floored remainder must end the call promptly; got {elapsed:?}"
+        );
+
+        rollback(&mut lock).await;
+        drop(lock);
+
+        assert!(
+            db.pin_sources_incomplete(&sha).await.unwrap(),
+            "a TIMED-OUT `record_pin_source` definitively did not land: it is an explicit \
+             multi-statement transaction, and the cancelled future never reaches \
+             `tx.commit()`, so no COMMIT is ever sent and the row cannot exist. The set is \
+             therefore incomplete, and leaving it UNMARKED is the exact state the marker \
+             exists to prevent: the resolver reads a non-empty below-cap set as complete \
+             and 404s a copy this repo would serve"
+        );
+    }
+
+    /// Scenario 8, the Pinata half of the durability floor. `batch_budget_gate` only
+    /// guarantees `PIN_READ_FLOOR` before an object STARTS and the upload runs under
+    /// the shared client's own ceiling, so a successful upload can return with ~0 of
+    /// the batch budget left. Without the floor the post-upload `record_pinata_cid`
+    /// would then be failed by a spent deadline, and this lane's `pinned.push` is
+    /// UNCONDITIONAL: `api/repos.rs` builds `cid_map` from the return and drives
+    /// `upsert_branch_cid` plus the p2p `publish_ref_update` gossip from it, so a
+    /// dropped record makes the node advertise a CID whose `/ipfs` read 404s.
+    ///
+    /// Fixture: a 2s budget, a 1.7s upload, and `pinned_cids` locked from 500ms (well
+    /// after `has_pinata_cid` has read it, and still well before the upload returns)
+    /// until 2.4s. The record therefore starts at ~1.72s with ~280ms of budget left
+    /// and needs ~680ms of lock wait to land, which only the `DB_RECORD_GRACE` floor
+    /// buys it.
+    ///
+    /// The lock time is a MARGIN, not a boundary: taking it at 100ms left
+    /// `has_pinata_cid` racing it on a loaded box, and losing that race makes the read
+    /// block, time out, and break the batch, which fails on `pinned.len() == 1` for a
+    /// reason that has nothing to do with the floor. Any time between the
+    /// `has_pinata_cid` round trip and the upload's 1.7s return proves the same thing.
+    #[sqlx::test]
+    async fn pinata_pin_add_with_spent_budget_still_records_cid(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool.clone());
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("pinata_spent_budget.git");
+        let oids = seed_loose_blobs(&repo_path, 1);
+        let sha = oids[0].clone();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let endpoint = delaying_pinata_endpoint(
+            vec![Duration::from_millis(1700)],
+            std::sync::Arc::clone(&requests),
+        )
+        .await;
+        // Install a log capture even though nothing here asserts on it: `tracing`
+        // caches a callsite's interest globally the first time it is hit, and a hit
+        // from a thread with no subscriber caches it as never-interested for the whole
+        // binary, which silently blinds the sibling tests that DO assert on the batch
+        // deadline warn.
+        let (_logs, _log_guard) = capture_logs();
+
+        let lock_pool = pool.clone();
+        let locker = async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let mut conn = lock_table(&lock_pool, "pinned_cids").await;
+            tokio::time::sleep(Duration::from_millis(1900)).await;
+            rollback(&mut conn).await;
+        };
+
+        let client = reqwest::Client::new();
+        let pin = tokio::time::timeout(
+            Duration::from_secs(20),
+            pin_new_objects(
+                &client,
+                &endpoint,
+                "test-jwt",
+                &repo_path,
+                "git",
+                Duration::from_secs(30),
+                oids.clone(),
+                &db,
+                "repo-pinata-spent-budget",
+                Duration::from_millis(2000),
+            ),
+        );
+        let (pinned, ()) = tokio::join!(pin, locker);
+        let pinned = pinned.expect("the floored record must land well inside this wrap");
+
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the fixture only proves anything if the upload actually ran"
+        );
+        assert!(
+            db.has_pinata_cid(&sha).await.unwrap(),
+            "a successful upload whose batch deadline is spent must still land its \
+             pinned_cids row: this lane pushes the pair unconditionally, so a dropped \
+             record makes api/repos.rs advertise a CID the resolver cannot serve"
+        );
+        assert_eq!(
+            pinned.len(),
+            1,
+            "the uploaded pin must still be returned: {pinned:?}"
+        );
+    }
+
+    /// The POST-UPLOAD source record's timeout arm, the one site of the three that
+    /// nothing else executes. The skip-branch twin above and the ipfs_pin lane cover
+    /// the other two; this arm sits after a SUCCESSFUL `pin_object`, so no skip-branch
+    /// fixture can reach it.
+    ///
+    /// Why it has to write the marker at all: `record_pin_source` is an explicit
+    /// transaction ending in `tx.commit()`, and a cancelled future never gets there, so
+    /// no COMMIT is sent and the row definitely does not exist. The set is therefore
+    /// incomplete, and leaving it unmarked is the state the marker exists to prevent.
+    ///
+    /// Fixture: the object is NOT seeded as Pinata-pinned, so `has_pinata_cid` is false
+    /// and the run takes the upload path. The mock answers the upload at once, then
+    /// `pin_repo_sources` is held under `ACCESS EXCLUSIVE` for the whole run, so the
+    /// post-upload `record_pin_source` blocks and elapses against its floored bound at
+    /// ~2s. `pinned_cids` is deliberately left UNLOCKED, so both `record_pinata_cid`
+    /// and the marker write itself are free to land and the assertion is about the arm
+    /// rather than about my own lock.
+    ///
+    /// The upload assertion is what keeps this from being vacuous: without it the test
+    /// would pass just as well if the run never reached the post-upload path at all.
+    #[sqlx::test]
+    async fn pinata_post_upload_stalled_record_marks_incomplete(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool.clone());
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("pinata_post_upload.git");
+        let oids = seed_loose_blobs(&repo_path, 1);
+        let sha = oids[0].clone();
+
+        let mut server = mockito::Server::new_async().await;
+        let upload = server
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"data":{"cid":"QmPostUploadProviderCid"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        // Install a log capture even though nothing here asserts on it: `tracing`
+        // caches a callsite's interest globally the first time it is hit, and a hit
+        // from a thread with no subscriber caches it as never-interested for the whole
+        // binary, which silently blinds the sibling tests that DO assert on the batch
+        // deadline warn.
+        let (_logs, _log_guard) = capture_logs();
+
+        let mut lock = lock_table(&pool, "pin_repo_sources").await;
+
+        let client = reqwest::Client::new();
+        let started = std::time::Instant::now();
+        let pinned = tokio::time::timeout(
+            Duration::from_secs(20),
+            pin_new_objects(
+                &client,
+                &server.url(),
+                "test-jwt",
+                &repo_path,
+                "git",
+                Duration::from_secs(30),
+                oids,
+                &db,
+                "repo-pinata-post-upload",
+                Duration::from_millis(1500),
+            ),
+        )
+        .await
+        .expect(
+            "the wrapped retry ladder must fit inside one floored remainder: the bare \
+             retry_db_record hangs past this wrap",
+        );
+        let elapsed = started.elapsed();
+
+        rollback(&mut lock).await;
+        drop(lock);
+
+        upload.assert_async().await;
+        assert_eq!(
+            pinned.len(),
+            1,
+            "the upload succeeded, so this lane still returns the pair: {pinned:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "the record's floored remainder must end the call promptly, never at the \
+             lock's lifetime; got {elapsed:?}"
+        );
+        assert!(
+            db.pin_sources_incomplete(&sha).await.unwrap(),
+            "the POST-UPLOAD arm must mark the source set incomplete when its record \
+             times out: `record_pin_source` is an explicit transaction whose cancelled \
+             future never reaches `tx.commit()`, so the row definitely did not land, and \
+             an incomplete-and-unmarked set is read as complete and 404s a copy this \
+             repo would serve"
+        );
     }
 
     #[tokio::test]

@@ -47,6 +47,110 @@ where
     }
 }
 
+/// The smallest bound a durability write is given, however little of the batch
+/// deadline is left.
+///
+/// `batch_budget_gate` only guarantees [`PIN_READ_FLOOR`] before an object STARTS,
+/// and the add is handed the whole remainder, so a successful add can finish with
+/// ~0 left. An unfloored bound would then fail a write that today completes in
+/// milliseconds: on the add path the bytes would sit in Kubo with no `pinned_cids`
+/// row, so nothing could resolve the CID, and on the skip branch the source record
+/// would fail AND its compensating `mark_pin_sources_incomplete` would fail with
+/// it, producing exactly the incomplete-set-without-marker state the marker exists
+/// to prevent. The grace exists so a spent batch deadline degrades to a slightly
+/// late permit release, never to a dropped durability write.
+pub(crate) const DB_RECORD_GRACE: Duration = Duration::from_secs(2);
+
+/// Why a DB call bounded by the batch deadline did not return a value.
+///
+/// The two arms are kept apart because an operator has to be able to tell a stalled
+/// batch (every object timing out at once) from scattered per-object DB failures, and
+/// because what an elapsed bound MEANS is not the same claim as a definite error even
+/// where the two lead to the same compensation. Every warn line at a bounded site
+/// names which arm fired.
+#[derive(Debug)]
+pub(crate) enum BoundedDbError {
+    /// The batch deadline was reached with the call still in flight.
+    ///
+    /// Whether this means "definitely did not happen" or "outcome unknown" is a
+    /// property of the OPERATION, not of the timeout, so each call site has to decide
+    /// it from the shape of the call it wrapped. `tokio::time::timeout` cancels the
+    /// client future; it does not cancel a statement Postgres has already started.
+    /// The two shapes that follow from that:
+    ///
+    /// - a MULTI-STATEMENT operation that ends in an explicit `tx.commit()`
+    ///   DEFINITELY did not land. The cancelled future never reaches the commit, so no
+    ///   COMMIT is ever sent and Postgres discards the transaction when the connection
+    ///   is reset. `Db::record_pin_source` and `Db::record_pinned_cid_with_source` are
+    ///   this shape, and a site that compensates for a definite error must compensate
+    ///   here too;
+    /// - a SINGLE AUTOCOMMIT statement may still land server-side after this arm is
+    ///   taken, because the statement is already running and nothing cancels it.
+    ///   `Db::mark_pin_sources_incomplete` and `Db::record_pinata_cid` are this shape,
+    ///   and nothing downstream may treat this arm as evidence the write did not
+    ///   happen.
+    Elapsed,
+    /// The DB operation itself failed, definitely and with a cause.
+    Db(anyhow::Error),
+}
+
+impl std::fmt::Display for BoundedDbError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Elapsed => write!(f, "batch deadline reached with the DB call in flight"),
+            Self::Db(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<BoundedDbError> for anyhow::Error {
+    fn from(e: BoundedDbError) -> Self {
+        match e {
+            BoundedDbError::Elapsed => anyhow::anyhow!("{e}"),
+            // Keep the real cause chain rather than flattening it to a string.
+            BoundedDbError::Db(inner) => inner,
+        }
+    }
+}
+
+/// Bound one DB operation by the batch deadline.
+///
+/// What this bounds is the PERMIT HOLD. Both pin loops run under a global
+/// `pin_semaphore` permit and that pool defers rather than sheds, so a bare DB
+/// await inside the budgeted region parks the permit for as long as the query is
+/// stuck; once every pin permit is so held, post-push IPFS replication stops for
+/// every repository on the node. `batch_budget_gate` cannot fix that, because it
+/// only gates BETWEEN objects and cannot preempt a call already in flight.
+///
+/// Takes the ABSOLUTE `deadline`, not a duration, so a slow predecessor cannot hand
+/// a later call a fresh full budget: the remainder is measured from the same fixed
+/// point every time, which is what keeps N calls inside ONE budget instead of N.
+///
+/// Callers must map the elapsed arm PER SITE, from the shape of the operation they
+/// wrapped, rather than folding it into their existing error arm or assuming one
+/// meaning for all of them. `timeout` cancels the client future, never the statement
+/// Postgres is already running, so an autocommit statement can land server-side after
+/// this returns [`BoundedDbError::Elapsed`] while a multi-statement transaction whose
+/// `tx.commit()` is never reached definitely cannot. See the arm's own docs for which
+/// operations here are which.
+pub(crate) async fn db_bounded<T, F>(deadline: Instant, fut: F) -> Result<T, BoundedDbError>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let left = deadline.saturating_duration_since(Instant::now());
+    match tokio::time::timeout(left, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(BoundedDbError::Db(e)),
+        Err(_elapsed) => Err(BoundedDbError::Elapsed),
+    }
+}
+
+/// The deadline a durability write gets: the batch deadline, floored at
+/// [`DB_RECORD_GRACE`] from now so a spent budget cannot drop the write.
+pub(crate) fn db_record_deadline(deadline: Instant) -> Instant {
+    std::cmp::max(deadline, Instant::now() + DB_RECORD_GRACE)
+}
+
 /// Opportunistically repair a legacy provider-CID row on the already-pinned skip
 /// path (#173 R8, KTD8). Releases before this branch stored the PROVIDER CID
 /// (Kubo dag-pb / Pinata CIDv0) in `pinned_cids.cid`; the `/ipfs` resolver
@@ -75,7 +179,11 @@ pub(crate) async fn repair_legacy_provider_cid(
     sha: &str,
     db: &crate::db::Db,
 ) -> Result<RepairOutcome> {
-    let stored = match db.cid_for_oid(sha).await? {
+    // Bounded by the SAME `deadline` the git read below uses (F3, #173): both pin
+    // loops call this with the pin permit held, so a bare await here parked that
+    // permit exactly the way the loop bodies' own awaits did. A grep over the loop
+    // bodies cannot see this site, which is why it is bounded from inside.
+    let stored = match db_bounded(deadline, db.cid_for_oid(sha)).await? {
         Some(c) => c,
         None => return Ok(RepairOutcome::Settled),
     };
@@ -130,7 +238,7 @@ pub(crate) async fn repair_legacy_provider_cid(
     if raw == stored {
         return Ok(RepairOutcome::Settled);
     }
-    db.repair_legacy_provider_cid(sha, &raw, &stored).await?;
+    db_bounded(deadline, db.repair_legacy_provider_cid(sha, &raw, &stored)).await?;
     Ok(RepairOutcome::Repaired)
 }
 
@@ -591,7 +699,7 @@ pub(crate) fn batch_budget_gate(
 ///
 /// The loop holds a `pin_semaphore` permit and that pool defers rather than
 /// sheds, so the hold has to be bounded by something other than the pusher's
-/// object count. Three things here are:
+/// object count. Four things here are:
 ///
 /// - this loop's own wall-clock: the deadline is taken once at loop start and
 ///   checked at the top of every iteration, so no object's work begins with less
@@ -607,12 +715,32 @@ pub(crate) fn batch_budget_gate(
 ///   as its per-request timeout, which is what lets one large healthy upload run past
 ///   the shared client's 10s default without letting the batch run forever. Measuring
 ///   it after the read is what keeps the read-plus-add pair inside one budget rather
-///   than up to two of them.
+///   than up to two of them;
+/// - the DB round-trips: every DB operation reachable from inside the region is
+///   bounded by the same absolute deadline through [`db_bounded`], including the two
+///   inside `repair_legacy_provider_cid`, which the loop body's own call sites do not
+///   show. `retry_db_record` is wrapped as a whole so its ladder cannot multiply one
+///   remainder, and the durability writes (the post-add record, the skip branch's
+///   source record and its incomplete marker) take the floored remainder
+///   `max(remaining, DB_RECORD_GRACE)` so a spent budget delays the permit release
+///   rather than dropping a write. A bound is not a rollback, and what an elapsed
+///   bound MEANS is a property of the operation, so each site maps that arm from the
+///   shape of the call it wrapped: a multi-statement transaction whose `tx.commit()`
+///   is never reached definitely did not land and is compensated like a definite
+///   error, while a single autocommit statement may still land server-side and is
+///   never treated as a failed write. See [`BoundedDbError::Elapsed`].
 ///
-/// So the LOOP's hold is bounded by roughly `batch_budget` plus one teardown. Two
-/// things inside that region still are not, and the gate cannot fix either:
+/// So the LOOP's hold is bounded by roughly `batch_budget` plus one teardown plus the
+/// record graces one iteration can chain. `db_record_deadline` re-floors from
+/// `Instant::now()` at EVERY call, so the graces inside a single iteration add up
+/// rather than sharing one floor: this loop's worst case is the skip branch at
+/// `deadline + 4s` (the source record, then its incomplete marker). It does NOT stack
+/// per object, because the next iteration's first statement is `batch_budget_gate`,
+/// which breaks the batch, so the overrun is one iteration's worth however many
+/// objects the push carried. Against the 120s `PIN_BATCH_BUDGET` that is roughly a 5%
+/// overrun for the batch, not an unbounded hold. One thing inside that region still is
+/// not bounded at all, and the gate cannot fix it:
 ///
-/// - the DB round-trips (`is_pinned`, `record_pinned_cid`).
 /// - the pool. `api::repos` acquires the same `pin_semaphore` for the Pinata
 ///   replication task and holds it across `pinata_object_list_for_refs`, a full git
 ///   re-derivation that runs BEFORE `pinata::pin_new_objects` is entered and whose
@@ -681,11 +809,22 @@ pub async fn pin_new_objects(
         // would never resolve to one repo and known CIDs keep hitting the scan. The
         // backfill only sets repo_id (AND repo_id IS NULL guard preserves
         // first-pinner-owns) and never re-pins the bytes: the object is already on IPFS.
-        match db.is_pinned(&sha).await {
+        // Every DB call from here to the end of the iteration is bounded by the
+        // ABSOLUTE batch deadline (F3, #173): the loop runs under a global pin permit
+        // and a bare await parked it for the whole stall. The elapsed arm is mapped per
+        // site below, never as a blanket "existing error arm": a timeout cancels the
+        // client future but not the statement Postgres is running, so it reports an
+        // UNKNOWN outcome, not a failed write.
+        match db_bounded(deadline, db.is_pinned(&sha)).await {
             Ok(true) => {
-                match db.provenance_for_oid(&sha).await {
+                // Elapsed here is free to skip: these are reads, so a late server-side
+                // completion costs nothing, and the backfill's own `AND repo_id IS NULL`
+                // guard makes a late-landing write idempotent.
+                match db_bounded(deadline, db.provenance_for_oid(&sha)).await {
                     Ok(None) => {
-                        if let Err(e) = db.backfill_pin_provenance(&sha, repo_id).await {
+                        if let Err(e) =
+                            db_bounded(deadline, db.backfill_pin_provenance(&sha, repo_id)).await
+                        {
                             tracing::warn!(sha = %sha, err = %e, "failed to backfill pin provenance");
                         }
                     }
@@ -700,15 +839,67 @@ pub async fn pin_new_objects(
                 // and without it `GET /ipfs/{cid}` only ever knows the first pinner, so a
                 // shared object first pinned from a private/quarantined repo 404s even
                 // when this repo would serve it. Bounded per object (MAX_PIN_SOURCES).
-                if let Err(e) = retry_db_record(|| db.record_pin_source(&sha, repo_id)).await {
-                    tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
-                    // U3 (#173): the retries are spent and this repo is NOT in the source
-                    // set, so the set is known incomplete. Persist that, or the resolver
-                    // reads a non-empty below-cap set as COMPLETE and 404s an object this
-                    // repo would serve. Warn-only in turn: if the marker write also fails
-                    // the object degrades to the pre-U3 behavior, never worse.
-                    if let Err(e) = db.mark_pin_sources_incomplete(&sha).await {
-                        tracing::warn!(sha = %sha, err = %e, "failed to mark pin sources incomplete");
+                // The retry ladder is wrapped AS A WHOLE, not per attempt: three stalls
+                // plus their backoff otherwise multiply one remainder by three. Floored
+                // at DB_RECORD_GRACE because this is a durability write.
+                match db_bounded(
+                    db_record_deadline(deadline),
+                    retry_db_record(|| db.record_pin_source(&sha, repo_id)),
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    // Elapsed here is a DEFINITE non-write, not an unknown outcome, and
+                    // that follows from what was wrapped rather than from the timeout.
+                    // `record_pin_source` is an explicit transaction (`pool.begin()`,
+                    // the insert, a conditional marker clear, `tx.commit()`), so a
+                    // cancelled future never reaches the commit, no COMMIT is ever sent,
+                    // and the row cannot have landed. The source set is therefore
+                    // incomplete and must be marked, exactly as on the definite-error
+                    // arm below; leaving it unmarked is the state the marker exists to
+                    // prevent, since the resolver reads a non-empty below-cap set as
+                    // COMPLETE and 404s a copy this repo would serve. The cost of the
+                    // marker is bounded: the fallback legacy scan is capped at
+                    // `ipfs_max_legacy_probes` and charges the per-IP work rate limiter
+                    // per probe. The arm stays separate only so the warn tells an
+                    // operator a stalled batch from a scattered per-object failure.
+                    Err(e @ BoundedDbError::Elapsed) => {
+                        tracing::warn!(
+                            sha = %sha,
+                            err = %e,
+                            "pin source record did not complete inside the batch deadline; \
+                             a cancelled multi-statement transaction never commits, so the \
+                             source is definitely missing and the set is marked incomplete"
+                        );
+                        if let Err(e) = db_bounded(
+                            db_record_deadline(deadline),
+                            db.mark_pin_sources_incomplete(&sha),
+                        )
+                        .await
+                        {
+                            tracing::warn!(sha = %sha, err = %e, "failed to mark pin sources incomplete");
+                        }
+                    }
+                    // U3 (#173): the retries are spent on REAL errors, so this repo is
+                    // definitely NOT in the source set and the set is known incomplete.
+                    // Persist that, or the resolver reads a non-empty below-cap set as
+                    // COMPLETE and 404s an object this repo would serve. Warn-only in
+                    // turn: if the marker write also fails the object degrades to the
+                    // pre-U3 behavior, never worse. Floored for the same reason the
+                    // record above is: a spent budget must not drop the compensation.
+                    // The marker write itself is a single autocommit statement, so ITS
+                    // own elapsed arm genuinely is an unknown outcome; nothing branches
+                    // on it, which is why warn-only is the right handling there.
+                    Err(e) => {
+                        tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
+                        if let Err(e) = db_bounded(
+                            db_record_deadline(deadline),
+                            db.mark_pin_sources_incomplete(&sha),
+                        )
+                        .await
+                        {
+                            tracing::warn!(sha = %sha, err = %e, "failed to mark pin sources incomplete");
+                        }
                     }
                 }
                 // R8 (#173 round 10): opportunistically repair a legacy provider-CID
@@ -867,8 +1058,24 @@ pub async fn pin_new_objects(
                 // sha-to-cid `cid_map` from it, which drives `upsert_branch_cid` and the
                 // p2p `publish_ref_update` gossip CID. Do not re-align them without moving
                 // that consumer first.
-                match retry_db_record(|| db.record_pinned_cid_with_source(&sha, &raw_cid, repo_id))
-                    .await
+                //
+                // The bound here is FLOORED at DB_RECORD_GRACE. The add was handed the
+                // whole remainder, so a successful one can return with ~0 left, and an
+                // unfloored bound would fail a write that today completes in
+                // milliseconds, leaving the bytes in Kubo with no row to resolve them
+                // by. If it still fires, both arms mean the same thing here and the site
+                // takes one Err path for them: `record_pinned_cid_with_source` is an
+                // explicit transaction, so a cancelled future never reaches its
+                // `tx.commit()` and the rows definitely did not land, exactly as on a
+                // real error. Either way the pin is not returned and the next push
+                // re-offers the object. The warn still names the arm through the error's
+                // own Display, so an operator can tell a stalled batch from a scattered
+                // per-object failure.
+                match db_bounded(
+                    db_record_deadline(deadline),
+                    retry_db_record(|| db.record_pinned_cid_with_source(&sha, &raw_cid, repo_id)),
+                )
+                .await
                 {
                     Ok(()) => pinned.push((sha, cid)),
                     Err(e) => {
@@ -1763,5 +1970,649 @@ mod tests {
             4,
             "one corrupt object must cost only itself: the other four must still pin"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // F3 (#173, jatmn): the DB operations inside the budgeted region.
+    //
+    // `api/repos.rs` holds the GLOBAL `pin_semaphore` permit across the whole
+    // `pin_new_objects` call. `batch_budget_gate` only gates BETWEEN objects and
+    // the git read is already clamped, but every DB call in the region used to be
+    // a bare await, so one stalled query parked the permit past every budget and,
+    // once all pin permits were so held, post-push IPFS replication stopped for
+    // every repo on the node. The tests below drive that stall with a
+    // `LOCK TABLE .. IN ACCESS EXCLUSIVE MODE` held on a dedicated pooled
+    // connection, the same technique as `get_by_cid_stalled_metadata_query_frees_
+    // walk_permit` in api/ipfs.rs, and copy its tolerances (a ~1s budget, an
+    // `elapsed < 3s` assertion, a 10s outer wrap). Pre-fix each one blocks on the
+    // lock until the outer wrap fires.
+    // ---------------------------------------------------------------------
+
+    /// Take an `ACCESS EXCLUSIVE` lock on `table` on a dedicated pooled connection.
+    /// Every SELECT needs `ACCESS SHARE`, which conflicts, so the next statement
+    /// touching the table blocks at lock acquisition regardless of row count.
+    async fn lock_table(
+        pool: &sqlx::PgPool,
+        table: &str,
+    ) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::raw_sql(&format!(
+            "BEGIN; LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE;"
+        ))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        conn
+    }
+
+    async fn rollback(conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>) {
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut **conn)
+            .await
+            .unwrap();
+    }
+
+    /// A raw CIDv1 to seed a pin with, so the opportunistic legacy repair takes its
+    /// cost gate and reads no bytes. The value only has to be a canonical raw key.
+    fn seed_cid() -> String {
+        Cid::from_git_object_bytes(b"pin loop seed").to_string()
+    }
+
+    /// The helper's zero-remainder path, where the absolute deadline is the whole
+    /// point: a spent deadline must error immediately rather than hand the call a
+    /// fresh budget.
+    ///
+    /// This is a unit test rather than a loop-driven one on purpose. Driving a ~0
+    /// `batch_budget` through `pin_new_objects` is VACUOUS: `batch_budget_gate`
+    /// returns None below [`PIN_READ_FLOOR`] as the first statement of the loop body,
+    /// so the batch breaks before any DB call and the test passes identically with
+    /// `db_bounded` deleted. The helper is tested where the zero-remainder path
+    /// actually runs.
+    #[tokio::test]
+    async fn db_bounded_elapsed_deadline_errors_promptly() {
+        let spent = Instant::now() - Duration::from_secs(5);
+        let started = std::time::Instant::now();
+        let out: Result<u8, BoundedDbError> = db_bounded(spent, async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(7u8)
+        })
+        .await;
+
+        assert!(
+            matches!(out, Err(BoundedDbError::Elapsed)),
+            "a spent deadline must yield the DISTINGUISHABLE timeout arm, not a value \
+             and not a generic DB error: {out:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a spent deadline must error at once, not after a fresh full budget; got {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The ABSOLUTE half of the same helper, which no loop-level test actually binds.
+    ///
+    /// `db_bounded` takes an `Instant`, not a `Duration`, so every call sharing one
+    /// deadline shares ONE budget: whatever an earlier call spends, a later one no
+    /// longer has. `pin_new_objects_multi_object_stall_charges_one_budget` covers that
+    /// end to end, but it only goes red under a per-call duration LARGER than the batch
+    /// budget (its mutation grants `PIN_BATCH_BUDGET`, 120s, against a 1.5s budget). A
+    /// defect that handed every call a fresh duration at or below the budget would slip
+    /// straight past it, so the property is bound here instead, where it lives and where
+    /// no lock, endpoint, or budget gate stands between the assertion and the helper.
+    ///
+    /// Two calls against one 3s deadline: the first spends 2s and succeeds, so the
+    /// second sees ~1s left and must elapse even though its own work needs only 2s.
+    /// Any fresh per-call duration of 2s or more, INCLUDING one exactly equal to the 3s
+    /// budget, would return a value there instead.
+    #[tokio::test]
+    async fn db_bounded_shares_one_budget_across_sequential_calls() {
+        let deadline = Instant::now() + Duration::from_secs(3);
+
+        let first: Result<u8, BoundedDbError> = db_bounded(deadline, async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok(1u8)
+        })
+        .await;
+        assert!(
+            matches!(first, Ok(1)),
+            "the first call fits well inside the shared budget and must return its \
+             value: {first:?}"
+        );
+
+        let started = std::time::Instant::now();
+        let second: Result<u8, BoundedDbError> = db_bounded(deadline, async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok(2u8)
+        })
+        .await;
+
+        assert!(
+            matches!(second, Err(BoundedDbError::Elapsed)),
+            "a SHARED deadline is consumed by the calls before it: with ~1s of the 3s \
+             left, a 2s call must elapse. A fresh per-call DURATION would let it \
+             succeed even when that duration is exactly the budget, and N calls would \
+             then charge N budgets instead of one: {second:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "the second call must be cut off by the REMAINDER (~1s) rather than run its \
+             full 2s; got {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Scenario 1: the FIRST DB call in the region (`is_pinned`) stalls. With the
+    /// batch deadline bounding it the loop abandons the object, the budget gate
+    /// then breaks the batch, and the call returns at ~budget with nothing pinned.
+    /// Pre-fix the bare await blocks on the lock for the lock's whole lifetime,
+    /// holding the caller's global pin permit with it.
+    #[sqlx::test]
+    async fn pin_new_objects_stalled_db_returns_by_budget(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool.clone());
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("stalled.git");
+        let oids = seed_loose_blobs(&repo_path, 1);
+        let endpoint = delaying_endpoint(vec![Duration::ZERO]).await;
+        // Install a log capture even though nothing here asserts on it: `tracing`
+        // caches a callsite's interest globally the first time it is hit, and a hit
+        // from a thread with no subscriber caches it as never-interested for the whole
+        // binary, which silently blinds the sibling tests that DO assert on the batch
+        // deadline warn.
+        let (_logs, _log_guard) = capture_logs();
+
+        let mut lock = lock_table(&pool, "pinned_cids").await;
+
+        let started = std::time::Instant::now();
+        let pinned = tokio::time::timeout(
+            Duration::from_secs(10),
+            pin_new_objects(
+                &endpoint,
+                &repo_path,
+                "git",
+                Duration::from_secs(30),
+                oids,
+                &db,
+                "repo-stalled-db",
+                Duration::from_millis(1500),
+            ),
+        )
+        .await
+        .expect(
+            "a stalled DB must cost the batch its budget, not the lock's lifetime: the \
+             bare await hangs past this wrap",
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            pinned.is_empty(),
+            "a stalled pinned-status check cannot produce a pinned object: {pinned:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the batch deadline must end the call at ~budget (1.5s); got {elapsed:?}"
+        );
+
+        rollback(&mut lock).await;
+    }
+
+    /// Scenario 2, and the sharpest unknown-outcome must-not. The object is already
+    /// pinned, so the loop takes the skip branch and tries to record this repo as an
+    /// additional source; `pin_repo_sources` is locked, so that insert stalls inside
+    /// `retry_db_record`. Two properties:
+    ///
+    /// - the whole retry ladder (three attempts plus backoff) lives inside ONE
+    ///   remainder, so the call still returns promptly;
+    /// - on the TIMEOUT arm the incomplete marker is NOT written. A cancelled client
+    ///   future does not cancel the statement Postgres is running, so the source may
+    ///   well be recorded; the marker would force every later `/ipfs` request for the
+    ///   object onto the O(repos) legacy scan, from any unauthenticated caller, on the
+    ///   strength of an outcome the code does not know. Only the definite-error arm
+    ///   marks incomplete.
+    ///
+    /// The record site carries the durability floor, so the return lands at ~2s
+    /// rather than at the 1.5s budget; that is the floor working, not a missed bound.
+    #[sqlx::test]
+    async fn pin_new_objects_skip_branch_stalled_record_returns_by_budget(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool.clone());
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("skip_stalled.git");
+        let oids = seed_loose_blobs(&repo_path, 1);
+        let sha = oids[0].clone();
+        db.record_pinned_cid_with_source(&sha, &seed_cid(), "repo-seed")
+            .await
+            .unwrap();
+        let endpoint = delaying_endpoint(vec![Duration::ZERO]).await;
+        // Install a log capture even though nothing here asserts on it: `tracing`
+        // caches a callsite's interest globally the first time it is hit, and a hit
+        // from a thread with no subscriber caches it as never-interested for the whole
+        // binary, which silently blinds the sibling tests that DO assert on the batch
+        // deadline warn.
+        let (_logs, _log_guard) = capture_logs();
+
+        let mut lock = lock_table(&pool, "pin_repo_sources").await;
+
+        let started = std::time::Instant::now();
+        let pinned = tokio::time::timeout(
+            Duration::from_secs(10),
+            pin_new_objects(
+                &endpoint,
+                &repo_path,
+                "git",
+                Duration::from_secs(30),
+                oids,
+                &db,
+                "repo-skip-stalled",
+                Duration::from_millis(1500),
+            ),
+        )
+        .await
+        .expect(
+            "the wrapped retry ladder must fit inside one remainder: the bare \
+             retry_db_record hangs past this wrap",
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            pinned.is_empty(),
+            "an already-pinned object is skipped, never re-pinned: {pinned:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the record's floored remainder must end the call promptly; got {elapsed:?}"
+        );
+
+        rollback(&mut lock).await;
+        drop(lock);
+
+        assert!(
+            db.pin_sources_incomplete(&sha).await.unwrap(),
+            "a TIMED-OUT `record_pin_source` definitively did not land: it is an explicit \
+             multi-statement transaction, and the cancelled future never reaches \
+             `tx.commit()`, so no COMMIT is ever sent and the row cannot exist. The set is \
+             therefore incomplete, and leaving it UNMARKED is the exact state the marker \
+             exists to prevent: the resolver reads a non-empty below-cap set as complete \
+             and 404s a copy this repo would serve"
+        );
+    }
+
+    /// Scenario 7: three objects, one budget. Every object's first DB call stalls on
+    /// the same lock, and the total must stay near ONE budget rather than one per
+    /// object. This is the only loop-level scenario where an absolute-deadline bound
+    /// and a per-call duration could differ; every single-object stall test above
+    /// passes under either.
+    #[sqlx::test]
+    async fn pin_new_objects_multi_object_stall_charges_one_budget(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool.clone());
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("multi_stalled.git");
+        let oids = seed_loose_blobs(&repo_path, 3);
+        let endpoint = delaying_endpoint(vec![Duration::ZERO]).await;
+        // Install a log capture even though nothing here asserts on it: `tracing`
+        // caches a callsite's interest globally the first time it is hit, and a hit
+        // from a thread with no subscriber caches it as never-interested for the whole
+        // binary, which silently blinds the sibling tests that DO assert on the batch
+        // deadline warn.
+        let (_logs, _log_guard) = capture_logs();
+
+        let mut lock = lock_table(&pool, "pinned_cids").await;
+
+        let started = std::time::Instant::now();
+        let pinned = tokio::time::timeout(
+            Duration::from_secs(10),
+            pin_new_objects(
+                &endpoint,
+                &repo_path,
+                "git",
+                Duration::from_secs(30),
+                oids,
+                &db,
+                "repo-multi-stalled",
+                Duration::from_millis(1500),
+            ),
+        )
+        .await
+        .expect("three stalled objects must still cost one budget, not three");
+        let elapsed = started.elapsed();
+
+        assert!(pinned.is_empty(), "nothing can pin against a stalled DB");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "three stalled objects must charge ONE budget (1.5s), not one each; got {elapsed:?}"
+        );
+
+        rollback(&mut lock).await;
+    }
+
+    /// Scenario 8, Kubo half of the durability floor. `batch_budget_gate` only
+    /// guarantees `PIN_READ_FLOOR` before an object STARTS and the add is handed the
+    /// whole remainder, so a successful add can finish with ~0 left. Without the
+    /// floor the post-add record would then be failed by a spent deadline, leaving
+    /// bytes in Kubo with no `pinned_cids` row and nothing able to resolve the CID.
+    ///
+    /// Fixture: a 2s budget, a 1.7s add, and `pinned_cids` locked from 500ms (well
+    /// after `is_pinned` has read it, and still well before the add returns) until
+    /// 2.4s. The record therefore starts at ~1.72s with ~280ms of budget left and
+    /// needs ~680ms of lock wait to land, which only the `DB_RECORD_GRACE` floor buys
+    /// it.
+    ///
+    /// The lock time is a MARGIN, not a boundary: taking it at 100ms left `is_pinned`
+    /// racing it on a loaded box, and losing that race makes the read block, time out,
+    /// and break the batch, which fails on `pinned.len() == 1` for a reason that has
+    /// nothing to do with the floor. Any time between the `is_pinned` round trip and
+    /// the add's 1.7s return proves the same thing.
+    #[sqlx::test]
+    async fn pin_add_with_spent_budget_still_records_row(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool.clone());
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("spent_budget.git");
+        let oids = seed_loose_blobs(&repo_path, 1);
+        let sha = oids[0].clone();
+        let endpoint = delaying_endpoint(vec![Duration::from_millis(1700)]).await;
+        // Install a log capture even though nothing here asserts on it: `tracing`
+        // caches a callsite's interest globally the first time it is hit, and a hit
+        // from a thread with no subscriber caches it as never-interested for the whole
+        // binary, which silently blinds the sibling tests that DO assert on the batch
+        // deadline warn.
+        let (_logs, _log_guard) = capture_logs();
+
+        let lock_pool = pool.clone();
+        let locker = async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let mut conn = lock_table(&lock_pool, "pinned_cids").await;
+            tokio::time::sleep(Duration::from_millis(1900)).await;
+            rollback(&mut conn).await;
+        };
+
+        let pin = tokio::time::timeout(
+            Duration::from_secs(15),
+            pin_new_objects(
+                &endpoint,
+                &repo_path,
+                "git",
+                Duration::from_secs(30),
+                oids.clone(),
+                &db,
+                "repo-spent-budget",
+                Duration::from_millis(2000),
+            ),
+        );
+        let (pinned, ()) = tokio::join!(pin, locker);
+        let pinned = pinned.expect("the floored record must land well inside this wrap");
+
+        assert!(
+            db.is_pinned(&sha).await.unwrap(),
+            "a successful add whose batch deadline is spent must still land its \
+             pinned_cids row: without the floor the bytes sit in Kubo with no row and \
+             nothing can resolve the CID"
+        );
+        assert_eq!(
+            pinned.len(),
+            1,
+            "the durably recorded pin must be returned: {pinned:?}"
+        );
+    }
+
+    /// Scenario 8, the other direction of the floor: the skip branch's DEFINITE-error
+    /// arm with the budget already spent must still write the incomplete marker.
+    /// Without it the source set is incomplete AND unmarked, which is exactly the
+    /// state the marker exists to prevent: the resolver reads a non-empty below-cap
+    /// set as complete and 404s an object this repo would serve.
+    ///
+    /// The definite error is a dropped `pin_repo_sources`, not a timeout: the DROP
+    /// runs inside a transaction that commits at 1.5s, so the insert blocks on that
+    /// transaction's lock and then fails outright. With a 1.2s budget the retry
+    /// ladder therefore returns its definite error at ~1.6s, past the deadline, and
+    /// only the floor lets the marker write run at all.
+    #[sqlx::test]
+    async fn pin_skip_branch_definite_error_with_spent_budget_marks_incomplete(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool.clone());
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("definite_error.git");
+        let oids = seed_loose_blobs(&repo_path, 1);
+        let sha = oids[0].clone();
+        db.record_pinned_cid_with_source(&sha, &seed_cid(), "repo-seed")
+            .await
+            .unwrap();
+        let endpoint = delaying_endpoint(vec![Duration::ZERO]).await;
+        // Install a log capture even though nothing here asserts on it: `tracing`
+        // caches a callsite's interest globally the first time it is hit, and a hit
+        // from a thread with no subscriber caches it as never-interested for the whole
+        // binary, which silently blinds the sibling tests that DO assert on the batch
+        // deadline warn.
+        let (_logs, _log_guard) = capture_logs();
+
+        let mut dropper = pool.acquire().await.unwrap();
+        sqlx::raw_sql("BEGIN; DROP TABLE pin_repo_sources;")
+            .execute(&mut *dropper)
+            .await
+            .unwrap();
+
+        let commit = async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            sqlx::raw_sql("COMMIT")
+                .execute(&mut *dropper)
+                .await
+                .unwrap();
+        };
+
+        let pin = tokio::time::timeout(
+            Duration::from_secs(15),
+            pin_new_objects(
+                &endpoint,
+                &repo_path,
+                "git",
+                Duration::from_secs(30),
+                oids,
+                &db,
+                "repo-definite-error",
+                Duration::from_millis(1200),
+            ),
+        );
+        let (pinned, ()) = tokio::join!(pin, commit);
+        pinned.expect("a definite DB error resolves inside the record floor, not the wrap");
+
+        assert!(
+            db.pin_sources_incomplete(&sha).await.unwrap(),
+            "the DEFINITE-error arm must still mark the source set incomplete with the \
+             batch deadline spent: an incomplete-and-unmarked set is read as complete and \
+             404s an object this repo would serve"
+        );
+    }
+
+    /// The MARKER's own floor, which the two tests above leave unbound.
+    ///
+    /// Both of them assert the marker lands with the batch deadline spent, and both
+    /// pass with the marker's `db_record_deadline` replaced by the bare `deadline`.
+    /// The reason is timing, not coverage: the remainder there really is ~0, but
+    /// `tokio::time::timeout` polls the inner future before it checks the timer, and a
+    /// local Postgres UPDATE against an uncontended table round-trips inside that one
+    /// poll. So the unfloored write lands anyway and the floor is never load-bearing.
+    ///
+    /// This makes the marker write SLOW, so a zero bound cannot smuggle it through.
+    /// `mark_pin_sources_incomplete` is `UPDATE pinned_cids`, so `pinned_cids` is held
+    /// under `ACCESS EXCLUSIVE` from 300ms (after `is_pinned` and `provenance_for_oid`
+    /// have read it, both round trips inside the first few ms) until 3s.
+    ///
+    /// The schedule, with a 1.5s budget and `pin_repo_sources` locked for the whole
+    /// run so the source record stalls:
+    ///
+    /// - ~10ms: `record_pin_source` starts and blocks on the sources lock. Its own
+    ///   floored bound is `now + 2s`, so it elapses at ~2.01s;
+    /// - ~2.01s: the elapsed arm runs the marker write, which blocks on the
+    ///   `pinned_cids` lock. Floored, its bound is ~4.01s; unfloored it is the spent
+    ///   1.5s batch deadline, so the bound is ~0 and the blocked UPDATE is cancelled at
+    ///   once, leaving no marker;
+    /// - ~3.0s: the lock lifts, a full second after the write started and a full second
+    ///   before its floored bound expires, so the floored write lands.
+    ///
+    /// Both margins are a full second on purpose. The proof only needs the release to
+    /// fall strictly between zero and `DB_RECORD_GRACE`, so there is no reason to put
+    /// it near either end and make the test a race.
+    #[sqlx::test]
+    async fn pin_skip_branch_marker_write_needs_the_record_floor(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool.clone());
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("marker_floor.git");
+        let oids = seed_loose_blobs(&repo_path, 1);
+        let sha = oids[0].clone();
+        db.record_pinned_cid_with_source(&sha, &seed_cid(), "repo-seed")
+            .await
+            .unwrap();
+        let endpoint = delaying_endpoint(vec![Duration::ZERO]).await;
+        // Asserted on here, and installed for the sibling reason too: `tracing` caches
+        // a callsite's interest globally on first hit, so a hit from a thread with no
+        // subscriber caches it as never-interested for the whole binary.
+        let (logs, _log_guard) = capture_logs();
+
+        let mut sources_lock = lock_table(&pool, "pin_repo_sources").await;
+
+        let lock_pool = pool.clone();
+        let controller = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let mut cids_lock = lock_table(&lock_pool, "pinned_cids").await;
+            tokio::time::sleep(Duration::from_millis(2700)).await;
+            rollback(&mut cids_lock).await;
+        };
+
+        let started = std::time::Instant::now();
+        let pin = tokio::time::timeout(
+            Duration::from_secs(20),
+            pin_new_objects(
+                &endpoint,
+                &repo_path,
+                "git",
+                Duration::from_secs(30),
+                oids,
+                &db,
+                "repo-marker-floor",
+                Duration::from_millis(1500),
+            ),
+        );
+        let (pinned, ()) = tokio::join!(pin, controller);
+        let pinned = pinned.expect("the floored marker write must land well inside this wrap");
+        let elapsed = started.elapsed();
+
+        rollback(&mut sources_lock).await;
+        drop(sources_lock);
+
+        assert!(
+            pinned.is_empty(),
+            "an already-pinned object is skipped, never re-pinned: {pinned:?}"
+        );
+        assert!(
+            logs.text()
+                .contains("did not complete inside the batch deadline"),
+            "the fixture only proves anything if the marker was reached from the ELAPSED \
+             arm of the source record, not from the definite-error arm: {}",
+            logs.text()
+        );
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "the call must end at one budget plus the one chained record grace the \
+             blocked marker write costs (~3s), never at the lock's lifetime; got \
+             {elapsed:?}"
+        );
+        assert!(
+            db.pin_sources_incomplete(&sha).await.unwrap(),
+            "the marker write must be given DB_RECORD_GRACE, not the spent batch \
+             deadline: it starts here with ~0 of the budget left and needs ~1s to get \
+             past the lock, so an unfloored bound cancels it and the source set is left \
+             incomplete AND unmarked, which the resolver reads as complete and 404s a \
+             copy this repo would serve"
+        );
+    }
+
+    /// The TRANSITIVE site. `repair_legacy_provider_cid` runs on the skip branch under
+    /// the same permit, and its own `deadline` argument used to bound only the
+    /// `spawn_blocking` git read: the two DB awaits inside it (`cid_for_oid` and the
+    /// key rewrite) were bare, so a stall there parked the permit exactly the way the
+    /// loop-body awaits did. A grep over the loop bodies cannot see this site, which
+    /// is why it is driven here rather than argued.
+    ///
+    /// Fixture, ordered so the stall lands on `cid_for_oid` and nothing earlier:
+    /// `pin_repo_sources` is locked from the start so the skip branch's source record
+    /// blocks; at 1.5s `pinned_cids` is locked (nothing is reading it by then) and at
+    /// 1.6s the first lock is released.
+    ///
+    /// What the loop actually does with that, since the timing is easy to misread: when
+    /// the `pin_repo_sources` lock lifts at 1.6s the insert succeeds, and then
+    /// `record_pin_source`'s follow-up `UPDATE pinned_cids` immediately blocks on the
+    /// `pinned_cids` lock taken at 1.5s and eats the rest of the budget, elapsing at
+    /// 2.2s. The timeout arm then writes the incomplete marker, another `UPDATE
+    /// pinned_cids`, which blocks on the same lock and elapses against its own floor at
+    /// ~4.2s. So the repair is reached with its deadline long SPENT, not with ~600ms
+    /// left, and ~4.2s is the fixture's expected total: one budget plus one chained
+    /// record grace, which is the `db_record_deadline` re-flooring described on
+    /// `pin_new_objects`.
+    ///
+    /// The test is load-bearing either way, and the 10s wrap is what makes it so: the
+    /// `pinned_cids` lock is held until after the call returns, so an unbounded
+    /// `cid_for_oid` inside the repair hangs past the wrap instead of returning here.
+    #[sqlx::test]
+    async fn pin_new_objects_stalled_legacy_repair_lookup_returns_by_budget(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool.clone());
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("repair_stalled.git");
+        let oids = seed_loose_blobs(&repo_path, 1);
+        let sha = oids[0].clone();
+        db.record_pinned_cid_with_source(&sha, &seed_cid(), "repo-seed")
+            .await
+            .unwrap();
+        let endpoint = delaying_endpoint(vec![Duration::ZERO]).await;
+        // Install a log capture even though nothing here asserts on it: `tracing`
+        // caches a callsite's interest globally the first time it is hit, and a hit
+        // from a thread with no subscriber caches it as never-interested for the whole
+        // binary, which silently blinds the sibling tests that DO assert on the batch
+        // deadline warn.
+        let (_logs, _log_guard) = capture_logs();
+
+        let mut sources_lock = lock_table(&pool, "pin_repo_sources").await;
+
+        let lock_pool = pool.clone();
+        let controller = async {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let cids_lock = lock_table(&lock_pool, "pinned_cids").await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            rollback(&mut sources_lock).await;
+            cids_lock
+        };
+
+        let started = std::time::Instant::now();
+        let pin = tokio::time::timeout(
+            Duration::from_secs(10),
+            pin_new_objects(
+                &endpoint,
+                &repo_path,
+                "git",
+                Duration::from_secs(30),
+                oids,
+                &db,
+                "repo-repair-stalled",
+                Duration::from_millis(2200),
+            ),
+        );
+        let (pinned, mut cids_lock) = tokio::join!(pin, controller);
+        pinned.expect(
+            "the repair's own DB lookup must be bounded by the batch deadline: the bare \
+             await hangs past this wrap",
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "a stall inside repair_legacy_provider_cid must end the call at ~budget \
+             (2.2s) plus the one chained record grace the marker write costs against the \
+             same lock (~4.2s), never at the lock's lifetime; got {elapsed:?}"
+        );
+
+        rollback(&mut cids_lock).await;
     }
 }
