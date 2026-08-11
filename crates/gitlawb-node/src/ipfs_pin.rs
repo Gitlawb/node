@@ -11,6 +11,22 @@ use anyhow::Result;
 use gitlawb_core::cid::Cid;
 use std::time::{Duration, Instant};
 
+/// How much READ work one source-less legacy row may cost a boot-time sweep.
+///
+/// The contract this number encodes: discovery for one pre-provenance row is allowed
+/// at most this many bounded object reads from warm local repos, whatever the node's
+/// repo count. The unit counted is the expensive one, a `git cat-file` pair against a
+/// candidate repo; a candidate rejected at filter time (quarantined, cold, an unsafe
+/// path) costs nothing against it. Without the cap the sweep is the O(repos x objects)
+/// fan-out this subsystem's cost rule exists to forbid, paid at boot on the node with
+/// the most history.
+///
+/// It happens to equal the resolver's serve-time per-request source cap
+/// (`db::MAX_PIN_SOURCES`), but it is a different bound with a different owner: that
+/// one bounds how many sources ONE `/ipfs` request may gate, this one bounds how many
+/// repos ONE background row may read. If either moves, the other does not follow.
+pub(crate) const MAX_LEGACY_DISCOVERY_PROBES: usize = 16;
+
 /// Attempts (including the first) for a transient DB-record retry.
 const PIN_RECORD_ATTEMPTS: u32 = 3;
 /// Backoff between DB-record retry attempts.
@@ -293,6 +309,194 @@ pub(crate) struct SweepStats {
 /// early keeps the cursor, so the next boot resumes past the rows already walked rather
 /// than repeating them, and the table still gets covered across boots.
 pub(crate) const MAX_DEAD_ROW_READS_PER_RUN: usize = 64;
+/// The warm, non-quarantined repos one pass may probe for a source-less legacy row,
+/// plus the one absolute deadline every probe in the pass shares.
+///
+/// Loaded LAZILY, once per pass, on the first source-less row, mirroring the resolver's
+/// own legacy-scan context: a pass with no such row pays nothing. The `is_dir` warm
+/// filter runs ONCE here rather than per row, on the blocking pool, because O(repos)
+/// stat calls per row would park a tokio worker for the whole boot sweep.
+struct DiscoveryCtx {
+    /// Warm candidates with their validated disk paths, oldest-first by
+    /// `(created_at, id)`.
+    candidates: Vec<(crate::db::RepoRecord, std::path::PathBuf)>,
+    /// Shared by every discovery read in the pass, so one pass's discovery costs at
+    /// most one `git_timeout` in total on top of the per-row probe cap.
+    deadline: Instant,
+}
+
+/// Build one pass's discovery candidate list.
+///
+/// Three filters, all applied before any probe so a rejected candidate costs nothing
+/// against [`MAX_LEGACY_DISCOVERY_PROBES`]:
+///
+/// - QUARANTINE. `list_all_repos` is a bare SELECT with no visibility or quarantine
+///   filter, and a quarantined repo is hidden from every reader, so it must not become
+///   a discovery source either. The resolver's legacy scan loads the same set and gates
+///   on it. Private, non-quarantined repos DO stay in the list: an additive source
+///   record binds nothing to one repo's ACL, because the resolver gates every source
+///   independently at serve time, so probing a private repo leaks nothing.
+/// - WARM ONLY. The path is resolved through the repo store's validated resolver and
+///   kept only if it is on local disk. Nothing here goes through `repo_store.acquire`:
+///   the sweep is opportunistic background maintenance over every pinned row on the
+///   node, and pulling cold repos back from remote storage would turn a repair pass
+///   into a bulk restore.
+/// - UNSAFE PATH. A name that fails the validated resolver is dropped with a warn and
+///   is terminal; nothing a later run changes.
+///
+/// The survivors are ordered oldest-first by `(created_at, id)` rather than by id
+/// alone. `repo_id` derives from the owner DID, which anyone can grind, so an id sort
+/// would let an attacker register low-sorting repos and push the true holder past the
+/// probe cap. Source-less rows predate provenance and their holders are old repos,
+/// while freshly registered repos sort last and cannot be backdated.
+async fn load_discovery_ctx(
+    repos_dir: &std::path::Path,
+    git_timeout: Duration,
+    db: &crate::db::Db,
+) -> Result<DiscoveryCtx> {
+    let repos = db.list_all_repos().await?;
+    let quarantined: std::collections::HashSet<String> = db
+        .list_quarantined_repos()
+        .await?
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    let mut candidates: Vec<crate::db::RepoRecord> = repos
+        .into_iter()
+        .filter(|r| !quarantined.contains(&r.id))
+        .collect();
+    candidates.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let repos_dir = repos_dir.to_path_buf();
+    let warm = tokio::task::spawn_blocking(move || {
+        candidates
+            .into_iter()
+            .filter_map(|repo| {
+                match crate::git::repo_store::validated_repo_disk_path(
+                    &repos_dir,
+                    &repo.owner_did,
+                    &repo.name,
+                ) {
+                    Ok(p) if p.is_dir() => Some((repo, p)),
+                    // Cold: not on this node's disk right now. It is not evidence about
+                    // any row (see `discover_legacy_row`), so it is simply absent here.
+                    Ok(_) => None,
+                    Err(e) => {
+                        tracing::warn!(repo_id = %repo.id, err = %e, "sweep discovery: rejected unsafe repo path");
+                        None
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+    })
+    .await?;
+
+    Ok(DiscoveryCtx {
+        candidates: warm,
+        deadline: Instant::now() + git_timeout,
+    })
+}
+
+/// What discovery did with one source-less legacy row, in the same three-way shape
+/// [`RepairOutcome`] uses so the row accounting is unchanged.
+enum DiscoveryOutcome {
+    /// Nothing here a later run would find either.
+    Settled,
+    /// Worth walking again: a warm candidate's read failed, the candidate list could
+    /// not be loaded, or the probe cap was reached with candidates still unprobed.
+    Retryable,
+    /// The row's key was rewritten from bytes verified in a warm local repo.
+    Repaired,
+}
+
+/// Probe a bounded set of warm local repos for a source-less legacy row's object.
+///
+/// On a hit, record ONLY what discovery actually knows. Reading identical bytes proves
+/// the repo HOLDS the object, not that it is the first pinner: forks, a shared LICENSE
+/// blob and the empty tree all collide, and `backfill_pin_provenance`'s
+/// `AND repo_id IS NULL` guard would make a guessed exclusive claim permanent. Worse,
+/// the resolver's `needs_scan` is `sources.is_empty() || at_cap || incomplete`, so an
+/// exclusive claim would permanently disable the fallback scan for that object. So
+/// `pinned_cids.repo_id` stays NULL, the discovered repo goes in ADDITIVELY, and the
+/// incomplete marker goes with it because one discovered holder never proves the set
+/// complete.
+///
+/// Both writes are best-effort and warn-only, and the degradation is stated rather
+/// than deferred to a healing pass that does not exist: if the source record fails the
+/// row is raw-CIDv1 with an empty or incomplete source set, which is exactly the state
+/// `needs_scan` routes to the bounded legacy scan, so the object stays servable. The
+/// sweep itself never revisits it (the cost gate skips a raw row free from then on),
+/// so the resolver's fallback is the healing path, not a retry.
+async fn discover_legacy_row(
+    sha: &str,
+    ctx: &mut Option<Option<DiscoveryCtx>>,
+    repos_dir: &std::path::Path,
+    git_bin: &str,
+    git_timeout: Duration,
+    db: &crate::db::Db,
+) -> DiscoveryOutcome {
+    if ctx.is_none() {
+        *ctx = Some(match load_discovery_ctx(repos_dir, git_timeout, db).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(err = %e, "sweep discovery: failed to load the candidate list");
+                None
+            }
+        });
+    }
+    let ctx = match ctx.as_ref().expect("the candidate list was just loaded") {
+        Some(c) => c,
+        // A failed load says nothing about the row, so a later run retries it.
+        None => return DiscoveryOutcome::Retryable,
+    };
+
+    let mut retryable = false;
+    // Every candidate that gets this far is READ, so taking the first
+    // MAX_LEGACY_DISCOVERY_PROBES bounds the expensive work exactly. Candidates the
+    // filters already rejected never reach here and so cost nothing against the cap.
+    for (repo, repo_path) in ctx.candidates.iter().take(MAX_LEGACY_DISCOVERY_PROBES) {
+        match repair_legacy_provider_cid(repo_path, git_bin, ctx.deadline, sha, db).await {
+            Ok(RepairOutcome::Repaired) => {
+                if let Err(e) = db.record_pin_source(sha, &repo.id).await {
+                    tracing::warn!(sha = %sha, repo_id = %repo.id, err = %e, "sweep discovery: failed to record the discovered pin source");
+                }
+                // After the record, never before: a successful `record_pin_source`
+                // clears this marker.
+                if let Err(e) = db.mark_pin_sources_incomplete(sha).await {
+                    tracing::warn!(sha = %sha, err = %e, "sweep discovery: failed to mark the pin-source set incomplete");
+                }
+                return DiscoveryOutcome::Repaired;
+            }
+            // The bytes could not be read from this WARM candidate right now, which IS
+            // evidence about the row: try the next one and walk the row again later.
+            Ok(RepairOutcome::Retryable) => retryable = true,
+            // Absent here, or the row was repaired concurrently. Next candidate.
+            Ok(RepairOutcome::Settled) => {}
+            Err(e) => {
+                tracing::warn!(sha = %sha, repo_id = %repo.id, err = %e, "sweep discovery: probe failed");
+                retryable = true;
+            }
+        }
+    }
+    if ctx.candidates.len() > MAX_LEGACY_DISCOVERY_PROBES {
+        // Cap exhausted with candidates left unprobed: RETRYABLE, never terminal. The
+        // probe order is deterministic, but "a re-walk finds the same nothing" only
+        // holds if the candidate set cannot be steered, and it can: repo ids derive
+        // from grindable owner DIDs, so a terminal verdict would let an attacker bury
+        // the true holder past the cap permanently. The oldest-first order makes that
+        // expensive, and this arm makes it non-permanent.
+        return DiscoveryOutcome::Retryable;
+    }
+    if retryable {
+        DiscoveryOutcome::Retryable
+    } else {
+        DiscoveryOutcome::Settled
+    }
+}
 
 /// One bounded pass of the U4 sweep: read at most `batch` `pinned_cids` rows after
 /// the persisted cursor, repair the legacy ones, and persist the new cursor.
@@ -319,6 +523,10 @@ async fn sweep_pass(
     let mut retryable_skips = 0usize;
     let mut dead_row_reads = 0usize;
     let mut last = cursor;
+    // Loaded on the first source-less row and reused by every later one. The outer
+    // `None` is "not loaded yet"; `Some(None)` is "the load failed this pass", which is
+    // remembered so a broken DB is not re-queried once per row.
+    let mut discovery: Option<Option<DiscoveryCtx>> = None;
 
     for (sha, stored) in rows {
         // Advance FIRST: every path below this line may skip the row, and none of them
@@ -331,7 +539,10 @@ async fn sweep_pass(
         }
         // Resolve the row's repo from its recorded provenance (first-pinner plus the
         // bounded additional source set). An empty set is a pin recorded before
-        // provenance existed: nothing to read the bytes from, so skip it.
+        // provenance existed, which is the pre-provenance-est shape of row and exactly
+        // what this sweep is for, so it is not skipped: discovery below probes a
+        // bounded, quarantine-filtered set of warm local repos for the object and
+        // records what it finds ADDITIVELY.
         let sources = match db.pin_sources_for_oid(&sha).await {
             Ok(s) => s,
             Err(e) => {
@@ -348,6 +559,18 @@ async fn sweep_pass(
         // Whether any source got as far as spending an object read on this row, which is
         // what makes an unrepairable row COST something rather than just being skipped.
         let mut row_read_attempted = false;
+        if sources.is_empty() {
+            match discover_legacy_row(&sha, &mut discovery, repos_dir, git_bin, git_timeout, db)
+                .await
+            {
+                DiscoveryOutcome::Repaired => {
+                    repaired += 1;
+                    row_repaired = true;
+                }
+                DiscoveryOutcome::Retryable => row_retryable = true,
+                DiscoveryOutcome::Settled => {}
+            }
+        }
         for repo_id in sources {
             let repo = match db.get_repo_by_id(&repo_id).await {
                 Ok(Some(r)) => r,
@@ -458,6 +681,14 @@ pub(crate) async fn sweep_legacy_provider_cids_once(
 /// when a later push re-carries the object, and normal git negotiation omits objects
 /// the node already has, so on an upgraded node that push generally never comes. This
 /// walks the table instead.
+///
+/// A row with NO recorded source is the pre-provenance case this exists for, so it is
+/// not skipped: the pass probes a bounded, quarantine-filtered set of WARM local repos
+/// for the object (at most [`MAX_LEGACY_DISCOVERY_PROBES`] reads per row, sharing one
+/// per-pass deadline) and, on a hit, rewrites the key from the verified bytes and
+/// records the discovered repo ADDITIVELY alongside the incomplete marker. It never
+/// writes an exclusive first-pinner claim and never pulls a cold repo back from remote
+/// storage. See `discover_legacy_row` for why both of those matter.
 ///
 /// Runs until a pass comes back short of a full batch, which is the end of the table.
 /// Sleeps `delay` between full batches so it cannot monopolize the DB, and persists
