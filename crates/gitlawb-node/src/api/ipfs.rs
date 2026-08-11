@@ -290,7 +290,11 @@ pub async fn get_by_cid(
     let oids = match tokio::time::timeout(remaining(), state.db.oids_for_cid(&canonical_cid)).await
     {
         Ok(Ok(v)) => v,
-        Ok(Err(e)) => return Err(AppError::Internal(e)),
+        // Bare conversion, never `AppError::Internal`: a connection-class sqlx failure
+        // downcasts to `AppError::Db` and answers 503 `db_unavailable` rather than a 500
+        // (#251). Every clamped site in this handler uses this arm for the same reason,
+        // so a stalled pool and a closed pool stay distinguishable to the caller.
+        Ok(Err(e)) => return Err(e.into()),
         Err(_elapsed) => {
             tracing::warn!(
                 budget_secs = state.config.ipfs_request_budget_secs,
@@ -354,7 +358,7 @@ pub async fn get_by_cid(
         .await
         {
             Ok(Ok(v)) => v,
-            Ok(Err(e)) => return Err(AppError::Internal(e)),
+            Ok(Err(e)) => return Err(e.into()),
             Err(_elapsed) => {
                 tracing::warn!(
                     budget_secs = state.config.ipfs_request_budget_secs,
@@ -384,7 +388,7 @@ pub async fn get_by_cid(
                 // A source repo is gone: skip it; a later source or the scan fallback
                 // below may still resolve.
                 Ok(Ok(None)) => continue,
-                Ok(Err(e)) => return Err(AppError::Internal(e)),
+                Ok(Err(e)) => return Err(e.into()),
                 Err(_elapsed) => {
                     tracing::warn!(
                         budget_secs = state.config.ipfs_request_budget_secs,
@@ -401,7 +405,7 @@ pub async fn get_by_cid(
             .await
             {
                 Ok(Ok(q)) => q,
-                Ok(Err(e)) => return Err(AppError::Internal(e)),
+                Ok(Err(e)) => return Err(e.into()),
                 Err(_elapsed) => {
                     tracing::warn!(
                         budget_secs = state.config.ipfs_request_budget_secs,
@@ -420,7 +424,7 @@ pub async fn get_by_cid(
             .await
             {
                 Ok(Ok(rules)) => rules,
-                Ok(Err(e)) => return Err(AppError::Internal(e)),
+                Ok(Err(e)) => return Err(e.into()),
                 Err(_elapsed) => {
                     tracing::warn!(
                         budget_secs = state.config.ipfs_request_budget_secs,
@@ -514,7 +518,7 @@ pub async fn get_by_cid(
                 .await
                 {
                     Ok(Ok(v)) => v,
-                    Ok(Err(e)) => return Err(AppError::Internal(e)),
+                    Ok(Err(e)) => return Err(e.into()),
                     Err(_elapsed) => {
                         tracing::warn!(
                         budget_secs = state.config.ipfs_request_budget_secs,
@@ -533,7 +537,7 @@ pub async fn get_by_cid(
                     .await
                     {
                         Ok(Ok(v)) => v,
-                        Ok(Err(e)) => return Err(AppError::Internal(e)),
+                        Ok(Err(e)) => return Err(e.into()),
                         Err(_elapsed) => {
                             tracing::warn!(
                             budget_secs = state.config.ipfs_request_budget_secs,
@@ -572,7 +576,7 @@ pub async fn get_by_cid(
                 .await
                 {
                     Ok(Ok(repos)) => repos,
-                    Ok(Err(e)) => return Err(AppError::Internal(e)),
+                    Ok(Err(e)) => return Err(e.into()),
                     Err(_elapsed) => {
                         tracing::warn!(
                             budget_secs,
@@ -590,7 +594,7 @@ pub async fn get_by_cid(
                 .await
                 {
                     Ok(Ok(rules)) => rules,
-                    Ok(Err(e)) => return Err(AppError::Internal(e)),
+                    Ok(Err(e)) => return Err(e.into()),
                     Err(_elapsed) => {
                         tracing::warn!(
                             budget_secs,
@@ -609,7 +613,7 @@ pub async fn get_by_cid(
                     // The quarantine set is also access control (INV-11), so a timeout
                     // must deny rather than scan with an empty set.
                     Ok(Ok(rows)) => rows.into_iter().map(|r| r.id).collect(),
-                    Ok(Err(e)) => return Err(AppError::Internal(e)),
+                    Ok(Err(e)) => return Err(e.into()),
                     Err(_elapsed) => {
                         tracing::warn!(
                             budget_secs,
@@ -1300,11 +1304,9 @@ async fn gate_and_serve(
 /// objects received via push. Each entry includes the git SHA-256 hex, the
 /// CIDv1 string, and the timestamp when it was pinned.
 pub async fn list_pins(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
-    let pins = state
-        .db
-        .list_pinned_cids()
-        .await
-        .map_err(AppError::Internal)?;
+    // Bare `?` so connection-class sqlx failures downcast to `AppError::Db` and
+    // map to 503 `db_unavailable` (not 500 via `.map_err(AppError::Internal)`) (#251).
+    let pins = state.db.list_pinned_cids().await?;
 
     Ok(Json(serde_json::json!({
         "pins": pins,
@@ -1441,6 +1443,93 @@ pub(crate) fn oversize_rejects() -> usize {
 #[cfg(test)]
 fn note_oversize_reject() {
     OVERSIZE_REJECTS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(test)]
+mod closed_pool_tests {
+    use super::*;
+    use axum::http::{Request, StatusCode};
+    use axum::Router;
+    use serde_json::Value;
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+
+    /// #251: a closed pool on /api/v1/ipfs/pins must be 503 db_unavailable,
+    /// not 500 internal_error from `.map_err(AppError::Internal)`.
+    #[sqlx::test]
+    async fn list_pins_closed_pool_returns_503_db_unavailable(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        pool.close().await;
+
+        let resp = Router::new()
+            .route("/api/v1/ipfs/pins", axum::routing::get(list_pins))
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/ipfs/pins")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "closed-pool outage must be retryable 503, not 500"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "error": crate::error::DB_UNAVAILABLE_CODE,
+                "message": crate::error::DB_UNAVAILABLE_MESSAGE,
+            })
+        );
+    }
+
+    /// #251 / CodeRabbit nit: cover `get_by_cid`'s `list_all_repos` conversion
+    /// path — a valid CID must still yield 503 on a closed pool.
+    #[sqlx::test]
+    async fn get_by_cid_closed_pool_returns_503_db_unavailable(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        pool.close().await;
+
+        // Any sha2-256 CIDv1 passes the codec gate and then hits the DB.
+        let cid = gitlawb_core::cid::Cid::from_git_object_bytes(b"closed-pool-probe").to_string();
+
+        let resp = Router::new()
+            .route("/ipfs/{cid}", axum::routing::get(get_by_cid))
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/ipfs/{cid}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "closed-pool outage on get_by_cid must be retryable 503, not 500"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "error": crate::error::DB_UNAVAILABLE_CODE,
+                "message": crate::error::DB_UNAVAILABLE_MESSAGE,
+            })
+        );
+    }
 }
 
 #[cfg(test)]
