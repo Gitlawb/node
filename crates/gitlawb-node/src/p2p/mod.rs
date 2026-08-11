@@ -169,38 +169,99 @@ struct GitlawbBehaviour {
 /// storing a fresh Ed25519 keypair the first time.
 pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
     if key_path.exists() {
-        let bytes = std::fs::read(key_path)
-            .with_context(|| format!("failed to read p2p key from {}", key_path.display()))?;
-        let kp = identity::Keypair::from_protobuf_encoding(&bytes)
-            .with_context(|| format!("invalid p2p key in {}", key_path.display()))?;
-        info!(path = %key_path.display(), "loaded existing p2p identity");
-        Ok(kp)
-    } else {
-        let kp = identity::Keypair::generate_ed25519();
-        let bytes = kp
-            .to_protobuf_encoding()
-            .map_err(|e| anyhow::anyhow!("failed to serialize p2p key: {e}"))?;
-
-        if let Some(parent) = key_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::write(key_path, &bytes)?;
-            std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        #[cfg(not(unix))]
-        std::fs::write(key_path, &bytes)?;
-
-        info!(
-            path = %key_path.display(),
-            peer_id = %PeerId::from(kp.public()),
-            "generated new p2p identity"
-        );
-        Ok(kp)
+        return read_p2p_keypair(key_path);
     }
+
+    let kp = identity::Keypair::generate_ed25519();
+    let bytes = kp
+        .to_protobuf_encoding()
+        .map_err(|e| anyhow::anyhow!("failed to serialize p2p key: {e}"))?;
+
+    if let Some(parent) = key_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    match create_new_key_file(key_path, &bytes) {
+        Ok(()) => {
+            info!(
+                path = %key_path.display(),
+                peer_id = %PeerId::from(kp.public()),
+                "generated new p2p identity"
+            );
+            Ok(kp)
+        }
+        // Something already occupies the path: another node process won the
+        // race between the existence check and the exclusive create, or the
+        // path is a symlink. Whatever is on disk is the identity of record, so
+        // read it back rather than failing the boot or overwriting it.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read_p2p_keypair(key_path),
+        Err(e) => Err(anyhow::Error::new(e)
+            .context(format!("failed to write p2p key to {}", key_path.display()))),
+    }
+}
+
+/// Create the key file exclusively, with owner-only permissions applied at
+/// creation time so the bytes are never visible to other users. `create_new`
+/// maps to `O_EXCL`, so an existing path entry (including a dangling symlink)
+/// is refused rather than followed or truncated.
+fn create_new_key_file(key_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    let mut file = opts.open(key_path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Read an existing key file, refusing one whose permissions or contents make
+/// it untrustworthy. Never regenerates: a node that silently replaces an
+/// unreadable key file would change its PeerId without the operator knowing.
+fn read_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = std::fs::metadata(key_path)
+            .with_context(|| format!("failed to stat p2p key at {}", key_path.display()))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "p2p key at {} has mode {:04o}, which grants access beyond its owner; \
+                 run `chmod 600 {}` or delete the file to regenerate the identity",
+                key_path.display(),
+                mode,
+                key_path.display()
+            );
+        }
+    }
+
+    let bytes = std::fs::read(key_path)
+        .with_context(|| format!("failed to read p2p key from {}", key_path.display()))?;
+
+    // An empty file decodes as a valid protobuf with a key type of RSA, so
+    // without this the operator gets a misleading complaint about a missing
+    // `rsa` cargo feature instead of being told the file is empty.
+    if bytes.is_empty() {
+        anyhow::bail!(
+            "p2p key file {} is empty; restore it from backup, \
+             or delete it to regenerate the identity",
+            key_path.display()
+        );
+    }
+
+    let kp = identity::Keypair::from_protobuf_encoding(&bytes)
+        .with_context(|| format!("invalid p2p key in {}", key_path.display()))?;
+    info!(path = %key_path.display(), "loaded existing p2p identity");
+    Ok(kp)
 }
 
 /// Start the libp2p swarm. Returns a handle for sending commands and the
@@ -505,7 +566,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("keys").join("p2p.key");
 
-        load_or_create_p2p_keypair(&path).unwrap();
+        // Create the key under a fully permissive umask, otherwise a restrictive
+        // ambient umask masks the bits down to 0600 on its own and the assertion
+        // below passes whether or not the code pins the mode.
+        // SAFETY: `umask` is always safe to call; it only reads and replaces the
+        // process-wide value.
+        let prev_umask = unsafe { libc::umask(0o000) };
+        let result = load_or_create_p2p_keypair(&path);
+        unsafe { libc::umask(prev_umask) };
+        result.unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(
@@ -515,11 +584,83 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn p2p_key_file_with_loose_permissions_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p2p.key");
+
+        let kp = identity::Keypair::generate_ed25519();
+        std::fs::write(&path, kp.to_protobuf_encoding().unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = load_or_create_p2p_keypair(&path)
+            .expect_err("a group/world-readable key file must be an error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&path.display().to_string()) && msg.contains("0644"),
+            "error must name the key path and the observed mode, got: {msg}"
+        );
+        // The rejection must not have regenerated the identity behind the
+        // operator's back.
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(on_disk, kp.to_protobuf_encoding().unwrap());
+    }
+
+    #[test]
+    fn p2p_empty_key_file_reports_the_file_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p2p.key");
+        std::fs::write(&path, b"").unwrap();
+        // Keep the permission guard out of the way so this exercises the
+        // empty-file path and not the mode check.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let err = load_or_create_p2p_keypair(&path).expect_err("an empty key file must be an error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&path.display().to_string()) && msg.contains("empty"),
+            "error must name the key path and say the file is empty, got: {msg}"
+        );
+        assert!(
+            !msg.contains("rsa"),
+            "an empty file must not be reported as an RSA decoding problem, got: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p2p_dangling_symlink_does_not_write_through_to_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("p2p.key");
+        let target = dir.path().join("elsewhere.key");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        load_or_create_p2p_keypair(&link).expect_err("a dangling symlink must not be followed");
+        assert!(
+            !target.exists(),
+            "no key may be written through the symlink to {}",
+            target.display()
+        );
+    }
+
     #[test]
     fn p2p_corrupt_key_file_is_an_error_not_a_panic() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("p2p.key");
         std::fs::write(&path, [0xFFu8; 7]).unwrap();
+        // Keep the permission guard out of the way so this exercises decoding.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
 
         let err =
             load_or_create_p2p_keypair(&path).expect_err("a corrupt key file must be an error");
@@ -527,6 +668,10 @@ mod tests {
         assert!(
             msg.contains(&path.display().to_string()),
             "error must name the key path, got: {msg}"
+        );
+        assert!(
+            msg.contains("invalid p2p key"),
+            "a corrupt key must be reported as a decoding failure, got: {msg}"
         );
     }
 

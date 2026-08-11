@@ -339,6 +339,7 @@ Important node settings:
 | `GITLAWB_P2P_PORT` | libp2p QUIC/UDP port. Use `0` to disable. |
 | `GITLAWB_BOOTSTRAP_PEERS` | Comma-separated HTTP peer URLs. |
 | `GITLAWB_P2P_BOOTSTRAP` | Comma-separated libp2p multiaddrs. |
+| `GITLAWB_P2P_KEY` | Path to the node's persistent libp2p identity key file, which fixes the PeerId across restarts. Created with owner-only permissions on first start. Default `~/.gitlawb/p2p.key`; point it at a persistent volume when running in a container. |
 | `GITLAWB_BOOTSTRAP_DISABLE_SEEDS` | Disable embedded seed peers for isolated dev/test networks. |
 | `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` | Require signed peer announce/sync writes. |
 | `GITLAWB_AUTO_SYNC` | Enable automatic sync from known peers. |
