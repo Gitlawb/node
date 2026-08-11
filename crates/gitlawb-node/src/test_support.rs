@@ -4290,6 +4290,83 @@ mod tests {
         );
     }
 
+    /// #173 round 12 (jatmn): the incompleteness marker is per `(object, repo)`, so a
+    /// record from an UNRELATED repo does not clear a marker a different repo's failed
+    /// record set. It was one boolean per object, and the resolver reads a cleared marker
+    /// as "every source is recorded", drops the scan fallback, and 404s an anonymous
+    /// caller whose only servable copy is the unrecorded public one.
+    ///
+    /// Both directions, because the precision is the point: an unrelated repo must NOT
+    /// clear, and the repo that actually failed MUST clear, or every transient DB blip
+    /// would strand an object on the scan path forever.
+    #[sqlx::test]
+    async fn pin_source_failure_is_cleared_only_by_the_repo_that_failed(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["u3perrepo"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("u3perrepo.git");
+        let repo_a = seed_repo(&owner_did, "u3perrepo");
+        state.db.create_repo(&repo_a).await.expect("seed repo A");
+        let repo_b = seed_repo(&owner_did, "u3perrepo-b");
+        state.db.create_repo(&repo_b).await.expect("seed repo B");
+        let repo_c = seed_repo(&owner_did, "u3perrepo-c");
+        state.db.create_repo(&repo_c).await.expect("seed repo C");
+        let _ = pin_cid_for_repo(&bare, &fx.public_oid, &state.db, &repo_a.id).await;
+
+        // Repo B's record fails: the object is now known to be missing B as a source.
+        state
+            .db
+            .mark_pin_sources_incomplete(&fx.public_oid, &repo_b.id)
+            .await
+            .expect("mark B's failure");
+        assert!(
+            state
+                .db
+                .pin_sources_incomplete(&fx.public_oid)
+                .await
+                .unwrap(),
+            "B's failed record marks the set incomplete"
+        );
+
+        // A genuine record from an UNRELATED repo C. B is still missing.
+        state
+            .db
+            .record_pin_source(&fx.public_oid, &repo_c.id)
+            .await
+            .expect("record C");
+        assert!(
+            state
+                .db
+                .pin_sources_incomplete(&fx.public_oid)
+                .await
+                .unwrap(),
+            "a record from an unrelated repo must not clear a marker another repo set: \
+             the resolver would drop the scan fallback while B's copy is still unrecorded"
+        );
+
+        // The repo that actually failed lands its record: now the set is complete.
+        state
+            .db
+            .record_pin_source(&fx.public_oid, &repo_b.id)
+            .await
+            .expect("record B");
+        assert!(
+            !state
+                .db
+                .pin_sources_incomplete(&fx.public_oid)
+                .await
+                .unwrap(),
+            "the repo whose record failed clears its own marker once it lands"
+        );
+    }
+
     /// U3 scenario 5 (#173): the Pinata pin path had BARE `record_pin_source` calls, so
     /// one transient DB error dropped a source permanently. It now shares the ipfs_pin
     /// retry helper and marks/clears the same marker. The elapsed-time assertion is the
@@ -4975,12 +5052,74 @@ mod tests {
         );
         state
             .db
-            .mark_pin_sources_incomplete("preu3oid")
+            .mark_pin_sources_incomplete("preu3oid", "somerepo")
             .await
             .expect("mark after upgrade");
         assert!(
             state.db.pin_sources_incomplete("preu3oid").await.unwrap(),
-            "the v22 column is present and writable after the upgrade"
+            "the marker store is present and writable after the upgrade"
+        );
+    }
+
+    /// #173 round 12 (INV-7 upgrade path for v24): a node already carrying v22 markers
+    /// keeps them across the move to per-`(oid, repo)` state. Which repo failed was never
+    /// recorded, so a carried marker takes the empty sentinel and no real record clears
+    /// it, which is strictly safer than the v22 behavior it replaces (there, the next
+    /// unrelated record cleared it). Also asserts the re-migration is idempotent and that
+    /// an object with no marker still reads complete.
+    #[sqlx::test]
+    async fn pin_source_failures_upgrade_path(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+
+        // Pre-v24 shape: drop the new table, forget v24, and leave a v22-style marker.
+        sqlx::query("DROP TABLE IF EXISTS pin_source_failures")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 24")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (oid, marked) in [("carriedoid", true), ("cleanoid", false)] {
+            sqlx::query(
+                "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pin_sources_incomplete) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(oid)
+            .bind(format!("{oid}cid"))
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(marked)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        state.db.run_migrations().await.expect("re-migrate");
+        state
+            .db
+            .run_migrations()
+            .await
+            .expect("migrations are idempotent: a second run succeeds");
+
+        assert!(
+            state.db.pin_sources_incomplete("carriedoid").await.unwrap(),
+            "a v22 marker survives the upgrade instead of being silently dropped"
+        );
+        assert!(
+            !state.db.pin_sources_incomplete("cleanoid").await.unwrap(),
+            "an unmarked row stays complete, so the upgrade arms no new fallback"
+        );
+
+        // A real record cannot clear a carried marker: the failing repo is unknown, so
+        // the sentinel it carries matches no repo id.
+        state
+            .db
+            .record_pin_source("carriedoid", "anyrepo")
+            .await
+            .expect("record a source");
+        assert!(
+            state.db.pin_sources_incomplete("carriedoid").await.unwrap(),
+            "a carried marker names no repo, so nothing clears it by accident"
         );
     }
 
@@ -7428,6 +7567,56 @@ mod tests {
     // false-404 an object that may be readable (F2). The bound is a per-request probe
     // BUDGET, not a per-IP brake: a walk-free public fetch stays un-rate-limited
     // (ipfs_walk_rate_limited_per_source), while the expensive walk keeps its IP brake.
+
+    /// #173 round 12 (jatmn): a failure of the SIZE stage must reach the client as the
+    /// retryable 503, never as a definitive 404. `object_size_bounded` mapped every
+    /// non-timeout failure to `Ok(None)`, which `gate_and_serve` read as a verified
+    /// absence and did not taint the search for, so a corrupt object or a failed spawn
+    /// 404'd an authorized caller on an object the type probe had just reported present.
+    ///
+    /// The failure is induced between the two stages with a test seam, because the size
+    /// read uses the real `git` rather than `state.git_bin` and no shim can be injected
+    /// there. The BEFORE request is what makes the AFTER assertion mean anything: it
+    /// proves this fixture serves 200 when the size read succeeds, so the 503 is caused
+    /// by the broken size probe and nothing else.
+    #[sqlx::test]
+    async fn ipfs_cid_size_probe_failure_is_retryable_not_a_404(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["sizefault"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("sizefault.git");
+        let repo = seed_repo(&owner_did, "sizefault"); // public, no rule
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let cid = pin_cid_for_repo(&bare, &fx.public_oid, &state.db, &repo.id).await;
+
+        let (before, body) =
+            cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            before,
+            StatusCode::OK,
+            "the fixture serves this object when the size read succeeds"
+        );
+        assert!(body.contains("public bytes"), "and serves the real content");
+
+        // The object vanishes between the type probe and the size probe. Armed on THIS
+        // repo's path: fixture oids are shared across tests, so an oid-only key would
+        // reach into another test's repo.
+        crate::api::ipfs::break_size_probe_for(&bare, &fx.public_oid);
+        let (after, _) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            after,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a size-stage fault taints the search and tails to a retryable 503; a 404 here \
+             would tell an authorized caller the object does not exist"
+        );
+    }
 
     /// T1 (F1): the probe budget gates BEFORE `acquire`/`cat-file`, so it genuinely
     /// bounds the fan-out — a repo past the budget is never probed, even one that

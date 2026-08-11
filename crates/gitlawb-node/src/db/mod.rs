@@ -1011,6 +1011,40 @@ const MIGRATIONS: &[Migration] = &[
              )",
         ],
     },
+    Migration {
+        version: 24,
+        name: "pin_source_failures",
+        stmts: &[
+            // #173 round 12 (jatmn): v22's `pin_sources_incomplete` is one boolean per
+            // OBJECT, so any successful source record cleared it, including one from a
+            // repo unrelated to the failure. The resolver then read the set as fully
+            // enumerated, dropped the scan fallback, and 404'd an anonymous caller whose
+            // only servable copy was the unrecorded public one. The missing source is a
+            // property of an (object, repo) PAIR, so it is stored as one.
+            //
+            // NEW versioned migration (never appended to an applied block, INV-7). A new
+            // table rather than a column on `pinned_cids`: the relation is many-per-object
+            // and `CREATE TABLE` takes no lock on the pin table a live node is reading.
+            "CREATE TABLE IF NOT EXISTS pin_source_failures (
+                 sha256_hex TEXT NOT NULL,
+                 repo_id    TEXT NOT NULL,
+                 PRIMARY KEY (sha256_hex, repo_id)
+             )",
+            // Carry the pre-upgrade markers over. Which repo failed was never recorded,
+            // so they get the empty sentinel, which no real `repo_id` equals: those
+            // objects keep the scan fallback until something repairs them, rather than
+            // being cleared by the next unrelated record the way they would have been
+            // before. Strictly safer than the behavior being replaced, and bounded by how
+            // rare an exhausted record is.
+            "INSERT INTO pin_source_failures (sha256_hex, repo_id)
+                  SELECT sha256_hex, '' FROM pinned_cids WHERE pin_sources_incomplete
+                  ON CONFLICT DO NOTHING",
+            // `pinned_cids.pin_sources_incomplete` is deliberately NOT dropped. Nothing
+            // reads it after this migration, and leaving it costs one unused boolean,
+            // whereas dropping it makes a rollback to the previous release lose the
+            // markers it still reads.
+        ],
+    },
 ];
 
 /// Max distinct source repos recorded per pinned object (F1, #173 jatmn round 8).
@@ -2827,13 +2861,14 @@ impl Db {
         .await?
         .rows_affected();
         if inserted > 0 {
-            sqlx::query(
-                "UPDATE pinned_cids SET pin_sources_incomplete = FALSE
-                  WHERE sha256_hex = $1 AND pin_sources_incomplete",
-            )
-            .bind(sha256_hex)
-            .execute(&mut *tx)
-            .await?;
+            // Clears THIS repo's failure only (#173 round 12). A boolean per object meant
+            // repo C's genuine record wiped the marker repo B's failure set, and the
+            // resolver then dropped the scan fallback while B's copy was still unrecorded.
+            sqlx::query("DELETE FROM pin_source_failures WHERE sha256_hex = $1 AND repo_id = $2")
+                .bind(sha256_hex)
+                .bind(repo_id)
+                .execute(&mut *tx)
+                .await?;
         }
         tx.commit().await?;
         Ok(())
@@ -2884,44 +2919,55 @@ impl Db {
         .await?
         .rows_affected();
         if inserted > 0 {
-            sqlx::query(
-                "UPDATE pinned_cids SET pin_sources_incomplete = FALSE
-                  WHERE sha256_hex = $1 AND pin_sources_incomplete",
-            )
-            .bind(sha256_hex)
-            .execute(&mut *tx)
-            .await?;
+            // Clears THIS repo's failure only (#173 round 12). A boolean per object meant
+            // repo C's genuine record wiped the marker repo B's failure set, and the
+            // resolver then dropped the scan fallback while B's copy was still unrecorded.
+            sqlx::query("DELETE FROM pin_source_failures WHERE sha256_hex = $1 AND repo_id = $2")
+                .bind(sha256_hex)
+                .bind(repo_id)
+                .execute(&mut *tx)
+                .await?;
         }
         tx.commit().await?;
         Ok(())
     }
 
-    /// Mark this object's pin-source set as KNOWN INCOMPLETE (U3, #173). Called when a
-    /// `record_pin_source` exhausts its retries, which is the only moment the node
-    /// knows a source it meant to record is missing. `GET /ipfs/{cid}` reads it to keep
-    /// the bounded scan fallback for that object, so a public copy that would serve is
-    /// no longer 404'd. A no-op when no `pinned_cids` row exists (the first-pin path is
-    /// transactional, so there is no half-recorded pin to describe).
-    pub async fn mark_pin_sources_incomplete(&self, sha256_hex: &str) -> Result<()> {
-        sqlx::query("UPDATE pinned_cids SET pin_sources_incomplete = TRUE WHERE sha256_hex = $1")
-            .bind(sha256_hex)
-            .execute(&self.pool)
-            .await?;
+    /// Mark this object's pin-source set as KNOWN INCOMPLETE for `repo_id` (U3, #173).
+    /// Called when a `record_pin_source` exhausts its retries, which is the only moment
+    /// the node knows a source it meant to record is missing. `GET /ipfs/{cid}` reads it
+    /// to keep the bounded scan fallback for that object, so a public copy that would
+    /// serve is no longer 404'd.
+    ///
+    /// The marker names the PAIR, so only a later successful record from the same repo
+    /// clears it (#173 round 12). A no-op when no `pinned_cids` row exists: the first-pin
+    /// path is transactional, so there is no half-recorded pin to describe, and without
+    /// the guard a marker for an object this node never pinned would sit in the table
+    /// arming a fallback for nothing.
+    pub async fn mark_pin_sources_incomplete(&self, sha256_hex: &str, repo_id: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO pin_source_failures (sha256_hex, repo_id)
+                  SELECT $1, $2 WHERE EXISTS (SELECT 1 FROM pinned_cids WHERE sha256_hex = $1)
+                  ON CONFLICT DO NOTHING",
+        )
+        .bind(sha256_hex)
+        .bind(repo_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
     /// Whether this object's pin-source set is KNOWN INCOMPLETE (U3, #173): a
-    /// `record_pin_source` for it failed outright and no later record has repaired the
-    /// set. `false` for an unpinned oid and for every row predating the column, so the
-    /// common path is unchanged and an ordinary denial never fans out (INV-10).
+    /// `record_pin_source` for it failed outright and no later record from the same repo
+    /// has repaired it. `false` for an unpinned oid and for every object with no recorded
+    /// failure, so the common path is unchanged and an ordinary denial never fans out
+    /// (INV-10).
     pub async fn pin_sources_incomplete(&self, sha256_hex: &str) -> Result<bool> {
-        let flag: Option<bool> = sqlx::query_scalar(
-            "SELECT pin_sources_incomplete FROM pinned_cids WHERE sha256_hex = $1",
-        )
-        .bind(sha256_hex)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(flag.unwrap_or(false))
+        let found: Option<i32> =
+            sqlx::query_scalar("SELECT 1 FROM pin_source_failures WHERE sha256_hex = $1 LIMIT 1")
+                .bind(sha256_hex)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(found.is_some())
     }
 
     /// Every source repository recorded for a pinned object (F1, #173 jatmn round 8):

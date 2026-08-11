@@ -1215,6 +1215,8 @@ async fn gate_and_serve(
         // Admission clone (#174 U1): the slot stays taken until this blocking work
         // returns, even if the handler future was dropped or this closure panics.
         let _admission = read_admission;
+        #[cfg(test)]
+        break_size_probe_if_armed(&read_repo, &read_sha);
         match store::object_size_bounded(&git_bin, &read_repo, &read_sha, read_deadline) {
             Ok(size) if size > max_bytes => return ServedRead::TooLarge(size),
             Ok(_) => {}
@@ -1314,6 +1316,60 @@ pub async fn list_pins(State(state): State<AppState>) -> Result<Json<serde_json:
 // `#[sqlx::test]` drives each test on its own current-thread runtime, so the async
 // preload runs on the test's thread — no cross-test races on a shared global.
 #[cfg(test)]
+// Test seam for the SIZE stage of the serve read (#173 round 12). The size probe runs
+// after the type probe has already reported the object present, and the interesting case
+// is a failure THERE, which no fixture can produce from the outside: the size read
+// deliberately uses the real `git` rather than `state.git_bin`, so a shim cannot be
+// injected the way it can for the walk.
+//
+// A shared set rather than a `thread_local` like the seams below, because this one has to
+// fire inside the read's `spawn_blocking`, on a different thread from the test.
+//
+// Keyed by (repo path, oid), and the repo path is the load-bearing half. An oid alone is
+// NOT unique across the test binary: fixture oids are content-derived, so every test
+// seeding the same fixture bytes shares them, and arming one oid deleted the object out
+// from under two unrelated tests running in parallel. The repo path carries a per-test
+// slug, so it is what makes the key private to the test that armed it. The entry is also
+// consumed on the first fire, so a test's later requests see an intact repo.
+#[cfg(test)]
+static SIZE_PROBE_BREAKERS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn size_probe_seam_key(repo_path: &std::path::Path, sha256_hex: &str) -> String {
+    format!("{}::{sha256_hex}", repo_path.display())
+}
+
+/// Arm the seam: the next serve read of `sha256_hex` FROM `repo_path` loses its loose
+/// object between the type probe and the size probe, so the size probe fails on an object
+/// git just confirmed present.
+#[cfg(test)]
+pub(crate) fn break_size_probe_for(repo_path: &std::path::Path, sha256_hex: &str) {
+    SIZE_PROBE_BREAKERS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("size-probe seam mutex")
+        .insert(size_probe_seam_key(repo_path, sha256_hex));
+}
+
+#[cfg(test)]
+fn break_size_probe_if_armed(repo_path: &std::path::Path, sha256_hex: &str) {
+    let armed = SIZE_PROBE_BREAKERS.get().is_some_and(|s| {
+        s.lock()
+            .expect("size-probe seam mutex")
+            .remove(&size_probe_seam_key(repo_path, sha256_hex))
+    });
+    if armed {
+        let _ = std::fs::remove_file(
+            repo_path
+                .join("objects")
+                .join(&sha256_hex[0..2])
+                .join(&sha256_hex[2..]),
+        );
+    }
+}
+
 thread_local! {
     static PRELOAD_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

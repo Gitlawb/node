@@ -934,7 +934,7 @@ pub async fn pin_new_objects(
                         );
                         if let Err(e) = db_bounded(
                             db_record_deadline(deadline),
-                            db.mark_pin_sources_incomplete(&sha),
+                            db.mark_pin_sources_incomplete(&sha, repo_id),
                         )
                         .await
                         {
@@ -955,7 +955,7 @@ pub async fn pin_new_objects(
                         tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
                         if let Err(e) = db_bounded(
                             db_record_deadline(deadline),
-                            db.mark_pin_sources_incomplete(&sha),
+                            db.mark_pin_sources_incomplete(&sha, repo_id),
                         )
                         .await
                         {
