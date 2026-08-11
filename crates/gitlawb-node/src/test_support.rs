@@ -6653,10 +6653,19 @@ mod tests {
     }
 
     /// U4 scenario 10 (#173, the other arm of scenario 9): a PERMANENTLY unrepairable
-    /// row must not make the sweep re-walk forever. Bytes that are genuinely gone are a
-    /// terminal skip, so the cursor stays parked and a later run reads nothing. Without
-    /// that split the transient-skip reset of scenario 9 turns every boot on such a node
-    /// into a full table walk. Both runs are timeout-bounded, so a hot loop FAILS here.
+    /// row must not cost anything on a later run. Bytes that are genuinely gone stay
+    /// gone, so a re-walk must not read object bytes for that row, must not repair it,
+    /// and must not spin: both runs are timeout-bounded, so a hot loop FAILS here.
+    ///
+    /// The assertion is about BOUNDED cost, not about the row going unread (jatmn
+    /// round 12). It asserted `scanned == 0` while the cursor parked at the table
+    /// maximum on a clean run; that parking is what let a row written below the cursor
+    /// by another node go unswept forever, so the run now always rewinds on clean
+    /// completion. The terminal row is therefore re-walked once per run, and its
+    /// repair is re-attempted once: the object read is attempted before the bytes are
+    /// found missing. That cost is real and it is the price of D. What must stay true
+    /// is that it is exactly ONE attempt per run and never repairs, so a regression
+    /// that retries the dead row within a run fails here.
     #[sqlx::test]
     async fn sweep_does_not_rewalk_for_a_terminal_skip(pool: PgPool) {
         use gitlawb_core::identity::Keypair;
@@ -6704,6 +6713,7 @@ mod tests {
             "the row is walked and cannot be repaired"
         );
 
+        crate::ipfs_pin::reset_legacy_repair_reads();
         let second = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             crate::ipfs_pin::sweep_legacy_provider_cids(
@@ -6718,9 +6728,183 @@ mod tests {
         .await
         .expect("the second run terminates");
         assert_eq!(
-            (second.scanned, second.repaired, second.passes),
-            (0, 0, 1),
-            "a terminal skip leaves the cursor parked: the next run re-reads nothing"
+            (second.repaired, second.passes),
+            (0, 1),
+            "the terminal row is still unrepairable and the run does not spin"
+        );
+        assert_eq!(
+            crate::ipfs_pin::legacy_repair_reads(),
+            1,
+            "the dead row costs exactly one repair attempt per run, never a retry loop"
+        );
+    }
+
+    /// U4 (#173, jatmn round 12): a row inserted BELOW a parked cursor must still be
+    /// swept. A clean run (no retryable skips) leaves the cursor at the table's maximum
+    /// `sha256_hex` and every later pass reads only `> cursor`, so a provider-CID row
+    /// written afterwards by an older node mid-rolling-upgrade whose oid sorts below
+    /// that maximum is never revisited. The resolver withholds its advertised key, so
+    /// the object stays unretrievable with nothing left to fix it. The rewind added for
+    /// the transient-skip case does not cover this: it is gated on `retryable_skips > 0`
+    /// and a clean pass reports zero.
+    #[sqlx::test]
+    async fn sweep_revisits_a_row_written_below_a_parked_cursor(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+
+        let fx = seed_cid_repos(&slug, &short, &["rollsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("rollsrc.git");
+        let repo = seed_repo(&owner_did, "rollsrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        // Two objects from the fixture, ordered by the column the walk is keyed on.
+        let mut oids = [fx.public_oid.clone(), fx.secret_oid.clone()];
+        oids.sort();
+        let (low_oid, high_oid) = (oids[0].clone(), oids[1].clone());
+
+        // First boot: one legacy row, repaired, nothing retryable. The cursor parks at
+        // that row's oid, which is the table maximum.
+        seed_legacy_pin(&pool, &bare, &high_oid, Some(&repo.id)).await;
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the first run terminates");
+        assert_eq!(
+            (first.repaired, first.retryable_skips),
+            (1, 0),
+            "the first run is a clean completion, so no rewind is triggered"
+        );
+        assert_eq!(
+            state.db.pin_repair_cursor().await.unwrap(),
+            "",
+            "a completed run rewinds instead of parking at the table maximum"
+        );
+
+        // An older node in the rolling upgrade writes a provider-CID row that sorts
+        // below the parked cursor.
+        let (low_raw, low_provider) = seed_legacy_pin(&pool, &bare, &low_oid, Some(&repo.id)).await;
+
+        // Next boot.
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the second run terminates");
+
+        let (stored, stashed) = stored_pin(&pool, &low_oid).await;
+        assert_eq!(
+            stored, low_raw,
+            "the row written below the cursor is repaired to the raw-content key \
+             (stored {stored}, provider key {low_provider}, second run scanned \
+             {} repaired {})",
+            second.scanned, second.repaired
+        );
+        assert_eq!(
+            stashed.as_deref(),
+            Some(low_provider.as_str()),
+            "its old provider CID is stashed"
+        );
+        assert!(
+            state
+                .db
+                .list_pinned_cids()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.cid == low_raw),
+            "the repaired row is advertised again"
+        );
+    }
+
+    /// U4 (#173, round 12, the other side of the unconditional rewind): a run that stops
+    /// on a pass ERROR keeps its mid-table cursor. The rewind is what a COMPLETED walk
+    /// does; applying it to a failed one would restart from the beginning of the table
+    /// on every boot of a node whose DB fails part-way through, and such a node would
+    /// never reach the rows behind the failure point. The error is induced by renaming
+    /// `pinned_cids` out from under the walk during the inter-batch sleep.
+    #[sqlx::test]
+    async fn sweep_keeps_its_cursor_when_a_pass_fails(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+
+        let fx = seed_cid_repos(&slug, &short, &["failsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("failsrc.git");
+        let repo = seed_repo(&owner_did, "failsrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let mut oids = [fx.public_oid.clone(), fx.secret_oid.clone()];
+        oids.sort();
+        for oid in &oids {
+            seed_legacy_pin(&pool, &bare, oid, Some(&repo.id)).await;
+        }
+
+        // A batch of one means the first pass is full, so the run sleeps and comes back
+        // for a second pass. The table is gone by then.
+        let killer = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                sqlx::query("ALTER TABLE pinned_cids RENAME TO pinned_cids_gone")
+                    .execute(&pool)
+                    .await
+                    .expect("rename the table out from under the walk");
+            })
+        };
+
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                1,
+                std::time::Duration::from_millis(300),
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the run terminates on the failed pass");
+        killer.await.expect("the killer task completes");
+
+        assert_eq!(
+            stats.scanned, 1,
+            "the first pass read its one row before the table went away"
+        );
+        assert_eq!(
+            state.db.pin_repair_cursor().await.unwrap(),
+            oids[0],
+            "a failed run keeps the position it reached instead of rewinding"
         );
     }
 

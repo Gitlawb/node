@@ -434,15 +434,29 @@ pub(crate) async fn sweep_legacy_provider_cids_once(
 /// or repairing an individual row are warn-and-skip; only a failure of the batch query
 /// or the cursor write ends the run, and a later run picks up from the stored cursor.
 ///
-/// A run that skipped at least one RETRYABLE row rewinds the cursor to the start of the
-/// table on its way out (#173 round 11). Without that the cursor parked at the maximum
-/// `sha256_hex` for good: every later boot read zero rows, so a row skipped for a
-/// transient reason (its repo cold on a Tigris-backed node, a DB or object read error)
-/// was skipped permanently, unadvertised and unresolvable with nothing left to fix it.
-/// The rewind is a per-RUN decision made after the walk has already finished, never
-/// mid-walk, so it cannot spin: the cost is one extra ordered scan on the next run, and
-/// a row that is unrepairable in principle (bytes gone, provenance gone) does not count
-/// as retryable, so a node holding one does not re-walk on every boot forever.
+/// A run that REACHES THE END OF THE TABLE rewinds the cursor to the start on its way
+/// out, so the next run walks the whole table again (#173 rounds 11 and 12). Without
+/// that the cursor parked at the maximum `sha256_hex` for good and every later boot
+/// read zero rows, which stranded two different kinds of row: one skipped for a
+/// transient reason (its repo cold on a Tigris-backed node, a DB or object read error),
+/// and one written BELOW the parked cursor afterwards by another node mid-rolling-
+/// upgrade. Either way the row was unadvertised and unresolvable with nothing left to
+/// fix it.
+///
+/// Round 11 gated the rewind on a transient skip having happened. That could not cover
+/// the second case, because the run that parks the cursor is a clean one by definition:
+/// the row it strands does not exist yet. So the rewind is unconditional on completion.
+///
+/// It is a per-RUN decision made after the walk has finished, never mid-walk, so it
+/// cannot spin. The cost is one extra ordered scan per run, plus one repair attempt per
+/// run for each row that is unrepairable in principle (bytes gone, provenance gone) —
+/// the read is attempted before the bytes are found missing. A row already carrying the
+/// canonical raw key costs a codec decode and no read at all, so a node that has
+/// finished repairing pays the scan and nothing more.
+///
+/// A run that stops on a pass ERROR does NOT rewind: its cursor is mid-table and
+/// discarding it would restart the walk from the beginning on a node whose DB is
+/// failing part-way through.
 pub(crate) async fn sweep_legacy_provider_cids(
     repos_dir: &std::path::Path,
     git_bin: &str,
@@ -452,6 +466,7 @@ pub(crate) async fn sweep_legacy_provider_cids(
     db: &crate::db::Db,
 ) -> SweepStats {
     let mut totals = SweepStats::default();
+    let mut completed = false;
     loop {
         let pass = match sweep_pass(repos_dir, git_bin, git_timeout, batch, db).await {
             Ok(p) => p,
@@ -467,11 +482,12 @@ pub(crate) async fn sweep_legacy_provider_cids(
         // A short batch means the ordered walk reached the end of the table. Stop here
         // rather than after an extra empty pass, and do NOT sleep on the way out.
         if (pass.scanned as i64) < batch {
+            completed = true;
             break;
         }
         tokio::time::sleep(delay).await;
     }
-    if totals.retryable_skips > 0 {
+    if completed {
         if let Err(e) = db.set_pin_repair_cursor("").await {
             tracing::warn!(err = %e, "failed to rewind the legacy provider-CID sweep cursor");
         }
