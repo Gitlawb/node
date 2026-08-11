@@ -32,6 +32,25 @@ use crate::db::{Db, PeerWriteDenied, ReceivedRefUpdate};
 /// Topic for ref-update notifications published after every push.
 pub const REF_UPDATES_TOPIC: &str = "gitlawb/ref-updates/v1";
 
+/// Per-source gossip ingest budget: 60 events per 60 seconds. A legitimate peer
+/// emits one event per pushed ref, so this leaves generous headroom while
+/// bounding what one mesh source can cost us.
+const GOSSIP_INGEST_MAX_EVENTS: usize = 60;
+const GOSSIP_INGEST_WINDOW: Duration = Duration::from_secs(60);
+/// Ceiling on tracked source peers, matching the bound the HTTP brakes use in
+/// `main.rs`. Keeps a source-rotation flood from growing the limiter's own map.
+const GOSSIP_INGEST_MAX_SOURCES: usize = 200_000;
+
+/// The gossip ingest limiter, built the same way for the swarm loop and for the
+/// tests so a test can never assert against a budget production does not run.
+pub(crate) fn new_ingest_rate_limiter() -> crate::rate_limit::RateLimiter {
+    crate::rate_limit::RateLimiter::new_bounded(
+        GOSSIP_INGEST_MAX_EVENTS,
+        GOSSIP_INGEST_WINDOW,
+        GOSSIP_INGEST_MAX_SOURCES,
+    )
+}
+
 /// A ref-update event published to Gossipsub when a push lands.
 ///
 /// The signing bytes are this struct serialized with `sig` set to None (see
@@ -90,11 +109,21 @@ fn signing_bytes(event: &RefUpdateEvent) -> serde_json::Result<Vec<u8>> {
 
 /// Sign an event in place: sets `sig` to the base64url signature by `keypair`
 /// over [`signing_bytes`].
-#[allow(dead_code)] // wired into the emit path in a later unit
 fn sign_ref_update(keypair: &Keypair, event: &mut RefUpdateEvent) -> serde_json::Result<()> {
     let bytes = signing_bytes(event)?;
     event.sig = Some(keypair.sign_b64(&bytes));
     Ok(())
+}
+
+/// The bytes the node publishes for one outbound ref-update: the event signed
+/// by the node keypair, then serialized.
+///
+/// The swarm loop and the round-trip test share this one function, so the bytes
+/// a test verifies are the bytes the mesh actually receives.
+fn signed_publish_bytes(keypair: &Keypair, event: &RefUpdateEvent) -> serde_json::Result<Vec<u8>> {
+    let mut event = event.clone();
+    sign_ref_update(keypair, &mut event)?;
+    serde_json::to_vec(&event)
 }
 
 /// Resolve the public key behind a claimed `node_did`, refusing anything that
@@ -161,6 +190,9 @@ pub(crate) enum IngestOutcome {
     /// The event was dropped. Nothing is stored, so the reason exists only to
     /// be logged and counted.
     Rejected(String),
+    /// The source peer is over its ingest budget. Dropped without being parsed
+    /// or verified, which is the whole point of the brake.
+    RateLimited,
 }
 
 /// Handle one inbound gossip ref-update: authenticate it, then write it.
@@ -174,11 +206,21 @@ pub(crate) enum IngestOutcome {
 /// sender cannot grow a table.
 pub(crate) async fn ingest_ref_update(
     db: &Db,
+    limiter: &crate::rate_limit::RateLimiter,
     require_signed: bool,
     auto_sync: bool,
     data: &[u8],
     propagation_source: &PeerId,
 ) -> IngestOutcome {
+    // FIRST, ahead of the parse and ahead of signature verification. Verifying
+    // a signature is the expensive step on this path, so a brake placed after it
+    // would let an unauthenticated flood buy exactly the CPU the brake exists to
+    // protect. Same ordering rationale as the HTTP sync-trigger brake in
+    // server.rs, which is layered outermost so it runs before auth.
+    if !limiter.check(&propagation_source.to_string()).await {
+        return IngestOutcome::RateLimited;
+    }
+
     let event = match serde_json::from_slice::<RefUpdateEvent>(data) {
         Ok(event) => event,
         Err(e) => return IngestOutcome::Rejected(format!("malformed ref-update event: {e}")),
@@ -417,9 +459,9 @@ pub async fn start(
 
     info!(peer_id = %local_peer_id, "libp2p identity");
 
-    // The node identity that signs outgoing publishes. The emit path is wired
-    // in a later unit; ingest only ever resolves keys from the claimed DID.
-    let _keypair = keypair;
+    // Per-source ingest brake, held across the whole swarm loop so budgets
+    // accumulate per forwarding peer.
+    let ingest_limiter = new_ingest_rate_limiter();
 
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<P2pCommand>(64);
 
@@ -524,18 +566,24 @@ pub async fn start(
                         SwarmEvent::Behaviour(GitlawbBehaviourEvent::Gossipsub(
                             gossipsub::Event::Message { propagation_source, message, .. }
                         )) => {
-                            if let IngestOutcome::Rejected(reason) = ingest_ref_update(
+                            match ingest_ref_update(
                                 &db,
+                                &ingest_limiter,
                                 require_signed,
                                 auto_sync,
                                 &message.data,
                                 &propagation_source,
                             ).await {
-                                warn!(
+                                IngestOutcome::Accepted => {}
+                                IngestOutcome::Rejected(reason) => warn!(
                                     from = %propagation_source,
                                     reason = %reason,
                                     "dropped gossip ref-update"
-                                );
+                                ),
+                                IngestOutcome::RateLimited => warn!(
+                                    from = %propagation_source,
+                                    "dropped gossip ref-update: source over its ingest rate budget"
+                                ),
                             }
                         }
                         // ── Kademlia results ──────────────────────────
@@ -588,12 +636,17 @@ pub async fn start(
                 Some(cmd) = cmd_rx.recv() => {
                     match cmd {
                         P2pCommand::PublishRefUpdate(event) => {
-                            if let Ok(bytes) = serde_json::to_vec(&event) {
-                                let topic = gossipsub::IdentTopic::new(REF_UPDATES_TOPIC);
-                                match swarm.behaviour_mut().gossipsub.publish(topic, bytes) {
-                                    Ok(id) => info!(msg_id = %id, repo = %event.repo, "published ref-update"),
-                                    Err(e) => warn!(err = %e, "failed to publish ref-update"),
+                            match signed_publish_bytes(&keypair, &event) {
+                                Ok(bytes) => {
+                                    let topic = gossipsub::IdentTopic::new(REF_UPDATES_TOPIC);
+                                    match swarm.behaviour_mut().gossipsub.publish(topic, bytes) {
+                                        Ok(id) => info!(msg_id = %id, repo = %event.repo, "published ref-update"),
+                                        Err(e) => warn!(err = %e, "failed to publish ref-update"),
+                                    }
                                 }
+                                // Skip the publish rather than emit something a
+                                // verifying peer would drop anyway.
+                                Err(e) => warn!(err = %e, "failed to sign ref-update; not publishing"),
                             }
                         }
                         P2pCommand::AddKnownPeer { peer_id, addr } => {
@@ -992,10 +1045,35 @@ mod tests {
         serde_json::to_vec(event).expect("serialize event")
     }
 
+    /// Ingest one event against a limiter with no history, for the cases that
+    /// are about a guard other than the rate brake. The rate-limit tests below
+    /// hold one limiter across calls instead, since that is the state they
+    /// assert on.
+    async fn ingest_with_fresh_limiter(
+        db: &Db,
+        require_signed: bool,
+        auto_sync: bool,
+        data: &[u8],
+        propagation_source: &PeerId,
+    ) -> IngestOutcome {
+        ingest_ref_update(
+            db,
+            &new_ingest_rate_limiter(),
+            require_signed,
+            auto_sync,
+            data,
+            propagation_source,
+        )
+        .await
+    }
+
     fn rejection_reason(outcome: IngestOutcome, context: &str) -> String {
         match outcome {
             IngestOutcome::Rejected(reason) => reason,
             IngestOutcome::Accepted => panic!("{context}: the event must be rejected"),
+            IngestOutcome::RateLimited => {
+                panic!("{context}: the event must be rejected by a guard, not by the rate brake")
+            }
         }
     }
 
@@ -1010,7 +1088,7 @@ mod tests {
         seed_peer(&pool, &event.node_did).await;
 
         let outcome =
-            ingest_ref_update(&db, true, true, &bytes_of(&event), &PeerId::random()).await;
+            ingest_with_fresh_limiter(&db, true, true, &bytes_of(&event), &PeerId::random()).await;
 
         assert_nothing_written(&pool, "unsigned event with enforcement on").await;
         rejection_reason(outcome, "unsigned event with enforcement on");
@@ -1030,7 +1108,7 @@ mod tests {
 
         for require_signed in [true, false] {
             let context = format!("foreign-key signature, require_signed={require_signed}");
-            let outcome = ingest_ref_update(
+            let outcome = ingest_with_fresh_limiter(
                 &db,
                 require_signed,
                 true,
@@ -1055,7 +1133,7 @@ mod tests {
 
         for require_signed in [true, false] {
             let context = format!("tampered event, require_signed={require_signed}");
-            let outcome = ingest_ref_update(
+            let outcome = ingest_with_fresh_limiter(
                 &db,
                 require_signed,
                 true,
@@ -1083,7 +1161,7 @@ mod tests {
 
         for require_signed in [true, false] {
             let context = format!("did:web node_did, require_signed={require_signed}");
-            let outcome = ingest_ref_update(
+            let outcome = ingest_with_fresh_limiter(
                 &db,
                 require_signed,
                 true,
@@ -1113,7 +1191,7 @@ mod tests {
 
         for require_signed in [true, false] {
             let context = format!("unknown peer DID, require_signed={require_signed}");
-            let outcome = ingest_ref_update(
+            let outcome = ingest_with_fresh_limiter(
                 &db,
                 require_signed,
                 true,
@@ -1140,7 +1218,7 @@ mod tests {
 
         for require_signed in [true, false] {
             let context = format!("traversal slug, require_signed={require_signed}");
-            let outcome = ingest_ref_update(
+            let outcome = ingest_with_fresh_limiter(
                 &db,
                 require_signed,
                 true,
@@ -1164,7 +1242,7 @@ mod tests {
         seed_peer(&pool, &event.node_did).await;
         let source = PeerId::random();
 
-        let outcome = ingest_ref_update(&db, true, true, &bytes_of(&event), &source).await;
+        let outcome = ingest_with_fresh_limiter(&db, true, true, &bytes_of(&event), &source).await;
         assert!(
             matches!(outcome, IngestOutcome::Accepted),
             "a correctly signed event from a known peer must be accepted, got {outcome:?}"
@@ -1201,7 +1279,7 @@ mod tests {
         seed_peer(&pool, &event.node_did).await;
 
         let outcome =
-            ingest_ref_update(&db, true, false, &bytes_of(&event), &PeerId::random()).await;
+            ingest_with_fresh_limiter(&db, true, false, &bytes_of(&event), &PeerId::random()).await;
         assert!(matches!(outcome, IngestOutcome::Accepted));
 
         assert_eq!(count(&pool, "received_ref_updates").await, 1);
@@ -1225,13 +1303,159 @@ mod tests {
         seed_peer(&pool, &event.node_did).await;
 
         let outcome =
-            ingest_ref_update(&db, false, true, &bytes_of(&event), &PeerId::random()).await;
+            ingest_with_fresh_limiter(&db, false, true, &bytes_of(&event), &PeerId::random()).await;
         assert!(
             matches!(outcome, IngestOutcome::Accepted),
             "an unsigned known-peer event must survive the rolling-upgrade window, got {outcome:?}"
         );
         assert_eq!(count(&pool, "received_ref_updates").await, 1);
         assert_eq!(count(&pool, "sync_queue").await, 1);
+    }
+
+    // ── Emit side ─────────────────────────────────────────────────────────
+
+    /// The round trip that matters: bytes built by the emit path are fed to the
+    /// real ingest with enforcement ON, and must be accepted.
+    ///
+    /// Nothing else proves emit and verify agree on the signing input by
+    /// execution. The golden test pins the input's shape, and the helper tests
+    /// sign and verify through `sign_ref_update` directly, but only this one
+    /// exercises what the node actually puts on the wire. If it fails once the
+    /// fleet turns enforcement on, every node drops every other node's events.
+    #[sqlx::test]
+    async fn emitted_bytes_verify_through_ingest_with_enforcement_on(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        // Straight off the publish path: the caller hands over an unsigned
+        // event, exactly as `publish_ref_update` does.
+        let event = event_for(&keypair);
+        assert_eq!(event.sig, None, "the emit path is what adds the signature");
+        seed_peer(&pool, &event.node_did).await;
+
+        let bytes = signed_publish_bytes(&keypair, &event).expect("emit path must produce bytes");
+
+        let published: RefUpdateEvent =
+            serde_json::from_slice(&bytes).expect("published bytes must parse");
+        assert!(
+            published.sig.is_some(),
+            "an emitted event must carry a signature"
+        );
+
+        let outcome = ingest_with_fresh_limiter(&db, true, true, &bytes, &PeerId::random()).await;
+        assert!(
+            matches!(outcome, IngestOutcome::Accepted),
+            "bytes from the emit path must survive ingest with enforcement on, got {outcome:?}"
+        );
+        assert_eq!(count(&pool, "received_ref_updates").await, 1);
+    }
+
+    // ── Per-source rate limit ─────────────────────────────────────────────
+
+    #[test]
+    fn gossip_ingest_budget_is_sixty_per_minute() {
+        assert_eq!(GOSSIP_INGEST_MAX_EVENTS, 60);
+        assert_eq!(GOSSIP_INGEST_WINDOW, Duration::from_secs(60));
+    }
+
+    /// The ordering test, and the reason the brake exists at all. Signature
+    /// verification is the expensive step, so a limiter sitting after it lets an
+    /// unauthenticated flood buy exactly the CPU the brake was meant to protect.
+    ///
+    /// This discriminates the ordering by execution rather than by inspection.
+    /// The flood is garbage that neither parses nor verifies. With the check
+    /// first, those 60 messages spend the source's budget and the next event, a
+    /// perfectly valid signed known-peer one, comes back `RateLimited`. Move the
+    /// check below the parse or below verification and the garbage never reaches
+    /// the limiter, the budget is untouched, and that last event is accepted:
+    /// this assertion is what goes red.
+    #[sqlx::test]
+    async fn rate_limit_runs_before_parse_and_signature_verification(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiter = new_ingest_rate_limiter();
+        let source = PeerId::random();
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        seed_peer(&pool, &event.node_did).await;
+
+        for i in 0..GOSSIP_INGEST_MAX_EVENTS {
+            let outcome =
+                ingest_ref_update(&db, &limiter, true, true, b"not json at all", &source).await;
+            assert!(
+                matches!(outcome, IngestOutcome::Rejected(_)),
+                "flood message {i} is inside the budget, so it is admitted and then dropped as malformed, got {outcome:?}"
+            );
+        }
+
+        let outcome =
+            ingest_ref_update(&db, &limiter, true, true, &bytes_of(&event), &source).await;
+        assert!(
+            matches!(outcome, IngestOutcome::RateLimited),
+            "the 61st event from one source inside the window must be rate limited; \
+             an unverifiable flood has to spend the budget, which only happens if the \
+             check precedes the parse and the signature work. Got {outcome:?}"
+        );
+        assert_nothing_written(&pool, "source over its ingest budget").await;
+    }
+
+    /// The budget is per source peer, not one global bucket. Without this, one
+    /// noisy or hostile mesh source would silence the whole fleet.
+    #[sqlx::test]
+    async fn rate_limit_is_per_source_not_global(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiter = new_ingest_rate_limiter();
+        let throttled = PeerId::random();
+        let other = PeerId::random();
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        seed_peer(&pool, &event.node_did).await;
+
+        for _ in 0..GOSSIP_INGEST_MAX_EVENTS {
+            ingest_ref_update(&db, &limiter, true, true, b"not json at all", &throttled).await;
+        }
+        let outcome =
+            ingest_ref_update(&db, &limiter, true, true, &bytes_of(&event), &throttled).await;
+        assert!(
+            matches!(outcome, IngestOutcome::RateLimited),
+            "the first source must be over budget, got {outcome:?}"
+        );
+
+        let outcome = ingest_ref_update(&db, &limiter, true, true, &bytes_of(&event), &other).await;
+        assert!(
+            matches!(outcome, IngestOutcome::Accepted),
+            "a second peer keeps its own budget while the first is throttled, got {outcome:?}"
+        );
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            1,
+            "the second peer's event is the only one that should have been written"
+        );
+    }
+
+    /// The brake must not cost a legitimate peer anything under budget.
+    #[sqlx::test]
+    async fn under_budget_events_from_one_source_are_all_accepted(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiter = new_ingest_rate_limiter();
+        let source = PeerId::random();
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        seed_peer(&pool, &event.node_did).await;
+
+        for i in 0..GOSSIP_INGEST_MAX_EVENTS {
+            let outcome =
+                ingest_ref_update(&db, &limiter, true, true, &bytes_of(&event), &source).await;
+            assert!(
+                matches!(outcome, IngestOutcome::Accepted),
+                "event {i} is inside the budget and must be accepted, got {outcome:?}"
+            );
+        }
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            GOSSIP_INGEST_MAX_EVENTS as i64
+        );
     }
 
     #[test]
