@@ -2471,6 +2471,8 @@ async fn post_receive_replication_tail(
                             timestamp: chrono::Utc::now().to_rfc3339(),
                             cert_id: None,
                             cid: cid.map(|s| s.to_string()),
+                            // Signing is U4's job; unsigned for now.
+                            sig: None,
                         })
                         .await;
                     }

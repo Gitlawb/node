@@ -25,12 +25,22 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::db::{Db, ReceivedRefUpdate};
+use gitlawb_core::identity::Keypair;
+
+use crate::db::{Db, PeerWriteDenied, ReceivedRefUpdate};
 
 /// Topic for ref-update notifications published after every push.
 pub const REF_UPDATES_TOPIC: &str = "gitlawb/ref-updates/v1";
 
 /// A ref-update event published to Gossipsub when a push lands.
+///
+/// The signing bytes are this struct serialized with `sig` set to None (see
+/// [`signing_bytes`]), so ANY future field added here changes the signing bytes
+/// for every event that carries it. In a mixed fleet, a node that does not know
+/// the new field re-serializes without it and computes different bytes, so
+/// verification fails. A field addition therefore needs its own rollout plan
+/// (ship the field to the whole fleet before anything emits it), not just a
+/// struct edit.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RefUpdateEvent {
     /// gitlawb DID of the node publishing the event
@@ -56,6 +66,88 @@ pub struct RefUpdateEvent {
     pub cert_id: Option<String>,
     /// IPFS CID of the latest commit object (set after pinning completes)
     pub cid: Option<String>,
+    /// Ed25519 signature (base64url, no padding) by the key behind `node_did`,
+    /// over the signing bytes defined by `signing_bytes` (this struct serialized
+    /// with `sig` set to None). Optional for backward compat with older peers
+    /// that don't include it; enforcement is the operator flag's job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
+}
+
+/// The bytes a `RefUpdateEvent` signature is computed over: the event
+/// serialized with `sig` set to None.
+///
+/// This is the ONLY producer of signing input on either side. Emit and verify
+/// both call it, so the two cannot drift. `skip_serializing_if` on `sig` keeps
+/// the output byte-identical to the legacy wire form (no `"sig": null`), and
+/// serde's derive serializes in declaration order, so both sides re-serializing
+/// the same struct definition agree regardless of the order fields arrived in.
+#[allow(dead_code)] // consumed by the emit and ingest paths in later units
+fn signing_bytes(event: &RefUpdateEvent) -> serde_json::Result<Vec<u8>> {
+    let mut unsigned = event.clone();
+    unsigned.sig = None;
+    serde_json::to_vec(&unsigned)
+}
+
+/// Sign an event in place: sets `sig` to the base64url signature by `keypair`
+/// over [`signing_bytes`].
+#[allow(dead_code)] // wired into the emit path in a later unit
+fn sign_ref_update(keypair: &Keypair, event: &mut RefUpdateEvent) -> serde_json::Result<()> {
+    let bytes = signing_bytes(event)?;
+    event.sig = Some(keypair.sign_b64(&bytes));
+    Ok(())
+}
+
+/// Verify that `event.sig` is an Ed25519 signature over [`signing_bytes`] by
+/// the key behind `event.node_did`.
+///
+/// The signature is bound to the claimed identity structurally: the key comes
+/// from `node_did` and nowhere else, so a valid signature by some other key
+/// never passes.
+#[allow(dead_code)] // wired into the ingest path in a later unit
+fn verify_ref_update(event: &RefUpdateEvent) -> Result<(), String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    let sig_b64 = event
+        .sig
+        .as_deref()
+        .ok_or_else(|| "event carries no signature".to_string())?;
+
+    // The did-method and resolution refusals answer in the SAME words as the
+    // peers-table gate in db/mod.rs, so the two surfaces that judge the same
+    // input do not drift into separate vocabularies. The sentences are built
+    // from PeerWriteDenied itself rather than retyped, so they cannot.
+    let unresolvable = |reason: String| {
+        PeerWriteDenied::UnresolvableDid {
+            did: event.node_did.clone(),
+            reason,
+        }
+        .to_string()
+    };
+
+    let did = event
+        .node_did
+        .parse::<gitlawb_core::did::Did>()
+        .map_err(|e| unresolvable(e.to_string()))?;
+    if !did.is_did_key() {
+        return Err(PeerWriteDenied::UnsupportedDidMethod {
+            did: event.node_did.clone(),
+        }
+        .to_string());
+    }
+    let verifying_key = did
+        .to_verifying_key()
+        .map_err(|e| unresolvable(e.to_string()))?;
+
+    let sig_bytes: [u8; 64] = URL_SAFE_NO_PAD
+        .decode(sig_b64)
+        .map_err(|_| "signature is not valid base64url".to_string())?
+        .try_into()
+        .map_err(|_| "signature is not 64 bytes".to_string())?;
+
+    let bytes = signing_bytes(event).map_err(|e| e.to_string())?;
+    gitlawb_core::identity::verify(&verifying_key, &bytes, &sig_bytes)
+        .map_err(|_| "signature does not verify against node_did".to_string())
 }
 
 /// A DID record stored in the Kademlia DHT — maps a gitlawb DID to a node.
@@ -456,6 +548,7 @@ mod tests {
             timestamp: "2026-07-02T12:00:00Z".into(),
             cert_id: None,
             cid: None,
+            sig: None,
         };
         let json = serde_json::to_value(&event).unwrap();
         // owner_did must be present in the serialized output
@@ -500,5 +593,252 @@ mod tests {
         });
         let deserialized: RefUpdateEvent = serde_json::from_value(with_null).unwrap();
         assert_eq!(deserialized.owner_did, None);
+    }
+
+    /// A fully populated event used by the wire-format tests. Every optional
+    /// field is Some so the serialized form exercises the widest field set.
+    fn populated_event() -> RefUpdateEvent {
+        RefUpdateEvent {
+            node_did: "did:key:zNode".into(),
+            pusher_did: "did:key:zPusher".into(),
+            repo: "zOwner/myrepo".into(),
+            owner_did: Some("did:key:zOwner".into()),
+            ref_name: "refs/heads/main".into(),
+            old_sha: "0000000000000000000000000000000000000000".into(),
+            new_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            timestamp: "2026-07-02T12:00:00Z".into(),
+            cert_id: Some("cert-1".into()),
+            cid: Some("bafycid".into()),
+            sig: None,
+        }
+    }
+
+    /// The load-bearing backward-compatibility test (R12). An un-upgraded peer
+    /// runs `from_slice::<RefUpdateEvent>` against the PRE-CHANGE field set, so
+    /// this replicates that struct verbatim and proves bytes produced by the
+    /// new code still parse into it. If this fails, upgraded nodes' events are
+    /// silently dropped by every node that has not upgraded yet.
+    #[test]
+    fn signed_event_still_parses_under_the_pre_change_field_set() {
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct LegacyRefUpdateEvent {
+            node_did: String,
+            pusher_did: String,
+            repo: String,
+            #[serde(default)]
+            owner_did: Option<String>,
+            ref_name: String,
+            old_sha: String,
+            new_sha: String,
+            timestamp: String,
+            cert_id: Option<String>,
+            cid: Option<String>,
+        }
+
+        let mut event = populated_event();
+        event.sig = Some("c2lnbmF0dXJl".into());
+        let bytes = serde_json::to_vec(&event).unwrap();
+
+        let legacy: LegacyRefUpdateEvent = serde_json::from_slice(&bytes)
+            .expect("new-code bytes must deserialize under the old field set");
+        assert_eq!(legacy.repo, "zOwner/myrepo");
+        assert_eq!(legacy.owner_did, Some("did:key:zOwner".into()));
+    }
+
+    #[test]
+    fn legacy_json_without_sig_parses_with_sig_none() {
+        let old_json = serde_json::json!({
+            "node_did": "did:key:zNode",
+            "pusher_did": "did:key:zPusher",
+            "repo": "zOwner/myrepo",
+            "ref_name": "refs/heads/main",
+            "old_sha": "0000000000000000000000000000000000000000",
+            "new_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "timestamp": "2026-07-02T12:00:00Z",
+            "cert_id": null,
+            "cid": null
+        });
+        let deserialized: RefUpdateEvent = serde_json::from_value(old_json).unwrap();
+        assert_eq!(deserialized.sig, None);
+
+        let with_null = serde_json::json!({
+            "node_did": "did:key:zNode",
+            "pusher_did": "did:key:zPusher",
+            "repo": "zOwner/myrepo",
+            "ref_name": "refs/heads/main",
+            "old_sha": "0000000000000000000000000000000000000000",
+            "new_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "timestamp": "2026-07-02T12:00:00Z",
+            "cert_id": null,
+            "cid": null,
+            "sig": null
+        });
+        let deserialized: RefUpdateEvent = serde_json::from_value(with_null).unwrap();
+        assert_eq!(deserialized.sig, None);
+    }
+
+    /// `skip_serializing_if` is not cosmetic: the signing bytes are the event
+    /// with `sig` set to None, so a `"sig": null` key would change them and
+    /// break byte-identity with the legacy wire form.
+    #[test]
+    fn unsigned_event_serializes_with_no_sig_key() {
+        let json = serde_json::to_string(&populated_event()).unwrap();
+        assert!(
+            !json.contains("\"sig\""),
+            "an unsigned event must carry no sig key at all, got: {json}"
+        );
+    }
+
+    /// Golden signing input, pinned byte for byte.
+    ///
+    /// If this fails, the wire signing input changed. That is not a constant to
+    /// re-pin: every already-signed event in flight, and every signature made by
+    /// a previously deployed build, becomes unverifiable against the new build,
+    /// so the change needs a rollout plan (ship the reader everywhere before
+    /// anything emits the new form). A field REORDER or rename produces exactly
+    /// this failure, and the emit-to-ingest round trip is structurally blind to
+    /// it because both sides re-serialize the same new declaration order.
+    const GOLDEN_SIGNING_BYTES: &str = concat!(
+        r#"{"node_did":"did:key:zNode","pusher_did":"did:key:zPusher","#,
+        r#""repo":"zOwner/myrepo","owner_did":"did:key:zOwner","#,
+        r#""ref_name":"refs/heads/main","#,
+        r#""old_sha":"0000000000000000000000000000000000000000","#,
+        r#""new_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","#,
+        r#""timestamp":"2026-07-02T12:00:00Z","cert_id":"cert-1","cid":"bafycid"}"#,
+    );
+
+    #[test]
+    fn signing_bytes_match_the_golden_constant() {
+        let bytes = signing_bytes(&populated_event()).unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            GOLDEN_SIGNING_BYTES,
+            "the wire signing input changed; see the comment on GOLDEN_SIGNING_BYTES"
+        );
+    }
+
+    /// The signature must be excluded from its own input, so a signed event and
+    /// its unsigned original produce identical signing bytes.
+    #[test]
+    fn signing_bytes_ignore_the_sig_field() {
+        let mut signed = populated_event();
+        signed.sig = Some("c2lnbmF0dXJl".into());
+        assert_eq!(
+            signing_bytes(&signed).unwrap(),
+            signing_bytes(&populated_event()).unwrap()
+        );
+    }
+
+    /// Build a populated event whose `node_did` is the given keypair's DID.
+    fn event_for(keypair: &Keypair) -> RefUpdateEvent {
+        let mut event = populated_event();
+        event.node_did = keypair.did().to_string();
+        event
+    }
+
+    #[test]
+    fn sign_then_verify_round_trips() {
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        assert!(event.sig.is_some(), "signing must populate sig");
+
+        // Through the wire, since that is how a peer receives it.
+        let bytes = serde_json::to_vec(&event).unwrap();
+        let received: RefUpdateEvent = serde_json::from_slice(&bytes).unwrap();
+        verify_ref_update(&received).expect("a correctly signed event must verify");
+        assert_eq!(received.repo, "zOwner/myrepo");
+        assert_eq!(received.node_did, keypair.did().to_string());
+    }
+
+    /// A cryptographically valid signature that does not bind the claimed
+    /// identity. This is the RUSTSEC-2022-0009 shape: libp2p-core accepted a
+    /// valid signature without checking it derived the claimed peer id, so the
+    /// signature proved someone signed, not that the claimed party did. Here
+    /// keypair A signs an event claiming keypair B's DID; the bytes carry a
+    /// real signature, and verification must still refuse it because it does
+    /// not verify against the key behind `node_did`.
+    #[test]
+    fn a_signature_that_does_not_bind_the_claimed_did_is_rejected() {
+        let signer = Keypair::generate();
+        let claimed = Keypair::generate();
+        let mut event = event_for(&claimed);
+        // Signed by `signer` over bytes that name `claimed` as node_did.
+        sign_ref_update(&signer, &mut event).unwrap();
+        assert!(event.sig.is_some());
+
+        verify_ref_update(&event)
+            .expect_err("a signature by a key other than node_did's must be refused");
+    }
+
+    #[test]
+    fn tampering_with_a_signed_field_fails_verification() {
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        verify_ref_update(&event).expect("baseline must verify before tampering");
+
+        for tamper in [
+            |e: &mut RefUpdateEvent| e.repo = "attacker/evil".into(),
+            |e: &mut RefUpdateEvent| e.ref_name = "refs/heads/attacker".into(),
+            |e: &mut RefUpdateEvent| e.new_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            |e: &mut RefUpdateEvent| e.old_sha = "cccccccccccccccccccccccccccccccccccccccc".into(),
+            |e: &mut RefUpdateEvent| e.pusher_did = "did:key:zAttacker".into(),
+            |e: &mut RefUpdateEvent| e.owner_did = Some("did:key:zAttacker".into()),
+            |e: &mut RefUpdateEvent| e.timestamp = "2030-01-01T00:00:00Z".into(),
+            |e: &mut RefUpdateEvent| e.cert_id = Some("cert-2".into()),
+            |e: &mut RefUpdateEvent| e.cid = Some("bafyother".into()),
+        ] {
+            let mut tampered = event.clone();
+            tamper(&mut tampered);
+            verify_ref_update(&tampered)
+                .expect_err("mutating any signed field must fail verification");
+        }
+    }
+
+    #[test]
+    fn an_event_with_no_signature_is_rejected() {
+        let keypair = Keypair::generate();
+        let event = event_for(&keypair);
+        assert_eq!(event.sig, None);
+        verify_ref_update(&event).expect_err("an unsigned event must not verify");
+    }
+
+    /// Two surfaces judging the same input answer with the same sentence. The
+    /// literals here are copied from `PeerWriteDenied` in db/mod.rs on purpose:
+    /// if that wording changes, this goes red rather than letting the gossip
+    /// surface drift into its own vocabulary for the same refusal.
+    #[test]
+    fn a_non_did_key_node_did_is_rejected_with_the_shared_sentence() {
+        let keypair = Keypair::generate();
+        let mut event = populated_event();
+        event.node_did = "did:web:example.com".into();
+        sign_ref_update(&keypair, &mut event).unwrap();
+
+        let err = verify_ref_update(&event).expect_err("did:web must never authenticate");
+        assert_eq!(
+            err,
+            "methodNotSupported: only did:key peers can be registered without a proof of control: did:web:example.com"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_did_key_is_rejected_with_the_shared_sentence() {
+        let keypair = Keypair::generate();
+        let mut event = populated_event();
+        // A did:key whose method id is not a decodable ed25519 multibase key.
+        event.node_did = "did:key:zNotARealKey".into();
+        sign_ref_update(&keypair, &mut event).unwrap();
+
+        let err = verify_ref_update(&event).expect_err("an unresolvable did:key must be refused");
+        assert!(
+            err.starts_with("cannot resolve DID 'did:key:zNotARealKey': "),
+            "expected the shared unresolvable-DID sentence, got: {err}"
+        );
+        assert!(
+            !err.ends_with(": "),
+            "the sentence must carry the underlying reason, got: {err}"
+        );
     }
 }
