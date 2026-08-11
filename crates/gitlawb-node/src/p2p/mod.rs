@@ -4,8 +4,8 @@
 //!   - Peer discovery via Kademlia DHT (DID → multiaddr mapping)
 //!   - Real-time ref-update events via Gossipsub
 //!
-//! The node's PeerId is derived from its Ed25519 identity keypair,
-//! so the gitlawb DID and libp2p PeerId share the same key.
+//! The node's PeerId comes from an Ed25519 keypair loaded from a persistent
+//! key file, so the PeerId is stable across restarts.
 
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
@@ -206,31 +206,16 @@ pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> 
 /// Start the libp2p swarm. Returns a handle for sending commands and the
 /// listening multiaddrs. Runs the event loop as a background tokio task
 /// that exits cleanly when `shutdown_rx` flips to `true`.
+/// `local_key` is the node's libp2p identity, loaded from the persistent key
+/// file by [`load_or_create_p2p_keypair`].
 pub async fn start(
-    node_did: &str,
+    local_key: identity::Keypair,
     listen_port: u16,
     bootstrap_addrs: Vec<Multiaddr>,
     db: Arc<Db>,
     auto_sync: bool,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<P2pHandle> {
-    // Derive a stable libp2p Ed25519 key from a seed based on the node DID.
-    // In production you'd load/persist this key alongside the identity PEM.
-    // For now we use the DID string as a deterministic seed.
-    let seed = {
-        let mut h = DefaultHasher::new();
-        node_did.hash(&mut h);
-        h.finish()
-    };
-    let mut seed_bytes = [0u8; 32];
-    seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
-    // Spread the seed across all bytes for better distribution
-    for i in 1..4 {
-        seed_bytes[i * 8..(i + 1) * 8].copy_from_slice(&seed.wrapping_add(i as u64).to_le_bytes());
-    }
-
-    let local_key = identity::Keypair::ed25519_from_bytes(seed_bytes)
-        .map_err(|e| anyhow::anyhow!("failed to create p2p keypair: {e}"))?;
     let local_peer_id = PeerId::from(local_key.public());
 
     info!(peer_id = %local_peer_id, "libp2p identity");
