@@ -4234,6 +4234,134 @@ mod tests {
         );
     }
 
+    /// U3 residual (#173): pins the ACCEPTED cost of a single boolean, and is NOT a bug
+    /// report. `pinned_cids.pin_sources_incomplete` is one flag per OBJECT, not per
+    /// (object, repo), so a GENUINE record from a third repo C clears a marker that repo
+    /// B's FAILED record set, and the resolver then reads a non-empty below-cap source
+    /// set as fully enumerated and stops running the scan fallback. The decision of
+    /// record is the `record_pin_source` doc comment in `db/mod.rs`, which names this
+    /// exact case and calls it the deliberate cost of a single boolean; closing it needs
+    /// a per-(oid, repo) marker table.
+    ///
+    /// Why it is acceptable: the residual fails CLOSED. The provenance loop and the scan
+    /// fallback both serve through the same `gate_and_serve`, so clearing the marker only
+    /// ever removes a gated search and can never serve something a caller may not read.
+    /// The window is exactly `1 <= sources < MAX_PIN_SOURCES`: an empty set always scans,
+    /// and at cap the insert is a no-op so the marker survives.
+    ///
+    /// The BEFORE request is what makes the AFTER assertion mean anything: it proves the
+    /// unrecorded public holder IS reachable while the marker stands, so the later 404 is
+    /// caused by the clear and by nothing else in the fixture.
+    ///
+    /// If someone implements the per-(oid, repo) marker, this test is EXPECTED to go red.
+    /// Update it to assert the new behavior rather than deleting it: a red here is the
+    /// residual being closed, not a regression.
+    #[sqlx::test]
+    async fn ipfs_cid_third_repo_record_clears_marker_and_hides_an_unrecorded_holder(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["u3ta", "u3tb", "u3tc"]);
+        let a_bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("u3ta.git");
+        let b_bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("u3tb.git");
+        let c_bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("u3tc.git");
+
+        // Repo A (private) is the first pinner and the only recorded source.
+        let mut a_repo = seed_repo(&owner_did, "u3ta");
+        a_repo.is_public = false;
+        state.db.create_repo(&a_repo).await.expect("seed A private");
+        let cid = pin_cid_for_repo(&a_bare, &fx.public_oid, &state.db, &a_repo.id).await;
+        state
+            .db
+            .record_pin_source(&fx.public_oid, &a_repo.id)
+            .await
+            .expect("record the first pinner as a source");
+
+        // Repo B (public) genuinely holds the object, but its source record never lands,
+        // so the node marks the set known-incomplete.
+        let b_repo = seed_repo(&owner_did, "u3tb"); // public, no rule
+        state.db.create_repo(&b_repo).await.expect("seed B public");
+        with_pin_sources_broken(&pool, || {
+            repin_via_skip_branch(&state, &b_bare, &fx.public_oid, &b_repo.id)
+        })
+        .await;
+        assert!(
+            state
+                .db
+                .pin_sources_incomplete(&fx.public_oid)
+                .await
+                .unwrap(),
+            "B's exhausted record marked the set incomplete"
+        );
+
+        // BEFORE: while the marker stands, the scan fallback finds B and serves.
+        let (st, body) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "with the marker set, the unrecorded public holder is reachable"
+        );
+        assert!(
+            body.contains("public bytes"),
+            "the served body is the public object's bytes"
+        );
+
+        // Repo C (private) pushes the same object. Its record is a GENUINE insert (C is
+        // not yet a source), so it clears the marker B set, even though B is still missing.
+        let mut c_repo = seed_repo(&owner_did, "u3tc");
+        c_repo.is_public = false;
+        state.db.create_repo(&c_repo).await.expect("seed C private");
+        repin_via_skip_branch(&state, &c_bare, &fx.public_oid, &c_repo.id).await;
+
+        assert!(
+            !state
+                .db
+                .pin_sources_incomplete(&fx.public_oid)
+                .await
+                .unwrap(),
+            "a third repo's genuine record clears the per-object marker"
+        );
+        assert!(
+            !state.db.pin_sources_at_cap(&fx.public_oid).await.unwrap(),
+            "the set is below cap, so at_cap is not what drives the gate here"
+        );
+        let sources = state.db.pin_sources_for_oid(&fx.public_oid).await.unwrap();
+        assert_eq!(sources.len(), 2, "the set names A and C only: {sources:?}");
+        assert!(
+            !sources.contains(&b_repo.id),
+            "B is still missing from the set it was marked for: {sources:?}"
+        );
+
+        // AFTER: the identical request now reads the set as complete and 404s the public
+        // copy it served a moment ago, without ever arming the scan.
+        crate::api::ipfs::reset_preload_queries();
+        let (st, body) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "the cleared marker hides B: the same anonymous request now 404s"
+        );
+        assert!(
+            !body.contains("public bytes"),
+            "the 404 body must not carry the object it declined to serve"
+        );
+        assert_eq!(
+            crate::api::ipfs::preload_queries(),
+            0,
+            "the fallback scan provably did not run, so the 404 is the cleared marker and not a failed search"
+        );
+    }
+
     /// U3 scenario 4 (#173): the marker tracks the record's OUTCOME, not the attempt.
     /// An exhausted retry sets it; a first-attempt success never does. Without the
     /// second arm the first could be satisfied by marking unconditionally.
