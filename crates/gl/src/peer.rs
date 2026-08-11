@@ -63,12 +63,7 @@ pub async fn run(args: PeerArgs) -> Result<()> {
 
 async fn cmd_list(node: String) -> Result<()> {
     let client = NodeClient::new(&node, None);
-    let resp: Value = client
-        .get("/api/v1/peers")
-        .await?
-        .json()
-        .await
-        .context("failed to list peers")?;
+    let resp = crate::http::read_json(client.get("/api/v1/peers").await?, "peers").await?;
 
     let peers = resp["peers"].as_array().cloned().unwrap_or_default();
     let count = resp["count"].as_u64().unwrap_or(peers.len() as u64);
@@ -169,18 +164,20 @@ async fn cmd_add(peer_url: String, node: String, dir: Option<PathBuf>) -> Result
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let my_did = keypair.did().to_string();
 
-    // Fetch our node's public URL so we can announce it to the peer
+    // Fetch our node's public URL so we can announce it to the peer. This lookup
+    // is a deliberate fail-soft diagnostic: it only improves the URL we advertise.
+    // A response-level failure (denial, error, garbage body) falls back to the
+    // --node value with a visible note rather than aborting; only a transport
+    // failure on the GET itself is fatal. The announce below keeps the
+    // fail-closed read_json check.
     let local_client = NodeClient::new(&node, None);
-    let node_info: Value = local_client
-        .get("/")
-        .await?
-        .json()
-        .await
-        .context("failed to fetch local node info")?;
-    let my_url = node_info["public_url"]
-        .as_str()
-        .unwrap_or(&node)
-        .to_string();
+    let my_url = match crate::http::read_json(local_client.get("/").await?, "node info").await {
+        Ok(info) => info["public_url"].as_str().unwrap_or(&node).to_string(),
+        Err(e) => {
+            eprintln!("note: local node info unavailable ({e}); announcing {node}");
+            node.clone()
+        }
+    };
 
     // Announce our local node to the remote peer
     let body = serde_json::to_vec(&serde_json::json!({
@@ -256,12 +253,7 @@ async fn cmd_add(peer_url: String, node: String, dir: Option<PathBuf>) -> Result
 async fn cmd_ping(did: String, node: String) -> Result<()> {
     let client = NodeClient::new(&node, None);
     let path = format!("/api/v1/peers/{did}/ping");
-    let resp: Value = client
-        .get(&path)
-        .await?
-        .json()
-        .await
-        .context("failed to ping peer")?;
+    let resp = crate::http::read_json(client.get(&path).await?, "ping peer").await?;
 
     let url = resp["http_url"].as_str().unwrap_or("?");
     let reachable = resp["reachable"].as_bool().unwrap_or(false);
@@ -281,12 +273,7 @@ async fn cmd_resolve(did: String, node: String) -> Result<()> {
     let client = NodeClient::new(&node, None);
     let encoded = urlencoding::encode(&did);
     let path = format!("/api/v1/resolve/{encoded}");
-    let resp: Value = client
-        .get(&path)
-        .await?
-        .json()
-        .await
-        .context("failed to resolve DID")?;
+    let resp = crate::http::read_json(client.get(&path).await?, "resolve DID").await?;
 
     let source = resp["source"].as_str().unwrap_or("not found");
     let http_url = resp["http_url"].as_str().unwrap_or("(none)");

@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
-use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::http::NodeClient;
@@ -233,13 +232,7 @@ async fn cmd_create(
         .post(&format!("/api/v1/repos/{owner}/{repo}/pulls"), &payload)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let pr: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = pr["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("create PR failed ({status}): {msg}");
-    }
+    let pr = crate::http::read_json(resp, "create PR").await?;
 
     let number = pr["number"].as_i64().unwrap_or(0);
     println!("✓ Opened PR #{number}: {title}");
@@ -254,12 +247,13 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
     let owner = resolve_owner(&keypair);
     let client = NodeClient::new(&node, None);
 
-    let resp: Value = client
-        .get(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
-        .await?
-        .json()
-        .await
-        .context("invalid JSON")?;
+    let resp = crate::http::read_json(
+        client
+            .get(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
+            .await?,
+        "pull requests",
+    )
+    .await?;
 
     let prs = resp["pulls"].as_array().cloned().unwrap_or_default();
     if prs.is_empty() {
@@ -298,12 +292,13 @@ async fn cmd_view(repo: String, number: u64, node: String, dir: Option<PathBuf>)
     let owner = resolve_owner(&keypair);
     let client = NodeClient::new(&node, None);
 
-    let pr: Value = client
-        .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
-        .await?
-        .json()
-        .await
-        .context("invalid JSON")?;
+    let pr = crate::http::read_json(
+        client
+            .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
+            .await?,
+        "pull request",
+    )
+    .await?;
 
     let title = pr["title"].as_str().unwrap_or("?");
     let status = pr["status"].as_str().unwrap_or("?");
@@ -321,14 +316,15 @@ async fn cmd_view(repo: String, number: u64, node: String, dir: Option<PathBuf>)
     }
 
     // Show reviews
-    let reviews: Value = client
-        .get(&format!(
-            "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"
-        ))
-        .await?
-        .json()
-        .await
-        .context("invalid JSON")?;
+    let reviews = crate::http::read_json(
+        client
+            .get(&format!(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"
+            ))
+            .await?,
+        "reviews",
+    )
+    .await?;
     let reviews = reviews["reviews"].as_array().cloned().unwrap_or_default();
     if !reviews.is_empty() {
         println!("\nReviews ({}):", reviews.len());
@@ -354,14 +350,15 @@ async fn cmd_view(repo: String, number: u64, node: String, dir: Option<PathBuf>)
     }
 
     // Show comments
-    let comments: Value = client
-        .get(&format!(
-            "/api/v1/repos/{owner}/{repo}/pulls/{number}/comments"
-        ))
-        .await?
-        .json()
-        .await
-        .context("invalid JSON")?;
+    let comments = crate::http::read_json(
+        client
+            .get(&format!(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/comments"
+            ))
+            .await?,
+        "comments",
+    )
+    .await?;
     let comments = comments["comments"].as_array().cloned().unwrap_or_default();
     if !comments.is_empty() {
         println!("\nComments ({}):", comments.len());
@@ -386,12 +383,13 @@ async fn cmd_diff(repo: String, number: u64, node: String, dir: Option<PathBuf>)
     let owner = resolve_owner(&keypair);
     let client = NodeClient::new(&node, None);
 
-    let resp: Value = client
-        .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
-        .await?
-        .json()
-        .await
-        .context("invalid JSON")?;
+    let resp = crate::http::read_json(
+        client
+            .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
+            .await?,
+        "diff",
+    )
+    .await?;
 
     let diff = resp["diff"].as_str().unwrap_or("");
     if diff.is_empty() {
@@ -415,13 +413,7 @@ async fn cmd_merge(repo: String, number: u64, node: String, dir: Option<PathBuf>
         )
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("merge failed ({status}): {msg}");
-    }
+    let result = crate::http::read_json(resp, "merge").await?;
 
     let sha = result["merge_sha"].as_str().unwrap_or("?");
     println!("✓ Merged PR #{number}");
@@ -453,13 +445,7 @@ async fn cmd_review(
         )
         .await
         .context("failed to connect to node")?;
-    let code = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !code.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("review failed ({code}): {msg}");
-    }
+    let _ = crate::http::read_json(resp, "review").await?;
 
     let icon = match status.as_str() {
         "approved" => "✓",
@@ -489,13 +475,7 @@ async fn cmd_comment(
         )
         .await
         .context("failed to connect to node")?;
-    let code = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !code.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("comment failed ({code}): {msg}");
-    }
+    let _ = crate::http::read_json(resp, "comment").await?;
 
     println!("· Comment posted on PR #{number}");
     Ok(())
@@ -506,14 +486,15 @@ async fn cmd_comments(repo: String, number: u64, node: String, dir: Option<PathB
     let owner = resolve_owner(&keypair);
     let client = NodeClient::new(&node, None);
 
-    let resp: Value = client
-        .get(&format!(
-            "/api/v1/repos/{owner}/{repo}/pulls/{number}/comments"
-        ))
-        .await?
-        .json()
-        .await
-        .context("invalid JSON")?;
+    let resp = crate::http::read_json(
+        client
+            .get(&format!(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/comments"
+            ))
+            .await?,
+        "comments",
+    )
+    .await?;
 
     let comments = resp["comments"].as_array().cloned().unwrap_or_default();
     if comments.is_empty() {
@@ -654,6 +635,7 @@ mod tests {
             .with_status(422)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"branch not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -671,6 +653,8 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("branch not found"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -768,6 +752,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"PR not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -781,6 +766,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("PR not found"), "got: {err}");
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -864,5 +851,122 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    // ── Gated PR reads surface node denials, not empty/stub renders (#123 / INV-8) ──
+
+    #[tokio::test]
+    async fn cmd_list_surfaces_denial_not_empty() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Regex(r"/pulls$".to_string()))
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = cmd_list(
+            "myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "cmd_list must Err on 404, not print 'No pull requests'"
+        );
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_view_surfaces_denial_not_stub() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+        let mut server = mockito::Server::new_async().await;
+        // The PR fetch is first; a 404 there errors before the reviews/comments reads.
+        let _m = server
+            .mock("GET", mockito::Matcher::Regex(r"/pulls/1$".to_string()))
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = cmd_view(
+            "myrepo".to_string(),
+            1,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "cmd_view must Err on 404, not print a stub PR"
+        );
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_diff_surfaces_denial_not_empty() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/pulls/1/diff$".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = cmd_diff(
+            "myrepo".to_string(),
+            1,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "cmd_diff must Err on 404, not print 'No diff'"
+        );
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_comments_surfaces_denial_not_empty() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/pulls/1/comments$".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = cmd_comments(
+            "myrepo".to_string(),
+            1,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await;
+        assert!(result.is_err(), "cmd_comments must Err on a gated 404");
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 }
