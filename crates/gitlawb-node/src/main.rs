@@ -421,9 +421,13 @@ async fn main() -> Result<()> {
         create_ip_rate_limiter,
         push_rate_limiter,
         ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
-        // The legacy-probe budget is operator-tunable via GITLAWB_IPFS_MAX_REPOS_WALKED
-        // (R5); the history-walk ceiling above stays constant (a smaller value false-503s
-        // a provenanced request). Default 256 preserves the shipped behaviour.
+        // The legacy-probe budget is operator-tunable via GITLAWB_IPFS_MAX_LEGACY_PROBES
+        // (R5), which is what `ipfs_legacy_probe_budget` reads. NOT
+        // GITLAWB_IPFS_MAX_REPOS_WALKED, which this comment used to name: that is the
+        // separate cap on expensive visibility walks, so an operator following the old
+        // text tuned the walk cap and left this fan-out unchanged. The history-walk
+        // ceiling above stays constant (a smaller value false-503s a provenanced
+        // request). Default 256 preserves the shipped behaviour.
         ipfs_max_legacy_probes: AppState::ipfs_legacy_probe_budget(&config),
         ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust,
