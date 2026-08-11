@@ -2107,10 +2107,17 @@ impl Db {
     ) -> Result<Vec<RefCertificate>> {
         let limit = limit.max(1);
 
+        // `!` is the LIKE escape character rather than the backslash default: a
+        // backslash in the SQL text would be an escape inside the string literal
+        // when the session runs with the legacy `standard_conforming_strings=off`,
+        // leaving `ESCAPE '\'` unterminated and failing every prefix lookup. The
+        // pool is opened from externally supplied connection settings, so that
+        // mode can arrive from a database- or role-level setting. `!` keeps the
+        // statement free of backslashes and parses the same either way.
         let mut escaped_prefix = String::with_capacity(prefix.len() + 4);
         for c in prefix.chars() {
-            if c == '%' || c == '_' || c == '\\' {
-                escaped_prefix.push('\\');
+            if c == '%' || c == '_' || c == '!' {
+                escaped_prefix.push('!');
             }
             escaped_prefix.push(c);
         }
@@ -2118,7 +2125,7 @@ impl Db {
 
         let rows = sqlx::query(
             "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
-             FROM ref_certificates WHERE repo_id = $1 AND id LIKE $2 ESCAPE '\\' ORDER BY issued_at DESC LIMIT $3",
+             FROM ref_certificates WHERE repo_id = $1 AND id LIKE $2 ESCAPE '!' ORDER BY issued_at DESC LIMIT $3",
         )
         .bind(repo_id)
         .bind(&pattern)
@@ -5602,6 +5609,7 @@ mod ref_update_keyset_same_timestamp_tests {
 mod ref_certificate_tests {
     use super::{Db, RefCertificate, RepoRecord};
     use chrono::Utc;
+    use sqlx::postgres::PgPoolOptions;
     use sqlx::PgPool;
 
     async fn db(pool: PgPool) -> Db {
@@ -5821,9 +5829,13 @@ mod ref_certificate_tests {
         assert!(certs.is_empty());
     }
 
-    #[sqlx::test]
-    async fn list_ref_certificates_by_prefix_treats_wildcards_literally(pool: PgPool) {
-        let db = db(pool).await;
+    /// Certificate ids covering every character the prefix search has to treat
+    /// literally: the two LIKE wildcards, the escape character itself, and a
+    /// backslash (the default escape, which must stay an ordinary character).
+    const PREFIX_CERT_IDS: [&str; 5] = ["cert-a", "cert%b", "cert_c", "cert\\d", "cert!e"];
+
+    /// Seed one repo holding `PREFIX_CERT_IDS` and return the repo id.
+    async fn seed_prefix_certs(db: &Db) -> String {
         let repo_id = uuid::Uuid::new_v4().to_string();
 
         db.create_repo(&RepoRecord {
@@ -5842,7 +5854,7 @@ mod ref_certificate_tests {
         .await
         .unwrap();
 
-        for (i, id) in ["cert-a", "cert%b", "cert_c", "cert\\d"].iter().enumerate() {
+        for (i, id) in PREFIX_CERT_IDS.iter().enumerate() {
             db.insert_ref_certificate(&make_cert(
                 id,
                 &repo_id,
@@ -5855,15 +5867,23 @@ mod ref_certificate_tests {
             .unwrap();
         }
 
+        repo_id
+    }
+
+    #[sqlx::test]
+    async fn list_ref_certificates_by_prefix_treats_wildcards_literally(pool: PgPool) {
+        let db = db(pool).await;
+        let repo_id = seed_prefix_certs(&db).await;
+
         // A plain prefix still matches every id that starts with it.
         let all = db
             .list_ref_certificates_by_prefix(&repo_id, "cert", 10)
             .await
             .unwrap();
-        assert_eq!(all.len(), 4, "plain prefix matches all four certs");
+        assert_eq!(all.len(), 5, "plain prefix matches all five certs");
 
         // `%` in the prefix must match a literal percent sign, not act as a
-        // wildcard that would also return "cert-a", "cert_c", "cert\d".
+        // wildcard that would also return every other seeded id.
         let pct = db
             .list_ref_certificates_by_prefix(&repo_id, "cert%", 10)
             .await
@@ -5879,13 +5899,86 @@ mod ref_certificate_tests {
         assert_eq!(under.len(), 1, "underscore prefix matches only literal id");
         assert_eq!(under[0].id, "cert_c");
 
-        // A backslash must match a literal backslash, not escape the next char.
+        // `!` carries the escape role, so a caller-supplied `!` must itself be
+        // escaped and match a literal exclamation mark.
+        let bang = db
+            .list_ref_certificates_by_prefix(&repo_id, "cert!", 10)
+            .await
+            .unwrap();
+        assert_eq!(bang.len(), 1, "escape-char prefix matches only literal id");
+        assert_eq!(bang[0].id, "cert!e");
+
+        // A backslash is an ordinary character once `!` is the escape, so it must
+        // match a literal backslash rather than escaping the character after it.
         let bs = db
             .list_ref_certificates_by_prefix(&repo_id, "cert\\", 10)
             .await
             .unwrap();
         assert_eq!(bs.len(), 1, "backslash prefix matches only literal id");
         assert_eq!(bs[0].id, "cert\\d");
+    }
+
+    /// The prefix query must parse under either `standard_conforming_strings`
+    /// mode. Spelling the LIKE escape as a backslash SQL literal (`ESCAPE '\'`)
+    /// leaves the statement unterminated when a session runs with the legacy
+    /// `off` value, which breaks *every* prefix lookup, not only the ones that
+    /// contain a metacharacter. Connection settings come from outside the
+    /// process, so that mode can arrive from database- or role-level config.
+    #[sqlx::test]
+    async fn list_ref_certificates_by_prefix_parses_under_legacy_string_mode(pool: PgPool) {
+        let db = db(pool.clone()).await;
+        let repo_id = seed_prefix_certs(&db).await;
+
+        // Request the legacy parser mode at connection startup, the same way
+        // `PGOPTIONS` or a `ALTER ROLE ... SET` would deliver it.
+        let legacy_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                (*pool.connect_options())
+                    .clone()
+                    .options([("standard_conforming_strings", "off")]),
+            )
+            .await
+            .unwrap();
+
+        let mode: String = sqlx::query_scalar("SHOW standard_conforming_strings")
+            .fetch_one(&legacy_pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            mode, "off",
+            "test session must be in the legacy parser mode"
+        );
+
+        let legacy_db = Db::for_testing(legacy_pool.clone());
+
+        // A prefix with no metacharacters at all: this is what a backslash
+        // literal would break first, since the parse fails before the bound
+        // parameters are ever considered.
+        let all = legacy_db
+            .list_ref_certificates_by_prefix(&repo_id, "cert", 10)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 5, "plain prefix still resolves in legacy mode");
+
+        // Escaping still holds under the legacy mode.
+        let pct = legacy_db
+            .list_ref_certificates_by_prefix(&repo_id, "cert%", 10)
+            .await
+            .unwrap();
+        assert_eq!(pct.len(), 1, "percent prefix matches only literal id");
+        assert_eq!(pct[0].id, "cert%b");
+
+        let bs = legacy_db
+            .list_ref_certificates_by_prefix(&repo_id, "cert\\", 10)
+            .await
+            .unwrap();
+        assert_eq!(bs.len(), 1, "backslash prefix matches only literal id");
+        assert_eq!(bs[0].id, "cert\\d");
+
+        // Release the extra session so it can't hold the per-test database open
+        // against the harness's cleanup.
+        legacy_pool.close().await;
     }
 
     /// NOTE: this test hand-copies the migration SQL as string literals and will
