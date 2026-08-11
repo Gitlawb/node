@@ -267,12 +267,32 @@ pub(crate) struct SweepStats {
     pub repaired: usize,
     pub passes: usize,
     /// Rows left unrepaired for a reason a LATER run could fix (the source repo is not
-    /// on this node's local disk, a DB read failed, a bounded object read failed). A
-    /// nonzero count is what makes the run rewind its cursor instead of parking it at
-    /// the end of the table forever. Rows that are unrepairable in principle (no
-    /// provenance, the repo row is gone, the bytes are gone) are NOT counted here.
+    /// on this node's local disk, a DB read failed, a bounded object read failed). Rows
+    /// that are unrepairable in principle (no provenance, the repo row is gone, the
+    /// bytes are gone) are NOT counted here.
+    ///
+    /// This drives NO control decision. It gated the cursor rewind under round 11; the
+    /// rewind now fires on reaching the end of the table, whatever happened on the way
+    /// (see [`sweep_legacy_provider_cids`]). Re-gating it on this field reopens the
+    /// below-cursor rolling-upgrade hole, because the run that parks the cursor is a
+    /// clean one by definition. The field is reporting only.
     pub retryable_skips: usize,
+    /// Object reads spent on rows that turned out to be unrepairable in principle: the
+    /// bytes are gone, so the read is pure waste and the next run will waste it again.
+    /// [`MAX_DEAD_ROW_READS_PER_RUN`] bounds this per run.
+    pub dead_row_reads: usize,
 }
+
+/// How many fruitless object reads one sweep run will spend before it stops and leaves
+/// the rest of the table for the next run (#173 round 12, second-model pass).
+///
+/// A completed run rewinds, so every later run re-attempts the read for every row whose
+/// bytes are permanently gone. Without a bound that is `O(dead rows)` `git cat-file`
+/// invocations on every single boot, and a node that accumulated a lot of them (a
+/// deleted repo, a force-pushed history, a failed migration) pays it forever. Stopping
+/// early keeps the cursor, so the next boot resumes past the rows already walked rather
+/// than repeating them, and the table still gets covered across boots.
+pub(crate) const MAX_DEAD_ROW_READS_PER_RUN: usize = 64;
 
 /// One bounded pass of the U4 sweep: read at most `batch` `pinned_cids` rows after
 /// the persisted cursor, repair the legacy ones, and persist the new cursor.
@@ -297,6 +317,7 @@ async fn sweep_pass(
     let scanned = rows.len();
     let mut repaired = 0usize;
     let mut retryable_skips = 0usize;
+    let mut dead_row_reads = 0usize;
     let mut last = cursor;
 
     for (sha, stored) in rows {
@@ -324,6 +345,9 @@ async fn sweep_pass(
         // along the way was a transient obstacle rather than a permanent one.
         let mut row_repaired = false;
         let mut row_retryable = false;
+        // Whether any source got as far as spending an object read on this row, which is
+        // what makes an unrepairable row COST something rather than just being skipped.
+        let mut row_read_attempted = false;
         for repo_id in sources {
             let repo = match db.get_repo_by_id(&repo_id).await {
                 Ok(Some(r)) => r,
@@ -366,6 +390,7 @@ async fn sweep_pass(
             }
             // The sweep holds no pin permit and has no batch to overrun, so the plain
             // `git_timeout` is the right budget here.
+            row_read_attempted = true;
             match repair_legacy_provider_cid(
                 &repo_path,
                 git_bin,
@@ -394,6 +419,11 @@ async fn sweep_pass(
         if !row_repaired && row_retryable {
             retryable_skips += 1;
         }
+        // Read, not repaired, and nothing a later run would change: pure waste, and the
+        // rewind means the next run repeats it. This is the quantity the run bounds.
+        if row_read_attempted && !row_repaired && !row_retryable {
+            dead_row_reads += 1;
+        }
     }
 
     db.set_pin_repair_cursor(&last).await?;
@@ -402,6 +432,7 @@ async fn sweep_pass(
         repaired,
         passes: 1,
         retryable_skips,
+        dead_row_reads,
     })
 }
 
@@ -448,11 +479,13 @@ pub(crate) async fn sweep_legacy_provider_cids_once(
 /// the row it strands does not exist yet. So the rewind is unconditional on completion.
 ///
 /// It is a per-RUN decision made after the walk has finished, never mid-walk, so it
-/// cannot spin. The cost is one extra ordered scan per run, plus one repair attempt per
-/// run for each row that is unrepairable in principle (bytes gone, provenance gone) —
-/// the read is attempted before the bytes are found missing. A row already carrying the
-/// canonical raw key costs a codec decode and no read at all, so a node that has
-/// finished repairing pays the scan and nothing more.
+/// cannot spin. The cost is one extra ordered scan per run, plus a repair attempt for
+/// each row that is unrepairable in principle (bytes gone, provenance gone): the read is
+/// attempted before the bytes are found missing. Those reads are the one cost that does
+/// not shrink as the migration progresses, so `MAX_DEAD_ROW_READS_PER_RUN` bounds them
+/// per run and the run stops early rather than paying `O(dead rows)` on every boot. A
+/// row already carrying the canonical raw key costs a codec decode and no read at all,
+/// so a node that has finished repairing pays the scan and nothing more.
 ///
 /// A run that stops on a pass ERROR does NOT rewind: its cursor is mid-table and
 /// discarding it would restart the walk from the beginning on a node whose DB is
@@ -478,11 +511,23 @@ pub(crate) async fn sweep_legacy_provider_cids(
         totals.scanned += pass.scanned;
         totals.repaired += pass.repaired;
         totals.retryable_skips += pass.retryable_skips;
+        totals.dead_row_reads += pass.dead_row_reads;
         totals.passes += 1;
         // A short batch means the ordered walk reached the end of the table. Stop here
         // rather than after an extra empty pass, and do NOT sleep on the way out.
         if (pass.scanned as i64) < batch {
             completed = true;
+            break;
+        }
+        // Enough fruitless reads for one run. Stop WITHOUT completing, so the cursor
+        // stays where the walk got to and the next run carries on from there instead of
+        // re-reading these rows. Checked between passes, so a run can overshoot by at
+        // most one batch.
+        if totals.dead_row_reads >= MAX_DEAD_ROW_READS_PER_RUN {
+            tracing::info!(
+                dead_row_reads = totals.dead_row_reads,
+                "legacy provider-CID sweep pausing: too many unrepairable rows this run"
+            );
             break;
         }
         tokio::time::sleep(delay).await;

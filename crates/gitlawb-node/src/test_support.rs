@@ -6769,8 +6769,9 @@ mod tests {
         oids.sort();
         let (low_oid, high_oid) = (oids[0].clone(), oids[1].clone());
 
-        // First boot: one legacy row, repaired, nothing retryable. The cursor parks at
-        // that row's oid, which is the table maximum.
+        // First boot: one legacy row, repaired, nothing retryable. Under round 11 this
+        // is exactly the run that parked the cursor at that row's oid, the table
+        // maximum, because a clean run reported no retryable skip to rewind for.
         seed_legacy_pin(&pool, &bare, &high_oid, Some(&repo.id)).await;
         let first = tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -6788,7 +6789,7 @@ mod tests {
         assert_eq!(
             (first.repaired, first.retryable_skips),
             (1, 0),
-            "the first run is a clean completion, so no rewind is triggered"
+            "the first run is a clean completion: nothing retryable to rewind for"
         );
         assert_eq!(
             state.db.pin_repair_cursor().await.unwrap(),
@@ -6797,7 +6798,7 @@ mod tests {
         );
 
         // An older node in the rolling upgrade writes a provider-CID row that sorts
-        // below the parked cursor.
+        // below where the walk finished, which is where round 11 left the cursor.
         let (low_raw, low_provider) = seed_legacy_pin(&pool, &bare, &low_oid, Some(&repo.id)).await;
 
         // Next boot.
@@ -6840,6 +6841,89 @@ mod tests {
         );
     }
 
+    /// U4 (#173, round 12, second-model pass): the fruitless reads a run spends on rows
+    /// whose bytes are permanently gone are bounded per run. The rewind means every
+    /// later run re-attempts each of them, so without a bound a node that accumulated
+    /// dead pins (a deleted repo, a force-pushed history) pays `O(dead rows)` git
+    /// invocations on every boot, forever. The run stops early instead and keeps its
+    /// cursor, so the next boot resumes past what it already walked.
+    #[sqlx::test]
+    async fn sweep_bounds_fruitless_reads_per_run(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+        let cap = crate::ipfs_pin::MAX_DEAD_ROW_READS_PER_RUN;
+        let batch: i64 = 16;
+
+        // A real repo on disk, so every row gets as far as spending an object read, and
+        // objects that were never in it, so every one of those reads is wasted.
+        let _fx = seed_cid_repos(&slug, &short, &["deadsrc"]);
+        let repo = seed_repo(&owner_did, "deadsrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let raw_cid =
+            gitlawb_core::cid::Cid::from_git_object_bytes(b"bytes that live nowhere").to_string();
+        let dead_rows = cap + 2 * batch as usize;
+        for i in 0..dead_rows {
+            let phantom_oid = format!("{:064x}", i);
+            sqlx::query(
+                "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(&phantom_oid)
+            .bind(legacy_dagpb_cid(&raw_cid))
+            .bind("2020-01-01T00:00:00Z")
+            .bind(&repo.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                batch,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the run terminates");
+
+        assert!(
+            stats.dead_row_reads >= cap,
+            "the run spends its budget before stopping (spent {})",
+            stats.dead_row_reads
+        );
+        assert!(
+            stats.dead_row_reads < cap + batch as usize,
+            "the run overshoots its budget by at most one batch (spent {}, cap {cap})",
+            stats.dead_row_reads
+        );
+        assert!(
+            stats.scanned < dead_rows,
+            "the run stops short of the table (scanned {} of {dead_rows})",
+            stats.scanned
+        );
+
+        // Not a completed walk, so the cursor is kept and the next run carries on from
+        // it rather than re-reading the rows this one already paid for.
+        let cursor = state.db.pin_repair_cursor().await.unwrap();
+        assert_ne!(cursor, "", "a run that stops on its budget keeps its place");
+        let resumed = state.db.pinned_cids_after(&cursor, batch).await.unwrap();
+        assert_eq!(
+            resumed.first().map(|(sha, _)| sha.as_str()),
+            Some(format!("{:064x}", stats.scanned).as_str()),
+            "the next run starts at the row after the last one walked"
+        );
+    }
+
     /// U4 (#173, round 12, the other side of the unconditional rewind): a run that stops
     /// on a pass ERROR keeps its mid-table cursor. The rewind is what a COMPLETED walk
     /// does; applying it to a failed one would restart from the beginning of the table
@@ -6871,10 +6955,22 @@ mod tests {
 
         // A batch of one means the first pass is full, so the run sleeps and comes back
         // for a second pass. The table is gone by then.
+        //
+        // The killer WAITS for the first pass to finish rather than racing a fixed sleep
+        // against it: the pass writes its cursor as its last act, so a non-empty cursor
+        // is the signal that the run is now in its inter-batch sleep. A fixed delay here
+        // fails on a runner slow enough that the rename lands during the first pass's
+        // own query, which reports `scanned = 0` and asserts something else entirely.
         let killer = {
             let pool = pool.clone();
+            let db = state.db.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                loop {
+                    if !db.pin_repair_cursor().await.unwrap().is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
                 sqlx::query("ALTER TABLE pinned_cids RENAME TO pinned_cids_gone")
                     .execute(&pool)
                     .await
