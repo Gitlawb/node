@@ -6968,6 +6968,1220 @@ mod tests {
         );
     }
 
+    // ---- F1: bounded additive discovery for source-less legacy rows ----
+
+    /// An empty bare repo at `path`, used as a warm discovery candidate that does not
+    /// hold the object. sha256 so a 64-hex oid probe is a clean "absent" rather than a
+    /// format error.
+    fn init_empty_bare(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).expect("create the owner dir");
+        let out = std::process::Command::new("git")
+            .args([
+                "init",
+                "-q",
+                "--bare",
+                "--object-format=sha256",
+                path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git init --bare: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    async fn set_quarantined(pool: &PgPool, repo_id: &str) {
+        sqlx::query("UPDATE repos SET quarantined = TRUE WHERE id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn pinned_repo_id(pool: &PgPool, oid: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT repo_id FROM pinned_cids WHERE sha256_hex = $1")
+            .bind(oid)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// F1 scenario 1 (#173): a pre-provenance row (`repo_id` NULL, no `pin_repo_sources`
+    /// entry) is repaired by probing warm local repos for the object, and the discovered
+    /// repo is recorded ADDITIVELY. The must-not half is the last assertion: reading
+    /// identical bytes proves the repo HOLDS the object, never that it is the FIRST
+    /// pinner (forks, a shared LICENSE blob and the empty tree all collide), and
+    /// `backfill_pin_provenance`'s `AND repo_id IS NULL` guard would make a guessed
+    /// exclusive claim permanent, so `pinned_cids.repo_id` must stay NULL. RED before
+    /// discovery exists: the source set is empty, the row is skipped, and the cursor
+    /// advances past it for good.
+    #[sqlx::test]
+    async fn sweep_discovery_repairs_sourceless_legacy_row(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["discsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("discsrc.git");
+        let repo = seed_repo(&owner_did, "discsrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        // The pre-provenance shape: NULL repo_id and no pin_repo_sources row.
+        let (raw_cid, provider_cid) = seed_legacy_pin(&pool, &bare, &fx.public_oid, None).await;
+        assert!(
+            state
+                .db
+                .pin_sources_for_oid(&fx.public_oid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the seeded row really has no recorded source"
+        );
+
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the sweep terminates");
+        assert_eq!(stats.repaired, 1, "discovery repairs the source-less row");
+
+        let (stored, stashed) = stored_pin(&pool, &fx.public_oid).await;
+        assert_eq!(
+            stored, raw_cid,
+            "the key is rewritten to the raw-content CID from locally verified bytes"
+        );
+        assert_eq!(
+            stashed.as_deref(),
+            Some(provider_cid.as_str()),
+            "the old provider CID is stashed"
+        );
+        assert_eq!(
+            state.db.pin_sources_for_oid(&fx.public_oid).await.unwrap(),
+            vec![repo.id.clone()],
+            "the discovered repo is recorded as an additive source"
+        );
+        assert!(
+            state
+                .db
+                .pin_sources_incomplete(&fx.public_oid)
+                .await
+                .unwrap(),
+            "one discovered holder never proves the set complete, so the marker is set \
+             and the resolver's fallback scan stays available"
+        );
+        assert_eq!(
+            pinned_repo_id(&pool, &fx.public_oid).await,
+            None,
+            "discovery makes no exclusive first-pinner claim: repo_id stays NULL"
+        );
+    }
+
+    /// F1 scenario 2 (#173): once discovery has repaired the row it is raw-CIDv1, so a
+    /// later pass takes the cost gate's cheap path and reads no bytes at all. The cursor
+    /// is rewound by hand so the second pass really re-walks the row rather than reading
+    /// nothing because it is behind the cursor.
+    #[sqlx::test]
+    async fn sweep_discovery_repaired_row_is_cheap_on_later_passes(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+
+        let fx = seed_cid_repos(&slug, &short, &["cheapsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("cheapsrc.git");
+        let repo = seed_repo(&owner_did, "cheapsrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let (raw_cid, _provider) = seed_legacy_pin(&pool, &bare, &fx.public_oid, None).await;
+
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the first run terminates");
+        assert_eq!(first.repaired, 1, "the first run repairs by discovery");
+
+        // Re-walk the same row: the cost gate must spare it every byte read.
+        state.db.set_pin_repair_cursor("").await.unwrap();
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the second run terminates");
+        assert_eq!(second.scanned, 1, "the second run really re-walks the row");
+        assert_eq!(second.repaired, 0, "there is nothing left to repair");
+        assert_eq!(
+            crate::ipfs_pin::legacy_repair_reads(),
+            0,
+            "a repaired row is raw-CIDv1, so no later pass reads bytes for it"
+        );
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            raw_cid,
+            "the repaired key survives the second pass"
+        );
+    }
+
+    /// F1 scenario 3 (#173, MUST-NOT): a quarantined repo is hidden from every reader,
+    /// so it must not become a discovery source either. The only holder here is warm and
+    /// quarantined, and the filter drops it at candidate-load time, before any probe: the
+    /// row is left exactly as it is and no bytes are read.
+    #[sqlx::test]
+    async fn sweep_discovery_skips_quarantined_holder(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["quarsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("quarsrc.git");
+        let repo = seed_repo(&owner_did, "quarsrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        set_quarantined(&pool, &repo.id).await;
+        let (_raw_cid, provider_cid) = seed_legacy_pin(&pool, &bare, &fx.public_oid, None).await;
+
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the sweep terminates");
+
+        assert_eq!(
+            stats.repaired, 0,
+            "a quarantined repo never serves as a discovery source"
+        );
+        assert_eq!(
+            crate::ipfs_pin::legacy_repair_reads(),
+            0,
+            "the quarantine filter drops the candidate before any probe reads bytes"
+        );
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            provider_cid,
+            "the row keeps its provider key"
+        );
+        assert_eq!(
+            state
+                .db
+                .pin_sources_for_oid(&fx.public_oid)
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "no source is recorded from a quarantined repo"
+        );
+    }
+
+    /// F1 scenario 4 (#173, MUST-NOT): a candidate that is not on local disk is COLD.
+    /// Discovery must not pull it back from remote storage (the sweep is opportunistic
+    /// background maintenance, not a bulk restore), and it must not mark the row
+    /// retryable either. The candidate list is every repo on the node rather than the
+    /// row's holders, so on a Tigris-backed node where most repos are cold a
+    /// cold-candidate retryable would rewind the cursor
+    /// (`sweep_legacy_provider_cids` rewinds whenever `retryable_skips > 0`) on every
+    /// run: the sweep would never drain while paying full discovery cost each pass. The
+    /// second run's `scanned` is what proves the cursor was not rewound.
+    ///
+    /// The no-fetch half is asserted here on the EFFECT rather than on the call: the
+    /// cold candidate's disk path must still not exist after two full runs, which is
+    /// what any restore (through the repo store, through Tigris, through anything else)
+    /// would have changed. The control that keeps that assertion from being vacuous is
+    /// the read from `stashed_away`: the bytes really are still on this node and really
+    /// would have repaired the row, so declining them is a choice and not an absence.
+    /// The call-shape half is `sweep_module_never_calls_a_remote_fetch`.
+    #[sqlx::test]
+    async fn sweep_discovery_cold_candidates_do_not_rewind(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+
+        let fx = seed_cid_repos(&slug, &short, &["coldcand"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("coldcand.git");
+        let repo = seed_repo(&owner_did, "coldcand");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let (raw_cid, provider_cid) = seed_legacy_pin(&pool, &bare, &fx.public_oid, None).await;
+
+        // The only holder goes cold: its row stays in the DB, its bytes leave the disk.
+        let stashed_away = bare.with_extension("git.away");
+        let _ = std::fs::remove_dir_all(&stashed_away);
+        std::fs::rename(&bare, &stashed_away).expect("take the repo off local disk");
+
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the first run terminates");
+        assert_eq!(
+            (first.scanned, first.repaired),
+            (1, 0),
+            "the row is walked and no cold candidate can repair it"
+        );
+        // The effect a restore would have left behind. Nothing put the repo back.
+        assert!(
+            !bare.exists(),
+            "the sweep must never materialize a cold candidate on local disk: a repair \
+             pass over every pinned row on the node would become a bulk restore"
+        );
+        // Anti-vacuity for the assertion above: the bytes are still reachable on this
+        // node and still recompute to the raw key, so a fetch would have succeeded and
+        // repaired the row. The sweep declined an available copy rather than finding
+        // nothing to take.
+        let (_ty, stashed_bytes) = crate::git::store::read_object(&stashed_away, &fx.public_oid)
+            .expect("the stashed copy is readable")
+            .expect("the stashed copy still holds the object");
+        assert_eq!(
+            gitlawb_core::cid::Cid::from_git_object_bytes(&stashed_bytes).to_string(),
+            raw_cid,
+            "the withheld copy is exactly the one that would have repaired the row"
+        );
+        assert_eq!(
+            first.retryable_skips, 0,
+            "a cold candidate is not evidence about the row, so it never marks the row \
+             retryable and never drives a cursor rewind"
+        );
+        assert_eq!(
+            crate::ipfs_pin::legacy_repair_reads(),
+            0,
+            "a cold candidate is filtered at load, so nothing is read and nothing is pulled"
+        );
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the second run terminates");
+        assert_eq!(
+            (second.scanned, second.retryable_skips),
+            (0, 0),
+            "the cursor was not rewound: the second run re-reads nothing"
+        );
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            provider_cid,
+            "the row keeps its provider key"
+        );
+        assert!(
+            !bare.exists(),
+            "no later pass materialized the cold candidate either"
+        );
+    }
+
+    /// F1 scenario 5 (#173, BOUND plus anti-burial): the probe cap counts the expensive
+    /// unit, a bounded object read from a warm repo, so a row costs at most
+    /// `MAX_LEGACY_DISCOVERY_PROBES` reads however many candidates the node holds. With
+    /// candidates left over the row is classified RETRYABLE, not terminal: `repo_id`
+    /// derives from the owner DID, which anyone can grind, so a first-N-wins cap over a
+    /// sorted set would otherwise let an attacker bury the true holder permanently.
+    #[sqlx::test]
+    async fn sweep_discovery_read_probes_are_capped(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        // The bytes live in a bare repo with NO repos row, so it is never a candidate.
+        let fx = seed_cid_repos(&slug, &short, &["capsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("capsrc.git");
+        let (_raw_cid, provider_cid) = seed_legacy_pin(&pool, &bare, &fx.public_oid, None).await;
+
+        // More warm candidates than the cap, none of them holding the object.
+        let candidates = crate::ipfs_pin::MAX_LEGACY_DISCOVERY_PROBES + 4;
+        for i in 0..candidates {
+            let name = format!("capcand{i}");
+            init_empty_bare(
+                &std::path::PathBuf::from("/tmp")
+                    .join(&slug)
+                    .join(format!("{name}.git")),
+            );
+            let repo = seed_repo(&owner_did, &name);
+            state.db.create_repo(&repo).await.expect("seed candidate");
+        }
+
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the sweep terminates");
+
+        assert_eq!(
+            crate::ipfs_pin::legacy_repair_reads(),
+            crate::ipfs_pin::MAX_LEGACY_DISCOVERY_PROBES,
+            "one row costs at most the probe cap in object reads, whatever the candidate count"
+        );
+        assert_eq!(stats.repaired, 0, "no candidate holds the object");
+        assert_eq!(
+            stats.retryable_skips, 1,
+            "cap exhaustion with candidates remaining is RETRYABLE, so a buried holder \
+             is re-walked by a later run instead of written off"
+        );
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            provider_cid,
+            "the row is untouched"
+        );
+    }
+
+    /// F1 scenario 6 (#173, the collision case): two warm repos hold identical bytes,
+    /// which is the shape (forks, a shared LICENSE blob, the empty tree) that makes an
+    /// exclusive first-pinner claim wrong. Discovery records ONE additive source and
+    /// sets the incomplete marker, and the marker is what keeps `needs_scan` true so a
+    /// caller who can only read the OTHER holder is still served. Under an exclusive
+    /// claim `needs_scan` would be false and that caller would get a 404 for a public
+    /// object.
+    #[sqlx::test]
+    async fn sweep_discovery_multi_holder_serves_both_readers(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["holda", "holdb"]);
+        let bare_a = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("holda.git");
+
+        // A is older, so the oldest-first probe order selects it; it is PRIVATE, so it
+        // denies the anonymous caller. B is public and holds the same bytes.
+        let mut repo_a = seed_repo(&owner_did, "holda");
+        repo_a.is_public = false;
+        repo_a.created_at = Utc::now() - chrono::Duration::days(2);
+        let repo_b = seed_repo(&owner_did, "holdb");
+        state.db.create_repo(&repo_a).await.expect("seed repo a");
+        state.db.create_repo(&repo_b).await.expect("seed repo b");
+
+        let (raw_cid, _provider) = seed_legacy_pin(&pool, &bare_a, &fx.public_oid, None).await;
+
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the sweep terminates");
+        assert_eq!(
+            stats.repaired, 1,
+            "the row is repaired from the first holder"
+        );
+        assert_eq!(
+            state.db.pin_sources_for_oid(&fx.public_oid).await.unwrap(),
+            vec![repo_a.id.clone()],
+            "exactly one additive source is recorded, the oldest-first selection"
+        );
+        assert!(
+            state
+                .db
+                .pin_sources_incomplete(&fx.public_oid)
+                .await
+                .unwrap(),
+            "the marker records that discovery does not know the full source set"
+        );
+        assert_eq!(
+            pinned_repo_id(&pool, &fx.public_oid).await,
+            None,
+            "no exclusive claim is written for either holder"
+        );
+
+        let (st, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&raw_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "a caller who can read only the NON-selected holder is still served"
+        );
+        assert!(body.contains("public bytes"), "the object's bytes serve");
+    }
+
+    /// F1 scenario 7 (#173, degenerate state): the cost gate at the top of the row loop
+    /// fires before the sources query, so a source-less row that is ALREADY raw-CIDv1
+    /// never enters discovery and reads nothing.
+    #[sqlx::test]
+    async fn sweep_discovery_never_runs_for_a_raw_cidv1_sourceless_row(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["rawnosrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("rawnosrc.git");
+        let repo = seed_repo(&owner_did, "rawnosrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        // No provenance recorded: `pin_cid_for` stores the raw key with a NULL repo_id.
+        let raw_cid = pin_cid_for(&bare, &fx.public_oid, &state.db).await;
+
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the sweep terminates");
+
+        assert_eq!(stats.scanned, 1, "the row is walked");
+        assert_eq!(stats.repaired, 0, "a raw-CIDv1 row needs no repair");
+        assert_eq!(
+            crate::ipfs_pin::legacy_repair_reads(),
+            0,
+            "the cost gate spares a raw row every byte read, discovery included"
+        );
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            raw_cid,
+            "the raw row is left as-is"
+        );
+    }
+
+    /// F1 scenario 8 (#173, the negative direction of the new branch): a row WITH a
+    /// recorded source resolves through the existing source loop only. An older warm
+    /// decoy repo holds identical bytes, so if discovery ran it would record the decoy
+    /// and set the incomplete marker; neither happens.
+    #[sqlx::test]
+    async fn sweep_discovery_is_not_used_for_a_provenanced_row(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["provsrc", "decoysrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("provsrc.git");
+
+        let mut decoy = seed_repo(&owner_did, "decoysrc");
+        decoy.created_at = Utc::now() - chrono::Duration::days(2);
+        let repo = seed_repo(&owner_did, "provsrc");
+        state.db.create_repo(&decoy).await.expect("seed decoy");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let (raw_cid, _provider) =
+            seed_legacy_pin(&pool, &bare, &fx.public_oid, Some(&repo.id)).await;
+
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the sweep terminates");
+
+        assert_eq!(stats.repaired, 1, "the provenanced row repairs as before");
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            raw_cid,
+            "the key is rewritten from the recorded source"
+        );
+        assert_eq!(
+            crate::ipfs_pin::legacy_repair_reads(),
+            1,
+            "exactly one read, from the recorded source: discovery never probes"
+        );
+        assert_eq!(
+            state.db.pin_sources_for_oid(&fx.public_oid).await.unwrap(),
+            vec![repo.id.clone()],
+            "the decoy is never recorded as a source"
+        );
+        assert!(
+            !state
+                .db
+                .pin_sources_incomplete(&fx.public_oid)
+                .await
+                .unwrap(),
+            "a provenanced row's source set is not marked incomplete"
+        );
+    }
+
+    /// F1 scenario 9 (#173, the degradation posture, by execution): if the additive
+    /// `record_pin_source` fails after the key rewrite lands, the row is raw-CIDv1 with
+    /// an empty source set. Nothing in the sweep revisits it (the cost gate skips a raw
+    /// row free on every later pass), so the source record is best-effort and the
+    /// resolver's own fallback is the healing path, not a retry. This is that state,
+    /// driven end to end: an empty source set makes `needs_scan` true and the bounded
+    /// legacy scan still serves the object.
+    #[sqlx::test]
+    async fn sweep_repaired_row_without_source_record_still_served(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["nosrcrec"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("nosrcrec.git");
+        let repo = seed_repo(&owner_did, "nosrcrec");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        // The post-repair state a failed source record leaves behind: raw key, no
+        // provenance row, no pin_repo_sources row.
+        let raw_cid = pin_cid_for(&bare, &fx.public_oid, &state.db).await;
+        assert!(
+            state
+                .db
+                .pin_sources_for_oid(&fx.public_oid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the row really has no recorded source"
+        );
+
+        let (st, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&raw_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "an empty source set routes the resolver to its bounded legacy scan, so a \
+             repaired row whose source record failed still serves"
+        );
+        assert!(body.contains("public bytes"), "the object's bytes serve");
+    }
+
+    /// F1 scenario 10 (#173, the unsafe-path arm of the candidate load): a `repos` row
+    /// whose name cannot be turned into a validated disk path is dropped when the
+    /// candidate list is built, and the drop is both TERMINAL and NON-FATAL.
+    ///
+    /// Terminal: nothing a later pass does makes an unsafe name safe, so the rejection
+    /// must not mark the row retryable and must not consume a probe against
+    /// `MAX_LEGACY_DISCOVERY_PROBES`.
+    ///
+    /// Non-fatal is the half that matters most. `load_discovery_ctx` builds ONE list for
+    /// the whole pass, so a rejection that propagated instead of warning would fail the
+    /// load, `discover_legacy_row` would return Retryable for every source-less row in
+    /// the pass, and a single unsafe `repos` row anywhere on the node would strand every
+    /// legacy row behind it on every future run. Here the unsafe row sorts first (the
+    /// candidate order is oldest-first by `(created_at, id)`), so the pass has to survive
+    /// it before it can reach the warm holder that actually repairs the row.
+    #[sqlx::test]
+    async fn sweep_discovery_drops_unsafe_candidate_and_keeps_going(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["safesrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("safesrc.git");
+
+        // `validate_repo_name` bails on a '..' sequence, so this name can never resolve
+        // to a disk path. Asserted against the validator itself rather than assumed, so
+        // the fixture cannot quietly become a safe name and turn the test vacuous.
+        let bad_name = "../escape";
+        assert!(
+            crate::git::repo_store::validated_repo_disk_path(
+                std::path::Path::new("/tmp"),
+                &owner_did,
+                bad_name,
+            )
+            .is_err(),
+            "the fixture name is genuinely refused by the validated resolver"
+        );
+
+        let mut unsafe_repo = seed_repo(&owner_did, bad_name);
+        unsafe_repo.created_at = Utc::now() - chrono::Duration::days(2);
+        let holder = seed_repo(&owner_did, "safesrc");
+        state
+            .db
+            .create_repo(&unsafe_repo)
+            .await
+            .expect("seed the unsafe repos row");
+        state
+            .db
+            .create_repo(&holder)
+            .await
+            .expect("seed the warm holder");
+
+        // The pre-provenance shape: NULL repo_id and no pin_repo_sources row.
+        let (raw_cid, _provider) = seed_legacy_pin(&pool, &bare, &fx.public_oid, None).await;
+
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("an unsafe candidate never wedges the pass");
+
+        assert_eq!(
+            stats.repaired, 1,
+            "the rejection is non-fatal: a later safe candidate in the same list still \
+             repairs the row"
+        );
+        assert_eq!(
+            crate::ipfs_pin::legacy_repair_reads(),
+            1,
+            "the unsafe candidate is dropped before any probe, so the only object read \
+             is the warm holder's"
+        );
+        assert_eq!(
+            stats.retryable_skips, 0,
+            "an unsafe name is not a condition a later pass clears, so the drop is \
+             terminal and drives no cursor rewind"
+        );
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            raw_cid,
+            "the key is rewritten from the safe candidate's verified bytes"
+        );
+        assert_eq!(
+            state.db.pin_sources_for_oid(&fx.public_oid).await.unwrap(),
+            vec![holder.id.clone()],
+            "only the safe candidate is recorded as a source"
+        );
+    }
+
+    /// Strip Rust line comments, block comments and double-quoted string literals,
+    /// leaving code. Used by the source scan below, which must not fire on the prose
+    /// that DESCRIBES the forbidden call (`ipfs_pin.rs` names `repo_store.acquire` in
+    /// two comments) and must still fire on the call itself.
+    fn code_only(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let b: Vec<char> = src.chars().collect();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == '/' && i + 1 < b.len() && b[i + 1] == '/' {
+                while i < b.len() && b[i] != '\n' {
+                    i += 1;
+                }
+            } else if b[i] == '/' && i + 1 < b.len() && b[i + 1] == '*' {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == '*' && b[i + 1] == '/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            } else if b[i] == '"' {
+                i += 1;
+                while i < b.len() && b[i] != '"' {
+                    if b[i] == '\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            } else {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// The call-shape half of the sweep's no-remote-fetch guarantee, and a STRUCTURAL
+    /// guard, not a behavioral one. Say what that means before trusting it.
+    ///
+    /// The sweep must never pull a cold repo back from remote storage: it is
+    /// opportunistic background maintenance over every pinned row on the node, so a
+    /// fetch would turn a repair pass into a bulk restore. A behavioral test that made
+    /// the candidate cold, made it fetchable from a live remote, and counted zero fetch
+    /// attempts cannot be built here, and the reason is worth stating rather than
+    /// working around: `sweep_pass` takes a `repos_dir`, a `git_bin` and a `&Db`, and
+    /// holds no `RepoStore` and no `TigrisClient`. A download counter armed on a store
+    /// the TEST builds could never move no matter what the sweep did, so a zero from it
+    /// would be vacuous by construction rather than evidence.
+    ///
+    /// So the guarantee is asserted from two sides instead. The effect side lives in
+    /// `sweep_discovery_cold_candidates_do_not_rewind`, which proves the bytes were
+    /// still available and the cold candidate's path was still absent after two full
+    /// runs. This is the call side: the module's production code contains none of the
+    /// fetch-capable call shapes.
+    ///
+    /// What it does NOT cover: a fetch reached indirectly through a helper this module
+    /// calls (`git::store`, `db`) whose own source is not scanned, and git's own lazy
+    /// fetch if a bare repo on disk were ever configured as a partial clone with a
+    /// promisor remote. Neither shape exists today; neither is detected here.
+    #[test]
+    fn sweep_module_never_calls_a_remote_fetch() {
+        const SRC: &str = include_str!("ipfs_pin.rs");
+        // Scan the PRODUCTION half only. The module's own test module legitimately
+        // calls `pool.acquire()`, which shares a needle with the store's fetch entry
+        // points and would otherwise force the needle set to be weakened.
+        let marker = "\n#[cfg(test)]\nmod tests {";
+        let cut = SRC
+            .find(marker)
+            .expect("ipfs_pin.rs still opens its test module the usual way");
+        let production = &SRC[..cut];
+        let code = code_only(production);
+
+        // Anti-vacuity, three ways: a scan that read nothing, a stripper that ate the
+        // code, or a stripper that left the comments in would each let this pass while
+        // proving nothing.
+        assert!(
+            code.len() > 10_000,
+            "the scan kept only {} chars of production code, so a clean result proves \
+             nothing",
+            code.len()
+        );
+        assert!(
+            code.contains("validated_repo_disk_path"),
+            "the stripper removed real code: the sweep's own path resolver is gone from \
+             what was scanned"
+        );
+        assert!(
+            production.contains("repo_store.acquire"),
+            "the module no longer names the forbidden call in prose, so this scan is no \
+             longer exercising the comment-vs-code distinction it exists to make"
+        );
+        assert!(
+            !code.contains("bulk restore"),
+            "the stripper left comments in, so every needle below would fire on the \
+             prose that describes it rather than on a call"
+        );
+
+        // Every way this crate reaches remote storage. `repo_store::` alone is not a
+        // needle: the sweep legitimately calls `repo_store::validated_repo_disk_path`,
+        // the non-fetching path resolver.
+        for shape in [
+            ".acquire(",
+            "acquire_fresh",
+            "acquire_write",
+            "RepoStore",
+            "TigrisClient",
+            ".download(",
+            "tigris",
+        ] {
+            assert!(
+                !code.contains(shape),
+                "the sweep's production code reaches remote storage through `{shape}`. \
+                 A repair pass over every pinned row on the node must never pull a cold \
+                 repo back: that is a bulk restore, not maintenance"
+            );
+        }
+    }
+
+    /// Poll until some backend in THIS test's database is blocked on a lock, so a test
+    /// that means to drive an interleaving cannot silently degrade into two calls that
+    /// simply ran one after the other. Returns false if nothing ever blocked.
+    async fn wait_for_lock_wait(pool: &PgPool) -> bool {
+        for _ in 0..600 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                  WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+            if waiting > 0 {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    /// GAP 2: discovery's `record_pin_source` then `mark_pin_sources_incomplete` pair
+    /// under a REAL concurrent writer on the same row, not a reasoned ordering.
+    ///
+    /// The order is load-bearing because a `record_pin_source` that actually inserts
+    /// CLEARS the marker in its own transaction (`rows_affected > 0`), so marking first
+    /// would have discovery wipe its own marker. The resolver's `needs_scan` is
+    /// `sources.is_empty() || at_cap || incomplete`, so a non-empty, below-cap, unmarked
+    /// set is what tells it to stop scanning. Discovery's knowledge is never complete
+    /// (it stops at the first hit, and its candidate list is capped), so that
+    /// combination is exactly the state the row must not end in.
+    ///
+    /// The interleaving driven here is the one that threatens the pair: a second writer
+    /// recording a DIFFERENT source for the same oid lands while discovery is mid-row.
+    /// A row lock parks the sweep inside `repair_legacy_provider_cid`, which is after
+    /// the source set was read as empty and before either of discovery's own writes, and
+    /// `wait_for_lock_wait` proves the sweep really is parked rather than already done.
+    /// The end state must still be a marked row.
+    #[sqlx::test]
+    async fn sweep_discovery_marker_survives_a_concurrent_source_record(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+
+        let fx = seed_cid_repos(&slug, &short, &["concwarm"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("concwarm.git");
+        let holder = seed_repo(&owner_did, "concwarm");
+        state.db.create_repo(&holder).await.expect("seed holder");
+        // The concurrent writer's repo has no directory on disk, so it is filtered out
+        // of the candidate list and the only thing it contributes to the row is its own
+        // `record_pin_source`.
+        let other = seed_repo(&owner_did, "conccold");
+        state.db.create_repo(&other).await.expect("seed other");
+
+        let (raw_cid, _provider) = seed_legacy_pin(&pool, &bare, &fx.public_oid, None).await;
+
+        let mut blocker = pool.begin().await.expect("open the blocking transaction");
+        sqlx::query("SELECT sha256_hex FROM pinned_cids WHERE sha256_hex = $1 FOR UPDATE")
+            .bind(&fx.public_oid)
+            .execute(&mut *blocker)
+            .await
+            .expect("hold the row lock");
+
+        let driver = async {
+            let parked = wait_for_lock_wait(&pool).await;
+            state
+                .db
+                .record_pin_source(&fx.public_oid, &other.id)
+                .await
+                .expect("the concurrent record lands");
+            blocker.commit().await.expect("release the row lock");
+            parked
+        };
+        let (stats, parked) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            tokio::join!(
+                crate::ipfs_pin::sweep_legacy_provider_cids(
+                    std::path::Path::new("/tmp"),
+                    &state.git_bin,
+                    git_timeout,
+                    16,
+                    std::time::Duration::ZERO,
+                    &state.db,
+                ),
+                driver
+            )
+        })
+        .await
+        .expect("the interleaved run terminates");
+
+        assert!(
+            parked,
+            "nothing ever blocked, so the two writers did not actually interleave and \
+             this test proved nothing about ordering"
+        );
+        assert_eq!(stats.repaired, 1, "discovery still repairs the row");
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            raw_cid,
+            "the key is rewritten to the raw-content CID"
+        );
+        let mut sources = state.db.pin_sources_for_oid(&fx.public_oid).await.unwrap();
+        sources.sort();
+        let mut expected = vec![holder.id.clone(), other.id.clone()];
+        expected.sort();
+        assert_eq!(
+            sources, expected,
+            "both writers' sources are present: the record is additive, so neither \
+             writer erases the other"
+        );
+        assert!(
+            state
+                .db
+                .pin_sources_incomplete(&fx.public_oid)
+                .await
+                .unwrap(),
+            "the marker survives a concurrent record landing inside discovery's window: \
+             a non-empty, below-cap, unmarked set would tell the resolver to stop \
+             scanning while discovery's knowledge of the set is still incomplete"
+        );
+        assert_eq!(
+            pinned_repo_id(&pool, &fx.public_oid).await,
+            None,
+            "no exclusive first-pinner claim is made under concurrency either"
+        );
+    }
+
+    /// GAP 2, the other interleaving: two sweep passes over the same source-less row at
+    /// the same time. Whichever order the two passes' `repair_legacy_provider_cid`,
+    /// `record_pin_source` and `mark_pin_sources_incomplete` calls land in, the end
+    /// state the resolver reads must be the same one a single pass leaves: the raw key,
+    /// exactly one recorded source, no exclusive claim, and a marked row.
+    ///
+    /// The second pass cannot double-record: `record_pin_source` is
+    /// `ON CONFLICT DO NOTHING` on `(oid, repo)`, so its insert affects no rows, its
+    /// marker clear is gated on `rows_affected > 0` and does not run, and its own
+    /// `mark_pin_sources_incomplete` is idempotent.
+    #[sqlx::test]
+    async fn sweep_discovery_two_concurrent_passes_leave_one_marked_source(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+
+        let fx = seed_cid_repos(&slug, &short, &["twopass"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("twopass.git");
+        let holder = seed_repo(&owner_did, "twopass");
+        state.db.create_repo(&holder).await.expect("seed holder");
+        let (raw_cid, _provider) = seed_legacy_pin(&pool, &bare, &fx.public_oid, None).await;
+
+        let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            tokio::join!(
+                crate::ipfs_pin::sweep_legacy_provider_cids_once(
+                    std::path::Path::new("/tmp"),
+                    &state.git_bin,
+                    git_timeout,
+                    16,
+                    &state.db,
+                ),
+                crate::ipfs_pin::sweep_legacy_provider_cids_once(
+                    std::path::Path::new("/tmp"),
+                    &state.git_bin,
+                    git_timeout,
+                    16,
+                    &state.db,
+                )
+            )
+        })
+        .await
+        .expect("both passes terminate");
+        let a = a.expect("the first pass succeeds");
+        let b = b.expect("the second pass succeeds");
+        assert!(
+            a.repaired + b.repaired >= 1,
+            "at least one of the two concurrent passes repairs the row"
+        );
+
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            raw_cid,
+            "the key is the raw-content CID whichever pass got there first"
+        );
+        assert_eq!(
+            state.db.pin_sources_for_oid(&fx.public_oid).await.unwrap(),
+            vec![holder.id.clone()],
+            "the holder is recorded exactly once: the second pass's insert conflicts and \
+             affects no rows"
+        );
+        assert!(
+            state
+                .db
+                .pin_sources_incomplete(&fx.public_oid)
+                .await
+                .unwrap(),
+            "two concurrent passes still leave the row marked, so the resolver keeps its \
+             fallback scan"
+        );
+        assert_eq!(
+            pinned_repo_id(&pool, &fx.public_oid).await,
+            None,
+            "neither pass makes an exclusive first-pinner claim"
+        );
+    }
+
+    /// GAP 2, the residual this pair does NOT close, pinned here so it is a known
+    /// property rather than an assumption.
+    ///
+    /// `pin_sources_incomplete` is one boolean per OBJECT, not per `(object, repo)`, so
+    /// any later `record_pin_source` that actually inserts clears it, including one from
+    /// a repo that has nothing to do with discovery. A concurrent writer whose record
+    /// commits strictly AFTER discovery's mark therefore leaves the row with a non-empty
+    /// source set and no marker, which is the combination that stops the resolver's
+    /// fallback scan. Discovery's ordering cannot prevent that: the clear happens inside
+    /// the other writer's transaction, after discovery has already finished the row.
+    ///
+    /// It is bounded, and the bound is why this is documented rather than fixed here.
+    /// The clearing writer is a real pusher of the same object, so every source in the
+    /// set genuinely holds the bytes and the row stays servable through them. And for
+    /// these rows specifically the state cannot be a regression: before discovery ran,
+    /// the row was keyed on a provider CID, so the resolver withheld it and
+    /// `list_pinned_cids` did not advertise it. Closing the residual properly needs a
+    /// per-`(oid, repo)` marker, which is a change to the marker's shape and not to this
+    /// sweep. See `Db::record_pin_source`, which states the same residual for the four
+    /// pre-existing call sites.
+    #[sqlx::test]
+    async fn sweep_discovery_marker_is_cleared_by_a_later_record_from_another_repo(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["latewarm"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("latewarm.git");
+        let holder = seed_repo(&owner_did, "latewarm");
+        state.db.create_repo(&holder).await.expect("seed holder");
+        let other = seed_repo(&owner_did, "latecold");
+        state.db.create_repo(&other).await.expect("seed other");
+        seed_legacy_pin(&pool, &bare, &fx.public_oid, None).await;
+
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the sweep terminates");
+        assert_eq!(stats.repaired, 1, "discovery repairs the row");
+        assert!(
+            state
+                .db
+                .pin_sources_incomplete(&fx.public_oid)
+                .await
+                .unwrap(),
+            "discovery leaves the row marked"
+        );
+
+        // A genuine later pusher of the same object from a different repo.
+        state
+            .db
+            .record_pin_source(&fx.public_oid, &other.id)
+            .await
+            .expect("the later record lands");
+
+        assert!(
+            !state
+                .db
+                .pin_sources_incomplete(&fx.public_oid)
+                .await
+                .unwrap(),
+            "the residual: a per-object marker is cleared by any later inserting record, \
+             so discovery's marker does not survive one"
+        );
+        let mut sources = state.db.pin_sources_for_oid(&fx.public_oid).await.unwrap();
+        sources.sort();
+        let mut expected = vec![holder.id.clone(), other.id.clone()];
+        expected.sort();
+        assert_eq!(
+            sources, expected,
+            "the bound on that residual: every source left in the set is a repo that \
+             really holds the object, so the row stays servable through them"
+        );
+    }
+
     /// U4 scenario 6 (#173): `list_pinned_cids` never advertises a key the `/ipfs`
     /// resolver would withhold. The resolver recomputes the raw CIDv1 from the object
     /// bytes and 404s any row keyed on a legacy PROVIDER CID, so advertising that key
