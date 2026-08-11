@@ -120,6 +120,10 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_P2P_PORT", default_value_t = 7546)]
     pub p2p_port: u16,
 
+    /// Path to the persistent libp2p identity key
+    #[arg(long, env = "GITLAWB_P2P_KEY", default_value = "~/.gitlawb/p2p.key")]
+    pub p2p_key_path: String,
+
     /// libp2p bootstrap multiaddrs (comma-separated)
     /// Example: /ip4/1.2.3.4/udp/7546/quic-v1/p2p/12D3KooW...
     #[arg(long, env = "GITLAWB_P2P_BOOTSTRAP", value_delimiter = ',')]
@@ -717,6 +721,16 @@ impl Config {
             }
         }
         PathBuf::from(&self.key_path)
+    }
+
+    /// Resolve ~ in p2p_key_path
+    pub fn resolved_p2p_key_path(&self) -> PathBuf {
+        if self.p2p_key_path.starts_with("~/") {
+            if let Some(home) = dirs_next::home_dir() {
+                return home.join(&self.p2p_key_path[2..]);
+            }
+        }
+        PathBuf::from(&self.p2p_key_path)
     }
 
     /// DB connections reserved for everything other than held write-locks: auth

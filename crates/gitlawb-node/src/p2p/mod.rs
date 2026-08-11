@@ -9,10 +9,11 @@
 
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use futures::StreamExt;
 use libp2p_core::{muxing::StreamMuxerBox, Multiaddr, PeerId, Transport};
@@ -162,6 +163,44 @@ struct GitlawbBehaviour {
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     gossipsub: gossipsub::Behaviour,
     identify: identify::Behaviour,
+}
+
+/// Load the node's persistent libp2p identity from `key_path`, generating and
+/// storing a fresh Ed25519 keypair the first time.
+pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
+    if key_path.exists() {
+        let bytes = std::fs::read(key_path)
+            .with_context(|| format!("failed to read p2p key from {}", key_path.display()))?;
+        let kp = identity::Keypair::from_protobuf_encoding(&bytes)
+            .with_context(|| format!("invalid p2p key in {}", key_path.display()))?;
+        info!(path = %key_path.display(), "loaded existing p2p identity");
+        Ok(kp)
+    } else {
+        let kp = identity::Keypair::generate_ed25519();
+        let bytes = kp
+            .to_protobuf_encoding()
+            .map_err(|e| anyhow::anyhow!("failed to serialize p2p key: {e}"))?;
+
+        if let Some(parent) = key_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(key_path, &bytes)?;
+            std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        #[cfg(not(unix))]
+        std::fs::write(key_path, &bytes)?;
+
+        info!(
+            path = %key_path.display(),
+            peer_id = %PeerId::from(kp.public()),
+            "generated new p2p identity"
+        );
+        Ok(kp)
+    }
 }
 
 /// Start the libp2p swarm. Returns a handle for sending commands and the
@@ -442,6 +481,69 @@ pub async fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p2p_identity_not_derivable_from_did_alone() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+
+        let kp_a = load_or_create_p2p_keypair(&dir_a.path().join("p2p.key")).unwrap();
+        let kp_b = load_or_create_p2p_keypair(&dir_b.path().join("p2p.key")).unwrap();
+
+        assert_ne!(
+            PeerId::from(kp_a.public()),
+            PeerId::from(kp_b.public()),
+            "two independent key files must yield different PeerIds"
+        );
+    }
+
+    #[test]
+    fn p2p_identity_stable_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p2p.key");
+
+        let first = load_or_create_p2p_keypair(&path).unwrap();
+        let second = load_or_create_p2p_keypair(&path).unwrap();
+
+        assert_eq!(
+            PeerId::from(first.public()),
+            PeerId::from(second.public()),
+            "the same key file must yield the same PeerId"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p2p_key_file_is_0600_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys").join("p2p.key");
+
+        load_or_create_p2p_keypair(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "key file must be owner-read/write only"
+        );
+    }
+
+    #[test]
+    fn p2p_corrupt_key_file_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p2p.key");
+        std::fs::write(&path, [0xFFu8; 7]).unwrap();
+
+        let err =
+            load_or_create_p2p_keypair(&path).expect_err("a corrupt key file must be an error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "error must name the key path, got: {msg}"
+        );
+    }
 
     #[test]
     fn ref_update_event_round_trip_with_owner_did() {
