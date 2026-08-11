@@ -707,10 +707,6 @@ enum ServedRead {
     Mismatch(String),
     /// The object exceeds the served-object size cap; withhold rather than buffer it.
     TooLarge(u64),
-    /// The object is genuinely absent (git reported it does not exist); try the next
-    /// candidate. Distinct from `ReadErr` so an infra failure is never silently rendered
-    /// as a clean not-found.
-    Gone,
     /// A git subprocess failed to run (spawn/IO error, not a "no such object"). Logged at
     /// the handler layer and skipped — an infra failure must surface as an error, not a
     /// silent 404 for an authorized caller (INV-25 spirit, #173).
@@ -1220,13 +1216,11 @@ async fn gate_and_serve(
         // returns, even if the handler future was dropped or this closure panics.
         let _admission = read_admission;
         match store::object_size_bounded(&git_bin, &read_repo, &read_sha, read_deadline) {
-            Ok(Some(size)) if size > max_bytes => return ServedRead::TooLarge(size),
-            Ok(Some(_)) => {}
-            // git ran and reported no such object (or an unparseable size): genuine
-            // not-found for this candidate.
-            Ok(None) => return ServedRead::Gone,
-            // git failed to run OR the bounded read timed out (GitServiceTimeout): an
-            // infra/timeout failure, not a not-found.
+            Ok(size) if size > max_bytes => return ServedRead::TooLarge(size),
+            Ok(_) => {}
+            // Every failure of this stage is a fault, never a not-found: the type probe
+            // above already returned Present, and the probe no longer has an absence
+            // value to collapse a corrupt object or a failed spawn into (#173 round 12).
             Err(e) => return ServedRead::ReadErr(e.to_string()),
         }
         let content = match store::read_object_content_bounded(
@@ -1272,7 +1266,6 @@ async fn gate_and_serve(
             );
             return GateOutcome::Skip;
         }
-        ServedRead::Gone => return GateOutcome::Skip,
         ServedRead::ReadErr(e) => {
             // Infra failure (git spawn/IO), NOT a not-found: mark the search truncated so
             // a wholly-unserved request tails to a retryable 503, never a definitive 404

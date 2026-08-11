@@ -606,8 +606,20 @@ pub(crate) fn object_store_readable_store_wide(repo_path: &Path) -> bool {
 /// is rejected before it is buffered, #173 F6), under
 /// [`run_bounded_git`](crate::git::visibility_pack::run_bounded_git) so a wedged size
 /// read is reaped at `deadline` instead of pinning the held /ipfs walk admission.
-/// `Ok(Some(n))` on success, `Ok(None)` when the object is absent (a non-timeout
-/// non-zero exit), `Err(GitServiceTimeout)` on the deadline.
+/// `Ok(n)` on success, and otherwise a [`ProbeError`] in the same vocabulary the type and
+/// content stages use: a reaped child is `Transient` (retryable), and every other failure
+/// goes through [`classify_store_fault`], so it is `Transient` when the object store is
+/// not readable and `Deterministic` when it is.
+///
+/// There is deliberately NO absence value (#173 round 12). This returned
+/// `Ok(None)` for every non-timeout failure, which `gate_and_serve` reads as a verified
+/// absence and does not taint the search for, so a corrupt object, an unreadable pack, or
+/// a failed spawn handed an authorized caller a definitive 404 instead of the retryable
+/// 503 tail. Absence is also not this stage's question: the caller has already had a
+/// `Present` verdict from [`object_type_bounded`], so an object that cannot be sized here
+/// is a fault, not a not-found, and the one honest exception (a concurrent gc between the
+/// two stages) is classified by store readability like any other. Making the absence
+/// unrepresentable is what keeps the next caller from reintroducing the swallow.
 ///
 /// Takes the shared `deadline` rather than its own timeout so a caller that pairs this
 /// size check with a later read spends ONE budget across the pair, not one per stage.
@@ -616,7 +628,7 @@ pub fn object_size_bounded(
     repo_path: &Path,
     sha256_hex: &str,
     deadline: std::time::Instant,
-) -> Result<Option<u64>> {
+) -> std::result::Result<u64, ProbeError> {
     match crate::git::visibility_pack::run_bounded_git(
         git_bin,
         &["cat-file", "-s", sha256_hex],
@@ -624,9 +636,25 @@ pub fn object_size_bounded(
         b"",
         deadline,
     ) {
-        Ok(out) => Ok(String::from_utf8_lossy(&out).trim().parse::<u64>().ok()),
-        Err(e) if e.is::<crate::git::smart_http::GitServiceTimeout>() => Err(e),
-        Err(_) => Ok(None),
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out);
+            text.trim().parse::<u64>().map_err(|e| {
+                // git exited 0 but did not print a size: the store answered something
+                // this code cannot read, which is a fault and never an absence.
+                classify_store_fault(
+                    repo_path,
+                    sha256_hex,
+                    anyhow::anyhow!("unparseable `cat-file -s` output {:?}: {e}", text.trim()),
+                )
+            })
+        }
+        // The watchdog reaped the child at `deadline`; retryable whatever the store looks
+        // like, so it is routed before readability gets a say (same rule as the content
+        // stage in `read_object_bounded`).
+        Err(e) if e.is::<crate::git::smart_http::GitServiceTimeout>() => {
+            Err(ProbeError::Transient(e))
+        }
+        Err(e) => Err(classify_store_fault(repo_path, sha256_hex, e)),
     }
 }
 
@@ -1485,6 +1513,134 @@ mod tests {
             matches!(res_absent, Err(super::ProbeError::Deterministic(_))),
             "even a would-be-absent oid must not read as Ok(None) once the config is \
              corrupt; got {res_absent:?}"
+        );
+    }
+
+    /// #173 round 12 (jatmn): the SIZE probe must use the same absence-versus-fault
+    /// vocabulary the type probe does. It mapped every non-timeout failure to `Ok(None)`,
+    /// which `gate_and_serve` reads as a verified absence and does not taint, so a
+    /// corrupt object, an unreadable pack, or a failed spawn ended the search cleanly and
+    /// handed an authorized caller a definitive 404 instead of the retryable 503 tail.
+    ///
+    /// A corrupt loose object is the same fixture the type stage uses for this, and it is
+    /// the honest case: the object EXISTS, the type probe says so, and only the size read
+    /// fails. RED before the change (`Ok(None)`).
+    #[cfg(unix)]
+    #[test]
+    fn object_size_bounded_corrupt_loose_object_is_fault_not_absence() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().join("sizecorrupt");
+        std::fs::create_dir_all(&work).unwrap();
+        let g = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&work)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        g(&["init", "-q", "--object-format=sha256", "."]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(work.join("f.txt"), b"loose object content\n").unwrap();
+        g(&["add", "f.txt"]);
+        g(&["commit", "-qm", "c1"]);
+        let blob = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD:f.txt"])
+                .current_dir(&work)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Healthy first: the probe reads the real size, so the fault case below is not
+        // passing for the trivial reason that this fixture never worked.
+        let healthy = super::object_size_bounded("git", &work, &blob, deadline);
+        assert!(
+            matches!(healthy, Ok(n) if n > 0),
+            "a readable object reports its size; got {healthy:?}"
+        );
+
+        let obj = work.join(".git/objects").join(&blob[0..2]).join(&blob[2..]);
+        let mut perms = std::fs::metadata(&obj).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&obj, perms).unwrap();
+        std::fs::write(&obj, b"garbage not a zlib stream").unwrap();
+
+        let res = super::object_size_bounded("git", &work, &blob, deadline);
+        assert!(
+            res.is_err(),
+            "a corrupt object must surface as a probe fault, never as an absence the \
+             resolver renders as a clean 404; got {res:?}"
+        );
+    }
+
+    /// #173 round 12 (jatmn), the transient arm: a store this process cannot read is the
+    /// retryable case, so the size probe classifies it `Transient` exactly as the type
+    /// probe does. Distinguishing the two arms is the whole point of routing through
+    /// `classify_store_fault` rather than returning one undifferentiated error.
+    #[cfg(unix)]
+    #[test]
+    fn object_size_bounded_unreadable_store_is_transient() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().join("sizeunreadable");
+        std::fs::create_dir_all(&work).unwrap();
+        let g = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&work)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        g(&["init", "-q", "--object-format=sha256", "."]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(work.join("f.txt"), b"loose object content\n").unwrap();
+        g(&["add", "f.txt"]);
+        g(&["commit", "-qm", "c1"]);
+        let blob = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD:f.txt"])
+                .current_dir(&work)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        // Make this oid's loose fan-out unreadable: git fails, and the store cannot
+        // certify absence, so the fault is retryable rather than terminal.
+        let fanout = work.join(".git/objects").join(&blob[0..2]);
+        let mut perms = std::fs::metadata(&fanout).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&fanout, perms).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let res = super::object_size_bounded("git", &work, &blob, deadline);
+
+        let mut restore = std::fs::metadata(&fanout).unwrap().permissions();
+        restore.set_mode(0o755);
+        std::fs::set_permissions(&fanout, restore).unwrap();
+
+        assert!(
+            matches!(res, Err(super::ProbeError::Transient(_))),
+            "an unreadable object store is the retryable arm; got {res:?}"
         );
     }
 
