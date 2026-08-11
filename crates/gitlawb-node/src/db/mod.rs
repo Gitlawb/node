@@ -2106,10 +2106,19 @@ impl Db {
         limit: i64,
     ) -> Result<Vec<RefCertificate>> {
         let limit = limit.max(1);
-        let pattern = format!("{}%", prefix);
+
+        let mut escaped_prefix = String::with_capacity(prefix.len() + 4);
+        for c in prefix.chars() {
+            if c == '%' || c == '_' || c == '\\' {
+                escaped_prefix.push('\\');
+            }
+            escaped_prefix.push(c);
+        }
+        let pattern = format!("{}%", escaped_prefix);
+
         let rows = sqlx::query(
             "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
-             FROM ref_certificates WHERE repo_id = $1 AND id LIKE $2 ORDER BY issued_at DESC LIMIT $3",
+             FROM ref_certificates WHERE repo_id = $1 AND id LIKE $2 ESCAPE '\\' ORDER BY issued_at DESC LIMIT $3",
         )
         .bind(repo_id)
         .bind(&pattern)
@@ -5810,6 +5819,73 @@ mod ref_certificate_tests {
             .await
             .unwrap();
         assert!(certs.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn list_ref_certificates_by_prefix_treats_wildcards_literally(pool: PgPool) {
+        let db = db(pool).await;
+        let repo_id = uuid::Uuid::new_v4().to_string();
+
+        db.create_repo(&RepoRecord {
+            id: repo_id.clone(),
+            name: "prefix-test".into(),
+            owner_did: "did:key:zOWNER".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: "/tmp/prefix-test".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+
+        for (i, id) in ["cert-a", "cert%b", "cert_c", "cert\\d"].iter().enumerate() {
+            db.insert_ref_certificate(&make_cert(
+                id,
+                &repo_id,
+                &format!("refs/heads/branch-{i}"),
+                "0000",
+                "1111",
+                &format!("2026-07-03T20:0{i}:00Z"),
+            ))
+            .await
+            .unwrap();
+        }
+
+        // A plain prefix still matches every id that starts with it.
+        let all = db
+            .list_ref_certificates_by_prefix(&repo_id, "cert", 10)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 4, "plain prefix matches all four certs");
+
+        // `%` in the prefix must match a literal percent sign, not act as a
+        // wildcard that would also return "cert-a", "cert_c", "cert\d".
+        let pct = db
+            .list_ref_certificates_by_prefix(&repo_id, "cert%", 10)
+            .await
+            .unwrap();
+        assert_eq!(pct.len(), 1, "percent prefix matches only literal id");
+        assert_eq!(pct[0].id, "cert%b");
+
+        // `_` must match a literal underscore, not any single character.
+        let under = db
+            .list_ref_certificates_by_prefix(&repo_id, "cert_", 10)
+            .await
+            .unwrap();
+        assert_eq!(under.len(), 1, "underscore prefix matches only literal id");
+        assert_eq!(under[0].id, "cert_c");
+
+        // A backslash must match a literal backslash, not escape the next char.
+        let bs = db
+            .list_ref_certificates_by_prefix(&repo_id, "cert\\", 10)
+            .await
+            .unwrap();
+        assert_eq!(bs.len(), 1, "backslash prefix matches only literal id");
+        assert_eq!(bs[0].id, "cert\\d");
     }
 
     /// NOTE: this test hand-copies the migration SQL as string literals and will
