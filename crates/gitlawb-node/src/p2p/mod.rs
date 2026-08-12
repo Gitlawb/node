@@ -32,23 +32,77 @@ use crate::db::{Db, PeerWriteDenied, ReceivedRefUpdate};
 /// Topic for ref-update notifications published after every push.
 pub const REF_UPDATES_TOPIC: &str = "gitlawb/ref-updates/v1";
 
-/// Per-source gossip ingest budget: 60 events per 60 seconds. A legitimate peer
-/// emits one event per pushed ref, so this leaves generous headroom while
-/// bounding what one mesh source can cost us.
-const GOSSIP_INGEST_MAX_EVENTS: usize = 60;
+/// Pre-parse budget, keyed on the mesh peer that HANDED us the message: 2000
+/// events per 60 seconds.
+///
+/// This one is not an authorization control and must not be sized like one.
+/// `propagation_source` is free to mint and identifies a forwarder, not an
+/// author, so it is weak in both directions: an attacker rotates it, and a
+/// flood relayed through an honest neighbour debits that neighbour. All it buys
+/// is a bound on raw CPU before anything is parsed or verified, so it is sized
+/// to be well clear of any legitimate burst. Gossipsub re-shares mesh-wide, so
+/// one edge carries the traffic of every author routed through it; 2000 per
+/// minute is roughly 33 parse-plus-Ed25519-verify per second, a fraction of a
+/// core, while still bounding what a single edge can cost.
+const GOSSIP_SOURCE_MAX_EVENTS: usize = 2000;
+/// Post-auth budget, keyed on the authenticated `node_did`: 500 events per 60
+/// seconds.
+///
+/// This is the tight bound, and it is where the tightness belongs, because by
+/// the time it runs the signature and the known-peer check have established
+/// WHO is asking. It bounds the two durable writes per event, charged to the
+/// principal that authored them rather than to a mesh edge. `api::repos`
+/// publishes one event per updated ref, so the number has to admit a whole
+/// large push: 500 covers a tag-heavy push, an initial import, or a mirror
+/// backfill of a few hundred refs arriving in one window.
+const GOSSIP_AUTHOR_MAX_EVENTS: usize = 500;
+/// The pre-parse brake keys on a forwarder that aggregates many authors, so
+/// sizing it at or below the per-author budget puts the tight bound back on the
+/// mesh edge, which is the shape being fixed here. Enforced at compile time
+/// rather than in a test, because it is a relation between two constants and a
+/// test can only catch it after someone runs it.
+const _: () = assert!(
+    GOSSIP_SOURCE_MAX_EVENTS > GOSSIP_AUTHOR_MAX_EVENTS,
+    "the forwarder bound must stay looser than the per-author bound"
+);
 const GOSSIP_INGEST_WINDOW: Duration = Duration::from_secs(60);
 /// Ceiling on tracked source peers, matching the bound the HTTP brakes use in
 /// `main.rs`. Keeps a source-rotation flood from growing the limiter's own map.
 const GOSSIP_INGEST_MAX_SOURCES: usize = 200_000;
+/// Ceiling on tracked author DIDs. Reaching this map costs an attacker a
+/// registered peer row per key, but registration is open through the announce
+/// path, so the bound is not left to that.
+const GOSSIP_INGEST_MAX_AUTHORS: usize = 200_000;
 
-/// The gossip ingest limiter, built the same way for the swarm loop and for the
-/// tests so a test can never assert against a budget production does not run.
-pub(crate) fn new_ingest_rate_limiter() -> crate::rate_limit::RateLimiter {
-    crate::rate_limit::RateLimiter::new_bounded(
-        GOSSIP_INGEST_MAX_EVENTS,
-        GOSSIP_INGEST_WINDOW,
-        GOSSIP_INGEST_MAX_SOURCES,
-    )
+/// The two gossip ingest budgets, built the same way for the swarm loop and for
+/// the tests so a test can never assert against a budget production does not
+/// run.
+///
+/// They are deliberately separate limiters rather than one: they key on
+/// different identities (a forwarder before parsing, an author after
+/// authentication) and sit at different points in the path.
+pub(crate) struct IngestLimiters {
+    /// Keyed on `propagation_source`, checked before the parse.
+    source: crate::rate_limit::RateLimiter,
+    /// Keyed on the authenticated `node_did`, checked before the writes.
+    author: crate::rate_limit::RateLimiter,
+}
+
+impl IngestLimiters {
+    pub(crate) fn new() -> Self {
+        Self {
+            source: crate::rate_limit::RateLimiter::new_bounded(
+                GOSSIP_SOURCE_MAX_EVENTS,
+                GOSSIP_INGEST_WINDOW,
+                GOSSIP_INGEST_MAX_SOURCES,
+            ),
+            author: crate::rate_limit::RateLimiter::new_bounded(
+                GOSSIP_AUTHOR_MAX_EVENTS,
+                GOSSIP_INGEST_WINDOW,
+                GOSSIP_INGEST_MAX_AUTHORS,
+            ),
+        }
+    }
 }
 
 /// A ref-update event published to Gossipsub when a push lands.
@@ -195,9 +249,12 @@ pub(crate) enum IngestOutcome {
     /// The event was dropped. Nothing is stored, so the reason exists only to
     /// be logged and counted.
     Rejected(String),
-    /// The source peer is over its ingest budget. Dropped without being parsed
-    /// or verified, which is the whole point of the brake.
-    RateLimited,
+    /// The forwarding peer is over the pre-parse ingest budget. Dropped without
+    /// being parsed or verified, which is the whole point of that brake.
+    SourceRateLimited,
+    /// The authenticated author is over its own write budget. Carries the DID
+    /// so the drop names a principal and not just a mesh edge.
+    AuthorRateLimited(String),
 }
 
 /// Handle one inbound gossip ref-update: authenticate it, then write it.
@@ -211,7 +268,7 @@ pub(crate) enum IngestOutcome {
 /// sender cannot grow a table.
 pub(crate) async fn ingest_ref_update(
     db: &Db,
-    limiter: &crate::rate_limit::RateLimiter,
+    limiters: &IngestLimiters,
     require_signed: bool,
     auto_sync: bool,
     data: &[u8],
@@ -222,8 +279,12 @@ pub(crate) async fn ingest_ref_update(
     // would let an unauthenticated flood buy exactly the CPU the brake exists to
     // protect. Same ordering rationale as the HTTP sync-trigger brake in
     // server.rs, which is layered outermost so it runs before auth.
-    if !limiter.check(&propagation_source.to_string()).await {
-        return IngestOutcome::RateLimited;
+    //
+    // It is kept generous on purpose. The key is a forwarder, so a tight bound
+    // here denies an honest neighbour on someone else's flood; the tight bound
+    // lives below, on the authenticated author.
+    if !limiters.source.check(&propagation_source.to_string()).await {
+        return IngestOutcome::SourceRateLimited;
     }
 
     let event = match serde_json::from_slice::<RefUpdateEvent>(data) {
@@ -270,13 +331,27 @@ pub(crate) async fn ingest_ref_update(
     // at all, and that combined with the signature check above, an existing
     // peer cannot be impersonated: claiming a registered DID now requires the
     // key behind it.
-    match db.list_peers().await {
-        Ok(peers) => {
-            if !peers.iter().any(|p| p.did == event.node_did) {
-                return IngestOutcome::Rejected(format!("unknown peer DID: {}", event.node_did));
-            }
+    //
+    // Keyed lookup, not `list_peers`: this runs on every event that survives
+    // the parse, and scanning the whole table per event makes ingest cost grow
+    // with the peer count.
+    match db.peer_exists(&event.node_did).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return IngestOutcome::Rejected(format!("unknown peer DID: {}", event.node_did));
         }
         Err(e) => return IngestOutcome::Rejected(format!("peer lookup failed: {e}")),
+    }
+
+    // The tight budget, and the only one keyed on an identity the sender had to
+    // prove. Everything above this line establishes WHO is asking; everything
+    // below it costs durable writes, so the write budget is charged to the
+    // author rather than to whichever neighbour happened to relay the message.
+    // In the rolling-upgrade window an unsigned event's `node_did` is asserted
+    // rather than proven, but it is still a registered peer, so the key is at
+    // worst as strong as the gate above it.
+    if !limiters.author.check(&event.node_did).await {
+        return IngestOutcome::AuthorRateLimited(event.node_did.clone());
     }
 
     // #272: the slug reaches a `PathBuf::join` in the sync worker, so it is
@@ -483,7 +558,7 @@ pub async fn start(
 
     // Per-source ingest brake, held across the whole swarm loop so budgets
     // accumulate per forwarding peer.
-    let ingest_limiter = new_ingest_rate_limiter();
+    let ingest_limiters = IngestLimiters::new();
 
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<P2pCommand>(64);
 
@@ -590,7 +665,7 @@ pub async fn start(
                         )) => {
                             match ingest_ref_update(
                                 &db,
-                                &ingest_limiter,
+                                &ingest_limiters,
                                 require_signed,
                                 auto_sync,
                                 &message.data,
@@ -607,9 +682,24 @@ pub async fn start(
                                     reason = %reason,
                                     "dropped gossip ref-update"
                                 ),
-                                IngestOutcome::RateLimited => warn!(
+                                // Both arms are warn, not debug: a dropped
+                                // ref-update is a ref this node will not
+                                // federate and the publisher gets no
+                                // back-pressure signal, so the budget and the
+                                // window are named here to make a silent
+                                // federation miss a diagnosable one.
+                                IngestOutcome::SourceRateLimited => warn!(
                                     from = %propagation_source,
-                                    "dropped gossip ref-update: source over its ingest rate budget"
+                                    limit = GOSSIP_SOURCE_MAX_EVENTS,
+                                    window_secs = GOSSIP_INGEST_WINDOW.as_secs(),
+                                    "dropped gossip ref-update: forwarding peer over the pre-parse ingest budget"
+                                ),
+                                IngestOutcome::AuthorRateLimited(did) => warn!(
+                                    from = %propagation_source,
+                                    did = %did,
+                                    limit = GOSSIP_AUTHOR_MAX_EVENTS,
+                                    window_secs = GOSSIP_INGEST_WINDOW.as_secs(),
+                                    "dropped gossip ref-update: authenticated peer over its write budget"
                                 ),
                             }
                         }
@@ -1126,7 +1216,7 @@ mod tests {
     ) -> IngestOutcome {
         ingest_ref_update(
             db,
-            &new_ingest_rate_limiter(),
+            &IngestLimiters::new(),
             require_signed,
             auto_sync,
             data,
@@ -1142,8 +1232,8 @@ mod tests {
             IngestOutcome::WriteFailed(reason) => {
                 panic!("{context}: the event must be rejected by a guard, not admitted and then failed to write: {reason}")
             }
-            IngestOutcome::RateLimited => {
-                panic!("{context}: the event must be rejected by a guard, not by the rate brake")
+            IngestOutcome::SourceRateLimited | IngestOutcome::AuthorRateLimited(_) => {
+                panic!("{context}: the event must be rejected by a guard, not by a rate brake")
             }
         }
     }
@@ -1466,57 +1556,66 @@ mod tests {
         assert_eq!(count(&pool, "received_ref_updates").await, 1);
     }
 
-    // ── Per-source rate limit ─────────────────────────────────────────────
+    // ── Ingest rate limits ────────────────────────────────────────────────
 
     #[test]
-    fn gossip_ingest_budget_is_sixty_per_minute() {
-        assert_eq!(GOSSIP_INGEST_MAX_EVENTS, 60);
+    fn the_two_ingest_budgets_are_wired_as_documented() {
+        assert_eq!(GOSSIP_SOURCE_MAX_EVENTS, 2000);
+        assert_eq!(GOSSIP_AUTHOR_MAX_EVENTS, 500);
         assert_eq!(GOSSIP_INGEST_WINDOW, Duration::from_secs(60));
         assert_eq!(GOSSIP_INGEST_MAX_SOURCES, 200_000);
+        assert_eq!(GOSSIP_INGEST_MAX_AUTHORS, 200_000);
     }
 
-    /// The source ceiling has to reach the limiter production builds, not just
-    /// exist as a constant. Asserting the constant alone leaves
-    /// `new_ingest_rate_limiter` free to call the unbounded-ish `new`, which
+    /// The key ceilings have to reach the limiters production builds, not just
+    /// exist as constants. Asserting the constants alone leaves
+    /// `IngestLimiters::new` free to call the unbounded-ish `new`, which
     /// silently swaps in `DEFAULT_MAX_KEYS` and passes every other test here.
     ///
-    /// Driving 200_000 distinct source keys to observe the cap by behavior
-    /// would cost more than it proves, so this reads the wired value through
-    /// the test-only accessor instead. What it does NOT cover is the eviction
+    /// Driving 200_000 distinct keys to observe the cap by behavior would cost
+    /// more than it proves, so this reads the wired values through the
+    /// test-only accessor instead. What it does NOT cover is the eviction
     /// behavior at the cap; that is `rate_limit`'s own test's job.
     #[test]
-    fn gossip_ingest_limiter_carries_the_source_ceiling() {
+    fn both_ingest_limiters_carry_their_key_ceiling() {
+        let limiters = IngestLimiters::new();
         assert_eq!(
-            new_ingest_rate_limiter().max_keys(),
+            limiters.source.max_keys(),
             GOSSIP_INGEST_MAX_SOURCES,
-            "the gossip limiter must be built bounded by GOSSIP_INGEST_MAX_SOURCES"
+            "the source limiter must be built bounded by GOSSIP_INGEST_MAX_SOURCES"
+        );
+        assert_eq!(
+            limiters.author.max_keys(),
+            GOSSIP_INGEST_MAX_AUTHORS,
+            "the author limiter must be built bounded by GOSSIP_INGEST_MAX_AUTHORS"
         );
     }
 
-    /// The ordering test, and the reason the brake exists at all. Signature
-    /// verification is the expensive step, so a limiter sitting after it lets an
-    /// unauthenticated flood buy exactly the CPU the brake was meant to protect.
+    /// The ordering test, and the reason the pre-parse brake exists at all.
+    /// Signature verification is the expensive step, so a limiter sitting after
+    /// it lets an unauthenticated flood buy exactly the CPU the brake was meant
+    /// to protect.
     ///
     /// This discriminates the ordering by execution rather than by inspection.
     /// The flood is garbage that neither parses nor verifies. With the check
-    /// first, those 60 messages spend the source's budget and the next event, a
-    /// perfectly valid signed known-peer one, comes back `RateLimited`. Move the
-    /// check below the parse or below verification and the garbage never reaches
-    /// the limiter, the budget is untouched, and that last event is accepted:
-    /// this assertion is what goes red.
+    /// first, those messages spend the source's budget and the next event, a
+    /// perfectly valid signed known-peer one, comes back `SourceRateLimited`.
+    /// Move the check below the parse or below verification and the garbage
+    /// never reaches the limiter, the budget is untouched, and that last event
+    /// is accepted: this assertion is what goes red.
     #[sqlx::test]
     async fn rate_limit_runs_before_parse_and_signature_verification(pool: PgPool) {
         let db = ingest_db(&pool).await;
-        let limiter = new_ingest_rate_limiter();
+        let limiters = IngestLimiters::new();
         let source = PeerId::random();
         let keypair = Keypair::generate();
         let mut event = event_for(&keypair);
         sign_ref_update(&keypair, &mut event).unwrap();
         seed_peer(&pool, &event.node_did).await;
 
-        for i in 0..GOSSIP_INGEST_MAX_EVENTS {
+        for i in 0..GOSSIP_SOURCE_MAX_EVENTS {
             let outcome =
-                ingest_ref_update(&db, &limiter, true, true, b"not json at all", &source).await;
+                ingest_ref_update(&db, &limiters, true, true, b"not json at all", &source).await;
             assert!(
                 matches!(outcome, IngestOutcome::Rejected(_)),
                 "flood message {i} is inside the budget, so it is admitted and then dropped as malformed, got {outcome:?}"
@@ -1524,22 +1623,22 @@ mod tests {
         }
 
         let outcome =
-            ingest_ref_update(&db, &limiter, true, true, &bytes_of(&event), &source).await;
+            ingest_ref_update(&db, &limiters, true, true, &bytes_of(&event), &source).await;
         assert!(
-            matches!(outcome, IngestOutcome::RateLimited),
-            "the 61st event from one source inside the window must be rate limited; \
+            matches!(outcome, IngestOutcome::SourceRateLimited),
+            "the event past the budget from one source inside the window must be rate limited; \
              an unverifiable flood has to spend the budget, which only happens if the \
              check precedes the parse and the signature work. Got {outcome:?}"
         );
         assert_nothing_written(&pool, "source over its ingest budget").await;
     }
 
-    /// The budget is per source peer, not one global bucket. Without this, one
-    /// noisy or hostile mesh source would silence the whole fleet.
+    /// The pre-parse budget is per source peer, not one global bucket. Without
+    /// this, one noisy or hostile mesh source would silence the whole fleet.
     #[sqlx::test]
     async fn rate_limit_is_per_source_not_global(pool: PgPool) {
         let db = ingest_db(&pool).await;
-        let limiter = new_ingest_rate_limiter();
+        let limiters = IngestLimiters::new();
         let throttled = PeerId::random();
         let other = PeerId::random();
         let keypair = Keypair::generate();
@@ -1547,17 +1646,18 @@ mod tests {
         sign_ref_update(&keypair, &mut event).unwrap();
         seed_peer(&pool, &event.node_did).await;
 
-        for _ in 0..GOSSIP_INGEST_MAX_EVENTS {
-            ingest_ref_update(&db, &limiter, true, true, b"not json at all", &throttled).await;
+        for _ in 0..GOSSIP_SOURCE_MAX_EVENTS {
+            ingest_ref_update(&db, &limiters, true, true, b"not json at all", &throttled).await;
         }
         let outcome =
-            ingest_ref_update(&db, &limiter, true, true, &bytes_of(&event), &throttled).await;
+            ingest_ref_update(&db, &limiters, true, true, &bytes_of(&event), &throttled).await;
         assert!(
-            matches!(outcome, IngestOutcome::RateLimited),
+            matches!(outcome, IngestOutcome::SourceRateLimited),
             "the first source must be over budget, got {outcome:?}"
         );
 
-        let outcome = ingest_ref_update(&db, &limiter, true, true, &bytes_of(&event), &other).await;
+        let outcome =
+            ingest_ref_update(&db, &limiters, true, true, &bytes_of(&event), &other).await;
         assert!(
             matches!(outcome, IngestOutcome::Accepted),
             "a second peer keeps its own budget while the first is throttled, got {outcome:?}"
@@ -1569,28 +1669,153 @@ mod tests {
         );
     }
 
-    /// The brake must not cost a legitimate peer anything under budget.
+    /// FINDING 2, the victim-denial case, and the reason the tight bound moved
+    /// off `propagation_source`. Junk relayed through an honest neighbour is
+    /// charged to that neighbour's key, because it is the only identity
+    /// available before parsing. What must NOT follow is that the neighbour
+    /// stops being a usable path for real traffic: a correctly signed event
+    /// from a known author arriving down the same edge is still accepted.
+    ///
+    /// The flood here runs to one below the source ceiling, which is far past
+    /// the old 60-per-source bound, so under that bound this event is the one
+    /// that came back rate limited.
+    ///
+    /// What this canNOT express: the junk never reaches the author limiter at
+    /// all (it does not parse), and whether the neighbour's own budget is spent
+    /// on OTHER receivers is a property of the live mesh, which needs the swarm
+    /// loop and is out of scope here.
     #[sqlx::test]
-    async fn under_budget_events_from_one_source_are_all_accepted(pool: PgPool) {
+    async fn a_junk_flood_down_one_edge_does_not_deny_a_valid_author_on_that_edge(pool: PgPool) {
         let db = ingest_db(&pool).await;
-        let limiter = new_ingest_rate_limiter();
-        let source = PeerId::random();
+        let limiters = IngestLimiters::new();
+        let neighbour = PeerId::random();
         let keypair = Keypair::generate();
         let mut event = event_for(&keypair);
         sign_ref_update(&keypair, &mut event).unwrap();
         seed_peer(&pool, &event.node_did).await;
 
-        for i in 0..GOSSIP_INGEST_MAX_EVENTS {
+        for _ in 0..GOSSIP_SOURCE_MAX_EVENTS - 1 {
+            ingest_ref_update(&db, &limiters, true, true, b"not json at all", &neighbour).await;
+        }
+
+        let outcome =
+            ingest_ref_update(&db, &limiters, true, true, &bytes_of(&event), &neighbour).await;
+        assert!(
+            matches!(outcome, IngestOutcome::Accepted),
+            "an honest author must still get through an edge that carried a junk flood, got {outcome:?}"
+        );
+        assert_eq!(count(&pool, "received_ref_updates").await, 1);
+        assert_eq!(count(&pool, "sync_queue").await, 1);
+    }
+
+    /// The per-author budget, end to end: a full budget of signed events from
+    /// one known author is accepted, the next one is refused and writes NOTHING
+    /// to either sink, and a DIFFERENT known author on the SAME mesh edge is
+    /// unaffected.
+    ///
+    /// The last assertion is the other half of FINDING 2. With the tight bound
+    /// keyed on `propagation_source`, one author exhausting the budget took the
+    /// edge down for every author sharing it; keyed on the authenticated DID,
+    /// the cost lands on the principal that incurred it.
+    #[sqlx::test]
+    async fn the_author_budget_bounds_one_author_without_touching_another(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        let source = PeerId::random();
+        let noisy = Keypair::generate();
+        let quiet = Keypair::generate();
+        seed_peer(&pool, &noisy.did().to_string()).await;
+        seed_peer(&pool, &quiet.did().to_string()).await;
+
+        let mut event = event_for(&noisy);
+        sign_ref_update(&noisy, &mut event).unwrap();
+        for i in 0..GOSSIP_AUTHOR_MAX_EVENTS {
             let outcome =
-                ingest_ref_update(&db, &limiter, true, true, &bytes_of(&event), &source).await;
+                ingest_ref_update(&db, &limiters, true, true, &bytes_of(&event), &source).await;
             assert!(
                 matches!(outcome, IngestOutcome::Accepted),
-                "event {i} is inside the budget and must be accepted, got {outcome:?}"
+                "event {i} is inside the author budget and must be accepted, got {outcome:?}"
             );
         }
+        let accepted = GOSSIP_AUTHOR_MAX_EVENTS as i64;
+        assert_eq!(count(&pool, "received_ref_updates").await, accepted);
+        assert_eq!(count(&pool, "sync_queue").await, accepted);
+
+        let outcome =
+            ingest_ref_update(&db, &limiters, true, true, &bytes_of(&event), &source).await;
+        match &outcome {
+            IngestOutcome::AuthorRateLimited(did) => assert_eq!(
+                did, &event.node_did,
+                "the refusal must name the author it was charged to"
+            ),
+            other => panic!("the over-budget author must be refused, got {other:?}"),
+        }
+        // Both sinks, separately: an over-budget refusal is a refusal, so
+        // neither the row nor the queue entry may move.
         assert_eq!(
             count(&pool, "received_ref_updates").await,
-            GOSSIP_INGEST_MAX_EVENTS as i64
+            accepted,
+            "an over-budget refusal must write no received_ref_updates row"
+        );
+        assert_eq!(
+            count(&pool, "sync_queue").await,
+            accepted,
+            "an over-budget refusal must enqueue no sync_queue row"
+        );
+
+        let mut other_event = event_for(&quiet);
+        other_event.repo = "zOwner/otherrepo".into();
+        sign_ref_update(&quiet, &mut other_event).unwrap();
+        let outcome =
+            ingest_ref_update(&db, &limiters, true, true, &bytes_of(&other_event), &source).await;
+        assert!(
+            matches!(outcome, IngestOutcome::Accepted),
+            "a second author sharing the mesh edge keeps its own budget, got {outcome:?}"
+        );
+        assert_eq!(count(&pool, "received_ref_updates").await, accepted + 1);
+    }
+
+    /// FINDING 1: one push, many refs. `api::repos` publishes ONE gossip event
+    /// per updated ref, so a tag-heavy push, an initial import, or a mirror
+    /// backfill arrives as a burst of N events down a single mesh edge inside
+    /// one window. The HTTP twin batches the same push into a single
+    /// `/sync/notify`, so the brake is the only thing that makes the two
+    /// transports disagree about whether the push federated.
+    ///
+    /// 61 distinct refs is the smallest burst that exceeded the original
+    /// 60-per-source bound, and the tail was dropped with no back-pressure
+    /// signal to the publisher: a silent federation miss. Both budgets have to
+    /// clear it, and every event has to reach both sinks.
+    #[sqlx::test]
+    async fn a_sixty_one_ref_push_from_one_known_peer_is_accepted_whole(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        let source = PeerId::random();
+        let keypair = Keypair::generate();
+        seed_peer(&pool, &keypair.did().to_string()).await;
+
+        const REFS: usize = 61;
+        for i in 0..REFS {
+            let mut event = event_for(&keypair);
+            event.ref_name = format!("refs/tags/v{i}");
+            sign_ref_update(&keypair, &mut event).unwrap();
+            let outcome =
+                ingest_ref_update(&db, &limiters, true, true, &bytes_of(&event), &source).await;
+            assert!(
+                matches!(outcome, IngestOutcome::Accepted),
+                "ref {i} of a {REFS}-ref push must be accepted, got {outcome:?}"
+            );
+        }
+
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            REFS as i64,
+            "every ref in the push must land a received_ref_updates row"
+        );
+        assert_eq!(
+            count(&pool, "sync_queue").await,
+            REFS as i64,
+            "every ref in the push must be enqueued for sync"
         );
     }
 

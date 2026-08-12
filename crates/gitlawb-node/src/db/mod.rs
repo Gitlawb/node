@@ -2280,15 +2280,7 @@ impl Db {
             // The read-then-write race is benign: if a row appears in between,
             // this write becomes an UPDATE and the UnprovenRepoint guard below
             // still refuses any http_url change.
-            PeerWriteAuthority::Unproven
-                if !sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS(SELECT 1 FROM peers WHERE did = $1)",
-                )
-                .bind(did)
-                .fetch_one(&self.pool)
-                .await
-                .unwrap_or(false) =>
-            {
+            PeerWriteAuthority::Unproven if !self.peer_exists(did).await.unwrap_or(false) => {
                 match did.parse::<gitlawb_core::did::Did>() {
                     // Only reachable from the bootstrap announce-back in main.rs,
                     // which passes the contacted peer's raw JSON string; the
@@ -2416,6 +2408,21 @@ impl Db {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Whether a DID has a row in `peers`, by keyed lookup.
+    ///
+    /// For callers that only need the membership answer. `list_peers` fetches
+    /// and materializes every row, so using it as a membership test on a hot
+    /// path (the gossip ingest gate) makes the cost of one event grow with the
+    /// size of the table.
+    pub async fn peer_exists(&self, did: &str) -> Result<bool> {
+        Ok(
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM peers WHERE did = $1)")
+                .bind(did)
+                .fetch_one(&self.pool)
+                .await?,
+        )
     }
 
     pub async fn list_peers(&self) -> Result<Vec<PeerRecord>> {
@@ -6698,6 +6705,41 @@ mod peer_authority_tests {
         let db = Db::for_testing(pool);
         db.run_migrations().await.unwrap();
         db
+    }
+
+    /// `peer_exists` answers the membership question the gossip ingest gate
+    /// asks on every event, so both answers are pinned here: a registered DID
+    /// is true, and an unregistered one is false rather than an error or a
+    /// prefix match on a registered DID.
+    #[sqlx::test]
+    async fn peer_exists_answers_both_ways(pool: sqlx::PgPool) {
+        let db = db(pool).await;
+        let did = VICTIM_DID;
+
+        assert!(
+            !db.peer_exists(did).await.unwrap(),
+            "an empty peers table must answer false, not error"
+        );
+
+        db.upsert_peer(
+            did,
+            "https://peer.example.com",
+            PeerWriteAuthority::Proven(did),
+        )
+        .await
+        .unwrap();
+
+        assert!(db.peer_exists(did).await.unwrap());
+        assert!(
+            !db.peer_exists(OTHER_DID).await.unwrap(),
+            "a different DID must not match"
+        );
+        assert!(
+            !db.peer_exists(&VICTIM_DID[..VICTIM_DID.len() - 1])
+                .await
+                .unwrap(),
+            "the lookup is an equality test, not a prefix test"
+        );
     }
 
     /// The whole row, read back through `list_peers` rather than raw SQL, so a
