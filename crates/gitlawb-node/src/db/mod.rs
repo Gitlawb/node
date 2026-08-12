@@ -3118,6 +3118,70 @@ impl Db {
         Ok(())
     }
 
+    /// Record a DISCOVERED holder and arm the resolver's fallback ATOMICALLY (U5, #173).
+    /// The sweep's discovery arm used to call `record_pin_source` and then, separately,
+    /// `mark_pin_sources_incomplete`. Two best-effort writes, so a transient failure of
+    /// the second one left the row with a nonempty, below-cap, UNMARKED source set: the
+    /// resolver's `needs_scan` is `sources.is_empty() || at_cap || incomplete`, so all
+    /// three signals were off, the bounded legacy scan was dropped, and an unrecorded
+    /// public duplicate stayed 404'd for good once the DB error cleared (no later sweep
+    /// revisits a raw-CIDv1 row). One transaction removes that state entirely: either the
+    /// source row and the sentinel both land or neither does, and neither-lands is the
+    /// benign end (an empty set is itself a `needs_scan` signal).
+    ///
+    /// The sentinel insert is UNCONDITIONAL, unlike the marker clear's `rows_affected`
+    /// gate: discovery probes a bounded, warm-only candidate set and stops at the first
+    /// holder, so finding one holder is never evidence the set is complete, whether or
+    /// not this particular call added a row. It names the empty-string UNKNOWN-repo
+    /// sentinel (the same one the v24 migration carries pre-upgrade markers under), so no
+    /// real per-repo record can clear it, and it carries the same
+    /// `WHERE EXISTS (pinned_cids row)` guard as [`Self::mark_pin_sources_incomplete`]
+    /// so a marker never sits in the table for an object this node never pinned.
+    ///
+    /// Commit-terminated, like [`Self::record_pin_source`], so a caller that wraps this
+    /// in `db_bounded` may read `BoundedDbError::Elapsed` as "definitely did not land":
+    /// the cancelled future never reaches `tx.commit()`, no COMMIT is sent, and Postgres
+    /// discards the transaction when the connection resets.
+    pub async fn record_discovered_pin_source(
+        &self,
+        sha256_hex: &str,
+        repo_id: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query(
+            "INSERT INTO pin_repo_sources (sha256_hex, repo_id)
+             SELECT $1, $2
+             WHERE (SELECT count(*) FROM pin_repo_sources WHERE sha256_hex = $1) < $3
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(sha256_hex)
+        .bind(repo_id)
+        .bind(MAX_PIN_SOURCES)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if inserted > 0 {
+            // Clears THIS repo's failure only, the same gate and reason as
+            // `record_pin_source`: a per-object clear let one repo's genuine record wipe
+            // a marker another repo's failure set.
+            sqlx::query("DELETE FROM pin_source_failures WHERE sha256_hex = $1 AND repo_id = $2")
+                .bind(sha256_hex)
+                .bind(repo_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query(
+            "INSERT INTO pin_source_failures (sha256_hex, repo_id)
+                  SELECT $1, '' WHERE EXISTS (SELECT 1 FROM pinned_cids WHERE sha256_hex = $1)
+                  ON CONFLICT DO NOTHING",
+        )
+        .bind(sha256_hex)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Mark this object's pin-source set as KNOWN INCOMPLETE for `repo_id` (U3, #173).
     /// Called when a `record_pin_source` exhausts its retries, which is the only moment
     /// the node knows a source it meant to record is missing. `GET /ipfs/{cid}` reads it

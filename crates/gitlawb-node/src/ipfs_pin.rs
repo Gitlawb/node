@@ -610,12 +610,18 @@ enum DiscoveryOutcome {
 /// incomplete marker goes with it because one discovered holder never proves the set
 /// complete.
 ///
-/// Both writes are best-effort and warn-only, and the degradation is stated rather
-/// than deferred to a healing pass that does not exist: if the source record fails the
-/// row is raw-CIDv1 with an empty or incomplete source set, which is exactly the state
-/// `needs_scan` routes to the bounded legacy scan, so the object stays servable. The
-/// sweep itself never revisits it (the cost gate skips a raw row free from then on),
-/// so the resolver's fallback is the healing path, not a retry.
+/// Both rows are written by ONE transaction (`record_discovered_pin_source`, U5), never
+/// as two independent best-effort calls. Split, a failed sentinel left the row with a
+/// nonempty, below-cap, UNMARKED source set, which `needs_scan` reads as complete: the
+/// fallback scan is dropped and an unrecorded public duplicate is 404'd permanently.
+/// Together they either both land or neither does.
+///
+/// The record as a whole is still best-effort and warn-only, and the degradation is
+/// stated rather than deferred to a healing pass that does not exist: if it fails the row
+/// is raw-CIDv1 with an EMPTY source set, which is exactly the state `needs_scan` routes
+/// to the bounded legacy scan, so the object stays servable. The sweep itself never
+/// revisits it (the cost gate skips a raw row free from then on), so the resolver's
+/// fallback is the healing path, not a retry.
 async fn discover_legacy_row(
     sha: &str,
     ctx: &mut Option<Option<DiscoveryCtx>>,
@@ -684,12 +690,11 @@ async fn discover_legacy_row(
         reads += 1;
         match repair_legacy_provider_cid(repo_path, git_bin, row_deadline, sha, db).await {
             Ok(RepairOutcome::Repaired) => {
-                if let Err(e) = db.record_pin_source(sha, &repo.id).await {
-                    tracing::warn!(sha = %sha, repo_id = %repo.id, err = %e, "sweep discovery: failed to record the discovered pin source");
-                }
-                // Discovery found ONE holder out of a bounded, warm-only candidate set,
-                // so the source set is still not known complete and the resolver must
-                // keep its scan fallback for this row.
+                // ONE transaction for both writes (U5, #173). Discovery found ONE holder
+                // out of a bounded, warm-only candidate set, so the source set is still
+                // not known complete and the resolver must keep its scan fallback for
+                // this row; the sentinel that arms it is therefore not a separate
+                // best-effort write but part of the same commit as the source row.
                 //
                 // Marked against the UNKNOWN-repo sentinel rather than the repo just
                 // recorded, which would be a lie (that repo IS recorded). The sentinel is
@@ -699,10 +704,35 @@ async fn discover_legacy_row(
                 //
                 // Rebase note (#321 onto the per-(oid, repo) marker): the original wrote
                 // this marker because `record_pin_source` used to clear the whole
-                // per-object boolean. It no longer does, so this call went from
-                // compensating for a clear to being the only thing arming the fallback.
-                if let Err(e) = db.mark_pin_sources_incomplete(sha, "").await {
-                    tracing::warn!(sha = %sha, err = %e, "sweep discovery: failed to mark the pin-source set incomplete");
+                // per-object boolean. It no longer does, so the sentinel went from
+                // compensating for a clear to being the only thing arming the fallback,
+                // which is why it may not be allowed to fail on its own.
+                match db_bounded(
+                    db_record_deadline(row_deadline),
+                    retry_db_record(|| db.record_discovered_pin_source(sha, &repo.id)),
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    // Elapsed is a DEFINITE non-write here, and that follows from the
+                    // shape of what was wrapped: the record is commit-terminated, so a
+                    // cancelled future never sends the COMMIT. The arm stays separate
+                    // only so the warn tells an operator a stalled DB from a scattered
+                    // per-row failure; both leave the same benign end state below.
+                    Err(e @ BoundedDbError::Elapsed) => {
+                        tracing::warn!(
+                            sha = %sha,
+                            repo_id = %repo.id,
+                            err = %e,
+                            "sweep discovery: the discovered pin source record did not \
+                             complete inside the row deadline; a cancelled \
+                             commit-terminated transaction definitely did not land, so \
+                             the row keeps an empty source set and the resolver falls back"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(sha = %sha, repo_id = %repo.id, err = %e, "sweep discovery: failed to record the discovered pin source and its sentinel");
+                    }
                 }
                 traversal.note_row(live_probes, fits_under_cap);
                 return (DiscoveryOutcome::Repaired, reads);
@@ -2713,6 +2743,59 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "a spent deadline must error at once, not after a fresh full budget; got {:?}",
             started.elapsed()
+        );
+    }
+
+    /// U5 (#173): the elapsed arm of the discovery record leaves neither row behind.
+    ///
+    /// What this proves and what it does NOT: it shows the wrapper composition
+    /// (`db_bounded` over `retry_db_record` over `record_discovered_pin_source`) returns
+    /// promptly and cleanly on the elapsed arm with a healthy pool, so the call site's
+    /// "definitely did not land" reading is not contradicted here. It is NOT evidence of
+    /// transactionality: a spent deadline reduces to `timeout(0, fut)`, the future never
+    /// starts, and "neither row landed" would hold just as well for two separate calls.
+    /// It kills no mutation. The atomicity property is proven by
+    /// `sweep_discovery_failed_marker_does_not_strand_public_copy` and its mutations
+    /// alone.
+    ///
+    /// Driven directly with a past deadline rather than through `db_record_deadline`,
+    /// whose `DB_RECORD_GRACE` floor makes this arm near-unreachable in production.
+    #[sqlx::test]
+    async fn discovery_record_elapsed_leaves_neither_row(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool.clone());
+        db.run_migrations().await.expect("migrations");
+        let sha = "d5".repeat(32);
+        // A `pinned_cids` row so the sentinel's `WHERE EXISTS` guard is satisfied and its
+        // absence below is the timeout's doing, not the guard's.
+        db.record_pinned_cid_with_source(&sha, &seed_cid(), "repo-first")
+            .await
+            .expect("seed the pinned row");
+
+        let spent = Instant::now() - Duration::from_secs(5);
+        let started = std::time::Instant::now();
+        let out = db_bounded(
+            spent,
+            retry_db_record(|| db.record_discovered_pin_source(&sha, "repo-discovered")),
+        )
+        .await;
+
+        assert!(
+            matches!(out, Err(BoundedDbError::Elapsed)),
+            "a spent deadline must yield the timeout arm, not a value: {out:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the wrapped retry ladder must not outlive the spent deadline; got {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            db.pin_sources_for_oid(&sha).await.unwrap(),
+            vec!["repo-first".to_string()],
+            "no discovered source row landed"
+        );
+        assert!(
+            !db.pin_sources_incomplete(&sha).await.unwrap(),
+            "no sentinel landed either"
         );
     }
 

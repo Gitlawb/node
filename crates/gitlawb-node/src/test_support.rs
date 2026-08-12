@@ -9449,6 +9449,193 @@ mod tests {
         assert!(body.contains("public bytes"), "the object's bytes serve");
     }
 
+    /// U5 (#173, F7): the discovered-source row and the fallback-arming sentinel commit
+    /// together or not at all, so discovery can never leave a row in the one state the
+    /// resolver reads as complete while it is not: a nonempty, below-cap, UNMARKED
+    /// source set.
+    ///
+    /// Same shape as the multi-holder test above (older private holder selected, newer
+    /// public holder unrecorded), plus a fault that fails ONLY the marker insert: a
+    /// `BEFORE INSERT` trigger on `pin_source_failures` that raises. Under the pre-fix
+    /// two-call shape the source insert commits (its own transaction's second statement
+    /// is a DELETE, which an insert trigger does not fire) and the separate marker insert
+    /// then fails, leaving the source set holding the private holder alone with no
+    /// marker; `needs_scan` is `sources.is_empty() || at_cap || incomplete`, so all three
+    /// signals are off, the resolver drops its fallback scan, and the public duplicate is
+    /// permanently 404'd for the anonymous caller. One transaction makes that state
+    /// unreachable: the marker's failure rolls the source row back with it, the set stays
+    /// EMPTY, and the empty-set signal routes the request to the fallback scan.
+    #[sqlx::test]
+    async fn sweep_discovery_failed_marker_does_not_strand_public_copy(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["stranda", "strandb"]);
+        let bare_a = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("stranda.git");
+
+        // A is older, so the oldest-first probe order selects it; it is PRIVATE, so it
+        // denies the anonymous caller. B is public and holds the same bytes.
+        let mut repo_a = seed_repo(&owner_did, "stranda");
+        repo_a.is_public = false;
+        repo_a.created_at = Utc::now() - chrono::Duration::days(2);
+        let repo_b = seed_repo(&owner_did, "strandb");
+        state.db.create_repo(&repo_a).await.expect("seed repo a");
+        state.db.create_repo(&repo_b).await.expect("seed repo b");
+
+        let (raw_cid, _provider) = seed_legacy_pin(&pool, &bare_a, &fx.public_oid, None).await;
+
+        // The fault, installed AFTER migrations: every insert into `pin_source_failures`
+        // raises. Postgres triggers cannot raise inline, hence the plpgsql function.
+        // Deliberately NOT a `DROP TABLE`: the source-record transaction's own DELETE on
+        // this table would then error too, that transaction would roll back, and the
+        // pre-fix run would land the same empty set as the post-fix one, so the test
+        // would pass for the wrong reason.
+        sqlx::query(
+            "CREATE FUNCTION fail_pin_source_failure_insert() RETURNS trigger AS $$
+             BEGIN RAISE EXCEPTION 'injected pin_source_failures insert failure'; END;
+             $$ LANGUAGE plpgsql",
+        )
+        .execute(&pool)
+        .await
+        .expect("install the fault function");
+        sqlx::query(
+            "CREATE TRIGGER fail_pin_source_failure_insert
+                 BEFORE INSERT ON pin_source_failures
+                 FOR EACH ROW EXECUTE FUNCTION fail_pin_source_failure_insert()",
+        )
+        .execute(&pool)
+        .await
+        .expect("install the fault trigger");
+
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+                &mut Default::default(),
+            ),
+        )
+        .await
+        .expect("the sweep terminates");
+        assert_eq!(
+            stats.repaired, 1,
+            "the row is still repaired to its raw key; only the source record is at risk"
+        );
+
+        // Gathered before the assertions so the RED output carries the half-state.
+        let sources = state
+            .db
+            .pin_sources_for_oid(&fx.public_oid)
+            .await
+            .expect("read the source set");
+        let marker_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM pin_source_failures WHERE sha256_hex = $1")
+                .bind(&fx.public_oid)
+                .fetch_one(&pool)
+                .await
+                .expect("read the marker table");
+
+        let (st, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&raw_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            (st, body.contains("public bytes")),
+            (StatusCode::OK, true),
+            "the anonymous caller must be served the PUBLIC holder's copy through the \
+             fallback scan; got {st} with source set {sources:?} and {marker_rows} marker \
+             row(s), the nonempty-and-unmarked half-state the resolver reads as complete"
+        );
+        assert!(
+            sources.is_empty(),
+            "the failed marker must roll the source row back with it; got {sources:?}"
+        );
+        assert_eq!(
+            marker_rows, 0,
+            "the marker insert is what failed, so no marker row can exist"
+        );
+    }
+
+    /// U5 (#173, F7, the healthy direction): one discovery hit writes BOTH rows, asserted
+    /// against the tables directly rather than through the boolean helper. The sentinel
+    /// is unconditional because one discovered holder out of a bounded warm-only
+    /// candidate set never proves the source set complete, and it is written against the
+    /// empty-string UNKNOWN-repo sentinel so no later real record clears it.
+    #[sqlx::test]
+    async fn sweep_discovery_records_source_and_sentinel_in_one_commit(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["bothrows"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("bothrows.git");
+        let repo = seed_repo(&owner_did, "bothrows");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        seed_legacy_pin(&pool, &bare, &fx.public_oid, None).await;
+
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+                &mut Default::default(),
+            ),
+        )
+        .await
+        .expect("the sweep terminates");
+        assert_eq!(stats.repaired, 1, "the discovered row is repaired");
+
+        let source_rows: Vec<String> = sqlx::query_scalar(
+            "SELECT repo_id FROM pin_repo_sources WHERE sha256_hex = $1 ORDER BY repo_id",
+        )
+        .bind(&fx.public_oid)
+        .fetch_all(&pool)
+        .await
+        .expect("read pin_repo_sources");
+        assert_eq!(
+            source_rows,
+            vec![repo.id.clone()],
+            "the discovered holder is recorded additively"
+        );
+
+        let marker_repos: Vec<String> = sqlx::query_scalar(
+            "SELECT repo_id FROM pin_source_failures WHERE sha256_hex = $1 ORDER BY repo_id",
+        )
+        .bind(&fx.public_oid)
+        .fetch_all(&pool)
+        .await
+        .expect("read pin_source_failures");
+        assert_eq!(
+            marker_repos,
+            vec![String::new()],
+            "the same commit writes the unknown-repo sentinel: one discovered holder never \
+             proves the set complete, so the resolver must keep its fallback scan"
+        );
+    }
+
     /// F1 scenario 7 (#173, degenerate state): the cost gate at the top of the row loop
     /// fires before the sources query, so a source-less row that is ALREADY raw-CIDv1
     /// never enters discovery and reads nothing.
