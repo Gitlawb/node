@@ -44,8 +44,8 @@ use crate::visibility::{visibility_check, Decision};
 /// within ONE request the object can exist under path-scoped rules in many repos, and
 /// each distinct repo pays its own `spawn_blocking` walk (the memo only dedups the same
 /// repo). Without a ceiling a single request fans out to O(repos) walks — an
-/// amplification sink (INV-10). Once this many walks have run, no further walk is
-/// spawned for the rest of the request: any remaining candidate that still needs
+/// amplification sink (INV-10). Once this many walks have run IN A PHASE, no further
+/// walk is spawned for that phase: any remaining candidate there that still needs
 /// a walk is skipped (and, with nothing else readable, the request falls through
 /// to the opaque 404). The bound is deliberately generous: a legitimate caller
 /// serves on the first repo that grants them, so reaching it requires being
@@ -59,6 +59,15 @@ use crate::visibility::{visibility_check, Decision};
 /// served, not falsely 503'd as a truncated search. The legacy scan's fan-out is
 /// separately bounded by `MAX_LEGACY_PROBES_PER_REQUEST`, so widening this by one
 /// does not loosen that path.
+///
+/// The ceiling is charged PER PHASE (#173 round 13, F3), and that is what makes the
+/// paragraph above hold for the fallback too: the legacy-scan fallback gets its own
+/// equal budget rather than the provenance phase's remainder, so one request can spawn
+/// up to `2 * walk_cap` walks in total and no more. Without the split, a source set of
+/// root-readable but path-scoped denials spends the whole ceiling reaching its denials,
+/// and the fallback armed to find the PUBLIC source `record_pin_source` silently
+/// dropped cannot walk to it, a deterministic 503 on every retry for an object that is
+/// public.
 pub(crate) const MAX_HISTORY_WALKS_PER_REQUEST: u32 = crate::db::MAX_PIN_SOURCES as u32 + 1;
 
 /// Hard per-request ceiling on how many legacy (NULL-provenance) repositories
@@ -496,7 +505,8 @@ pub async fn get_by_cid(
     // and the legacy scan so both honor the same fan-out ceiling, per-repo memo, and
     // IP brake. The caller is constant for one request, so `repo.id` alone keys the memo.
     let mut walk = WalkState {
-        walks: 0,
+        provenance_walks: 0,
+        scan_walks: 0,
         probes: 0,
         visits: 0,
         truncated_by: Vec::new(),
@@ -1011,7 +1021,14 @@ struct ResolveCtx<'a> {
 /// Per-request walk budget + memos, shared across the provenance path and the legacy
 /// scan so the fan-out ceiling and per-repo memoization span the whole request.
 struct WalkState {
-    walks: u32,
+    /// Walks spent by the PROVENANCE phase, checked against `walk_cap` on its own.
+    provenance_walks: u32,
+    /// Walks spent by the legacy-scan fallback, checked against the SAME `walk_cap`
+    /// but from its own zero. The two phases are budgeted separately because they are
+    /// not alternatives: the fallback exists precisely to reach a source the
+    /// provenance set dropped, and a shared counter let the provenance phase's denials
+    /// spend the budget the fallback needs to get there (#173 round 13, F3).
+    scan_walks: u32,
     /// Count of legacy (NULL-provenance) repos actually probed this request, so the
     /// scan can stop at `ipfs_max_legacy_probes` instead of fanning out to O(repos)
     /// `acquire` + `cat-file` (#173, F1, INV-10). Only the legacy path bumps it.
@@ -1302,17 +1319,41 @@ async fn gate_and_serve(
             }
             // Per-request fan-out ceiling (INV-10): once this many walks have run, skip
             // THIS walk-requiring candidate and keep scanning (a later walk-free copy
-            // must still serve). `walks` is bumped only inside this block, so walk-free
+            // must still serve). Only this block bumps a counter, so walk-free
             // candidates never consume budget.
             // Both parents bound this loop, under different knobs: #173's
             // `ipfs_max_history_walks` (an AppState field, seeded from config) and
             // #174's `GITLAWB_IPFS_MAX_REPOS_WALKED`. Honor the tighter of the two, so
             // neither knob silently stops working after the merge.
+            //
+            // The cap is charged PER PHASE (#173 round 13, F3): the provenance path and
+            // the legacy-scan fallback each get their own `walk_cap`, so the total walk
+            // work one request can buy is `2 * walk_cap` and no more. A single shared
+            // counter made a public object permanently unservable: every provenance
+            // source that is root-readable but path-scoped needs a walk to reach its
+            // deny, so a full source set of them spends the whole ceiling, and the
+            // fallback armed to find the source `record_pin_source` dropped then has
+            // nothing left to walk with: it skips that source here, taints, and every
+            // retry reproduces the same 503.
+            //
+            // Raising a single shared ceiling instead was rejected. The adversary
+            // controls how many provenance slots exist (they are grindable repo ids
+            // filling `pin_repo_sources`), so for any constant N a set of
+            // `walk_cap + N` path-scoped denials re-creates the exhaustion. Only a
+            // budget the provenance phase cannot draw from bounds the fallback's reach
+            // independently of what the source set contains. The taint name stays
+            // "walk-cap": to an operator the meaning is unchanged (a walk ceiling cut
+            // the search), and the knobs still mean what they say, now per phase.
             let walk_cap = std::cmp::min(
                 state.ipfs_max_history_walks as usize,
                 state.config.ipfs_max_repos_walked,
             );
-            if walk.walks as usize >= walk_cap {
+            let spent = if legacy_scan {
+                walk.scan_walks
+            } else {
+                walk.provenance_walks
+            };
+            if spent as usize >= walk_cap {
                 // The walk ceiling truncated the search: a later repo (possibly one that
                 // authorizes this caller) is left unwalked, so absence is unproven —
                 // record it so the tail returns 503, not a false 404 (#173, F2).
@@ -1341,7 +1382,11 @@ async fn gate_and_serve(
                     }
                 }
             }
-            walk.walks += 1;
+            if legacy_scan {
+                walk.scan_walks += 1;
+            } else {
+                walk.provenance_walks += 1;
+            }
 
             let rp = repo_path.clone();
             let r = rules.to_vec();
@@ -2196,6 +2241,43 @@ mod tests {
             .to_string()
     }
 
+    /// Walk-counting shim that runs the REAL walk (`state.git_bin`): each `rev-list`
+    /// appends one line to `log`, then every invocation execs the real `git`, so the
+    /// allowed-set a walk produces is the repo's genuine one.
+    ///
+    /// `walk_logging_fake_git` below answers every subcommand with nothing, so under it
+    /// EVERY walked repo yields an empty allowed set and no repo can ever authorize. The
+    /// per-phase budget tests need one candidate to deny after a real walk and a later
+    /// one to allow after another, so they need the real sets and the tally both.
+    #[cfg(unix)]
+    fn walk_logging_real_git(dir: &std::path::Path, log: &std::path::Path) -> String {
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               rev-list) echo walk >> \"{}\" ;;\n\
+             esac\n\
+             exec git \"$@\"\n",
+            log.display()
+        );
+        let git_path = dir.join("walkgit");
+        std::fs::write(&git_path, &body).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&git_path).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&git_path, perm).unwrap();
+        }
+        git_path.to_str().unwrap().to_string()
+    }
+
+    /// How many expensive walks the shim above has recorded so far.
+    #[cfg(unix)]
+    fn walks_logged(log: &std::path::Path) -> usize {
+        std::fs::read_to_string(log)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
     /// Fake git for the WALK only (`state.git_bin`): empty refs, `rev-parse`
     /// resolves, and each `rev-list` appends one line to `log` and prints nothing —
     /// every walked repo yields an EMPTY allowed-set (path-gate deny verdict) and
@@ -2530,6 +2612,273 @@ mod tests {
             walks, 1,
             "cap honored exactly: the first path-scoped repo walks, the second is cut"
         );
+    }
+
+    /// A reader DID that is on no rule in these fixtures, so every path-scoped rule
+    /// naming it denies the anonymous caller at the rule's path.
+    #[cfg(unix)]
+    const OTHER_READER: &str = "did:key:z6MkU3IpfsReaderCCCCCCCCCCCCCCCCCCCCCCCC";
+
+    /// Seed a repo holding `content` at `/src/secret.txt` and give it a path-scoped
+    /// rule over `/src/**` naming a reader that is not the caller. The repo stays
+    /// readable at "/" (the rule does not match "/", so the mirror row's public flag
+    /// decides), which is what makes the object cost a real allowed-set walk before it
+    /// is denied: a root deny would short-circuit ahead of the walk and spend nothing.
+    #[cfg(unix)]
+    async fn seed_path_denying_repo(
+        state: &crate::state::AppState,
+        tmp: &std::path::Path,
+        owner: &str,
+        name: &str,
+        content: &[u8],
+    ) -> (String, String) {
+        let (id, oid) = seed_repo_with_blob(state, tmp, owner, name, content).await;
+        state
+            .db
+            .set_visibility_rule(
+                &id,
+                "/src/**",
+                crate::db::VisibilityMode::B,
+                &[OTHER_READER.to_string()],
+                owner,
+            )
+            .await
+            .expect("seed the path-scoped deny rule");
+        (id, oid)
+    }
+
+    /// F3 per-phase walk budgets: a PUBLIC source that only the legacy-scan fallback
+    /// can reach must still serve after path-scoped provenance denials spent the whole
+    /// walk cap.
+    ///
+    /// One shared `walks` counter made that impossible. Every provenance source that is
+    /// root-readable but path-scoped needs its own allowed-set walk to reach its deny,
+    /// so `MAX_PIN_SOURCES + 1` such sources consume the entire cap; the fallback the
+    /// at-cap/incomplete markers then arm has nothing left to spend, skips its first
+    /// walk-needing candidate at `walk-cap`, and the request tails to a retryable 503
+    /// that every retry reproduces. A public object, permanently unservable.
+    ///
+    /// The existing buried-public test cannot see this: its extra repos do not exist on
+    /// disk, so they never reach the `!already` block and consume no walk. This fixture
+    /// uses REAL repos with REAL denying rules, and the walk log is what proves each one
+    /// genuinely spent a walk rather than being skipped for free.
+    ///
+    /// Both caps are set to 2, so `walk_cap` is 2 per phase. The first request runs
+    /// WITHOUT the fallback armed and pins the provenance phase's own bound (exactly 2
+    /// walks, never more, for a complete source set). The second arms the fallback and
+    /// is the RED: pre-fix the public repo is skipped at `walk-cap` and the request 503s.
+    /// The third pins that the fresh scan budget is capacity, not a gate change: an
+    /// object held ONLY by a path-denying repo is still not served to the anonymous
+    /// caller, with the fallback armed for it too.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_fallback_reaches_public_source_past_provenance_walk_spend(
+        pool: sqlx::PgPool,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        let walk_log = tmp.path().join("walks.log");
+        state.git_bin = walk_logging_real_git(tmp.path(), &walk_log);
+        // `walk_cap` is the min of the two knobs, so both go to 2.
+        state.ipfs_max_history_walks = 2;
+        let mut cfg = (*state.config).clone();
+        cfg.ipfs_max_repos_walked = 2;
+        state.config = Arc::new(cfg);
+
+        // Identical content in every holder, so one CID resolves to one oid that all of
+        // them carry. Iteration is `(created_at, id)` ASC, so insert order is scan order.
+        let content = b"per-phase walk budget proof\n";
+        let (prov_one, oid) =
+            seed_path_denying_repo(&state, tmp.path(), "z6f3phase", "provdeny-one", content).await;
+        let (prov_two, _) =
+            seed_path_denying_repo(&state, tmp.path(), "z6f3phase", "provdeny-two", content).await;
+        // The fallback's holder. Its rule IS path-scoped (so the object still costs a
+        // walk) but covers a path this object is not at, so the walk's allowed-set
+        // decides on the mirror row's public flag and ALLOWS. A path-scoped rule can
+        // never name an anonymous reader, so this is the only shape in which a walked
+        // repo authorizes anon.
+        let (public_id, _) =
+            seed_repo_with_blob(&state, tmp.path(), "z6f3phase", "pubreach", content).await;
+        state
+            .db
+            .set_visibility_rule(
+                &public_id,
+                "/decoy/**",
+                crate::db::VisibilityMode::B,
+                &[OTHER_READER.to_string()],
+                "z6f3phase",
+            )
+            .await
+            .unwrap();
+        // A second object held ONLY by a path-denying repo, for the denial-class check.
+        let denied_content = b"held only where anon is denied\n";
+        let (denied_id, denied_oid) = seed_path_denying_repo(
+            &state,
+            tmp.path(),
+            "z6f3phase",
+            "deniedsolo",
+            denied_content,
+        )
+        .await;
+
+        // Provenance: the two denying repos are the recorded sources of `oid`; the
+        // public holder is NOT, which is exactly the dropped-source case.
+        state.db.record_pin_source(&oid, &prov_one).await.unwrap();
+        state.db.record_pin_source(&oid, &prov_two).await.unwrap();
+        state
+            .db
+            .record_pin_source(&denied_oid, &denied_id)
+            .await
+            .unwrap();
+        state
+            .db
+            .mark_pin_sources_incomplete(&denied_oid, "")
+            .await
+            .unwrap();
+
+        let cid = seed_legacy_pin_for_oid(&state, &oid).await;
+        let denied_cid = seed_legacy_pin_for_oid(&state, &denied_oid).await;
+        let router = ipfs_router(state.clone());
+
+        // 1. Provenance only: the source set carries no incompleteness signal, so no
+        //    fallback runs. Both sources walk and deny, and the phase spends its cap
+        //    exactly, never more, whatever the fallback later gets.
+        let (status, body) =
+            status_and_body(router.clone().oneshot(get_cid(&cid, None)).await.unwrap()).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a complete source set that denies everywhere is a definitive miss: {body}"
+        );
+        assert_eq!(
+            walks_logged(&walk_log),
+            2,
+            "the provenance phase must spend exactly its own walk_cap of 2: two REAL \
+             path-denying sources, each walked to reach its deny"
+        );
+
+        // 2. Arm the fallback (the node's own record that a source is missing) and the
+        //    buried public holder must serve, on the scan phase's own budget.
+        state
+            .db
+            .mark_pin_sources_incomplete(&oid, "")
+            .await
+            .unwrap();
+        std::fs::remove_file(&walk_log).unwrap();
+        let resp = router.clone().oneshot(get_cid(&cid, None)).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a public source reachable only through the fallback must serve even after \
+             path-scoped provenance denials spent the whole walk cap: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            &body[..],
+            content.as_slice(),
+            "the served bytes must be the public holder's object"
+        );
+        assert_eq!(
+            walks_logged(&walk_log),
+            3,
+            "two provenance-phase walks plus ONE scan-phase walk: the phases hold \
+             separate budgets and neither exceeds the cap of 2"
+        );
+
+        // 3. The fresh scan budget is capacity, not a gate change: an object held only
+        //    where anon is denied stays denied, fallback armed and all.
+        std::fs::remove_file(&walk_log).unwrap();
+        let (status, body) = status_and_body(
+            router
+                .clone()
+                .oneshot(get_cid(&denied_cid, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "a path-scoped deny must still deny under the per-phase budgets: {body}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "every holder of that object reached a real deny verdict, so the miss is \
+             definitive rather than truncated: {body}"
+        );
+    }
+
+    /// F3 must-not: the per-phase split raises the total walk work to `2 * walk_cap`
+    /// and no further. Two provenance sources spend the provenance budget; three more
+    /// path-denying repos, none of them recorded sources, offer the fallback more
+    /// walk-needing candidates than its own budget. The scan takes two and skips the
+    /// rest at `walk-cap`, so the request tails to the tainted 503 rather than walking
+    /// on.
+    ///
+    /// The walk count is asserted BEFORE the status so an unbounded scan fails HERE,
+    /// on the bound, and not on some downstream difference.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_per_phase_walk_budgets_stay_bounded_at_twice_the_cap(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        let walk_log = tmp.path().join("walks.log");
+        state.git_bin = walk_logging_real_git(tmp.path(), &walk_log);
+        state.ipfs_max_history_walks = 2;
+        let mut cfg = (*state.config).clone();
+        cfg.ipfs_max_repos_walked = 2;
+        state.config = Arc::new(cfg);
+
+        let content = b"bounded total walk work\n";
+        let (prov_one, oid) =
+            seed_path_denying_repo(&state, tmp.path(), "z6f3total", "provdeny-one", content).await;
+        let (prov_two, _) =
+            seed_path_denying_repo(&state, tmp.path(), "z6f3total", "provdeny-two", content).await;
+        for name in ["fallback-one", "fallback-two", "fallback-three"] {
+            seed_path_denying_repo(&state, tmp.path(), "z6f3total", name, content).await;
+        }
+        state.db.record_pin_source(&oid, &prov_one).await.unwrap();
+        state.db.record_pin_source(&oid, &prov_two).await.unwrap();
+        state
+            .db
+            .mark_pin_sources_incomplete(&oid, "")
+            .await
+            .unwrap();
+
+        let cid = seed_legacy_pin_for_oid(&state, &oid).await;
+        let (status, body) = status_and_body(
+            ipfs_router(state)
+                .oneshot(get_cid(&cid, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let walks = walks_logged(&walk_log);
+        assert!(
+            walks <= 4,
+            "total walk work must stay within 2 * walk_cap = 4 however many walk-needing \
+             candidates the fallback is offered, got {walks}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the fallback's own budget runs out on the surplus candidates, so the tail \
+             is the truncated-search 503: {body}"
+        );
+        assert_eq!(body["error"], "search_incomplete", "{body}");
     }
 
     /// F2 visit ceiling: `ipfs_max_repo_visits` bounds the acquire+probe cost class
