@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::db::Db;
 
-use super::types::{AgentTaskType, RefUpdateType, RepoType};
+use super::types::{AgentTaskReadType, RefUpdateType, RepoType};
 
 pub struct QueryRoot;
 
@@ -115,26 +115,39 @@ impl QueryRoot {
             desc = "Max 200; larger requests are clamped to 200 (no error). Negative values clamp to 0."
         )]
         limit: i64,
-    ) -> Result<Vec<AgentTaskType>> {
+    ) -> Result<Vec<AgentTaskReadType>> {
         let db = ctx.data_unchecked::<Arc<Db>>();
-        // Clamp before SQL: a negative LIMIT is a client fault that Postgres
-        // rejects with 2201W, which would otherwise trip the opaque DB path
-        // and write an error-level log on every probe (#250 review).
-        let limit = limit.clamp(0, 200);
-        let tasks = db
-            .list_tasks(status.as_deref(), assignee_did.as_deref(), limit)
-            .await
-            .map_err(crate::graphql::graphql_db_err)?;
-        Ok(tasks.into_iter().map(AgentTaskType::from).collect())
+        // #268: gate rows via the same collector the REST list route uses (like
+        // `ref_updates` shares `collect_visible_ref_updates` with its REST feed),
+        // so the two surfaces cannot drift. The collector clamps `limit` itself,
+        // including the negative-LIMIT case #250 called out for this resolver.
+        let caller = ctx
+            .data::<crate::auth::AuthenticatedDid>()
+            .ok()
+            .map(|d| d.0.as_str());
+        let tasks = crate::api::tasks::collect_visible_tasks(
+            db,
+            status.as_deref(),
+            assignee_did.as_deref(),
+            limit,
+            caller,
+        )
+        .await
+        .map_err(crate::graphql::graphql_app_err)?;
+        Ok(tasks.into_iter().map(AgentTaskReadType::from).collect())
     }
 
-    async fn task(&self, ctx: &Context<'_>, id: String) -> Result<Option<AgentTaskType>> {
+    async fn task(&self, ctx: &Context<'_>, id: String) -> Result<Option<AgentTaskReadType>> {
         let db = ctx.data_unchecked::<Arc<Db>>();
-        let t = db
-            .get_task(&id)
+        // #268: same gate as the REST get route, via the shared helper.
+        let caller = ctx
+            .data::<crate::auth::AuthenticatedDid>()
+            .ok()
+            .map(|d| d.0.as_str());
+        let t = crate::api::tasks::get_visible_task(db, &id, caller)
             .await
-            .map_err(crate::graphql::graphql_db_err)?;
-        Ok(t.map(AgentTaskType::from))
+            .map_err(crate::graphql::graphql_app_err)?;
+        Ok(t.map(AgentTaskReadType::from))
     }
 }
 

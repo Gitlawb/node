@@ -76,10 +76,16 @@ pub fn build_router(state: AppState) -> Router {
         state.clone(),
     );
 
-    // ── Task routes (read — open) ──────────────────────────────────────────
+    // ── Task routes (read — open, but scoped) ──────────────────────────────
+    // `optional_signature` attaches the verified DID when a signature is present
+    // so the handlers can identify the caller; the routes stay anonymous-reachable,
+    // but each task/row is gated to its delegator, its assignee, or (for a
+    // repo-scoped task) whoever can read that repo (#268 — these routes previously
+    // carried no gate and no identity at all).
     let task_read_routes = Router::new()
         .route("/api/v1/tasks", get(tasks::list_tasks))
-        .route("/api/v1/tasks/{id}", get(tasks::get_task));
+        .route("/api/v1/tasks/{id}", get(tasks::get_task))
+        .layer(middleware::from_fn(auth::optional_signature));
 
     // ── Rate-limited creation routes — require HTTP Signature, plus a per-DID
     // throttle AND a per-IP flood brake. The per-DID limiter (inner) caps a
