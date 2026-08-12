@@ -286,7 +286,7 @@ async fn main() -> Result<()> {
             // visible only to whoever reads the logs. Making it fatal, or
             // surfacing it in the health response, is its own change.
             Err(e) => {
-                tracing::warn!(err = %e, "failed to load p2p identity key — continuing without p2p");
+                tracing::warn!(err = %e, "failed to load p2p identity key, continuing without p2p");
                 None
             }
         }
