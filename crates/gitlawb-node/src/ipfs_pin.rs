@@ -297,6 +297,11 @@ pub(crate) struct SweepStats {
     /// bytes are gone, so the read is pure waste and the next run will waste it again.
     /// [`MAX_DEAD_ROW_READS_PER_RUN`] bounds this per run.
     pub dead_row_reads: usize,
+    /// Whether at least one source-less row was reached with the pass's whole discovery
+    /// budget already spent, so it was skipped without a probe (see
+    /// [`DISCOVERY_ROW_BUDGET_DIVISOR`]). Reporting only, like `retryable_skips`: it
+    /// drives no control decision, it just keeps a starved pass from being silent.
+    pub discovery_budget_spent: bool,
 }
 
 /// How many fruitless object reads one sweep run will spend before it stops and leaves
@@ -309,8 +314,32 @@ pub(crate) struct SweepStats {
 /// early keeps the cursor, so the next boot resumes past the rows already walked rather
 /// than repeating them, and the table still gets covered across boots.
 pub(crate) const MAX_DEAD_ROW_READS_PER_RUN: usize = 64;
+
+/// How the pass's discovery budget is sliced per source-less row (#173 round 13, F6).
+///
+/// The pass budget alone is not enough. It is one `git_timeout` shared by every
+/// source-less row the pass reaches, so a single wedged candidate on the first row spent
+/// all of it and every later row arrived with a dead deadline, came back retryable
+/// without a real probe, and starved. `sha256_hex` order is stable, so the same row won
+/// the race on every boot and the rows behind it were never probed at all.
+///
+/// The trade this number sets, stated both ways so neither half is silent: at least four
+/// rows are guaranteed a live probe out of one pass budget, and no single row may spend
+/// more than a quarter of it. Raising the divisor guarantees more rows per pass and gives
+/// each a shorter probe; lowering it does the reverse. Four keeps a row's slice generous
+/// against the default 600s `git_service_timeout_secs` (150s, far past any healthy
+/// `cat-file`) while still bounding the damage one wedged candidate can do.
+///
+/// It is NOT a bound on a single probe. Within a row's slice the per-row deadline is
+/// shared by up to [`MAX_LEGACY_DISCOVERY_PROBES`] candidates exactly as the pass
+/// deadline used to be shared by rows, so one wedged candidate can still consume its
+/// row's whole slice and leave that row's later candidates unprobed. What this bounds is
+/// the blast radius: the row, not the pass.
+const DISCOVERY_ROW_BUDGET_DIVISOR: u32 = 4;
+
 /// The warm, non-quarantined repos one pass may probe for a source-less legacy row,
-/// plus the one absolute deadline every probe in the pass shares.
+/// plus the absolute deadline bounding the pass's discovery as a whole, from which each
+/// row takes a slice.
 ///
 /// Loaded LAZILY, once per pass, on the first source-less row, mirroring the resolver's
 /// own legacy-scan context: a pass with no such row pays nothing. The `is_dir` warm
@@ -320,9 +349,14 @@ struct DiscoveryCtx {
     /// Warm candidates with their validated disk paths, oldest-first by
     /// `(created_at, id)`.
     candidates: Vec<(crate::db::RepoRecord, std::path::PathBuf)>,
-    /// Shared by every discovery read in the pass, so one pass's discovery costs at
-    /// most one `git_timeout` in total on top of the per-row probe cap.
-    deadline: Instant,
+    /// The ceiling on the whole pass's discovery, so one pass costs at most one
+    /// `git_timeout` in total on top of the per-row probe cap. Per PASS, not per run:
+    /// `load_discovery_ctx` runs once per `sweep_pass` and a run loops passes.
+    ///
+    /// No row gets all of it. Each takes at most
+    /// `git_timeout / DISCOVERY_ROW_BUDGET_DIVISOR`, clamped to what is left here, and a
+    /// row reached with this already past is skipped without a probe.
+    pass_deadline: Instant,
 }
 
 /// Build one pass's discovery candidate list.
@@ -416,7 +450,7 @@ async fn load_discovery_ctx(
 
     Ok(DiscoveryCtx {
         candidates: warm,
-        deadline: Instant::now() + git_timeout,
+        pass_deadline: Instant::now() + git_timeout,
     })
 }
 
@@ -430,6 +464,12 @@ enum DiscoveryOutcome {
     Retryable,
     /// The row's key was rewritten from bytes verified in a warm local repo.
     Repaired,
+    /// The pass's whole discovery budget was already spent when this row was reached, so
+    /// nothing was probed. Accounted RETRYABLE like the arm above (nothing was learned
+    /// about the row), but kept distinct because it must cost NOTHING: charging it the
+    /// reads it never made would burn [`MAX_DEAD_ROW_READS_PER_RUN`] on rows that were
+    /// only ever skipped, pausing the run early for no information.
+    PassBudgetSpent,
 }
 
 /// Probe a bounded set of warm local repos for a source-less legacy row's object.
@@ -474,6 +514,19 @@ async fn discover_legacy_row(
         None => return (DiscoveryOutcome::Retryable, reads),
     };
 
+    // Reached with the pass's discovery budget already gone: probing now buys nothing but
+    // a spent-deadline error per candidate, so return before any read is charged.
+    if Instant::now() >= ctx.pass_deadline {
+        return (DiscoveryOutcome::PassBudgetSpent, reads);
+    }
+    // This row's slice of the pass budget, clamped to what is left of it. Without the
+    // clamp a row reached near the end of the pass would overrun the pass's own ceiling;
+    // without the slice one wedged candidate would spend the whole pass on this row.
+    let row_deadline = std::cmp::min(
+        Instant::now() + git_timeout / DISCOVERY_ROW_BUDGET_DIVISOR,
+        ctx.pass_deadline,
+    );
+
     let mut retryable = false;
     // Every candidate that gets this far is READ, so taking the first
     // MAX_LEGACY_DISCOVERY_PROBES bounds the expensive work exactly. Candidates the
@@ -482,7 +535,7 @@ async fn discover_legacy_row(
         // Counted before the match, because the read is spent whatever it returns. This
         // is the quantity the caller charges against the per-run budget.
         reads += 1;
-        match repair_legacy_provider_cid(repo_path, git_bin, ctx.deadline, sha, db).await {
+        match repair_legacy_provider_cid(repo_path, git_bin, row_deadline, sha, db).await {
             Ok(RepairOutcome::Repaired) => {
                 if let Err(e) = db.record_pin_source(sha, &repo.id).await {
                     tracing::warn!(sha = %sha, repo_id = %repo.id, err = %e, "sweep discovery: failed to record the discovered pin source");
@@ -557,6 +610,7 @@ async fn sweep_pass(
     let mut repaired = 0usize;
     let mut retryable_skips = 0usize;
     let mut dead_row_reads = 0usize;
+    let mut discovery_budget_spent = false;
     let mut last = cursor;
     // Loaded on the first source-less row and reused by every later one. The outer
     // `None` is "not loaded yet"; `Some(None)` is "the load failed this pass", which is
@@ -605,6 +659,13 @@ async fn sweep_pass(
                 }
                 DiscoveryOutcome::Retryable => row_retryable = true,
                 DiscoveryOutcome::Settled => {}
+                // Worth walking again, like any retryable row, but it read nothing and so
+                // is charged nothing below (`reads` is zero). The flag is what keeps a
+                // starved pass from being silent.
+                DiscoveryOutcome::PassBudgetSpent => {
+                    row_retryable = true;
+                    discovery_budget_spent = true;
+                }
             }
             // Charge every probe that did not end in a repair, INCLUDING a retryable
             // one, which is where discovery differs from the provenance loop below.
@@ -704,6 +765,7 @@ async fn sweep_pass(
         passes: 1,
         retryable_skips,
         dead_row_reads,
+        discovery_budget_spent,
     })
 }
 
@@ -732,8 +794,9 @@ pub(crate) async fn sweep_legacy_provider_cids_once(
 ///
 /// A row with NO recorded source is the pre-provenance case this exists for, so it is
 /// not skipped: the pass probes a bounded, quarantine-filtered set of WARM local repos
-/// for the object (at most [`MAX_LEGACY_DISCOVERY_PROBES`] reads per row, sharing one
-/// per-pass deadline) and, on a hit, rewrites the key from the verified bytes and
+/// for the object (at most [`MAX_LEGACY_DISCOVERY_PROBES`] reads per row, each row
+/// taking a [`DISCOVERY_ROW_BUDGET_DIVISOR`] slice of the pass's one discovery deadline)
+/// and, on a hit, rewrites the key from the verified bytes and
 /// records the discovered repo ADDITIVELY alongside the incomplete marker. It never
 /// writes an exclusive first-pinner claim and never pulls a cold repo back from remote
 /// storage. See `discover_legacy_row` for why both of those matter.
@@ -791,6 +854,7 @@ pub(crate) async fn sweep_legacy_provider_cids(
         totals.repaired += pass.repaired;
         totals.retryable_skips += pass.retryable_skips;
         totals.dead_row_reads += pass.dead_row_reads;
+        totals.discovery_budget_spent |= pass.discovery_budget_spent;
         totals.passes += 1;
         // A short batch means the ordered walk reached the end of the table. Stop here
         // rather than after an extra empty pass, and do NOT sleep on the way out.
@@ -810,6 +874,13 @@ pub(crate) async fn sweep_legacy_provider_cids(
             break;
         }
         tokio::time::sleep(delay).await;
+    }
+    if totals.discovery_budget_spent {
+        tracing::info!(
+            passes = totals.passes,
+            "legacy provider-CID sweep: a pass spent its whole discovery budget before \
+             reaching every source-less row; the rest were skipped unprobed"
+        );
     }
     if completed {
         if let Err(e) = db.set_pin_repair_cursor("").await {

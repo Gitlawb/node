@@ -8125,6 +8125,205 @@ mod tests {
         );
     }
 
+    /// Write an executable `git` stand-in and return its path.
+    fn write_git_shim(name: &str, script: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(&path, script).expect("write the git shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod the git shim");
+        }
+        path
+    }
+
+    /// F6 scenario 1 (#173 round 13): one hung candidate must not starve the rows behind
+    /// it in the same pass. `DiscoveryCtx` is loaded once per pass, so before the per-row
+    /// slice every source-less row in a pass shared ONE deadline: the first row's wedged
+    /// `cat-file` spent the whole budget, and every later row reached
+    /// `repair_legacy_provider_cid` with it already gone, came back retryable without a
+    /// meaningful probe, and (because `sha256_hex` order is stable) starved on the same
+    /// row on every boot.
+    ///
+    /// Two source-less legacy rows, one warm candidate holding both objects, and a `git`
+    /// stand-in that wedges on the FIRST row's object and answers the second's for real.
+    /// With `git_timeout` at 4s the row slice is 1s, so the wedged row costs a quarter of
+    /// the pass budget and the second row still probes with a live deadline. RED before
+    /// the slice: the first row burns all 4s and the second is never repaired.
+    #[sqlx::test]
+    async fn sweep_discovery_hung_candidate_does_not_starve_later_rows(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["hungsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("hungsrc.git");
+        let repo = seed_repo(&owner_did, "hungsrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        // The walk is ordered by `sha256_hex`, so the row that is reached FIRST is the
+        // lexicographically smaller oid. That is the one the stand-in wedges on.
+        let mut oids = [fx.public_oid.clone(), fx.secret_oid.clone()];
+        oids.sort();
+        let (hung_oid, live_oid) = (oids[0].clone(), oids[1].clone());
+        let (_hung_raw, hung_provider) = seed_legacy_pin(&pool, &bare, &hung_oid, None).await;
+        let (live_raw, live_provider) = seed_legacy_pin(&pool, &bare, &live_oid, None).await;
+
+        // The type stage feeds the oid on STDIN (`cat-file --batch-check`) and the
+        // content stage puts it in argv, so the stand-in has to look in both places.
+        let git_bin = write_git_shim(
+            &format!("gl-hung-git-{short}"),
+            &format!(
+                "#!/bin/sh\n\
+                 if [ \"$2\" = \"--batch-check\" ]; then\n\
+                 \x20 oid=$(cat)\n\
+                 \x20 case \"$oid\" in\n\
+                 \x20   {hung_oid}) sleep 30; exit 1 ;;\n\
+                 \x20 esac\n\
+                 \x20 printf '%s\\n' \"$oid\" | git \"$@\"\n\
+                 \x20 exit $?\n\
+                 fi\n\
+                 case \"$*\" in\n\
+                 \x20 *{hung_oid}*) sleep 30; exit 1 ;;\n\
+                 esac\n\
+                 exec git \"$@\"\n"
+            ),
+        );
+
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            crate::ipfs_pin::sweep_legacy_provider_cids_once(
+                std::path::Path::new("/tmp"),
+                git_bin.to_str().unwrap(),
+                std::time::Duration::from_secs(4),
+                16,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the pass terminates")
+        .expect("the pass succeeds");
+
+        assert_eq!(stats.scanned, 2, "both rows are walked in the one pass");
+        assert_eq!(
+            stored_pin(&pool, &live_oid).await.0,
+            live_raw,
+            "the second row still probes with a LIVE deadline and is repaired in the \
+             same pass; a hung first row must not spend the whole pass budget"
+        );
+        assert_eq!(stats.repaired, 1, "exactly the second row is repaired");
+        assert_eq!(
+            stored_pin(&pool, &hung_oid).await.0,
+            hung_provider,
+            "the wedged row keeps its provider key"
+        );
+        assert_eq!(
+            stats.retryable_skips, 1,
+            "the wedged row is retryable, so a later run walks it again"
+        );
+        assert_ne!(
+            live_raw, live_provider,
+            "control: the repaired key really differs from the seeded legacy one"
+        );
+    }
+
+    /// F6 scenario 2 (#173 round 13, MUST-NOT): once a pass's whole discovery budget is
+    /// spent, the rows it has not reached are skipped CHEAPLY and visibly, never folded
+    /// into ordinary retryable accounting. A row charged for a probe it never meaningfully
+    /// made burns `MAX_DEAD_ROW_READS_PER_RUN` on nothing, which pauses the run early and
+    /// (once the discovery continuation lands) would let it advance over windows nobody
+    /// probed.
+    ///
+    /// Seven source-less legacy rows, one warm candidate, and a `git` that wedges on
+    /// everything. With `git_timeout` at 4s each row slice is 1s, so about four rows spend
+    /// the pass budget between them and the rest start with it already gone: those charge
+    /// ZERO reads and the pass reports that it ran out. RED before the skip arm: every row
+    /// past the first reaches the probe with a dead deadline and is charged a read for it,
+    /// so `dead_row_reads` equals the row count.
+    #[sqlx::test]
+    async fn sweep_discovery_spent_pass_budget_skips_cheaply(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["spentsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("spentsrc.git");
+        let repo = seed_repo(&owner_did, "spentsrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let oids = [
+            fx.public_oid.clone(),
+            fx.secret_oid.clone(),
+            fx.public_tree_oid.clone(),
+            fx.secret_tree_oid.clone(),
+            fx.root_tree_oid.clone(),
+            fx.commit_oid.clone(),
+            fx.tag_oid.clone(),
+        ];
+        for oid in &oids {
+            seed_legacy_pin(&pool, &bare, oid, None).await;
+        }
+
+        // Wedges on every invocation, so no row can ever be repaired and the only
+        // question left is what each one COSTS.
+        let git_bin = write_git_shim(
+            &format!("gl-spent-git-{short}"),
+            "#!/bin/sh\nsleep 30\nexit 1\n",
+        );
+
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            crate::ipfs_pin::sweep_legacy_provider_cids_once(
+                std::path::Path::new("/tmp"),
+                git_bin.to_str().unwrap(),
+                std::time::Duration::from_secs(4),
+                16,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the pass terminates")
+        .expect("the pass succeeds");
+
+        assert_eq!(stats.scanned, oids.len(), "every row is walked");
+        assert_eq!(stats.repaired, 0, "a wedged candidate repairs nothing");
+        assert!(
+            stats.dead_row_reads < stats.scanned,
+            "a row reached after the pass budget is spent must be skipped free, not \
+             charged for a probe it cannot make: {} reads charged over {} rows",
+            stats.dead_row_reads,
+            stats.scanned
+        );
+        assert!(
+            stats.dead_row_reads <= 5,
+            "the pass budget is four row slices wide, so at most the rows that really \
+             probed are charged (plus at most one on the boundary); got {}",
+            stats.dead_row_reads
+        );
+        assert!(
+            stats.discovery_budget_spent,
+            "a pass that ran out of discovery budget must SAY so rather than starving \
+             its remaining rows silently"
+        );
+        assert_eq!(
+            stats.retryable_skips,
+            oids.len(),
+            "no row is settled: the wedged ones and the unprobed ones are all worth \
+             walking again"
+        );
+    }
+
     /// F1 scenario 6 (#173, the collision case): two warm repos hold identical bytes,
     /// which is the shape (forks, a shared LICENSE blob, the empty tree) that makes an
     /// exclusive first-pinner claim wrong. Discovery records ONE additive source and
