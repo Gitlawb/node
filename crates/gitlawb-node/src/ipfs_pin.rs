@@ -330,10 +330,11 @@ struct DiscoveryCtx {
 /// Three filters, all applied before any probe so a rejected candidate costs nothing
 /// against [`MAX_LEGACY_DISCOVERY_PROBES`]:
 ///
-/// - QUARANTINE. `list_all_repos` is a bare SELECT with no visibility or quarantine
-///   filter, and a quarantined repo is hidden from every reader, so it must not become
-///   a discovery source either. The resolver's legacy scan loads the same set and gates
-///   on it. Private, non-quarantined repos DO stay in the list: an additive source
+/// - QUARANTINE. A quarantined repo is hidden from every reader, so it must not become
+///   a discovery source either. Each page row carries its own `quarantined` flag, so
+///   the drop is a filter over the rows this pass already read rather than a second
+///   whole-node query. The resolver's legacy scan reads the same rows and drops on the
+///   same flag. Private, non-quarantined repos DO stay in the list: an additive source
 ///   record binds nothing to one repo's ACL, because the resolver gates every source
 ///   independently at serve time, so probing a private repo leaks nothing.
 /// - WARM ONLY. The path is resolved through the repo store's validated resolver and
@@ -344,32 +345,50 @@ struct DiscoveryCtx {
 /// - UNSAFE PATH. A name that fails the validated resolver is dropped with a warn and
 ///   is terminal; nothing a later run changes.
 ///
-/// The survivors are ordered oldest-first by `(created_at, id)` rather than by id
+/// The candidates are ordered oldest-first by `(created_at, id)` rather than by id
 /// alone. `repo_id` derives from the owner DID, which anyone can grind, so an id sort
 /// would let an attacker register low-sorting repos and push the true holder past the
 /// probe cap. Source-less rows predate provenance and their holders are old repos,
-/// while freshly registered repos sort last and cannot be backdated.
+/// while freshly registered repos sort last and cannot be backdated. That order is now
+/// the QUERY's (`ORDER BY created_at ASC, id ASC`, index-backed by migration v25) and
+/// pages concatenate in it, so the list is globally sorted as it is built and no
+/// client-side sort is involved.
 async fn load_discovery_ctx(
     repos_dir: &std::path::Path,
     git_timeout: Duration,
     db: &crate::db::Db,
 ) -> Result<DiscoveryCtx> {
-    let repos = db.list_all_repos().await?;
-    let quarantined: std::collections::HashSet<String> = db
-        .list_quarantined_repos()
-        .await?
-        .into_iter()
-        .map(|r| r.id)
-        .collect();
-    let mut candidates: Vec<crate::db::RepoRecord> = repos
-        .into_iter()
-        .filter(|r| !quarantined.contains(&r.id))
-        .collect();
-    candidates.sort_by(|a, b| {
-        a.created_at
-            .cmp(&b.created_at)
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    // Page to EXHAUSTION. The resolver's legacy scan drives this same query and
+    // deliberately does NOT (`api::ipfs`): it stops the moment its probe or visit budget
+    // is spent, because it runs on an anonymously reachable route while holding scarce
+    // walk admission, where reading the whole table is the amplification the budget
+    // exists to forbid. Same query, different threat model. This is background
+    // maintenance on a timer: no caller to amplify, no permit to pin, and the pass needs
+    // the whole warm candidate set before it can call a row settled. Do not "align" this
+    // loop with the resolver's — the budgets it stops on have no counterpart here.
+    //
+    // Per PASS, not per row: `load_discovery_ctx` already runs once per pass and its
+    // result is reused for every source-less row, so the paging cost is paid once.
+    let page_rows = crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS;
+    let mut cursor: Option<(String, String)> = None;
+    let mut candidates: Vec<crate::db::RepoRecord> = Vec::new();
+    loop {
+        let page = db
+            .list_repos_page_for_scan(
+                cursor
+                    .as_ref()
+                    .map(|(created_at, id)| (created_at.as_str(), id.as_str())),
+                page_rows as i64,
+            )
+            .await?;
+        let Some(last) = page.last() else { break };
+        cursor = Some((last.created_at_key.clone(), last.repo.id.clone()));
+        let last_page = page.len() < page_rows;
+        candidates.extend(page.into_iter().filter(|r| !r.quarantined).map(|r| r.repo));
+        if last_page {
+            break;
+        }
+    }
 
     let repos_dir = repos_dir.to_path_buf();
     let warm = tokio::task::spawn_blocking(move || {
