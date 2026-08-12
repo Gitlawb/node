@@ -50,8 +50,15 @@ pub enum AppError {
     #[error("incomplete: {0}")]
     Incomplete(String),
 
-    #[error("search incomplete: {0}")]
-    SearchIncomplete(String),
+    /// A bounded search that could not complete. `continuation`, when present, is the
+    /// sealed scan position the caller echoes as `?scan=` to resume where the search
+    /// stopped (#173 round 13, F2). It is AEAD-sealed at the mint site, never plaintext:
+    /// the row it names is by construction one the caller was denied (INV-13).
+    #[error("search incomplete: {message}")]
+    SearchIncomplete {
+        message: String,
+        continuation: Option<String>,
+    },
 
     #[error("git error: {0}")]
     Git(String),
@@ -168,10 +175,10 @@ impl IntoResponse for AppError {
             // legacy-probe or walk ceiling), distinct from the 404 that asserts a
             // definitive not-found: absence was NOT proven, so the caller should
             // retry rather than treat it as gone (#173, F2). 503, retryable.
-            AppError::SearchIncomplete(msg) => (
+            AppError::SearchIncomplete { message, .. } => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "search_incomplete",
-                msg.clone(),
+                message.clone(),
             ),
             AppError::Git(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "git_error", msg.clone()),
             // 504, distinct from the 500 git_error and from the read-gate's 404 /
@@ -213,19 +220,31 @@ impl IntoResponse for AppError {
             }
         };
 
-        let body = Json(json!({
+        let mut body = json!({
             "error": code,
             "message": message,
-        }));
+        });
+        // A truncated CID search may carry the sealed position the caller echoes as
+        // `?scan=` to resume. Rendered as a third body field, present only when the
+        // shed actually left something to resume: a wrapped scan and a throttled
+        // request both omit it, and its ABSENCE is what tells a caller the ladder is
+        // over. It is opaque ciphertext; see `gitlawb_core::scan_token`.
+        if let AppError::SearchIncomplete {
+            continuation: Some(token),
+            ..
+        } = &self
+        {
+            body["continuation"] = json!(token);
+        }
 
-        let mut resp = (status, body).into_response();
+        let mut resp = (status, Json(body)).into_response();
         // Both retryable 503s advertise when to retry: Overloaded (capacity shed) and
         // SearchIncomplete (a bounded CID search cut short by a cap — retry may complete
         // it). They ride the shared tail above for body/status, so the header is attached
         // here rather than in bespoke early returns, keeping each variant handled once.
         if matches!(
             self,
-            AppError::Overloaded(_) | AppError::SearchIncomplete(_)
+            AppError::Overloaded(_) | AppError::SearchIncomplete { .. }
         ) {
             resp.headers_mut().insert(
                 axum::http::header::RETRY_AFTER,

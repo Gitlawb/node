@@ -430,6 +430,11 @@ async fn main() -> Result<()> {
         // request). Default 256 preserves the shipped behaviour.
         ipfs_max_legacy_probes: AppState::ipfs_legacy_probe_budget(&config),
         ipfs_legacy_scan_page_rows: crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS,
+        // Operator-tunable via GITLAWB_IPFS_MAX_LEGACY_SCAN_ROWS, read through the same
+        // helper shape as the probe budget so the knob cannot be a silent no-op.
+        ipfs_max_legacy_scan_rows: AppState::ipfs_legacy_scan_row_budget(&config),
+        ipfs_max_legacy_scan_rules: crate::api::ipfs::MAX_LEGACY_SCAN_RULES_PER_REQUEST,
+        ipfs_scan_token_key: Arc::new(AppState::new_scan_token_key()),
         ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust,
         sync_trigger_rate_limiter,

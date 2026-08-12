@@ -86,6 +86,45 @@ pub(crate) const MAX_LEGACY_PROBES_PER_REQUEST: u32 = 256;
 /// sibling caps.
 pub(crate) const LEGACY_SCAN_PAGE_ROWS: usize = 128;
 
+/// Hard per-request ceiling on how many repo ROWS the legacy scan's pager may fetch
+/// (#173 round 13, F2, INV-10). The probe ceiling above only starts counting once a
+/// probe runs, and the two denial classes that dominate a hostile inventory —
+/// quarantine and a root-scope visibility deny — return before either `walk.probes`
+/// or `walk.visits` increments. So an all-quarantined or all-root-denying node paged
+/// through its ENTIRE repo table at zero probes, anonymously, retaining every row and
+/// rule set, while holding one of the scarce global walk permits for up to the whole
+/// request budget. This ceiling is what the DB-facing selection actually stops on.
+///
+/// Reaching a holder buried past the ceiling costs `ceil(repos / ceiling) + 1`
+/// token-echoing retries: a truncated scan sheds the retryable 503 with a sealed
+/// continuation (`ScanPosition`), and the caller echoes it as `?scan=` to resume
+/// exactly where the previous page stopped. No server-side scan state exists, so
+/// concurrent callers cannot advance or reset each other's ladder.
+///
+/// Above roughly `ceiling * (work-budget page term)` rows the bound's total page cost
+/// exceeds one work-budget window, so a caller laddering a very large inventory will
+/// meet the per-IP page toll before the end and resume after their bucket refills.
+///
+/// Tuning DOWN has a cost worth stating: token presence is a coarse inventory-size
+/// oracle. A ceiling truncation emits a token; a wrapped scan does not, so laddering
+/// until the `scan-wrapped` taint tells an anonymous caller the node's TOTAL repo
+/// count — private and quarantined rows included — to within one ceiling. At the 2048
+/// default that is tolled and coarse; it sharpens as the ceiling is lowered.
+///
+/// Tunable via `GITLAWB_IPFS_MAX_LEGACY_SCAN_ROWS` / `AppState`.
+pub(crate) const MAX_LEGACY_SCAN_ROWS_PER_REQUEST: usize = 2048;
+
+/// Hard per-request ceiling on how many visibility RULES the legacy scan's pager may
+/// retain (#173 round 13, F2, INV-10). The row ceiling bounds the row count but not
+/// the memory each row drags in: `fetch_next_page` keeps every fetched page's rules in
+/// `LegacyScanPager::rules` for the whole request (a later oid candidate re-reads them
+/// rather than re-querying), so a node whose repos each carry hundreds of path-scoped
+/// rules is retained-memory-unbounded at a row count well under the row ceiling.
+/// Counting the retained rules and stopping on them is the second half of the same
+/// bound. Not an operator knob: it is a memory guard, not a reach/coverage tradeoff,
+/// and 8192 is four rules per row at the default row ceiling.
+pub(crate) const MAX_LEGACY_SCAN_RULES_PER_REQUEST: usize = 8192;
+
 /// Hard ceiling on the byte size of an object `GET /ipfs/{cid}` buffers and serves
 /// (#173 round 8, F6, INV-10). The serve reads via a blocking `git cat-file` and
 /// buffers the whole object; unbounded, a large public blob (enumerable from the pins
@@ -124,6 +163,17 @@ struct LegacyScanPager {
     cursor: Option<(String, String)>,
     /// Set once a short page proves no rows remain after the cursor.
     exhausted: bool,
+    /// True when `cursor` was seeded from a caller-supplied continuation token rather
+    /// than starting at the front. Half of the `"scan-wrapped"` condition: absence is
+    /// only ever proven over `[start, end)`, so a resumed scan that runs off the end
+    /// has NOT covered `[front, start)` and must never reach the definitive 404.
+    resumed: bool,
+    /// Rows fetched THIS request, the quantity the row ceiling bounds. Distinct from
+    /// `rows.len()`, which is the same number today but would silently stop tracking
+    /// the DB-facing cost if the pager ever dropped gated rows.
+    fetched_rows: usize,
+    /// Visibility rules retained this request, the quantity the rules ceiling bounds.
+    fetched_rules: usize,
 }
 
 impl LegacyScanPager {
@@ -174,6 +224,7 @@ impl LegacyScanPager {
         };
         #[cfg(test)]
         note_scan_rows(page.len());
+        self.fetched_rows += page.len();
         if page.len() < state.ipfs_legacy_scan_page_rows {
             self.exhausted = true;
         }
@@ -200,11 +251,28 @@ impl LegacyScanPager {
                 return Err(budget_shed());
             }
         };
+        self.fetched_rules += rules.values().map(Vec::len).sum::<usize>();
         self.rules.extend(rules);
         self.rows.extend(page);
         Ok(())
     }
 }
+
+/// Query string of `GET /ipfs/{cid}`.
+#[derive(serde::Deserialize)]
+pub struct ScanQuery {
+    /// Sealed continuation from a previous truncated scan's 503 body. Opened with the
+    /// node's per-boot key and the request's canonical CID as associated data; ANY
+    /// failure (undecryptable, tampered, expired, malformed, minted for another CID) is
+    /// treated as absent and the scan starts at the front, identically and silently, so
+    /// the token is no oracle.
+    scan: Option<String>,
+}
+
+/// How long a continuation stays usable. Long enough for a caller to walk a ladder at a
+/// human pace and to ride out a work-bucket throttle; short enough that a leaked token
+/// stops being a valid scan seed quickly. An expired token is simply absent.
+const SCAN_TOKEN_TTL_SECS: i64 = 3600;
 
 /// GET /ipfs/{cid}
 ///
@@ -280,6 +348,7 @@ struct WalkAdmission {
 
 pub async fn get_by_cid(
     Path(cid_str): Path<String>,
+    axum::extract::Query(scan_query): axum::extract::Query<ScanQuery>,
     State(state): State<AppState>,
     crate::rate_limit::PeerAddr(peer): crate::rate_limit::PeerAddr,
     headers: HeaderMap,
@@ -457,6 +526,27 @@ pub async fn get_by_cid(
     // cursor and its fetched rows are accounted per REQUEST: a per-candidate pager
     // would restore the very fan-out the paging removes.
     let mut pager = LegacyScanPager::default();
+    // Resume from the caller's sealed continuation, if they sent one that opens. The
+    // node holds NO scan state of its own: the position rides in the token, which is
+    // what keeps concurrent ladders from advancing or resetting each other. Every
+    // failure class — tampered, wrong key (a prior boot's), expired, malformed, minted
+    // for a different CID — lands on the same `None` and starts at the front, silently,
+    // so no probe distinguishes them (INV-13).
+    if let Some(token) = scan_query.scan.as_deref() {
+        if let Some(pos) = gitlawb_core::scan_token::open_scan_token(
+            &state.ipfs_scan_token_key,
+            &canonical_cid,
+            token,
+            chrono::Utc::now().timestamp(),
+        ) {
+            pager.cursor = Some((pos.created_at_key, pos.id));
+            pager.resumed = true;
+        }
+    }
+    // Set when a ceiling truncates the scan, to the position the caller echoes back.
+    // Sealed at the tail rather than here so exactly one site mints a token and the
+    // wrap case can clear it in one place.
+    let mut scan_continuation: Option<(String, String)> = None;
 
     for sha256_hex in &oids {
         // A pinned object records EVERY repo it was pinned from (#173 round 8, F1).
@@ -678,15 +768,17 @@ pub async fn get_by_cid(
                     // this is the check that keeps the DB-facing selection bounded, so
                     // a one-probe request cannot pull the node's whole inventory.
                     //
-                    // Note what is deliberately NOT a stop condition: a page of pure
-                    // denials. A quarantined row or a visibility deny costs no probe,
-                    // so paging must continue past them or a public object buried
-                    // behind many private repos would falsely 404. The budgets above,
-                    // not a page count, are what bound that case.
+                    // A page of pure denials is still NOT a hard stop into a 404: a
+                    // quarantined row or a visibility deny costs no probe, so paging
+                    // must continue past them or a public object buried behind many
+                    // private repos would falsely 404. What bounds that case is not a
+                    // denial count but the DB-facing ceilings just below, and every
+                    // truncation they cause carries a continuation so the buried object
+                    // stays reachable across requests (#173 round 13, F2).
                     //
-                    // Stopping here leaves every unread repo unproven, so it TAINTS:
-                    // the tail sheds a retryable 503 naming the ceiling, never a
-                    // definitive 404 (#173, F2).
+                    // Stopping at any of these leaves every unread repo unproven, so
+                    // each TAINTS: the tail sheds a retryable 503 naming the ceiling,
+                    // never a definitive 404 (#173, F2).
                     if walk.probes >= state.ipfs_max_legacy_probes {
                         walk.taint("probe-ceiling");
                         break;
@@ -694,6 +786,45 @@ pub async fn get_by_cid(
                     if walk.visits >= state.config.ipfs_max_repo_visits {
                         walk.taint("visit-ceiling");
                         break;
+                    }
+                    // Row ceiling (F2). The two checks above only bind once a probe or a
+                    // visit has been spent, and the gate returns Skip on quarantine and
+                    // on a root-scope deny BEFORE either counter moves — so an
+                    // all-denying inventory paged the node's whole repo table at zero
+                    // probes, anonymously, while holding a scarce walk permit. This is
+                    // the check that actually stops that scan.
+                    if pager.fetched_rows >= state.ipfs_max_legacy_scan_rows {
+                        walk.taint("row-ceiling");
+                        scan_continuation = pager.cursor.clone();
+                        break;
+                    }
+                    // Rules ceiling: the row ceiling bounds rows, not the rules each row
+                    // drags in, and the pager retains every fetched page's rules for the
+                    // whole request.
+                    if pager.fetched_rules >= state.ipfs_max_legacy_scan_rules {
+                        walk.taint("rules-ceiling");
+                        scan_continuation = pager.cursor.clone();
+                        break;
+                    }
+                    // Page toll (F2). Every page is work bought by an anonymous caller,
+                    // so it is charged to the per-IP WORK bucket — the same bucket the
+                    // per-probe charge debits — immediately before the query it pays
+                    // for. Without it a denial-only inventory could be re-paged for free
+                    // by re-requesting, which is the across-request half of the same
+                    // amplification. Reuses the `source_key` already resolved at
+                    // admission; no resolvable key (a test oneshot with no peer or
+                    // trusted header) skips the charge, exactly as the walk and probe
+                    // brakes do.
+                    //
+                    // A spent bucket sets `throttled` and breaks WITHOUT tainting and
+                    // WITHOUT a token: the caller's own bucket stopped them, their
+                    // previous token still resumes them after it refills, and the tail
+                    // renders the 429 when nothing else tainted.
+                    if let Some(key) = &source_key {
+                        if !state.ipfs_work_rate_limiter.check(key).await {
+                            throttled = true;
+                            break;
+                        }
                     }
                     pager
                         .fetch_next_page(&state, request_deadline, &cid_str)
@@ -731,6 +862,25 @@ pub async fn get_by_cid(
         }
     }
 
+    // A RESUMED scan that reached the end of the table has proven absence only over
+    // `[token, end)`; the rows before the token were never looked at this request, so
+    // the definitive 404 is not available and the honest answer is the retryable 503.
+    //
+    // The condition is evaluated HERE, on `pager.exhausted`, and deliberately not at any
+    // particular break site. That is what covers the degenerate zero-row resume: a token
+    // at or past the last row — which the row ceiling emits whenever the row count is an
+    // exact multiple of the ceiling, and which repo deletion between ladder steps also
+    // reaches — fetches an EMPTY short page, sets `exhausted`, and breaks without
+    // gating anything. An implementation keying this on having fetched a page passes
+    // every other case and turns exactly that incomplete search into a false 404.
+    //
+    // A wrapped scan emits NO continuation: there is nothing left to resume, and the
+    // absence of the token is what tells the caller their ladder is over.
+    if pager.resumed && pager.exhausted {
+        walk.taint("scan-wrapped");
+        scan_continuation = None;
+    }
+
     // Nothing served — four distinct tails, in precedence order:
     //  1. A candidate repo is persistently broken (a corrupt repo, a bad `.git/config`),
     //     and that was the SOLE reason nothing served → terminal, non-retryable 500
@@ -745,7 +895,20 @@ pub async fn get_by_cid(
     //     retryable, and explicitly NOT a definitive not-found (#173 F2). This outranks
     //     the throttle: an incomplete search must not masquerade as a clean rate-limit
     //     outcome. The message names the truncation sources so an operator can map the
-    //     shed to the right knob or backend, and carries no object/OID/metadata.
+    //     shed to the right knob or backend, and carries no object/OID/metadata. When a
+    //     ceiling was the cut, the shed also carries the sealed continuation the caller
+    //     echoes as `?scan=` to resume.
+    //
+    //     ONE deliberate exception to that precedence (#173 round 13, F2): the legacy
+    //     scan's PAGE toll breaks the pager WITHOUT tainting, so a request stopped only
+    //     by its own spent work bucket falls through to the 429 below rather than the
+    //     503 here. The reason is that a 503 says "the node's search was cut short,
+    //     retry" and invites an immediate retry straight back into the same empty
+    //     bucket; a 429 names what actually stopped the caller and carries the honest
+    //     wait. Their previously issued token is still valid, so the retry after the
+    //     refill resumes rather than restarts. A request that tainted for any OTHER
+    //     reason and then also ran its bucket dry still lands here, per the ordering
+    //     as written.
     //  3. A walk-requiring candidate was skipped for a spent IP quota while the scan
     //     otherwise completed → 429 (the brake bit; a cheaper copy was sought first).
     //  4. A full scan under the caps found nothing readable → opaque 404, uniform with
@@ -756,10 +919,35 @@ pub async fn get_by_cid(
         ));
     }
     if !walk.truncated_by.is_empty() {
-        return Err(AppError::SearchIncomplete(format!(
-            "CID {cid_str} search incomplete ({}) — retry",
-            walk.truncated_by.join("+")
-        )));
+        // Seal the continuation HERE, the single mint site. The position is the last
+        // row the pager FETCHED, and on a scan that served nothing every fetched row is
+        // by construction private or quarantined — so its `created_at` and its `id`
+        // (which carries the owner's DID) are withheld fields and the token must be
+        // confidential, not merely tamper-evident (INV-13). A seal failure is not fatal
+        // to the shed: drop the continuation and answer the plain 503, which degrades to
+        // the pre-token behaviour rather than turning a truncation into a 500.
+        let continuation = scan_continuation.and_then(|(created_at_key, id)| {
+            match gitlawb_core::scan_token::seal_scan_token(
+                &state.ipfs_scan_token_key,
+                &canonical_cid,
+                &gitlawb_core::scan_token::ScanPosition { created_at_key, id },
+                chrono::Utc::now().timestamp() + SCAN_TOKEN_TTL_SECS,
+            ) {
+                Ok(token) => Some(token),
+                Err(e) => {
+                    tracing::warn!(error = %e, "/ipfs could not seal a scan continuation; \
+                         shedding the truncation 503 without one");
+                    None
+                }
+            }
+        });
+        return Err(AppError::SearchIncomplete {
+            message: format!(
+                "CID {cid_str} search incomplete ({}) — retry",
+                walk.truncated_by.join("+")
+            ),
+            continuation,
+        });
     }
     if throttled {
         return Err(AppError::TooManyRequests(
@@ -1831,6 +2019,139 @@ mod tests {
         "f2".repeat(32)
     }
 
+    /// Status plus decoded JSON body, for the F2 row-ceiling tests that assert on the
+    /// error code and the `continuation` field together.
+    async fn status_and_body(resp: axum::response::Response) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("read body");
+        let json = serde_json::from_slice(&bytes).unwrap_or_else(
+            |_| serde_json::json!({ "raw": String::from_utf8_lossy(&bytes).to_string() }),
+        );
+        (status, json)
+    }
+
+    /// The `continuation` token from a `search_incomplete` body, or `None`.
+    fn continuation_of(body: &serde_json::Value) -> Option<String> {
+        body.get("continuation")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
+
+    /// Deterministic ascending `created_at` for the seeded-inventory fixtures. The
+    /// paged scan orders on the STORED `created_at` TEXT then `id`, so whole-second
+    /// stamps from one base keep text order and time order identical (a `to_rfc3339`
+    /// with sub-second digits on some rows and not others would not).
+    fn scan_order_stamp(i: usize) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc
+            .with_ymd_and_hms(2020, 1, 1, 0, 0, 0)
+            .unwrap()
+            .checked_add_signed(chrono::Duration::seconds(i as i64))
+            .expect("in-range stamp")
+    }
+
+    /// Seed `n` PRIVATE repos owned by a foreign DID, in scan order, with `rules_each`
+    /// path-scoped rules apiece. An anonymous caller is denied at the root gate on every
+    /// one, and a root deny costs neither a probe nor a visit — which is exactly the
+    /// hole the row ceiling closes. Their `disk_path`s do not exist on purpose: if a
+    /// deny ever stopped short-circuiting, the missing-dir probe would taint the scan
+    /// with a different source and the tests' taint assertions would catch it.
+    async fn seed_root_denying_repos(
+        state: &crate::state::AppState,
+        prefix: &str,
+        n: usize,
+        rules_each: usize,
+    ) {
+        let owner = "did:key:z6MkF2RowCeilingOwnerAAAAAAAAAAAAAAAAAAA";
+        for i in 0..n {
+            let at = scan_order_stamp(i);
+            let id = format!("{prefix}-{i:04}");
+            state
+                .db
+                .create_repo(&crate::db::RepoRecord {
+                    id: id.clone(),
+                    name: format!("{prefix}-{i:04}"),
+                    owner_did: owner.to_string(),
+                    description: None,
+                    is_public: false,
+                    default_branch: "main".to_string(),
+                    created_at: at,
+                    updated_at: at,
+                    disk_path: format!("/nonexistent/{prefix}-{i:04}"),
+                    forked_from: None,
+                    machine_id: None,
+                })
+                .await
+                .expect("seed a root-denying repo");
+            for r in 0..rules_each {
+                state
+                    .db
+                    .set_visibility_rule(
+                        &id,
+                        &format!("withheld-{r}/**"),
+                        crate::db::VisibilityMode::B,
+                        &["did:key:z6MkU3NotTheCallerBBBBBBBBBBBBBBBBBBBBBB".to_string()],
+                        owner,
+                    )
+                    .await
+                    .expect("seed a visibility rule");
+            }
+        }
+    }
+
+    /// Seed `n` QUARANTINED mirror rows in scan order. Quarantine is the other denial
+    /// class that returns from the gate before a probe or a visit is spent, so it drives
+    /// the same unbounded pager the private-repo fixture does.
+    async fn seed_quarantined_repos(state: &crate::state::AppState, prefix: &str, n: usize) {
+        for i in 0..n {
+            state
+                .db
+                .upsert_mirror_repo(
+                    "z6quarantine",
+                    &format!("{prefix}-{i:04}"),
+                    &format!("/nonexistent/{prefix}-{i:04}"),
+                    None,
+                    true,
+                )
+                .await
+                .expect("seed a quarantined mirror row");
+        }
+    }
+
+    /// A GET carrying an optional `?scan=` continuation token.
+    fn get_cid_scan(cid: &str, peer: Option<SocketAddr>, scan: Option<&str>) -> Request<Body> {
+        let uri = match scan {
+            Some(t) => format!("/ipfs/{cid}?scan={}", urlencode(t)),
+            None => format!("/ipfs/{cid}"),
+        };
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        if let Some(p) = peer {
+            req.extensions_mut().insert(ConnectInfo(p));
+        }
+        req
+    }
+
+    /// Percent-encode the few characters base64url tokens cannot contain but a hostile
+    /// or tampered token can. Keeps the invalid-token probes honest: a raw `+` in a
+    /// query string decodes to a space, which would make a tamper test pass for the
+    /// wrong reason.
+    fn urlencode(s: &str) -> String {
+        s.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    }
+
     /// Register a LEGACY (NULL-provenance) `pinned_cids` row and return its CID.
     ///
     /// The scan-verdict tests below predate the CID index (#173): they drove a bare
@@ -2874,6 +3195,1066 @@ mod tests {
             StatusCode::NOT_FOUND,
             "an anonymous caller denied by every repo gets a complete-scan 404 — a deny \
              is a verdict and must not visit, taint, or 503"
+        );
+    }
+
+    // ----------------------------------------------------------------------------
+    // #173 round 13, F2: the legacy scan's ROW ceiling, its caller-carried
+    // continuation token, and the per-page toll.
+    //
+    // The hole: the pager bought another page unless `walk.probes` or `walk.visits`
+    // was exhausted, but the gate returns Skip on quarantine and on a root-scope
+    // visibility deny BEFORE either counter increments. An all-quarantined or
+    // all-root-denying inventory therefore paged the node's entire repo table at zero
+    // probes, anonymously, retaining every row and rule set, while holding one of the
+    // scarce global walk permits for up to the whole request budget.
+    // ----------------------------------------------------------------------------
+
+    /// Scenario 1: an all-root-denied inventory stops at the row ceiling.
+    ///
+    /// Every seeded repo is private and the caller is anonymous, so each row is a root
+    /// deny: no probe, no visit, and pre-fix nothing that could stop the pager. The
+    /// scan must stop at the ceiling, taint (so the tail is the retryable 503, never a
+    /// false 404), free the walk permit, and hand back a continuation token.
+    ///
+    /// MUTATION A (RED): delete the row-ceiling check and `scan_rows()` reads the whole
+    /// seeded inventory instead of one ceiling's worth.
+    #[sqlx::test]
+    async fn get_by_cid_denial_only_scan_stops_at_row_ceiling(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 4;
+        seed_root_denying_repos(&state, "deny", 12, 0).await;
+        let cid = seed_legacy_pin(&state, &absent_oid()).await;
+
+        let walk_pool = state.git_ipfs_walk_semaphore.clone();
+        let free_before = walk_pool.available_permits();
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.140:5000".parse().unwrap();
+
+        crate::api::ipfs::reset_scan_rows();
+        let (status, body) = status_and_body(
+            router
+                .clone()
+                .oneshot(get_cid_scan(&cid, Some(peer), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        // The row COUNT first: it is the cost this ceiling exists to bound, and a
+        // status-first ordering would attribute a missing ceiling to the tail instead.
+        let rows = crate::api::ipfs::scan_rows();
+        assert!(
+            rows <= 4 + 2,
+            "the ceiling (4) bounds the DB-facing selection to at most one page (2) of \
+             overshoot; a denial-only inventory must not page the whole table. Read {rows} \
+             of 12 seeded rows"
+        );
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a scan cut short at the row ceiling left rows unproven, so the honest tail \
+             is the retryable 503, never a definitive 404; got body {body}"
+        );
+        assert_eq!(
+            body["error"], "search_incomplete",
+            "the shed must name the incomplete search: {body}"
+        );
+        assert!(
+            continuation_of(&body).is_some(),
+            "a ceiling truncation must hand back a continuation so a holder past the \
+             ceiling is still reachable: {body}"
+        );
+        assert_eq!(
+            walk_pool.available_permits(),
+            free_before,
+            "the shed must free the scarce walk admission, not hold it for the request budget"
+        );
+
+        // The follow-up is ADMITTED: the shed released the walk permit rather than
+        // parking it, so the next caller is not capacity-503'd behind it.
+        let (status, _) = status_and_body(
+            router
+                .oneshot(get_cid_scan(&cid, Some(peer), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the follow-up must be admitted and reach the same truncation verdict, not \
+             shed at capacity behind a held permit"
+        );
+    }
+
+    /// Scenario 2: an all-QUARANTINED inventory, same contract. Quarantine is the other
+    /// denial class that returns from the gate before a probe or a visit is spent, so a
+    /// ceiling keyed on either counter would miss it entirely.
+    ///
+    /// MUTATION A (RED): as scenario 1.
+    #[sqlx::test]
+    async fn get_by_cid_quarantined_only_scan_stops_at_row_ceiling(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 4;
+        seed_quarantined_repos(&state, "quar", 12).await;
+        let cid = seed_legacy_pin(&state, &absent_oid()).await;
+
+        let peer: SocketAddr = "203.0.113.141:5000".parse().unwrap();
+        crate::api::ipfs::reset_scan_rows();
+        let (status, body) = status_and_body(
+            ipfs_router(state)
+                .oneshot(get_cid_scan(&cid, Some(peer), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a quarantined-only inventory truncates at the ceiling like a denied one: {body}"
+        );
+        assert_eq!(body["error"], "search_incomplete", "{body}");
+        let rows = crate::api::ipfs::scan_rows();
+        assert!(
+            rows <= 4 + 2,
+            "quarantine costs neither a probe nor a visit, so only the ROW ceiling can \
+             stop this pager. Read {rows} of 12 seeded rows"
+        );
+        assert!(
+            continuation_of(&body).is_some(),
+            "the quarantined-inventory truncation carries a continuation too: {body}"
+        );
+    }
+
+    /// Scenario 3 (must-not): a buried PUBLIC row inside the ceiling still serves. The
+    /// ceiling bounds the search; it must never convert reachable content into a shed.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_public_row_inside_row_ceiling_still_serves(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        // Ceiling comfortably ABOVE the inventory: nothing may truncate here.
+        state.ipfs_max_legacy_scan_rows = 64;
+
+        seed_root_denying_repos(&state, "buried", 5, 0).await;
+        // Seeded last, and `upsert_mirror_repo` stamps `now`, so this row sorts after
+        // every 2020-stamped denial row and is genuinely reached last.
+        let (_, oid) = seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6inside",
+            "holder",
+            b"inside ceiling\n",
+        )
+        .await;
+        let cid = seed_legacy_pin_for_oid(&state, &oid).await;
+
+        let peer: SocketAddr = "203.0.113.142:5000".parse().unwrap();
+        let resp = ipfs_router(state)
+            .oneshot(get_cid_scan(&cid, Some(peer), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a public holder inside the ceiling must serve; a ceiling that sheds \
+             reachable content is worse than the unbounded scan it replaced"
+        );
+    }
+
+    /// Scenario 4 (must-not): no ceiling ever produces a 404.
+    ///
+    /// Three legs against one genuinely-absent object over 5 denial rows at ceiling 2:
+    ///   * a front-started truncated scan is 503 `search_incomplete` WITH a token;
+    ///   * a token-resumed scan that reaches the table end taints `scan-wrapped` and
+    ///     emits NO token (absence was proven only over `[start, end)`);
+    ///   * only a front-started scan that exhausts under every ceiling reaches the 404.
+    ///
+    /// MUTATION B (RED): replace taint-and-break with a bare `break` and the first leg
+    /// becomes the 404 tail.
+    #[sqlx::test]
+    async fn get_by_cid_row_ceiling_never_returns_404(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 2;
+        seed_root_denying_repos(&state, "no404", 5, 0).await;
+        let cid = seed_legacy_pin(&state, &absent_oid()).await;
+
+        let router = ipfs_router(state.clone());
+        let peer: SocketAddr = "203.0.113.143:5000".parse().unwrap();
+
+        // Leg 1: front-started truncation.
+        let (status, body) = status_and_body(
+            router
+                .clone()
+                .oneshot(get_cid_scan(&cid, Some(peer), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a truncated scan is never a 404: {body}"
+        );
+        assert_eq!(body["error"], "search_incomplete", "{body}");
+        let mut token = continuation_of(&body).expect("leg 1 must emit a continuation");
+
+        // Leg 2: ladder to the end. 5 rows at ceiling 2 truncates twice, then the third
+        // resume reads the short final page and WRAPS.
+        let mut wrapped = None;
+        for step in 0..6 {
+            let (status, body) = status_and_body(
+                router
+                    .clone()
+                    .oneshot(get_cid_scan(&cid, Some(peer), Some(&token)))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "every rung of the ladder over an absent object is a retryable 503, \
+                 never a 404 (step {step}): {body}"
+            );
+            match continuation_of(&body) {
+                Some(next) => token = next,
+                None => {
+                    wrapped = Some(body);
+                    break;
+                }
+            }
+        }
+        let wrapped = wrapped.expect("the ladder must reach the table end within its bound");
+        assert!(
+            wrapped["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("scan-wrapped"),
+            "a resumed scan that reaches the end must taint scan-wrapped, so absence \
+             proven only over [start, end) is never reported as a definitive 404: {wrapped}"
+        );
+        assert!(
+            continuation_of(&wrapped).is_none(),
+            "a wrapped scan emits NO token — there is nothing left to resume: {wrapped}"
+        );
+
+        // Leg 3: the 404 tail stays reachable for a front-started scan that exhausts
+        // under every ceiling.
+        let mut wide = state.clone();
+        wide.ipfs_max_legacy_scan_rows = 1000;
+        let (status, body) = status_and_body(
+            ipfs_router(wide)
+                .oneshot(get_cid_scan(&cid, Some(peer), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a front-started scan that exhausts under every ceiling still gets the \
+             definitive 404; a ceiling that swallowed it would make every miss retryable \
+             forever: {body}"
+        );
+    }
+
+    /// Scenario 5: a holder buried PAST the ceiling becomes servable within the stated
+    /// bound by echoing tokens, under the PRODUCTION toll at its raised derived floor.
+    ///
+    /// Ceiling 4 over 10 denial rows with the public holder behind them: the bound is
+    /// `ceil(10 / 4) + 1 = 4` requests. Every intermediate response is the retryable
+    /// 503 with a token, and no 429 interrupts the ladder — which is what the floor fix
+    /// pins. The work bucket is sized to the DERIVED floor of a config whose page term
+    /// dominates (probe knob 1, row knob 896 = 7 pages, so floor = 8); under the old
+    /// floor (`max(route, probes)` = 1) the very first page would 429.
+    ///
+    /// The floor is 8 rather than the honest ladder's exact cost (6 pages + 1 probe = 7)
+    /// on purpose. A ladder that never resumes re-pages from the front every request and
+    /// costs 8, so at a bucket of 7 mutation C would trip the 429 guard one step before
+    /// the reach guard and its RED would be attributed to the toll rather than to the
+    /// missing continuation. One token of headroom keeps each guard reporting its own
+    /// property.
+    ///
+    /// MUTATION C (RED): emit the token but never open it on the way in, and the ladder
+    /// restarts at the front every time so the 200 never arrives.
+    ///
+    /// This test has NO pre-fix RED, and that is by design rather than an omission.
+    /// Mutation A (delete the row ceiling) must leave it GREEN, which means its
+    /// assertions have to tolerate the holder being served on the very first request —
+    /// exactly what an unbounded scan does. So the pre-fix head passes it. Its
+    /// load-bearing proof is mutation C, its designated mutant: C keeps the ceiling and
+    /// keeps minting tokens but never honours one, which is the only shape that makes
+    /// the holder permanently unservable.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_holder_past_scan_ceiling_serves_via_token_ladder(pool: sqlx::PgPool) {
+        use crate::state::AppState;
+        use clap::Parser;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 4;
+
+        // The production toll, sized exactly at its derived floor. The row knob here
+        // sizes the FLOOR (it reads the production 128-row page size); the ceiling the
+        // scan actually enforces is the AppState seam above, as with page rows.
+        let cfg = crate::config::Config::parse_from([
+            "gitlawb-node",
+            "--ipfs-rate-limit",
+            "1",
+            "--ipfs-max-legacy-probes",
+            "1",
+            "--ipfs-max-legacy-scan-rows",
+            "896",
+        ]);
+        let floor = AppState::ipfs_work_budget(&cfg);
+        assert_eq!(
+            floor, 8,
+            "fixture precondition: 1 probe + 896/128 = 7 pages"
+        );
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(floor, std::time::Duration::from_secs(3600));
+
+        seed_root_denying_repos(&state, "ladder", 10, 0).await;
+        let (_, oid) = seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6ladder",
+            "holder",
+            b"past the ceiling\n",
+        )
+        .await;
+        let cid = seed_legacy_pin_for_oid(&state, &oid).await;
+
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.144:5000".parse().unwrap();
+        let bound = 10usize.div_ceil(4) + 1;
+
+        let mut token: Option<String> = None;
+        let mut served_at = None;
+        for step in 1..=bound {
+            let (status, body) = status_and_body(
+                router
+                    .clone()
+                    .oneshot(get_cid_scan(&cid, Some(peer), token.as_deref()))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_ne!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "no 429 may interrupt an honest caller's ladder at step {step}: the work \
+                 floor must fit a full deep scan's page toll, or the reach bound is a \
+                 promise the toll breaks: {body}"
+            );
+            if status == StatusCode::OK {
+                served_at = Some(step);
+                break;
+            }
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "an intermediate rung is the retryable 503 (step {step}): {body}"
+            );
+            assert_eq!(body["error"], "search_incomplete", "{body}");
+            token = Some(
+                continuation_of(&body)
+                    .unwrap_or_else(|| panic!("rung {step} must carry a continuation: {body}")),
+            );
+        }
+        assert!(
+            served_at.is_some(),
+            "a holder past the ceiling must be served within ceil(10/4)+1 = {bound} \
+             token-echoing requests, or the ceiling has made it permanently unservable"
+        );
+    }
+
+    /// Scenario 6: the page toll accumulates ACROSS requests.
+    ///
+    /// Every page the scan buys is charged to the caller's per-IP work bucket, so a
+    /// denial-only inventory cannot be re-paged for free by re-requesting. A bucket
+    /// sized to 4 pages admits four requests' worth of paging and then sheds the fifth
+    /// with 429 — buying NO page (the `preload_queries()` count stalls) and carrying NO
+    /// token. The caller's PREVIOUS token still resumes them once the bucket refills.
+    ///
+    /// MUTATION D (RED): drop the page toll and the pages are free again — the fifth
+    /// request buys its page and never 429s.
+    #[sqlx::test]
+    async fn get_by_cid_denial_only_requests_throttle_across_requests(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 2;
+        // Four pages of allowance: above the derived floor's page term for this fixture
+        // and still small enough that a handful of requests exhausts it.
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(4, std::time::Duration::from_secs(3600));
+        seed_root_denying_repos(&state, "toll", 20, 0).await;
+        let cid = seed_legacy_pin(&state, &absent_oid()).await;
+
+        let router = ipfs_router(state.clone());
+        let peer: SocketAddr = "203.0.113.145:5000".parse().unwrap();
+
+        crate::api::ipfs::reset_preload_queries();
+        let mut last_token = None;
+        for step in 1..=4 {
+            let (status, body) = status_and_body(
+                router
+                    .clone()
+                    .oneshot(get_cid_scan(&cid, Some(peer), None))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "request {step} is within the bucket and must buy its page: {body}"
+            );
+            last_token = continuation_of(&body);
+        }
+        let last_token = last_token.expect("a tolled-but-admitted request still emits a token");
+        let pages_before = crate::api::ipfs::preload_queries();
+
+        let (status, body) = status_and_body(
+            router
+                .clone()
+                .oneshot(get_cid_scan(&cid, Some(peer), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a spent work bucket must brake the next denial-only request with 429 \
+             rather than sell it another page: {body}"
+        );
+        assert_eq!(
+            crate::api::ipfs::preload_queries(),
+            pages_before,
+            "and the braked request must buy NO page — a 429 that still paged would \
+             leave the amplification exactly where it was"
+        );
+        assert!(
+            continuation_of(&body).is_none(),
+            "the 429 carries no token: the caller's own bucket, not the node's search, \
+             stopped them, and their previous token is still valid: {body}"
+        );
+
+        // Bucket refilled (a fresh limiter is the window elapsing). The token the caller
+        // already holds still resumes them — the throttle cost them a page, not their
+        // place in the ladder.
+        let mut refilled = state.clone();
+        refilled.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(4, std::time::Duration::from_secs(3600));
+        crate::api::ipfs::reset_scan_rows();
+        let (status, body) = status_and_body(
+            ipfs_router(refilled)
+                .oneshot(get_cid_scan(&cid, Some(peer), Some(&last_token)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the previously issued token must still resume after a refill: {body}"
+        );
+        assert_eq!(
+            crate::api::ipfs::scan_rows(),
+            2,
+            "and it must resume at the sealed position — one ceiling's worth of rows \
+             read, not a restart at the front"
+        );
+    }
+
+    /// Scenario 7: the RULES ceiling. The row ceiling bounds the row count but not the
+    /// memory each row drags in: the pager retains every fetched page's rules for the
+    /// whole request. A window of rule-heavy repos must taint at the rules ceiling with
+    /// the row count still well under the row ceiling, on the same 503-with-token
+    /// contract.
+    #[sqlx::test]
+    async fn get_by_cid_rules_ceiling_stops_scan_with_token(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        // Rows are NOT the binding ceiling here.
+        state.ipfs_max_legacy_scan_rows = 1000;
+        state.ipfs_max_legacy_scan_rules = 3;
+        seed_root_denying_repos(&state, "rules", 8, 2).await;
+        let cid = seed_legacy_pin(&state, &absent_oid()).await;
+
+        let peer: SocketAddr = "203.0.113.146:5000".parse().unwrap();
+        crate::api::ipfs::reset_scan_rows();
+        let (status, body) = status_and_body(
+            ipfs_router(state)
+                .oneshot(get_cid_scan(&cid, Some(peer), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a rules-ceiling truncation sheds the same retryable 503: {body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("rules-ceiling"),
+            "the shed must name the rules ceiling so an operator can tell it from a row \
+             truncation: {body}"
+        );
+        let rows = crate::api::ipfs::scan_rows();
+        assert!(
+            rows < 1000,
+            "the rules ceiling must fire with rows still under the row ceiling, or it is \
+             not the guard being exercised; read {rows} rows"
+        );
+        assert!(
+            continuation_of(&body).is_some(),
+            "a rules truncation carries a continuation too: {body}"
+        );
+    }
+
+    /// Scenario 8: interleaved callers stay isolated. Two source keys alternate
+    /// token-echoing ladders against the same denial-heavy inventory with the holder
+    /// past the ceiling; each must reach its own 200 within its own bound.
+    ///
+    /// Isolation is STRUCTURAL under this design — each ladder's entire state rides in
+    /// its own tokens and the node holds none — so this is the executed confirmation
+    /// rather than a mutant target. It is what rules out the rejected designs: a
+    /// node-global persisted cursor lets these two advance each other's window, and a
+    /// per-caller server-side map lets one evict the other.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_interleaved_callers_each_reach_their_holder(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 4;
+        // The production toll, generous enough that neither caller's ladder is braked;
+        // this scenario is about isolation, not the toll.
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(600, std::time::Duration::from_secs(3600));
+
+        seed_root_denying_repos(&state, "interleave", 10, 0).await;
+        let (_, oid) = seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6interleave",
+            "holder",
+            b"shared holder\n",
+        )
+        .await;
+        let cid = seed_legacy_pin_for_oid(&state, &oid).await;
+
+        let router = ipfs_router(state);
+        let peers: [SocketAddr; 2] = [
+            "203.0.113.147:5000".parse().unwrap(),
+            "203.0.113.148:5000".parse().unwrap(),
+        ];
+        let bound = 10usize.div_ceil(4) + 1;
+        let mut tokens: [Option<String>; 2] = [None, None];
+        let mut served = [None, None];
+
+        for step in 1..=bound {
+            for (i, peer) in peers.iter().enumerate() {
+                if served[i].is_some() {
+                    continue;
+                }
+                let (status, body) = status_and_body(
+                    router
+                        .clone()
+                        .oneshot(get_cid_scan(&cid, Some(*peer), tokens[i].as_deref()))
+                        .await
+                        .unwrap(),
+                )
+                .await;
+                if status == StatusCode::OK {
+                    served[i] = Some(step);
+                    continue;
+                }
+                assert_eq!(
+                    status,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "caller {i} rung {step} must be the retryable 503: {body}"
+                );
+                tokens[i] = Some(
+                    continuation_of(&body)
+                        .unwrap_or_else(|| panic!("caller {i} rung {step} needs a token: {body}")),
+                );
+            }
+        }
+
+        assert!(
+            served[0].is_some() && served[1].is_some(),
+            "both interleaved callers must reach the holder within their own bound of \
+             {bound}; got {served:?}. A shared server-side cursor would let one caller's \
+             progress skip the other's coverage"
+        );
+    }
+
+    /// Seed `n` PRIVATE repos whose id, owner DID, and `created_at` are all
+    /// high-entropy MARKERS, so a substring search over an emitted token is a real
+    /// test. Returns the markers in scan order.
+    async fn seed_marked_withheld_repos(
+        state: &crate::state::AppState,
+        n: usize,
+    ) -> Vec<(String, String, String)> {
+        const OWNER: &str = "did:key:z6MkWithheldOwnerMarkerQQQQQQQQQQQQQQQQ";
+        let mut out = Vec::new();
+        for i in 0..n {
+            let at = scan_order_stamp(i);
+            let id = format!("marker-repo-XZXZ{i:04}");
+            // Every other row is a quarantined mirror instead of a private repo, so
+            // both withholding classes sit in the window the token is minted from.
+            if i % 2 == 1 {
+                state
+                    .db
+                    .upsert_mirror_repo(OWNER, &id, &format!("/nonexistent/{id}"), None, true)
+                    .await
+                    .expect("seed a quarantined marker row");
+                // `upsert_mirror_repo` stamps `now` and derives its own id, so re-read
+                // the row the scan will actually see.
+                let rec = state
+                    .db
+                    .get_repo(OWNER, &id)
+                    .await
+                    .unwrap()
+                    .expect("the quarantined marker row exists");
+                out.push((rec.id, OWNER.to_string(), rec.created_at.to_rfc3339()));
+                continue;
+            }
+            state
+                .db
+                .create_repo(&crate::db::RepoRecord {
+                    id: id.clone(),
+                    name: id.clone(),
+                    owner_did: OWNER.to_string(),
+                    description: None,
+                    is_public: false,
+                    default_branch: "main".to_string(),
+                    created_at: at,
+                    updated_at: at,
+                    disk_path: format!("/nonexistent/{id}"),
+                    forked_from: None,
+                    machine_id: None,
+                })
+                .await
+                .expect("seed a private marker row");
+            out.push((id, OWNER.to_string(), at.to_rfc3339()));
+        }
+        out
+    }
+
+    /// Scenario 9, the INV-13 guard: the emitted continuation leaks no withheld field.
+    ///
+    /// A denial-only scan fetches nothing BUT withheld rows, so the row its token seals
+    /// is by construction a private or quarantined repo the caller may not read. Its
+    /// `created_at` leaks a hidden repo's creation time and its `id` carries the owner's
+    /// DID. Base64 is transport, not confidentiality — this is the exact shape #134
+    /// shipped and INV-13 records — so the token must be AEAD-SEALED.
+    ///
+    /// The fixture is arranged so the row at the truncation boundary (the row the token
+    /// seals) IS one of the poisoned withheld repos. Stated because it is load-bearing:
+    /// a future edit seeding a READABLE repo at the boundary would leave mutation E
+    /// green and this guard would silently stop proving anything.
+    ///
+    /// The last assertion is the one the substring checks structurally cannot make.
+    /// AEAD ciphertext is plaintext-length plus the tag, and both halves of a scan
+    /// position vary in length, so without fixed-width padding the token LENGTH is a
+    /// side channel for the sealed row.
+    ///
+    /// MUTATION E (RED): seal by base64-of-plaintext and the markers decode straight out.
+    /// MUTATION G (RED): drop the fixed-width padding and the two lengths diverge.
+    ///
+    /// Like the two token guards below it, this has no pre-fix RED: its assertions call
+    /// `seal_scan_token` / `open_scan_token`, which do not exist on the pre-fix head, so
+    /// the only failure available there is a compile error. Mutations E and G are its
+    /// REDs, and each injects precisely the encoding INV-13 forbids rather than merely
+    /// removing the code, which is the stronger observation.
+    #[sqlx::test]
+    async fn scan_token_leaks_no_withheld_fields(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 2;
+        let markers = seed_marked_withheld_repos(&state, 6).await;
+        let cid = seed_legacy_pin(&state, &absent_oid()).await;
+        let key = state.ipfs_scan_token_key.clone();
+
+        let peer: SocketAddr = "203.0.113.150:5000".parse().unwrap();
+        let resp = ipfs_router(state)
+            .oneshot(get_cid_scan(&cid, Some(peer), None))
+            .await
+            .unwrap();
+        let raw_body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("read body");
+        let body_text = String::from_utf8_lossy(&raw_body).to_string();
+        let body: serde_json::Value = serde_json::from_slice(&raw_body).expect("json body");
+        let token = continuation_of(&body).expect("the truncation must emit a token");
+
+        // Fixture precondition, on the FIXTURE rather than on the token: every seeded
+        // row is withheld (private or quarantined) and the scan stopped after exactly
+        // one ceiling's worth, so the row the token seals is a withheld row. Stated
+        // without opening the token so the leak assertions below are what fires when the
+        // seal is replaced by an encoding, rather than a precondition panic.
+        assert_eq!(
+            crate::api::ipfs::scan_rows(),
+            2,
+            "the truncation boundary must sit inside the seeded withheld window"
+        );
+
+        let decoded = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            token.as_bytes(),
+        )
+        .expect("the token is base64url");
+        let decoded_text = String::from_utf8_lossy(&decoded).to_string();
+
+        for (id, owner, created) in &markers {
+            for (what, marker) in [
+                ("repo id", id),
+                ("owner did", owner),
+                ("created_at", created),
+            ] {
+                assert!(
+                    !body_text.contains(marker.as_str()),
+                    "the response body must not carry a withheld repo's {what} ({marker}): \
+                     {body_text}"
+                );
+                assert!(
+                    !decoded_text.contains(marker.as_str()),
+                    "the token's DECODED bytes must not carry a withheld repo's {what} \
+                     ({marker}) — base64 is transport, not confidentiality (INV-13)"
+                );
+                assert!(
+                    decoded
+                        .windows(marker.len())
+                        .all(|w| w != marker.as_bytes()),
+                    "the token's raw bytes must not carry a withheld repo's {what} ({marker})"
+                );
+            }
+        }
+
+        // And the row it actually seals IS one of the poisoned withheld rows — checked
+        // after the leak assertions so a broken seal is reported as a leak, not as a
+        // fixture failure. Load-bearing: seeding a READABLE repo at the boundary would
+        // leave mutation E green and this whole guard would stop proving anything.
+        let sealed = gitlawb_core::scan_token::open_scan_token(
+            &key,
+            &cid,
+            &token,
+            chrono::Utc::now().timestamp(),
+        )
+        .expect("the node's own key opens its own token");
+        assert!(
+            markers
+                .iter()
+                .any(|(id, _, created)| *id == sealed.id && *created == sealed.created_at_key),
+            "the row at the truncation boundary must be one of the poisoned withheld \
+             repos; sealed {sealed:?}"
+        );
+
+        // A different key must not open it: the seal, not an encoding, is what withholds.
+        let other = gitlawb_core::scan_token::new_key();
+        assert!(
+            gitlawb_core::scan_token::open_scan_token(
+                &other,
+                &cid,
+                &token,
+                chrono::Utc::now().timestamp()
+            )
+            .is_none(),
+            "a token that opens under any key but the node's own is not sealed"
+        );
+
+        // Token LENGTH must not vary with the sealed row.
+        let now = chrono::Utc::now().timestamp();
+        let short = gitlawb_core::scan_token::seal_scan_token(
+            &key,
+            &cid,
+            &gitlawb_core::scan_token::ScanPosition {
+                created_at_key: "2020-01-01T00:00:00+00:00".into(),
+                id: "a/b".into(),
+            },
+            now + 60,
+        )
+        .unwrap();
+        let long = gitlawb_core::scan_token::seal_scan_token(
+            &key,
+            &cid,
+            &gitlawb_core::scan_token::ScanPosition {
+                created_at_key: "2020-01-01T00:00:00+00:00".into(),
+                id: format!("did:key:z6MkAVeryLongOwnerKeyIdentifier/{}", "n".repeat(48)),
+            },
+            now + 60,
+        )
+        .unwrap();
+        assert_eq!(
+            short.len(),
+            long.len(),
+            "tokens sealing rows of very different id lengths must be byte-identical in \
+             length, or the length is a side channel for the withheld row — which the \
+             substring assertions above structurally cannot see"
+        );
+    }
+
+    /// Scenario 10: tampered, foreign-CID, and expired tokens are ABSENT, uniformly.
+    ///
+    /// Each of the three failure classes must produce exactly the front-started response
+    /// a tokenless request gets: same status, same body shape, and — the decisive part —
+    /// an emitted continuation sealing the FRONT window's last row, not the row the
+    /// rejected token named. Never an error, never a resumed position, and no way to
+    /// tell the three classes apart.
+    ///
+    /// The "front-started" half is asserted by opening the EMITTED token and checking
+    /// which row it seals, which looks over-elaborate until you try the obvious thing.
+    /// `scan_rows()` cannot separate the two states: a front start reads rows 1-2 and a
+    /// resume from the rejected position reads rows 3-4, so the counter says 2 either
+    /// way. The sealed position is the only thing that differs, and without checking it
+    /// the foreign-CID leg passes under mutation F.
+    ///
+    /// No pre-fix RED, for the same reason as the guard above: the probes are minted
+    /// with `seal_scan_token`, which does not exist pre-fix. Mutation F is its RED.
+    ///
+    /// MUTATION F (RED): drop the CID from the associated data and the foreign-CID leg's
+    /// token is honoured, so the scan resumes at the foreign position.
+    #[sqlx::test]
+    async fn scan_token_invalid_variants_start_at_front(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 2;
+        seed_root_denying_repos(&state, "front", 6, 0).await;
+        let cid = seed_legacy_pin(&state, &absent_oid()).await;
+        let key = state.ipfs_scan_token_key.clone();
+        let now = chrono::Utc::now().timestamp();
+
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.151:5000".parse().unwrap();
+
+        // Baseline: a tokenless request reads the front window and seals row 2.
+        let (base_status, base_body) = status_and_body(
+            router
+                .clone()
+                .oneshot(get_cid_scan(&cid, Some(peer), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let base_token = continuation_of(&base_body).expect("baseline emits a token");
+        let front = gitlawb_core::scan_token::open_scan_token(&key, &cid, &base_token, now)
+            .expect("baseline token opens");
+        assert_eq!(
+            front.id, "front-0001",
+            "fixture precondition: the front window ends at the second seeded row"
+        );
+
+        // Probe 1: a byte-flipped token.
+        let mut bytes: Vec<u8> = base_token.bytes().collect();
+        let last = bytes.len() - 1;
+        bytes[last] = if bytes[last] == b'A' { b'B' } else { b'A' };
+        let tampered = String::from_utf8(bytes).unwrap();
+
+        // Probe 2: a well-formed token minted for a DIFFERENT CID, at a position deep
+        // in the table so honouring it would be unmistakable.
+        let elsewhere = cid_for_oid(&"f4".repeat(32));
+        let foreign = gitlawb_core::scan_token::seal_scan_token(
+            &key,
+            &elsewhere,
+            &gitlawb_core::scan_token::ScanPosition {
+                created_at_key: scan_order_stamp(3).to_rfc3339(),
+                id: "front-0003".into(),
+            },
+            now + 3600,
+        )
+        .unwrap();
+
+        // Probe 3: a token for this CID whose expiry is already past.
+        let expired = gitlawb_core::scan_token::seal_scan_token(
+            &key,
+            &cid,
+            &gitlawb_core::scan_token::ScanPosition {
+                created_at_key: scan_order_stamp(3).to_rfc3339(),
+                id: "front-0003".into(),
+            },
+            now - 1,
+        )
+        .unwrap();
+
+        for (what, probe) in [
+            ("tampered", tampered),
+            ("foreign-CID", foreign),
+            ("expired", expired),
+        ] {
+            let (status, body) = status_and_body(
+                router
+                    .clone()
+                    .oneshot(get_cid_scan(&cid, Some(peer), Some(&probe)))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                status, base_status,
+                "a {what} token must answer exactly as a tokenless request does, never \
+                 an error and never a distinguishable status: {body}"
+            );
+            assert_eq!(
+                body["error"], base_body["error"],
+                "a {what} token must not change the body shape: {body}"
+            );
+            assert_eq!(
+                body["message"], base_body["message"],
+                "a {what} token must not change the message: {body}"
+            );
+            let token = continuation_of(&body)
+                .unwrap_or_else(|| panic!("the {what} probe answers like a front start: {body}"));
+            let pos = gitlawb_core::scan_token::open_scan_token(&key, &cid, &token, now)
+                .expect("the emitted token opens");
+            assert_eq!(
+                pos.id, front.id,
+                "a {what} token must be treated as ABSENT and the scan must start at the \
+                 FRONT; resuming from it would honour a position the caller was never \
+                 handed for this CID"
+            );
+        }
+    }
+
+    /// Scenario 11: every seal draws a FRESH nonce.
+    ///
+    /// This is the property the whole confidentiality claim rests on and the one the
+    /// other two token guards cannot see: both of them pass unchanged under a constant
+    /// nonce. Under a stream cipher a repeated nonce repeats the keystream, so two
+    /// tokens sealed under one nonce XOR to the difference of their plaintexts — and an
+    /// attacker who can force the node to seal a position they know then recovers a
+    /// withheld row's fields in full. That is strictly worse than the base64 defect
+    /// INV-13 records.
+    ///
+    /// No pre-fix RED, like the two guards above: it seals through an API that does not
+    /// exist on the pre-fix head. Mutation H is its RED, and H reddens nothing else,
+    /// which is the same fact stated from the other side.
+    ///
+    /// MUTATION H (RED): fix the nonce to a constant and the two tokens are identical.
+    #[test]
+    fn scan_token_seals_are_nonce_fresh() {
+        let key = gitlawb_core::scan_token::new_key();
+        let pos = gitlawb_core::scan_token::ScanPosition {
+            created_at_key: "2020-01-01T00:00:07+00:00".into(),
+            id: "did:key:z6MkHiddenOwner/withheld-repo".into(),
+        };
+        let expires = chrono::Utc::now().timestamp() + 3600;
+        let first =
+            gitlawb_core::scan_token::seal_scan_token(&key, "bafkcid", &pos, expires).unwrap();
+        let second =
+            gitlawb_core::scan_token::seal_scan_token(&key, "bafkcid", &pos, expires).unwrap();
+
+        assert_ne!(
+            first, second,
+            "sealing the same position twice must produce different bytes — identical \
+             tokens mean a reused nonce, and a reused nonce under a stream cipher leaks \
+             the withheld plaintext to anyone holding two tokens"
+        );
+        let now = chrono::Utc::now().timestamp();
+        for token in [&first, &second] {
+            let opened = gitlawb_core::scan_token::open_scan_token(&key, "bafkcid", token, now)
+                .expect("both tokens must still open");
+            assert_eq!(
+                opened, pos,
+                "nonce freshness must not cost correctness: both seals open to the same \
+                 position"
+            );
+        }
+    }
+
+    /// Scenario 12: the degenerate ZERO-ROW resume never 404s.
+    ///
+    /// A row count that is an EXACT multiple of the ceiling is the shape whose last
+    /// emitted token points AT the final row, so the next resume fetches an empty page.
+    /// The wrap taint is evaluated on `pager.exhausted`, not at any particular break
+    /// site, so this is covered by construction: an implementation that keys the taint
+    /// on having fetched a page passes every other scenario here and converts an
+    /// incomplete search into a false 404 exactly here.
+    #[sqlx::test]
+    async fn scan_token_at_table_end_wraps_not_404(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 2;
+        // 4 rows at ceiling 2: the second rung's token points at the last row.
+        seed_root_denying_repos(&state, "endstop", 4, 0).await;
+        let cid = seed_legacy_pin(&state, &absent_oid()).await;
+
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.149:5000".parse().unwrap();
+
+        let mut token: Option<String> = None;
+        let mut last = None;
+        for step in 1..=4 {
+            let (status, body) = status_and_body(
+                router
+                    .clone()
+                    .oneshot(get_cid_scan(&cid, Some(peer), token.as_deref()))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no rung of this ladder may 404 — least of all the zero-row one \
+                 (step {step}): {body}"
+            );
+            match continuation_of(&body) {
+                Some(next) => token = Some(next),
+                None => {
+                    last = Some(body);
+                    break;
+                }
+            }
+        }
+        let last = last.expect("the ladder must terminate at the table end");
+        assert_eq!(last["error"], "search_incomplete", "{last}");
+        assert!(
+            last["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("scan-wrapped"),
+            "a resume landing on or past the last row fetches an empty page, which sets \
+             `exhausted` and must taint scan-wrapped: {last}"
+        );
+        assert!(
+            continuation_of(&last).is_none(),
+            "a wrapped scan emits no token: {last}"
         );
     }
 

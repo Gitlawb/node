@@ -106,6 +106,33 @@ pub struct AppState {
     /// before spending a single probe (#173, INV-10). A field for the same test-seam
     /// reason as the sibling caps.
     pub ipfs_legacy_scan_page_rows: usize,
+    /// Per-request ceiling on how many repo ROWS the CID resolver's legacy scan may
+    /// fetch (default `api::ipfs::MAX_LEGACY_SCAN_ROWS_PER_REQUEST`, operator-tunable via
+    /// `GITLAWB_IPFS_MAX_LEGACY_SCAN_ROWS`). `ipfs_max_legacy_probes` bounds the PROBE
+    /// fan-out but only starts counting once a probe runs, and quarantine plus a
+    /// root-scope visibility deny both return before a probe or a visit is spent, so an
+    /// all-denying inventory paged the whole repo table at zero probes (#173 round 13, F2).
+    /// Truncating here sheds a retryable 503 carrying a sealed continuation token.
+    pub ipfs_max_legacy_scan_rows: usize,
+    /// Per-request ceiling on how many visibility RULES the CID resolver's legacy scan
+    /// may retain (default `api::ipfs::MAX_LEGACY_SCAN_RULES_PER_REQUEST`). The row
+    /// ceiling above bounds the row count but not the memory each row drags in: the
+    /// pager keeps every fetched page's rules for the whole request. Deliberately NOT an
+    /// operator knob (it is a memory guard, not a reach tradeoff); a field only for the
+    /// same test-seam reason as the sibling caps.
+    pub ipfs_max_legacy_scan_rules: usize,
+    /// Per-boot key sealing the legacy scan's continuation tokens (INV-13).
+    ///
+    /// The token is minted from a FETCHED row on a scan that served nothing, so by
+    /// construction that row is a private or quarantined repo the caller may not read:
+    /// its `created_at` and its `id` (which carries the owner's DID) are withheld
+    /// fields. The token is therefore AEAD-SEALED, never signed plaintext and never
+    /// base64-of-plaintext — integrity is not confidentiality. Random per boot rather
+    /// than derived or persisted: a scan continuation has no cross-restart meaning (a
+    /// stale token simply fails to open and the caller restarts at the front, which is
+    /// the same uniform absent behaviour a tampered token gets), and a per-boot key
+    /// bounds the window in which any single key seals anything.
+    pub ipfs_scan_token_key: Arc<[u8; 32]>,
     /// Hard ceiling on the byte size of an object `GET /ipfs/{cid}` will buffer and
     /// serve (default `api::ipfs::MAX_SERVED_OBJECT_BYTES`). The serve reads via a
     /// blocking `git cat-file` and buffers the whole object; without a bound a large
@@ -322,6 +349,19 @@ impl AppState {
         config.ipfs_max_legacy_probes as u32
     }
 
+    /// Legacy-scan ROW budget wired from the `GITLAWB_IPFS_MAX_LEGACY_SCAN_ROWS` knob,
+    /// the same helper shape as the probe budget above so the knob cannot become a
+    /// silent no-op if a struct literal drifts back to the bare constant.
+    pub(crate) fn ipfs_legacy_scan_row_budget(config: &crate::config::Config) -> usize {
+        config.ipfs_max_legacy_scan_rows
+    }
+
+    /// A fresh random key for sealing legacy-scan continuation tokens (INV-13).
+    /// Drawn from the OS CSPRNG at construction; see `ipfs_scan_token_key`.
+    pub(crate) fn new_scan_token_key() -> [u8; 32] {
+        gitlawb_core::scan_token::new_key()
+    }
+
     /// Work-budget capacity for [`ipfs_work_rate_limiter`](Self#structfield.ipfs_work_rate_limiter)
     /// (R6, KTD6), DERIVED from the route limit rather than a new operator knob. The route
     /// limiter (`ipfs_rate_limiter`) charges once per request; this separate bucket absorbs
@@ -336,11 +376,25 @@ impl AppState {
     /// The floor is the LEGACY-PROBE knob, not `ipfs_max_repos_walked`. Those were one
     /// field before the walk cap and the probe budget were split apart, and reading the
     /// walk cap here would silently size this bucket at 64 instead of 256.
+    ///
+    /// The floor also carries the scan's PAGE toll (#173 round 13, F2): every page the
+    /// legacy scan buys is charged to this same bucket, so a deep scan spends
+    /// `ceil(ipfs_max_legacy_scan_rows / LEGACY_SCAN_PAGE_ROWS)` tokens on pages on top
+    /// of its probes. Leaving those out would 429 an honest caller part-way down their
+    /// own continuation-token ladder, which is the F6 admit-then-429 shape in a new
+    /// place. The page term uses the CONSTANT page size, not `AppState`'s field: the
+    /// field is a test seam that shrinks pages to make paging observable, and sizing a
+    /// production floor from it would inflate the budget by whatever a test chose.
     pub(crate) fn ipfs_work_budget(config: &crate::config::Config) -> usize {
         if config.ipfs_rate_limit == 0 {
             return 0;
         }
-        config.ipfs_rate_limit.max(config.ipfs_max_legacy_probes)
+        let pages = config
+            .ipfs_max_legacy_scan_rows
+            .div_ceil(crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS);
+        config
+            .ipfs_rate_limit
+            .max(config.ipfs_max_legacy_probes + pages)
     }
 }
 

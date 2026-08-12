@@ -83,6 +83,9 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
         ipfs_max_legacy_probes: crate::api::ipfs::MAX_LEGACY_PROBES_PER_REQUEST,
         ipfs_legacy_scan_page_rows: crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS,
+        ipfs_max_legacy_scan_rows: crate::api::ipfs::MAX_LEGACY_SCAN_ROWS_PER_REQUEST,
+        ipfs_max_legacy_scan_rules: crate::api::ipfs::MAX_LEGACY_SCAN_RULES_PER_REQUEST,
+        ipfs_scan_token_key: Arc::new(crate::state::AppState::new_scan_token_key()),
         ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust: crate::rate_limit::TrustedProxy::None,
         sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
@@ -10810,8 +10813,14 @@ mod tests {
         let slug = owner_did.replace([':', '/'], "_");
         let short = owner_did.split(':').next_back().unwrap().to_string();
         let mut state = test_state(pool).await;
+        // Budget = one full scan of the single seeded repo: 1 page + 1 probe. The page
+        // is charged because the legacy scan's DB-facing pages draw on this same bucket
+        // (#173 round 13, F2) — without that charge a denial-only inventory could be
+        // re-paged for free by re-requesting. Production never sees a bucket this small:
+        // `AppState::ipfs_work_budget` floors it at probes + pages, so only a fixture
+        // that sets the limiter by hand has to do the arithmetic itself.
         state.ipfs_work_rate_limiter =
-            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
+            crate::rate_limit::RateLimiter::new(2, Duration::from_secs(3600));
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
 
         let fx = seed_cid_repos(&slug, &short, &["fanout"]);
@@ -10869,10 +10878,15 @@ mod tests {
         let slug = owner_did.replace([':', '/'], "_");
         let short = owner_did.split(':').next_back().unwrap().to_string();
         let mut state = test_state(pool).await;
-        // Budget = one full scan of the four seeded repos. A repeat scan from the same
-        // IP then finds it spent. Keyed on XFF so `oneshot` can choose the source IP.
+        // Budget = one full scan of the four seeded repos: 1 page + 4 probes. A repeat
+        // scan from the same IP then finds it spent. Keyed on XFF so `oneshot` can
+        // choose the source IP. The page term is there because the scan's DB-facing
+        // pages draw on this same bucket (#173 round 13, F2), so re-requesting cannot
+        // buy the inventory again for free; all four repos fit in one 128-row page, so
+        // one page covers the whole scan. Production is floored at probes + pages by
+        // `AppState::ipfs_work_budget` — only a hand-set limiter does this arithmetic.
         state.ipfs_work_rate_limiter =
-            crate::rate_limit::RateLimiter::new(4, Duration::from_secs(3600));
+            crate::rate_limit::RateLimiter::new(5, Duration::from_secs(3600));
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
 
         let names = ["a0", "a1", "a2", "a3"];
@@ -12667,12 +12681,15 @@ mod tests {
         let short = owner_did.split(':').next_back().unwrap().to_string();
 
         let mut state = test_state(pool).await;
-        // The scan probes both seeded repos (walklimit + walkpublic) per request, so
-        // size the per-IP budget to admit exactly one full scan (2 probes). A repeat
-        // scan from the same IP then finds the bucket spent. Keyed on the rightmost
-        // X-Forwarded-For hop so the test can choose a source IP under `oneshot`.
+        // The scan reads both seeded repos (walklimit + walkpublic) in one page and
+        // probes each, so size the per-IP budget to admit exactly one full scan:
+        // 1 page + 2 probes. A repeat scan from the same IP then finds the bucket spent.
+        // Keyed on the rightmost X-Forwarded-For hop so the test can choose a source IP
+        // under `oneshot`. The page is charged because the scan's DB-facing pages draw
+        // on this same bucket (#173 round 13, F2). Production is floored at
+        // probes + pages by `AppState::ipfs_work_budget`; a hand-set limiter is not.
         state.ipfs_work_rate_limiter =
-            crate::rate_limit::RateLimiter::new(2, Duration::from_secs(3600));
+            crate::rate_limit::RateLimiter::new(3, Duration::from_secs(3600));
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
 
         let fx = seed_cid_repos(&slug, &short, &["walklimit"]);
@@ -12875,11 +12892,14 @@ mod tests {
         let slug = owner_did.replace([':', '/'], "_");
         let short = owner_did.split(':').next_back().unwrap().to_string();
         let mut state = test_state(pool).await;
-        // Budget = one full two-repo scan (2 probes), keyed on the rightmost XFF hop
-        // so `oneshot` can choose a source IP (no socket peer). A repeat scan from the
-        // same IP then finds the budget spent.
+        // Budget = one full two-repo scan: 1 page + 2 probes. Keyed on the rightmost XFF
+        // hop so `oneshot` can choose a source IP (no socket peer). A repeat scan from
+        // the same IP then finds the budget spent. The page is charged because the
+        // scan's DB-facing pages draw on this same bucket (#173 round 13, F2); both
+        // repos fit in one 128-row page. Production is floored at probes + pages by
+        // `AppState::ipfs_work_budget`, so only a hand-set limiter counts this out.
         state.ipfs_work_rate_limiter =
-            crate::rate_limit::RateLimiter::new(2, Duration::from_secs(3600));
+            crate::rate_limit::RateLimiter::new(3, Duration::from_secs(3600));
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
 
         // Identical secret-blob content in both bare clones → one CID resolves to

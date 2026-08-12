@@ -480,6 +480,37 @@ pub struct Config {
     )]
     pub ipfs_max_legacy_probes: usize,
 
+    /// Per-request ceiling on how many repo ROWS the `/ipfs/{cid}` resolver's legacy
+    /// scan may fetch from the database. The probe ceiling above only starts counting
+    /// once a probe runs, and the two denial classes that dominate a hostile inventory
+    /// (quarantine, and a root-scope visibility deny) return before a probe or a visit
+    /// is spent, so without this an all-denying node paged its ENTIRE repo table for one
+    /// anonymous request while holding a scarce walk permit.
+    ///
+    /// Reach bound: a holder buried past the ceiling is servable in
+    /// `ceil(repos / ceiling) + 1` token-echoing retries. A truncated scan sheds a
+    /// retryable 503 carrying a sealed continuation token; the caller echoes it as
+    /// `?scan=` and the scan resumes where it stopped. No server-side scan state.
+    ///
+    /// Floor coupling: raising this knob raises every caller's per-window `/ipfs` work
+    /// allowance whenever the route limit sits below the derived floor, because the
+    /// floor must fit one full deep scan's page toll (see `AppState::ipfs_work_budget`).
+    ///
+    /// Tuning DOWN trade: token presence is a coarse inventory-size oracle. A ceiling
+    /// truncation emits a token and a wrapped scan does not, so laddering to the
+    /// `scan-wrapped` taint tells an anonymous caller the node's total repo count,
+    /// private and quarantined included, to within one ceiling. Tolled and coarse at
+    /// the 2048 default; it sharpens as the ceiling is lowered.
+    ///
+    /// Must be between 1 and 1_048_576. Default: 2048.
+    #[arg(
+        long,
+        env = "GITLAWB_IPFS_MAX_LEGACY_SCAN_ROWS",
+        default_value_t = crate::api::ipfs::MAX_LEGACY_SCAN_ROWS_PER_REQUEST,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
+    )]
+    pub ipfs_max_legacy_scan_rows: usize,
+
     /// Upper bound on the number of EXPENSIVE visibility walks
     /// (`allowed_blob_set_for_caller_bounded`, a full-history git walk in a
     /// blocking thread) a single `/ipfs/{cid}` request may run. Only a blob in a
@@ -970,20 +1001,23 @@ mod tests {
             "the work budget must clear one full legacy search per window"
         );
 
-        // Tight route limit (1): the floor lifts the work budget to the probe budget
-        // (256), NOT down to 1 — a single deep search still completes its full scan.
+        // Tight route limit (1): the floor lifts the work budget to a full deep scan —
+        // the 256-probe budget PLUS the page toll a 2048-row ceiling costs at 128 rows
+        // per page (16) = 272, NOT down to 1. A single deep search still completes its
+        // full scan without self-throttling on either charge.
         let tight = Config::parse_from(["gitlawb-node", "--ipfs-rate-limit", "1"]);
         assert_eq!(
             AppState::ipfs_work_budget(&tight),
-            256,
-            "a tight route limit is floored at the 256-probe budget, not clamped to 1"
+            272,
+            "a tight route limit is floored at probes + pages (256 + 16), not clamped to 1"
         );
 
         // Raised probe budget lifts the floor with it (the work budget tracks the
         // effective probe budget, not the constant). The walk cap is set to a DIFFERENT
         // value in the same config on purpose: the two were one field before the split,
         // so a floor that silently read the walk cap would return 7 here and still look
-        // plausible. Only the legacy-probe knob may drive this budget.
+        // plausible. Only the legacy-probe and legacy-scan-rows knobs may drive this
+        // budget.
         let raised = Config::parse_from([
             "gitlawb-node",
             "--ipfs-rate-limit",
@@ -995,8 +1029,28 @@ mod tests {
         ]);
         assert_eq!(
             AppState::ipfs_work_budget(&raised),
-            1000,
-            "the floor tracks the operator-raised legacy-probe budget, not the walk cap"
+            1016,
+            "the floor tracks the operator-raised legacy-probe budget (1000) plus the \
+             default row ceiling's page toll (16), not the walk cap"
+        );
+
+        // The scan-rows knob is coupled to the floor too, and this EXECUTES the coupling
+        // rather than describing it: every page the ceiling permits is charged to the
+        // caller's work bucket, so a raised ceiling that did not lift the floor would
+        // 429 an honest caller part-way down their own token ladder. 4096 rows at 128
+        // rows per page is 32 pages, so the floor is 256 + 32.
+        let wide_scan = Config::parse_from([
+            "gitlawb-node",
+            "--ipfs-rate-limit",
+            "10",
+            "--ipfs-max-legacy-scan-rows",
+            "4096",
+        ]);
+        assert_eq!(
+            AppState::ipfs_work_budget(&wide_scan),
+            288,
+            "raising the row ceiling must raise the work floor by the pages it buys \
+             (256 probes + 4096/128 = 32 pages), or a full deep scan self-throttles"
         );
 
         // 0 route limit disables the derived bucket too (a 0-capacity limiter admits all).
