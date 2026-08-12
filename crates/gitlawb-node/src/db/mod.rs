@@ -1143,10 +1143,13 @@ const MIGRATIONS: &[Migration] = &[
         version: 20,
         name: "drop_ref_certs_repo_ref_unique",
         stmts: &[
-            // Remove the superseded (repo_id, ref_name) unique index plus its
-            // per-ref append-only rails.  Deferred to v20 so nodes are not
-            // running a mix of old/new code that each VACUUMed and relied on
-            // this unique index during a rolling upgrade (see v19).
+            // Remove the superseded (repo_id, ref_name) unique index.  v19 makes
+            // the cert chain append-only, which requires multiple rows per
+            // (repo_id, ref_name); the unique index would reject the second
+            // insert for a ref.  Deferring the drop is impossible for the same
+            // reason the old index could not survive this feature in any later
+            // release, and nodes each run their own local Postgres so there is
+            // no mixed-version shared database to strand a writer.
             "DROP INDEX IF EXISTS idx_ref_certs_repo_ref",
         ],
     },
@@ -2484,6 +2487,35 @@ impl Db {
              FROM ref_certificates WHERE id = $1",
         )
         .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(row_to_cert))
+    }
+
+    /// Look up the node's own certificate row for a legacy cert by the fields the
+    /// 7-field signature actually covers: `(repo_id, ref_name, old_sha, new_sha,
+    /// issued_at)`. Corroboration must NOT key on `id` — that column is not part
+    /// of any signed payload, so a forger could otherwise pick which stored row
+    /// their chain-position claims are measured against.
+    pub async fn get_cert_by_signed_tuple(
+        &self,
+        repo_id: &str,
+        ref_name: &str,
+        old_sha: &str,
+        new_sha: &str,
+        issued_at: &str,
+    ) -> Result<Option<RefCertificate>> {
+        let row = sqlx::query(
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path
+             FROM ref_certificates
+             WHERE repo_id = $1 AND ref_name = $2 AND old_sha = $3 AND new_sha = $4 AND issued_at = $5
+             LIMIT 1",
+        )
+        .bind(repo_id)
+        .bind(ref_name)
+        .bind(old_sha)
+        .bind(new_sha)
+        .bind(issued_at)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(row_to_cert))

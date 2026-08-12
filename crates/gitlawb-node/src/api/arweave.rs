@@ -79,7 +79,11 @@ pub async fn list_anchors(
         .list_arweave_anchors(q.repo.as_deref(), limit)
         .await?;
 
-    let gateway = state.config.arweave_gateway.trim_end_matches('/');
+    // The gateway config may carry credentials (e.g. an Irys user:pass). Those
+    // must never leak into a public listing, so only the credential-free origin
+    // is embedded in each anchor's URL.
+    let gateway =
+        crate::server::mask_credential_url(state.config.arweave_gateway.trim_end_matches('/'));
     let anchors: Vec<crate::db::ArweaveAnchor> = anchors
         .into_iter()
         .map(|mut a| {
@@ -138,5 +142,64 @@ mod closed_pool_tests {
                 "message": crate::error::DB_UNAVAILABLE_MESSAGE,
             })
         );
+    }
+
+    /// A credentialed gateway (user:pass in the URL) must not leak into the
+    /// public anchors listing — every `arweave_url` is built from the masked
+    /// origin, never the raw config.
+    #[sqlx::test]
+    async fn list_anchors_does_not_leak_gateway_credentials(pool: PgPool) {
+        use clap::Parser as _;
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.config = std::sync::Arc::new(crate::config::Config::parse_from([
+            "gitlawb-node",
+            "--arweave-gateway",
+            "https://user:supersecret@arweave.net",
+        ]));
+
+        state
+            .db
+            .record_arweave_anchor(&crate::db::RecordAnchorInputV2 {
+                repo: "alice/myrepo",
+                owner_did: "did:key:zAlice",
+                ref_name: "refs/heads/main",
+                old_sha: &"a".repeat(40),
+                new_sha: &"b".repeat(40),
+                cid: Some("bafy1test"),
+                arweave_tx_id: &"f".repeat(43),
+                node_did: "did:key:zNode",
+                cert_id: None,
+            })
+            .await
+            .unwrap();
+
+        let resp = Router::new()
+            .route("/api/v1/arweave/anchors", axum::routing::get(list_anchors))
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/arweave/anchors")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: String = String::from_utf8(bytes.to_vec()).expect("utf8 body");
+        assert!(
+            !body.contains("supersecret"),
+            "anchors listing must not disclose gateway credentials"
+        );
+        assert!(
+            body.contains("https://arweave.net/"),
+            "arweave_url should carry the credential-free origin"
+        );
+        let v: Value = serde_json::from_str(&body).expect("json body");
+        assert_eq!(v["count"], 1);
     }
 }

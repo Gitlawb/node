@@ -1,3 +1,4 @@
+mod ans104;
 mod api;
 mod arweave;
 mod auth;
@@ -108,12 +109,15 @@ async fn main() -> Result<()> {
     }
 
     // When a bundler URL is configured (whether via the modern
-    // GITLAWB_BUNDLER_URL or the legacy GITLAWB_IRYS_URL alias) and
-    // GITLAWB_ARWEAVE_GATEWAY was not explicitly set, pair the gateway to the
-    // same network so that anchors uploaded to a devnet bundler (whose
-    // transactions are not resolvable via the arweave.net default gateway) are
-    // verifiable through the verify endpoint.
-    if !config.bundler_url.is_empty() && std::env::var("GITLAWB_ARWEAVE_GATEWAY").is_err() {
+    // GITLAWB_BUNDLER_URL or the legacy GITLAWB_IRYS_URL alias) and the gateway
+    // was not explicitly set — neither via --arweave-gateway nor the
+    // GITLAWB_ARWEAVE_GATEWAY env var — pair the gateway to the same network so
+    // that anchors uploaded to a devnet bundler (whose transactions are not
+    // resolvable via the arweave.net default gateway) are verifiable through
+    // the verify endpoint. An operator-chosen gateway is never overwritten.
+    if !config.bundler_url.is_empty()
+        && !Config::arweave_gateway_explicitly_set(std::env::args_os())
+    {
         config.arweave_gateway = config.bundler_url.clone();
         tracing::warn!(
             "GITLAWB_ARWEAVE_GATEWAY unset — inferred from bundler URL as {}",

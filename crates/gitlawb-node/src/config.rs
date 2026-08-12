@@ -741,6 +741,24 @@ impl Config {
         PathBuf::from(&self.key_path)
     }
 
+    /// Whether `arweave_gateway` was set explicitly by the operator — via the
+    /// `--arweave-gateway` CLI flag or the `GITLAWB_ARWEAVE_GATEWAY` env var —
+    /// rather than falling back to the clap default. Startup inference (pairing
+    /// the gateway to the bundler URL) must not overwrite an explicitly chosen
+    /// gateway. Pass `std::env::args_os()` at runtime.
+    pub fn arweave_gateway_explicitly_set<I, T>(args: I) -> bool
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        use clap::parser::ValueSource;
+        use clap::CommandFactory;
+        Config::command()
+            .get_matches_from(args)
+            .value_source("arweave_gateway")
+            .is_some_and(|s| s != ValueSource::DefaultValue)
+    }
+
     /// DB connections reserved for everything other than held write-locks: auth
     /// lookups, visibility-rule reads, the post-receive tail's own DB writes, and
     /// admin tooling. A write pins one pooled connection for its whole duration, so

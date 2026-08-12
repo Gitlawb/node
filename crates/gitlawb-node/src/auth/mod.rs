@@ -181,17 +181,42 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
         .unwrap_or("/")
         .to_string();
 
-    let content_digest = parts
-        .headers
-        .get("content-digest")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    // The signature always covers content-digest (see COVERED_COMPONENTS), so a
+    // request that claims a valid RFC 9421 signature but sends no Content-Digest
+    // header is not bound to any particular body. Accepting the empty-string
+    // substitute would let a signed receive-pack produce a certificate/anchor
+    // proof that commits to no pushed bytes, so a missing or unreadable header
+    // is rejected before any proof is issued or presented.
+    let content_digest = match parts.headers.get("content-digest") {
+        Some(v) => match v.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "content_digest_invalid",
+                        "message": "Content-Digest header is not a valid string",
+                    })),
+                )
+                    .into_response()
+            }
+        },
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "content_digest_missing",
+                    "message": "Content-Digest header is required when the signature covers content-digest",
+                })),
+            )
+                .into_response()
+        }
+    };
 
     let mut request_values: HashMap<String, String> = HashMap::new();
     request_values.insert("@method".to_string(), method.clone());
     request_values.insert("@path".to_string(), path_and_query.clone());
-    request_values.insert("content-digest".to_string(), content_digest.clone());
+    request_values.insert("content-digest".to_string(), content_digest.to_string());
 
     // The @signature-params value is the part of Signature-Input after "sig1="
     let sig_params_value = sig_input.strip_prefix("sig1=").unwrap_or(&sig_input);
@@ -236,23 +261,20 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
             .into_response();
     }
 
-    // Verify Content-Digest matches the actual request body
-    if let Some(claimed) = parts
-        .headers
-        .get("content-digest")
-        .and_then(|v| v.to_str().ok())
-    {
-        let actual = compute_content_digest(&body_bytes);
-        if claimed != actual {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": "content_digest_mismatch",
-                    "message": "Content-Digest does not match request body",
-                })),
-            )
-                .into_response();
-        }
+    // Verify Content-Digest matches the actual request body. The header is
+    // mandatory above, so this comparison always runs: a signature over the
+    // empty-string substitute (or a forged digest) never reaches the body check
+    // with a clean pass, and a present-but-wrong digest is rejected here.
+    let actual = compute_content_digest(&body_bytes);
+    if content_digest != actual {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "content_digest_mismatch",
+                "message": "Content-Digest does not match request body",
+            })),
+        )
+            .into_response();
     }
 
     tracing::info!(did = %sig.key_id, "✓ authenticated request");
@@ -663,5 +685,35 @@ mod tests {
         let body_bytes = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body_json["error"], "invalid_ucan");
+    }
+
+    #[tokio::test]
+    async fn require_signature_rejects_signed_request_without_content_digest() {
+        // A request whose Signature-Input covers content-digest but which omits
+        // the Content-Digest header must be rejected up front. Accepting it would
+        // let a signed receive-pack produce a certificate/anchor proof that
+        // commits to no pushed bytes.
+        let kp = Keypair::generate();
+        let _state = make_test_state(kp.did());
+        let app = Router::new()
+            .route("/", axum::routing::post(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn(require_signature));
+
+        let signed = gitlawb_core::http_sig::sign_request(&kp, "POST", "/", b"push-body");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            // Content-Digest deliberately omitted
+            .header("Signature-Input", signed.signature_input)
+            .header("Signature", signed.signature)
+            .body(axum::body::Body::from("push-body"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body_json["error"], "content_digest_missing");
     }
 }

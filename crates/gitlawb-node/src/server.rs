@@ -595,11 +595,26 @@ pub(crate) async fn stats(State(state): State<AppState>) -> Json<serde_json::Val
     }))
 }
 
-/// Mask a URL that might contain embedded credentials by stripping everything
-/// after the '@' separator (user:pass@host → host).
-fn mask_credential_url(url: &str) -> String {
-    if let Some(at_pos) = url.rfind('@') {
-        url[at_pos + 1..].to_string()
+/// Mask a URL that might contain embedded credentials by stripping the userinfo
+/// component: `https://user:pass@host/path` → `https://host/path`. URLs without
+/// credentials are returned unchanged.
+pub(crate) fn mask_credential_url(url: &str) -> String {
+    let scheme_end = match url.find("://") {
+        Some(pos) => pos + 3,
+        None => 0,
+    };
+    let authority_end = url[scheme_end..]
+        .find('/')
+        .map(|p| scheme_end + p)
+        .unwrap_or(url.len());
+    let authority = &url[scheme_end..authority_end];
+    if let Some(at) = authority.rfind('@') {
+        format!(
+            "{}{}{}",
+            &url[..scheme_end],
+            &authority[at + 1..],
+            &url[authority_end..]
+        )
     } else {
         url.to_string()
     }
@@ -645,5 +660,44 @@ async fn p2p_info(State(state): State<AppState>) -> Json<serde_json::Value> {
             }))
         }
         None => Json(json!({ "enabled": false })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mask_credential_url;
+
+    #[test]
+    fn masks_userinfo_preserving_scheme_and_path() {
+        assert_eq!(
+            mask_credential_url("https://user:pass@arweave.net"),
+            "https://arweave.net"
+        );
+        assert_eq!(
+            mask_credential_url("https://user:pass@arweave.net/"),
+            "https://arweave.net/"
+        );
+        assert_eq!(
+            mask_credential_url("https://u:p@host:9443/gateway"),
+            "https://host:9443/gateway"
+        );
+    }
+
+    #[test]
+    fn leaves_credential_free_urls_unchanged() {
+        assert_eq!(
+            mask_credential_url("https://arweave.net"),
+            "https://arweave.net"
+        );
+        assert_eq!(
+            mask_credential_url("http://localhost:3000"),
+            "http://localhost:3000"
+        );
+        assert_eq!(mask_credential_url("arweave.net"), "arweave.net");
+        // '@' inside the path (not userinfo) must be preserved
+        assert_eq!(
+            mask_credential_url("https://arweave.net/a@b"),
+            "https://arweave.net/a@b"
+        );
     }
 }

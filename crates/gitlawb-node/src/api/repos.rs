@@ -1493,6 +1493,7 @@ async fn pin_and_encrypt_objects(
                     &ctx.http_client,
                     &ctx.irys_url,
                     &manifest,
+                    &ctx.node_keypair,
                 )
                 .await
                 {
@@ -2846,8 +2847,13 @@ async fn post_receive_replication_tail(
                         node_did: node_did_str.clone(),
                         certificate: cert,
                     };
-                    match crate::arweave::anchor_ref_update(&http_client, &bundler_url, &anchor)
-                        .await
+                    match crate::arweave::anchor_ref_update(
+                        &http_client,
+                        &bundler_url,
+                        &anchor,
+                        &node_keypair,
+                    )
+                    .await
                     {
                         Ok(tx_id) if !tx_id.is_empty() => {
                             if let Err(e) = db_clone
