@@ -48,6 +48,47 @@ impl From<AgentTask> for AgentTaskType {
     }
 }
 
+/// Read-only projection of `AgentTask` for the `tasks`/`task` queries, as
+/// opposed to `AgentTaskType`, which the task mutations (`createTask`,
+/// `claimTask`, `completeTask`, `failTask` — all `require_signer`-gated)
+/// return. Identical except for the missing `ucan_token` (#268): a read
+/// surface never needs to echo it back, since the assignee already received it
+/// at delegation/claim time via the mutation response.
+#[derive(SimpleObject, Clone)]
+pub struct AgentTaskReadType {
+    pub id: String,
+    pub repo_id: Option<String>,
+    pub kind: String,
+    pub status: String,
+    pub delegator_did: String,
+    pub assignee_did: Option<String>,
+    pub capability: String,
+    pub payload: Option<String>,
+    pub result: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub deadline: Option<String>,
+}
+
+impl From<AgentTask> for AgentTaskReadType {
+    fn from(t: AgentTask) -> Self {
+        Self {
+            id: t.id,
+            repo_id: t.repo_id,
+            kind: t.kind,
+            status: t.status,
+            delegator_did: t.delegator_did,
+            assignee_did: t.assignee_did,
+            capability: t.capability,
+            payload: t.payload,
+            result: t.result,
+            created_at: t.created_at,
+            updated_at: t.updated_at,
+            deadline: t.deadline,
+        }
+    }
+}
+
 #[derive(SimpleObject, Clone)]
 pub struct RefUpdateType {
     pub repo: String,
