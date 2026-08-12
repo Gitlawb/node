@@ -251,6 +251,11 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            // Deliberately non-fatal, and the cost is worth naming: an
+            // unreadable key file takes the node off the p2p network for the
+            // whole run while /health keeps reporting healthy, so the outage is
+            // visible only to whoever reads the logs. Making it fatal, or
+            // surfacing it in the health response, is its own change.
             Err(e) => {
                 tracing::warn!(err = %e, "failed to load p2p identity key — continuing without p2p");
                 None

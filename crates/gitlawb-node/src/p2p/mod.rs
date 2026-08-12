@@ -168,6 +168,13 @@ struct GitlawbBehaviour {
 /// Load the node's persistent libp2p identity from `key_path`, generating and
 /// storing a fresh Ed25519 keypair the first time.
 pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
+    // Runs on both the load and the create path: the directory guards the key
+    // just as much as the key's own mode does, and an existing directory keeps
+    // whatever mode it was made with.
+    if let Some(parent) = key_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        ensure_key_dir(parent)?;
+    }
+
     if key_path.exists() {
         return read_p2p_keypair(key_path);
     }
@@ -177,11 +184,7 @@ pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> 
         .to_protobuf_encoding()
         .map_err(|e| anyhow::anyhow!("failed to serialize p2p key: {e}"))?;
 
-    if let Some(parent) = key_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    match create_new_key_file(key_path, &bytes) {
+    match write_key_atomically(key_path, &bytes) {
         Ok(()) => {
             info!(
                 path = %key_path.display(),
@@ -191,33 +194,170 @@ pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> 
             Ok(kp)
         }
         // Something already occupies the path: another node process won the
-        // race between the existence check and the exclusive create, or the
-        // path is a symlink. Whatever is on disk is the identity of record, so
-        // read it back rather than failing the boot or overwriting it.
+        // race between the existence check and the atomic publish, or the path
+        // is a symlink. Whatever is on disk is the identity of record, so read
+        // it back rather than failing the boot or overwriting it.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read_p2p_keypair(key_path),
         Err(e) => Err(anyhow::Error::new(e)
             .context(format!("failed to write p2p key to {}", key_path.display()))),
     }
 }
 
-/// Create the key file exclusively, with owner-only permissions applied at
-/// creation time so the bytes are never visible to other users. `create_new`
-/// maps to `O_EXCL`, so an existing path entry (including a dangling symlink)
-/// is refused rather than followed or truncated.
-fn create_new_key_file(key_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
+/// Create the directory holding the key with owner-only permissions, and
+/// tighten it if it already exists with a looser mode. Write permission on this
+/// directory is enough to unlink or replace the 0600 key inside it, so the
+/// directory guards the key as much as the key's own mode does.
+///
+/// `create_dir_all` takes 0777 masked by the umask, which lands 0755 under a
+/// normal umask and 0777 under a permissive one. `DirBuilder`'s mode fixes that
+/// for directories it creates, but an existing directory keeps whatever mode it
+/// was made with, so the load path has to check too.
+///
+/// A loose existing directory is repaired rather than rejected. Rejecting it
+/// would refuse to boot on every node whose directory already landed 0755,
+/// which is the common case, and through `main.rs`'s non-fatal handling that
+/// would read as a silent p2p outage rather than a clear failure. Tightening
+/// applies exactly the remedy the alternative would have asked the operator to
+/// run by hand. Failure to tighten is fatal, since at that point the key cannot
+/// be protected.
+///
+/// `~/.gitlawb/identity.pem` lives in this directory too, so this covers both
+/// keys. Issue #231 owns the sibling gap in `main.rs`'s own creation path for
+/// that file; nothing here touches it.
+fn ensure_key_dir(dir: &Path) -> Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    // On non-unix this is exactly `create_dir_all`; there is no mode to pin.
+    builder
+        .create(dir)
+        .with_context(|| format!("failed to create key directory {}", dir.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = std::fs::metadata(dir)
+            .with_context(|| format!("failed to stat key directory {}", dir.display()))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            warn!(
+                dir = %dir.display(),
+                mode = format!("{mode:04o}"),
+                "key directory grants access beyond its owner; tightening it to 0700"
+            );
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).with_context(
+                || {
+                    format!(
+                        "key directory {} has mode {:04o}, which lets other users replace \
+                         the keys it holds, and it could not be tightened; run `chmod 700 {}`",
+                        dir.display(),
+                        mode,
+                        dir.display()
+                    )
+                },
+            )?;
+        }
     }
 
-    let mut file = opts.open(key_path)?;
+    Ok(())
+}
+
+/// Write the key to a scratch file in the same directory, then publish it to
+/// `key_path` in one atomic step, so no reader ever sees a partial key and a
+/// crash mid-write cannot leave a truncated file at the final path.
+///
+/// The publish is `link(2)`, not `rename(2)`. Rename would replace an existing
+/// key silently, throwing away the `O_EXCL` protection the previous code got
+/// from `create_new`; guarding it with an existence check first only narrows
+/// the window rather than closing it, since a concurrent start can land its own
+/// key between the check and the rename. `hard_link` is atomic and fails with
+/// `AlreadyExists` if anything already occupies the path (a real file, or a
+/// symlink, which it does not follow), so the two properties hold together
+/// without a check-then-act gap. The scratch file is unlinked either way, so a
+/// failed start leaves the key directory as it found it.
+fn write_key_atomically(key_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = key_path.parent().unwrap_or_else(|| Path::new("."));
+    let (tmp_path, mut file) = create_scratch_key_file(dir)?;
+    let result = fill_and_publish(&mut file, bytes, &tmp_path, key_path);
+    drop(file);
+    // Unconditional: on success the key is reachable through `key_path`, and on
+    // failure nothing may be left behind.
+    let _ = std::fs::remove_file(&tmp_path);
+    result
+}
+
+/// Open a uniquely named scratch file in `dir` with owner-only permissions
+/// applied at creation time. The name carries the pid so concurrent node starts
+/// do not pick the same one, and `create_new` (`O_EXCL`) plus the retry makes a
+/// collision with a leftover or a sibling thread impossible rather than merely
+/// unlikely.
+fn create_scratch_key_file(dir: &Path) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+    let pid = std::process::id();
+    for attempt in 0..64u32 {
+        let tmp_path = dir.join(format!(".p2p.key.{pid}.{attempt}.tmp"));
+
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+
+        match opts.open(&tmp_path) {
+            Ok(file) => return Ok((tmp_path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("no free scratch key file name in {}", dir.display()),
+    ))
+}
+
+fn fill_and_publish(
+    file: &mut std::fs::File,
+    bytes: &[u8],
+    tmp_path: &Path,
+    key_path: &Path,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    #[cfg(test)]
+    if FAIL_KEY_WRITE.with(|f| f.get()) {
+        file.write_all(&bytes[..bytes.len() / 2])?;
+        return Err(std::io::Error::other("injected key-write failure"));
+    }
+
     file.write_all(bytes)?;
-    file.sync_all()
+    // The bytes must be durable before the name that points at them appears,
+    // otherwise a crash can leave the entry pointing at an empty file.
+    file.sync_all()?;
+    std::fs::hard_link(tmp_path, key_path)?;
+
+    // Make the new directory entry itself durable. Best-effort: the key is
+    // already written and linked, and not every platform allows this.
+    if let Some(dir) = key_path.parent() {
+        if let Ok(dir_file) = std::fs::File::open(dir) {
+            let _ = dir_file.sync_all();
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only fault injection for the key write. Thread-local so an armed
+    /// test cannot disturb the others running beside it.
+    static FAIL_KEY_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Read an existing key file, refusing one whose permissions or contents make
@@ -582,6 +722,83 @@ mod tests {
             0o600,
             "key file must be owner-read/write only"
         );
+
+        // The directory was created inside the same permissive-umask window, so
+        // this proves the directory mode is pinned by the code and not by the
+        // ambient umask. Write permission on the directory alone is enough to
+        // unlink or replace the 0600 key inside it.
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(dir_mode & 0o777, 0o700, "key directory must be owner-only");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p2p_existing_key_dir_with_loose_permissions_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_dir = dir.path().join("keys");
+        std::fs::create_dir(&key_dir).unwrap();
+        std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = key_dir.join("p2p.key");
+
+        // Creation path: a pre-existing loose directory is detected and repaired.
+        let created = load_or_create_p2p_keypair(&path).expect("boot must not fail on a loose dir");
+        assert_eq!(
+            std::fs::metadata(&key_dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "an existing loose key directory must be tightened"
+        );
+
+        // Load path: same check, on a directory loosened after the key exists.
+        std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let loaded = load_or_create_p2p_keypair(&path).expect("reload must not fail");
+        assert_eq!(
+            std::fs::metadata(&key_dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "the load path must tighten the key directory too"
+        );
+        assert_eq!(
+            PeerId::from(created.public()),
+            PeerId::from(loaded.public()),
+            "tightening must not change the identity"
+        );
+    }
+
+    #[test]
+    fn p2p_failed_key_write_leaves_no_file_at_the_final_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_dir = dir.path().join("keys");
+        let path = key_dir.join("p2p.key");
+
+        FAIL_KEY_WRITE.with(|f| f.set(true));
+        let result = load_or_create_p2p_keypair(&path);
+        FAIL_KEY_WRITE.with(|f| f.set(false));
+
+        result.expect_err("an interrupted key write must not report success");
+        assert!(
+            !path.exists(),
+            "a partially written key must never be observable at {}",
+            path.display()
+        );
+
+        // Nor may a half-written scratch file be left behind for an operator to
+        // trip over on the next boot.
+        let leftovers: Vec<_> = std::fs::read_dir(&key_dir)
+            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "a failed write must clean up after itself, found: {leftovers:?}"
+        );
+
+        // The next boot must be able to create the identity normally.
+        let kp = load_or_create_p2p_keypair(&path).expect("a retry after a failed write must work");
+        let reloaded = load_or_create_p2p_keypair(&path).unwrap();
+        assert_eq!(PeerId::from(kp.public()), PeerId::from(reloaded.public()));
     }
 
     #[cfg(unix)]
@@ -622,7 +839,8 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
 
-        let err = load_or_create_p2p_keypair(&path).expect_err("an empty key file must be an error");
+        let err =
+            load_or_create_p2p_keypair(&path).expect_err("an empty key file must be an error");
         let msg = format!("{err:#}");
         assert!(
             msg.contains(&path.display().to_string()) && msg.contains("empty"),
