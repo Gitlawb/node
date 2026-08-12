@@ -1310,8 +1310,8 @@ mod tests {
     /// R11: a non-did:key `node_did` cannot be authenticated by design, and the
     /// refusal answers in the SAME sentence as the peers-table gate.
     ///
-    /// What this test guards is the REFUSAL WORDING, not the pre-parse
-    /// did-method gate. The event here is signed, so with that gate deleted
+    /// What this test guards is the REFUSAL WORDING, not the did-method
+    /// gate itself. The event here is signed, so with that gate deleted
     /// `verify_ref_update` resolves `node_did` itself and returns the identical
     /// sentence; the assertion below cannot tell the two apart. The test that
     /// isolates the gate is
@@ -1344,7 +1344,7 @@ mod tests {
         }
     }
 
-    /// The load-bearing test for the pre-parse did-method gate, and the ONLY
+    /// The load-bearing test for the did-method gate, and the ONLY
     /// combination that isolates it.
     ///
     /// Three inputs, each chosen to take one of the other guards out of the
