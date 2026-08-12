@@ -257,10 +257,10 @@ fn f4_release_keeps_conn_owned_until_unlock_resolves() {
     );
 }
 
-/// F6/KTD-5 (initial IPFS metadata queries deadline-wrapped): `get_by_cid` acquires
-/// the scarce walk permits (RAII, held for the whole request) BEFORE its two initial
-/// metadata queries, and the per-repo loop's first budget gate runs only later. So
-/// both `list_all_repos` and `list_visibility_rules_for_repos` must be clamped to the
+/// F6/KTD-5 (IPFS metadata queries deadline-wrapped): `get_by_cid` acquires
+/// the scarce walk permits (RAII, held for the whole request) BEFORE its metadata
+/// queries, and the per-repo loop's first budget gate runs only later. So
+/// both `list_repos_page_for_scan` and `list_visibility_rules_for_repos` must be clamped to the
 /// remaining request budget — otherwise a query blocked in Postgres pins the walk slot
 /// for the whole stall, past the budget. This scans the PRODUCTION half of `api/ipfs.rs`
 /// (the `mod tests` half names the same calls in its own harness and would make the
@@ -285,7 +285,7 @@ fn f6_ipfs_metadata_queries_are_deadline_wrapped() {
     // every time a call site is added, which is how a guard quietly stops covering the
     // site that matters. Requiring all of them scales with the code instead.
     for call in [
-        ".list_all_repos()",
+        ".list_repos_page_for_scan(",
         ".list_visibility_rules_for_repos(",
         ".get_repo_by_id(",
         ".is_repo_quarantined(",

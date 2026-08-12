@@ -99,6 +99,13 @@ pub struct AppState {
     /// Bounds the anonymous `acquire` + `cat-file` fan-out across the node (#173,
     /// INV-10); a field for the same test-seam reason as `ipfs_max_history_walks`.
     pub ipfs_max_legacy_probes: u32,
+    /// How many repo rows the CID resolver's legacy scan pulls per keyset page
+    /// (default `api::ipfs::LEGACY_SCAN_PAGE_ROWS`). Bounds the DATABASE-facing half
+    /// of the same fan-out `ipfs_max_legacy_probes` bounds on the probe side: without
+    /// it the scan materialized every repo row and every matching visibility rule
+    /// before spending a single probe (#173, INV-10). A field for the same test-seam
+    /// reason as the sibling caps.
+    pub ipfs_legacy_scan_page_rows: usize,
     /// Hard ceiling on the byte size of an object `GET /ipfs/{cid}` will buffer and
     /// serve (default `api::ipfs::MAX_SERVED_OBJECT_BYTES`). The serve reads via a
     /// blocking `git cat-file` and buffers the whole object; without a bound a large

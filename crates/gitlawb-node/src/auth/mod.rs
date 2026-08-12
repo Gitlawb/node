@@ -520,6 +520,7 @@ mod tests {
             ipfs_work_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
             ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
             ipfs_max_legacy_probes: crate::api::ipfs::MAX_LEGACY_PROBES_PER_REQUEST,
+            ipfs_legacy_scan_page_rows: crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS,
             ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
             push_limiter_trust: crate::rate_limit::TrustedProxy::None,
             sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),

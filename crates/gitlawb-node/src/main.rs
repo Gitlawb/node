@@ -429,6 +429,7 @@ async fn main() -> Result<()> {
         // ceiling above stays constant (a smaller value false-503s a provenanced
         // request). Default 256 preserves the shipped behaviour.
         ipfs_max_legacy_probes: AppState::ipfs_legacy_probe_budget(&config),
+        ipfs_legacy_scan_page_rows: crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS,
         ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust,
         sync_trigger_rate_limiter,

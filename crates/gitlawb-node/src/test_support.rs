@@ -82,6 +82,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         ipfs_work_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
         ipfs_max_legacy_probes: crate::api::ipfs::MAX_LEGACY_PROBES_PER_REQUEST,
+        ipfs_legacy_scan_page_rows: crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS,
         ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust: crate::rate_limit::TrustedProxy::None,
         sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
@@ -8380,9 +8381,10 @@ mod tests {
             .join("withhold.git");
         let secret_cid = pin_cid_for(&bare, &fx.secret_oid, &state.db).await;
 
-        // Withholding repo, iterated FIRST (later updated_at; list_all_repos is DESC).
+        // Withholding repo, iterated FIRST: the paged scan orders on the immutable
+        // `(created_at, id)` ASC, so the OLDER created_at leads (#173, jatmn).
         let mut withhold = seed_repo(&owner_did, "withhold");
-        withhold.updated_at = Utc::now();
+        withhold.created_at = Utc::now() - chrono::Duration::seconds(60);
         state
             .db
             .create_repo(&withhold)
@@ -8400,9 +8402,9 @@ mod tests {
             .await
             .expect("deny rule");
 
-        // Public copy, no rules, iterated AFTER.
+        // Public copy, no rules, iterated AFTER (newer created_at).
         let mut pubcopy = seed_repo(&owner_did, "pubcopy");
-        pubcopy.updated_at = Utc::now() - chrono::Duration::seconds(60);
+        pubcopy.created_at = Utc::now();
         state.db.create_repo(&pubcopy).await.expect("pubcopy repo");
 
         // anon: denied at the withholding repo (continue), served from the public copy.
@@ -9539,11 +9541,11 @@ mod tests {
         // surface). The reader is allowed under /secret so the walk returns 200.
         let secret_tree_cid = pin_cid_for(&bare, &fx.secret_tree_oid, &state.db).await;
 
-        // Oldest `updated_at` → `list_all_repos` (ORDER BY updated_at DESC) probes
+        // NEWEST `created_at` → the paged scan (ORDER BY created_at, id ASC) probes
         // this serving repo LAST, so a scan deterministically charges the walk-free
         // `walkpublic` miss first then this serve: exactly 2 probes per scan.
         let mut walklimit = seed_repo(&owner_did, "walklimit");
-        walklimit.updated_at = chrono::Utc::now() - chrono::Duration::seconds(60);
+        walklimit.created_at = chrono::Utc::now() + chrono::Duration::seconds(60);
         state.db.create_repo(&walklimit).await.expect("seed repo");
         let rec = state
             .db
@@ -9707,9 +9709,9 @@ mod tests {
     /// probe-throttled repo since #173-F3) must not end the whole request: the scan
     /// keeps going so a later walk-free copy still serves, and a spent probe budget is
     /// a clean 429, never a false 404/503. Otherwise a public CID would 404/429 solely
-    /// because a newer path-scoped duplicate sorts ahead of an older no-rule copy under
-    /// `updated_at DESC`. Two same-oid legacy copies: a NEWER `/secret`-scoped denier
-    /// and an OLDER no-rule public copy.
+    /// because a path-scoped duplicate sorts ahead of a no-rule copy under the scan's
+    /// `(created_at, id)` ASC order. Two same-oid legacy copies: a `/secret`-scoped
+    /// denier iterated first and a no-rule public copy behind it.
     ///
     /// Two requests from the SAME IP, budget = 2 (one full scan of both copies):
     /// req1 probes the denier (charged), its allowed-blob walk denies anon → skip and
@@ -9747,10 +9749,11 @@ mod tests {
             .join("scopeddenier.git");
         let secret_cid = pin_cid_for(&denier_bare, &fx.secret_oid, &state.db).await;
 
-        // Newer denier: public at "/", `/secret/**` Mode B empty readers → an anon
-        // blob fetch clears "/", runs the allowed-blob walk, is denied → continue.
+        // First-iterated denier: public at "/", `/secret/**` Mode B empty readers → an
+        // anon blob fetch clears "/", runs the allowed-blob walk, is denied → continue.
+        // The paged scan orders on the immutable `(created_at, id)` ASC (#173, jatmn).
         let mut denier = seed_repo(&owner_did, "scopeddenier");
-        denier.updated_at = Utc::now();
+        denier.created_at = Utc::now() - chrono::Duration::seconds(60);
         state.db.create_repo(&denier).await.expect("seed denier");
         state
             .db
@@ -9758,9 +9761,9 @@ mod tests {
             .await
             .expect("path rule");
 
-        // Older public copy — NO rule → the secret blob serves via the no-walk path.
+        // Public copy behind it — NO rule → the secret blob serves via the no-walk path.
         let mut public = seed_repo(&owner_did, "publiccopy");
-        public.updated_at = Utc::now() - chrono::Duration::seconds(60);
+        public.created_at = Utc::now();
         state
             .db
             .create_repo(&public)
@@ -9818,7 +9821,7 @@ mod tests {
     /// Load-bearing witness (#173, F4): a readable public copy (no path rule →
     /// served via the no-walk path, exactly like
     /// `ipfs_cid_served_from_public_copy_when_withheld_elsewhere`) is given the
-    /// OLDEST `updated_at` so `list_all_repos` (ORDER BY updated_at DESC) iterates it
+    /// NEWEST `created_at` so the paged scan (ORDER BY created_at, id ASC) iterates it
     /// LAST. Ahead of it sit `cap + 1` path-scoped deniers, each forcing an
     /// allowed-blob walk that denies anon. The cap bounds SPAWNED walks to `cap`, but
     /// hitting it must `continue` (skip only the walk-requiring denier), NOT `break`
@@ -9859,25 +9862,26 @@ mod tests {
         // no-rule public copy — the proven serve path.
         let secret_cid = pin_cid_for(&readable_bare, &fx.secret_oid, &state.db).await;
 
-        // 1) Readable public copy — OLDEST updated_at → iterated LAST. Public with
-        //    NO visibility rule, so the blob serves via the no-walk path. This is
-        //    the copy an uncapped fan-out would eventually reach and serve.
+        // 1) Readable public copy — NEWEST created_at → iterated LAST under the paged
+        //    `(created_at, id)` ASC order (#173, jatmn). Public with NO visibility
+        //    rule, so the blob serves via the no-walk path. This is the copy an
+        //    uncapped fan-out would eventually reach and serve.
         let mut readable = seed_repo(&owner_did, "readable");
-        readable.updated_at = Utc::now() - chrono::Duration::seconds(60);
+        readable.created_at = Utc::now() + chrono::Duration::seconds(60);
         state
             .db
             .create_repo(&readable)
             .await
             .expect("seed readable copy");
 
-        // 2) cap+1 deniers with NEWER updated_at → iterated before the copy. Public
+        // 2) cap+1 deniers with OLDER created_at → iterated before the copy. Public
         //    at "/", but a `/secret/**` Mode B rule with an EMPTY reader list, so an
         //    anon blob fetch clears the "/" gate, runs the allowed-blob walk, and is
         //    denied (the secret blob is in no one's set) → continue. Each distinct
         //    repo.id is its own walk (the memo only dedups the same repo).
         for name in &denier_names {
             let mut denier = seed_repo(&owner_did, name);
-            denier.updated_at = Utc::now();
+            denier.created_at = Utc::now();
             state.db.create_repo(&denier).await.expect("seed denier");
             state
                 .db

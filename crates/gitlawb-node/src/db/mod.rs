@@ -23,6 +23,21 @@ pub struct RepoRecord {
     pub machine_id: Option<String>,
 }
 
+/// One row of a keyset page from [`Db::list_repos_page_for_scan`].
+///
+/// Carries the row's quarantine flag inline (so the IPFS scan needs no separate
+/// whole-node quarantine query) and the RAW stored `created_at` text, which is
+/// the first half of the keyset cursor. The raw text is kept because the keyset
+/// comparison is a text comparison and re-serializing the parsed `DateTime` is
+/// not guaranteed to reproduce the stored bytes — a cursor that differs from the
+/// stored value by one character skips or repeats rows.
+#[derive(Debug, Clone)]
+pub struct ScanRepoRow {
+    pub repo: RepoRecord,
+    pub quarantined: bool,
+    pub created_at_key: String,
+}
+
 /// Per-rule replication mode for a visibility rule.
 /// `A` hides existence entirely (only valid at whole-repo scope `/`).
 /// `B` keeps object SHAs and the path visible but withholds content
@@ -1045,6 +1060,34 @@ const MIGRATIONS: &[Migration] = &[
             // markers it still reads.
         ],
     },
+    Migration {
+        version: 25,
+        name: "repos_created_at_id_index",
+        stmts: &[
+            // #173 (jatmn): backs the keyset order of the paged legacy CID scan
+            // (`list_repos_page_for_scan`, `ORDER BY created_at ASC, id ASC` with a
+            // `(created_at, id) > (...)` cursor). The scan replaced a whole-table
+            // preload precisely to stop one anonymous `GET /ipfs/{cid}` from costing
+            // work proportional to the node's repo inventory (INV-10), and without this
+            // index that bound is only half real: `repos` carries no index on
+            // `(created_at, id)`, so Postgres seq-scans the whole table and top-N sorts
+            // it to return EVERY page, while the scarce IPFS walk admission is held.
+            // Measured on a 50k-row fixture: 954 shared buffers and ~47ms per page
+            // without it, versus an Index Only Scan at 4-5 buffers, ~0.08ms, and
+            // `Heap Fetches: 0` with it — and the keyset predicate is pushed down as an
+            // `Index Cond` instead of filtering after a scan.
+            //
+            // Column order and direction are load-bearing and must match the query
+            // exactly; `idx_repos_updated_at` (the order the scan used to use) cannot
+            // serve this one. NOTHING NAMES THIS INDEX IN ANY QUERY TEXT, so a
+            // grep-driven "unused index" cleanup will not see its consumer: it is
+            // reachable from an unauthenticated route and dropping it reopens the
+            // amplification, so treat it as part of the resolver, not as tuning.
+            //
+            // NEW versioned migration (never appended to an applied block, INV-7).
+            "CREATE INDEX IF NOT EXISTS idx_repos_created_at_id ON repos (created_at ASC, id ASC)",
+        ],
+    },
 ];
 
 /// Max distinct source repos recorded per pinned object (F1, #173 jatmn round 8).
@@ -1231,7 +1274,7 @@ impl Db {
 
     /// Fetch a repo by its stable `id`. Used by the `/ipfs/{cid}` provenance path,
     /// which resolves a pin straight to its ONE source repo (#173) instead of
-    /// scanning `list_all_repos`. `id` is exact, so unlike `get_repo`'s fuzzy
+    /// paging the whole repo table. `id` is exact, so unlike `get_repo`'s fuzzy
     /// owner/name match there is no mirror-vs-canonical disambiguation.
     pub async fn get_repo_by_id(&self, id: &str) -> Result<Option<RepoRecord>> {
         let row = sqlx::query(
@@ -1259,21 +1302,68 @@ impl Db {
         Ok(rows.into_iter().map(row_to_repo).collect())
     }
 
-    /// Raw list of every repo row — NOT deduped (a mirror row and its canonical
-    /// row both appear) and without stars. For enumeration callers that must see
-    /// every physical row (e.g. the IPFS object scan in `api::ipfs`), not for
-    /// listing surfaces. Listing surfaces dedupe via `list_all_repos_deduped` or
-    /// `list_all_repos_with_stars` + `dedupe_canonical_repos`.
-    pub async fn list_all_repos(&self) -> Result<Vec<RepoRecord>> {
+    /// One keyset page of raw repo rows for the IPFS object scan (`api::ipfs`) —
+    /// NOT deduped (a mirror row and its canonical row both appear), since that
+    /// scan must see every physical row. Listing surfaces dedupe via
+    /// `list_all_repos_deduped` or `list_all_repos_with_stars` +
+    /// `dedupe_canonical_repos` and must not use this.
+    ///
+    /// Paged rather than whole-table because the scan runs on an anonymously
+    /// reachable route while holding scarce walk admission: materializing the
+    /// node's entire repo inventory (plus its rules) before the per-probe budget
+    /// has spent a single probe is an amplification sink (INV-10). The caller
+    /// stops asking for pages once its budgets are spent.
+    ///
+    /// Ordered on `(created_at, id)` ASC, both IMMUTABLE, so keyset paging is
+    /// exact: no row is visited twice and none is skipped. `updated_at` would be
+    /// wrong twice over — a repo touched mid-scan can cross a page boundary and go
+    /// unvisited (a servable public object misreported as a 404), and it is
+    /// attacker-bumpable, which would let a caller sort their own repos ahead of
+    /// the true holder and bury it past the probe budget.
+    ///
+    /// `after` is the raw `(created_at, id)` of the last row of the previous page,
+    /// `None` for the first page. It carries the STORED `created_at` text, not a
+    /// re-serialized `DateTime`: the comparison is a text comparison and a
+    /// round-trip through `to_rfc3339` is not guaranteed to reproduce the stored
+    /// bytes.
+    ///
+    /// Each row carries its own `quarantined` flag so the scan needs no separate
+    /// whole-node quarantine query (INV-11's hard drop stays per row).
+    pub async fn list_repos_page_for_scan(
+        &self,
+        after: Option<(&str, &str)>,
+        limit: i64,
+    ) -> Result<Vec<ScanRepoRow>> {
+        let (after_created, after_id) = match after {
+            Some((created_at, id)) => (Some(created_at), Some(id)),
+            None => (None, None),
+        };
         let rows = sqlx::query(
             "SELECT id, name, owner_did, description, is_public, default_branch,
-                    created_at, updated_at, disk_path, forked_from, machine_id
-             FROM repos ORDER BY updated_at DESC",
+                    created_at, updated_at, disk_path, forked_from, machine_id, quarantined
+             FROM repos
+             WHERE $1::text IS NULL OR (created_at, id) > ($1::text, $2::text)
+             ORDER BY created_at ASC, id ASC
+             LIMIT $3",
         )
+        .bind(after_created)
+        .bind(after_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.into_iter().map(row_to_repo).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let quarantined: bool = r.get("quarantined");
+                let created_at_key: String = r.get("created_at");
+                ScanRepoRow {
+                    quarantined,
+                    created_at_key,
+                    repo: row_to_repo(r),
+                }
+            })
+            .collect())
     }
 
     pub async fn list_all_repos_with_stars(&self) -> Result<Vec<(RepoRecord, i64)>> {
@@ -6529,6 +6619,81 @@ mod ref_certificate_tests {
         assert!(
             index_exists(&pool).await,
             "v11 must recreate idx_pinned_cids_cid on an upgrading node"
+        );
+    }
+
+    /// #173 (jatmn), INV-7 + INV-10: the paged legacy CID scan orders on
+    /// `(created_at, id)` ASC, and `repos` had no index in that order — only
+    /// `idx_repos_updated_at`, which backed the order the paging REPLACED. Without a
+    /// matching index Postgres seq-scans `repos` and top-N sorts it to return every
+    /// page (measured: 954 shared buffers, ~47ms per page on 50k rows) while the
+    /// scarce IPFS walk admission is held, so the application-side bound the paging
+    /// buys is cancelled by an O(rows) database cost on an anonymously reachable
+    /// route. With the index each page is an Index Only Scan at 4-5 buffers with the
+    /// keyset predicate pushed down as an `Index Cond`.
+    ///
+    /// PRESENCE is the whole property, so this asserts it structurally rather than by
+    /// name: some index on `repos` must lead with `created_at` then `id`, in that
+    /// order and ascending. A rename is fine; a reorder, a direction flip, or a drop
+    /// is not. Nothing names this index in any query text, so nothing else would
+    /// notice its removal.
+    ///
+    /// Also the INV-7 upgrade path, in the shape of the v18 test above: an existing
+    /// node past v1 gets the index from its OWN v25 entry, proven by dropping the
+    /// index plus its `schema_migrations` row and re-running the real migration code.
+    /// MUTATION (RED): delete the v25 entry from `MIGRATIONS` and the fresh-chain
+    /// assertion fails.
+    #[sqlx::test]
+    async fn v25_repos_created_at_id_index_applies_on_upgrade(pool: PgPool) {
+        // Structural, not by name: the leading two columns must be `created_at` then
+        // `id`, ascending (ASC is the default, so it renders with no DESC).
+        async fn keyset_index_exists(pool: &PgPool) -> bool {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM pg_index i
+                     JOIN pg_class t ON t.oid = i.indrelid
+                     WHERE t.relname = 'repos'
+                       AND i.indnatts >= 2
+                       AND (SELECT a.attname FROM pg_attribute a
+                            WHERE a.attrelid = t.oid AND a.attnum = i.indkey[0]) = 'created_at'
+                       AND (SELECT a.attname FROM pg_attribute a
+                            WHERE a.attrelid = t.oid AND a.attnum = i.indkey[1]) = 'id'
+                       AND pg_get_indexdef(i.indexrelid) NOT LIKE '%DESC%'
+                 )",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+        assert!(
+            keyset_index_exists(&pool).await,
+            "the paged legacy CID scan's ORDER BY created_at ASC, id ASC must be \
+             index-backed, or every page seq-scans and sorts the whole repos table \
+             while the IPFS walk admission is held (INV-10)"
+        );
+
+        // Simulate a node at pre-v25: drop the index and its migration record.
+        sqlx::query("DROP INDEX IF EXISTS idx_repos_created_at_id")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 25")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !keyset_index_exists(&pool).await,
+            "precondition: index and its migration record removed"
+        );
+
+        db.run_migrations().await.unwrap();
+        assert!(
+            keyset_index_exists(&pool).await,
+            "v25 must recreate the keyset index on an upgrading node"
         );
     }
 

@@ -74,6 +74,18 @@ pub(crate) const MAX_HISTORY_WALKS_PER_REQUEST: u32 = crate::db::MAX_PIN_SOURCES
 /// transitional path, not the steady state. Tunable via `AppState`.
 pub(crate) const MAX_LEGACY_PROBES_PER_REQUEST: u32 = 256;
 
+/// How many repo rows the legacy scan pulls from the database per keyset page
+/// (#173, jatmn, INV-10). The probe ceiling above bounds the EXPENSIVE work, but
+/// it only starts counting once a probe runs; before that, loading the node's whole
+/// repo inventory and every matching visibility rule is itself work proportional to
+/// the node's size, bought by one anonymous GET while the scarce walk permits are
+/// held. Paging makes the database-facing selection bounded too: the scan reads one
+/// page, gates it, and asks for another only while its probe and visit budgets have
+/// room. Not an operator knob — sized so a full default-budget scan (256 probes)
+/// costs two pages, and a field on `AppState` for the same test-seam reason as the
+/// sibling caps.
+pub(crate) const LEGACY_SCAN_PAGE_ROWS: usize = 128;
+
 /// Hard ceiling on the byte size of an object `GET /ipfs/{cid}` buffers and serves
 /// (#173 round 8, F6, INV-10). The serve reads via a blocking `git cat-file` and
 /// buffers the whole object; unbounded, a large public blob (enumerable from the pins
@@ -85,14 +97,114 @@ pub(crate) const MAX_LEGACY_PROBES_PER_REQUEST: u32 = 256;
 /// `AppState` for the test seam, like the sibling caps.
 pub(crate) const MAX_SERVED_OBJECT_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Lazily-loaded context for the legacy (NULL-provenance) scan fallback in
-/// `get_by_cid`: all repos, their visibility rules keyed by repo id, and the set of
-/// quarantined repo ids. Loaded once per request only if a legacy pin is hit.
-type LegacyScanCtx = (
-    Vec<crate::db::RepoRecord>,
-    HashMap<String, Vec<crate::db::VisibilityRule>>,
-    HashSet<String>,
-);
+/// Keyset pager for the legacy (NULL-provenance) scan fallback in `get_by_cid`.
+///
+/// Replaces the old "load every repo, every matching rule, and the whole node's
+/// quarantine set up front" preload (#173, jatmn, INV-10). That preload ran before
+/// the probe ceiling had spent a single probe, so an anonymous GET for a CID
+/// enumerable from the public pins index bought allocation and queries proportional
+/// to the node's entire repo and rule inventory, with the scarce walk permits held
+/// throughout. Here the scan reads one bounded page at a time and asks for another
+/// only while its probe and visit budgets have room.
+///
+/// Per REQUEST, not per oid candidate. `get_by_cid` may try several oids under one
+/// CID, and a pager that reset between them would restore the full fan-out; instead
+/// the cursor, the fetched rows, and their rules persist across the whole request,
+/// so a later candidate re-reads the pages already paid for and only ever extends
+/// the cursor forward.
+#[derive(Default)]
+struct LegacyScanPager {
+    /// Rows fetched so far this request, in `(created_at, id)` ASC order. Bounded by
+    /// the budgets that gate the next fetch, never by the node's repo count.
+    rows: Vec<crate::db::ScanRepoRow>,
+    /// Visibility rules for the fetched rows only, keyed by repo id.
+    rules: HashMap<String, Vec<crate::db::VisibilityRule>>,
+    /// Keyset cursor: the `(created_at, id)` of the last row fetched, `None` before
+    /// the first page. Both halves are immutable columns, so paging is exact.
+    cursor: Option<(String, String)>,
+    /// Set once a short page proves no rows remain after the cursor.
+    exhausted: bool,
+}
+
+impl LegacyScanPager {
+    /// Fetch the next page and its rules, appending both.
+    ///
+    /// INV-22: these awaits happen while the scarce walk admission is held and the
+    /// pool sets no `statement_timeout`, so each is clamped to the remaining request
+    /// budget exactly as the old preload's queries were. A timeout on the rules query
+    /// FAILS CLOSED — it returns the retryable budget 503 rather than letting the scan
+    /// continue against an empty rule map and serve a path-scoped object to a caller
+    /// the rules would have denied.
+    async fn fetch_next_page(
+        &mut self,
+        state: &AppState,
+        request_deadline: std::time::Instant,
+        cid_str: &str,
+    ) -> Result<()> {
+        #[cfg(test)]
+        bump_preload_queries();
+        let budget_secs = state.config.ipfs_request_budget_secs;
+        let budget_shed = || {
+            AppError::Overloaded(format!(
+                "ipfs scan incomplete (budget) for CID {cid_str}; retry shortly"
+            ))
+        };
+        let after = self
+            .cursor
+            .as_ref()
+            .map(|(created_at, id)| (created_at.as_str(), id.as_str()));
+        let page = match tokio::time::timeout(
+            request_deadline.saturating_duration_since(std::time::Instant::now()),
+            state
+                .db
+                .list_repos_page_for_scan(after, state.ipfs_legacy_scan_page_rows as i64),
+        )
+        .await
+        {
+            Ok(Ok(page)) => page,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_elapsed) => {
+                tracing::warn!(
+                    budget_secs,
+                    "/ipfs list_repos_page_for_scan exceeded the request budget \
+                     (GITLAWB_IPFS_REQUEST_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
+                );
+                return Err(budget_shed());
+            }
+        };
+        #[cfg(test)]
+        note_scan_rows(page.len());
+        if page.len() < state.ipfs_legacy_scan_page_rows {
+            self.exhausted = true;
+        }
+        if page.is_empty() {
+            return Ok(());
+        }
+        let last = page.last().expect("non-empty page has a last row");
+        self.cursor = Some((last.created_at_key.clone(), last.repo.id.clone()));
+        let repo_ids: Vec<String> = page.iter().map(|r| r.repo.id.clone()).collect();
+        let rules = match tokio::time::timeout(
+            request_deadline.saturating_duration_since(std::time::Instant::now()),
+            state.db.list_visibility_rules_for_repos(&repo_ids),
+        )
+        .await
+        {
+            Ok(Ok(rules)) => rules,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_elapsed) => {
+                tracing::warn!(
+                    budget_secs,
+                    "/ipfs list_visibility_rules_for_repos exceeded the request budget \
+                     (GITLAWB_IPFS_REQUEST_BUDGET_SECS); denying (fail closed) and freeing the walk permit"
+                );
+                return Err(budget_shed());
+            }
+        };
+        self.rules.extend(rules);
+        self.rows.extend(page);
+        Ok(())
+    }
+}
 
 /// GET /ipfs/{cid}
 ///
@@ -339,10 +451,12 @@ pub async fn get_by_cid(
         admission: &admission,
     };
 
-    // Legacy scan context (repos + rules + quarantined ids), loaded LAZILY only when a
-    // legacy NULL-provenance pin is hit — the provenance path must never trigger the
-    // O(repos) load (that fan-out is exactly what provenance removes, #173 round 2).
-    let mut scan_ctx: Option<LegacyScanCtx> = None;
+    // Legacy scan pager, advanced LAZILY only when a legacy NULL-provenance pin is hit
+    // — the provenance path must never trigger it (that fan-out is exactly what
+    // provenance removes, #173 round 2). Declared here, outside the oid loop, so its
+    // cursor and its fetched rows are accounted per REQUEST: a per-candidate pager
+    // would restore the very fan-out the paging removes.
+    let mut pager = LegacyScanPager::default();
 
     for sha256_hex in &oids {
         // A pinned object records EVERY repo it was pinned from (#173 round 8, F1).
@@ -549,91 +663,61 @@ pub async fn get_by_cid(
                     }
             };
         if needs_scan {
-            // Load the scan context once, lazily (shared across oid candidates).
-            if scan_ctx.is_none() {
-                #[cfg(test)]
-                bump_preload_queries();
-                // F6/KTD-5 (#174): the preload queries run while the scarce walk permits
-                // are ALREADY held, and the pool sets no statement_timeout, so a query
-                // blocked in Postgres would pin those slots for the whole stall — past the
-                // request budget — capacity-503'ing later requests. Clamp each to the
-                // remaining budget; a timeout returns the same retryable budget 503 the
-                // later stages shed, and returning here drops the permits.
-                // `list_visibility_rules_for_repos` is the access-control query, so its
-                // timeout returns BEFORE the loop: the scan can never run with an empty
-                // rule map and serve an unfiltered listing that exposes private repos
-                // (FAIL CLOSED).
-                let budget_secs = state.config.ipfs_request_budget_secs;
-                let budget_shed = || {
-                    AppError::Overloaded(format!(
-                        "ipfs scan incomplete (budget) for CID {cid_str}; retry shortly"
-                    ))
-                };
-                let repos = match tokio::time::timeout(
-                    request_deadline.saturating_duration_since(std::time::Instant::now()),
-                    state.db.list_all_repos(),
-                )
-                .await
-                {
-                    Ok(Ok(repos)) => repos,
-                    Ok(Err(e)) => return Err(e.into()),
-                    Err(_elapsed) => {
-                        tracing::warn!(
-                            budget_secs,
-                            "/ipfs list_all_repos exceeded the request budget \
-                             (GITLAWB_IPFS_REQUEST_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
-                        );
-                        return Err(budget_shed());
+            // Walk the candidate repos one bounded page at a time. Pages already
+            // fetched by an earlier oid candidate are re-read from `pager.rows` for
+            // free; only the tail of the scan costs another query.
+            let mut idx = 0usize;
+            loop {
+                if idx == pager.rows.len() {
+                    if pager.exhausted {
+                        break;
                     }
-                };
-                let repo_ids: Vec<String> = repos.iter().map(|r| r.id.clone()).collect();
-                let rules_by_repo = match tokio::time::timeout(
-                    request_deadline.saturating_duration_since(std::time::Instant::now()),
-                    state.db.list_visibility_rules_for_repos(&repo_ids),
-                )
-                .await
-                {
-                    Ok(Ok(rules)) => rules,
-                    Ok(Err(e)) => return Err(e.into()),
-                    Err(_elapsed) => {
-                        tracing::warn!(
-                            budget_secs,
-                            "/ipfs list_visibility_rules_for_repos exceeded the request budget \
-                             (GITLAWB_IPFS_REQUEST_BUDGET_SECS); denying (fail closed) and freeing the walk permit"
-                        );
-                        return Err(budget_shed());
+                    // Buying another page is only worth its query if a row on it could
+                    // still reach a verdict, and a verdict needs the probe and the
+                    // acquire these ceilings are refusing. Spent means stop reading —
+                    // this is the check that keeps the DB-facing selection bounded, so
+                    // a one-probe request cannot pull the node's whole inventory.
+                    //
+                    // Note what is deliberately NOT a stop condition: a page of pure
+                    // denials. A quarantined row or a visibility deny costs no probe,
+                    // so paging must continue past them or a public object buried
+                    // behind many private repos would falsely 404. The budgets above,
+                    // not a page count, are what bound that case.
+                    //
+                    // Stopping here leaves every unread repo unproven, so it TAINTS:
+                    // the tail sheds a retryable 503 naming the ceiling, never a
+                    // definitive 404 (#173, F2).
+                    if walk.probes >= state.ipfs_max_legacy_probes {
+                        walk.taint("probe-ceiling");
+                        break;
                     }
-                };
-                let quarantined: HashSet<String> = match tokio::time::timeout(
-                    request_deadline.saturating_duration_since(std::time::Instant::now()),
-                    state.db.list_quarantined_repos(),
-                )
-                .await
-                {
-                    // The quarantine set is also access control (INV-11), so a timeout
-                    // must deny rather than scan with an empty set.
-                    Ok(Ok(rows)) => rows.into_iter().map(|r| r.id).collect(),
-                    Ok(Err(e)) => return Err(e.into()),
-                    Err(_elapsed) => {
-                        tracing::warn!(
-                            budget_secs,
-                            "/ipfs list_quarantined_repos exceeded the request budget \
-                             (GITLAWB_IPFS_REQUEST_BUDGET_SECS); denying (fail closed) and freeing the walk permit"
-                        );
-                        return Err(budget_shed());
+                    if walk.visits >= state.config.ipfs_max_repo_visits {
+                        walk.taint("visit-ceiling");
+                        break;
                     }
-                };
-                scan_ctx = Some((repos, rules_by_repo, quarantined));
-            }
-            let (repos, rules_by_repo, quarantined) = scan_ctx.as_ref().unwrap();
-            for repo in repos {
-                let rules = rules_by_repo
-                    .get(&repo.id)
+                    pager
+                        .fetch_next_page(&state, request_deadline, &cid_str)
+                        .await?;
+                    if idx == pager.rows.len() {
+                        break;
+                    }
+                }
+                let row = &pager.rows[idx];
+                idx += 1;
+                let rules = pager
+                    .rules
+                    .get(&row.repo.id)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
-                let is_quar = quarantined.contains(&repo.id);
                 match gate_and_serve(
-                    &state, repo, rules, is_quar, sha256_hex, &rctx, &mut walk, true,
+                    &state,
+                    &row.repo,
+                    rules,
+                    row.quarantined,
+                    sha256_hex,
+                    &rctx,
+                    &mut walk,
+                    true,
                 )
                 .await
                 {
@@ -1389,6 +1473,31 @@ fn bump_preload_queries() {
     PRELOAD_QUERIES.with(|c| c.set(c.get() + 1));
 }
 
+// Test-only INV-10 cost counter (#173, jatmn): how many repo ROWS the legacy scan's
+// database-facing selection actually materialized this request. The query counter above
+// cannot see the failure it guards — one unbounded `SELECT ... FROM repos` is a single
+// query that pulls the node's entire inventory, so it reads 1 either way. Counting rows
+// is what goes red if the paging is reverted.
+#[cfg(test)]
+thread_local! {
+    static SCAN_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_scan_rows() {
+    SCAN_ROWS.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn scan_rows() -> usize {
+    SCAN_ROWS.with(|c| c.get())
+}
+
+#[cfg(test)]
+fn note_scan_rows(n: usize) {
+    SCAN_ROWS.with(|c| c.set(c.get() + n));
+}
+
 // Test-only cost counter (F5, #173 round 11): how many times the fallback gate ran the
 // `pin_sources_at_cap` / `pin_sources_incomplete` pair. The work-budget peek sits ahead
 // of them, so an already-throttled caller leaves this at 0; putting the peek back after
@@ -1540,8 +1649,8 @@ mod closed_pool_tests {
         );
     }
 
-    /// #251 / CodeRabbit nit: cover `get_by_cid`'s `list_all_repos` conversion
-    /// path — a valid CID must still yield 503 on a closed pool.
+    /// #251 / CodeRabbit nit: cover `get_by_cid`'s DB-error conversion path — a
+    /// valid CID must still yield 503 on a closed pool.
     #[sqlx::test]
     async fn get_by_cid_closed_pool_returns_503_db_unavailable(pool: PgPool) {
         let state = crate::test_support::test_state(pool.clone()).await;
@@ -1795,12 +1904,176 @@ mod tests {
         git_path.to_str().unwrap().to_string()
     }
 
+    /// #173 (jatmn, INV-10): the legacy scan's DATABASE-facing selection is bounded
+    /// too, not just its probes. The probe ceiling only starts counting once a probe
+    /// runs, so before this fix an anonymous GET for a CID enumerable from the public
+    /// pins index loaded every repo row, every matching visibility rule, and the whole
+    /// node's quarantine set — work proportional to the node's inventory, bought at a
+    /// probe budget of 1, with the scarce walk permits held throughout.
+    ///
+    /// Page size 1 and probe budget 1 against THREE candidate repos: the scan may read
+    /// exactly one page, spend its one probe, and stop. It must then report the
+    /// truncation (503), never a false 404 — the two later repos were never looked at.
+    ///
+    /// The ROW count is the load-bearing assertion. A query counter cannot see this
+    /// regression: reverting to one unbounded `SELECT ... FROM repos` is a single query
+    /// that pulls the entire inventory, so the query count reads 1 either way.
+    /// MUTATION (RED): drop the pre-fetch probe-budget check and the pager walks every
+    /// page anyway — 3 rows materialized and 4 queries instead of 1 and 1.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_legacy_scan_stops_paging_when_the_probe_budget_is_spent(
+        pool: sqlx::PgPool,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        // One row per page and one probe per request: the smallest configuration in
+        // which "stopped early" and "read everything" are distinguishable.
+        state.ipfs_legacy_scan_page_rows = 1;
+        state.ipfs_max_legacy_probes = 1;
+
+        for name in ["one", "two", "three"] {
+            seed_repo_with_blob(
+                &state,
+                tmp.path(),
+                "z6pager",
+                name,
+                format!("pager row {name}\n").as_bytes(),
+            )
+            .await;
+        }
+
+        // An oid no repo carries, so every probe reaches a clean absent verdict and the
+        // only thing that can cut the scan short is the budget under test.
+        let cid = seed_legacy_pin(&state, &absent_oid()).await;
+        crate::api::ipfs::reset_scan_rows();
+        crate::api::ipfs::reset_preload_queries();
+        let peer: SocketAddr = "203.0.113.90:5000".parse().unwrap();
+        let resp = ipfs_router(state)
+            .oneshot(get_cid(&cid, Some(peer)))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "stopping early must taint the scan: a truncated search is a retryable 503, \
+             never a definitive 404"
+        );
+        assert_eq!(
+            crate::api::ipfs::scan_rows(),
+            1,
+            "the selection must materialize only the page it can afford to gate, never \
+             the node's whole repo inventory (INV-10)"
+        );
+        assert_eq!(
+            crate::api::ipfs::preload_queries(),
+            1,
+            "and it must stop asking for pages once the probe budget is spent"
+        );
+    }
+
+    /// #173 (jatmn, INV-10): the pager is per REQUEST, not per oid candidate.
+    ///
+    /// The `pinned_cids` index is unique on the git oid but NOT on the cid, so one CID
+    /// can resolve to several oids and `get_by_cid` tries each. If the pager were
+    /// re-created inside that loop, every extra candidate would re-page the whole
+    /// inventory and the fan-out this fix removes would come straight back — a CID with
+    /// k source-less candidates would cost k full scans of the node.
+    ///
+    /// Two DISTINCT absent oids seeded under ONE cid, both source-less so both reach
+    /// `needs_scan`. Three candidate repos at one row per page, with the probe and visit
+    /// budgets left at their generous defaults so nothing truncates: the scan runs to
+    /// exhaustion and 404s honestly. The whole request must cost ONE pass — 4 page
+    /// queries (3 full pages plus the short page that proves exhaustion) and 3 rows —
+    /// because the second candidate re-reads rows the first already paid for.
+    ///
+    /// MUTATION (RED): shadow `pager` with a fresh `LegacyScanPager::default()` inside
+    /// the `for sha256_hex in &oids` loop and the counters double to 8 and 6.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_second_oid_candidate_reuses_pages_from_the_first(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        // One row per page so each page is individually visible in the counters. The
+        // probe and visit budgets stay at their defaults: this is about page REUSE, so
+        // nothing may truncate.
+        state.ipfs_legacy_scan_page_rows = 1;
+
+        for name in ["one", "two", "three"] {
+            seed_repo_with_blob(
+                &state,
+                tmp.path(),
+                "z6reuse",
+                name,
+                format!("reuse row {name}\n").as_bytes(),
+            )
+            .await;
+        }
+
+        // Two oids no repo carries, sharing one cid: every probe reaches a clean absent
+        // verdict, so the scan completes for both candidates and nothing taints.
+        let first_oid = absent_oid();
+        let second_oid = "f3".repeat(32);
+        let cid = seed_legacy_pin(&state, &first_oid).await;
+        state
+            .db
+            .record_pinned_cid(&second_oid, &cid, None)
+            .await
+            .expect("co-locate a second source-less oid under the same cid");
+        assert_eq!(
+            state.db.oids_for_cid(&cid).await.unwrap().len(),
+            2,
+            "precondition: the CID must resolve to two candidates, or the reuse this \
+             test is about never happens"
+        );
+
+        crate::api::ipfs::reset_scan_rows();
+        crate::api::ipfs::reset_preload_queries();
+        let peer: SocketAddr = "203.0.113.92:5000".parse().unwrap();
+        let resp = ipfs_router(state)
+            .oneshot(get_cid(&cid, Some(peer)))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "every candidate reached a verdict under generous budgets, so the honest \
+             answer is the definitive 404 — a 503 here would mean something truncated \
+             and the counters below would be measuring the wrong thing"
+        );
+        assert_eq!(
+            crate::api::ipfs::preload_queries(),
+            4,
+            "the pager is per REQUEST: a second oid candidate re-reads the pages the \
+             first already paid for and must never re-query. Expected one pass over 3 \
+             repos at 1 row per page = 4 page queries (3 full + the short page that \
+             proves exhaustion); a per-candidate pager reads 8"
+        );
+        assert_eq!(
+            crate::api::ipfs::scan_rows(),
+            3,
+            "and one pass materializes each repo row exactly once (3), not once per \
+             oid candidate (6)"
+        );
+    }
+
     /// F2 buried-row repro: with more readable repos than `ipfs_max_repos_walked`,
     /// existing PUBLIC content past the cap must still serve. The cap counts
     /// EXPENSIVE walks only — this request has no path-scoped rules anywhere, so it
     /// runs ZERO walks (the fake-git walk log stays empty) and the cap can never cut
-    /// the scan: the blob buried in the OLDER-updated repo (iterated last under
-    /// `list_all_repos`' updated_at DESC) serves its 200. Before F2 the cap counted
+    /// the scan: the blob buried in the LAST-iterated repo serves its 200. Iteration
+    /// is `(created_at, id)` ASC since the scan was paged (#173, jatmn), so the
+    /// blob-carrying repo is seeded LAST to keep it buried. Before F2 the cap counted
     /// visibility-passing VISITS and broke the loop into the opaque 404 — existing
     /// content misreported absent because of unrelated repos. MUTATION (RED): count
     /// visits against the cap again (re-add the check+increment at the visibility
@@ -1821,22 +2094,23 @@ mod tests {
         cfg.ipfs_max_repos_walked = 1;
         state.config = Arc::new(cfg);
 
-        // Seed the blob-carrying repo FIRST so its updated_at is OLDER: the empty
-        // repo is iterated first and the blob row sits past the old visit budget.
-        let (_, oid) = seed_repo_with_blob(
-            &state,
-            tmp.path(),
-            "z6f2buried",
-            "buried",
-            b"buried row proof\n",
-        )
-        .await;
+        // Seed the blob-carrying repo LAST so its created_at is NEWEST: under the
+        // paged `(created_at, id)` ASC order the empty repo is iterated first and the
+        // blob row sits past the old visit budget.
         seed_repo_with_blob(
             &state,
             tmp.path(),
             "z6f2buried",
             "fresh",
             b"unrelated content\n",
+        )
+        .await;
+        let (_, oid) = seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6f2buried",
+            "buried",
+            b"buried row proof\n",
         )
         .await;
 
@@ -1867,7 +2141,7 @@ mod tests {
 
     /// F2 walk-cap skip-and-continue: exhausting `ipfs_max_repos_walked` skips the
     /// walk-NEEDING repo without a verdict but keeps the scan alive. Three public
-    /// repos carry the same blob, newest first: the first (path-scoped) consumes the
+    /// repos carry the same blob, in iteration order: the first (path-scoped) consumes the
     /// cap-of-1 walk and denies (empty allowed-set — a verdict); the second
     /// (path-scoped) needs a walk the cap forbids and is skipped WITHOUT one (taint);
     /// the third is plain public and serves the 200 from a cheap probe — found beats
@@ -1889,15 +2163,16 @@ mod tests {
         cfg.ipfs_max_repos_walked = 1;
         state.config = Arc::new(cfg);
 
-        // Insert order = oldest first, so iteration (updated_at DESC) is reversed:
-        // gatedwalk, then gatedskip, then pubcopy. Identical content -> one CID.
+        // Iteration is `(created_at, id)` ASC since the scan was paged (#173, jatmn),
+        // so insert order IS iteration order: gatedwalk, then gatedskip, then pubcopy.
+        // Identical content -> one CID.
         let content = b"skip and continue proof\n";
-        let (_, oid) =
-            seed_repo_with_blob(&state, tmp.path(), "z6f2skip", "pubcopy", content).await;
-        let (skip_id, _) =
-            seed_repo_with_blob(&state, tmp.path(), "z6f2skip", "gatedskip", content).await;
         let (walk_id, _) =
             seed_repo_with_blob(&state, tmp.path(), "z6f2skip", "gatedwalk", content).await;
+        let (skip_id, _) =
+            seed_repo_with_blob(&state, tmp.path(), "z6f2skip", "gatedskip", content).await;
+        let (_, oid) =
+            seed_repo_with_blob(&state, tmp.path(), "z6f2skip", "pubcopy", content).await;
         for id in [&walk_id, &skip_id] {
             state
                 .db
@@ -1939,9 +2214,9 @@ mod tests {
     /// F2 visit ceiling: `ipfs_max_repo_visits` bounds the acquire+probe cost class
     /// (each visit can be a full Tigris archive fetch on a cache miss). Unlike the
     /// walk cap there is no cheap way to keep scanning, so exhaustion STOPS the scan
-    /// — and the stop is a truncation, not an absence: with ceiling 1 the newer
-    /// empty repo consumes the only visit and the blob-carrying older repo is never
-    /// probed, so the request sheds a retryable 503 + Retry-After, never a false
+    /// — and the stop is a truncation, not an absence: with ceiling 1 the
+    /// first-iterated empty repo consumes the only visit and the blob-carrying repo
+    /// behind it is never probed, so the request sheds a retryable 503 + Retry-After, never a false
     /// 404. MUTATION (RED): drop the ceiling check and the blob serves (200); drop
     /// only the taint on the break and the 503 decays to a 404.
     #[sqlx::test]
@@ -1956,8 +2231,10 @@ mod tests {
         cfg.ipfs_max_repo_visits = 1;
         state.config = Arc::new(cfg);
 
-        // Blob repo first (older, iterated second); empty repo second (newer,
-        // consumes the single visit).
+        // Empty repo seeded first, so under the paged `(created_at, id)` ASC order it
+        // is iterated first and consumes the single visit; the blob repo behind it is
+        // never probed.
+        seed_repo_with_blob(&state, tmp.path(), "z6f2visit", "fresh", b"unrelated\n").await;
         let (_, oid) = seed_repo_with_blob(
             &state,
             tmp.path(),
@@ -1966,7 +2243,6 @@ mod tests {
             b"visit ceiling proof\n",
         )
         .await;
-        seed_repo_with_blob(&state, tmp.path(), "z6f2visit", "fresh", b"unrelated\n").await;
 
         let peer: SocketAddr = "203.0.113.62:5000".parse().unwrap();
         let cid = seed_legacy_pin_for_oid(&state, &oid).await;
@@ -2078,10 +2354,11 @@ mod tests {
 
     /// F2 found-beats-taint on the acquire arm: an acquire timeout taints the
     /// scan but must NOT stop it — the loop `continue`s, and a later repo that
-    /// genuinely carries the object still serves. The NEWER row (visited first
-    /// under `list_all_repos`' updated_at DESC) is a Tigris-backed ghost whose
-    /// acquire stalls against the silent endpoint and times out at 1s; the
-    /// OLDER row is a plain public repo carrying the blob, reached next and
+    /// genuinely carries the object still serves. The FIRST-iterated row (the paged
+    /// scan orders on `(created_at, id)` ASC since #173/jatmn, so it is the row
+    /// created first) is a Tigris-backed ghost whose acquire stalls against the
+    /// silent endpoint and times out at 1s; the row behind it is a plain public
+    /// repo carrying the blob, reached next and
     /// served from a cheap probe — found beats taint: 200 with the blob bytes,
     /// never the truncation 503. MUTATION (RED): turn the acquire-timeout arm's
     /// `continue` into a `break` and the public copy never serves (503).
@@ -2092,42 +2369,44 @@ mod tests {
         std::fs::create_dir_all(&repos_dir).unwrap();
         let mut state = crate::test_support::test_state(pool.clone()).await;
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
-        // Seed the blob repo through a LOCAL-ONLY store first, so seeding never
-        // consults the (deliberately unreachable) Tigris endpoint.
+        // Seed through a LOCAL-ONLY store first, so seeding never consults the
+        // (deliberately unreachable) Tigris endpoint. The ghost row goes in FIRST:
+        // it is a bare DB insert, and under the paged `(created_at, id)` ASC order
+        // the row created first is the row iterated first.
         state.repo_store =
             crate::git::repo_store::RepoStore::for_testing(repos_dir.clone(), pool.clone());
-        let content = b"acquire taint continue proof\n";
-        let (_, oid) =
-            seed_repo_with_blob(&state, tmp.path(), "z6f2acqcont", "pubcopy", content).await;
-        // Swap in a Tigris-backed store over the SAME repos_dir (the seeded bare
-        // repo stays a fast local hit) and add a NEWER ghost row with no local
-        // copy: its acquire consults the silent local endpoint and stalls to the
-        // 1s timeout (endpoint-pinned test client, no AWS_* env reads).
-        let endpoint = crate::test_support::silent_http_endpoint().await;
-        let tigris =
-            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
-                .await;
-        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
         state
             .db
             .upsert_mirror_repo("z6f2acqcont", "ghost", "/unused-ghost", None, false)
             .await
             .unwrap();
+        let content = b"acquire taint continue proof\n";
+        let (_, oid) =
+            seed_repo_with_blob(&state, tmp.path(), "z6f2acqcont", "pubcopy", content).await;
+        // Swap in a Tigris-backed store over the SAME repos_dir (the seeded bare
+        // repo stays a fast local hit). The ghost has no local copy, so its acquire
+        // consults the silent local endpoint and stalls to the 1s timeout
+        // (endpoint-pinned test client, no AWS_* env reads).
+        let endpoint = crate::test_support::silent_http_endpoint().await;
+        let tigris =
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
+                .await;
+        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
         let mut cfg = (*state.config).clone();
         cfg.git_acquire_timeout_secs = 1;
         state.config = Arc::new(cfg);
 
-        // Ordering precondition: the ghost must be iterated FIRST (updated_at
-        // DESC — it was upserted after the blob repo), otherwise the pubcopy
-        // would serve before the taint ever fires and the continue-vs-break
-        // distinction would go untested.
+        // Ordering precondition: the ghost must be iterated FIRST, otherwise the
+        // pubcopy would serve before the taint ever fires and the continue-vs-break
+        // distinction would go untested. Read through the same paged selection the
+        // scan uses, so the precondition cannot drift from the real order.
         let order: Vec<String> = state
             .db
-            .list_all_repos()
+            .list_repos_page_for_scan(None, 100)
             .await
             .unwrap()
             .into_iter()
-            .map(|r| r.name)
+            .map(|r| r.repo.name)
             .collect();
         let ghost_pos = order.iter().position(|n| n == "ghost").unwrap();
         let pub_pos = order.iter().position(|n| n == "pubcopy").unwrap();
@@ -2601,8 +2880,8 @@ mod tests {
     /// F3 budget expiry mid-loop: one absolute request budget
     /// (`ipfs_request_budget_secs`) bounds the whole admitted scan; per-repo
     /// stages may not each draw a fresh timeout past it. Budget 1s, per-iteration
-    /// acquire timeout 2s; the NEWER row is a Tigris-backed ghost (no local copy,
-    /// silent local endpoint) whose acquire stalls, the OLDER row is a plain
+    /// acquire timeout 2s; the FIRST-iterated row is a Tigris-backed ghost (no local
+    /// copy, silent local endpoint) whose acquire stalls, the row behind it is a plain
     /// public repo carrying the blob. The ghost's acquire runs clamped to the ~1s
     /// remainder and times out; at the next repo the budget gate sees zero
     /// remaining, taints "budget", and STOPS the scan, so the blob repo is never
@@ -2619,10 +2898,17 @@ mod tests {
         std::fs::create_dir_all(&repos_dir).unwrap();
         let mut state = crate::test_support::test_state(pool.clone()).await;
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
-        // Seed the blob repo through a LOCAL-ONLY store first, so seeding never
-        // consults the (deliberately unreachable) Tigris endpoint.
+        // Seed through a LOCAL-ONLY store first, so seeding never consults the
+        // (deliberately unreachable) Tigris endpoint. The ghost row goes in FIRST: the
+        // paged scan orders on `(created_at, id)` ASC (#173, jatmn), so the row created
+        // first is the row iterated first.
         state.repo_store =
             crate::git::repo_store::RepoStore::for_testing(repos_dir.clone(), pool.clone());
+        state
+            .db
+            .upsert_mirror_repo("z6f3budget", "ghost", "/unused-ghost", None, false)
+            .await
+            .unwrap();
         let (_, oid) = seed_repo_with_blob(
             &state,
             tmp.path(),
@@ -2632,19 +2918,14 @@ mod tests {
         )
         .await;
         // Swap in a Tigris-backed store over the SAME repos_dir (the seeded bare
-        // repo stays a fast local hit) and add a NEWER ghost row with no local
-        // copy: its acquire consults the silent local endpoint and stalls past
-        // the budget (endpoint-pinned test client, no AWS_* env reads).
+        // repo stays a fast local hit). The ghost has no local copy, so its acquire
+        // consults the silent local endpoint and stalls past the budget
+        // (endpoint-pinned test client, no AWS_* env reads).
         let endpoint = crate::test_support::silent_http_endpoint().await;
         let tigris =
             crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
                 .await;
         state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
-        state
-            .db
-            .upsert_mirror_repo("z6f3budget", "ghost", "/unused-ghost", None, false)
-            .await
-            .unwrap();
         let mut cfg = (*state.config).clone();
         cfg.ipfs_request_budget_secs = 1;
         cfg.git_acquire_timeout_secs = 2;
@@ -2691,7 +2972,7 @@ mod tests {
     /// the recorded pid is already dead: a tokio abort would have left it
     /// running), the log shows the walk started but never completed, and the
     /// request sheds the terminal budget-truncated 503 without ever reaching the
-    /// OLDER public copy of the same blob (which would have served 200). After
+    /// public copy of the same blob behind it (which would have served 200). After
     /// the response the permit is free: the spawn_blocking closure genuinely
     /// returned. MUTATION (RED): drop the `min` clamp on `walk_timeout` and the
     /// walk runs its full 8s sleep (elapsed and log-completion assertions fail).
@@ -2742,13 +3023,13 @@ mod tests {
         cfg.ipfs_request_budget_secs = 2;
         state.config = Arc::new(cfg);
 
-        // Older row: a plain public copy of the same blob, which must never be
-        // reached. Newer row: path-scoped, so its blob costs the clamped walk.
+        // First-iterated row (seeded first, `(created_at, id)` ASC): path-scoped, so
+        // its blob costs the clamped walk. Behind it, a plain public copy of the same
+        // blob which must never be reached.
         let content = b"budget walk clamp proof\n";
-        let (_, oid) =
-            seed_repo_with_blob(&state, tmp.path(), "z6f3clamp", "pubcopy", content).await;
-        let (walk_id, _) =
+        let (walk_id, oid) =
             seed_repo_with_blob(&state, tmp.path(), "z6f3clamp", "gated", content).await;
+        seed_repo_with_blob(&state, tmp.path(), "z6f3clamp", "pubcopy", content).await;
         state
             .db
             .set_visibility_rule(
@@ -3740,19 +4021,20 @@ mod tests {
         );
     }
 
-    /// F6/KTD-5: the two initial metadata queries (`list_all_repos`,
+    /// F6/KTD-5: the legacy scan's page queries (`list_repos_page_for_scan`,
     /// `list_visibility_rules_for_repos`) run AFTER the scarce walk permits are
     /// acquired (held RAII for the whole request) but BEFORE the per-repo loop's
     /// first budget gate. Pre-fix they were bare awaits with no deadline, so a query
     /// blocked in Postgres pinned the walk slot for the whole stall, past the request
-    /// budget. Here we hold an ACCESS EXCLUSIVE lock on `repos` so `list_all_repos`
+    /// budget. Here we hold an ACCESS EXCLUSIVE lock on `repos` so the page query
     /// blocks; with the budget clamp the request sheds a retryable budget 503 within
     /// ~budget and FREES the walk permit, and a follow-up (lock released) is served.
     ///
     /// Load-bearing: pre-fix the bare await blocks on the lock until the 10s wrapping
     /// timeout fires (RED — "never returned within budget"). After the fix it returns
     /// the 503 at ~1s and the permit is free again. MUTATION (RED): drop the
-    /// `tokio::time::timeout` around `list_all_repos` and this hangs past the wrap.
+    /// `tokio::time::timeout` around `list_repos_page_for_scan` and this hangs past
+    /// the wrap.
     #[sqlx::test]
     async fn get_by_cid_stalled_metadata_query_frees_walk_permit(pool: sqlx::PgPool) {
         let mut state = crate::test_support::test_state(pool.clone()).await;
@@ -3770,8 +4052,8 @@ mod tests {
         let router = ipfs_router(state);
 
         // Hold an ACCESS EXCLUSIVE lock on `repos` on a dedicated pooled connection:
-        // `list_all_repos`' SELECT needs ACCESS SHARE, which conflicts, so it blocks
-        // at lock acquisition regardless of row count.
+        // the page SELECT needs ACCESS SHARE, which conflicts, so it blocks at lock
+        // acquisition regardless of row count.
         let mut lock_conn = pool.acquire().await.unwrap();
         sqlx::raw_sql("BEGIN; LOCK TABLE repos IN ACCESS EXCLUSIVE MODE;")
             .execute(&mut *lock_conn)
@@ -4010,7 +4292,9 @@ mod tests {
     /// listing — exposing a public repo's path-restricted blob. Here a PUBLIC repo
     /// carries the blob under a path-scoped rule that denies anon; `visibility_rules`
     /// is locked ACCESS EXCLUSIVE so the rule query blocks. The fix returns the budget
-    /// 503 BEFORE the loop, so the handler NEVER serves (never 200).
+    /// 503 BEFORE the loop, so the handler NEVER serves (never 200). Since the scan was
+    /// paged (#173, jatmn) the rules are fetched per PAGE, so this covers the clamp on
+    /// every page rather than on one whole-inventory load.
     ///
     /// Load-bearing: pre-fix the bare await blocks on the lock until the 10s wrap fires
     /// (RED). After the fix it sheds the 503 at ~1s. The `assert_ne!(200)` is the
@@ -4052,7 +4336,7 @@ mod tests {
         let cid = seed_legacy_pin_for_oid(&state, &oid).await;
         let router = ipfs_router(state);
 
-        // Lock `visibility_rules` ACCESS EXCLUSIVE: list_all_repos (on `repos`) still
+        // Lock `visibility_rules` ACCESS EXCLUSIVE: the page query (on `repos`) still
         // succeeds, but list_visibility_rules_for_repos blocks on the rule query.
         let mut lock_conn = pool.acquire().await.unwrap();
         sqlx::raw_sql("BEGIN; LOCK TABLE visibility_rules IN ACCESS EXCLUSIVE MODE;")
