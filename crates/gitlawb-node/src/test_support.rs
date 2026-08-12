@@ -8378,6 +8378,204 @@ mod tests {
         assert!(body.contains("public bytes"), "the object's bytes serve");
     }
 
+    /// U2 (#173, F1 proved by execution): a genuinely PRE-PROVENANCE `pinned_cids` row,
+    /// one written while `pinned_cids.repo_id` and `pin_repo_sources` do not exist, is
+    /// repaired by the sweep and then served end to end by `GET /ipfs/{cid}`.
+    ///
+    /// The fixture un-applies v19 and v20 before the insert on purpose. A source-less
+    /// row written through the modern schema is a shortcut: it shows the sweep copes
+    /// with an empty source set, not that it copes with the row shape an upgraded node
+    /// actually carries. With the column absent, a provenance-carrying insert is
+    /// impossible, so the row cannot be anything but the real upgrade case.
+    ///
+    /// F1 was that the sweep SKIPPED exactly this row. An empty `pin_sources_for_oid`
+    /// left the `for repo_id in sources` body unentered while the cursor had already
+    /// advanced past it, so the row kept its provider key and stayed unresolvable with
+    /// nothing left to fix it. The pre-sweep assertion below brackets the repair, so
+    /// the serve at the end cannot pass vacuously on a row that was already fine.
+    #[sqlx::test]
+    async fn sweep_repairs_pre_provenance_upgrade_row_and_serves(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["preprov"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("preprov.git");
+        let repo = seed_repo(&owner_did, "preprov"); // public, no rule
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        // Un-apply the provenance schema: the node is back at the shape it had before
+        // v19 and v20, where a pin could not carry provenance at all.
+        sqlx::query("DROP TABLE IF EXISTS pin_repo_sources")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE pinned_cids DROP COLUMN IF EXISTS repo_id")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version IN (19, 20)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The legacy row, INSERTed naming only the columns that exist at this schema.
+        // `seed_legacy_pin` cannot be reused here: it binds `repo_id`, which is the one
+        // thing this fixture is proving the row never had.
+        let (_ty, bytes) = crate::git::store::read_object(&bare, &fx.public_oid)
+            .expect("read object bytes")
+            .expect("object exists in the bare repo");
+        let raw_cid = gitlawb_core::cid::Cid::from_git_object_bytes(&bytes).to_string();
+        let provider_cid = legacy_dagpb_cid(&raw_cid);
+        assert_ne!(
+            provider_cid, raw_cid,
+            "the legacy key differs from the raw resolver key"
+        );
+        sqlx::query("INSERT INTO pinned_cids (sha256_hex, cid, pinned_at) VALUES ($1, $2, $3)")
+            .bind(&fx.public_oid)
+            .bind(&provider_cid)
+            .bind("2020-01-01T00:00:00Z")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Upgrade forward. The row now reads as the exact F1 shape: no first-pinner, no
+        // source rows, and no incompleteness signal either, so emptiness is the only
+        // thing the sweep has to go on.
+        state
+            .db
+            .run_migrations()
+            .await
+            .expect("re-apply the provenance migrations");
+        let first_pinner: Option<String> =
+            sqlx::query_scalar("SELECT repo_id FROM pinned_cids WHERE sha256_hex = $1")
+                .bind(&fx.public_oid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            first_pinner.is_none(),
+            "the upgraded row carries no first-pinner: the column did not exist when it \
+             was written"
+        );
+        assert!(
+            state
+                .db
+                .pin_sources_for_oid(&fx.public_oid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the upgraded row has no recorded source of any kind"
+        );
+        assert!(
+            !state
+                .db
+                .pin_sources_incomplete(&fx.public_oid)
+                .await
+                .unwrap(),
+            "and no incompleteness marker either: an upgrade row is indistinguishable \
+             from a healthy one except by being empty"
+        );
+
+        // The bracket: while the row is unrepaired the resolver withholds it, so the
+        // raw key a correct client sends does not serve.
+        let (st_before, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&raw_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_ne!(
+            st_before,
+            StatusCode::OK,
+            "the raw key does not serve while the row is still keyed on the provider CID"
+        );
+
+        let stats = crate::ipfs_pin::sweep_legacy_provider_cids(
+            std::path::Path::new("/tmp"),
+            &state.git_bin,
+            std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+            16,
+            std::time::Duration::ZERO,
+            &state.db,
+        )
+        .await;
+        assert_eq!(
+            stats.repaired, 1,
+            "the sweep repairs the pre-provenance upgrade row"
+        );
+
+        let (stored, stashed) = stored_pin(&pool, &fx.public_oid).await;
+        assert_eq!(
+            stored, raw_cid,
+            "the key is rewritten to the raw-content resolver key"
+        );
+        assert_eq!(
+            stashed.as_deref(),
+            Some(provider_cid.as_str()),
+            "the old provider CID is stashed rather than dropped"
+        );
+        assert_eq!(
+            state.db.pin_sources_for_oid(&fx.public_oid).await.unwrap(),
+            vec![repo.id.clone()],
+            "the repo discovery read the bytes from is recorded as a source"
+        );
+        let claimed: Option<String> =
+            sqlx::query_scalar("SELECT repo_id FROM pinned_cids WHERE sha256_hex = $1")
+                .bind(&fx.public_oid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            claimed.is_none(),
+            "discovery records the holder ADDITIVELY: reading identical bytes proves \
+             the repo holds the object, never that it pinned it first, so the exclusive \
+             first-pinner column stays NULL"
+        );
+        assert!(
+            state
+                .db
+                .pin_sources_incomplete(&fx.public_oid)
+                .await
+                .unwrap(),
+            "one discovered holder out of a bounded candidate set never proves the set \
+             complete, so the resolver keeps its scan fallback for this row"
+        );
+        let marker: Vec<String> =
+            sqlx::query_scalar("SELECT repo_id FROM pin_source_failures WHERE sha256_hex = $1")
+                .bind(&fx.public_oid)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            marker,
+            vec![String::new()],
+            "the marker is against the UNKNOWN-repo sentinel, not the repo just \
+             recorded: no real record can clear it"
+        );
+
+        // End to end: the repaired key serves the object's raw bytes to an anonymous
+        // caller, which is the whole point of repairing it.
+        let (st, body) = cid_bytes(
+            cid_router(&state)
+                .oneshot(cid_anon(&raw_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "the repaired raw key serves");
+        assert_eq!(
+            body, bytes,
+            "the served body is the object's raw content, byte for byte"
+        );
+    }
+
     /// F1 scenario 10 (#173, the unsafe-path arm of the candidate load): a `repos` row
     /// whose name cannot be turned into a validated disk path is dropped when the
     /// candidate list is built, and the drop is both TERMINAL and NON-FATAL.
