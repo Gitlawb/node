@@ -1088,6 +1088,41 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_repos_created_at_id ON repos (created_at ASC, id ASC)",
         ],
     },
+    Migration {
+        version: 26,
+        name: "pin_repair_sweep_discovery_cursor",
+        stmts: &[
+            // #173 round 13 (F5): discovery probes at most
+            // `MAX_LEGACY_DISCOVERY_PROBES` warm candidates per source-less row, taken
+            // from a list ordered `(created_at, id)`. That order is stable, so without a
+            // continuation every traversal probed the same oldest sixteen and a holder
+            // at position seventeen was never reached by anything, on any node, ever.
+            // These two columns are the boundary the next traversal's window starts
+            // after, so coverage becomes a bounded number of traversals rather than
+            // unreachable.
+            //
+            // STEERABILITY is why this is a keyset KEY and not an offset into the list.
+            // `repo_id` derives from a grindable owner DID, so the one thing an attacker
+            // must not be able to do is move the window off the true holder. Candidates
+            // enter and leave the warm list between traversals (a cold repo warming on a
+            // Tigris-backed node, a fresh registration, a deletion), and every such
+            // change silently renumbers an offset while leaving a key's boundary exactly
+            // where it was. Fresh registrations sort LAST under `created_at` and cannot
+            // be backdated, so they can only ever be appended behind the window.
+            //
+            // RESIDUAL, stated rather than implied: an operator who can insert repos
+            // with an arbitrary `created_at` can still place candidates between the
+            // continuation and the holder and delay it by a traversal per sixteen rows
+            // inserted. That is a privileged write, it costs a real repo row each, and
+            // it delays rather than prevents, since the window keeps advancing.
+            //
+            // NEW versioned migration (never appended to an applied block, INV-7). NOT
+            // NULL DEFAULT '' so an existing `pin_repair_sweep` row reads as "start at
+            // the head of the list", which is the same thing a never-swept node reads.
+            "ALTER TABLE pin_repair_sweep ADD COLUMN IF NOT EXISTS discovery_cursor_created_at TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE pin_repair_sweep ADD COLUMN IF NOT EXISTS discovery_cursor_id TEXT NOT NULL DEFAULT ''",
+        ],
+    },
 ];
 
 /// Max distinct source repos recorded per pinned object (F1, #173 jatmn round 8).
@@ -2873,6 +2908,67 @@ impl Db {
              ON CONFLICT (id) DO UPDATE SET cursor = EXCLUDED.cursor",
         )
         .bind(cursor)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Where the sweep's DISCOVERY window left off, as a `(created_at, id)` keyset
+    /// key, or `("", "")` before any traversal has completed one.
+    ///
+    /// A second, independent position from [`Db::pin_repair_cursor`]: that one walks
+    /// `pinned_cids` rows, this one walks the warm CANDIDATE list a source-less row is
+    /// probed against. Both are per-TRAVERSAL, and the candidate one only ever moves
+    /// at the end of a completed traversal, so every pass of one traversal reads the
+    /// same value and every source-less row in it shares one window.
+    ///
+    /// A key rather than an offset. Repos enter and leave the warm candidate list
+    /// between traversals (a cold repo warming on a Tigris-backed node, a fresh
+    /// registration, a deletion), and an offset silently means a different candidate
+    /// once anything below it moves, which slides the window off the row it was about
+    /// to reach. A key names the boundary itself, so an insert below it is invisible.
+    /// The key is the RAW stored `created_at` text (`ScanRepoRow::created_at_key`),
+    /// never a re-serialized `DateTime`, for the reason that struct's own doc gives.
+    pub async fn discovery_continuation(&self) -> Result<(String, String)> {
+        let row = sqlx::query(
+            "SELECT discovery_cursor_created_at, discovery_cursor_id
+               FROM pin_repair_sweep WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row
+            .map(|r| {
+                (
+                    r.get::<String, _>("discovery_cursor_created_at"),
+                    r.get::<String, _>("discovery_cursor_id"),
+                )
+            })
+            .unwrap_or_default())
+    }
+
+    /// Persist the discovery window's continuation at the end of a completed traversal.
+    ///
+    /// The INSERT arm names `cursor` explicitly with `''`. v23 declares that column
+    /// `NOT NULL` and seeds NO row, so a never-swept node has nothing to update and an
+    /// upsert naming only the continuation columns would fail its NOT NULL check.
+    /// Every caller treats a failed persist as warn-only, so that failure would be
+    /// SILENT and the window would never rotate on exactly the nodes this sweep exists
+    /// for. `''` is the same value `pin_repair_cursor` reads as "never swept", so
+    /// seeding it here starts no walk anywhere but the top of the table.
+    ///
+    /// The UPDATE arm touches ONLY the two continuation columns. Writing `cursor` there
+    /// too would clobber a live row-walk position with `''` every time the window
+    /// rotated, rewinding the `pinned_cids` walk to the start of the table.
+    pub async fn set_discovery_continuation(&self, created_at_key: &str, id: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO pin_repair_sweep (id, cursor, discovery_cursor_created_at, discovery_cursor_id)
+             VALUES (1, '', $1, $2)
+             ON CONFLICT (id) DO UPDATE SET
+                 discovery_cursor_created_at = EXCLUDED.discovery_cursor_created_at,
+                 discovery_cursor_id = EXCLUDED.discovery_cursor_id",
+        )
+        .bind(created_at_key)
+        .bind(id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -6694,6 +6790,112 @@ mod ref_certificate_tests {
         assert!(
             keyset_index_exists(&pool).await,
             "v25 must recreate the keyset index on an upgrading node"
+        );
+    }
+
+    /// U4 (#173 round 13, F5, INV-7 upgrade path): an existing node past v1 gets the
+    /// discovery-continuation columns from its OWN v26 entry, proven by dropping the
+    /// columns plus their `schema_migrations` row and re-running the real migration
+    /// code.
+    ///
+    /// The round-trip runs on a NEVER-SWEPT database, with no `pin_repair_sweep` row at
+    /// all, because that is the state the setter's insert arm is written for. v23
+    /// declares `cursor` NOT NULL and seeds no row, so an upsert naming only the two new
+    /// columns fails its NOT NULL check on exactly the nodes this sweep exists for, and
+    /// every caller of the setter treats a failure as warn-only, so the window would
+    /// simply never rotate and nothing would say so. Asserting the read-back is what
+    /// makes that failure visible here.
+    ///
+    /// MUTATION (RED): delete the v26 entry from `MIGRATIONS` and the fresh-chain
+    /// round-trip fails on the missing columns.
+    #[sqlx::test]
+    async fn v26_discovery_continuation_applies_on_upgrade(pool: PgPool) {
+        async fn continuation_columns_exist(pool: &PgPool) -> bool {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM information_schema.columns
+                  WHERE table_name = 'pin_repair_sweep'
+                    AND column_name IN ('discovery_cursor_created_at', 'discovery_cursor_id')",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap()
+                == 2
+        }
+
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+        assert!(
+            continuation_columns_exist(&pool).await,
+            "the fresh migration chain must carry the discovery continuation columns"
+        );
+
+        // Simulate a node at pre-v26: drop the columns and their migration record.
+        sqlx::query(
+            "ALTER TABLE pin_repair_sweep
+                 DROP COLUMN IF EXISTS discovery_cursor_created_at,
+                 DROP COLUMN IF EXISTS discovery_cursor_id",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 26")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !continuation_columns_exist(&pool).await,
+            "precondition: columns and their migration record removed"
+        );
+
+        db.run_migrations().await.unwrap();
+        assert!(
+            continuation_columns_exist(&pool).await,
+            "v26 must add the continuation columns on an upgrading node"
+        );
+
+        // NEVER SWEPT: no `pin_repair_sweep` row exists, so the setter has to INSERT and
+        // its insert arm has to satisfy v23's NOT NULL `cursor`.
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM pin_repair_sweep")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0,
+            "precondition: the sweep has never run on this node"
+        );
+        assert_eq!(
+            db.discovery_continuation().await.unwrap(),
+            (String::new(), String::new()),
+            "an unswept node reads the empty continuation, which means the head of the list"
+        );
+        db.set_discovery_continuation("2020-01-01T00:00:00+00:00", "repo-42")
+            .await
+            .expect("the continuation persists on a never-swept node");
+        assert_eq!(
+            db.discovery_continuation().await.unwrap(),
+            (
+                "2020-01-01T00:00:00+00:00".to_string(),
+                "repo-42".to_string()
+            ),
+            "the continuation round-trips"
+        );
+        assert_eq!(
+            db.pin_repair_cursor().await.unwrap(),
+            "",
+            "the insert arm seeds the row-walk cursor at the head of the table"
+        );
+
+        // A rotation must never move the row walk. Park the row cursor, rotate again,
+        // and read it back.
+        db.set_pin_repair_cursor("ff00").await.unwrap();
+        db.set_discovery_continuation("2021-06-01T00:00:00+00:00", "repo-99")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.pin_repair_cursor().await.unwrap(),
+            "ff00",
+            "the update arm touches only the continuation columns, so an in-progress \
+             table walk is never rewound by a window rotation"
         );
     }
 

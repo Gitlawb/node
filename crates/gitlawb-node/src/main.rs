@@ -700,7 +700,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// U4 (#173): spawn the one-shot legacy provider-CID repair sweep. Releases before this
+/// U4 (#173): spawn the periodic legacy provider-CID repair sweep. Releases before this
 /// version stored the PROVIDER CID (Kubo dag-pb / Pinata CIDv0) in `pinned_cids.cid`,
 /// and this version's `/ipfs/{cid}` resolver withholds any row whose stored key is not
 /// the raw-content CID. The opportunistic repair on the pin path only fires when a push
@@ -708,7 +708,8 @@ async fn main() -> Result<()> {
 /// need a walk. DETACHED, never on the boot path: the caller keeps serving while this
 /// runs, and the sweep's own batch bound plus inter-batch delay keep it off the DB's
 /// critical path. Its cursor is durable, so a restart mid-walk resumes instead of
-/// rewinding.
+/// rewinding. It re-arms on `SWEEP_REARM_DELAY` and so returns only on a failing pass
+/// query, which is why the awaited value is no longer worth logging here.
 ///
 /// A named function rather than an inline block in `main` so the WIRING has a seam a
 /// test can call: that the task is spawned at all, that it reads its batch and delay
@@ -725,17 +726,10 @@ fn spawn_legacy_cid_sweep(state: &AppState, config: &Config) -> tokio::task::Joi
     let mut shutdown_rx = state.subscribe_shutdown();
     tokio::spawn(async move {
         tokio::select! {
-            stats = ipfs_pin::sweep_legacy_provider_cids(
-                &repos_dir, &git_bin, git_timeout, batch, delay, &db,
-            ) => {
-                if stats.repaired > 0 {
-                    tracing::info!(
-                        scanned = stats.scanned,
-                        repaired = stats.repaired,
-                        "legacy provider-CID sweep finished"
-                    );
-                }
-            }
+            _ = ipfs_pin::run_sweep_rearmed(
+                &repos_dir, &git_bin, git_timeout, batch, delay,
+                ipfs_pin::SWEEP_REARM_DELAY, &db,
+            ) => {}
             // Shutdown mid-walk simply drops the run; the persisted cursor means the
             // next boot picks up where this one stopped.
             _ = shutdown_rx.changed() => {}

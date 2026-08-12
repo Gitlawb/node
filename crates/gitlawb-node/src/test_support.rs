@@ -6481,6 +6481,7 @@ mod tests {
             16,
             std::time::Duration::ZERO,
             &state.db,
+            &mut Default::default(),
         )
         .await;
         assert_eq!(stats.repaired, 1, "the sweep repairs the one legacy row");
@@ -6558,6 +6559,7 @@ mod tests {
             16,
             std::time::Duration::ZERO,
             &state.db,
+            &mut Default::default(),
         )
         .await;
         assert_eq!(stats.repaired, 0, "an unrepairable row is not repaired");
@@ -6609,6 +6611,7 @@ mod tests {
             16,
             std::time::Duration::ZERO,
             &state.db,
+            &mut Default::default(),
         )
         .await;
         assert_eq!(stats.scanned, 1, "the sweep walked the row");
@@ -6662,6 +6665,7 @@ mod tests {
             std::time::Duration::from_secs(state.config.git_service_timeout_secs),
             2,
             &state.db,
+            &mut Default::default(),
         )
         .await
         .expect("one pass runs");
@@ -6717,6 +6721,7 @@ mod tests {
             git_timeout,
             2,
             &state.db,
+            &mut Default::default(),
         )
         .await
         .expect("pass 1 runs");
@@ -6730,6 +6735,7 @@ mod tests {
             git_timeout,
             2,
             &state.db,
+            &mut Default::default(),
         )
         .await
         .expect("pass 2 runs");
@@ -6806,6 +6812,7 @@ mod tests {
                 1,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -6870,6 +6877,7 @@ mod tests {
                 16,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -6892,6 +6900,7 @@ mod tests {
                 16,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -6968,6 +6977,7 @@ mod tests {
                 16,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -6988,6 +6998,7 @@ mod tests {
                 16,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -7047,6 +7058,7 @@ mod tests {
                 16,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -7076,6 +7088,7 @@ mod tests {
                 16,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -7156,6 +7169,7 @@ mod tests {
                 batch,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -7252,6 +7266,7 @@ mod tests {
                 1,
                 std::time::Duration::from_millis(300),
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -7313,6 +7328,7 @@ mod tests {
                 16,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -7382,6 +7398,7 @@ mod tests {
             16,
             std::time::Duration::ZERO,
             &state.db,
+            &mut Default::default(),
         )
         .await;
         ticker.abort();
@@ -7417,6 +7434,7 @@ mod tests {
                 4,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -7447,6 +7465,7 @@ mod tests {
                 4,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -7498,6 +7517,7 @@ mod tests {
             2,
             delay,
             &state.db,
+            &mut Default::default(),
         )
         .await;
         let elapsed = started.elapsed();
@@ -7599,6 +7619,7 @@ mod tests {
                 16,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -7667,6 +7688,7 @@ mod tests {
                 16,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -7685,6 +7707,7 @@ mod tests {
                 16,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -7735,6 +7758,7 @@ mod tests {
                 16,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -7820,6 +7844,7 @@ mod tests {
                 16,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -7867,6 +7892,7 @@ mod tests {
                 16,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -7954,6 +7980,7 @@ mod tests {
                 batch,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -8038,6 +8065,7 @@ mod tests {
                 16,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -8102,6 +8130,7 @@ mod tests {
                 16,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -8204,6 +8233,7 @@ mod tests {
                 std::time::Duration::from_secs(4),
                 16,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -8290,6 +8320,7 @@ mod tests {
                 std::time::Duration::from_secs(4),
                 16,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -8321,6 +8352,1016 @@ mod tests {
             oids.len(),
             "no row is settled: the wedged ones and the unprobed ones are all worth \
              walking again"
+        );
+    }
+
+    // ---- #173 round 13, F5: the per-traversal discovery window continuation ----
+
+    /// A repo row at a chosen point in the sweep's `(created_at, id)` candidate order,
+    /// `pos` seconds past a fixed base so the order is the fixture's to set rather than
+    /// the clock's. Negative positions sort BELOW the base, which is how a fixture models
+    /// a candidate entering the warm list underneath an already-persisted continuation.
+    fn seed_repo_at(owner_did: &str, name: &str, pos: i64) -> RepoRecord {
+        let created_at = chrono::DateTime::parse_from_rfc3339("2020-01-01T12:00:00Z")
+            .expect("the fixture base parses")
+            .with_timezone(&Utc)
+            + chrono::Duration::seconds(pos);
+        RepoRecord {
+            created_at,
+            updated_at: created_at,
+            ..seed_repo(owner_did, name)
+        }
+    }
+
+    /// The keyset key the sweep stores for a candidate: the RAW `created_at` text as
+    /// `create_repo` wrote it, plus the repo id.
+    fn candidate_key(repo: &RepoRecord) -> (String, String) {
+        (repo.created_at.to_rfc3339(), repo.id.clone())
+    }
+
+    /// Seed `n` warm candidates in candidate order (position 1 is the oldest). The one at
+    /// 1-based `holder` is the already-cloned bare named there and really holds the
+    /// fixture's objects; every other position is an empty bare that holds nothing, so a
+    /// probe against it costs a real object read and finds nothing.
+    async fn seed_candidate_ladder(
+        db: &crate::db::Db,
+        owner_did: &str,
+        slug: &str,
+        prefix: &str,
+        n: usize,
+        holder: Option<(usize, &str)>,
+    ) -> Vec<RepoRecord> {
+        let mut rows = Vec::new();
+        for pos in 1..=n {
+            let name = match holder {
+                Some((hp, hn)) if hp == pos => hn.to_string(),
+                _ => {
+                    let name = format!("{prefix}{pos}");
+                    init_empty_bare(
+                        &std::path::PathBuf::from("/tmp")
+                            .join(slug)
+                            .join(format!("{name}.git")),
+                    );
+                    name
+                }
+            };
+            let repo = seed_repo_at(owner_did, &name, pos as i64);
+            db.create_repo(&repo).await.expect("seed candidate");
+            rows.push(repo);
+        }
+        rows
+    }
+
+    /// Copy ONE blob between SHA-256 bares, preserving its oid. A bare clone carries
+    /// every object in the fixture, and the cross-batch scenario needs a candidate that
+    /// holds exactly one of them.
+    fn copy_blob_into_bare(src: &std::path::Path, dst: &std::path::Path, oid: &str) {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let blob = Command::new("git")
+            .args(["cat-file", "blob", oid])
+            .current_dir(src)
+            .output()
+            .expect("git runs");
+        assert!(blob.status.success(), "cat-file blob {oid}");
+        let mut child = Command::new("git")
+            .args(["hash-object", "-w", "-t", "blob", "--stdin"])
+            .current_dir(dst)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("git runs");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(&blob.stdout)
+            .expect("feed the blob");
+        let out = child.wait_with_output().expect("hash-object finishes");
+        assert!(out.status.success(), "hash-object -w");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            oid,
+            "the copied blob keeps its oid, or the fixture is not the object the row names"
+        );
+    }
+
+    /// Poll `f` until it yields a value or `limit` runs out. Several scenarios drive the
+    /// re-arm wrapper, which on a healthy table never returns, so the assertion has to be
+    /// on DB state observed while it runs.
+    async fn poll_until<T, F, Fut>(limit: std::time::Duration, mut f: F) -> Option<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Option<T>>,
+    {
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            if let Some(v) = f().await {
+                return Some(v);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// F5 scenario 1 (#173 round 13): a holder past the probe cap is REACHED.
+    ///
+    /// `discover_legacy_row` probes the first `MAX_LEGACY_DISCOVERY_PROBES` of a list
+    /// ordered `(created_at, id)`. That order is stable and the list was rebuilt from
+    /// scratch every run, so before the continuation every traversal on every node probed
+    /// the same oldest sixteen and a holder at position seventeen was unreachable by
+    /// anything: not a later pass, not a later run, not a reboot. Seventeen warm
+    /// candidates with only the newest holding the object; the first traversal must
+    /// repair nothing and persist where it got to, the second must start after that and
+    /// repair the row, and neither may exceed the probe cap.
+    ///
+    /// RED before the rotation: both traversals probe the same first sixteen and the row
+    /// keeps its provider key forever.
+    #[sqlx::test]
+    async fn sweep_discovery_rotation_reaches_later_candidates(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+
+        // `rotsrc` carries the bytes but has NO repos row, so it is never a candidate;
+        // `rotheld` is the candidate that really holds them.
+        let fx = seed_cid_repos(&slug, &short, &["rotsrc", "rotheld"]);
+        let src = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("rotsrc.git");
+        let candidates = seed_candidate_ladder(
+            &state.db,
+            &owner_did,
+            &slug,
+            "rotcand",
+            crate::ipfs_pin::MAX_LEGACY_DISCOVERY_PROBES + 1,
+            Some((crate::ipfs_pin::MAX_LEGACY_DISCOVERY_PROBES + 1, "rotheld")),
+        )
+        .await;
+        let (raw_cid, provider_cid) = seed_legacy_pin(&pool, &src, &fx.public_oid, None).await;
+
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+                &mut Default::default(),
+            ),
+        )
+        .await
+        .expect("the first traversal terminates");
+
+        assert_eq!(
+            first.repaired, 0,
+            "the holder sits past the probe cap, so the first window cannot reach it"
+        );
+        assert_eq!(
+            first.dead_row_reads,
+            crate::ipfs_pin::MAX_LEGACY_DISCOVERY_PROBES,
+            "the first traversal spends exactly one window of probes on the row"
+        );
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            provider_cid,
+            "the row still carries its legacy provider key after the first traversal"
+        );
+        assert_eq!(
+            state.db.discovery_continuation().await.unwrap(),
+            candidate_key(&candidates[crate::ipfs_pin::MAX_LEGACY_DISCOVERY_PROBES - 1]),
+            "a completed traversal that ran out of window persists the last candidate it \
+             actually read, so the next one starts after it instead of repeating it"
+        );
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+                &mut Default::default(),
+            ),
+        )
+        .await
+        .expect("the second traversal terminates");
+
+        assert_eq!(
+            second.repaired, 1,
+            "the second traversal's window starts at the seventeenth candidate and \
+             repairs the row"
+        );
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            raw_cid,
+            "the key is rewritten to the raw-content CID"
+        );
+        assert!(
+            second.dead_row_reads <= crate::ipfs_pin::MAX_LEGACY_DISCOVERY_PROBES,
+            "the rotation moves the window, it does not widen it: {} reads in one \
+             traversal",
+            second.dead_row_reads
+        );
+        assert_ne!(raw_cid, provider_cid, "control: the two keys really differ");
+    }
+
+    /// F5 scenario 2 (#173 round 13, MUST-NOT, the steerability negative): candidates
+    /// appearing between traversals must not move the window off the holder.
+    ///
+    /// The continuation is a keyset KEY, not an offset, and this is the difference.
+    /// Freshly registered repos sort LAST under `created_at` and cannot be backdated, so
+    /// they can only ever land behind the window. Candidates can also enter BELOW the
+    /// continuation without any mint at all: a cold repo warms on a Tigris-backed node,
+    /// an operator restores an archived one. Every one of those silently renumbers an
+    /// offset, and sixteen of them slide an offset window clean off the candidate it was
+    /// about to reach, while a key names the boundary itself and does not care what
+    /// appeared underneath it.
+    ///
+    /// RED under an offset continuation: the second traversal's window starts sixteen
+    /// entries into a list that grew underneath it and never reaches the holder.
+    #[sqlx::test]
+    async fn sweep_discovery_rotation_survives_minted_candidates(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+        let cap = crate::ipfs_pin::MAX_LEGACY_DISCOVERY_PROBES;
+
+        let fx = seed_cid_repos(&slug, &short, &["mintsrc", "mintheld"]);
+        let src = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("mintsrc.git");
+        let candidates = seed_candidate_ladder(
+            &state.db,
+            &owner_did,
+            &slug,
+            "mintcand",
+            cap + 1,
+            Some((cap + 1, "mintheld")),
+        )
+        .await;
+        let (raw_cid, provider_cid) = seed_legacy_pin(&pool, &src, &fx.public_oid, None).await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+                &mut Default::default(),
+            ),
+        )
+        .await
+        .expect("the first traversal terminates");
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            provider_cid,
+            "precondition: the first window does not reach the holder"
+        );
+        let boundary = state.db.discovery_continuation().await.unwrap();
+        assert_eq!(
+            boundary,
+            candidate_key(&candidates[cap - 1]),
+            "precondition: the window boundary is the sixteenth candidate"
+        );
+
+        // The mint: several brand-new repos. They sort last and are the only thing an
+        // attacker who can grind owner DIDs actually gets to do.
+        for i in 0..5 {
+            let name = format!("minted{i}");
+            init_empty_bare(
+                &std::path::PathBuf::from("/tmp")
+                    .join(&slug)
+                    .join(format!("{name}.git")),
+            );
+            state
+                .db
+                .create_repo(&seed_repo_at(&owner_did, &name, 100 + i))
+                .await
+                .expect("seed a minted candidate");
+        }
+        // And a whole window's worth entering BELOW the boundary, which is what an
+        // offset silently mistakes for a move of the boundary itself.
+        for i in 0..cap {
+            let name = format!("warmed{i}");
+            init_empty_bare(
+                &std::path::PathBuf::from("/tmp")
+                    .join(&slug)
+                    .join(format!("{name}.git")),
+            );
+            state
+                .db
+                .create_repo(&seed_repo_at(&owner_did, &name, -(i as i64) - 1))
+                .await
+                .expect("seed a candidate below the boundary");
+        }
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+                &mut Default::default(),
+            ),
+        )
+        .await
+        .expect("the second traversal terminates");
+
+        assert_eq!(
+            second.repaired, 1,
+            "the window boundary is a key, so twenty-one candidates arriving between \
+             traversals leave it exactly where the first traversal put it and the holder \
+             is still the next thing read"
+        );
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            raw_cid,
+            "the holder's row is repaired despite the churn"
+        );
+    }
+
+    /// F5 scenario 3 (#173 round 13): a candidate list that has shrunk below one window
+    /// RESETS the continuation instead of stranding it past the end of the list.
+    ///
+    /// The migration's own success shrinks the list (repos go cold, get deleted), and a
+    /// continuation left pointing past everything would rotate each later traversal to an
+    /// empty tail and then wrap to the same prefix forever. Once the whole warm list fits
+    /// in one window there is no next window to advance to, so the traversal resets.
+    #[sqlx::test]
+    async fn sweep_discovery_shrunken_list_resets_the_continuation(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+        let cap = crate::ipfs_pin::MAX_LEGACY_DISCOVERY_PROBES;
+
+        let fx = seed_cid_repos(&slug, &short, &["shrinksrc"]);
+        let src = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("shrinksrc.git");
+        // Nothing warm holds the object, so the row stays unrepaired and every traversal
+        // spends a full window on it.
+        let candidates =
+            seed_candidate_ladder(&state.db, &owner_did, &slug, "shrinkcand", cap + 1, None).await;
+        seed_legacy_pin(&pool, &src, &fx.public_oid, None).await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+                &mut Default::default(),
+            ),
+        )
+        .await
+        .expect("the first traversal terminates");
+        assert_eq!(
+            state.db.discovery_continuation().await.unwrap(),
+            candidate_key(&candidates[cap - 1]),
+            "precondition: the traversal parked the continuation past the head"
+        );
+
+        // The list shrinks to two: everything but the two oldest goes away.
+        for repo in candidates.iter().skip(2) {
+            sqlx::query("DELETE FROM repos WHERE id = $1")
+                .bind(&repo.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+                &mut Default::default(),
+            ),
+        )
+        .await
+        .expect("the second traversal terminates");
+
+        assert_eq!(
+            state.db.discovery_continuation().await.unwrap(),
+            (String::new(), String::new()),
+            "once the whole warm list fits in one window there is no next window, so the \
+             continuation resets rather than pointing past the end of a shrunken list"
+        );
+    }
+
+    /// F5 scenario 5 (#173 round 13, MUST-NOT): a traversal may only advance over
+    /// candidates it really READ, never over the ones it merely walked past with a dead
+    /// deadline.
+    ///
+    /// U3 gives each source-less row a slice of the pass budget and skips a row reached
+    /// with the pass budget already gone. What it does NOT skip is the candidates behind
+    /// a wedged one INSIDE a row: those still enter the probe loop, still get charged a
+    /// read, and still come back retryable, but `db_bounded` returns on the spent
+    /// deadline without touching the repo. Advancing over them would burn a window nobody
+    /// looked in, which is the same hole the continuation exists to close.
+    ///
+    /// Twenty warm candidates, seven source-less rows, and a `git` that wedges on
+    /// everything. With `git_timeout` at 4s each row slice is 1s, so each row that probes
+    /// at all spends its whole slice on candidate ONE and walks the other fifteen with a
+    /// dead deadline. The traversal may advance to candidate one and no further.
+    #[sqlx::test]
+    async fn sweep_discovery_starved_traversal_advances_only_over_live_probes(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let cap = crate::ipfs_pin::MAX_LEGACY_DISCOVERY_PROBES;
+
+        let fx = seed_cid_repos(&slug, &short, &["starvesrc"]);
+        let src = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("starvesrc.git");
+        let candidates =
+            seed_candidate_ladder(&state.db, &owner_did, &slug, "starvecand", cap + 4, None).await;
+        for oid in [
+            &fx.public_oid,
+            &fx.secret_oid,
+            &fx.public_tree_oid,
+            &fx.secret_tree_oid,
+            &fx.root_tree_oid,
+            &fx.commit_oid,
+            &fx.tag_oid,
+        ] {
+            seed_legacy_pin(&pool, &src, oid, None).await;
+        }
+
+        let git_bin = write_git_shim(
+            &format!("gl-starve-git-{short}"),
+            "#!/bin/sh\nsleep 30\nexit 1\n",
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            crate::ipfs_pin::sweep_legacy_provider_cids_once(
+                std::path::Path::new("/tmp"),
+                git_bin.to_str().unwrap(),
+                std::time::Duration::from_secs(4),
+                16,
+                &state.db,
+                &mut Default::default(),
+            ),
+        )
+        .await
+        .expect("the traversal terminates")
+        .expect("the traversal succeeds");
+
+        let seen = state.db.discovery_continuation().await.unwrap();
+        assert_eq!(
+            seen,
+            candidate_key(&candidates[0]),
+            "the only candidate any row read with a live deadline is the first, so that \
+             is exactly how far the traversal may advance"
+        );
+        assert_ne!(
+            seen,
+            candidate_key(&candidates[cap - 1]),
+            "advancing to the end of the window would skip fifteen candidates that were \
+             charged a read but never actually looked at"
+        );
+    }
+
+    /// F5 scenario 6 (#173 round 13, MUST-NOT): a candidate that wedges MID-window must
+    /// not carry the continuation past the candidates behind it.
+    ///
+    /// The sharp version of the live-budget rule, and the one a window's-end advance gets
+    /// wrong while looking correct. Twenty-four warm candidates, the holder at position
+    /// twelve, and a `git` that wedges only in the repo at position nine. Positions one
+    /// to eight are read for real, nine eats the row's whole slice, and ten through
+    /// sixteen are charged a read apiece against a dead deadline without the repo ever
+    /// being opened. The continuation may advance to nine and no further, or the holder
+    /// at twelve is skipped by a traversal that never looked at it.
+    #[sqlx::test]
+    async fn sweep_discovery_hung_mid_window_does_not_skip_unread_candidates(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let cap = crate::ipfs_pin::MAX_LEGACY_DISCOVERY_PROBES;
+
+        let fx = seed_cid_repos(&slug, &short, &["midsrc", "midheld"]);
+        let src = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("midsrc.git");
+        let candidates = seed_candidate_ladder(
+            &state.db,
+            &owner_did,
+            &slug,
+            "midcand",
+            cap + 8,
+            Some((12, "midheld")),
+        )
+        .await;
+        let (raw_cid, provider_cid) = seed_legacy_pin(&pool, &src, &fx.public_oid, None).await;
+
+        // Wedges only inside the position-nine repo, which the sweep enters by cwd.
+        let git_bin = write_git_shim(
+            &format!("gl-mid-git-{short}"),
+            "#!/bin/sh\ncase \"$(pwd)\" in\n  */midcand9.git) sleep 30; exit 1 ;;\nesac\nexec git \"$@\"\n",
+        );
+
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(180),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                git_bin.to_str().unwrap(),
+                std::time::Duration::from_secs(16),
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+                &mut Default::default(),
+            ),
+        )
+        .await
+        .expect("the first traversal terminates");
+
+        assert_eq!(
+            first.repaired, 0,
+            "the wedged candidate spends the row's slice, so the holder behind it is \
+             charged a read but never actually read"
+        );
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            provider_cid,
+            "precondition: the first traversal leaves the row on its provider key"
+        );
+        assert_eq!(
+            state.db.discovery_continuation().await.unwrap(),
+            candidate_key(&candidates[8]),
+            "the last candidate read with a live deadline is the wedged one at position \
+             nine, so that is the boundary; anything further skips unread candidates"
+        );
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(180),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                git_bin.to_str().unwrap(),
+                std::time::Duration::from_secs(16),
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+                &mut Default::default(),
+            ),
+        )
+        .await
+        .expect("the second traversal terminates");
+
+        assert_eq!(
+            second.repaired, 1,
+            "the next traversal starts at position ten and reaches the holder at twelve"
+        );
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            raw_cid,
+            "the row is repaired from the candidate the hang had hidden"
+        );
+    }
+
+    /// F5 scenario 7 (#173 round 13): the continuation survives the future being DROPPED.
+    ///
+    /// `spawn_legacy_cid_sweep` runs the sweep inside a `tokio::select!` against the
+    /// shutdown watcher, so on shutdown the sweep future is dropped wherever it happens
+    /// to be. The re-arm wrapper never returns on a healthy node, so a persist written on
+    /// the way out of the wrapper would never be written at all. Persisting inside the
+    /// traversal-ending pass is what makes a shutdown cost at most a repeated window.
+    #[sqlx::test]
+    async fn sweep_continuation_survives_dropped_sweep_future(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+        let cap = crate::ipfs_pin::MAX_LEGACY_DISCOVERY_PROBES;
+
+        let fx = seed_cid_repos(&slug, &short, &["dropsrc"]);
+        let src = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("dropsrc.git");
+        let candidates =
+            seed_candidate_ladder(&state.db, &owner_did, &slug, "dropcand", cap + 1, None).await;
+        seed_legacy_pin(&pool, &src, &fx.public_oid, None).await;
+
+        // The wrapper completes a traversal and then parks on its re-arm sleep, which is
+        // exactly where a shutdown drops it in production.
+        let expected = candidate_key(&candidates[cap - 1]);
+        let observed = tokio::select! {
+            _ = crate::ipfs_pin::run_sweep_rearmed(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(3600),
+                &state.db,
+            ) => None,
+            v = poll_until(std::time::Duration::from_secs(120), || async {
+                let c = state.db.discovery_continuation().await.unwrap();
+                (c != (String::new(), String::new())).then_some(c)
+            }) => v,
+        };
+
+        assert_eq!(
+            observed,
+            Some(expected),
+            "the traversal-ending pass persists the continuation, so dropping the sweep \
+             future afterwards keeps the advance the traversal earned"
+        );
+    }
+
+    /// F5 scenario 8 (#173 round 13, MUST-NOT, the aliasing negative): two source-less
+    /// rows in DIFFERENT passes of the same traversal share one window.
+    ///
+    /// The continuation advances once per TRAVERSAL, not once per pass. Per pass, a row's
+    /// window index across traversals is `(t*m + j) mod W` for `m` rows and `W` windows,
+    /// so with `m` and `W` sharing a factor a given row only ever visits `W / gcd(m, W)`
+    /// of the windows and orbits a strict subset forever. Two rows, two windows: under
+    /// per-pass advancement the first row is pinned to window one for the life of the
+    /// node and its holder in window two is unreachable.
+    ///
+    /// Thirty-two warm candidates, `batch = 1` so the two rows land in different passes,
+    /// the first row's holder at position twenty, the second row's object nowhere at all.
+    #[sqlx::test]
+    async fn sweep_discovery_rows_in_different_batches_share_windows(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+        let cap = crate::ipfs_pin::MAX_LEGACY_DISCOVERY_PROBES;
+
+        let fx = seed_cid_repos(&slug, &short, &["alisrc"]);
+        let src = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("alisrc.git");
+        // The walk is ordered by `sha256_hex`, so the smaller oid is the row read first.
+        let mut oids = [fx.public_oid.clone(), fx.secret_oid.clone()];
+        oids.sort();
+        let (first_row, second_row) = (oids[0].clone(), oids[1].clone());
+
+        let candidates =
+            seed_candidate_ladder(&state.db, &owner_did, &slug, "alicand", 2 * cap, None).await;
+        // Position twenty holds ONLY the first row's blob: a bare clone would carry both
+        // and the second row would stop being the unrepairable control.
+        copy_blob_into_bare(
+            &src,
+            &std::path::PathBuf::from("/tmp")
+                .join(&slug)
+                .join("alicand20.git"),
+            &first_row,
+        );
+        let (first_raw, first_provider) = seed_legacy_pin(&pool, &src, &first_row, None).await;
+        seed_legacy_pin(&pool, &src, &second_row, None).await;
+
+        let log = std::env::temp_dir().join(format!("gl-ali-log-{short}"));
+        let _ = std::fs::remove_file(&log);
+        let git_bin = write_git_shim(
+            &format!("gl-ali-git-{short}"),
+            &format!(
+                "#!/bin/sh\n\
+                 if [ \"$2\" = \"--batch-check\" ]; then\n\
+                 \x20 oid=$(cat)\n\
+                 \x20 printf '%s %s\\n' \"$oid\" \"$(basename $(pwd))\" >> {log}\n\
+                 \x20 printf '%s\\n' \"$oid\" | git \"$@\"\n\
+                 \x20 exit $?\n\
+                 fi\n\
+                 exec git \"$@\"\n",
+                log = log.display()
+            ),
+        );
+
+        let mut traversal = crate::ipfs_pin::DiscoveryTraversalState::default();
+        for _ in 0..2 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(180),
+                crate::ipfs_pin::sweep_legacy_provider_cids(
+                    std::path::Path::new("/tmp"),
+                    git_bin.to_str().unwrap(),
+                    git_timeout,
+                    1,
+                    std::time::Duration::ZERO,
+                    &state.db,
+                    &mut traversal,
+                ),
+            )
+            .await
+            .expect("the traversal terminates");
+        }
+
+        assert_eq!(
+            stored_pin(&pool, &first_row).await.0,
+            first_raw,
+            "the first row's holder is in the second window, which it only reaches if \
+             both rows moved through the windows together"
+        );
+        assert_ne!(
+            first_raw, first_provider,
+            "control: the repaired key really differs from the seeded legacy one"
+        );
+
+        // The invocation log proves the shared window rather than inferring it: inside
+        // one traversal both oids must have been probed against the same repos.
+        let text = std::fs::read_to_string(&log).expect("the shim logged its probes");
+        let _ = std::fs::remove_file(&log);
+        let repos_for = |oid: &str| -> Vec<String> {
+            let mut v: Vec<String> = text
+                .lines()
+                .filter_map(|l| l.split_once(' '))
+                .filter(|(o, _)| *o == oid)
+                .map(|(_, r)| r.to_string())
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        let first_probed = repos_for(&first_row);
+        let second_probed = repos_for(&second_row);
+        assert!(
+            first_probed.len() >= cap && second_probed.len() >= cap,
+            "precondition: both rows really probed a full window ({} and {})",
+            first_probed.len(),
+            second_probed.len()
+        );
+        let window_one: Vec<String> = {
+            let mut v: Vec<String> = candidates[..cap]
+                .iter()
+                .map(|r| format!("{}.git", r.name))
+                .collect();
+            v.sort();
+            v
+        };
+        for repo in &window_one {
+            assert!(
+                first_probed.contains(repo) && second_probed.contains(repo),
+                "both rows must have probed {repo} in the first traversal; per-pass \
+                 advancement would have handed the second row a different window"
+            );
+        }
+    }
+
+    /// F5 scenario 9 (#173 round 13): the dead-read cap PAUSES a run, and the re-arm is
+    /// what keeps coverage moving afterwards.
+    ///
+    /// Before the wrapper the sweep ran exactly once per boot, so the window advanced
+    /// once per boot too and a node that never reboots never advanced past its first
+    /// window. Five unrepairable source-less rows at a full window of probes each blow
+    /// through `MAX_DEAD_ROW_READS_PER_RUN` inside one run; the holder sits in the second
+    /// window, so it is reachable only across re-arms.
+    #[sqlx::test]
+    async fn sweep_rearm_advances_past_dead_read_cap(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+        let cap = crate::ipfs_pin::MAX_LEGACY_DISCOVERY_PROBES;
+
+        let fx = seed_cid_repos(&slug, &short, &["rearmsrc", "rearmheld"]);
+        let src = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("rearmsrc.git");
+        seed_candidate_ladder(
+            &state.db,
+            &owner_did,
+            &slug,
+            "rearmcand",
+            cap + 4,
+            Some((cap + 2, "rearmheld")),
+        )
+        .await;
+        let mut oids = [
+            fx.public_oid.clone(),
+            fx.secret_oid.clone(),
+            fx.public_tree_oid.clone(),
+            fx.secret_tree_oid.clone(),
+            fx.root_tree_oid.clone(),
+        ];
+        oids.sort();
+        for oid in &oids {
+            seed_legacy_pin(&pool, &src, oid, None).await;
+        }
+        let target = oids.last().unwrap().clone();
+        let target_raw = {
+            let (_ty, bytes) = crate::git::store::read_object(&src, &target)
+                .expect("read the object")
+                .expect("the object exists");
+            gitlawb_core::cid::Cid::from_git_object_bytes(&bytes).to_string()
+        };
+
+        // One run, driven directly: five rows at a full window each is more fruitless
+        // reading than one run will do, so it PAUSES rather than completing.
+        let mut traversal = crate::ipfs_pin::DiscoveryTraversalState::default();
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                1,
+                std::time::Duration::ZERO,
+                &state.db,
+                &mut traversal,
+            ),
+        )
+        .await
+        .expect("the run terminates");
+        assert_eq!(
+            run.stop,
+            crate::ipfs_pin::SweepStop::PausedOnDeadReadCap,
+            "one run cannot walk this table: it stops on the dead-read cap with the \
+             cursor mid-table"
+        );
+        assert_eq!(run.repaired, 0, "the holder is past the first window");
+
+        let repaired = tokio::select! {
+            _ = crate::ipfs_pin::run_sweep_rearmed(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                1,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+                &state.db,
+            ) => false,
+            v = poll_until(std::time::Duration::from_secs(300), || async {
+                (stored_pin(&pool, &target).await.0 == target_raw).then_some(())
+            }) => v.is_some(),
+        };
+        assert!(
+            repaired,
+            "a run that pauses on the dead-read cap is re-armed, so traversals keep \
+             completing and the window keeps advancing until the holder is reached"
+        );
+    }
+
+    /// F5 scenario 10 (#173 round 13, MUST-NOT): a cap pause AFTER the traversal's last
+    /// source-less row must not lose the advance that traversal earned.
+    ///
+    /// The traversal accumulator is scoped to the TRAVERSAL, not the run, and this is the
+    /// case that separates the two. The run that probes the window is paused by the
+    /// dead-read cap before it reaches the end of the table; a LATER run reads the short
+    /// batch and is the one that applies the advance. Rebuild the accumulator per run and
+    /// that later run sees nothing recorded, applies the hold arm, and the window never
+    /// moves however many times the sweep re-arms.
+    ///
+    /// One source-less row against twenty warm candidates (a full window of probes),
+    /// then enough bytes-gone rows behind it to trip the cap before the short batch.
+    #[sqlx::test]
+    async fn sweep_cap_pause_after_last_discovery_row_still_advances(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+        let cap = crate::ipfs_pin::MAX_LEGACY_DISCOVERY_PROBES;
+
+        let fx = seed_cid_repos(&slug, &short, &["pausesrc"]);
+        let src = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("pausesrc.git");
+        let candidates =
+            seed_candidate_ladder(&state.db, &owner_did, &slug, "pausecand", cap + 4, None).await;
+        let (_raw, provider) = seed_legacy_pin(&pool, &src, &fx.public_oid, None).await;
+        assert!(
+            !fx.public_oid.starts_with("ff"),
+            "precondition: the discovery row sorts before the synthetic bytes-gone rows"
+        );
+
+        // Bytes-gone rows: real provenance pointing at a warm repo that does not hold
+        // them, so each costs exactly one fruitless read. Enough of them that the run
+        // trips the cap with the end of the table still ahead of it.
+        let ghost = &candidates[0];
+        let needed = crate::ipfs_pin::MAX_DEAD_ROW_READS_PER_RUN - cap;
+        for i in 0..needed {
+            let oid = format!("ff{:062x}", i);
+            sqlx::query(
+                "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id)
+                 VALUES ($1, $2, $3, NULL)",
+            )
+            .bind(&oid)
+            .bind(&provider)
+            .bind("2020-01-01T00:00:00Z")
+            .execute(&pool)
+            .await
+            .unwrap();
+            state
+                .db
+                .record_pin_source(&oid, &ghost.id)
+                .await
+                .expect("record the ghost source");
+        }
+
+        let expected = candidate_key(&candidates[cap - 1]);
+        let observed = tokio::select! {
+            _ = crate::ipfs_pin::run_sweep_rearmed(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                1,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+                &state.db,
+            ) => None,
+            v = poll_until(std::time::Duration::from_secs(300), || async {
+                let c = state.db.discovery_continuation().await.unwrap();
+                (c != (String::new(), String::new())).then_some(c)
+            }) => v,
+        };
+
+        assert_eq!(
+            observed,
+            Some(expected),
+            "the run that probed the window was paused by the dead-read cap, so a LATER \
+             run ends the traversal; the advance it applies has to come from the \
+             traversal's accumulator, not that run's"
+        );
+    }
+
+    /// F5 scenario 11 (#173 round 13): a failing pass query EXITS the wrapper.
+    ///
+    /// The re-arm loop is for a healthy node making slow progress. A broken database is
+    /// not that, and retrying it every re-arm would turn one logged failure into an
+    /// endless stream of them. The one-shot behavior a failing pass had before the
+    /// wrapper existed is preserved exactly.
+    #[sqlx::test]
+    async fn sweep_rearm_exits_on_pass_failure(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        sqlx::query("DROP TABLE pinned_cids")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::run_sweep_rearmed(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                std::time::Duration::from_secs(5),
+                16,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("a failing pass query must END the wrapper, never re-arm it forever");
+
+        assert_eq!(
+            stats.stop,
+            crate::ipfs_pin::SweepStop::PassFailed,
+            "the wrapper reports the failure it exited on"
+        );
+        assert_eq!(
+            stats.repaired, 0,
+            "nothing was repaired against a broken table"
         );
     }
 
@@ -8365,6 +9406,7 @@ mod tests {
                 16,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -8438,6 +9480,7 @@ mod tests {
                 16,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -8494,6 +9537,7 @@ mod tests {
                 16,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -8703,6 +9747,7 @@ mod tests {
             16,
             std::time::Duration::ZERO,
             &state.db,
+            &mut Default::default(),
         )
         .await;
         assert_eq!(
@@ -8845,6 +9890,7 @@ mod tests {
                 16,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await
@@ -9074,6 +10120,7 @@ mod tests {
             blocker.commit().await.expect("release the row lock");
             parked
         };
+        let mut traversal = Default::default();
         let (stats, parked) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
             tokio::join!(
                 crate::ipfs_pin::sweep_legacy_provider_cids(
@@ -9083,6 +10130,7 @@ mod tests {
                     16,
                     std::time::Duration::ZERO,
                     &state.db,
+                    &mut traversal,
                 ),
                 driver
             )
@@ -9155,6 +10203,7 @@ mod tests {
         state.db.create_repo(&holder).await.expect("seed holder");
         let (raw_cid, _provider) = seed_legacy_pin(&pool, &bare, &fx.public_oid, None).await;
 
+        let (mut ta, mut tb) = (Default::default(), Default::default());
         let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
             tokio::join!(
                 crate::ipfs_pin::sweep_legacy_provider_cids_once(
@@ -9163,6 +10212,7 @@ mod tests {
                     git_timeout,
                     16,
                     &state.db,
+                    &mut ta,
                 ),
                 crate::ipfs_pin::sweep_legacy_provider_cids_once(
                     std::path::Path::new("/tmp"),
@@ -9170,6 +10220,7 @@ mod tests {
                     git_timeout,
                     16,
                     &state.db,
+                    &mut tb,
                 )
             )
         })
@@ -9250,6 +10301,7 @@ mod tests {
                 16,
                 std::time::Duration::ZERO,
                 &state.db,
+                &mut Default::default(),
             ),
         )
         .await

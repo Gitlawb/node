@@ -302,6 +302,28 @@ pub(crate) struct SweepStats {
     /// [`DISCOVERY_ROW_BUDGET_DIVISOR`]). Reporting only, like `retryable_skips`: it
     /// drives no control decision, it just keeps a starved pass from being silent.
     pub discovery_budget_spent: bool,
+    /// Why the run stopped. Meaningful on a RUN (`sweep_legacy_provider_cids` and the
+    /// re-arm wrapper); on a single pass it is always `Completed` and says nothing.
+    pub stop: SweepStop,
+}
+
+/// Why a sweep run ended, which is what [`run_sweep_rearmed`] dispatches on.
+///
+/// Two of the three arms are re-armable and one is not. A run that walked to the end of
+/// the table and a run that paused on [`MAX_DEAD_ROW_READS_PER_RUN`] both left the node
+/// in a state a later run improves, so the wrapper sleeps and goes again. A failing pass
+/// QUERY is a broken database, and retrying it on a timer would turn one logged failure
+/// into an endless stream of them, so the wrapper returns and leaves the run one-shot,
+/// exactly as it was before the re-arm existed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SweepStop {
+    /// The ordered walk reached the end of the table (a short batch).
+    #[default]
+    Completed,
+    /// Enough fruitless reads for one run; the cursor stays mid-table.
+    PausedOnDeadReadCap,
+    /// A pass's batch query or cursor write failed.
+    PassFailed,
 }
 
 /// How many fruitless object reads one sweep run will spend before it stops and leaves
@@ -346,9 +368,16 @@ const DISCOVERY_ROW_BUDGET_DIVISOR: u32 = 4;
 /// filter runs ONCE here rather than per row, on the blocking pool, because O(repos)
 /// stat calls per row would park a tokio worker for the whole boot sweep.
 struct DiscoveryCtx {
-    /// Warm candidates with their validated disk paths, oldest-first by
-    /// `(created_at, id)`.
-    candidates: Vec<(crate::db::RepoRecord, std::path::PathBuf)>,
+    /// Warm candidates with their RAW `(created_at, id)` keyset key and validated disk
+    /// path, ROTATED so the traversal's window starts at the head.
+    ///
+    /// The key is `ScanRepoRow::created_at_key`, the stored text, carried through rather
+    /// than re-derived from `RepoRecord::created_at`: re-serializing the parsed
+    /// `DateTime` is not guaranteed to reproduce the stored bytes (that struct says so
+    /// itself), and the keyset comparison this feeds is a TEXT comparison against the
+    /// SQL order, so a key off by one character rotates the list to a boundary the query
+    /// never had.
+    candidates: Vec<(crate::db::RepoRecord, String, std::path::PathBuf)>,
     /// The ceiling on the whole pass's discovery, so one pass costs at most one
     /// `git_timeout` in total on top of the per-row probe cap. Per PASS, not per run:
     /// `load_discovery_ctx` runs once per `sweep_pass` and a run loops passes.
@@ -357,6 +386,74 @@ struct DiscoveryCtx {
     /// `git_timeout / DISCOVERY_ROW_BUDGET_DIVISOR`, clamped to what is left here, and a
     /// row reached with this already past is skipped without a probe.
     pass_deadline: Instant,
+}
+
+/// What one TRAVERSAL of the `pinned_cids` table learned about how far its discovery
+/// window actually got, and therefore where the next traversal's window may start.
+///
+/// Owned by [`run_sweep_rearmed`] and passed `&mut` through every run and every pass of
+/// the traversal, which is the whole point of the type: the dead-read cap can PAUSE a
+/// run in the middle of a traversal, and the run that later reaches the short batch is a
+/// different run. Rebuilding this per run means that final run sees an empty accumulator
+/// and applies the hold arm (or the reset arm) for windows the earlier run really did
+/// probe, so the traversal advances by nothing and the sweep stalls on the same window
+/// forever. Its lifetime is the traversal, so that is what it is scoped to.
+#[derive(Debug, Default)]
+pub(crate) struct DiscoveryTraversalState {
+    /// The `(created_at_key, id)` of the last candidate whose probe STARTED with the
+    /// row's deadline still live.
+    ///
+    /// A probe started against a dead deadline is charged a read (the U3 boundary row is
+    /// exactly this) but learns nothing: `db_bounded` returns immediately and the
+    /// candidate is left unread. Advancing over one would skip a candidate nobody looked
+    /// at, which is the same hole the continuation exists to close, one window narrower.
+    last_live_probe: Option<(String, String)>,
+    /// A row reached the probe cap with candidates still unprobed AND spent at least one
+    /// live-budget probe doing it. This is the arm that ADVANCES: there is a next window
+    /// and the traversal earned the right to move to it.
+    cap_exhausted_with_budget: bool,
+    /// The whole warm list fit inside one window, observed by a row with live budget.
+    /// There is no next window, so the continuation RESETS: leaving a stale key behind
+    /// on a list that has since shrunk below it would rotate every later traversal to an
+    /// empty tail and then wrap to the same prefix forever.
+    fit_under_cap: bool,
+}
+
+impl DiscoveryTraversalState {
+    /// The advance to apply at the end of a completed traversal, or `None` to hold the
+    /// continuation where it is.
+    ///
+    /// Three arms, in this order. ADVANCE when a row ran out of window with budget left
+    /// to spend, to the last candidate actually read live. RESET when the list fit under
+    /// the cap, because there is nothing past the window to advance to. HOLD otherwise,
+    /// which is the starved traversal: nothing was probed live, so burning a window
+    /// would skip candidates on the strength of reads that never happened.
+    fn advance(&self) -> Option<(String, String)> {
+        if self.cap_exhausted_with_budget {
+            return self.last_live_probe.clone();
+        }
+        if self.fit_under_cap {
+            return Some((String::new(), String::new()));
+        }
+        None
+    }
+
+    /// Fold one finished row's window observation in.
+    ///
+    /// A row that read NOTHING with live budget contributes nothing at all, neither arm.
+    /// Such a row is evidence about the clock, not about the candidates: letting it set
+    /// either flag would move or reset the window on the strength of probes that were
+    /// charged but never made.
+    fn note_row(&mut self, live_probes: usize, fits_under_cap: bool) {
+        if live_probes == 0 {
+            return;
+        }
+        if fits_under_cap {
+            self.fit_under_cap = true;
+        } else {
+            self.cap_exhausted_with_budget = true;
+        }
+    }
 }
 
 /// Build one pass's discovery candidate list.
@@ -405,7 +502,7 @@ async fn load_discovery_ctx(
     // result is reused for every source-less row, so the paging cost is paid once.
     let page_rows = crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS;
     let mut cursor: Option<(String, String)> = None;
-    let mut candidates: Vec<crate::db::RepoRecord> = Vec::new();
+    let mut candidates: Vec<(crate::db::RepoRecord, String)> = Vec::new();
     loop {
         let page = db
             .list_repos_page_for_scan(
@@ -418,7 +515,11 @@ async fn load_discovery_ctx(
         let Some(last) = page.last() else { break };
         cursor = Some((last.created_at_key.clone(), last.repo.id.clone()));
         let last_page = page.len() < page_rows;
-        candidates.extend(page.into_iter().filter(|r| !r.quarantined).map(|r| r.repo));
+        candidates.extend(
+            page.into_iter()
+                .filter(|r| !r.quarantined)
+                .map(|r| (r.repo, r.created_at_key)),
+        );
         if last_page {
             break;
         }
@@ -428,13 +529,13 @@ async fn load_discovery_ctx(
     let warm = tokio::task::spawn_blocking(move || {
         candidates
             .into_iter()
-            .filter_map(|repo| {
+            .filter_map(|(repo, created_at_key)| {
                 match crate::git::repo_store::validated_repo_disk_path(
                     &repos_dir,
                     &repo.owner_did,
                     &repo.name,
                 ) {
-                    Ok(p) if p.is_dir() => Some((repo, p)),
+                    Ok(p) if p.is_dir() => Some((repo, created_at_key, p)),
                     // Cold: not on this node's disk right now. It is not evidence about
                     // any row (see `discover_legacy_row`), so it is simply absent here.
                     Ok(_) => None,
@@ -447,6 +548,31 @@ async fn load_discovery_ctx(
             .collect::<Vec<_>>()
     })
     .await?;
+    let mut warm = warm;
+
+    // ROTATE to the traversal's window. The list is already in `(created_at, id)` order,
+    // so the window is the first `MAX_LEGACY_DISCOVERY_PROBES` entries strictly after the
+    // persisted continuation, wrapping through the prefix when it runs off the end.
+    //
+    // After the warm filter, deliberately: a cold or quarantined candidate is not a
+    // window slot the traversal spent, so rotating first would let a node full of cold
+    // repos advance the continuation past warm candidates nobody ever probed. The window
+    // is sixteen WARM candidates.
+    //
+    // Every pass of a traversal reads the same persisted value (it only moves in the
+    // traversal-ending pass), so the window is stable across the traversal by
+    // construction and two source-less rows in different passes probe the same repos.
+    let (cont_created_at, cont_id) = db.discovery_continuation().await?;
+    if !cont_created_at.is_empty() || !cont_id.is_empty() {
+        let split = warm
+            .iter()
+            .position(|(repo, created_at_key, _)| {
+                (created_at_key.as_str(), repo.id.as_str())
+                    > (cont_created_at.as_str(), cont_id.as_str())
+            })
+            .unwrap_or(warm.len());
+        warm.rotate_left(split);
+    }
 
     Ok(DiscoveryCtx {
         candidates: warm,
@@ -497,6 +623,7 @@ async fn discover_legacy_row(
     git_bin: &str,
     git_timeout: Duration,
     db: &crate::db::Db,
+    traversal: &mut DiscoveryTraversalState,
 ) -> (DiscoveryOutcome, usize) {
     let mut reads = 0usize;
     if ctx.is_none() {
@@ -528,10 +655,30 @@ async fn discover_legacy_row(
     );
 
     let mut retryable = false;
+    // How many of this row's probes actually STARTED with budget to spend, and whether
+    // the whole warm list fits in one window. Together they pick the traversal's advance
+    // arm once the row is done.
+    let mut live_probes = 0usize;
+    let fits_under_cap = ctx.candidates.len() <= MAX_LEGACY_DISCOVERY_PROBES;
     // Every candidate that gets this far is READ, so taking the first
     // MAX_LEGACY_DISCOVERY_PROBES bounds the expensive work exactly. Candidates the
     // filters already rejected never reach here and so cost nothing against the cap.
-    for (repo, repo_path) in ctx.candidates.iter().take(MAX_LEGACY_DISCOVERY_PROBES) {
+    for (repo, created_at_key, repo_path) in ctx.candidates.iter().take(MAX_LEGACY_DISCOVERY_PROBES)
+    {
+        // The live-budget test, taken BEFORE the probe and against the SAME deadline the
+        // probe is handed. Two shapes reach a probe with the deadline already gone and
+        // both are charged a read for it: U3's boundary row, admitted by a skip guard of
+        // `now >= pass_deadline` with a sliver of budget that `row_deadline` clamps to
+        // nothing, and every candidate queued behind a wedged one inside a row. In both,
+        // `db_bounded` returns on the spent deadline and the repo is never opened. They
+        // are reads, not looks, and the continuation must not advance over them: doing so
+        // skips candidates nobody examined, which is the hole the continuation exists to
+        // close, one window narrower.
+        let live = Instant::now() < row_deadline;
+        if live {
+            live_probes += 1;
+            traversal.last_live_probe = Some((created_at_key.clone(), repo.id.clone()));
+        }
         // Counted before the match, because the read is spent whatever it returns. This
         // is the quantity the caller charges against the per-run budget.
         reads += 1;
@@ -557,6 +704,7 @@ async fn discover_legacy_row(
                 if let Err(e) = db.mark_pin_sources_incomplete(sha, "").await {
                     tracing::warn!(sha = %sha, err = %e, "sweep discovery: failed to mark the pin-source set incomplete");
                 }
+                traversal.note_row(live_probes, fits_under_cap);
                 return (DiscoveryOutcome::Repaired, reads);
             }
             // The bytes could not be read from this WARM candidate right now, which IS
@@ -570,6 +718,7 @@ async fn discover_legacy_row(
             }
         }
     }
+    traversal.note_row(live_probes, fits_under_cap);
     if ctx.candidates.len() > MAX_LEGACY_DISCOVERY_PROBES {
         // Cap exhausted with candidates left unprobed: RETRYABLE, never terminal. The
         // probe order is deterministic, but "a re-walk finds the same nothing" only
@@ -603,6 +752,7 @@ async fn sweep_pass(
     git_timeout: Duration,
     batch: i64,
     db: &crate::db::Db,
+    traversal: &mut DiscoveryTraversalState,
 ) -> Result<SweepStats> {
     let cursor = db.pin_repair_cursor().await?;
     let rows = db.pinned_cids_after(&cursor, batch).await?;
@@ -649,9 +799,16 @@ async fn sweep_pass(
         // what makes an unrepairable row COST something rather than just being skipped.
         let mut row_read_attempted = false;
         if sources.is_empty() {
-            let (outcome, reads) =
-                discover_legacy_row(&sha, &mut discovery, repos_dir, git_bin, git_timeout, db)
-                    .await;
+            let (outcome, reads) = discover_legacy_row(
+                &sha,
+                &mut discovery,
+                repos_dir,
+                git_bin,
+                git_timeout,
+                db,
+                traversal,
+            )
+            .await;
             match outcome {
                 DiscoveryOutcome::Repaired => {
                     repaired += 1;
@@ -759,6 +916,22 @@ async fn sweep_pass(
     }
 
     db.set_pin_repair_cursor(&last).await?;
+    // A short batch is the end of the table, so this pass ended the TRAVERSAL: apply the
+    // window advance the traversal earned, then start a fresh accumulator for the next
+    // one. Persisting from HERE, not from the end of the run, is what survives the
+    // shutdown `select!` in `spawn_legacy_cid_sweep`: a drop mid-traversal loses only
+    // the accumulator, so the next traversal repeats a window rather than skipping one.
+    //
+    // The write is warn-only. A failed persist leaves the old continuation, and the next
+    // traversal probes the same window again, which is wasted work and never a gap.
+    if (scanned as i64) < batch {
+        if let Some((created_at_key, id)) = traversal.advance() {
+            if let Err(e) = db.set_discovery_continuation(&created_at_key, &id).await {
+                tracing::warn!(err = %e, "failed to persist the sweep discovery continuation");
+            }
+        }
+        *traversal = DiscoveryTraversalState::default();
+    }
     Ok(SweepStats {
         scanned,
         repaired,
@@ -766,6 +939,7 @@ async fn sweep_pass(
         retryable_skips,
         dead_row_reads,
         discovery_budget_spent,
+        stop: SweepStop::Completed,
     })
 }
 
@@ -778,8 +952,9 @@ pub(crate) async fn sweep_legacy_provider_cids_once(
     git_timeout: Duration,
     batch: i64,
     db: &crate::db::Db,
+    traversal: &mut DiscoveryTraversalState,
 ) -> Result<SweepStats> {
-    sweep_pass(repos_dir, git_bin, git_timeout, batch, db).await
+    sweep_pass(repos_dir, git_bin, git_timeout, batch, db, traversal).await
 }
 
 /// U4 (#173): the one-shot legacy provider-CID migration sweep.
@@ -839,14 +1014,16 @@ pub(crate) async fn sweep_legacy_provider_cids(
     batch: i64,
     delay: Duration,
     db: &crate::db::Db,
+    traversal: &mut DiscoveryTraversalState,
 ) -> SweepStats {
     let mut totals = SweepStats::default();
     let mut completed = false;
     loop {
-        let pass = match sweep_pass(repos_dir, git_bin, git_timeout, batch, db).await {
+        let pass = match sweep_pass(repos_dir, git_bin, git_timeout, batch, db, traversal).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(err = %e, "legacy provider-CID sweep pass failed; stopping");
+                totals.stop = SweepStop::PassFailed;
                 break;
             }
         };
@@ -860,6 +1037,7 @@ pub(crate) async fn sweep_legacy_provider_cids(
         // rather than after an extra empty pass, and do NOT sleep on the way out.
         if (pass.scanned as i64) < batch {
             completed = true;
+            totals.stop = SweepStop::Completed;
             break;
         }
         // Enough fruitless reads for one run. Stop WITHOUT completing, so the cursor
@@ -871,6 +1049,7 @@ pub(crate) async fn sweep_legacy_provider_cids(
                 dead_row_reads = totals.dead_row_reads,
                 "legacy provider-CID sweep pausing: too many unrepairable rows this run"
             );
+            totals.stop = SweepStop::PausedOnDeadReadCap;
             break;
         }
         tokio::time::sleep(delay).await;
@@ -888,6 +1067,82 @@ pub(crate) async fn sweep_legacy_provider_cids(
         }
     }
     totals
+}
+
+/// How long the sweep waits between runs before walking the table again.
+///
+/// Coverage of the discovery window is per TRAVERSAL, and a node with more warm repos
+/// than one window needs several of them, so how long a source-less row waits for its
+/// holder's window is set by how often traversals happen. Tying that to reboots would
+/// make it a reboot count on a node that never reboots, which is the healthy node.
+///
+/// Five minutes is chosen against what a run COSTS on a settled node, not against how
+/// fast the migration should finish: a fully repaired table is one indexed range scan
+/// per batch and a codec decode per row, no object reads at all, so the standing cost is
+/// a few queries every five minutes and the migration still converges in hours rather
+/// than never. It is also the anti-hot-spin floor for the degenerate case, an empty or
+/// fully repaired table where a run returns immediately.
+pub(crate) const SWEEP_REARM_DELAY: Duration = Duration::from_secs(300);
+
+/// Run the legacy provider-CID sweep on a timer until shutdown or a broken database.
+///
+/// Owns the [`DiscoveryTraversalState`] across runs, which is the reason this is a
+/// wrapper and not a loop inside `sweep_legacy_provider_cids`: a run can PAUSE
+/// mid-traversal on [`MAX_DEAD_ROW_READS_PER_RUN`], and the traversal it was in is
+/// finished by a later run, which has to apply the advance the earlier run earned.
+///
+/// Sleeps `rearm_delay` after EVERY re-armable run, unconditionally. Not conditional on
+/// the run having done work: a run over an empty or fully repaired table returns
+/// immediately, and without the sleep this loop would spin the database as fast as it
+/// can answer.
+///
+/// Returns only on [`SweepStop::PassFailed`], preserving the one-shot behavior a failing
+/// database had before the re-arm existed. On a healthy node it never returns, which is
+/// why the per-run summary is logged HERE rather than by the caller off the awaited
+/// value.
+pub(crate) async fn run_sweep_rearmed(
+    repos_dir: &std::path::Path,
+    git_bin: &str,
+    git_timeout: Duration,
+    batch: i64,
+    delay: Duration,
+    rearm_delay: Duration,
+    db: &crate::db::Db,
+) -> SweepStats {
+    let mut totals = SweepStats::default();
+    let mut traversal = DiscoveryTraversalState::default();
+    loop {
+        let run = sweep_legacy_provider_cids(
+            repos_dir,
+            git_bin,
+            git_timeout,
+            batch,
+            delay,
+            db,
+            &mut traversal,
+        )
+        .await;
+        if run.repaired > 0 {
+            tracing::info!(
+                scanned = run.scanned,
+                repaired = run.repaired,
+                passes = run.passes,
+                stop = ?run.stop,
+                "legacy provider-CID sweep run finished"
+            );
+        }
+        totals.scanned += run.scanned;
+        totals.repaired += run.repaired;
+        totals.passes += run.passes;
+        totals.retryable_skips += run.retryable_skips;
+        totals.dead_row_reads += run.dead_row_reads;
+        totals.discovery_budget_spent |= run.discovery_budget_spent;
+        totals.stop = run.stop;
+        if run.stop == SweepStop::PassFailed {
+            return totals;
+        }
+        tokio::time::sleep(rearm_delay).await;
+    }
 }
 
 // Test-only cost-gate counter (R8, U7): how many times the opportunistic repair
