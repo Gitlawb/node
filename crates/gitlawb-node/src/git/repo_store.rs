@@ -762,7 +762,16 @@ impl Drop for RepoWriteGuard {
 /// produces the same `i64` key across every Rust toolchain version, operating
 /// system, and machine — the algorithm is frozen by the SHA-2 standard rather
 /// than by a std-internal implementation detail.
+///
+/// Domain separation is `owner_slug + ":" + repo_name` with no length prefix,
+/// so the mapping is injective only while `owner_slug` contains no `:` (the
+/// `did:key:`→`did_key_` slug form `local_path` produces). A raw DID would
+/// collide: `("did:key:abc", "x")` and `("did", "key:abc:x")` hash the same.
 pub(crate) fn advisory_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
+    debug_assert!(
+        !owner_slug.contains(':'),
+        "advisory_lock_key owner_slug must not contain ':' (domain-separation guarantee)"
+    );
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     hasher.update(owner_slug.as_bytes());
