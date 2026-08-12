@@ -8,7 +8,7 @@
 //!   POST   /api/v1/tasks/{id}/complete      — complete task
 //!   POST   /api/v1/tasks/{id}/fail          — fail task
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -187,11 +187,36 @@ pub(crate) async fn collect_visible_tasks(
     if tasks.is_empty() {
         return Ok(tasks);
     }
-    let repos = db.list_all_repos_deduped().await?;
-    let repos_by_id: HashMap<String, RepoRecord> =
-        repos.into_iter().map(|r| (r.id.clone(), r)).collect();
+    // Narrow to the repos this page's tasks actually name, so the rule lookup
+    // below is bounded by the page (≤ MAX_VISIBLE_TASKS) instead of by how many
+    // repos the node hosts — otherwise an anonymous request pulls every
+    // visibility rule on the node. The deduped snapshot stays the source of
+    // truth for *which* repo a `repo_id` resolves to: it collapses
+    // mirror/canonical pairs and omits quarantined repos, and an id that is
+    // absent from it must keep failing closed in `task_visible` (a raw
+    // repos-by-id lookup would resurrect exactly those rows).
+    let referenced: HashSet<&str> = tasks.iter().filter_map(|t| t.repo_id.as_deref()).collect();
+    if referenced.is_empty() {
+        let empty_repos = HashMap::new();
+        let empty_rules = HashMap::new();
+        return Ok(tasks
+            .into_iter()
+            .filter(|t| task_visible(t, caller, &empty_repos, &empty_rules))
+            .collect());
+    }
+    let repos_by_id: HashMap<String, RepoRecord> = db
+        .list_all_repos_deduped()
+        .await?
+        .into_iter()
+        .filter(|r| referenced.contains(r.id.as_str()))
+        .map(|r| (r.id.clone(), r))
+        .collect();
     let ids: Vec<String> = repos_by_id.keys().cloned().collect();
-    let rules_by_repo = db.list_visibility_rules_for_repos(&ids).await?;
+    let rules_by_repo = if ids.is_empty() {
+        HashMap::new()
+    } else {
+        db.list_visibility_rules_for_repos(&ids).await?
+    };
     Ok(tasks
         .into_iter()
         .filter(|t| task_visible(t, caller, &repos_by_id, &rules_by_repo))

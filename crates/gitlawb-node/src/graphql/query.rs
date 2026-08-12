@@ -521,6 +521,86 @@ mod tests {
         assert_eq!(count_tasks(&resp), 200, "limit above 200 must clamp to 200");
     }
 
+    /// Seed one repo-less task carrying a `ucan_token`, so a leak on any read
+    /// surface is visible in the response body.
+    async fn seed_task(db: &Db, id: &str, delegator: &str) {
+        let now = Utc::now().to_rfc3339();
+        db.create_task(&crate::db::AgentTask {
+            id: id.into(),
+            repo_id: None,
+            kind: "build".into(),
+            status: "pending".into(),
+            delegator_did: delegator.into(),
+            assignee_did: None,
+            capability: "repo:write".into(),
+            ucan_token: Some("SECRET-UCAN-TOKEN".into()),
+            payload: None,
+            result: None,
+            created_at: now.clone(),
+            updated_at: now,
+            deadline: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    /// #268: the `tasks` resolver must delegate to the gated collector, not
+    /// query the DB directly. A repo-less task belonging to someone else is
+    /// invisible to an anonymous caller. `tasks_negative_limit_clamped` cannot
+    /// catch a resolver that stops calling `collect_visible_tasks` because it
+    /// seeds no rows — this seeds one, so the gate is load-bearing here.
+    #[sqlx::test]
+    async fn tasks_repo_less_task_hidden_from_anon(pool: PgPool) {
+        let db = db(pool).await;
+        seed_task(&db, "t1", OWNER).await;
+        let schema = schema(db);
+        let resp = anon(&schema, "{ tasks { id } }").await;
+        assert_eq!(
+            count_tasks(&resp),
+            0,
+            "anon must not enumerate another party's repo-less task"
+        );
+        assert!(
+            !format!("{:?}", resp.data).contains("SECRET-UCAN-TOKEN"),
+            "no ucan token may reach an anonymous caller"
+        );
+    }
+
+    /// #268 sibling for the single-task resolver: an invisible task reads as
+    /// `null`, indistinguishable from one that does not exist.
+    #[sqlx::test]
+    async fn task_by_id_is_null_for_anon(pool: PgPool) {
+        let db = db(pool).await;
+        seed_task(&db, "t1", OWNER).await;
+        let schema = schema(db);
+        let resp = anon(&schema, r#"{ task(id: "t1") { id } }"#).await;
+        assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
+        let async_graphql::Value::Object(obj) = &resp.data else {
+            panic!("data not an object: {:?}", resp.data);
+        };
+        assert_eq!(
+            obj.get("task"),
+            Some(&async_graphql::Value::Null),
+            "an invisible task must read as null, got {:?}",
+            obj.get("task")
+        );
+    }
+
+    /// #268: `ucanToken` is absent from the read type's schema entirely, so the
+    /// delegator cannot request it either. Asking for it is a validation error,
+    /// which pins the redaction at the schema level rather than per-resolver.
+    #[sqlx::test]
+    async fn task_read_schema_has_no_ucan_token_field(pool: PgPool) {
+        let db = db(pool).await;
+        seed_task(&db, "t1", OWNER).await;
+        let schema = schema(db);
+        let resp = authed(&schema, r#"{ task(id: "t1") { id ucanToken } }"#, OWNER).await;
+        assert!(
+            !resp.errors.is_empty(),
+            "ucanToken must not exist on the task read type"
+        );
+    }
+
     fn count_tasks(resp: &async_graphql::Response) -> usize {
         assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
         let async_graphql::Value::Object(obj) = &resp.data else {
