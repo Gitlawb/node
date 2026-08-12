@@ -447,6 +447,18 @@ pub async fn get_by_cid(
         _per_source: caller_permit,
     });
 
+    // A SECOND, much shorter absolute clock, anchored here at admission, bounding only
+    // the pre-walk CID resolve below (#174 F4). The request budget alone is 600s by
+    // default, and a syntactically valid CID with no `pinned_cids` row runs zero probes
+    // and zero walks, so a resolve stalled in Postgres held these scarce permits for the
+    // whole 600s while nothing walked; enough distinct source keys doing that
+    // capacity-503 every real `/ipfs` retrieval at admission. Admission deliberately
+    // stays FIRST: resolving before taking it would let arbitrarily many unadmitted
+    // permissionless callers stack concurrent DB queries, trading one amplification for
+    // another, so the repair is a shorter deadline on the stage rather than a reorder.
+    let resolve_deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(state.config.ipfs_resolve_budget_secs);
+
     // Caller DID (owned): the `spawn_blocking` closures below cannot borrow the
     // handler's `auth` extension, so resolve it once here.
     let caller_owned = auth.as_ref().map(|e| e.0 .0.as_str().to_string());
@@ -460,6 +472,20 @@ pub async fn get_by_cid(
     // needed. Defined once here so the clamp sites on the provenance path share one
     // definition (the legacy-scan preload below keeps its own `budget_shed` inside
     // its nested scope).
+    //
+    // Which of the two clocks each await runs on (#174 F4), enumerated once here:
+    //   - `oids_for_cid` runs on the SHORT resolve budget (clamped by the request
+    //     budget). It is the one await that decides whether the request does any
+    //     admitted work at all; nothing has been paid for yet when it runs, so a shed
+    //     there discards nothing but the permits it is holding.
+    //   - EVERYTHING after it stays on the FULL request budget. `pin_sources_for_oid`
+    //     runs once per oid candidate and from the second candidate on runs after real
+    //     probe and walk work; the marker pair runs only on a provenance miss, which is
+    //     after the per-source loop may already have walked; the per-source trio and the
+    //     legacy pager's fetches interleave with admitted walk work by construction. A
+    //     short deadline anchored at admission would be long spent by the time those run
+    //     in a legitimately slow scan, so putting any of them under it sheds a
+    //     PROGRESSING request rather than an idle one.
     let budget_shed = || {
         AppError::Overloaded(format!(
             "ipfs scan incomplete (budget) for CID {cid_str}; retry shortly"
@@ -477,7 +503,16 @@ pub async fn get_by_cid(
     // when the chosen one is withheld or absent while another is readable (#173).
     // An empty result is an opaque 404, uniform with a genuine not-found and a
     // visibility denial.
-    let oids = match tokio::time::timeout(remaining(), state.db.oids_for_cid(&canonical_cid)).await
+    //
+    // Clamped to the LESSER of the resolve budget and the request budget, so a resolve
+    // budget set larger than the request budget degrades to the request budget instead
+    // of extending it.
+    let resolve_remaining = resolve_deadline.saturating_duration_since(std::time::Instant::now());
+    let oids = match tokio::time::timeout(
+        std::cmp::min(resolve_remaining, remaining()),
+        state.db.oids_for_cid(&canonical_cid),
+    )
+    .await
     {
         Ok(Ok(v)) => v,
         // Bare conversion, never `AppError::Internal`: a connection-class sqlx failure
@@ -486,6 +521,22 @@ pub async fn get_by_cid(
         // so a stalled pool and a closed pool stay distinguishable to the caller.
         Ok(Err(e)) => return Err(e.into()),
         Err(_elapsed) => {
+            // Name the clock that actually bound this await, in the log AND in the body:
+            // the two budgets are separately settable, so pointing an operator at the
+            // knob that did nothing here is the same defect as not naming one at all.
+            // Compared as DEADLINES, not as remainders read at two different instants:
+            // when the two clocks coincide the later read is always the smaller one, so
+            // a remainder comparison would attribute a tie to whichever was read second.
+            if resolve_deadline <= request_deadline {
+                tracing::warn!(
+                    resolve_budget_secs = state.config.ipfs_resolve_budget_secs,
+                    "/ipfs oids_for_cid exceeded the pre-walk resolve budget \
+                     (GITLAWB_IPFS_RESOLVE_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
+                );
+                return Err(AppError::Overloaded(format!(
+                    "ipfs resolve incomplete (resolve budget) for CID {cid_str}; retry shortly"
+                )));
+            }
             tracing::warn!(
                 budget_secs = state.config.ipfs_request_budget_secs,
                 "/ipfs oids_for_cid exceeded the request budget \
@@ -5930,6 +5981,213 @@ mod tests {
             StatusCode::NOT_FOUND,
             "with the permit freed and the lock released, a follow-up is ADMITTED and \
              answers 404 (no pin was seeded), never capacity-503'd"
+        );
+    }
+
+    /// F4 (#174 round 13): the pre-walk resolve carries its OWN short budget. The
+    /// clamp above proves `oids_for_cid` cannot run unbounded, but its deadline is the
+    /// 600s request budget, and a CID with no `pinned_cids` row does zero probe and
+    /// zero walk work. Under a stalled pool such a request held the scarce walk slot
+    /// for that whole window while nothing walked, so requests from enough distinct
+    /// source keys capacity-503'd every real `/ipfs` retrieval at admission.
+    ///
+    /// The request budget is left at its 600s DEFAULT here on purpose: that is the
+    /// whole point of the scenario, since the short resolve budget, not the long
+    /// request budget, is what must end this request.
+    ///
+    /// Load-bearing: without the resolve clamp the stalled lookup runs to the 600s
+    /// request budget and blows past the 10s wrap (RED). MUTATION (RED): revert the
+    /// clamp to `remaining()` only, the pre-fix shape.
+    #[sqlx::test]
+    async fn get_by_cid_stalled_resolve_frees_walk_permit_within_resolve_budget(
+        pool: sqlx::PgPool,
+    ) {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        // Global walk pool of 1 so the held/freed permit is directly observable;
+        // per-source cap permissive so only the global pool matters.
+        state.git_ipfs_walk_semaphore = Arc::new(Semaphore::new(1));
+        state.git_ipfs_walk_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
+        let mut cfg = (*state.config).clone();
+        cfg.ipfs_resolve_budget_secs = 1;
+        assert_eq!(
+            cfg.ipfs_request_budget_secs, 600,
+            "the request budget stays at its default: this scenario proves the SHORT \
+             budget is what sheds"
+        );
+        state.config = Arc::new(cfg);
+
+        let sem = state.git_ipfs_walk_semaphore.clone();
+        // A well-formed CID with no `pinned_cids` row: an anonymous caller's request
+        // that will do no admitted work at all once the lookup answers.
+        let cid = cid_for_oid(&absent_oid());
+        let router = ipfs_router(state);
+
+        let mut lock_conn = pool.acquire().await.unwrap();
+        sqlx::raw_sql("BEGIN; LOCK TABLE pinned_cids IN ACCESS EXCLUSIVE MODE;")
+            .execute(&mut *lock_conn)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.85:5000".parse().unwrap();
+        let started = std::time::Instant::now();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            router.clone().oneshot(get_cid(&cid, Some(peer))),
+        )
+        .await
+        .expect(
+            "the resolve clamp must return within the SHORT budget; on the request budget \
+             alone the stalled lookup holds for 600s",
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a resolve blocked past the resolve budget must shed a retryable 503"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "the clamp must end the request at ~the resolve budget (1s); got {elapsed:?} \
+             (on the request budget alone it runs for 600s)"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        // INV-24: the knob an operator can turn must be the one the shed names. The two
+        // budgets are separately settable, so a body naming the request budget here
+        // would point at a knob that did nothing.
+        assert!(
+            body.contains("resolve budget"),
+            "the shed must name the RESOLVE budget so it maps to \
+             GITLAWB_IPFS_RESOLVE_BUDGET_SECS; got: {body}"
+        );
+        assert!(
+            !body.contains("request budget"),
+            "the resolve shed must not name the request budget, which is untouched at \
+             600s here and would send an operator to the wrong knob; got: {body}"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the walk permit must be freed on the resolve-budget shed path, not held \
+             for the stall"
+        );
+
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut *lock_conn)
+            .await
+            .unwrap();
+        drop(lock_conn);
+        let resp2 = router.oneshot(get_cid(&cid, Some(peer))).await.unwrap();
+        assert_eq!(
+            resp2.status(),
+            StatusCode::NOT_FOUND,
+            "with the permit freed and the lock released, a follow-up is ADMITTED and \
+             answers 404 (no pin was seeded), never capacity-503'd"
+        );
+    }
+
+    /// F4 must-not (#174 round 13): the short resolve budget bounds the RESOLVE and
+    /// nothing else. A request whose resolve answers promptly and then spends real time
+    /// in an admitted visibility walk is PROGRESSING, and shedding it would convert a
+    /// slow-but-correct retrieval into a 503 on a box that is merely loaded.
+    ///
+    /// The resolve budget is 1s while the walk sleeps ~2s per `rev-list`, so any
+    /// deadline that reaches past `oids_for_cid` ends this request before it can serve.
+    /// The shim execs the REAL git after sleeping, so the allowed-set the walk produces
+    /// is the repo's genuine one and the 200 is a real serve, not an artifact.
+    ///
+    /// MUTATION (RED): anchor the region's `remaining()` on the resolve deadline (the
+    /// plausible over-wide re-implementation: one short admission-anchored clock for
+    /// the whole permit-held region) and this 200 becomes a budget 503.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_slow_walk_not_shed_by_resolve_budget(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.git_ipfs_walk_semaphore = Arc::new(Semaphore::new(1));
+        state.git_ipfs_walk_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
+
+        let content = b"slow but progressing\n";
+        let (repo_id, oid) =
+            seed_repo_with_blob(&state, tmp.path(), "z6slowwalk", "holder", content).await;
+        // Path-scoped, so serving costs a real reachability walk: the rule withholds a
+        // path the seeded blob is NOT under (it lives at `src/secret.txt`), so anon is
+        // allowed and the request must reach a 200 the slow way.
+        state
+            .db
+            .set_visibility_rule(
+                &repo_id,
+                "withheld/**",
+                crate::db::VisibilityMode::B,
+                &["did:key:z6MkU3IpfsReaderDDDDDDDDDDDDDDDDDDDDDDDD".to_string()],
+                "z6slowwalk",
+            )
+            .await
+            .unwrap();
+        let cid = seed_legacy_pin_for_oid(&state, &oid).await;
+
+        // Sleep only on the reachability walk, then exec the real git, so the delay
+        // lands inside the admitted region and after the resolve has already answered.
+        let shim = tmp.path().join("slowwalkgit");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               rev-list) sleep 2 ;;\n\
+             esac\n\
+             exec git \"$@\"\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&shim).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&shim, perm).unwrap();
+        }
+        state.git_bin = shim.to_str().unwrap().to_string();
+
+        let mut cfg = (*state.config).clone();
+        cfg.ipfs_resolve_budget_secs = 1;
+        state.config = Arc::new(cfg);
+
+        let peer: SocketAddr = "203.0.113.86:5000".parse().unwrap();
+        let started = std::time::Instant::now();
+        let resp = ipfs_router(state)
+            .oneshot(get_cid(&cid, Some(peer)))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a walk that outlives the SHORT resolve budget must still serve: the resolve \
+             budget bounds the pre-walk lookup, never admitted walk work. Got: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            &body[..],
+            content.as_slice(),
+            "the served bytes must be the seeded object's"
+        );
+        // Anti-vacuity: without a walk that genuinely outlives the 1s resolve budget,
+        // the 200 above would prove nothing about the boundary.
+        assert!(
+            elapsed >= std::time::Duration::from_secs(2),
+            "the request must actually have spent longer than the 1s resolve budget in \
+             the walk; got {elapsed:?}, so the shim's sleep never ran"
         );
     }
 

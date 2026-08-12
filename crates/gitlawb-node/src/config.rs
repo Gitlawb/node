@@ -1,13 +1,13 @@
 use clap::Parser;
 use std::path::PathBuf;
 
-/// Upper bound on `git_service_timeout_secs` and `ipfs_request_budget_secs`, in seconds
-/// (100 years).
+/// Upper bound on `git_service_timeout_secs`, `ipfs_request_budget_secs`, and
+/// `ipfs_resolve_budget_secs`, in seconds (100 years).
 ///
-/// Two consumers now, so a future tightening moves both. `ipfs_request_budget_secs`
-/// derives only the `Instant` addition in `get_by_cid`, not the lease-steal multiply
-/// below, but it shares this ceiling because the defect class and the "set it very large
-/// to disable" contract are the same.
+/// Three consumers now, so a future tightening moves all of them. `ipfs_request_budget_secs`
+/// and `ipfs_resolve_budget_secs` derive only the `Instant` addition in `get_by_cid`, not the
+/// lease-steal multiply below, but they share this ceiling because the defect class and the
+/// "set it very large to disable" contract are the same.
 ///
 /// The knob is not just stored, it is arithmetic input: the write path derives the
 /// per-repo lease steal bound from it (`* 2 + 60`), and #174 routed it into
@@ -600,6 +600,40 @@ pub struct Config {
     )]
     pub ipfs_request_budget_secs: u64,
 
+    /// Budget for the PRE-WALK CID resolve inside `get_by_cid`, in seconds: the
+    /// `oids_for_cid` lookup that maps the requested CID to its git oid(s), which runs
+    /// while the scarce walk admission (the global pool permit plus the per-source
+    /// sub-permit) is already held.
+    ///
+    /// It exists because that one await decides whether the request does any admitted
+    /// work at all. A syntactically valid CID with no `pinned_cids` row runs zero probes
+    /// and zero walks, so under a stalled or saturated pool it would otherwise occupy a
+    /// walk slot for the whole `ipfs_request_budget_secs` window (600s by default) while
+    /// nothing is walking, and enough distinct source keys doing that reject every real
+    /// `/ipfs` retrieval at admission. The other repair, resolving the CID before taking
+    /// admission, was rejected: admission stays FIRST so an anonymous flood sheds before
+    /// touching the database at all, and moving the read ahead of it would let arbitrarily
+    /// many unadmitted permissionless callers stack concurrent DB queries.
+    ///
+    /// The effective deadline is the lesser of this and the remaining request budget, so a
+    /// value larger than `ipfs_request_budget_secs` degrades to the request budget rather
+    /// than extending it. Only the resolve is on this clock; every later stage stays on the
+    /// full request budget, because from the second oid candidate on those run after real
+    /// probe and walk work and a short deadline anchored at admission would shed a
+    /// legitimately slow but progressing scan.
+    ///
+    /// Must be positive, and no larger than `GIT_SERVICE_TIMEOUT_SECS_MAX`, for the same
+    /// representability reason as the request budget above: `get_by_cid` derives the
+    /// resolve deadline as `Instant::now() + Duration::from_secs(this)`, and that addition
+    /// panics on overflow in release builds too. Default: 10s.
+    #[arg(
+        long,
+        env = "GITLAWB_IPFS_RESOLVE_BUDGET_SECS",
+        default_value_t = 10,
+        value_parser = clap::value_parser!(u64).range(1..=GIT_SERVICE_TIMEOUT_SECS_MAX)
+    )]
+    pub ipfs_resolve_budget_secs: u64,
+
     /// Per-client-IP rate limit for `GET /ipfs/{cid}`, in requests per hour. The
     /// route is publicly reachable (`optional_signature`) and each request can drive
     /// a full-history git walk, so it carries a per-IP flood brake in addition to the
@@ -1136,6 +1170,52 @@ mod tests {
         assert!(
             Config::try_parse_from(["gitlawb-node", "--ipfs-request-budget-secs", "0"]).is_err()
         );
+    }
+
+    #[test]
+    fn ipfs_resolve_budget_secs_defaults_to_10_and_rejects_zero() {
+        assert_eq!(
+            Config::parse_from(["gitlawb-node"]).ipfs_resolve_budget_secs,
+            10
+        );
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--ipfs-resolve-budget-secs", "3"])
+                .ipfs_resolve_budget_secs,
+            3
+        );
+        // 0 would shed every /ipfs request at the pre-walk resolve (unconditional
+        // 503); clap must reject it.
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--ipfs-resolve-budget-secs", "0"]).is_err()
+        );
+        // The ceiling is shared with the request budget: at the max it parses and the
+        // derived deadline is still representable, past it clap rejects.
+        let at_max = Config::try_parse_from([
+            "gitlawb-node",
+            "--ipfs-resolve-budget-secs",
+            &GIT_SERVICE_TIMEOUT_SECS_MAX.to_string(),
+        ])
+        .expect("the documented maximum must parse");
+        assert_eq!(
+            at_max.ipfs_resolve_budget_secs,
+            GIT_SERVICE_TIMEOUT_SECS_MAX
+        );
+        assert!(std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(
+                at_max.ipfs_resolve_budget_secs
+            ))
+            .is_some());
+        for over in [GIT_SERVICE_TIMEOUT_SECS_MAX + 1, u64::MAX] {
+            assert!(
+                Config::try_parse_from([
+                    "gitlawb-node",
+                    "--ipfs-resolve-budget-secs",
+                    &over.to_string(),
+                ])
+                .is_err(),
+                "{over} is past the representable ceiling and must be rejected at parse time"
+            );
+        }
     }
 
     /// #174 (RED-before/GREEN-after): the upper bound is what keeps the deadline derived
