@@ -5683,22 +5683,12 @@ mod tests {
     /// stays pinned past the deadline. Restore to return GREEN.
     #[sqlx::test]
     async fn receive_pack_acquire_deadline_sheds_and_releases_permit(pool: sqlx::PgPool) {
+        use crate::git::repo_store::advisory_lock_key;
         use axum::extract::{Path, State};
         use axum::Extension;
         use std::net::SocketAddr;
         use std::sync::Arc;
         use tokio::sync::Semaphore;
-
-        // Reproduce acquire_write's session-level advisory-lock key exactly so the
-        // second-connection lock collides with the handler's pg_try_advisory_lock
-        // (repo_store.rs: advisory_lock_key over owner_slug then repo_name).
-        fn advisory_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            owner_slug.hash(&mut hasher);
-            repo_name.hash(&mut hasher);
-            hasher.finish() as i64
-        }
 
         let owner = "z6acqdead";
         let name = "acq1";
