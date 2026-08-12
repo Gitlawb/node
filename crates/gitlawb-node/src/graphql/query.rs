@@ -513,7 +513,11 @@ mod tests {
             .unwrap();
         }
         let schema = schema(db);
-        let resp = anon(&schema, "{ tasks(limit: 5000) { id } }").await;
+        // Queried as the delegator, not anonymously: since #268 the task read
+        // surface is visibility-gated, and an anonymous caller sees none of
+        // these repo-less tasks at all. The clamp is what this test pins, so it
+        // needs a caller who can legitimately see all 201 rows.
+        let resp = authed(&schema, "{ tasks(limit: 5000) { id } }", OWNER).await;
         assert_eq!(count_tasks(&resp), 200, "limit above 200 must clamp to 200");
     }
 
