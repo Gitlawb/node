@@ -53,12 +53,16 @@ pub enum TaskCmd {
         limit: i64,
         #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
         node: String,
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
     /// View a specific task
     View {
         id: String,
         #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
         node: String,
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
     /// Claim a pending task
     Claim {
@@ -121,8 +125,9 @@ pub async fn run(args: TaskArgs) -> Result<()> {
             assignee_did,
             limit,
             node,
-        } => cmd_list(status, assignee_did, limit, node).await,
-        TaskCmd::View { id, node } => cmd_view(id, node).await,
+            dir,
+        } => cmd_list(status, assignee_did, limit, node, dir).await,
+        TaskCmd::View { id, node, dir } => cmd_view(id, node, dir).await,
         TaskCmd::Claim { id, node, dir } => cmd_claim(id, node, dir).await,
         TaskCmd::Complete {
             id,
@@ -182,8 +187,9 @@ async fn cmd_list(
     assignee_did: Option<String>,
     limit: i64,
     node: String,
+    dir: Option<PathBuf>,
 ) -> Result<()> {
-    let client = NodeClient::new(&node, None);
+    let client = NodeClient::new(&node, load_keypair_from_dir(dir.as_deref()).ok());
     let mut path = format!("/api/v1/tasks?limit={}", limit);
     if let Some(s) = &status {
         path.push_str(&format!("&status={}", urlencoding::encode(s)));
@@ -192,8 +198,10 @@ async fn cmd_list(
         path.push_str(&format!("&assignee_did={}", urlencoding::encode(a)));
     }
     let resp: Value = client
-        .get(&path)
+        .get_maybe_signed(&path)
         .await
+        .context("failed to list tasks")?
+        .error_for_status()
         .context("failed to list tasks")?
         .json()
         .await
@@ -202,11 +210,13 @@ async fn cmd_list(
     Ok(())
 }
 
-async fn cmd_view(id: String, node: String) -> Result<()> {
-    let client = NodeClient::new(&node, None);
+async fn cmd_view(id: String, node: String, dir: Option<PathBuf>) -> Result<()> {
+    let client = NodeClient::new(&node, load_keypair_from_dir(dir.as_deref()).ok());
     let resp: Value = client
-        .get(&format!("/api/v1/tasks/{}", id))
+        .get_maybe_signed(&format!("/api/v1/tasks/{}", id))
         .await
+        .context("failed to get task")?
+        .error_for_status()
         .context("failed to get task")?
         .json()
         .await
@@ -379,6 +389,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_tasks_empty() {
         let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
 
         let _m = server
             .mock(
@@ -391,18 +402,29 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_list(None, None, 50, server.url()).await.unwrap();
+        cmd_list(None, None, 50, server.url(), Some(dir.path().to_path_buf()))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
-    async fn test_list_tasks_with_filters() {
+    async fn test_delegator_list_tasks_is_signed() {
         let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock(
                 "GET",
                 mockito::Matcher::Regex(r"status=pending".to_string()),
             )
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"tasks":[{"id":"t1","kind":"test","status":"pending"}]}"#)
@@ -414,6 +436,7 @@ mod tests {
             Some("did:key:z6Mk_test".to_string()),
             10,
             server.url(),
+            Some(dir.path().to_path_buf()),
         )
         .await
         .unwrap();
@@ -422,34 +445,87 @@ mod tests {
     // ── view ─────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_view_task_success() {
+    async fn test_assignee_view_task_is_signed() {
         let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("GET", "/api/v1/tasks/task-42")
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"id":"task-42","kind":"deploy","status":"completed","result":"ok"}"#)
             .create_async()
             .await;
 
-        cmd_view("task-42".to_string(), server.url()).await.unwrap();
+        cmd_view(
+            "task-42".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_private_repo_task_view_is_signed() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        let _m = server
+            .mock("GET", "/api/v1/tasks/private-task")
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"private-task","repo_id":"private-repo"}"#)
+            .create_async()
+            .await;
+
+        cmd_view(
+            "private-task".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn test_view_task_not_found() {
         let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
 
         let _m = server
             .mock("GET", "/api/v1/tasks/nope")
+            .match_header("signature", mockito::Matcher::Missing)
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"not found"}"#)
             .create_async()
             .await;
 
-        // cmd_view doesn't check status — it prints the JSON
-        cmd_view("nope".to_string(), server.url()).await.unwrap();
+        let err = cmd_view(
+            "nope".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("failed to get task"));
     }
 
     // ── claim ────────────────────────────────────────────────────────

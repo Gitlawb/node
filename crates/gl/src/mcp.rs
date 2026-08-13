@@ -1068,7 +1068,12 @@ async fn call_tool(
             if let Some(a) = args.get("assignee_did").and_then(|v| v.as_str()) {
                 path.push_str(&format!("&assignee_did={}", urlencoding::encode(a)));
             }
-            let resp: Value = client.get(&path).await?.json().await?;
+            let resp: Value = client
+                .get_maybe_signed(&path)
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1604,6 +1609,56 @@ mod tests {
         .unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["tasks"][0]["id"], "t1");
+    }
+
+    #[tokio::test]
+    async fn test_task_list_via_mcp_uses_loaded_identity() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()),
+            )
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[{"id":"t1"}]}"#)
+            .create_async()
+            .await;
+
+        let result = call_tool("task_list", json!({}), &server.url(), Some(dir.path()))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["tasks"][0]["id"], "t1");
+    }
+
+    #[tokio::test]
+    async fn test_task_list_via_mcp_returns_http_errors() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()),
+            )
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"failed"}"#)
+            .create_async()
+            .await;
+
+        let err = call_tool("task_list", json!({}), &server.url(), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"));
     }
 
     #[tokio::test]

@@ -1426,11 +1426,13 @@ impl Db {
 
     /// Shared dedup CTE: collapses the mirror row and the canonical row of one
     /// logical repo into a single survivor. `$1` is an optional owner filter
-    /// (NULL = all rows). Grouping collapses on a did:key-aware owner key: strip a
-    /// `did:key:` prefix (8 chars, so `substr(owner_did, 9)`) only when the
-    /// remainder is a bare id with no `:`, otherwise keep the full DID. That is the
-    /// exact normalization in `crate::api::did_matches`, so `did:key:X` and a bare
-    /// `X` collapse while distinct DID methods (`did:gitlawb:X`) never merge. The
+    /// (NULL = all rows). `$2` optionally scopes the work to the logical groups
+    /// containing the supplied repo ids. Grouping collapses on a did:key-aware
+    /// owner key: strip a `did:key:` prefix (8 chars, so
+    /// `substr(owner_did, 9)`) only when the remainder is a bare id with no `:`,
+    /// otherwise keep the full DID. That is the exact normalization in
+    /// `crate::api::did_matches`, so `did:key:X` and a bare `X` collapse while
+    /// distinct DID methods (`did:gitlawb:X`) never merge. The
     /// CASE is repeated verbatim in `count_repos_deduped` and the v7 index and must
     /// stay byte-identical or Postgres stops using the index.
     /// The canonical row wins (mirror rows carry a slash-form `id` written only by
@@ -1440,7 +1442,12 @@ impl Db {
     /// `crate::api::repos::dedupe_canonical_repos` must stay in sync.
     fn dedup_cte() -> String {
         format!(
-            "WITH deduped AS (
+            "WITH requested_groups AS (
+                 SELECT DISTINCT {key} AS owner_key, name
+                 FROM repos
+                 WHERE $2::text[] IS NOT NULL AND id = ANY($2)
+             ),
+             deduped AS (
                  SELECT DISTINCT ON ({key}, name)
                      id, name, owner_did, description, is_public, default_branch,
                      created_at,
@@ -1459,6 +1466,11 @@ impl Db {
                  -- Quarantined mirrors (admitted but unvalidated by the iCaptcha
                  -- propagation gate) are withheld from every listing surface.
                  WHERE quarantined = FALSE AND ($1::text IS NULL OR ({key}) = $1)
+                   AND ($2::text[] IS NULL OR EXISTS (
+                       SELECT 1 FROM requested_groups requested
+                       WHERE requested.owner_key = ({key})
+                         AND requested.name = repos.name
+                   ))
                  ORDER BY {key}, name,
                      -- mirror rows carry a slash-form id (\"{{owner_short}}/{{name}}\"),
                      -- written only by upsert_mirror_repo; canonical ids are UUIDs.
@@ -1506,6 +1518,7 @@ impl Db {
         );
         let rows = sqlx::query(&sql)
             .bind(owner_key)
+            .bind(None::<&[String]>)
             .fetch_all(&self.pool)
             .await?;
 
@@ -1534,6 +1547,32 @@ impl Db {
         );
         let rows = sqlx::query(&sql)
             .bind(None::<&str>)
+            .bind(None::<&[String]>)
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows.into_iter().map(row_to_repo).collect())
+    }
+
+    /// Resolve only the requested repository ids through the same canonical
+    /// survivor and quarantine rules as `list_all_repos_deduped`.
+    pub async fn list_repos_deduped_by_ids(&self, repo_ids: &[String]) -> Result<Vec<RepoRecord>> {
+        if repo_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "{}
+             SELECT d.id, d.name, d.owner_did, d.description, d.is_public,
+                 d.default_branch, d.created_at, d.updated_at, d.disk_path,
+                 d.forked_from, d.machine_id
+             FROM deduped d
+             WHERE d.id = ANY($2)
+             ORDER BY d.updated_at DESC",
+            Self::dedup_cte()
+        );
+        let rows = sqlx::query(&sql)
+            .bind(None::<&str>)
+            .bind(repo_ids)
             .fetch_all(&self.pool)
             .await?;
 
@@ -3697,46 +3736,29 @@ impl Db {
         Ok(row.map(row_to_task))
     }
 
-    pub async fn list_tasks(
+    pub async fn list_tasks_keyset(
         &self,
         status: Option<&str>,
         assignee_did: Option<&str>,
         limit: i64,
+        after: Option<(&str, &str)>,
     ) -> Result<Vec<AgentTask>> {
-        let rows = match (status, assignee_did) {
-            (Some(s), Some(a)) => sqlx::query(
-                "SELECT id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline
-                 FROM agent_tasks WHERE status=$1 AND assignee_did=$2 ORDER BY created_at DESC LIMIT $3",
-            )
-            .bind(s)
-            .bind(a)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?,
-            (Some(s), None) => sqlx::query(
-                "SELECT id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline
-                 FROM agent_tasks WHERE status=$1 ORDER BY created_at DESC LIMIT $2",
-            )
-            .bind(s)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?,
-            (None, Some(a)) => sqlx::query(
-                "SELECT id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline
-                 FROM agent_tasks WHERE assignee_did=$1 ORDER BY created_at DESC LIMIT $2",
-            )
-            .bind(a)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?,
-            (None, None) => sqlx::query(
-                "SELECT id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline
-                 FROM agent_tasks ORDER BY created_at DESC LIMIT $1",
-            )
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?,
-        };
+        let rows = sqlx::query(
+            "SELECT id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline
+             FROM agent_tasks
+             WHERE ($1::text IS NULL OR status = $1)
+               AND ($2::text IS NULL OR assignee_did = $2)
+               AND ($3::text IS NULL OR (created_at, id) < ($3, $4))
+             ORDER BY created_at DESC, id DESC
+             LIMIT $5",
+        )
+        .bind(status)
+        .bind(assignee_did)
+        .bind(after.map(|cursor| cursor.0))
+        .bind(after.map(|cursor| cursor.1))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows.into_iter().map(row_to_task).collect())
     }
 
@@ -5259,6 +5281,36 @@ mod dedup_db_tests {
             ts("2026-03-01T00:00:00Z"),
             "survivor inherits the group's MAX(updated_at)"
         );
+    }
+
+    #[sqlx::test]
+    async fn deduped_id_lookup_returns_only_requested_repo(pool: PgPool) {
+        let db = db(pool).await;
+        let requested = rec(
+            "requested",
+            "did:key:z6MkRequested",
+            "requested",
+            "requested",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        let unrelated = rec(
+            "unrelated",
+            "did:key:z6MkUnrelated",
+            "unrelated",
+            "unrelated",
+            "2026-01-02T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+        );
+        db.create_repo(&requested).await.unwrap();
+        db.create_repo(&unrelated).await.unwrap();
+
+        let out = db
+            .list_repos_deduped_by_ids(&[requested.id.clone()])
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, requested.id);
     }
 
     /// A PRIVATE canonical repo and a PUBLIC mirror row for the same

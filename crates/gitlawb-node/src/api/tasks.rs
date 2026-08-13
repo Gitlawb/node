@@ -149,7 +149,15 @@ pub(crate) fn task_visible(
             return true;
         }
     }
-    let Some(record) = task.repo_id.as_deref().and_then(|id| repos_by_id.get(id)) else {
+    let Some(repo_id) = task.repo_id.as_deref() else {
+        return false;
+    };
+    // Slash-form ids are mirror rows. Mirrors are public placeholders and do
+    // not replicate visibility rules, so they cannot establish read access.
+    if repo_id.contains('/') {
+        return false;
+    }
+    let Some(record) = repos_by_id.get(repo_id) else {
         return false;
     };
     let rules = rules_by_repo
@@ -165,13 +173,6 @@ pub(crate) fn task_visible(
 /// pattern in `api/events.rs`. `limit` is clamped here so a caller-supplied
 /// value never reaches SQL unclamped.
 ///
-/// Unlike the ref-updates feed, this does not page past invisible rows: it
-/// fetches one bounded page and filters it, so a request whose newest
-/// `MAX_VISIBLE_TASKS` rows are mostly invisible to the caller can return
-/// fewer rows than are truly visible further back. Accepted here because,
-/// unlike the cross-tenant ref-updates feed, task queries are already scoped
-/// by `status`/`assignee_did` up front, which keeps the visible/invisible mix
-/// per query far narrower in practice.
 pub(crate) async fn collect_visible_tasks(
     db: &crate::db::Db,
     status: Option<&str>,
@@ -183,44 +184,53 @@ pub(crate) async fn collect_visible_tasks(
     if bounded_limit == 0 {
         return Ok(Vec::new());
     }
-    let tasks = db.list_tasks(status, assignee_did, bounded_limit).await?;
-    if tasks.is_empty() {
-        return Ok(tasks);
-    }
-    // Narrow to the repos this page's tasks actually name, so the rule lookup
-    // below is bounded by the page (≤ MAX_VISIBLE_TASKS) instead of by how many
-    // repos the node hosts — otherwise an anonymous request pulls every
-    // visibility rule on the node. The deduped snapshot stays the source of
-    // truth for *which* repo a `repo_id` resolves to: it collapses
-    // mirror/canonical pairs and omits quarantined repos, and an id that is
-    // absent from it must keep failing closed in `task_visible` (a raw
-    // repos-by-id lookup would resurrect exactly those rows).
-    let referenced: HashSet<&str> = tasks.iter().filter_map(|t| t.repo_id.as_deref()).collect();
-    if referenced.is_empty() {
-        let empty_repos = HashMap::new();
-        let empty_rules = HashMap::new();
-        return Ok(tasks
+    let mut visible = Vec::with_capacity(bounded_limit as usize);
+    let mut cursor: Option<(String, String)> = None;
+    loop {
+        let tasks = db
+            .list_tasks_keyset(
+                status,
+                assignee_did,
+                MAX_VISIBLE_TASKS,
+                cursor
+                    .as_ref()
+                    .map(|(created_at, id)| (created_at.as_str(), id.as_str())),
+            )
+            .await?;
+        if tasks.is_empty() {
+            break;
+        }
+        let next_cursor = tasks
+            .last()
+            .map(|task| (task.created_at.clone(), task.id.clone()));
+        let referenced: Vec<String> = tasks
+            .iter()
+            .filter_map(|task| task.repo_id.clone())
+            .collect::<HashSet<_>>()
             .into_iter()
-            .filter(|t| task_visible(t, caller, &empty_repos, &empty_rules))
-            .collect());
+            .collect();
+        let repos_by_id: HashMap<String, RepoRecord> = db
+            .list_repos_deduped_by_ids(&referenced)
+            .await?
+            .into_iter()
+            .map(|repo| (repo.id.clone(), repo))
+            .collect();
+        let repo_ids: Vec<String> = repos_by_id.keys().cloned().collect();
+        let rules_by_repo = db.list_visibility_rules_for_repos(&repo_ids).await?;
+
+        visible.extend(
+            tasks
+                .iter()
+                .filter(|task| task_visible(task, caller, &repos_by_id, &rules_by_repo))
+                .take((bounded_limit as usize).saturating_sub(visible.len()))
+                .cloned(),
+        );
+        if visible.len() == bounded_limit as usize || tasks.len() < MAX_VISIBLE_TASKS as usize {
+            break;
+        }
+        cursor = next_cursor;
     }
-    let repos_by_id: HashMap<String, RepoRecord> = db
-        .list_all_repos_deduped()
-        .await?
-        .into_iter()
-        .filter(|r| referenced.contains(r.id.as_str()))
-        .map(|r| (r.id.clone(), r))
-        .collect();
-    let ids: Vec<String> = repos_by_id.keys().cloned().collect();
-    let rules_by_repo = if ids.is_empty() {
-        HashMap::new()
-    } else {
-        db.list_visibility_rules_for_repos(&ids).await?
-    };
-    Ok(tasks
-        .into_iter()
-        .filter(|t| task_visible(t, caller, &repos_by_id, &rules_by_repo))
-        .collect())
+    Ok(visible)
 }
 
 /// Fetch a single task gated the same way `collect_visible_tasks` gates a
@@ -238,7 +248,8 @@ pub(crate) async fn get_visible_task(
     };
     let (repos_by_id, rules_by_repo) = match task.repo_id.as_deref() {
         Some(repo_id) => {
-            let repos = db.list_all_repos_deduped().await?;
+            let ids = [repo_id.to_string()];
+            let repos = db.list_repos_deduped_by_ids(&ids).await?;
             match repos.into_iter().find(|r| r.id == repo_id) {
                 Some(record) => {
                     let rules = db.list_visibility_rules(&record.id).await?;
@@ -742,6 +753,35 @@ mod visible_tasks_tests {
         );
     }
 
+    #[sqlx::test]
+    async fn mirror_only_repo_task_is_hidden_from_anonymous_reads(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .upsert_mirror_repo(DELEGATOR, "mirror", "/tmp/mirror", None, false)
+            .await
+            .unwrap();
+        let mirror_id = format!("{DELEGATOR}/mirror");
+        state
+            .db
+            .create_task(&task("t1", Some(&mirror_id), DELEGATOR))
+            .await
+            .unwrap();
+
+        let resp = list_router(state.clone())
+            .oneshot(anon_get("/api/v1/tasks"))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["count"], 0);
+
+        let resp = list_router(state)
+            .oneshot(anon_get("/api/v1/tasks/t1"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
     /// A negative limit must clamp to zero through `collect_visible_tasks`,
     /// not fall through to the visible set.
     #[sqlx::test]
@@ -764,5 +804,34 @@ mod visible_tasks_tests {
             .unwrap();
         let body = body_json(resp).await;
         assert_eq!(body["count"], 0, "negative limit must clamp to 0");
+    }
+
+    #[sqlx::test]
+    async fn older_visible_task_is_not_hidden_by_newer_denied_window(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("public-repo", DELEGATOR, "public", true))
+            .await
+            .unwrap();
+        let mut visible = task("visible", Some("public-repo"), DELEGATOR);
+        visible.created_at = "2026-01-01T00:00:00Z".into();
+        visible.updated_at = visible.created_at.clone();
+        state.db.create_task(&visible).await.unwrap();
+
+        for i in 0..MAX_VISIBLE_TASKS {
+            let mut hidden = task(&format!("hidden-{i:03}"), None, DELEGATOR);
+            hidden.created_at = "2026-01-02T00:00:00Z".into();
+            hidden.updated_at = hidden.created_at.clone();
+            state.db.create_task(&hidden).await.unwrap();
+        }
+
+        let resp = list_router(state)
+            .oneshot(anon_get("/api/v1/tasks?limit=1"))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["tasks"][0]["id"], "visible");
     }
 }
