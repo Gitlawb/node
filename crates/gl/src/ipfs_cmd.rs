@@ -4,6 +4,7 @@
 //! objects by their content-addressed CID.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
@@ -89,7 +90,41 @@ async fn cmd_list(node: String, dir: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Automatic resumes attempted after the initial request when the node reports a
+/// truncated legacy scan, so at most `MAX_SCAN_RESUMES + 1` node calls per invocation.
+const MAX_SCAN_RESUMES: usize = 8;
+
+/// Wall-clock budget for a whole `gl ipfs get`, resumes included.
+const SCAN_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Mirror a stderr diagnostic into a per-thread buffer under `cfg(test)` so the
+/// command-level tests can assert on what the caller is actually told. Callers
+/// see the same line either way; only the test-visible copy is conditional.
+fn diag(msg: &str) {
+    eprintln!("{msg}");
+    #[cfg(test)]
+    tests::record_diag(msg);
+}
+
 async fn cmd_get(cid: String, node: String, dir: Option<PathBuf>) -> Result<()> {
+    cmd_get_inner(cid, node, dir, None, SCAN_DEADLINE, MAX_SCAN_RESUMES).await
+}
+
+/// The body of `gl ipfs get`, with the bounds and the starting continuation as
+/// parameters so tests can drive the resume ladder without waiting out the shipped
+/// defaults. `cmd_get` supplies those defaults.
+///
+/// The resume loop itself is not wired yet: `continuation`, `deadline`, and `cap`
+/// are accepted here so the ladder tests can address the seam, and the request
+/// behaviour below is still the single-shot, bail-on-any-non-success one.
+async fn cmd_get_inner(
+    cid: String,
+    node: String,
+    dir: Option<PathBuf>,
+    _continuation: Option<String>,
+    _deadline: Duration,
+    _cap: usize,
+) -> Result<()> {
     // #173 (F5): the resolver now serves path-scoped objects to authorized readers,
     // so sign with an available identity like `gl ipfs list` — otherwise an owner or
     // listed reader gets the opaque anonymous 404 for content they can read.
@@ -127,10 +162,16 @@ async fn cmd_get(cid: String, node: String, dir: Option<PathBuf>) -> Result<()> 
     // Print headers for diagnostics
     let headers = resp.headers().clone();
     if let Some(git_hash) = headers.get("x-git-hash") {
-        eprintln!("x-git-hash:   {}", git_hash.to_str().unwrap_or("?"));
+        diag(&format!(
+            "x-git-hash:   {}",
+            git_hash.to_str().unwrap_or("?")
+        ));
     }
     if let Some(content_cid) = headers.get("x-content-cid") {
-        eprintln!("x-content-cid: {}", content_cid.to_str().unwrap_or("?"));
+        diag(&format!(
+            "x-content-cid: {}",
+            content_cid.to_str().unwrap_or("?")
+        ));
     }
 
     // Write raw bytes to stdout (allows piping to files or other tools)
@@ -156,6 +197,119 @@ fn encode_cid_segment(cid: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    thread_local! {
+        /// Test-visible copy of the stderr diagnostics `diag` emits. `#[tokio::test]`
+        /// runs the future on the test's own thread, so a thread-local is enough.
+        static DIAG: RefCell<String> = const { RefCell::new(String::new()) };
+    }
+
+    pub(super) fn record_diag(msg: &str) {
+        DIAG.with(|d| {
+            let mut d = d.borrow_mut();
+            d.push_str(msg);
+            d.push('\n');
+        });
+    }
+
+    fn reset_diag() {
+        DIAG.with(|d| d.borrow_mut().clear());
+    }
+
+    fn diag_text() -> String {
+        DIAG.with(|d| d.borrow().clone())
+    }
+
+    /// Everything the caller is told about a failed get: the stderr diagnostics plus
+    /// the error itself (main renders both). `{:#}` flattens the anyhow context chain
+    /// onto one line, so a message carried in a context layer is still covered.
+    fn told(err: &anyhow::Error) -> String {
+        format!("{}{err:#}", diag_text())
+    }
+
+    /// Width of a real continuation today (see the node's scan_token module): 668
+    /// base64url-no-pad characters. The tests build tokens of that width so the
+    /// fixtures look like the wire, not like a placeholder.
+    const TOKEN_LEN: usize = 668;
+
+    fn token_of_len(seed: &str, len: usize) -> String {
+        let mut t = String::from(seed);
+        while t.len() < len {
+            t.push('A');
+        }
+        t.truncate(len);
+        t
+    }
+
+    fn make_token(seed: &str) -> String {
+        token_of_len(seed, TOKEN_LEN)
+    }
+
+    /// The `scan` query value of an incoming request, if it carries one.
+    fn scan_of(path_and_query: &str) -> Option<String> {
+        let (_, query) = path_and_query.split_once('?')?;
+        query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("scan="))
+            .map(str::to_string)
+    }
+
+    /// Derive the NEXT continuation from the one the client just echoed, so every
+    /// response on a ladder carries a different token (a real node re-seals with a
+    /// fresh nonce every time, and a fixed replayed body would hide that).
+    fn next_token(echoed: Option<&str>) -> String {
+        let n = echoed
+            .map(|t| {
+                t.trim_end_matches('A')
+                    .trim_start_matches('t')
+                    .parse::<usize>()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        make_token(&format!("t{}", n + 1))
+    }
+
+    /// A node message crafted to reach the terminal: a raw DEL (a control character
+    /// JSON permits unescaped), a JSON-escaped ESC/CSI sequence, a raw bidi override,
+    /// and a long tail so a missing length cap shows up.
+    fn hostile_msg() -> String {
+        format!("boom \u{7f} \\u001b[31m \u{202e} {}", "x".repeat(5000))
+    }
+
+    fn incomplete_body(continuation: Option<&str>, msg: &str) -> String {
+        match continuation {
+            Some(t) => {
+                format!(r#"{{"error":"search_incomplete","message":"{msg}","continuation":"{t}"}}"#)
+            }
+            None => format!(r#"{{"error":"search_incomplete","message":"{msg}"}}"#),
+        }
+    }
+
+    fn has_control_or_bidi(s: &str) -> bool {
+        s.chars()
+            .any(|c| c.is_control() || gitlawb_core::sanitize::is_bidi_format(c))
+    }
+
+    /// A bare re-run restarts the scan at row 0 and re-spends the caller's per-IP
+    /// budget, so any "run it again" phrasing is only honest when the token that
+    /// makes progress is right there with it.
+    fn implies_bare_rerun(text: &str, token: &str) -> bool {
+        let lower = text.to_lowercase();
+        [
+            "try again",
+            "re-run",
+            "rerun",
+            "run it again",
+            "retry the command",
+        ]
+        .iter()
+        .any(|p| lower.contains(p))
+            && !text.contains(token)
+    }
 
     /// Seed a keypair into a temp dir the way `load_keypair_from_dir` expects,
     /// then return the dir handle (keeps it alive for the test's duration).
@@ -329,32 +483,658 @@ mod tests {
         m.assert_async().await;
     }
 
-    /// #173 (INV-8) must-not: the node's new 503 "search incomplete" (the legacy CID
-    /// scan hit its bound and could not prove absence) must surface as an actionable
-    /// Err naming the status, NOT be rendered as an empty/"not found" success — a
-    /// retryable outcome the caller has to see. Mirrors the 404 denial case for the
-    /// bounded-search response the resolver now emits.
-    #[tokio::test]
-    async fn test_cmd_get_search_incomplete_503_is_error() {
-        let mut server = mockito::Server::new_async().await;
+    // #173 (F3): a truncated legacy scan comes back as 503 `search_incomplete` with a
+    // sealed continuation token. The command must follow that token instead of
+    // dead-ending, under an attempt cap, a wall-clock deadline, and a clamped
+    // Retry-After, and every terminal that still holds a token must hand it back with
+    // the invocation that resumes from it. The ladder fixtures answer with
+    // `Retry-After: 0` so the clamped sleeps are zero and a nine-call ladder stays
+    // sub-second in real time.
 
-        let m = server
-            .mock("GET", "/ipfs/bafkreiincomplete")
+    /// Scenario 1. A `search_incomplete` 503 carrying a valid continuation is resumed:
+    /// the second request repeats the CID with `?scan=<token>` (percent-encoding is the
+    /// identity over the base64url alphabet, so the echo is byte-identical) and the
+    /// content it returns is written.
+    #[tokio::test]
+    async fn test_cmd_get_resumes_search_incomplete_with_continuation() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+        let t = make_token("t1");
+
+        let m1 = server
+            .mock("GET", "/ipfs/bafkreiresume")
             .with_status(503)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"error":"search_incomplete","message":"CID search incomplete — retry"}"#)
+            .with_header("retry-after", "0")
+            .with_body(incomplete_body(Some(&t), "scan truncated"))
+            .expect(1)
+            .create_async()
+            .await;
+        let m2 = server
+            .mock("GET", "/ipfs/bafkreiresume")
+            .match_query(mockito::Matcher::Exact(format!("scan={t}")))
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_body("object bytes")
+            .expect(1)
             .create_async()
             .await;
 
-        let err = cmd_get("bafkreiincomplete".to_string(), server.url(), None)
+        cmd_get("bafkreiresume".to_string(), server.url(), None)
             .await
-            .expect_err("a 503 incomplete-search must be an error, not masked as not-found");
+            .expect("a search_incomplete 503 carrying a continuation must resume, not bail");
+
+        m1.assert_async().await;
+        m2.assert_async().await;
+    }
+
+    /// Scenario 2. A node that keeps truncating stops at the attempt cap: 8 automatic
+    /// resumes after the initial request, 9 node calls in all. The give-up names the
+    /// incomplete result and the cap, and hands back the token still held with the
+    /// invocation that resumes from it.
+    #[tokio::test]
+    async fn test_cmd_get_resume_ladder_stops_at_attempt_cap() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+
+        let m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_header("retry-after", "0")
+            .with_body_from_request(move |req| {
+                c.fetch_add(1, Ordering::SeqCst);
+                let next = next_token(scan_of(req.path_and_query()).as_deref());
+                incomplete_body(Some(&next), "scan truncated").into_bytes()
+            })
+            .expect(9)
+            .create_async()
+            .await;
+
+        let err = cmd_get("bafkreicap".to_string(), server.url(), None)
+            .await
+            .expect_err("a ladder that never completes must end in an error");
+        let told = told(&err);
+        let held = make_token("t9");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            9,
+            "cap is 8 resumes after the initial request, so exactly 9 node calls"
+        );
         assert!(
-            err.to_string().contains("503"),
-            "error should mention the status, got: {err}"
+            told.to_lowercase().contains("incomplete"),
+            "the give-up must name the incomplete result, got: {told}"
+        );
+        assert!(
+            told.contains('8'),
+            "the give-up must name the resume cap, got: {told}"
+        );
+        assert!(
+            told.contains(&held),
+            "the still-held continuation must be surfaced, got: {told}"
+        );
+        assert!(
+            told.contains(&format!("--scan {held}")),
+            "the exact resuming invocation must be surfaced, got: {told}"
+        );
+        assert!(
+            !implies_bare_rerun(&told, &held),
+            "a bare re-run restarts at row 0, so the wording must not imply it helps: {told}"
         );
 
         m.assert_async().await;
+    }
+
+    /// Scenario 3. A wedged node (every response a fresh token for the same position)
+    /// is indistinguishable from slow progress at the client, because tokens are
+    /// nonce-randomized ciphertext. The cap is what ends it, and that is the whole
+    /// assertion: the ladder stops at 9 calls with the explicit incomplete report.
+    #[tokio::test]
+    async fn test_cmd_get_wedged_ladder_still_stops_at_attempt_cap() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+
+        let m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_header("retry-after", "0")
+            .with_body_from_request(move |_req| {
+                let n = c.fetch_add(1, Ordering::SeqCst) + 1;
+                // A distinct token every time, none of them advancing the cursor.
+                incomplete_body(Some(&make_token(&format!("w{n}"))), "scan truncated").into_bytes()
+            })
+            .expect(9)
+            .create_async()
+            .await;
+
+        let err = cmd_get("bafkreiwedged".to_string(), server.url(), None)
+            .await
+            .expect_err("a wedged ladder must end in an error");
+        let told = told(&err);
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            9,
+            "the cap is the only bound on a wedged ladder, so exactly 9 node calls"
+        );
+        assert!(
+            told.to_lowercase().contains("incomplete"),
+            "the give-up must name the incomplete result, got: {told}"
+        );
+
+        m.assert_async().await;
+    }
+
+    /// Scenario 4. A `search_incomplete` 503 with no continuation is terminal: there is
+    /// nothing to resume from, and the message says so rather than reporting a bare
+    /// status. Exactly one node call.
+    #[tokio::test]
+    async fn test_cmd_get_search_incomplete_without_continuation_is_terminal() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+
+        let m1 = server
+            .mock("GET", "/ipfs/bafkreinotoken")
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_body(incomplete_body(None, "scan truncated"))
+            .expect(1)
+            .create_async()
+            .await;
+        let m2 = server
+            .mock("GET", mockito::Matcher::Regex("scan=".to_string()))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let err = cmd_get("bafkreinotoken".to_string(), server.url(), None)
+            .await
+            .expect_err("a truncation with no continuation must be an error");
+        let told = told(&err);
+
+        assert!(
+            told.to_lowercase().contains("continuation"),
+            "the terminal must name the missing continuation, got: {told}"
+        );
+        assert!(
+            told.contains("503"),
+            "the terminal must still name the status, got: {told}"
+        );
+
+        m1.assert_async().await;
+        m2.assert_async().await;
+    }
+
+    /// Scenario 5. An overload 503 on the FIRST request holds no token, so there is
+    /// nothing to resume: terminal, one call, and the node's text reaches the terminal
+    /// sanitized and length-capped rather than verbatim.
+    #[tokio::test]
+    async fn test_cmd_get_first_request_overload_503_is_terminal_and_sanitized() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+
+        let m1 = server
+            .mock("GET", "/ipfs/bafkreioverload")
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_header("retry-after", "0")
+            .with_body(format!(
+                r#"{{"error":"overloaded","message":"{}"}}"#,
+                hostile_msg()
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+        let m2 = server
+            .mock("GET", mockito::Matcher::Regex("scan=".to_string()))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let err = cmd_get("bafkreioverload".to_string(), server.url(), None)
+            .await
+            .expect_err("a first-request overload must be an error");
+        let told = told(&err);
+
+        assert!(
+            !has_control_or_bidi(&told),
+            "node text must be sanitized before it reaches the terminal, got: {told:?}"
+        );
+        assert!(
+            told.chars().count() < 600,
+            "node text must be length-capped, got {} chars",
+            told.chars().count()
+        );
+        assert!(
+            told.contains("503"),
+            "the terminal must name the status, got: {told}"
+        );
+
+        m1.assert_async().await;
+        m2.assert_async().await;
+    }
+
+    /// Scenario 6. The resumed request is signed like the first one, and the signature
+    /// covers the query: the token joins the path binding before signing, so the mock
+    /// matching both the `scan=` query and the RFC 9421 headers is the one served.
+    #[tokio::test]
+    async fn test_cmd_get_resumed_request_is_signed() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+        let keystore = seed_keystore();
+        let t = make_token("t1");
+
+        let m1 = server
+            .mock("GET", "/ipfs/bafkreisigned")
+            .match_header("signature", mockito::Matcher::Any)
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_header("retry-after", "0")
+            .with_body(incomplete_body(Some(&t), "scan truncated"))
+            .expect(1)
+            .create_async()
+            .await;
+        let m2 = server
+            .mock("GET", "/ipfs/bafkreisigned")
+            .match_query(mockito::Matcher::Exact(format!("scan={t}")))
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_body("object bytes")
+            .expect(1)
+            .create_async()
+            .await;
+
+        cmd_get(
+            "bafkreisigned".to_string(),
+            server.url(),
+            Some(keystore.path().to_path_buf()),
+        )
+        .await
+        .expect("the resumed request must be signed and served");
+
+        m1.assert_async().await;
+        m2.assert_async().await;
+    }
+
+    /// Scenario 7. An oversized, hostile `search_incomplete` body still terminates
+    /// cleanly: the surfaced message is capped and free of control and bidi characters.
+    #[tokio::test]
+    async fn test_cmd_get_hostile_incomplete_body_is_capped_and_sanitized() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+
+        let m = server
+            .mock("GET", "/ipfs/bafkreihostilebody")
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_body(incomplete_body(None, &hostile_msg()))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = cmd_get("bafkreihostilebody".to_string(), server.url(), None)
+            .await
+            .expect_err("a hostile truncation body must still be an error");
+        let told = told(&err);
+
+        assert!(
+            !has_control_or_bidi(&told),
+            "node text must be sanitized before it reaches the terminal, got: {told:?}"
+        );
+        assert!(
+            told.chars().count() < 600,
+            "node text must be length-capped, got {} chars",
+            told.chars().count()
+        );
+
+        m.assert_async().await;
+    }
+
+    /// Scenario 8. A continuation the node chose but that fails validation (`#`, a
+    /// newline, `&`) never enters the signed path: terminal exactly like a missing
+    /// token, no second request, and the rejected token is never echoed into the
+    /// message (the bound is named instead).
+    #[tokio::test]
+    async fn test_cmd_get_hostile_continuation_token_is_rejected() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+
+        let m1 = server
+            .mock("GET", "/ipfs/bafkreihostiletoken")
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"error":"search_incomplete","message":"{}","continuation":"abc#\ndef&ghi"}}"#,
+                hostile_msg()
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+        let m2 = server
+            .mock("GET", mockito::Matcher::Regex("scan=".to_string()))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let err = cmd_get("bafkreihostiletoken".to_string(), server.url(), None)
+            .await
+            .expect_err("a malformed continuation must be terminal");
+        let told = told(&err);
+
+        assert!(
+            !told.contains("abc#") && !told.contains("def&ghi"),
+            "a rejected token must never be echoed into the message, got: {told}"
+        );
+        assert!(
+            !has_control_or_bidi(&told),
+            "node text must be sanitized before it reaches the terminal, got: {told:?}"
+        );
+        assert!(
+            told.chars().count() < 600,
+            "node text must be length-capped, got {} chars",
+            told.chars().count()
+        );
+
+        m1.assert_async().await;
+        m2.assert_async().await;
+    }
+
+    /// Scenario 9. A mid-ladder 429 is terminal: the fanout limiter's window is an
+    /// hour, so its Retry-After cannot be honored inside one invocation. The message
+    /// names rate limiting (not truncation), is sanitized and capped, and the token
+    /// still held comes back with the invocation that resumes from it.
+    #[tokio::test]
+    async fn test_cmd_get_mid_ladder_429_is_terminal_and_surfaces_token() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+        let t = make_token("t1");
+
+        let m1 = server
+            .mock("GET", "/ipfs/bafkreithrottled")
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_header("retry-after", "0")
+            .with_body(incomplete_body(Some(&t), "scan truncated"))
+            .expect(1)
+            .create_async()
+            .await;
+        let m2 = server
+            .mock("GET", "/ipfs/bafkreithrottled")
+            .match_query(mockito::Matcher::Exact(format!("scan={t}")))
+            .with_status(429)
+            .with_header("content-type", "application/json")
+            .with_header("retry-after", "3600")
+            .with_body(format!(
+                r#"{{"error":"rate_limited","message":"{}"}}"#,
+                hostile_msg()
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = cmd_get("bafkreithrottled".to_string(), server.url(), None)
+            .await
+            .expect_err("a mid-ladder 429 must be an error");
+        let told = told(&err);
+
+        assert!(
+            told.to_lowercase().contains("rate limit"),
+            "the terminal must name rate limiting, distinct from the truncation wording, got: {told}"
+        );
+        assert!(
+            !has_control_or_bidi(&told),
+            "node text must be sanitized before it reaches the terminal, got: {told:?}"
+        );
+        assert!(
+            told.chars().count() < 600,
+            "node text must be length-capped, got {} chars",
+            told.chars().count()
+        );
+        assert!(
+            told.contains(&t) && told.contains(&format!("--scan {t}")),
+            "the still-held continuation and its resuming invocation must be surfaced, got: {told}"
+        );
+
+        m1.assert_async().await;
+        m2.assert_async().await;
+    }
+
+    /// Scenario 10. A mid-ladder overload 503 (no `search_incomplete` code, token still
+    /// held) is retried, not terminal: its three sources are transient, the node itself
+    /// says to retry shortly, and nothing accumulates per IP on that path. The ladder
+    /// continues on the same token and completes in three calls.
+    #[tokio::test]
+    async fn test_cmd_get_mid_ladder_overload_503_is_retried() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+        let t = make_token("t1");
+
+        let m1 = server
+            .mock("GET", "/ipfs/bafkreimidoverload")
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_header("retry-after", "0")
+            .with_body(incomplete_body(Some(&t), "scan truncated"))
+            .expect(1)
+            .create_async()
+            .await;
+        // Both of the next two match `scan=T`; mockito serves the first one that still
+        // has hits outstanding, so registration order sequences the overload then the
+        // success.
+        let m2 = server
+            .mock("GET", "/ipfs/bafkreimidoverload")
+            .match_query(mockito::Matcher::Exact(format!("scan={t}")))
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_header("retry-after", "0")
+            .with_body(r#"{"error":"overloaded","message":"busy, retry shortly"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let m3 = server
+            .mock("GET", "/ipfs/bafkreimidoverload")
+            .match_query(mockito::Matcher::Exact(format!("scan={t}")))
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_body("object bytes")
+            .expect(1)
+            .create_async()
+            .await;
+
+        cmd_get("bafkreimidoverload".to_string(), server.url(), None)
+            .await
+            .expect("a mid-ladder overload must be retried on the held token, not terminal");
+
+        m1.assert_async().await;
+        m2.assert_async().await;
+        m3.assert_async().await;
+    }
+
+    /// Scenario 11. The wall-clock deadline bounds the whole loop, and it bounds each
+    /// request's own timeout, so the composed worst case is the deadline plus one
+    /// clamped wait. Injected through the seam because the shipped 60s is unreachable
+    /// under the 5s clamp and 8 resumes.
+    #[tokio::test]
+    async fn test_cmd_get_resume_ladder_stops_at_wall_clock_deadline() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let last = Arc::new(Mutex::new(String::new()));
+        let c = calls.clone();
+        let l = last.clone();
+
+        let m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_header("retry-after", "1")
+            .with_body_from_request(move |req| {
+                c.fetch_add(1, Ordering::SeqCst);
+                let next = next_token(scan_of(req.path_and_query()).as_deref());
+                *l.lock().unwrap() = next.clone();
+                incomplete_body(Some(&next), "scan truncated").into_bytes()
+            })
+            .expect_at_least(2)
+            .create_async()
+            .await;
+
+        let started = Instant::now();
+        let err = cmd_get_inner(
+            "bafkreideadline".to_string(),
+            server.url(),
+            None,
+            None,
+            Duration::from_millis(2500),
+            MAX_SCAN_RESUMES,
+        )
+        .await
+        .expect_err("a ladder that outruns the deadline must end in an error");
+        let elapsed = started.elapsed();
+        let told = told(&err);
+        let held = last.lock().unwrap().clone();
+
+        assert!(
+            told.to_lowercase().contains("deadline"),
+            "the give-up must name the deadline, not the cap, got: {told}"
+        );
+        let calls = calls.load(Ordering::SeqCst);
+        assert!(
+            (2..9).contains(&calls),
+            "the deadline must stop the ladder before the cap, made {calls} calls"
+        );
+        assert!(
+            elapsed < Duration::from_secs(9),
+            "composed worst case is the 2.5s deadline plus one 5s clamped wait, took {elapsed:?}"
+        );
+        assert!(
+            told.contains(&held) && told.contains(&format!("--scan {held}")),
+            "the still-held continuation and its resuming invocation must be surfaced, got: {told}"
+        );
+
+        m.assert_async().await;
+    }
+
+    /// Scenario 12, lower half of the boundary pair: a 2048-character token is inside
+    /// the accepted bound and is resumed with.
+    #[tokio::test]
+    async fn test_cmd_get_accepts_2048_char_continuation() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+        let t = token_of_len("t1", 2048);
+
+        let m1 = server
+            .mock("GET", "/ipfs/bafkreibound")
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_header("retry-after", "0")
+            .with_body(incomplete_body(Some(&t), "scan truncated"))
+            .expect(1)
+            .create_async()
+            .await;
+        let m2 = server
+            .mock("GET", "/ipfs/bafkreibound")
+            .match_query(mockito::Matcher::Exact(format!("scan={t}")))
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_body("object bytes")
+            .expect(1)
+            .create_async()
+            .await;
+
+        cmd_get("bafkreibound".to_string(), server.url(), None)
+            .await
+            .expect("a 2048-character token is within the bound and must be resumed with");
+
+        m1.assert_async().await;
+        m2.assert_async().await;
+    }
+
+    /// Scenario 12, upper half: one character past the bound is rejected, terminal
+    /// exactly like a missing token, and never echoed back.
+    #[tokio::test]
+    async fn test_cmd_get_rejects_2049_char_continuation() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+        let t = token_of_len("t1", 2049);
+
+        let m1 = server
+            .mock("GET", "/ipfs/bafkreioverbound")
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_body(incomplete_body(Some(&t), "scan truncated"))
+            .expect(1)
+            .create_async()
+            .await;
+        let m2 = server
+            .mock("GET", mockito::Matcher::Regex("scan=".to_string()))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let err = cmd_get("bafkreioverbound".to_string(), server.url(), None)
+            .await
+            .expect_err("an over-bound token must be terminal");
+        let told = told(&err);
+
+        assert!(
+            !told.contains(&t),
+            "a rejected token must never be echoed into the message, got: {told}"
+        );
+        assert!(
+            told.chars().count() < 600,
+            "node text must be length-capped, got {} chars",
+            told.chars().count()
+        );
+
+        m1.assert_async().await;
+        m2.assert_async().await;
+    }
+
+    /// Scenario 13. A caller-supplied continuation is a resume INPUT: the very first
+    /// request carries `?scan=<token>`, so an invocation picked up from a previous
+    /// terminal starts where that one stopped instead of walking from row 0 again.
+    #[tokio::test]
+    async fn test_cmd_get_caller_supplied_continuation_starts_from_token() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+        let t = make_token("t7");
+
+        let front = server
+            .mock("GET", "/ipfs/bafkreisupplied")
+            .expect(0)
+            .create_async()
+            .await;
+        let resumed = server
+            .mock("GET", "/ipfs/bafkreisupplied")
+            .match_query(mockito::Matcher::Exact(format!("scan={t}")))
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_body("object bytes")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let res = cmd_get_inner(
+            "bafkreisupplied".to_string(),
+            server.url(),
+            None,
+            Some(t.clone()),
+            SCAN_DEADLINE,
+            MAX_SCAN_RESUMES,
+        )
+        .await;
+
+        front.assert_async().await;
+        resumed.assert_async().await;
+        res.expect("a supplied continuation must be used, not ignored");
     }
 
     /// #173 review (F1): a base64 CID (multibase prefix 'm') can contain '/', '+',
