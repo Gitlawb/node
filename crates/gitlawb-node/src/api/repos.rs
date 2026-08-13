@@ -858,6 +858,7 @@ struct EncryptTaskCtx {
     owner_did: String,
     repo_name: String,
     irys_url: String,
+    bundler_account: String,
     http_client: Arc<reqwest::Client>,
     node_did: String,
     node_keypair: Arc<gitlawb_core::identity::Keypair>,
@@ -1492,6 +1493,7 @@ async fn pin_and_encrypt_objects(
                 match crate::arweave::anchor_encrypted_manifest(
                     &ctx.http_client,
                     &ctx.irys_url,
+                    &ctx.bundler_account,
                     &manifest,
                     &ctx.node_keypair,
                 )
@@ -2609,7 +2611,8 @@ async fn post_receive_replication_tail(
             repo_id: record.id.clone(),
             owner_did: record.owner_did.clone(),
             repo_name: record.name.clone(),
-            irys_url: state.config.irys_url.clone(),
+            irys_url: state.config.bundler_url.clone(),
+            bundler_account: state.config.bundler_account.clone(),
             http_client: std::sync::Arc::clone(&state.http_client),
             node_did: state.node_did.to_string(),
             node_keypair: std::sync::Arc::clone(&state.node_keypair),
@@ -2667,6 +2670,7 @@ async fn post_receive_replication_tail(
         let db_for_peers = state.db.clone();
         let ref_update_tx = state.ref_update_tx.clone();
         let bundler_url = state.config.bundler_url.clone();
+        let bundler_account = state.config.bundler_account.clone();
         let owner_did_for_arweave = record.owner_did.clone();
         let self_public_url = state.config.public_url.clone();
         let node_keypair = Arc::clone(&state.node_keypair);
@@ -2850,6 +2854,7 @@ async fn post_receive_replication_tail(
                     match crate::arweave::anchor_ref_update(
                         &http_client,
                         &bundler_url,
+                        &bundler_account,
                         &anchor,
                         &node_keypair,
                     )
@@ -2875,7 +2880,19 @@ async fn post_receive_replication_tail(
                         }
                         Ok(_) => {}
                         Err(e) => {
-                            tracing::warn!(repo=%repo_slug, err=%e, "Arweave anchor failed")
+                            // A push must never fail over anchoring, but a
+                            // failure here is permanent data loss: the anchor
+                            // is never written. Name the two common causes
+                            // (unfunded bundler account, config only checks it
+                            // at boot) so operators can tell them apart.
+                            tracing::warn!(
+                                repo=%repo_slug,
+                                bundler_account=%bundler_account,
+                                err=%e,
+                                "Arweave anchor failed — if the bundler reports 'Not enough \
+                                 balance', fund GITLAWB_BUNDLER_ACCOUNT; an unfunded node \
+                                 silently loses every anchor"
+                            )
                         }
                     }
                 }
@@ -7902,6 +7919,7 @@ mod tests {
             owner_did: rec.owner_did.clone(),
             repo_name: rec.name.clone(),
             irys_url: String::new(),
+            bundler_account: String::new(),
             http_client: std::sync::Arc::clone(&state.http_client),
             node_did: state.node_did.to_string(),
             node_keypair: std::sync::Arc::clone(&state.node_keypair),

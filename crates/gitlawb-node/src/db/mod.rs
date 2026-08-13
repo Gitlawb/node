@@ -554,10 +554,7 @@ const MIGRATIONS: &[Migration] = &[
                 pusher_did  TEXT NOT NULL,
                 node_did    TEXT NOT NULL,
                 signature   TEXT NOT NULL,
-                issued_at   TEXT NOT NULL,
-                seq         BIGINT NOT NULL DEFAULT 1,
-                prev        TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000',
-                pusher_sig  TEXT
+                issued_at   TEXT NOT NULL
             )"#,
             "CREATE INDEX IF NOT EXISTS idx_ref_certs_repo ON ref_certificates(repo_id)",
             r#"CREATE TABLE IF NOT EXISTS peers (
@@ -669,16 +666,17 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_agent_tasks_repo      ON agent_tasks(repo_id)",
             // ── Arweave permanent anchors ────────────────────────────────────
             r#"CREATE TABLE IF NOT EXISTS arweave_anchors (
-                id              TEXT NOT NULL PRIMARY KEY,
-                repo            TEXT NOT NULL,
-                owner_did       TEXT NOT NULL,
-                ref_name        TEXT NOT NULL,
-                old_sha         TEXT NOT NULL,
-                new_sha         TEXT NOT NULL,
-                cid             TEXT,
-                arweave_tx_id   TEXT NOT NULL,
-                node_did        TEXT NOT NULL,
-                anchored_at     TEXT NOT NULL
+                id          TEXT NOT NULL PRIMARY KEY,
+                repo        TEXT NOT NULL,
+                owner_did   TEXT NOT NULL,
+                ref_name    TEXT NOT NULL,
+                old_sha     TEXT NOT NULL,
+                new_sha     TEXT NOT NULL,
+                cid         TEXT,
+                irys_tx_id  TEXT NOT NULL,
+                arweave_url TEXT NOT NULL,
+                node_did    TEXT NOT NULL,
+                anchored_at TEXT NOT NULL
             )"#,
             "CREATE INDEX IF NOT EXISTS idx_arweave_anchors_repo    ON arweave_anchors(repo)",
             "CREATE INDEX IF NOT EXISTS idx_arweave_anchors_new_sha ON arweave_anchors(new_sha)",
@@ -8892,5 +8890,147 @@ mod cid_candidate_order_tests {
             after, sorted,
             "the order must be a stated one (ascending oid), not whatever the heap holds"
         );
+/// The released v1 migration is immutable: every deployment that already ran it
+/// keeps the ORIGINAL column layout, and later migrations (v18+) do the column
+/// adds and renames against that layout. This test replays that exact upgrade —
+/// create the byte-identical released v1 schema, mark v1 applied, run the real
+/// migration chain — and proves a certificate and an anchor written with the new
+/// columns survive it.
+#[cfg(test)]
+mod upgrade_path_tests {
+    use super::{Db, RecordAnchorInputV2, RefCertificate, MIGRATIONS};
+    use sqlx::{PgPool, Row};
+
+    #[sqlx::test]
+    async fn upgrading_released_v1_schema_lands_cert_and_anchor_columns(pool: PgPool) {
+        let v1 = &MIGRATIONS[0];
+        assert_eq!(v1.version, 1, "test must target the released v1 migration");
+
+        // Bootstrap schema_migrations (the real migrate() creates it, but we
+        // replay v1 by hand to reproduce a deployed v1 database exactly).
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS schema_migrations (
+                version    BIGINT  NOT NULL PRIMARY KEY,
+                name       TEXT    NOT NULL,
+                applied_at TEXT    NOT NULL
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Replay the released v1 schema, then record v1 as applied so the
+        // chain below picks up at v2 — exactly what a deployed node does.
+        for stmt in v1.stmts {
+            sqlx::query(stmt).execute(&pool).await.unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (1, $1, now())",
+        )
+        .bind(v1.name)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The released v1 layout must not yet carry the post-v1 columns; this
+        // assertion is what makes the test bite — it fails if v1 is ever edited
+        // to pre-add them, exactly the regression the immutability rule bans.
+        for (table, column) in [
+            ("ref_certificates", "seq"),
+            ("ref_certificates", "pusher_sig"),
+            ("arweave_anchors", "arweave_tx_id"),
+            ("arweave_anchors", "cert_id"),
+        ] {
+            let exists: bool = sqlx::query(
+                "SELECT EXISTS(
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = $1 AND column_name = $2
+                ) AS present",
+            )
+            .bind(table)
+            .bind(column)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("present");
+            assert!(!exists, "released v1 must not contain {table}.{column}");
+        }
+
+        // Run the real migration chain v2..=v20 against the old layout.
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+
+        // The post-v1 columns must now exist...
+        for (table, column) in [
+            ("ref_certificates", "seq"),
+            ("ref_certificates", "prev"),
+            ("ref_certificates", "pusher_sig"),
+            ("ref_certificates", "signature_input"),
+            ("ref_certificates", "content_digest"),
+            ("ref_certificates", "request_path"),
+            ("arweave_anchors", "arweave_tx_id"),
+            ("arweave_anchors", "cert_id"),
+        ] {
+            let exists: bool = sqlx::query(
+                "SELECT EXISTS(
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = $1 AND column_name = $2
+                ) AS present",
+            )
+            .bind(table)
+            .bind(column)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("present");
+            assert!(exists, "upgraded schema must contain {table}.{column}");
+        }
+
+        // ...and a full certificate (chain + pusher-proof columns) plus an
+        // anchor written through the code paths must round-trip.
+        let cert = RefCertificate {
+            id: "cert-upgrade-1".to_string(),
+            repo_id: "repo-uuid".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            old_sha: "0".repeat(40),
+            new_sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".into(),
+            pusher_did: "did:key:zPusher".to_string(),
+            node_did: "did:key:zNode".to_string(),
+            signature: "sig".to_string(),
+            issued_at: "2026-07-22T00:00:00+00:00".to_string(),
+            seq: 7,
+            prev: "0".repeat(64),
+            pusher_sig: Some("sig1=:abc:".to_string()),
+            signature_input: Some(r#"("content-digest" "http://example.com/repo.git/git-receive-pack"; created=…; keyid="did:key:zPusher")"#.to_string()),
+            content_digest: Some("sha-256=:abc:".to_string()),
+            request_path: Some("/repo-uuid.git/git-receive-pack".to_string()),
+        };
+        db.insert_ref_certificate(&cert).await.unwrap();
+        let got = db
+            .get_cert_by_seq("repo-uuid", 7)
+            .await
+            .unwrap()
+            .expect("cert readable");
+        assert_eq!(got.pusher_sig.as_deref(), Some("sig1=:abc:"));
+
+        db.record_arweave_anchor(&RecordAnchorInputV2 {
+            repo: "alice/myrepo",
+            owner_did: "did:key:zOWNER",
+            ref_name: "refs/heads/main",
+            old_sha: &"0".repeat(40),
+            new_sha: &"1".repeat(40),
+            cid: Some("bafyreib5..."),
+            arweave_tx_id: "upgrade-tx-id",
+            node_did: "did:key:zNODE",
+            cert_id: Some("cert-upgrade-1".to_string()),
+        })
+        .await
+        .unwrap();
+        let anchors = db
+            .list_arweave_anchors(Some("alice/myrepo"), 10)
+            .await
+            .unwrap();
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].arweave_tx_id, "upgrade-tx-id");
     }
 }

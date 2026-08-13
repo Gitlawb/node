@@ -595,28 +595,65 @@ pub(crate) async fn stats(State(state): State<AppState>) -> Json<serde_json::Val
     }))
 }
 
-/// Mask a URL that might contain embedded credentials by stripping the userinfo
-/// component: `https://user:pass@host/path` → `https://host/path`. URLs without
-/// credentials are returned unchanged.
+/// Mask a URL before it is shown to API callers or written to logs: drop
+/// userinfo, query, and fragment so embedded credentials (`user:pass@`,
+/// `?token=...`, `#token=...`) cannot leak. The scheme, host, port, and path
+/// are preserved so a configured path prefix still routes correctly. Use the
+/// raw value only on the outbound client.
+///
+/// Scheme-less inputs (e.g. a bare `arweave.net`) cannot be parsed as URLs and
+/// fall back to a string-level userinfo strip plus query/fragment cut.
 pub(crate) fn mask_credential_url(url: &str) -> String {
-    let scheme_end = match url.find("://") {
+    match reqwest::Url::parse(url) {
+        Ok(parsed) if !parsed.cannot_be_a_base() => {
+            let needs_masking = !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some();
+            if !needs_masking {
+                return url.to_string();
+            }
+            let had_empty_path = !url.ends_with('/');
+            let mut clean = parsed;
+            let _ = clean.set_username("");
+            let _ = clean.set_password(None);
+            clean.set_query(None);
+            clean.set_fragment(None);
+            let mut masked = clean.to_string();
+            // The url crate serializes an empty path with a trailing '/';
+            // drop it so a bare-origin config masks to the same bare origin.
+            if had_empty_path && masked.ends_with('/') {
+                masked.pop();
+            }
+            masked
+        }
+        _ => mask_credential_url_fallback(url),
+    }
+}
+
+fn mask_credential_url_fallback(url: &str) -> String {
+    // Strip any query/fragment up front — the string may carry credentials
+    // even without a parseable scheme.
+    let end = url.find(['?', '#']).unwrap_or(url.len());
+    let without_query = &url[..end];
+    let scheme_end = match without_query.find("://") {
         Some(pos) => pos + 3,
         None => 0,
     };
-    let authority_end = url[scheme_end..]
+    let authority_end = without_query[scheme_end..]
         .find('/')
         .map(|p| scheme_end + p)
-        .unwrap_or(url.len());
-    let authority = &url[scheme_end..authority_end];
+        .unwrap_or(without_query.len());
+    let authority = &without_query[scheme_end..authority_end];
     if let Some(at) = authority.rfind('@') {
         format!(
             "{}{}{}",
-            &url[..scheme_end],
+            &without_query[..scheme_end],
             &authority[at + 1..],
-            &url[authority_end..]
+            &without_query[authority_end..]
         )
     } else {
-        url.to_string()
+        without_query.to_string()
     }
 }
 
@@ -680,6 +717,37 @@ mod tests {
         assert_eq!(
             mask_credential_url("https://u:p@host:9443/gateway"),
             "https://host:9443/gateway"
+        );
+    }
+
+    #[test]
+    fn drops_query_and_fragment_credentials() {
+        // Query tokens must not survive into public URLs, logs, or status
+        // responses — with or without userinfo and a path prefix.
+        assert_eq!(
+            mask_credential_url("https://gateway.example/data?token=SECRET"),
+            "https://gateway.example/data"
+        );
+        assert_eq!(
+            mask_credential_url("https://gateway.example/data?token=SECRET#frag"),
+            "https://gateway.example/data"
+        );
+        assert_eq!(
+            mask_credential_url("https://user:token@gateway.example/data?token=SECRET#frag"),
+            "https://gateway.example/data"
+        );
+        assert_eq!(
+            mask_credential_url("https://u:p@host:9443/gateway?token=SECRET"),
+            "https://host:9443/gateway"
+        );
+        assert_eq!(
+            mask_credential_url("https://host:9443/gateway#token=SECRET"),
+            "https://host:9443/gateway"
+        );
+        // Scheme-less configs still get the query cut.
+        assert_eq!(
+            mask_credential_url("gateway.example/data?token=SECRET"),
+            "gateway.example/data"
         );
     }
 

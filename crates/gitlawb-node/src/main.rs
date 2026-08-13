@@ -121,7 +121,7 @@ async fn main() -> Result<()> {
         config.arweave_gateway = config.bundler_url.clone();
         tracing::warn!(
             "GITLAWB_ARWEAVE_GATEWAY unset — inferred from bundler URL as {}",
-            config.arweave_gateway
+            crate::server::mask_credential_url(&config.arweave_gateway)
         );
     }
 
@@ -135,6 +135,15 @@ async fn main() -> Result<()> {
     config
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid configuration: {e}"))?;
+
+    if !config.bundler_url.is_empty() {
+        tracing::info!(
+            bundler_url = %crate::server::mask_credential_url(&config.bundler_url),
+            bundler_account = %config.bundler_account,
+            "arweave anchoring enabled; uploads billed to the funded bundler account \
+             (the node's ANS-104 signature is authorship, not payment)"
+        );
+    }
 
     if !config.public_read {
         warn!(

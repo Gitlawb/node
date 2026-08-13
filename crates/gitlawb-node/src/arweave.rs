@@ -7,13 +7,18 @@
 //!
 //! Uploads are signed ANS-104 data items (see [`crate::ans104`]): the node
 //! signs the item with its own keypair and embeds the metadata as item tags, so
-//! no separate wallet or upload credential is needed — the signature is the
-//! authentication the bundler enforces. Irys allows free uploads for data
-//! < 100 KiB on both devnet and mainnet (via Turbo).
+//! the item is verifiably authored by this node. That signature is NOT payment:
+//! the bundler only serves items backed by a funded account, and refuses
+//! under-funded uploads with "Not enough balance" — which the push path degrades
+//! to a warning, so an unfunded node silently loses every anchor. Funding is
+//! therefore mandatory configuration, not optional: set `GITLAWB_BUNDLER_ACCOUNT`
+//! to the funded account you created for this node (top up via the bundler's
+//! devnet faucet on devnet hosts); `Config::validate()` refuses to start with a
+//! bundler URL but no funded account.
 //!
 //! Set `GITLAWB_BUNDLER_URL` (deprecated name: `GITLAWB_IRYS_URL`) to override the default endpoint:
-//!   - devnet (free, no cost): https://devnet.irys.xyz
-//!   - mainnet:                https://node2.irys.xyz
+//!   - devnet (faucet-funded):  https://devnet.irys.xyz
+//!   - mainnet:                 https://node2.irys.xyz
 //!
 //! Configure `GITLAWB_ARWEAVE_GATEWAY` to override the gateway used for resolving anchors
 //! (defaults to https://arweave.net).
@@ -60,6 +65,7 @@ pub struct RefAnchor {
 pub async fn anchor_ref_update(
     client: &reqwest::Client,
     bundler_url: &str,
+    bundler_account: &str,
     anchor: &RefAnchor,
     node_keypair: &gitlawb_core::identity::Keypair,
 ) -> Result<String> {
@@ -111,6 +117,7 @@ pub async fn anchor_ref_update(
     let resp = client
         .post(&url)
         .header("Content-Type", "application/octet-stream")
+        .header("x-bundler-address", bundler_account)
         .body(data_item)
         .send()
         .await
@@ -138,6 +145,7 @@ pub async fn anchor_ref_update(
         ref_name = %anchor.ref_name,
         new_sha = %anchor.new_sha,
         tx_id = %tx_id,
+        bundler_account = %bundler_account,
         "anchored ref update to Arweave via bundler"
     );
 
@@ -170,6 +178,7 @@ pub struct EncryptedManifest<'a> {
 pub async fn anchor_encrypted_manifest(
     client: &reqwest::Client,
     bundler_url: &str,
+    bundler_account: &str,
     manifest: &EncryptedManifest<'_>,
     node_keypair: &gitlawb_core::identity::Keypair,
 ) -> Result<String> {
@@ -214,6 +223,7 @@ pub async fn anchor_encrypted_manifest(
     let resp = client
         .post(&url)
         .header("Content-Type", "application/octet-stream")
+        .header("x-bundler-address", bundler_account)
         .body(data_item)
         .send()
         .await
@@ -239,6 +249,7 @@ pub async fn anchor_encrypted_manifest(
         repo = %manifest.repo,
         tx_id = %tx_id,
         blobs = manifest.blobs.len(),
+        bundler_account = %bundler_account,
         "anchored encrypted manifest to Arweave via bundler"
     );
 
@@ -293,15 +304,24 @@ pub async fn verify_anchor(
     // Fetch the data item from the Arweave gateway's data path.
     // Gateways serve data at /{tx_id}, not /v1/tx/{id} (which is the bundler API).
     let url = format!("{}/{}", gateway_url.trim_end_matches('/'), tx_id);
+    // Public-facing display form of the same URL: reqwest's connection error
+    // embeds the request URL verbatim, so if the gateway config carries
+    // credentials the error text would otherwise leak them into VerifyResult.
+    let display_url = format!(
+        "{}/{}",
+        crate::server::mask_credential_url(gateway_url).trim_end_matches('/'),
+        tx_id
+    );
     let resp = match client.get(&url).send().await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("Arweave gateway connection failed: {e}");
+            let safe_err = e.to_string().replace(&url, &display_url);
+            tracing::warn!("Arweave gateway connection failed: {safe_err}");
             return Ok(VerifyResult {
                 valid: false,
                 anchor: serde_json::Value::Null,
                 certificate: None,
-                errors: vec![format!("Arweave gateway connection failed: {e}")],
+                errors: vec![format!("Arweave gateway connection failed: {safe_err}")],
             });
         }
     };
@@ -437,6 +457,12 @@ pub async fn verify_anchor(
         //    identity fields must agree with what it recorded.
         let outer_repo = anchor.get("repo").and_then(|v| v.as_str());
         let outer_owner = anchor.get("owner_did").and_then(|v| v.as_str());
+        // Fail closed: when the outer identity fields are present, a lookup
+        // that cannot complete (repo missing or DB error) must not silently
+        // skip corroboration. Otherwise a forger could echo attacker-chosen
+        // identities next to a valid:true verdict simply because the node has
+        // no record — or the DB is down — to check them against.
+        let outer_identity_present = outer_repo.is_some() || outer_owner.is_some();
         match db.get_repo_by_id(&c.repo_id).await {
             Ok(Some(record)) => {
                 let expected_repo = format!(
@@ -461,13 +487,27 @@ pub async fn verify_anchor(
                 }
             }
             Ok(None) => {
-                tracing::warn!(
-                    repo_id = %c.repo_id,
-                    "cannot corroborate anchor repo/owner_did — repo_id not found in node database"
-                );
+                if outer_identity_present {
+                    errors.push(format!(
+                        "anchor outer repo/owner_did present but repo_id {} not found in node database — outer identity cannot be corroborated",
+                        c.repo_id
+                    ));
+                } else {
+                    tracing::warn!(
+                        repo_id = %c.repo_id,
+                        "cannot corroborate anchor repo/owner_did — repo_id not found in node database"
+                    );
+                }
             }
             Err(e) => {
-                tracing::warn!("repo lookup failed for {}: {e}", c.repo_id);
+                if outer_identity_present {
+                    errors.push(format!(
+                        "repo lookup failed for {} — outer repo/owner_did cannot be corroborated: {e}",
+                        c.repo_id
+                    ));
+                } else {
+                    tracing::warn!("repo lookup failed for {}: {e}", c.repo_id);
+                }
             }
         }
 
@@ -827,6 +867,7 @@ mod tests {
     /// functions); success returns `{"id": <tx_id>}`.
     async fn spawn_enforcing_bundler(
         kp: &Keypair,
+        expected_bundler_account: &'static str,
         expected_tags: &[(&str, &str)],
         validate: impl Fn(&serde_json::Value) -> bool + Send + Sync + Clone + 'static,
         tx_id: &'static str,
@@ -840,45 +881,64 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let router = axum::Router::new().route(
             "/v1/tx",
-            axum::routing::post(move |body: axum::body::Bytes| {
-                let vk = vk;
-                let expected = expected.clone();
-                async move {
-                    let parsed = match crate::ans104::verify_data_item(&vk, &body) {
-                        Ok(p) => p,
-                        Err(e) => {
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let vk = vk;
+                    let expected = expected.clone();
+                    async move {
+                        // The funded-account identity must be part of the request,
+                        // not just the config: the item signature is authorship.
+                        if !expected_bundler_account.is_empty() {
+                            let got = headers
+                                .get("x-bundler-address")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or_default();
+                            if got != expected_bundler_account {
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    format!(
+                                        "missing/wrong x-bundler-address: got {got:?}, want \
+                                     {expected_bundler_account:?}"
+                                    ),
+                                );
+                            }
+                        }
+                        let parsed = match crate::ans104::verify_data_item(&vk, &body) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    format!("unsigned/invalid item: {e}"),
+                                );
+                            }
+                        };
+                        for (name, value) in &expected {
+                            if !parsed.tags.iter().any(|(tn, tv)| tn == name && tv == value) {
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    format!("missing signed tag {name}:{value}"),
+                                );
+                            }
+                        }
+                        let json: serde_json::Value = match serde_json::from_slice(&parsed.data) {
+                            Ok(j) => j,
+                            Err(e) => {
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    format!("item data is not JSON: {e}"),
+                                );
+                            }
+                        };
+                        if !validate(&json) {
                             return (
                                 StatusCode::BAD_REQUEST,
-                                format!("unsigned/invalid item: {e}"),
+                                "payload validation failed".to_string(),
                             );
                         }
-                    };
-                    for (name, value) in &expected {
-                        if !parsed.tags.iter().any(|(tn, tv)| tn == name && tv == value) {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                format!("missing signed tag {name}:{value}"),
-                            );
-                        }
+                        (StatusCode::OK, format!(r#"{{"id":"{tx_id}"}}"#))
                     }
-                    let json: serde_json::Value = match serde_json::from_slice(&parsed.data) {
-                        Ok(j) => j,
-                        Err(e) => {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                format!("item data is not JSON: {e}"),
-                            );
-                        }
-                    };
-                    if !validate(&json) {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            "payload validation failed".to_string(),
-                        );
-                    }
-                    (StatusCode::OK, format!(r#"{{"id":"{tx_id}"}}"#))
-                }
-            }),
+                },
+            ),
         );
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -902,7 +962,7 @@ mod tests {
             node_did: "did:key:z6MknndwexV9...".into(),
             certificate: None,
         };
-        let result = anchor_ref_update(&client, "", &anchor, &kp).await;
+        let result = anchor_ref_update(&client, "", "", &anchor, &kp).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "");
     }
@@ -912,6 +972,7 @@ mod tests {
         let kp = Keypair::generate();
         let server = spawn_enforcing_bundler(
             &kp,
+            "zBundlerAccount",
             &[
                 ("App-Name", "gitlawb"),
                 ("Schema", "gitlawb/ref-update/v1"),
@@ -936,11 +997,48 @@ mod tests {
             certificate: None,
         };
 
-        let result = anchor_ref_update(&client, &server, &anchor, &kp).await;
+        let result = anchor_ref_update(&client, &server, "zBundlerAccount", &anchor, &kp).await;
         assert!(result.is_ok(), "anchor should succeed: {result:?}");
         assert_eq!(
             result.unwrap(),
             "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuOk"
+        );
+    }
+
+    /// The funded bundler account must ride on the upload request: the item
+    /// signature is authorship, not payment, so an upload that omits the
+    /// account must be refused — it would otherwise be billed to nobody.
+    #[tokio::test]
+    async fn test_anchor_ref_update_rejects_missing_bundler_account() {
+        let kp = Keypair::generate();
+        let client = reqwest::Client::new();
+        let anchor = RefAnchor {
+            repo: "alice/myrepo".into(),
+            repo_id: "repo-uuid".into(),
+            owner_did: "did:key:z6Mk...".into(),
+            ref_name: "refs/heads/main".into(),
+            old_sha: "0".repeat(40),
+            new_sha: "a1b2c3d4".repeat(8),
+            cid: None,
+            timestamp: "2026-03-14T00:00:00Z".into(),
+            node_did: "did:key:z6Mknnd...".into(),
+            certificate: None,
+        };
+
+        let server = spawn_enforcing_bundler(
+            &kp,
+            "zBundlerAccount",
+            &[("App-Name", "gitlawb"), ("Schema", "gitlawb/ref-update/v1")],
+            |_| true,
+            "NEVER_RETURNED",
+        )
+        .await;
+
+        let result = anchor_ref_update(&client, &server, "", &anchor, &kp).await;
+        let err = result.expect_err("missing bundler account must fail the upload");
+        assert!(
+            err.to_string().contains("x-bundler-address"),
+            "error should name the missing account header: {err}"
         );
     }
 
@@ -956,6 +1054,7 @@ mod tests {
         let kp = Keypair::generate();
         let server = spawn_enforcing_bundler(
             &kp,
+            "zBundlerAccount",
             &[("App-Name", "gitlawb")],
             move |j| j["old_sha"] == real_old && j["new_sha"] == real_new,
             "TX_REAL_OLD_SHA",
@@ -976,7 +1075,7 @@ mod tests {
             certificate: None,
         };
 
-        let result = anchor_ref_update(&client, &server, &anchor, &kp).await;
+        let result = anchor_ref_update(&client, &server, "zBundlerAccount", &anchor, &kp).await;
         assert_eq!(result.unwrap(), "TX_REAL_OLD_SHA");
     }
 
@@ -988,6 +1087,7 @@ mod tests {
         let impostor_kp = Keypair::generate();
         let server = spawn_enforcing_bundler(
             &node_kp,
+            "zBundlerAccount",
             &[("App-Name", "gitlawb")],
             |_| true,
             "NEVER_RETURNED",
@@ -1008,7 +1108,8 @@ mod tests {
             certificate: None,
         };
 
-        let result = anchor_ref_update(&client, &server, &anchor, &impostor_kp).await;
+        let result =
+            anchor_ref_update(&client, &server, "zBundlerAccount", &anchor, &impostor_kp).await;
         assert!(
             result.is_err(),
             "upload signed by the wrong key must be denied by the bundler"
@@ -1040,7 +1141,7 @@ mod tests {
             blobs: &blobs,
         };
         assert_eq!(
-            anchor_encrypted_manifest(&client, "", &m, &kp)
+            anchor_encrypted_manifest(&client, "", "", &m, &kp)
                 .await
                 .unwrap(),
             ""
@@ -1061,7 +1162,7 @@ mod tests {
         };
         // Non-empty URL, but no blobs: still a no-op.
         assert_eq!(
-            anchor_encrypted_manifest(&client, "https://example.invalid", &m, &kp)
+            anchor_encrypted_manifest(&client, "https://example.invalid", "", &m, &kp)
                 .await
                 .unwrap(),
             ""
@@ -1073,6 +1174,7 @@ mod tests {
         let kp = Keypair::generate();
         let server = spawn_enforcing_bundler(
             &kp,
+            "zBundlerAccount",
             &[
                 ("App-Name", "gitlawb"),
                 ("Schema", "gitlawb/encrypted-manifest/v1"),
@@ -1094,7 +1196,7 @@ mod tests {
             timestamp: "2026-06-11T00:00:00Z",
             blobs: &blobs,
         };
-        let r = anchor_encrypted_manifest(&client, &server, &m, &kp).await;
+        let r = anchor_encrypted_manifest(&client, &server, "zBundlerAccount", &m, &kp).await;
         assert_eq!(r.unwrap(), "MANIFESTTX123");
     }
 
@@ -1143,6 +1245,36 @@ mod tests {
         let r = result.expect("verify_anchor should return Ok for gateway errors");
         assert!(!r.valid, "non-certificate JSON should be invalid");
         mock.assert_async().await;
+    }
+
+    /// A gateway URL carrying a query token must never surface that token in
+    /// the public VerifyResult error text: reqwest embeds the request URL in
+    /// its connection error, so the error must be rebuilt from the masked URL.
+    #[tokio::test]
+    async fn test_verify_anchor_error_does_not_leak_gateway_query_credentials() {
+        let client = reqwest::Client::new();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
+            .expect("lazy pool creation should not fail");
+        let db = crate::db::Db::for_testing(pool);
+
+        // Port 1 on loopback refuses connections deterministically.
+        let result = verify_anchor(
+            &client,
+            "http://127.0.0.1:1/?token=SECRET",
+            "txid",
+            &db,
+            "did:key:zNODE",
+        )
+        .await;
+
+        let r = result.expect("verify_anchor should return Ok for gateway connection errors");
+        assert!(!r.valid);
+        let err_text = r.errors.join(" ");
+        assert!(
+            !err_text.contains("SECRET"),
+            "gateway query token leaked into VerifyResult: {err_text}"
+        );
     }
 
     #[tokio::test]
@@ -1512,27 +1644,25 @@ mod tests {
     /// A true end-to-end accept: a cert signed by a real node keypair over a
     /// real 13-field payload, with a real RFC 9421 pusher proof, served through
     /// a mock gateway, must verify to `valid: true` with empty errors.
-    #[tokio::test]
-    async fn test_verify_anchor_accepts_authentic_13_field_certificate() {
-        let node_kp = gitlawb_core::identity::Keypair::generate();
-        let node_did = node_kp.did().as_str().to_string();
-        let pusher_kp = gitlawb_core::identity::Keypair::generate();
-        let pusher_did = pusher_kp.did().as_str().to_string();
-
-        let repo_id = "repo-uuid";
-        let ref_name = "refs/heads/main";
-        let old_sha = "0".repeat(40);
-        let new_sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
-        let issued_at = "2026-07-22T00:00:00+00:00";
-        let seq = 1i64;
-        let prev = "0".repeat(64);
-
-        // Build a real RFC 9421 pusher proof over an arbitrary push body.
+    /// Build an authentic 13-field certificate signed by `node_kp` with a real
+    /// RFC 9421 pusher proof from `pusher_kp` — the exact shape a live node
+    /// issues. Shared by the accept and fail-closed corroboration tests.
+    #[allow(clippy::too_many_arguments)]
+    fn authentic_13_field_cert(
+        node_kp: &Keypair,
+        pusher_kp: &Keypair,
+        repo_id: &str,
+        ref_name: &str,
+        old_sha: &str,
+        new_sha: &str,
+        node_did: &str,
+        issued_at: &str,
+        seq: i64,
+        prev: &str,
+    ) -> crate::db::RefCertificate {
         let request_path = "/repo-uuid.git/git-receive-pack";
         let signed =
-            gitlawb_core::http_sig::sign_request(&pusher_kp, "POST", request_path, b"push-body");
-        // The stored pusher_sig is the raw STANDARD base64 of the 64-byte
-        // signature, unwrapped from the `sig1=:...:` header form.
+            gitlawb_core::http_sig::sign_request(pusher_kp, "POST", request_path, b"push-body");
         let pusher_sig = signed
             .signature
             .strip_prefix("sig1=:")
@@ -1540,13 +1670,12 @@ mod tests {
             .unwrap()
             .to_string();
 
-        // Sign the 13-field payload exactly as the node does.
         let payload = serde_json::json!({
             "repo_id": repo_id,
             "ref": ref_name,
             "old": old_sha,
             "new": new_sha,
-            "pusher": pusher_did,
+            "pusher": pusher_kp.did().as_str().to_string(),
             "node": node_did,
             "ts": issued_at,
             "seq": seq,
@@ -1558,25 +1687,77 @@ mod tests {
         });
         let signature = node_kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
 
-        let cert = crate::db::RefCertificate {
+        crate::db::RefCertificate {
             id: "cert-accept-1".to_string(),
             repo_id: repo_id.to_string(),
             ref_name: ref_name.to_string(),
-            old_sha: old_sha.clone(),
+            old_sha: old_sha.to_string(),
             new_sha: new_sha.to_string(),
-            pusher_did,
-            node_did: node_did.clone(),
+            pusher_did: pusher_kp.did().as_str().to_string(),
+            node_did: node_did.to_string(),
             signature,
             issued_at: issued_at.to_string(),
             seq,
-            prev,
+            prev: prev.to_string(),
             pusher_sig: Some(pusher_sig),
             signature_input: Some(signed.signature_input),
             content_digest: Some(signed.content_digest),
             request_path: Some(request_path.to_string()),
-        };
+        }
+    }
 
+    /// Run the current schema on a fresh `#[sqlx::test]` pool so DB-backed
+    /// anchor tests share one seeding path.
+    async fn migrated_db(pool: sqlx::PgPool) -> crate::db::Db {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.expect("migrations should apply");
+        db
+    }
+
+    #[sqlx::test]
+    async fn test_verify_anchor_accepts_authentic_13_field_certificate(pool: sqlx::PgPool) {
+        let node_kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = node_kp.did().as_str().to_string();
+        let pusher_kp = gitlawb_core::identity::Keypair::generate();
+
+        let owner_did = "did:key:z6MkOwner";
+        let repo_id = "repo-uuid";
+        let ref_name = "refs/heads/main";
+        let old_sha = "0".repeat(40);
+        let new_sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let issued_at = "2026-07-22T00:00:00+00:00";
+        let seq = 1i64;
+        let prev = "0".repeat(64);
+
+        let db = migrated_db(pool).await;
+        // Seed the repo so the outer identity corroboration actually runs
+        // against a real row instead of being skipped by a lazy pool.
+        db.create_repo(&crate::db::RepoRecord {
+            id: repo_id.to_string(),
+            name: "myrepo".into(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            disk_path: "/tmp/anchor-test".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+
+        let cert = authentic_13_field_cert(
+            &node_kp, &pusher_kp, repo_id, ref_name, &old_sha, new_sha, &node_did, issued_at, seq,
+            &prev,
+        );
+
+        // The outer identity fields are present and must corroborate against
+        // the seeded repo row: expected_repo = normalize_owner_key(owner) / name.
         let anchor_json = serde_json::json!({
+            "repo": format!("{}/myrepo", crate::db::normalize_owner_key(owner_did)),
+            "owner_did": owner_did,
             "repo_id": repo_id,
             "ref_name": ref_name,
             "old_sha": old_sha,
@@ -1595,11 +1776,6 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
-            .expect("lazy pool creation should not fail");
-        let db = crate::db::Db::for_testing(pool);
-
         let result = verify_anchor(&client, &server.url(), "accept-tx", &db, &node_did).await;
         let r = result.expect("verify_anchor should return Ok for a served anchor");
         assert!(
@@ -1610,6 +1786,79 @@ mod tests {
         assert!(
             r.errors.is_empty(),
             "expected no errors, got: {:?}",
+            r.errors
+        );
+        _mock.assert_async().await;
+    }
+
+    /// Fail closed: when the anchor carries outer `repo`/`owner_did` claims but
+    /// the node has no record of the repo, corroboration cannot run — and the
+    /// verdict must not rest on the certificate signature alone.
+    #[sqlx::test]
+    async fn test_verify_anchor_fails_closed_when_outer_identity_cannot_be_corroborated(
+        pool: sqlx::PgPool,
+    ) {
+        let node_kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = node_kp.did().as_str().to_string();
+        let pusher_kp = gitlawb_core::identity::Keypair::generate();
+
+        let owner_did = "did:key:zVictim";
+        let repo_id = "repo-uuid";
+        let ref_name = "refs/heads/main";
+        let old_sha = "0".repeat(40);
+        let new_sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let issued_at = "2026-07-22T00:00:00+00:00";
+
+        let db = migrated_db(pool).await;
+        // Deliberately do NOT seed the repo row: the lookup must come up empty.
+
+        let cert = authentic_13_field_cert(
+            &node_kp,
+            &pusher_kp,
+            repo_id,
+            ref_name,
+            &old_sha,
+            new_sha,
+            &node_did,
+            issued_at,
+            1,
+            &"0".repeat(64),
+        );
+
+        // Forged outer identity fields, no way to corroborate them.
+        let anchor_json = serde_json::json!({
+            "repo": "victim-owner/victim-repo",
+            "owner_did": owner_did,
+            "repo_id": repo_id,
+            "ref_name": ref_name,
+            "old_sha": old_sha,
+            "new_sha": new_sha,
+            "node_did": node_did,
+            "certificate": cert,
+        });
+
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/uncorroborated-tx")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&anchor_json).unwrap())
+            .create_async()
+            .await;
+
+        let client = reqwest::Client::new();
+        let result =
+            verify_anchor(&client, &server.url(), "uncorroborated-tx", &db, &node_did).await;
+        let r = result.expect("verify_anchor should return Ok for a served anchor");
+        assert!(
+            !r.valid,
+            "uncorroborated outer identity must not verify as valid"
+        );
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.contains("cannot be corroborated")),
+            "expected the uncorroborated-identity error, got: {:?}",
             r.errors
         );
         _mock.assert_async().await;

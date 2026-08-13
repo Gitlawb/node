@@ -2,9 +2,13 @@
 //!
 //! Bundlers (Irys, Turbo, ...) accept a raw **Arweave data item** on their
 //! upload endpoint and verify the embedded Ed25519 signature before accepting
-//! the upload, so the node's own keypair *is* the upload credential — there is
-//! no separate wallet/token. This is the "signed/authenticated upload protocol"
-//! the Arweave surface is required to use.
+//! the upload, so the item provably originates from this node's keypair. The
+//! signature authenticates the item's authorship — it is NOT payment. The
+//! bundler charges each upload against a funded account and rejects items whose
+//! account is unfunded. The node therefore carries a funded account in its
+//! config (`GITLAWB_BUNDLER_ACCOUNT`) and sends it on every upload as
+//! `x-bundler-address`; `Config::validate()` refuses to start with a bundler
+//! URL but no funded account.
 //!
 //! Binary layout (per the ANS-104 spec, ed25519 = signature type 2):
 //!

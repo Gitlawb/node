@@ -202,4 +202,65 @@ mod closed_pool_tests {
         let v: Value = serde_json::from_str(&body).expect("json body");
         assert_eq!(v["count"], 1);
     }
+
+    /// Query and fragment credentials on a gateway with a path prefix must not
+    /// leak into the public listing, and the safe path prefix must survive so
+    /// the returned arweave_url still routes to the intended gateway.
+    #[sqlx::test]
+    async fn list_anchors_drops_query_and_fragment_credentials(pool: PgPool) {
+        use clap::Parser as _;
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.config = std::sync::Arc::new(crate::config::Config::parse_from([
+            "gitlawb-node",
+            "--arweave-gateway",
+            "https://user:supersecret@gateway.example/data?token=SECRET#frag",
+        ]));
+
+        let tx_id = "f".repeat(43);
+        state
+            .db
+            .record_arweave_anchor(&crate::db::RecordAnchorInputV2 {
+                repo: "alice/myrepo",
+                owner_did: "did:key:zAlice",
+                ref_name: "refs/heads/main",
+                old_sha: &"a".repeat(40),
+                new_sha: &"b".repeat(40),
+                cid: Some("bafy1test"),
+                arweave_tx_id: &tx_id,
+                node_did: "did:key:zNode",
+                cert_id: None,
+            })
+            .await
+            .unwrap();
+
+        let resp = Router::new()
+            .route("/api/v1/arweave/anchors", axum::routing::get(list_anchors))
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/arweave/anchors")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: String = String::from_utf8(bytes.to_vec()).expect("utf8 body");
+        for secret in ["supersecret", "SECRET"] {
+            assert!(
+                !body.contains(secret),
+                "anchors listing must not disclose {secret}"
+            );
+        }
+        // Path prefix preserved, query/fragment gone, tx_id appended cleanly.
+        assert!(
+            body.contains(&format!("https://gateway.example/data/{tx_id}")),
+            "arweave_url should carry the safe origin plus path prefix, got: {body}"
+        );
+    }
 }

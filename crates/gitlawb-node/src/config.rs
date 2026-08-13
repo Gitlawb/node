@@ -140,6 +140,21 @@ pub struct Config {
     )]
     pub bundler_url: String,
 
+    /// Funded bundler account (address/identity) that pays for anchoring.
+    /// The node signs ANS-104 data items with its own keypair, but that
+    /// signature is proof of authorship, NOT payment: the bundler only serves
+    /// items backed by a funded account. When `bundler_url` is set this must
+    /// name the funded account you created for the node (top up via the
+    /// bundler's devnet faucet for devnet hosts). `validate()` refuses to
+    /// start with a bundler URL but no funded account.
+    #[arg(
+        long,
+        env = "GITLAWB_BUNDLER_ACCOUNT",
+        default_value = "",
+        alias = "irys-account"
+    )]
+    pub bundler_account: String,
+
     /// Arweave gateway URL for resolving arweave_tx_id to data items.
     /// Used by the verify endpoint. Default: https://arweave.net
     #[arg(
@@ -785,6 +800,21 @@ impl Config {
                 Self::DB_POOL_APP_HEADROOM,
                 floor
             ));
+        }
+        // Anchoring writes real, permanent transactions: the node's ANS-104
+        // signature on each data item is authorship, not payment, and the
+        // bundler rejects items its funded-account ledger does not back.
+        // Refusing to start keeps an operator from silently losing every
+        // anchor to "Not enough balance" (see api/repos.rs anchor call sites,
+        // which degrade the push to a warning rather than fail it).
+        if !self.bundler_url.trim().is_empty() && self.bundler_account.trim().is_empty() {
+            return Err(
+                "GITLAWB_BUNDLER_URL is set but GITLAWB_BUNDLER_ACCOUNT is not: the data item \
+                 signature is not bundler payment. Create a funded account for this node (top up \
+                 via the bundler's faucet for devnet hosts) and set GITLAWB_BUNDLER_ACCOUNT to its \
+                 address/identity, or clear GITLAWB_BUNDLER_URL to disable anchoring."
+                    .to_string(),
+            );
         }
         Ok(())
     }
@@ -1448,6 +1478,48 @@ mod tests {
     /// nothing about what this crate declares — it reports the operator's setting.
     /// Asserting the declaration is the env-independent form, and it is the one that
     /// actually fails if someone flips `default_value_t` back.
+
+    /// Anchoring is paid, not free: the ANS-104 signature proves authorship,
+    /// and the bundler bills the funded account the upload names. A bundler URL
+    /// without a declared funded account must refuse to start, or every anchor
+    /// silently fails with "Not enough balance" behind a push-time warning.
+    #[test]
+    fn bundler_url_requires_a_funded_account() {
+        // Defaults (no bundler) validate.
+        Config::parse_from(["gitlawb-node"])
+            .validate()
+            .expect("default config must validate");
+
+        // Bundler URL alone must be rejected.
+        let no_account =
+            Config::parse_from(["gitlawb-node", "--bundler-url", "https://devnet.irys.xyz"]);
+        let err = no_account
+            .validate()
+            .expect_err("bundler URL without a funded account must be rejected");
+        assert!(
+            err.contains("GITLAWB_BUNDLER_ACCOUNT"),
+            "error must name the missing account: {err}"
+        );
+
+        // URL plus account validates.
+        Config::parse_from([
+            "gitlawb-node",
+            "--bundler-url",
+            "https://devnet.irys.xyz",
+            "--bundler-account",
+            "zBundlerAccount",
+        ])
+        .validate()
+        .expect("bundler URL with a funded account must validate");
+    }
+
+    /// #247: an explicit `--arweave-gateway` must not be overwritten by the
+    /// bundler-URL inference. The inference keys on the value source, so only
+    /// the clap default (no CLI flag, no env var) counts as "not explicit".
+    /// (The env-var arm of the detection is exercised indirectly: clap's `env`
+    /// feature routes `GITLAWB_ARWEAVE_GATEWAY` through the same
+    /// `ValueSource::EnvVariable` arm that the CLI-flag tests cover, and mutating
+    /// process env from a parallel test would race other cases.)
     #[test]
     fn enforce_owner_push_is_declared_true_independent_of_the_environment() {
         use clap::CommandFactory;
