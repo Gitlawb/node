@@ -294,7 +294,9 @@ async fn cmd_get_inner(
         }
 
         let retry_after = parse_retry_after(resp.headers());
-        let (raw, truncated) = read_body_capped(resp, 8 * 1024).await;
+        let body = read_body_capped(resp, 8 * 1024).await;
+        let (raw, truncated) = (body.text, body.truncated);
+        let read_failed = body.read_failed;
         let parsed = serde_json::from_str::<Value>(&raw).ok();
         let code = parsed.as_ref().and_then(|v| v["error"].as_str());
         let node_msg = parsed
@@ -326,7 +328,7 @@ async fn cmd_get_inner(
         };
 
         let Some(next) = resume_with else {
-            let msg = sanitize_node_msg(node_msg);
+            let msg = node_tail(node_msg, read_failed);
             if code == Some("search_incomplete") {
                 // Naming the bound, never echoing the value: a rejected token is
                 // node-chosen text and has no business in a terminal message.
@@ -416,6 +418,22 @@ fn surface_resume(cid: &str, token: Option<&str>) {
         diag(&format!(
             "resume from where this stopped: gl ipfs get {cid} --scan {t}"
         ));
+    }
+}
+
+/// Render the tail of a terminal message: what the node said, sanitized, plus the
+/// fact that its body did not finish arriving when that is what happened.
+///
+/// A read that fails mid-body is not the same as a node with nothing to say, and the
+/// two used to render identically. A 500 whose body died in transit produced an empty
+/// message and the terminal read `node returned 500: `, which reports the node as
+/// silent when the truth is that the connection broke before it could be heard.
+fn node_tail(node_msg: &str, read_failed: bool) -> String {
+    let msg = sanitize_node_msg(node_msg);
+    match (read_failed, msg.is_empty()) {
+        (false, _) => msg,
+        (true, true) => "the response body could not be read".to_string(),
+        (true, false) => format!("{msg} (the response body could not be read in full)"),
     }
 }
 
@@ -1782,6 +1800,133 @@ mod tests {
         );
 
         m.assert_async().await;
+    }
+
+    /// The transport-error terminal, which is the one arm of the token surfacing that
+    /// mockito cannot reach: its server outlives the call, and an unmatched route
+    /// answers 501, so a request always gets a response.
+    ///
+    /// A raw listener is what reproduces it. Rung 1 is a real `search_incomplete` 503
+    /// carrying a valid continuation, answered with `Connection: close` so reqwest
+    /// opens a fresh connection for rung 2. Rung 2 is ACCEPTED and then dropped
+    /// without a byte written, which is what a reset mid-ladder looks like to the
+    /// client. The ladder ends holding a token that still points at a real position,
+    /// and losing it there means the only way forward is a bare re-run that restarts
+    /// at row 0 and re-spends the caller's per-IP budget.
+    ///
+    /// MUTATION (RED): drop the `surface_resume` call in the transport-error arm.
+    #[tokio::test]
+    async fn test_cmd_get_transport_failure_mid_ladder_surfaces_the_held_token() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        reset_diag();
+        let t = make_token("t1");
+        let body = incomplete_body(Some(&t), "scan truncated");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let seen = connections.clone();
+
+        tokio::spawn(async move {
+            // Rung 1: a complete 503 with a continuation, then close the connection so
+            // rung 2 has to dial again.
+            let (mut sock, _) = listener.accept().await.unwrap();
+            seen.fetch_add(1, Ordering::SeqCst);
+            let mut scratch = [0u8; 2048];
+            let _ = sock.read(&mut scratch).await;
+            let resp = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n\
+                 Retry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+            drop(sock);
+
+            // Rung 2: accept and hang up without a response.
+            let (sock, _) = listener.accept().await.unwrap();
+            seen.fetch_add(1, Ordering::SeqCst);
+            drop(sock);
+        });
+
+        let err = cmd_get(
+            "bafkreireset".to_string(),
+            format!("http://{addr}"),
+            None,
+            None,
+        )
+        .await
+        .expect_err("a connection dropped mid-ladder must be an error");
+        let told = told(&err);
+
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            2,
+            "the fixture must actually reach rung 2, or the transport arm was never \
+             exercised"
+        );
+        assert!(
+            told.contains(&t) && told.contains(&format!("--scan {t}")),
+            "a transport failure ends the ladder still holding a usable token, so it \
+             must come back with the invocation that resumes from it, got: {told}"
+        );
+        assert!(
+            told.contains("bafkreireset"),
+            "the failure must still name the CID it was fetching, got: {told}"
+        );
+    }
+
+    /// A terminal whose body FAILED to arrive must say so, not report the node as
+    /// silent.
+    ///
+    /// The listener answers 500, promises 512 bytes, writes none, and hangs up. The
+    /// read comes back empty, and the terminal used to render that as
+    /// `node returned 500: ` with nothing after the colon, which reads as a node that
+    /// sent no message at all. MUTATION (RED): render the tail with
+    /// `sanitize_node_msg` again and the message ends at the colon.
+    #[tokio::test]
+    async fn test_cmd_get_reports_a_body_that_could_not_be_read() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        reset_diag();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 2048];
+            let _ = sock.read(&mut scratch).await;
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\
+                      Content-Length: 512\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            let _ = sock.flush().await;
+        });
+
+        let err = cmd_get(
+            "bafkreicutread".to_string(),
+            format!("http://{addr}"),
+            None,
+            None,
+        )
+        .await
+        .expect_err("a 500 is an error whatever became of its body");
+        let told = told(&err);
+
+        assert!(
+            told.contains("500"),
+            "the terminal must still name the status, got: {told}"
+        );
+        assert!(
+            told.to_lowercase().contains("could not be read"),
+            "a body that failed mid-read must be reported as unread rather than as an \
+             empty message, got: {told}"
+        );
+        assert!(
+            !told.contains("500: \n") && !told.ends_with("500: "),
+            "the terminal must not trail off after the colon, got: {told}"
+        );
     }
 
     /// #173 review (F9): a `search_incomplete` body the 8 KiB read cap CUT SHORT must

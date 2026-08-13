@@ -15,6 +15,63 @@ use icaptcha_client::IcaptchaCfg;
 /// (absorbs proof expiry / first-seen replay).
 const MAX_ICAPTCHA_RETRIES: usize = 2;
 
+/// Total request timeout: from the start of connecting through the end of the
+/// response body, so it bounds a slow download and not just a slow handshake.
+const TOTAL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Longest redirect chain followed. `Policy::custom` replaces reqwest's built-in
+/// limit, so the loop bound has to be restated here; the value is reqwest's own
+/// default. Same-origin redirects can cycle, and without this a node answering 302
+/// to itself would spin forever.
+const MAX_REDIRECTS: usize = 10;
+
+/// Follow a redirect only when it stays on the origin that issued it.
+///
+/// Every request this client sends may carry RFC 9421 `Signature` and
+/// `Signature-Input` headers, and reqwest strips only `Authorization`, `Cookie`,
+/// `Proxy-Authorization` and `WWW-Authenticate` when a redirect crosses hosts. The
+/// signature would survive, and it binds `@method`, `@path` and `content-digest`
+/// with no authority component, so a node answering 302 could hand a working
+/// credential to a host of its choosing and read as the caller anywhere for as long
+/// as the node's clock-skew window lasts.
+///
+/// `Policy::none()` would have been the simpler answer, but same-origin redirects
+/// are legitimate here (a node fronted by a proxy that upgrades http to https, or
+/// normalizes a trailing slash), so the policy is scoped to the origin rather than
+/// switched off. Refusal is `stop`, not `error`: the 3xx comes back as an ordinary
+/// response and each caller reports it through the status path it already has.
+///
+/// Host and port must match exactly. Port is compared as `Url::port`, which is
+/// `None` for a scheme's default port, so http -> https on the same host compares
+/// equal while http -> http on a different port does not. A downgrade from https to
+/// http is refused as well: the target is the same host, but the signature would go
+/// out in cleartext, which is the same credential leak by a slower route.
+fn same_origin_redirect(attempt: reqwest::redirect::Attempt<'_>) -> reqwest::redirect::Action {
+    let Some(previous) = attempt.previous().last() else {
+        // No previous URL to compare against. Unreachable through reqwest, which
+        // pushes the redirecting URL before consulting the policy, but the safe
+        // reading of "cannot prove same-origin" is to refuse.
+        return attempt.stop();
+    };
+    if attempt.previous().len() >= MAX_REDIRECTS {
+        return attempt.stop();
+    }
+    if may_follow(previous, attempt.url()) {
+        attempt.follow()
+    } else {
+        attempt.stop()
+    }
+}
+
+/// The decision itself, split out because `redirect::Attempt` cannot be built outside
+/// reqwest, so this is the only way to run the scheme and port branches both ways
+/// rather than reasoning about them.
+fn may_follow(previous: &reqwest::Url, next: &reqwest::Url) -> bool {
+    let same_origin = next.host_str() == previous.host_str() && next.port() == previous.port();
+    let downgraded = previous.scheme() == "https" && next.scheme() != "https";
+    same_origin && !downgraded
+}
+
 pub struct NodeClient {
     inner: reqwest::Client,
     pub node_url: String,
@@ -23,8 +80,20 @@ pub struct NodeClient {
 
 impl NodeClient {
     pub fn new(node_url: impl Into<String>, keypair: Option<Keypair>) -> Self {
+        Self::with_timeout(node_url, keypair, TOTAL_REQUEST_TIMEOUT)
+    }
+
+    /// `new` with the total request timeout as a parameter, so a test can drive the
+    /// timeout's behaviour without waiting out the shipped value. `new` supplies the
+    /// shipped one, which is what makes the scaled-down test cover the real client.
+    fn with_timeout(
+        node_url: impl Into<String>,
+        keypair: Option<Keypair>,
+        timeout: std::time::Duration,
+    ) -> Self {
         let inner = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::custom(same_origin_redirect))
             .user_agent(format!("gl/{} gitlawb-cli", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("failed to build HTTP client");
@@ -203,17 +272,37 @@ async fn obtain_proof(cfg: IcaptchaCfg) -> Result<String> {
         .context("iCaptcha solver task panicked")?
 }
 
+/// What a capped body read produced. `text` is the bytes that arrived; the two flags
+/// say why the read stopped where it did, which a caller that CLASSIFIES on the body
+/// cannot work out from the text alone.
+pub(crate) struct CappedBody {
+    /// The bytes read, lossily decoded.
+    pub(crate) text: String,
+    /// The cap cut the body short.
+    pub(crate) truncated: bool,
+    /// A chunk read FAILED part-way through, so the body is not merely short, it is
+    /// unfinished and the node may have had more to say.
+    pub(crate) read_failed: bool,
+}
+
 /// Read at most `cap` bytes of a response body. Bounds the allocation from a
 /// hostile or broken node returning a huge error body — the display is capped
 /// separately, but the read itself must not be unbounded (INV-6, read half).
 ///
-/// The second element of the return is whether the cap cut the body short. A
-/// caller that CLASSIFIES on the body needs it: a cut body fails JSON parse, and
-/// a parse failure is indistinguishable from a node that sent no code at all, so
-/// without this flag an oversized body silently picks a different arm.
-pub(crate) async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> (String, bool) {
+/// `truncated` reports whether the cap cut the body short. A caller that CLASSIFIES
+/// on the body needs it: a cut body fails JSON parse, and a parse failure is
+/// indistinguishable from a node that sent no code at all, so without this flag an
+/// oversized body silently picks a different arm.
+///
+/// `read_failed` reports the other way a body can end early. A mid-body read error
+/// used to leave through the same exit as a clean end of stream, so a 500 whose body
+/// died in transit surfaced as an empty message and the caller was told
+/// `node returned 500: ` with nothing after the colon. That is a report of what the
+/// node said, and the node never got to say it.
+pub(crate) async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> CappedBody {
     let mut buf: Vec<u8> = Vec::new();
     let mut truncated = false;
+    let mut read_failed = false;
     while buf.len() < cap {
         match resp.chunk().await {
             Ok(Some(chunk)) => {
@@ -224,7 +313,11 @@ pub(crate) async fn read_body_capped(mut resp: reqwest::Response, cap: usize) ->
                     break; // hit the cap mid-chunk
                 }
             }
-            _ => break, // end of body or read error — return what we have
+            Ok(None) => break, // clean end of body
+            Err(_) => {
+                read_failed = true;
+                break;
+            }
         }
     }
     // A body that lands exactly on the cap may or may not have more behind it;
@@ -232,7 +325,11 @@ pub(crate) async fn read_body_capped(mut resp: reqwest::Response, cap: usize) ->
     if buf.len() >= cap {
         truncated = true;
     }
-    (String::from_utf8_lossy(&buf).into_owned(), truncated)
+    CappedBody {
+        text: String::from_utf8_lossy(&buf).into_owned(),
+        truncated,
+        read_failed,
+    }
 }
 
 /// Strip terminal-dangerous characters from (and cap the length of) a
@@ -631,6 +728,298 @@ mod tests {
         n.assert();
         ic.challenge.assert();
         ic.answer.assert();
+    }
+
+    // ── redirect policy ─────────────────────────────────────────────────
+
+    /// The signed headers must not survive a redirect off the node's origin.
+    ///
+    /// reqwest strips only `Authorization`, `Cookie`, `Proxy-Authorization` and
+    /// `WWW-Authenticate` across hosts, so `Signature` and `Signature-Input` used to
+    /// ride a 302 straight to whatever origin the node named. The signature binds
+    /// `@method`, `@path` and `content-digest` and nothing about the authority, so the
+    /// receiving host holds a credential that reads path-scoped objects as the caller
+    /// at any node until the clock-skew window closes.
+    ///
+    /// Two mockito servers are two ports on one host, which is exactly the boundary
+    /// this policy draws (and the one reqwest's own header stripping draws). The
+    /// second server answers everything and expects nothing: a followed redirect
+    /// fails the expectation whether or not the signature came with it. MUTATION
+    /// (RED): drop the `.redirect(...)` line and the second server is hit.
+    #[tokio::test]
+    async fn cross_origin_redirect_is_not_followed() {
+        let mut elsewhere = Server::new_async().await;
+        let never = elsewhere
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body("bytes from the redirect target")
+            .expect(0)
+            .create_async()
+            .await;
+        let signature_seen = elsewhere
+            .mock("GET", mockito::Matcher::Any)
+            .match_header("signature", mockito::Matcher::Any)
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mut node = Server::new_async().await;
+        let bounce = node
+            .mock("GET", "/api/v1/thing")
+            .with_status(302)
+            .with_header("location", &format!("{}/api/v1/thing", elsewhere.url()))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = NodeClient::new(node.url(), Some(test_keypair()));
+        let resp = client.get_signed("/api/v1/thing").await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            302,
+            "a refused redirect stops rather than errors, so the caller sees the 3xx \
+             and reports it through the status path it already has"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(
+            !body.contains("bytes from the redirect target"),
+            "the redirect target's bytes must never reach the caller, got: {body}"
+        );
+        bounce.assert_async().await;
+        never.assert_async().await;
+        signature_seen.assert_async().await;
+    }
+
+    /// Every branch of the decision, both ways. The end-to-end test above drives one
+    /// pair of http origins, which is all mockito can serve; the scheme cases and the
+    /// default-port equivalence have no other way to be run.
+    #[test]
+    fn may_follow_covers_each_origin_branch() {
+        let url = |s: &str| reqwest::Url::parse(s).unwrap();
+        let cases: &[(&str, &str, bool, &str)] = &[
+            (
+                "http://node.example/a",
+                "http://node.example/b",
+                true,
+                "same origin, different path",
+            ),
+            (
+                "http://node.example/a",
+                "https://node.example/a",
+                true,
+                "http to https on one host: both ports are the scheme default",
+            ),
+            (
+                "https://node.example/a",
+                "https://node.example/a/",
+                true,
+                "trailing-slash normalization",
+            ),
+            (
+                "https://node.example:8443/a",
+                "https://node.example:8443/b",
+                true,
+                "same explicit port",
+            ),
+            (
+                "http://node.example/a",
+                "http://attacker.example/a",
+                false,
+                "different host",
+            ),
+            (
+                "http://node.example/a",
+                "http://node.example:8080/a",
+                false,
+                "same host, different port",
+            ),
+            (
+                "https://node.example/a",
+                "http://node.example/a",
+                false,
+                "https downgraded to cleartext on the same host",
+            ),
+            (
+                "https://node.example/a",
+                "http://node.example:443/a",
+                false,
+                "a downgrade dressed up as the https port",
+            ),
+        ];
+        for (previous, next, expected, why) in cases {
+            assert_eq!(
+                may_follow(&url(previous), &url(next)),
+                *expected,
+                "{previous} -> {next} ({why})"
+            );
+        }
+    }
+
+    /// The other direction: a same-origin redirect is still followed, so a node
+    /// fronted by a proxy that normalizes a path keeps working. Without this the
+    /// policy could be tightened to `Policy::none()` and nothing would notice.
+    #[tokio::test]
+    async fn same_origin_redirect_is_followed() {
+        let mut node = Server::new_async().await;
+        let bounce = node
+            .mock("GET", "/api/v1/thing")
+            .with_status(301)
+            .with_header("location", "/api/v1/thing/")
+            .expect(1)
+            .create_async()
+            .await;
+        let target = node
+            .mock("GET", "/api/v1/thing/")
+            .with_status(200)
+            .with_body("normalized")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = NodeClient::new(node.url(), Some(test_keypair()));
+        let resp = client.get_signed("/api/v1/thing").await.unwrap();
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "normalized");
+        bounce.assert_async().await;
+        target.assert_async().await;
+    }
+
+    // ── read_body_capped ────────────────────────────────────────────────
+
+    /// A body whose read FAILS mid-stream must be distinguishable from a body that
+    /// ended. Both used to leave through the same `_ => break`, so a 500 whose body
+    /// died in transit produced an empty message and the caller was told
+    /// `node returned 500: ` with nothing after the colon.
+    ///
+    /// The fixture is a raw listener that promises 64 bytes in `Content-Length`,
+    /// writes 5, and closes. mockito cannot express that: it always completes the
+    /// response it advertises. MUTATION (RED): restore the single `_ => break` arm
+    /// (or hard-code `read_failed: false`) and the flag reads false.
+    #[tokio::test]
+    async fn read_body_capped_flags_a_mid_body_read_failure() {
+        let addr = spawn_short_body_listener().await;
+        let resp = reqwest::get(format!("http://{addr}/truncated"))
+            .await
+            .expect("headers arrive before the body is cut");
+        let body = read_body_capped(resp, 8192).await;
+
+        assert!(
+            body.read_failed,
+            "a body cut off mid-stream must be reported as a failed read, not as a \
+             body that ended: got {:?}",
+            body.text
+        );
+        assert!(
+            !body.truncated,
+            "the cap did not cut this one; 5 bytes are nowhere near 8 KiB"
+        );
+    }
+
+    /// The must-not half: a body that ends cleanly must NOT be flagged, or the flag
+    /// means nothing and every terminal starts claiming the node went quiet.
+    #[tokio::test]
+    async fn read_body_capped_does_not_flag_a_clean_body() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", "/ok")
+            .with_status(500)
+            .with_body("node said this")
+            .create_async()
+            .await;
+        let resp = reqwest::get(format!("{}/ok", server.url())).await.unwrap();
+        let body = read_body_capped(resp, 8192).await;
+
+        assert_eq!(body.text, "node said this");
+        assert!(!body.read_failed, "a complete body is not a failed read");
+        assert!(!body.truncated, "a complete body is not a truncated one");
+    }
+
+    /// Answer one request with headers promising more body than gets written, then
+    /// close the connection. Returns the listener's address.
+    async fn spawn_short_body_listener() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 1024];
+            let _ = sock.read(&mut scratch).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 64\r\n\r\nshort")
+                .await;
+            let _ = sock.flush().await;
+            // Drop closes the socket with 59 of the promised bytes never sent.
+        });
+        addr
+    }
+
+    // ── total request timeout ───────────────────────────────────────────
+
+    /// The client's timeout is a TOTAL request timeout, so it bounds a download and
+    /// not just the handshake. `gl ipfs get`'s documentation leans on exactly that:
+    /// the wall-clock deadline covers the search and deliberately stops at the
+    /// response headers, and this timeout is the only thing left bounding the body.
+    ///
+    /// Driven at 250ms through `with_timeout`, the seam `new` itself calls with
+    /// `TOTAL_REQUEST_TIMEOUT`, because a test at the shipped 30s has no place in this
+    /// suite. What that costs is the value; what it proves is the SHAPE, which is the
+    /// part in doubt: that the deadline keeps running once the headers have landed. A
+    /// timeout that covered only the handshake would let this request hang until the
+    /// listener gives up.
+    #[tokio::test]
+    async fn total_timeout_cuts_off_a_body_that_outruns_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 1024];
+            let _ = sock.read(&mut scratch).await;
+            // Headers land immediately, then the body stalls indefinitely.
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\nfirst")
+                .await;
+            let _ = sock.flush().await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+
+        let client = NodeClient::with_timeout(
+            format!("http://{addr}"),
+            None,
+            std::time::Duration::from_millis(250),
+        );
+        let started = std::time::Instant::now();
+        let resp = client.get("/slow").await.expect("headers arrive promptly");
+        assert_eq!(
+            resp.status(),
+            200,
+            "the stall is in the body, not the status"
+        );
+        let err = resp
+            .bytes()
+            .await
+            .expect_err("a body still arriving past the total timeout must be cut off");
+        let elapsed = started.elapsed();
+
+        assert!(
+            err.is_timeout(),
+            "the body read must end in a timeout, got: {err}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the timeout must fire on its own schedule, not wait out the listener; \
+             took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn shipped_client_uses_the_documented_total_timeout() {
+        // The scaled-down test above proves the shape at 250ms. This pins the value
+        // `new` actually ships, so the two together cover the documented behaviour.
+        assert_eq!(TOTAL_REQUEST_TIMEOUT, std::time::Duration::from_secs(30));
     }
 
     #[test]

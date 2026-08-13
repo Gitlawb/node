@@ -3781,6 +3781,79 @@ mod tests {
     // scarce global walk permits for up to the whole request budget.
     // ----------------------------------------------------------------------------
 
+    /// Scenario 0, the case every other scan test skips: a ceiling that EXCEEDS the
+    /// table, on a scan that was never resumed. This is the one path that still owes
+    /// the caller a definitive 404.
+    ///
+    /// The three fixtures above and beside it all park the holder PAST a ceiling, so
+    /// each one proves the truncating half: nothing unproven may answer 404. Nobody
+    /// was covering the converse, and it is the more dangerous direction to lose,
+    /// because a scan that quietly stops short and STILL answers 404 reports existing
+    /// content as absent. Here five rows sit under a ceiling of 64, the requested CID
+    /// genuinely resolves to nothing, and the scan runs off the end of the table with
+    /// its ceilings untouched.
+    ///
+    /// The counters are what make "ran to exhaustion" an observation rather than an
+    /// inference. `scan_rows` reaching all five says the walk covered the table, and
+    /// `scan_limit` at 8 says both asks went out at the full page size, so no budget
+    /// ever shortened one. A 404 with either counter short would be the false-absent
+    /// answer wearing the right status.
+    ///
+    /// MUTATION (RED): drop the `pager.resumed &&` guard on the wrapped-scan taint and
+    /// this exhausted scan taints as `scan-wrapped`, so the tail becomes a 503 and the
+    /// definitive answer is never reached.
+    #[sqlx::test]
+    async fn get_by_cid_unresumed_scan_under_the_ceiling_is_a_definitive_404(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 4;
+        // Well clear of the five rows below: the point is a ceiling that never binds.
+        state.ipfs_max_legacy_scan_rows = 64;
+        seed_root_denying_repos(&state, "underceiling", 5, 0).await;
+        let cid = seed_legacy_pin(&state, &absent_oid()).await;
+
+        let peer: SocketAddr = "203.0.113.160:5000".parse().unwrap();
+        crate::api::ipfs::reset_scan_rows();
+        crate::api::ipfs::reset_scan_limit();
+        let (status, body) = status_and_body(
+            ipfs_router(state)
+                .oneshot(get_cid_scan(&cid, Some(peer), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let rows = crate::api::ipfs::scan_rows();
+        let limit = crate::api::ipfs::scan_limit();
+        assert_eq!(
+            rows, 5,
+            "the scan must reach every seeded row before it may call the object absent. \
+             Read {rows} of 5"
+        );
+        assert_eq!(
+            limit, 8,
+            "two asks at the full page size (4 + 4): with the ceiling far above the \
+             table, nothing may shorten the query, and a shortened one would mean the \
+             404 below rested on a bounded walk. Asked for {limit}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a scan that ran off the end of the table with no ceiling touched and no \
+             resume token has proven absence over the whole inventory, so the answer is \
+             the definitive 404, not a truncation 503: {body}"
+        );
+        assert!(
+            continuation_of(&body).is_none(),
+            "there is nothing left to resume, so a definitive 404 must carry no \
+             continuation: {body}"
+        );
+        assert_ne!(
+            body["error"], "search_incomplete",
+            "the answer is an absence, not a truncation: {body}"
+        );
+    }
+
     /// Scenario 1: an all-root-denied inventory stops at the row ceiling.
     ///
     /// Every seeded repo is private and the caller is anonymous, so each row is a root
