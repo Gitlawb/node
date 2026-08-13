@@ -22,7 +22,7 @@ multihash-codetable = { workspace = true }
 cid = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
-url = { workspace = true }
+url = { workspace = true, optional = true }
 zeroize = { version = "1", features = ["derive"] }
 pkcs8 = { version = "0.10", features = ["pem", "std"] }
 curve25519-dalek = "4"
@@ -31,3 +31,9 @@ chacha20poly1305 = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true }
+# Not optional here: the redirect matrix must run under a bare
+# `cargo test -p gitlawb-core`, with no feature selected.
+url = { workspace = true }
+
+[features]
+redirect = ["dep:url"]
