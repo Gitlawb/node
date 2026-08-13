@@ -265,8 +265,9 @@ impl LegacyScanPager {
             "legacy scan LIMIT must ask for at least one row"
         );
         // Record the DB-facing ask before it is made. It sits above the timeout opener
-        // because the INV-22 guard reads a fixed lookback from the query call for that
-        // wrapper, and anything inserted inside the window eats its margin.
+        // because the committed guard that checks this query is deadline-wrapped reads a
+        // fixed lookback from the query call, and anything inserted inside that window
+        // eats its margin.
         #[cfg(test)]
         note_scan_limit(limit);
         let page = match tokio::time::timeout(
@@ -4289,7 +4290,19 @@ mod tests {
         );
 
         // The withheld blob gets its OWN full ladder, and is denied on every rung.
+        //
+        // A not-served assertion alone is satisfied by a ladder that never reached the
+        // boundary row: the per-IP work limiter ends one with a shed that carries no
+        // continuation, and so does an early taint, and a bare `None => break` cannot
+        // tell either from an honest exhaustion. So this half also witnesses HOW the
+        // ladder ended: every intermediate rung is specifically the retryable 503, and
+        // the last one is the `scan-wrapped` taint, which only a resumed scan that
+        // reached the END of the table emits. That is what makes "the rules withheld
+        // it" the reading. (Not a 404: a resumed scan has proven absence only over
+        // `[token, end)`, so the node deliberately withholds the definitive 404 and
+        // answers 503 with no continuation instead.)
         let mut token: Option<String> = None;
+        let mut exhausted_at = None;
         for step in 1..=bound {
             let (status, body) = status_and_body(
                 router
@@ -4307,10 +4320,41 @@ mod tests {
                  reaches it as the last row of a shortened page (step {step}): {body}"
             );
             match continuation_of(&body) {
-                Some(t) => token = Some(t),
-                None => break,
+                Some(t) => {
+                    assert_eq!(
+                        status,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "an intermediate rung of the withheld ladder is the retryable \
+                         503 (step {step}): {body}"
+                    );
+                    token = Some(t);
+                }
+                None => {
+                    assert_eq!(
+                        status,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "the withheld ladder's last rung is the retryable 503 (step \
+                         {step}): {body}"
+                    );
+                    assert!(
+                        body["message"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .contains("scan-wrapped"),
+                        "the withheld ladder must end by EXHAUSTING the inventory, which \
+                         only the scan-wrapped taint witnesses, not by a per-IP brake \
+                         that stopped it short of the boundary row (step {step}): {body}"
+                    );
+                    exhausted_at = Some(step);
+                    break;
+                }
             }
         }
+        assert!(
+            exhausted_at.is_some(),
+            "the withheld ladder must reach the end of the inventory within {bound} \
+             rungs, otherwise no rung ever evaluated the rule that withholds the blob"
+        );
     }
 
     /// The positive control for the fixture above: the identical inventory with the

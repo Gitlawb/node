@@ -241,10 +241,13 @@ most 9 calls to the node, waiting between attempts for as long as the node's
 
 The whole ladder runs under a 60 second wall-clock deadline. The deadline bounds
 the search, not the download: each attempt gets the time left on it to produce
-response headers, and once an object is found its bytes stream under the client's
-own 30 second HTTP timeout, so a large blob is never cut off part way. Adding the
-one clamped wait that can still fire before the give-up check, a single run tops
-out around 95 seconds.
+response headers, and once an object is found its bytes stream outside that
+deadline. They are not unbounded, though. The client's own 30 second HTTP timeout
+is a total request timeout, running from the start of a request until its body
+has finished, so a transfer still going 30 seconds after its request began is cut
+off. Waits between attempts never run past the deadline either, so a single run
+tops out around 90 seconds: the deadline plus the 30 second timeout covering the
+last attempt.
 
 Two node-side brakes end a ladder early and are reported rather than retried
 around. A 429 is terminal, because the node's rate-limit window is an hour and

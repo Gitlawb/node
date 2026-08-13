@@ -206,21 +206,33 @@ async fn obtain_proof(cfg: IcaptchaCfg) -> Result<String> {
 /// Read at most `cap` bytes of a response body. Bounds the allocation from a
 /// hostile or broken node returning a huge error body — the display is capped
 /// separately, but the read itself must not be unbounded (INV-6, read half).
-pub(crate) async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> String {
+///
+/// The second element of the return is whether the cap cut the body short. A
+/// caller that CLASSIFIES on the body needs it: a cut body fails JSON parse, and
+/// a parse failure is indistinguishable from a node that sent no code at all, so
+/// without this flag an oversized body silently picks a different arm.
+pub(crate) async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> (String, bool) {
     let mut buf: Vec<u8> = Vec::new();
+    let mut truncated = false;
     while buf.len() < cap {
         match resp.chunk().await {
             Ok(Some(chunk)) => {
                 let take = (cap - buf.len()).min(chunk.len());
                 buf.extend_from_slice(&chunk[..take]);
                 if take < chunk.len() {
+                    truncated = true;
                     break; // hit the cap mid-chunk
                 }
             }
             _ => break, // end of body or read error — return what we have
         }
     }
-    String::from_utf8_lossy(&buf).into_owned()
+    // A body that lands exactly on the cap may or may not have more behind it;
+    // report it as cut, since the classification that follows cannot tell either.
+    if buf.len() >= cap {
+        truncated = true;
+    }
+    (String::from_utf8_lossy(&buf).into_owned(), truncated)
 }
 
 /// Strip terminal-dangerous characters from (and cap the length of) a

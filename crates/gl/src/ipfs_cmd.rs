@@ -43,10 +43,13 @@ pub enum IpfsCmd {
     /// The whole ladder runs under a 60 second wall-clock deadline. That deadline
     /// bounds the search: each attempt gets only the time left on it to produce
     /// response headers, and it deliberately does not cover the download of an
-    /// object once found, so a large blob already streaming is never cut off part
-    /// way. After the headers the transfer runs under the client's 30 second HTTP
-    /// timeout, and one final wait before the give-up check can add up to 5 seconds
-    /// more, so the longest a single run can take is about 95 seconds.
+    /// object once found. The download is not unbounded, though. The client's 30
+    /// second HTTP timeout is a TOTAL request timeout, running from the moment a
+    /// request starts connecting until its body has finished, so a transfer still
+    /// going 30 seconds after its own request began is cut off. Waits between
+    /// attempts are bounded by the time left on the deadline as well as by the 5
+    /// second clamp, so the longest a single run can take is about 90 seconds: the
+    /// deadline, plus the 30 second timeout covering the last attempt.
     ///
     /// A 429 ends the ladder immediately: the node's rate-limit window is an hour,
     /// so the wait it asks for cannot be honored inside one invocation. A transient
@@ -222,15 +225,17 @@ async fn cmd_get_inner(
     // That wrap covers `get_authed` only, which resolves on the response HEADERS: the
     // deadline is here to stop a slow legacy SEARCH, and extending it over the body
     // read would abort a legitimate large download whose bytes are already flowing.
+    // reqwest's blanket 30s is what bounds the download instead; it is a TOTAL request
+    // timeout, from the start of the request through the end of its body, so a transfer
+    // slower than that from its own request's start IS cut off.
     // The composed bound that follows. The last attempt of any run starts strictly
-    // before the deadline, since both checks above run first, and reqwest's blanket
-    // 30s covers that whole request from its start through the end of its body, so it
-    // is over by deadline + 30s. Two reads sit under that 30s and not under the
-    // deadline: `write_object`'s success read, which ends the run, and
-    // `read_body_capped`'s error read, which on a retryable arm is followed by one
-    // clamped wait before the next iteration's check ends the loop. So the worst case
-    // is deadline + 30s + clamp, about 95s at the shipped defaults, and the give-up
-    // sleep is not a separate tail but the last term of that one.
+    // before the deadline, since both checks above run first, and that same blanket 30s
+    // covers its whole request, so it is over by deadline + 30s. Two reads sit under the
+    // 30s and not under the deadline: `write_object`'s success read, which ends the run,
+    // and `read_body_capped`'s error read, which on a retryable arm is followed by one
+    // wait. That wait adds no term of its own, because it is bounded by the time LEFT on
+    // the deadline as well as by the clamp. So the worst case is deadline + 30s, about
+    // 90s at the shipped defaults.
     let start = tokio::time::Instant::now();
     let mut requests = 0usize;
     loop {
@@ -258,7 +263,15 @@ async fn cmd_get_inner(
             None => format!("/ipfs/{encoded_cid}"),
         };
         let resp = match tokio::time::timeout(remaining, client.get_authed(&path)).await {
-            Ok(r) => r.with_context(|| format!("failed to fetch CID {cid} from {node}"))?,
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                // A transport failure ends the ladder with the held token still
+                // pointing at a real position, so hand it back before propagating:
+                // otherwise a connection reset mid-ladder loses the only thing that
+                // makes progress on a re-run.
+                surface_resume(&cid, token.as_deref());
+                return Err(e).with_context(|| format!("failed to fetch CID {cid} from {node}"));
+            }
             Err(_) => return Err(deadline_reached(&cid, token.as_deref(), deadline)),
         };
         requests += 1;
@@ -281,7 +294,7 @@ async fn cmd_get_inner(
         }
 
         let retry_after = parse_retry_after(resp.headers());
-        let raw = read_body_capped(resp, 8 * 1024).await;
+        let (raw, truncated) = read_body_capped(resp, 8 * 1024).await;
         let parsed = serde_json::from_str::<Value>(&raw).ok();
         let code = parsed.as_ref().and_then(|v| v["error"].as_str());
         let node_msg = parsed
@@ -300,7 +313,15 @@ async fn cmd_get_inner(
             // end and asks the caller back shortly, so the ladder continues on the token
             // it already holds. With no token there is nothing to resume, which falls to
             // the default arm below.
-            Some(_) | None if status == reqwest::StatusCode::SERVICE_UNAVAILABLE => token.clone(),
+            //
+            // A body the cap CUT SHORT is excluded from this arm. A cut body cannot
+            // parse, so its code reads as absent and an oversized `search_incomplete`
+            // would land here and be retried on the OLD token, replaying one position
+            // for every rung while the fresh continuation it offered goes unread.
+            // Unclassifiable is terminal, like any unrecognized code.
+            Some(_) | None if status == reqwest::StatusCode::SERVICE_UNAVAILABLE && !truncated => {
+                token.clone()
+            }
             _ => None,
         };
 
@@ -310,19 +331,36 @@ async fn cmd_get_inner(
                 // Naming the bound, never echoing the value: a rejected token is
                 // node-chosen text and has no business in a terminal message.
                 let why = if offered.is_some() {
+                    // The OFFERED token is unusable, but the one already held still
+                    // points at a real position, so the ladder ends with something to
+                    // resume from. Surface ours, never theirs.
+                    surface_resume(&cid, token.as_deref());
                     format!(
                         "the continuation it offered is not a resume token \
                          (expected 1 to {MAX_CONTINUATION_LEN} base64url characters)"
                     )
                 } else {
+                    // No continuation at all is the node's deliberate "the scan wrapped
+                    // and finished" signal, so a resume hint here would invite a re-run
+                    // that cannot find more than this one did.
                     "it offered no continuation token".to_string()
                 };
                 anyhow::bail!("node returned {status} with the scan incomplete and {why}: {msg}");
             }
+            // Anything else stops the ladder with the held token still usable, so hand
+            // it back. The exception is a definitive 404: that is an answer, and a
+            // resume hint beside it would contradict it.
+            if status != reqwest::StatusCode::NOT_FOUND {
+                surface_resume(&cid, token.as_deref());
+            }
             anyhow::bail!("node returned {status}: {msg}");
         };
 
-        tokio::time::sleep(retry_after.min(MAX_RETRY_AFTER)).await;
+        // Bounded three ways, and the deadline is the term that stops the give-up from
+        // overshooting: the loop only re-checks it at the top, so a wait longer than
+        // what is left would run past the deadline before anything noticed.
+        let left = deadline.saturating_sub(start.elapsed());
+        tokio::time::sleep(retry_after.min(MAX_RETRY_AFTER).min(left)).await;
         token = Some(next);
     }
 }
@@ -346,9 +384,14 @@ async fn write_object(resp: reqwest::Response) -> Result<()> {
 
     let bytes = resp.bytes().await.context("failed to read response body")?;
     use std::io::Write;
-    std::io::stdout()
-        .write_all(&bytes)
-        .context("failed to write to stdout")?;
+    // Flush explicitly rather than leaving the tail to the process-exit flush, which
+    // discards its error: `gl ipfs get <cid> > object.bin` onto a full disk or a
+    // closed pipe would otherwise leave a TRUNCATED file behind exit status 0, and on
+    // a content-addressed fetch a silently short object is the worst possible answer.
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    out.write_all(&bytes).context("failed to write to stdout")?;
+    out.flush().context("failed to flush stdout")?;
 
     Ok(())
 }
@@ -790,8 +833,8 @@ mod tests {
             "the give-up must name the incomplete result, got: {told}"
         );
         assert!(
-            told.contains('8'),
-            "the give-up must name the resume cap, got: {told}"
+            told.contains(&format!("after {MAX_SCAN_RESUMES} automatic resumes")),
+            "the give-up must name the resume cap in words, got: {told}"
         );
         assert!(
             told.contains(&held),
@@ -1244,6 +1287,86 @@ mod tests {
             told.contains("500"),
             "the terminal must name the status, got: {told}"
         );
+        // Terminal is only half of it. The ladder stopped holding a token that still
+        // points at a real position, and without it the caller's only recourse is a
+        // bare re-run that restarts at row 0 and re-spends the per-IP budget. Every
+        // terminal that holds a usable token must hand it back.
+        assert!(
+            told.contains(&t) && told.contains(&format!("--scan {t}")),
+            "the still-held continuation and its resuming invocation must be surfaced \
+             on a mid-ladder terminal, got: {told}"
+        );
+
+        m1.assert_async().await;
+        m2.assert_async().await;
+    }
+
+    /// Scenario 10c, the other reachable terminal that holds a token: rung 1 offers a
+    /// valid continuation, rung 2 answers `search_incomplete` with a MALFORMED one.
+    ///
+    /// The offered token is unusable and must never be echoed, but the token the client
+    /// already HOLDS is untouched by that rejection and still points at where the scan
+    /// stopped, so it is what must come back. Distinct from scenario 4, where the node
+    /// offers nothing at all: that is its deliberate "the scan wrapped and finished"
+    /// signal and carries no resume hint.
+    #[tokio::test]
+    async fn test_cmd_get_rejected_offered_token_still_surfaces_the_held_one() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+        let t = make_token("t1");
+        let malformed = "abc#def&ghi";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c1 = calls.clone();
+        let c2 = calls.clone();
+
+        let m1 = server
+            .mock("GET", "/ipfs/bafkreirejectedoffer")
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_header("retry-after", "0")
+            .with_body_from_request({
+                let t = t.clone();
+                move |_req| {
+                    c1.fetch_add(1, Ordering::SeqCst);
+                    incomplete_body(Some(&t), "scan truncated").into_bytes()
+                }
+            })
+            .expect(1)
+            .create_async()
+            .await;
+        let m2 = server
+            .mock("GET", "/ipfs/bafkreirejectedoffer")
+            .match_query(mockito::Matcher::Exact(format!("scan={t}")))
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_header("retry-after", "0")
+            .with_body_from_request(move |_req| {
+                c2.fetch_add(1, Ordering::SeqCst);
+                incomplete_body(Some(malformed), "scan truncated").into_bytes()
+            })
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = cmd_get("bafkreirejectedoffer".to_string(), server.url(), None, None)
+            .await
+            .expect_err("a malformed offered continuation must be terminal");
+        let told = told(&err);
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a rejected offer is terminal, so exactly two node calls"
+        );
+        assert!(
+            told.contains(&t) && told.contains(&format!("--scan {t}")),
+            "the still-held continuation and its resuming invocation must be surfaced, \
+             got: {told}"
+        );
+        assert!(
+            !told.contains("abc#") && !told.contains("def&ghi"),
+            "a rejected token must never be echoed into the message, got: {told}"
+        );
 
         m1.assert_async().await;
         m2.assert_async().await;
@@ -1299,13 +1422,20 @@ mod tests {
             "the give-up must name the deadline, not the cap, got: {told}"
         );
         let calls = calls.load(Ordering::SeqCst);
+        // The lower bound is 1, not 2. What this scenario proves is that the DEADLINE,
+        // not the cap, is what ends the ladder, and one call satisfies that as well as
+        // three do; requiring a resume as well made the test depend on a loaded runner
+        // fitting two round trips inside 2.5s, which is the likeliest flake in the
+        // suite. That a valid continuation is actually resumed with is scenario 1's job.
         assert!(
-            (2..9).contains(&calls),
+            (1..9).contains(&calls),
             "the deadline must stop the ladder before the cap, made {calls} calls"
         );
         assert!(
             elapsed < Duration::from_secs(9),
-            "composed worst case is the 2.5s deadline plus one 5s clamped wait, took {elapsed:?}"
+            "the ladder never reaches a body read here, and every wait is bounded by the \
+             time left on the 2.5s deadline, so the run is over near the deadline itself; \
+             took {elapsed:?}"
         );
         assert!(
             told.contains(&held) && told.contains(&format!("--scan {held}")),
@@ -1541,5 +1671,185 @@ mod tests {
         );
 
         m.assert_async().await;
+    }
+
+    /// #173 review (F4): a caller-supplied `--scan` value clears the same bar as a
+    /// node-offered one, BEFORE any request is signed. Both existing caller-supplied
+    /// scenarios pass a valid token, so the reject arm of that match was uncovered and
+    /// deleting the check left every test green even though the identical property is
+    /// covered on the node-offered side. A malformed value must fail with no node call
+    /// at all, and the rejection names the bound rather than echoing the value.
+    #[tokio::test]
+    async fn test_cmd_get_rejects_a_malformed_caller_supplied_continuation() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+        let bad = "abc#def&ghi";
+
+        // Nothing may be sent: the value would otherwise reach a signed target.
+        let m = server
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let err = cmd_get_inner(
+            "bafkreibadinput".to_string(),
+            server.url(),
+            None,
+            Some(bad.to_string()),
+            SCAN_DEADLINE,
+            MAX_SCAN_RESUMES,
+        )
+        .await
+        .expect_err("a malformed --scan value must be rejected");
+        let told = told(&err);
+
+        assert!(
+            told.contains(&MAX_CONTINUATION_LEN.to_string())
+                && told.to_lowercase().contains("base64url"),
+            "the rejection must name the bound, got: {told}"
+        );
+        assert!(
+            !told.contains("abc#") && !told.contains("def&ghi"),
+            "a rejected value must never be echoed back, got: {told}"
+        );
+
+        m.assert_async().await;
+    }
+
+    /// #173 review (F3): the `Retry-After` clamp must actually bind somewhere. Every
+    /// other retryable fixture answers `Retry-After: 0` or `1`, both already under the
+    /// 5 second clamp, and the one 3600 in the suite rides a 429 that returns before
+    /// the header is ever parsed. So deleting `.min(MAX_RETRY_AFTER)` left the whole
+    /// suite green.
+    ///
+    /// Here a retryable 503 asks for an hour, with a valid continuation, under a
+    /// deadline set a little wider than the clamp. Clamped, the first wait is 5
+    /// seconds and the deadline still has room for a second attempt. Unclamped, that
+    /// one wait consumes the whole deadline and the run ends after a single call. The
+    /// call count is what separates them, and it fails fast rather than hanging,
+    /// because the wait is also bounded by the time left on the deadline.
+    #[tokio::test]
+    async fn test_cmd_get_clamps_a_hostile_retry_after_below_the_deadline() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+
+        let m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_header("retry-after", "3600")
+            .with_body_from_request(move |req| {
+                c.fetch_add(1, Ordering::SeqCst);
+                let next = next_token(scan_of(req.path_and_query()).as_deref());
+                incomplete_body(Some(&next), "scan truncated").into_bytes()
+            })
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let started = Instant::now();
+        let err = cmd_get_inner(
+            "bafkreihostileretry".to_string(),
+            server.url(),
+            None,
+            None,
+            Duration::from_secs(6),
+            MAX_SCAN_RESUMES,
+        )
+        .await
+        .expect_err("a ladder that outruns the deadline must end in an error");
+        let elapsed = started.elapsed();
+        let calls = calls.load(Ordering::SeqCst);
+
+        assert!(
+            calls >= 2,
+            "the clamp caps a single wait at {}s, well under the 6s deadline, so one \
+             hostile Retry-After must not swallow the run: made {calls} calls",
+            MAX_RETRY_AFTER.as_secs()
+        );
+        assert!(
+            elapsed < Duration::from_secs(12),
+            "every wait is bounded by the clamp and by the time left on the 6s \
+             deadline, so the run ends near the deadline; took {elapsed:?}"
+        );
+        assert!(
+            told(&err).to_lowercase().contains("deadline"),
+            "the give-up must name the deadline, got: {}",
+            told(&err)
+        );
+
+        m.assert_async().await;
+    }
+
+    /// #173 review (F9): a `search_incomplete` body the 8 KiB read cap CUT SHORT must
+    /// be terminal, not retried.
+    ///
+    /// A cut body cannot parse, so its `error` code reads as absent, and on a 503 that
+    /// used to fall through to the generic overload arm, which resumes on the token
+    /// ALREADY HELD. The fresh continuation the node offered is inside the part that
+    /// was never read, so the ladder replays one position for every remaining rung: a
+    /// 9000-character body drove eight requests carrying the old token. Unclassifiable
+    /// is terminal, like any unrecognized code.
+    #[tokio::test]
+    async fn test_cmd_get_truncated_incomplete_body_is_terminal_not_a_replay() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+        let t = make_token("t1");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c1 = calls.clone();
+        let c2 = calls.clone();
+
+        let m1 = server
+            .mock("GET", "/ipfs/bafkreicutbody")
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_header("retry-after", "0")
+            .with_body_from_request({
+                let t = t.clone();
+                move |_req| {
+                    c1.fetch_add(1, Ordering::SeqCst);
+                    incomplete_body(Some(&t), "scan truncated").into_bytes()
+                }
+            })
+            .expect(1)
+            .create_async()
+            .await;
+        // Well past the 8 KiB cap, with the fresh continuation behind the cut.
+        let m2 = server
+            .mock("GET", "/ipfs/bafkreicutbody")
+            .match_query(mockito::Matcher::Exact(format!("scan={t}")))
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_header("retry-after", "0")
+            .with_body_from_request(move |_req| {
+                c2.fetch_add(1, Ordering::SeqCst);
+                incomplete_body(Some(&make_token("t2")), &"x".repeat(9000)).into_bytes()
+            })
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = cmd_get("bafkreicutbody".to_string(), server.url(), None, None)
+            .await
+            .expect_err("an unclassifiable 503 body must be an error");
+        let told = told(&err);
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a body cut by the read cap must end the ladder, not replay the held token \
+             for every remaining rung"
+        );
+        assert!(
+            told.contains(&t) && told.contains(&format!("--scan {t}")),
+            "the still-held continuation and its resuming invocation must be surfaced, \
+             got: {told}"
+        );
+
+        m1.assert_async().await;
+        m2.assert_async().await;
     }
 }
