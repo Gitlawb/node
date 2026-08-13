@@ -84,7 +84,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         ipfs_max_legacy_probes: crate::api::ipfs::MAX_LEGACY_PROBES_PER_REQUEST,
         ipfs_legacy_scan_page_rows: crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS,
         ipfs_max_legacy_scan_rows: crate::api::ipfs::MAX_LEGACY_SCAN_ROWS_PER_REQUEST,
-        ipfs_max_legacy_scan_rules: crate::api::ipfs::MAX_LEGACY_SCAN_RULES_PER_REQUEST,
+        ipfs_max_legacy_scan_rule_bytes: crate::api::ipfs::MAX_LEGACY_SCAN_RULE_BYTES_PER_REQUEST,
         ipfs_scan_token_key: Arc::new(crate::state::AppState::new_scan_token_key()),
         ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust: crate::rate_limit::TrustedProxy::None,
@@ -6522,6 +6522,210 @@ mod tests {
         assert!(body.contains("public bytes"), "the object's bytes serve");
     }
 
+    /// One transient database fault must not permanently disable the sweep.
+    ///
+    /// The wrapper was made periodic so coverage is wall-clock rather than a reboot
+    /// count. Returning for good on the first failed pass query undoes exactly that: a
+    /// single deadlock or connection reset disables legacy-CID repair for the whole
+    /// process lifetime, `main` never joins the handle, so nothing observes it past one
+    /// warn, and the node keeps withholding every unrepaired row until someone reboots
+    /// it.
+    ///
+    /// The fixture renames `pinned_cids` out of the way so every pass query fails, waits
+    /// for the loop to have gone round more than once (which a terminal return cannot
+    /// do), then renames the table back and asserts the still-running loop picks the
+    /// repair up.
+    ///
+    /// MUTATION (RED): restore the terminal `return` on `PassFailed` and the loop exits
+    /// on the first failure, so the row is never repaired.
+    #[sqlx::test]
+    async fn sweep_rearms_after_a_failed_pass(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let _serialized = crate::ipfs_pin::sweep_run_lock().lock().await;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+
+        let fx = seed_cid_repos(&slug, &short, &["rearmsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("rearmsrc.git");
+        let repo = seed_repo(&owner_did, "rearmsrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let (raw_cid, _provider) =
+            seed_legacy_pin(&pool, &bare, &fx.public_oid, Some(&repo.id)).await;
+
+        // Every pass query now fails, exactly as a broken database makes them fail.
+        sqlx::query("ALTER TABLE pinned_cids RENAME TO pinned_cids_hidden")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        crate::ipfs_pin::reset_sweep_runs();
+        let db = state.db.clone();
+        let git_bin = state.git_bin.clone();
+        // Short rather than literally zero: the loop is spinning against a real
+        // Postgres, and the property under test is that it goes round again at all. The
+        // failure and idle intervals are multiples of this base, so they shrink with it.
+        let handle = tokio::spawn(async move {
+            crate::ipfs_pin::run_sweep_rearmed(
+                std::path::Path::new("/tmp"),
+                &git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                std::time::Duration::from_millis(10),
+                &db,
+            )
+            .await
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::ipfs_pin::sweep_runs() < 2 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            crate::ipfs_pin::sweep_runs() >= 2,
+            "a failed pass must re-arm: the sweep completed {} run(s) and stopped, which \
+             is one transient database fault disabling legacy-CID repair for the life of \
+             the process",
+            crate::ipfs_pin::sweep_runs()
+        );
+        assert!(
+            !handle.is_finished(),
+            "the re-arm loop must never return; shutdown preempts it from the outside"
+        );
+
+        // The database comes back. The loop is still there to notice.
+        sqlx::query("ALTER TABLE pinned_cids_hidden RENAME TO pinned_cids")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut repaired = false;
+        while std::time::Instant::now() < deadline {
+            if stored_pin(&pool, &fx.public_oid).await.0 == raw_cid {
+                repaired = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        handle.abort();
+        assert!(
+            repaired,
+            "once the database recovers the still-running sweep must repair the row; a \
+             wrapper that returned on the first failure never gets here"
+        );
+    }
+
+    /// A run that repairs nothing backs off; a run that repairs keeps the base interval.
+    ///
+    /// The base interval is priced against a settled table. It is not priced against the
+    /// table that never settles: source-less rows whose bytes are permanently gone cost
+    /// up to `MAX_DEAD_ROW_READS_PER_RUN` object reads per run and repair nothing, every
+    /// base interval, forever. Backing off on a fruitless run is what stops paying that;
+    /// resetting on a productive one is what keeps a table that is still yielding
+    /// repairs being walked often.
+    ///
+    /// Both directions, on the wall clock, off the run counter the wrapper exposes:
+    /// leg 1 is an empty table, where a run repairs nothing and the next run must NOT
+    /// arrive within a window several base intervals wide; leg 2 seeds a repairable row,
+    /// so the first run repairs and the second must arrive one BASE interval later.
+    ///
+    /// MUTATION (RED): drop the idle branch and leg 1 completes many runs in its window.
+    #[sqlx::test]
+    async fn sweep_backs_off_after_a_run_that_repairs_nothing(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let _serialized = crate::ipfs_pin::sweep_run_lock().lock().await;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+        // Scaled down from production by a constant factor: the idle interval is a
+        // multiple of this base, so the ratio under test is the production ratio.
+        let base = std::time::Duration::from_millis(200);
+        let window = std::time::Duration::from_millis(800);
+
+        let spawn_loop = |db: std::sync::Arc<crate::db::Db>, git_bin: String| {
+            tokio::spawn(async move {
+                crate::ipfs_pin::run_sweep_rearmed(
+                    std::path::Path::new("/tmp"),
+                    &git_bin,
+                    git_timeout,
+                    16,
+                    std::time::Duration::ZERO,
+                    base,
+                    &db,
+                )
+                .await
+            })
+        };
+        let await_first_run = || async {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while crate::ipfs_pin::sweep_runs() < 1 && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(
+                crate::ipfs_pin::sweep_runs() >= 1,
+                "fixture precondition: the sweep completes a first run"
+            );
+        };
+
+        // Leg 1: nothing to repair. The next run must not arrive inside a window four
+        // base intervals wide.
+        crate::ipfs_pin::reset_sweep_runs();
+        let idle_loop = spawn_loop(state.db.clone(), state.git_bin.clone());
+        await_first_run().await;
+        tokio::time::sleep(window).await;
+        let idle_runs = crate::ipfs_pin::sweep_runs();
+        idle_loop.abort();
+        assert_eq!(
+            idle_runs,
+            1,
+            "a run that repaired nothing must back off to the longer idle interval; at \
+             the base interval this window fits about {} runs, each of which pays up to \
+             MAX_DEAD_ROW_READS_PER_RUN fruitless object reads against a table that will \
+             never repair",
+            window.as_millis() / base.as_millis()
+        );
+
+        // Leg 2: a repairable row. The run that repairs it must be followed by the BASE
+        // interval, so a second run lands well inside the same window.
+        let fx = seed_cid_repos(&slug, &short, &["idlesrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("idlesrc.git");
+        let repo = seed_repo(&owner_did, "idlesrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let (raw_cid, _provider) =
+            seed_legacy_pin(&pool, &bare, &fx.public_oid, Some(&repo.id)).await;
+
+        crate::ipfs_pin::reset_sweep_runs();
+        let busy_loop = spawn_loop(state.db.clone(), state.git_bin.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::ipfs_pin::sweep_runs() < 2 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let busy_runs = crate::ipfs_pin::sweep_runs();
+        busy_loop.abort();
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            raw_cid,
+            "fixture precondition: the first run repairs the row"
+        );
+        assert!(
+            busy_runs >= 2,
+            "a run that repaired something must keep the BASE interval; backing off \
+             after a productive run would stall a table that is still yielding repairs \
+             (saw {busy_runs} run(s))"
+        );
+    }
+
     /// U4 scenario 2 (#173): a legacy row whose object bytes are gone is left exactly
     /// as it is by the sweep: never rewritten, never deleted. The row stays withheld
     /// until the bytes come back, which is the non-destructive contract the skip-branch
@@ -9328,46 +9532,6 @@ mod tests {
         );
     }
 
-    /// F5 scenario 11 (#173 round 13): a failing pass query EXITS the wrapper.
-    ///
-    /// The re-arm loop is for a healthy node making slow progress. A broken database is
-    /// not that, and retrying it every re-arm would turn one logged failure into an
-    /// endless stream of them. The one-shot behavior a failing pass had before the
-    /// wrapper existed is preserved exactly.
-    #[sqlx::test]
-    async fn sweep_rearm_exits_on_pass_failure(pool: PgPool) {
-        let state = test_state(pool.clone()).await;
-        sqlx::query("DROP TABLE pinned_cids")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let stats = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            crate::ipfs_pin::run_sweep_rearmed(
-                std::path::Path::new("/tmp"),
-                &state.git_bin,
-                std::time::Duration::from_secs(5),
-                16,
-                std::time::Duration::ZERO,
-                std::time::Duration::ZERO,
-                &state.db,
-            ),
-        )
-        .await
-        .expect("a failing pass query must END the wrapper, never re-arm it forever");
-
-        assert_eq!(
-            stats.stop,
-            crate::ipfs_pin::SweepStop::PassFailed,
-            "the wrapper reports the failure it exited on"
-        );
-        assert_eq!(
-            stats.repaired, 0,
-            "nothing was repaired against a broken table"
-        );
-    }
-
     /// F1 scenario 6 (#173, the collision case): two warm repos hold identical bytes,
     /// which is the shape (forks, a shared LICENSE blob, the empty tree) that makes an
     /// exclusive first-pinner claim wrong. Discovery records ONE additive source and
@@ -10815,7 +10979,7 @@ mod tests {
         let mut state = test_state(pool).await;
         // Budget = one full scan of the single seeded repo: 1 page + 1 probe. The page
         // is charged because the legacy scan's DB-facing pages draw on this same bucket
-        // (#173 round 13, F2) — without that charge a denial-only inventory could be
+        // (#173 round 13, F2). Without that charge a denial-only inventory could be
         // re-paged for free by re-requesting. Production never sees a bucket this small:
         // `AppState::ipfs_work_budget` floors it at probes + pages, so only a fixture
         // that sets the limiter by hand has to do the arithmetic itself.
@@ -10884,7 +11048,7 @@ mod tests {
         // pages draw on this same bucket (#173 round 13, F2), so re-requesting cannot
         // buy the inventory again for free; all four repos fit in one 128-row page, so
         // one page covers the whole scan. Production is floored at probes + pages by
-        // `AppState::ipfs_work_budget` — only a hand-set limiter does this arithmetic.
+        // `AppState::ipfs_work_budget`; only a hand-set limiter does this arithmetic.
         state.ipfs_work_rate_limiter =
             crate::rate_limit::RateLimiter::new(5, Duration::from_secs(3600));
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;

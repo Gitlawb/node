@@ -17,17 +17,18 @@
 //!   * A fresh `OsRng` nonce on EVERY seal. Under a stream cipher a repeated nonce
 //!     means repeated keystream, and an attacker who can force the node to seal a
 //!     position whose plaintext they know XORs two tokens and recovers a withheld
-//!     row's fields in full — strictly worse than emitting plaintext.
+//!     row's fields in full, strictly worse than emitting plaintext.
 //!   * FIXED-WIDTH plaintext. AEAD ciphertext is plaintext-length plus the tag, and
 //!     both halves of a scan position vary in length, so a variable encoding would
 //!     make token LENGTH a side channel for the sealed row (a short name under a
 //!     short owner vs a long one). Every token this module mints is byte-identical
-//!     in length.
+//!     in length. The two halves are padded to their own separate widths, which is
+//!     a per-field constant and so still leaks nothing about a given row.
 //!   * The canonical CID as associated data, so a token minted while scanning for
 //!     one CID does not authenticate when replayed against another.
 //!
-//! Every failure to open — wrong key, tampered bytes, wrong CID, expired, malformed
-//! — returns the same `None`. The caller treats that as "no token" and starts at the
+//! Every failure to open (wrong key, tampered bytes, wrong CID, expired, malformed)
+//! returns the same `None`. The caller treats that as "no token" and starts at the
 //! front, so no failure class is distinguishable and the token is no oracle.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
@@ -48,18 +49,38 @@ pub struct ScanPosition {
 
 /// Plaintext version byte, so a future layout change is a clean open-failure
 /// (treated as absent) rather than a misparse.
-const VERSION: u8 = 1;
+///
+/// Bumped to 2 when the two halves stopped sharing one width (see [`ID_WIDTH`]).
+/// A token minted under the version-1 layout is a different length and a different
+/// framing, so it opens to `None` and the caller restarts at the front, which is the
+/// safe direction: a misparse would resume at a fabricated row and skip coverage.
+const VERSION: u8 = 2;
 
-/// Byte width each variable-length field is padded to. Both halves of a scan
-/// position are stored at this width regardless of content, which is what keeps
-/// every minted token the same length. A repo id is `<owner-key>/<name>`, so 128
-/// clears a `did:key` z-base58 owner plus a long name with room to spare; anything
-/// past it fails the seal loudly rather than silently truncating a cursor (a
-/// truncated cursor would resume at the wrong row and skip coverage).
-const FIELD_WIDTH: usize = 128;
+/// Byte width the `created_at` half is padded to. Every value stored here is a
+/// serialized timestamp, about 30 bytes, so 64 is roomy for the field's whole domain.
+/// It is deliberately NOT widened to match [`ID_WIDTH`]: padding both halves to the id
+/// width would nearly double every token for a field that can never use the space.
+const CREATED_WIDTH: usize = 64;
 
-/// `version | created_len:u16 | created[FIELD_WIDTH] | id_len:u16 | id[FIELD_WIDTH] | expires:i64`
-const PLAINTEXT_LEN: usize = 1 + 2 + FIELD_WIDTH + 2 + FIELD_WIDTH + 8;
+/// Byte width the `id` half is padded to.
+///
+/// The bound is set by the WRITERS, not by what a typical id happens to look like.
+/// `upsert_mirror_repo` builds `repos.id` as `{owner}/{name}`, and the slug validators
+/// in the node's `repo_store` admit an owner of up to 255 bytes and a name of up to
+/// 100, so 356 bytes is reachable through the ordinary write path and repo names are
+/// peer-controllable. 384 clears that with margin.
+///
+/// Under-sizing this is not a cosmetic bug. A row at a truncation boundary whose id
+/// exceeds the width fails the seal, the handler sheds a 503 with no continuation, and
+/// a tokenless shed is byte-identical to the wrapped-scan response whose contract is
+/// "the absence of a token means the ladder is over". The boundary row is deterministic
+/// for a stable inventory, so every retry reproduces it and every row past it becomes
+/// permanently unreachable. Anything past the width still fails loudly rather than
+/// silently truncating a cursor into one that resumes at the wrong row.
+const ID_WIDTH: usize = 384;
+
+/// `version | created_len:u16 | created[CREATED_WIDTH] | id_len:u16 | id[ID_WIDTH] | expires:i64`
+const PLAINTEXT_LEN: usize = 1 + 2 + CREATED_WIDTH + 2 + ID_WIDTH + 8;
 
 /// Nonce width for XChaCha20-Poly1305.
 const NONCE_LEN: usize = 24;
@@ -73,33 +94,38 @@ pub fn new_key() -> [u8; 32] {
 
 // The two halves below are deliberately separate and adjacent. The framing pair owns
 // "every token is the same length"; the AEAD pair owns "the contents are confidential
-// and CID-bound". Keeping them apart is what lets each property be exercised — and
-// broken — without disturbing the other.
+// and CID-bound". Keeping them apart is what lets each property be exercised (and
+// broken) without disturbing the other.
 
 /// Encode a position into the FIXED-WIDTH plaintext:
-/// `version | created_len:u16 | created[FIELD_WIDTH] | id_len:u16 | id[FIELD_WIDTH] | expires:i64`
+/// `version | created_len:u16 | created[CREATED_WIDTH] | id_len:u16 | id[ID_WIDTH] | expires:i64`
 ///
 /// The padding is the point. AEAD ciphertext is plaintext-length plus the tag, and both
 /// halves of a scan position vary in length, so a length-prefixed encoding with no
-/// padding would make token LENGTH a side channel for the sealed row.
+/// padding would make token LENGTH a side channel for the sealed row. Each half is
+/// padded to its OWN fixed width, which keeps every minted token the same length while
+/// letting the id half carry the range the write path actually admits.
 fn encode_position(pos: &ScanPosition, expires_at_unix: i64) -> anyhow::Result<Vec<u8>> {
     let mut out = vec![0u8; PLAINTEXT_LEN];
     out[0] = VERSION;
     let mut at = 1;
-    for field in [pos.created_at_key.as_bytes(), pos.id.as_bytes()] {
-        if field.len() > FIELD_WIDTH {
+    for (field, width) in [
+        (pos.created_at_key.as_bytes(), CREATED_WIDTH),
+        (pos.id.as_bytes(), ID_WIDTH),
+    ] {
+        if field.len() > width {
             // Loud rather than truncating: a clipped cursor resumes at the wrong row and
             // silently skips coverage, which is the availability half of the bug this
             // token exists to fix.
             anyhow::bail!(
-                "scan token field is {} bytes, over the {FIELD_WIDTH}-byte fixed width",
+                "scan token field is {} bytes, over the {width}-byte fixed width",
                 field.len()
             );
         }
         out[at..at + 2].copy_from_slice(&(field.len() as u16).to_le_bytes());
         at += 2;
         out[at..at + field.len()].copy_from_slice(field);
-        at += FIELD_WIDTH;
+        at += width;
     }
     out[at..at + 8].copy_from_slice(&expires_at_unix.to_le_bytes());
     Ok(out)
@@ -112,14 +138,14 @@ fn decode_position(bytes: &[u8]) -> Option<(ScanPosition, i64)> {
     }
     let mut at = 1;
     let mut fields = [const { String::new() }; 2];
-    for slot in fields.iter_mut() {
+    for (slot, width) in fields.iter_mut().zip([CREATED_WIDTH, ID_WIDTH]) {
         let len = u16::from_le_bytes([bytes[at], bytes[at + 1]]) as usize;
         at += 2;
-        if len > FIELD_WIDTH {
+        if len > width {
             return None;
         }
         *slot = String::from_utf8(bytes[at..at + len].to_vec()).ok()?;
-        at += FIELD_WIDTH;
+        at += width;
     }
     let expires_at = i64::from_le_bytes(bytes[at..at + 8].try_into().ok()?);
     let [created_at_key, id] = fields;
@@ -132,7 +158,7 @@ fn seal_bytes(key: &[u8; 32], cid: &str, plaintext: &[u8]) -> anyhow::Result<Vec
         .map_err(|e| anyhow::anyhow!("scan token key: {e}"))?;
     // A FRESH nonce per seal, from the OS CSPRNG. Under a stream cipher a repeated nonce
     // repeats the keystream, and two tokens sealed under one nonce XOR to the difference
-    // of their plaintexts — which recovers a withheld row in full when the attacker can
+    // of their plaintexts, which recovers a withheld row in full when the attacker can
     // force one of the two positions. This draw is the property the whole confidentiality
     // claim rests on.
     let mut nonce = [0u8; NONCE_LEN];
@@ -176,7 +202,8 @@ fn open_bytes(key: &[u8; 32], cid: &str, raw: &[u8]) -> Option<Vec<u8>> {
 /// Seal `pos` under `key`, bound to `cid`, expiring at `expires_at_unix`.
 ///
 /// Returns the base64url (no pad) token. Errors only when a field exceeds
-/// [`FIELD_WIDTH`] or the AEAD itself fails — never silently truncates.
+/// its half's fixed width ([`CREATED_WIDTH`], [`ID_WIDTH`]) or the AEAD itself fails,
+/// never silently truncates.
 pub fn seal_scan_token(
     key: &[u8; 32],
     cid: &str,
@@ -256,10 +283,27 @@ mod tests {
         );
     }
 
+    /// The id half must clear the LARGEST repo id the node's own write path admits,
+    /// not merely a typical one. `upsert_mirror_repo` builds `repos.id` as
+    /// `{owner}/{name}`, and the slug validators in `repo_store` admit 255 bytes of
+    /// owner and 100 of name, so 356 is reachable. A width under that turns the
+    /// boundary row into a seal failure, which sheds a tokenless 503 that is
+    /// byte-identical to "your ladder is over" and strands every row past it forever.
+    #[test]
+    fn round_trips_a_repo_id_at_the_write_paths_maximum() {
+        let key = new_key();
+        let id = format!("{}/{}", "o".repeat(255), "n".repeat(100));
+        assert_eq!(id.len(), 356, "255 owner + '/' + 100 name");
+        let p = pos("2020-01-01T00:00:03+00:00", &id);
+        let t = seal_scan_token(&key, "bafkcid", &p, 1 << 40)
+            .expect("a repo id the write path admits must seal, never fail the width");
+        assert_eq!(open_scan_token(&key, "bafkcid", &t, 0), Some(p));
+    }
+
     #[test]
     fn a_field_over_the_fixed_width_fails_loudly() {
         let key = new_key();
-        let p = pos("2020-01-01T00:00:03+00:00", &"x".repeat(FIELD_WIDTH + 1));
+        let p = pos("2020-01-01T00:00:03+00:00", &"x".repeat(ID_WIDTH + 1));
         assert!(
             seal_scan_token(&key, "bafkcid", &p, 1 << 40).is_err(),
             "an over-wide field must fail the seal, never be truncated into a cursor \

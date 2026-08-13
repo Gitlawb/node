@@ -114,20 +114,22 @@ pub struct AppState {
     /// all-denying inventory paged the whole repo table at zero probes (#173 round 13, F2).
     /// Truncating here sheds a retryable 503 carrying a sealed continuation token.
     pub ipfs_max_legacy_scan_rows: usize,
-    /// Per-request ceiling on how many visibility RULES the CID resolver's legacy scan
-    /// may retain (default `api::ipfs::MAX_LEGACY_SCAN_RULES_PER_REQUEST`). The row
-    /// ceiling above bounds the row count but not the memory each row drags in: the
-    /// pager keeps every fetched page's rules for the whole request. Deliberately NOT an
-    /// operator knob (it is a memory guard, not a reach tradeoff); a field only for the
-    /// same test-seam reason as the sibling caps.
-    pub ipfs_max_legacy_scan_rules: usize,
+    /// Per-request ceiling on the BYTES of visibility rules the CID resolver's legacy
+    /// scan may retain (default `api::ipfs::MAX_LEGACY_SCAN_RULE_BYTES_PER_REQUEST`). The
+    /// row ceiling above bounds the row count but not the memory each row drags in: the
+    /// pager keeps every fetched page's rules for the whole request, and neither the
+    /// number of rules per repo nor the length of a rule's reader list is capped, so a
+    /// rule COUNT would be the wrong unit. Deliberately NOT an operator knob (it is a
+    /// memory guard, not a reach tradeoff); a field only for the same test-seam reason as
+    /// the sibling caps.
+    pub ipfs_max_legacy_scan_rule_bytes: usize,
     /// Per-boot key sealing the legacy scan's continuation tokens (INV-13).
     ///
     /// The token is minted from a FETCHED row on a scan that served nothing, so by
     /// construction that row is a private or quarantined repo the caller may not read:
     /// its `created_at` and its `id` (which carries the owner's DID) are withheld
     /// fields. The token is therefore AEAD-SEALED, never signed plaintext and never
-    /// base64-of-plaintext — integrity is not confidentiality. Random per boot rather
+    /// base64-of-plaintext, since integrity is not confidentiality. Random per boot rather
     /// than derived or persisted: a scan continuation has no cross-restart meaning (a
     /// stale token simply fails to open and the caller restarts at the front, which is
     /// the same uniform absent behaviour a tampered token gets), and a per-boot key

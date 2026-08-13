@@ -309,12 +309,14 @@ pub(crate) struct SweepStats {
 
 /// Why a sweep run ended, which is what [`run_sweep_rearmed`] dispatches on.
 ///
-/// Two of the three arms are re-armable and one is not. A run that walked to the end of
-/// the table and a run that paused on [`MAX_DEAD_ROW_READS_PER_RUN`] both left the node
-/// in a state a later run improves, so the wrapper sleeps and goes again. A failing pass
-/// QUERY is a broken database, and retrying it on a timer would turn one logged failure
-/// into an endless stream of them, so the wrapper returns and leaves the run one-shot,
-/// exactly as it was before the re-arm existed.
+/// All three arms are re-armable; what differs is how long the wrapper waits. A run that
+/// walked to the end of the table and a run that paused on
+/// [`MAX_DEAD_ROW_READS_PER_RUN`] both left the node in a state a later run improves, so
+/// the wrapper sleeps and goes again. A failing pass QUERY is a broken database, so it
+/// waits far longer (see [`SWEEP_REARM_DELAY`]) rather than turning one logged
+/// failure into a stream of them, but it does go again: exiting for good made a single
+/// deadlock or connection reset disable legacy-CID repair for the whole process
+/// lifetime.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SweepStop {
     /// The ordered walk reached the end of the table (a short batch).
@@ -496,7 +498,7 @@ async fn load_discovery_ctx(
     // exists to forbid. Same query, different threat model. This is background
     // maintenance on a timer: no caller to amplify, no permit to pin, and the pass needs
     // the whole warm candidate set before it can call a row settled. Do not "align" this
-    // loop with the resolver's — the budgets it stops on have no counterpart here.
+    // loop with the resolver's: the budgets it stops on have no counterpart here.
     //
     // Per PASS, not per row: `load_discovery_ctx` already runs once per pass and its
     // result is reused for every source-less row, so the paging cost is paid once.
@@ -1112,24 +1114,74 @@ pub(crate) async fn sweep_legacy_provider_cids(
 /// a few queries every five minutes and the migration still converges in hours rather
 /// than never. It is also the anti-hot-spin floor for the degenerate case, an empty or
 /// fully repaired table where a run returns immediately.
+///
+/// That pricing holds for a table that settles. It does NOT hold for the table that
+/// never does: a node carrying rows whose source bytes are permanently gone spends up to
+/// [`MAX_DEAD_ROW_READS_PER_RUN`] (64) object reads on every run, repairs nothing, and
+/// arrives back at exactly the same rows next time. At this interval alone that is 64
+/// fruitless `git cat-file` invocations every five minutes for the life of the process.
+/// This constant is therefore the interval after a run that REPAIRED something;
+/// [`SWEEP_IDLE_REARM_MULTIPLIER`] is what a run that repaired nothing backs off to (one
+/// hour), and it is what keeps the unrepairable case from costing that forever. A failed
+/// pass waits [`SWEEP_FAILURE_REARM_MULTIPLIER`] times this (30 minutes).
 pub(crate) const SWEEP_REARM_DELAY: Duration = Duration::from_secs(300);
 
-/// Run the legacy provider-CID sweep on a timer until shutdown or a broken database.
+/// How much longer the sweep waits after a run that repaired NOTHING, as a multiple of
+/// the base interval.
+///
+/// The base interval above is priced against a settled table, where a run is an indexed
+/// range scan and a codec decode per row. It is not priced against the case that never
+/// settles: a node carrying rows whose source bytes are permanently gone spends up to
+/// [`MAX_DEAD_ROW_READS_PER_RUN`] object reads on every run, repairs nothing, and does
+/// it again on the next one, forever. At the base interval that is 64 fruitless object
+/// reads every five minutes, for the life of the process, against a table that will
+/// never repair.
+///
+/// So a run that repaired nothing backs off to the longer interval instead. Any run that
+/// repairs at least one row resets to the base, because a table still yielding repairs
+/// is one worth walking often. A single longer interval, not an exponential ladder: the
+/// point is to stop paying a fixed waste every five minutes.
+///
+/// Expressed as a multiple of the base rather than as an absolute so that shortening the
+/// base (which the wrapper's tests do) shortens all three intervals coherently.
+/// One hour is what it comes to in production.
+const SWEEP_IDLE_REARM_MULTIPLIER: u32 = 12;
+
+/// How much longer the sweep waits after a pass QUERY failed, as a multiple of the base.
+///
+/// A failing pass is a broken database, not a broken sweep, and retrying it on the base
+/// interval would turn one fault into a stream of failing queries. But the alternative
+/// the wrapper used to take, returning for good, is worse: one deadlock or connection
+/// reset permanently disabled legacy-CID repair for the whole process lifetime, and
+/// nothing joins the task, so the only trace was a single warn. Half an hour in
+/// production is long enough not to hammer a database that is down, short enough that a
+/// transient fault costs one window rather than a reboot.
+const SWEEP_FAILURE_REARM_MULTIPLIER: u32 = 6;
+
+/// Consecutive failed runs before the per-failure log escalates from `warn!` to
+/// `error!`. A single failure is a transient the next run recovers from; a standing
+/// stream of them is a database that needs an operator, and at the production failure
+/// interval this is reached in a couple of hours.
+const SWEEP_FAILURE_ESCALATE_AFTER: u32 = 3;
+
+/// Run the legacy provider-CID sweep on a timer until shutdown.
 ///
 /// Owns the [`DiscoveryTraversalState`] across runs, which is the reason this is a
 /// wrapper and not a loop inside `sweep_legacy_provider_cids`: a run can PAUSE
 /// mid-traversal on [`MAX_DEAD_ROW_READS_PER_RUN`], and the traversal it was in is
 /// finished by a later run, which has to apply the advance the earlier run earned.
 ///
-/// Sleeps `rearm_delay` after EVERY re-armable run, unconditionally. Not conditional on
-/// the run having done work: a run over an empty or fully repaired table returns
+/// Sleeps after EVERY run, unconditionally, at the interval its outcome earns:
+/// `rearm_delay` after a run that repaired something, that scaled by
+/// [`SWEEP_IDLE_REARM_MULTIPLIER`] after one that repaired nothing, and by
+/// [`SWEEP_FAILURE_REARM_MULTIPLIER`] after a failed pass query. Not conditional on the
+/// run having done work: a run over an empty or fully repaired table returns
 /// immediately, and without the sleep this loop would spin the database as fast as it
 /// can answer.
 ///
-/// Returns only on [`SweepStop::PassFailed`], preserving the one-shot behavior a failing
-/// database had before the re-arm existed. On a healthy node it never returns, which is
-/// why the per-run summary is logged HERE rather than by the caller off the awaited
-/// value.
+/// It NEVER returns, which is why it yields nothing: shutdown preempts it from the
+/// outside, through the `tokio::select!` the caller wraps it in, so there is no awaited
+/// value for a caller to log and the per-run summary is logged HERE.
 pub(crate) async fn run_sweep_rearmed(
     repos_dir: &std::path::Path,
     git_bin: &str,
@@ -1138,9 +1190,9 @@ pub(crate) async fn run_sweep_rearmed(
     delay: Duration,
     rearm_delay: Duration,
     db: &crate::db::Db,
-) -> SweepStats {
-    let mut totals = SweepStats::default();
+) {
     let mut traversal = DiscoveryTraversalState::default();
+    let mut consecutive_failures: u32 = 0;
     loop {
         let run = sweep_legacy_provider_cids(
             repos_dir,
@@ -1161,18 +1213,78 @@ pub(crate) async fn run_sweep_rearmed(
                 "legacy provider-CID sweep run finished"
             );
         }
-        totals.scanned += run.scanned;
-        totals.repaired += run.repaired;
-        totals.passes += run.passes;
-        totals.retryable_skips += run.retryable_skips;
-        totals.dead_row_reads += run.dead_row_reads;
-        totals.discovery_budget_spent |= run.discovery_budget_spent;
-        totals.stop = run.stop;
-        if run.stop == SweepStop::PassFailed {
-            return totals;
-        }
-        tokio::time::sleep(rearm_delay).await;
+        #[cfg(test)]
+        note_sweep_run();
+
+        // A failed pass RE-ARMS, on its own longer interval, and never returns. Returning
+        // was the whole defect: the wrapper exists so coverage is wall-clock rather than
+        // a reboot count, and one deadlock or connection reset used to disable
+        // legacy-CID repair for the entire process lifetime. Nothing joins this task, so
+        // the only trace was a single warn and the node quietly kept withholding every
+        // unrepaired row. The longer interval is what keeps a genuinely broken database
+        // from being hammered, and the escalation is what keeps it from being quiet.
+        let next = if run.stop == SweepStop::PassFailed {
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            if consecutive_failures > SWEEP_FAILURE_ESCALATE_AFTER {
+                tracing::error!(
+                    consecutive_failures,
+                    "legacy provider-CID sweep has failed every run for a while; the \
+                     database looks broken and legacy CID repair is not progressing"
+                );
+            } else {
+                tracing::warn!(
+                    consecutive_failures,
+                    "legacy provider-CID sweep pass failed; re-arming on the longer \
+                     failure interval"
+                );
+            }
+            rearm_delay.saturating_mul(SWEEP_FAILURE_REARM_MULTIPLIER)
+        } else {
+            consecutive_failures = 0;
+            if run.repaired == 0 {
+                // Nothing repaired: either the table is settled, or it holds rows that
+                // will never repair and this run just paid up to
+                // MAX_DEAD_ROW_READS_PER_RUN fruitless object reads to learn that
+                // again. Back off rather than pay it every base interval forever. Any
+                // run that does repair something resets to the base above.
+                rearm_delay.saturating_mul(SWEEP_IDLE_REARM_MULTIPLIER)
+            } else {
+                rearm_delay
+            }
+        };
+        tokio::time::sleep(next).await;
     }
+}
+
+// Test-only wrapper-loop seam: how many RUNS the re-arm loop has completed. The loop
+// never returns, so a test cannot observe its behaviour off a return value, and the
+// interval it chose is only visible as "did another run happen inside this window".
+// A process-wide counter rather than a `thread_local`, because the loop is awaited on a
+// multi-thread runtime and can move between threads; the sweep tests that read it
+// serialize on `sweep_run_lock` so they never see each other's increments.
+#[cfg(test)]
+static SWEEP_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn note_sweep_run() {
+    SWEEP_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn reset_sweep_runs() {
+    SWEEP_RUNS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn sweep_runs() -> usize {
+    SWEEP_RUNS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Serializes the tests that read [`sweep_runs`], since the counter is process-wide.
+#[cfg(test)]
+pub(crate) fn sweep_run_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 // Test-only cost-gate counter (R8, U7): how many times the opportunistic repair
@@ -1800,6 +1912,23 @@ mod tests {
     // directly against a controlled closure (the record sites take a concrete
     // `&Db` over a `PgPool`, so a failing-first wrapper cannot slot in without
     // changing signatures — see U6 seam note).
+
+    /// The re-arm intervals are expressed as multiples of the base so a test can shrink
+    /// all three coherently. This pins what they come to in production, which is the
+    /// number the constants' docs quote.
+    #[test]
+    fn the_rearm_multipliers_give_the_documented_production_intervals() {
+        assert_eq!(
+            SWEEP_REARM_DELAY.saturating_mul(SWEEP_IDLE_REARM_MULTIPLIER),
+            Duration::from_secs(3600),
+            "a run that repairs nothing waits an hour"
+        );
+        assert_eq!(
+            SWEEP_REARM_DELAY.saturating_mul(SWEEP_FAILURE_REARM_MULTIPLIER),
+            Duration::from_secs(1800),
+            "a failed pass waits half an hour"
+        );
+    }
 
     #[tokio::test]
     async fn retry_lands_after_transient_failures() {

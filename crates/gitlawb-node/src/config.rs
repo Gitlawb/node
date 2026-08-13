@@ -523,8 +523,8 @@ pub struct Config {
     /// absent with a 404. The handler still short-circuits the moment it serves.
     /// Must be between 1 and 1_048_576. Default: 64.
     ///
-    /// The effective per-request ceiling is the TIGHTER of this knob and the node's
-    /// internal per-request history-walk ceiling, `MAX_PIN_SOURCES + 1` = 17 (see
+    /// The effective ceiling is the TIGHTER of this knob and the node's internal
+    /// history-walk ceiling, `MAX_PIN_SOURCES + 1` = 17 (see
     /// `api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST` and the `min()` that combines the
     /// two in the resolver). Setting this above 17 changes nothing, because the
     /// internal ceiling already binds. Setting it below 17 does lower the cap: the
@@ -532,6 +532,12 @@ pub struct Config {
     /// before its whole bounded provenance source set has been tried, so an operator
     /// who goes under it is choosing a tighter cap that can 503 a provenanced
     /// request, which is allowed.
+    ///
+    /// That combined cap is charged PER PHASE, not per request: the provenance phase and
+    /// the legacy-scan fallback each get their own equal budget, so one request can run
+    /// up to twice it in total (see `MAX_HISTORY_WALKS_PER_REQUEST`, which explains why
+    /// the split is what keeps the fallback from inheriting a provenance phase's spent
+    /// remainder).
     #[arg(
         long,
         env = "GITLAWB_IPFS_MAX_REPOS_WALKED",
@@ -1035,7 +1041,7 @@ mod tests {
             "the work budget must clear one full legacy search per window"
         );
 
-        // Tight route limit (1): the floor lifts the work budget to a full deep scan —
+        // Tight route limit (1): the floor lifts the work budget to a full deep scan,
         // the 256-probe budget PLUS the page toll a 2048-row ceiling costs at 128 rows
         // per page (16) = 272, NOT down to 1. A single deep search still completes its
         // full scan without self-throttling on either charge.

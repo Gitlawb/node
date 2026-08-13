@@ -433,7 +433,7 @@ async fn main() -> Result<()> {
         // Operator-tunable via GITLAWB_IPFS_MAX_LEGACY_SCAN_ROWS, read through the same
         // helper shape as the probe budget so the knob cannot be a silent no-op.
         ipfs_max_legacy_scan_rows: AppState::ipfs_legacy_scan_row_budget(&config),
-        ipfs_max_legacy_scan_rules: crate::api::ipfs::MAX_LEGACY_SCAN_RULES_PER_REQUEST,
+        ipfs_max_legacy_scan_rule_bytes: crate::api::ipfs::MAX_LEGACY_SCAN_RULE_BYTES_PER_REQUEST,
         ipfs_scan_token_key: Arc::new(AppState::new_scan_token_key()),
         ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust,
@@ -713,8 +713,9 @@ async fn main() -> Result<()> {
 /// need a walk. DETACHED, never on the boot path: the caller keeps serving while this
 /// runs, and the sweep's own batch bound plus inter-batch delay keep it off the DB's
 /// critical path. Its cursor is durable, so a restart mid-walk resumes instead of
-/// rewinding. It re-arms on `SWEEP_REARM_DELAY` and so returns only on a failing pass
-/// query, which is why the awaited value is no longer worth logging here.
+/// rewinding. It re-arms after every run, including a failed one, so it never returns
+/// and there is no awaited value to log here; the shutdown watcher below is what ends
+/// it.
 ///
 /// A named function rather than an inline block in `main` so the WIRING has a seam a
 /// test can call: that the task is spawned at all, that it reads its batch and delay

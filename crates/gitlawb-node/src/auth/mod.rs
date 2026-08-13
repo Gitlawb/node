@@ -522,7 +522,8 @@ mod tests {
             ipfs_max_legacy_probes: crate::api::ipfs::MAX_LEGACY_PROBES_PER_REQUEST,
             ipfs_legacy_scan_page_rows: crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS,
             ipfs_max_legacy_scan_rows: crate::api::ipfs::MAX_LEGACY_SCAN_ROWS_PER_REQUEST,
-            ipfs_max_legacy_scan_rules: crate::api::ipfs::MAX_LEGACY_SCAN_RULES_PER_REQUEST,
+            ipfs_max_legacy_scan_rule_bytes:
+                crate::api::ipfs::MAX_LEGACY_SCAN_RULE_BYTES_PER_REQUEST,
             ipfs_scan_token_key: Arc::new(crate::state::AppState::new_scan_token_key()),
             ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
             push_limiter_trust: crate::rate_limit::TrustedProxy::None,
