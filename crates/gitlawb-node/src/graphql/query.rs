@@ -601,6 +601,43 @@ mod tests {
         );
     }
 
+    #[sqlx::test]
+    async fn tasks_find_older_visible_row_behind_denied_window(pool: PgPool) {
+        let db = db(pool).await;
+        db.create_repo(&repo("public-repo", OWNER, "public", true))
+            .await
+            .unwrap();
+        let visible = crate::db::AgentTask {
+            id: "visible".into(),
+            repo_id: Some("public-repo".into()),
+            kind: "build".into(),
+            status: "pending".into(),
+            delegator_did: OWNER.into(),
+            assignee_did: None,
+            capability: "repo:write".into(),
+            ucan_token: None,
+            payload: None,
+            result: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            deadline: None,
+        };
+        db.create_task(&visible).await.unwrap();
+        for i in 0..200 {
+            let mut hidden = visible.clone();
+            hidden.id = format!("hidden-{i:03}");
+            hidden.repo_id = None;
+            hidden.created_at = "2026-01-02T00:00:00Z".into();
+            hidden.updated_at = hidden.created_at.clone();
+            db.create_task(&hidden).await.unwrap();
+        }
+
+        let schema = schema(db);
+        let resp = anon(&schema, "{ tasks(limit: 1) { id } }").await;
+        assert_eq!(count_tasks(&resp), 1);
+        assert!(format!("{:?}", resp.data).contains("visible"));
+    }
+
     fn count_tasks(resp: &async_graphql::Response) -> usize {
         assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
         let async_graphql::Value::Object(obj) = &resp.data else {
