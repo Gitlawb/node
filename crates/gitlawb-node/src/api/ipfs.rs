@@ -132,9 +132,15 @@ pub(crate) const MAX_LEGACY_SCAN_ROWS_PER_REQUEST: usize = 2048;
 ///
 /// Bytes, not a rule count, because a count is the wrong unit for a memory bound: an
 /// owner controls how many rules their repos carry AND how long each rule's
-/// `reader_dids` list is, so a handful of rules can retain as much as thousands. The
-/// check runs inside `fetch_next_page` immediately after the rules query returns, so the
-/// page that blows the budget truncates the request that bought it.
+/// `reader_dids` list is, so a handful of rules can retain as much as thousands.
+///
+/// Enforced IN THE QUERY (`Db::list_visibility_rules_for_repos_bounded`), not by summing
+/// the page once it has landed. A post-fetch sum truncates the request but leaves the
+/// transfer and the allocation already paid, so it bounds the result and not the work,
+/// which is the wrong half of INV-10 on an anonymously reachable route. The query cuts on
+/// a repo boundary and reports where; `fetch_next_page` drops the page's tail there and
+/// mints a continuation, so the page that would have blown the budget truncates the
+/// request that bought it without ever being materialized.
 ///
 /// Not an operator knob: it is a memory guard, not a reach/coverage tradeoff. 4 MiB is
 /// about 2 KiB per row at the default row ceiling, which is a generous rule set per repo
@@ -191,11 +197,12 @@ struct LegacyScanPager {
     /// Bytes of visibility rules retained this request, the quantity the rules ceiling
     /// bounds.
     fetched_rule_bytes: usize,
-    /// Set by `fetch_next_page` when the page it just retained put
-    /// `fetched_rule_bytes` over the ceiling. The flag exists because the check has to
-    /// happen where the retention happens: measuring only when another page is
-    /// contemplated lets the page that actually blew the budget go unnoticed on a scan
-    /// that ends there.
+    /// Set by `fetch_next_page` when the rules query CUT the page it just fetched, that
+    /// is when the byte budget stopped the query part-way through the page's repos. The
+    /// flag exists because the decision has to happen where the fetch happens: measuring
+    /// only when another page is contemplated lets the page that actually blew the budget
+    /// go unnoticed on a scan that ends there, and measuring after the fetch bounds the
+    /// result rather than the work.
     rule_bytes_exceeded: bool,
 }
 
@@ -263,18 +270,28 @@ impl LegacyScanPager {
         #[cfg(test)]
         note_scan_rows(page.len());
         self.fetched_rows += page.len();
+        // Measured on the FULL page the query returned, before any rules cut shortens it:
+        // this is the DB-facing row cost the row ceiling bounds, and a page that is short
+        // is a page with nothing behind it whatever the rules do.
         if page.len() < state.ipfs_legacy_scan_page_rows {
             self.exhausted = true;
         }
         if page.is_empty() {
             return Ok(());
         }
-        let last = page.last().expect("non-empty page has a last row");
-        self.cursor = Some((last.created_at_key.clone(), last.repo.id.clone()));
+        let mut page = page;
         let repo_ids: Vec<String> = page.iter().map(|r| r.repo.id.clone()).collect();
-        let rules = match tokio::time::timeout(
+        // The budget is per REQUEST, so what this page may spend is what is left of it.
+        // A cut ends the scan, so the remaining budget is only ever zero on a page bought
+        // after the always-admit escape overshot, and zero still admits one repo.
+        let budget_left = state
+            .ipfs_max_legacy_scan_rule_bytes
+            .saturating_sub(self.fetched_rule_bytes);
+        let (rules, cut_at) = match tokio::time::timeout(
             request_deadline.saturating_duration_since(std::time::Instant::now()),
-            state.db.list_visibility_rules_for_repos(&repo_ids),
+            state
+                .db
+                .list_visibility_rules_for_repos_bounded(&repo_ids, budget_left),
         )
         .await
         {
@@ -289,24 +306,42 @@ impl LegacyScanPager {
                 return Err(budget_shed());
             }
         };
-        // Measure the page HERE, where it is retained, not on the next trip round the
-        // caller's loop. A rules query answers with whatever the matched repos carry;
-        // nothing bounds that per repo, so one page can be arbitrarily large and a check
-        // that only runs when another page is contemplated never sees it on a scan that
-        // ends on this one. Bytes rather than a rule count for the same reason: the
-        // quantity that grows is the length of each `reader_dids` list, not the number
-        // of rows in `visibility_rules`.
+        #[cfg(test)]
+        note_scan_rule_rows(rules.values().map(Vec::len).sum());
+        // The bound lives in the QUERY, not in a sum taken once the page has landed. A
+        // rules query answers with whatever the matched repos carry, and nothing caps
+        // that per repo: a post-fetch sum truncated the request but left the transfer and
+        // the allocation already paid, which bounds the RESULT rather than the WORK. So
+        // the cut comes back from the database and the oversized tail is never
+        // materialized at all. Bytes rather than a rule count for the same reason as
+        // before: the quantity an owner can grow is the length of each `reader_dids`
+        // list, not the number of rows in `visibility_rules`.
+        if let Some(cut) = cut_at {
+            // The rows from the cut onward were never rule-loaded. Gating them against an
+            // empty rule map would read as "no restrictions" and FAIL OPEN, so they are
+            // dropped from the page entirely and the cursor stops in front of them.
+            //
+            // `max(1)` is belt and braces over the query's own guarantee that the first
+            // rule-carrying repo is always admitted. A cut at 0 would leave the cursor
+            // where it was, the caller's next request would reproduce this page exactly,
+            // and the ladder would be wedged on a permanent 503.
+            page.truncate(cut.max(1));
+            self.rule_bytes_exceeded = true;
+            // This page had rows behind the cut, so the table is NOT covered even if the
+            // page itself was short. This replaces the old `!exhausted` condition: the
+            // taint now keys on the query having left repos unloaded rather than on the
+            // page's length. A short final page whose rules all fit produces no cut, so a
+            // scan that genuinely covered the table is still the definitive 404 it was,
+            // and a short final page that IS cut is honestly incomplete and resumable.
+            self.exhausted = false;
+        }
+        let last = page.last().expect("the cut always leaves at least one row");
+        self.cursor = Some((last.created_at_key.clone(), last.repo.id.clone()));
         self.fetched_rule_bytes += rules
             .values()
             .flat_map(|v| v.iter())
             .map(rule_retained_bytes)
             .sum::<usize>();
-        // Only a page with more behind it truncates. A short page has already retained
-        // everything there is, so stopping on it would turn a scan that genuinely
-        // covered the table into a permanent 503 for an object that is simply absent.
-        if !self.exhausted && self.fetched_rule_bytes >= state.ipfs_max_legacy_scan_rule_bytes {
-            self.rule_bytes_exceeded = true;
-        }
         self.rules.extend(rules);
         self.rows.extend(page);
         Ok(())
@@ -317,7 +352,8 @@ impl LegacyScanPager {
 #[derive(serde::Deserialize)]
 pub struct ScanQuery {
     /// Sealed continuation from a previous truncated scan's 503 body. Opened with the
-    /// node's per-boot key and the request's canonical CID as associated data; ANY
+    /// key derived from the node's persistent identity (`AppState::derive_scan_token_key`,
+    /// so a restart does not invalidate it) and the request's canonical CID as associated data; ANY
     /// failure (undecryptable, tampered, expired, malformed, minted for another CID) is
     /// treated as absent and the scan starts at the front, identically and silently, so
     /// the token is no oracle.
@@ -919,9 +955,9 @@ pub async fn get_by_cid(
                     }
                     // Rule-bytes ceiling: the row ceiling bounds rows, not the rules each
                     // row drags in, and the pager retains every fetched page's rules for
-                    // the whole request. The decision itself was taken inside
-                    // `fetch_next_page`, against the page that did the retaining, so the
-                    // request that bought an oversized page is the one that truncates.
+                    // the whole request. The cut is made by the QUERY, so the oversized
+                    // tail is never materialized; `fetch_next_page` drops the rows behind
+                    // it and the request that asked for them is the one that truncates.
                     if pager.rule_bytes_exceeded {
                         walk.taint("rules-ceiling");
                         scan_continuation = pager.cursor.clone();
@@ -1840,6 +1876,31 @@ pub(crate) fn scan_rows() -> usize {
 #[cfg(test)]
 fn note_scan_rows(n: usize) {
     SCAN_ROWS.with(|c| c.set(c.get() + n));
+}
+
+// Test-only INV-10 cost counter: how many visibility-rule ROWS the legacy scan actually
+// pulled out of the database this request. The byte ceiling is the guard, but a byte
+// count computed from the rows AFTER they arrive cannot tell a bounded query from an
+// unbounded one -- both report the same total. Counting the rows the query returned is
+// what goes red when the bound moves back out of the query and into a post-fetch sum.
+#[cfg(test)]
+thread_local! {
+    static SCAN_RULE_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_scan_rule_rows() {
+    SCAN_RULE_ROWS.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn scan_rule_rows() -> usize {
+    SCAN_RULE_ROWS.with(|c| c.get())
+}
+
+#[cfg(test)]
+fn note_scan_rule_rows(n: usize) {
+    SCAN_RULE_ROWS.with(|c| c.set(c.get() + n));
 }
 
 // Test-only cost counter (F5, #173 round 11): how many times the fallback gate ran the
@@ -4504,6 +4565,176 @@ mod tests {
             "a rule-bytes truncation carries a continuation like every other ceiling: \
              {body}"
         );
+    }
+
+    /// The rule-bytes ceiling must be enforced by the QUERY, not by summing the page
+    /// after it has been transferred and allocated.
+    ///
+    /// A repo owner controls how many rules their repos carry and how long each
+    /// `reader_dids` list is, so a post-fetch sum truncates the REQUEST while leaving the
+    /// WORK unbounded: the oversized page is already in memory by the time the guard
+    /// fires. INV-10 bounds work done, never results measured afterwards, and the caller
+    /// here is an anonymous `/ipfs/{legacy-cid}` request holding one of the scarce walk
+    /// permits.
+    ///
+    /// The assertion is on the number of rule ROWS the query actually returned, not on
+    /// the status: the status is identical either way, which is exactly why the old shape
+    /// looked correct.
+    ///
+    /// MUTATION (RED): drop the query bound and sum the rules after the fetch, and the
+    /// whole page's rules are materialized (16 rows here against a budget that admits
+    /// one repo's two).
+    #[sqlx::test]
+    async fn get_by_cid_rule_bytes_bounded_in_the_query_not_after_the_page(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        // One page holds every seeded repo, so nothing but the rule budget can bind.
+        state.ipfs_legacy_scan_page_rows = 8;
+        state.ipfs_max_legacy_scan_rows = 1000;
+        // Under this budget a single repo's pair of rules is already over, so at most one
+        // repo may be loaded and the page's remaining seven must never leave the database.
+        state.ipfs_max_legacy_scan_rule_bytes = 200;
+        seed_root_denying_repos(&state, "querybound", 8, 2).await;
+        let cid = seed_legacy_pin(&state, &absent_oid()).await;
+
+        let peer: SocketAddr = "203.0.113.171:5000".parse().unwrap();
+        crate::api::ipfs::reset_scan_rule_rows();
+        let (status, body) = status_and_body(
+            ipfs_router(state)
+                .oneshot(get_cid_scan(&cid, Some(peer), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let rule_rows = crate::api::ipfs::scan_rule_rows();
+        assert!(
+            rule_rows <= 4,
+            "the byte budget must bound the QUERY: at most one repo's rules may be \
+             materialized under a 200-byte budget, but {rule_rows} rule rows were pulled \
+             (the whole page is 16)"
+        );
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "reaching the query bound is the ceiling condition and sheds the retryable \
+             503, exactly as the post-fetch sum did: {body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("rules-ceiling"),
+            "the shed still names the rule-bytes ceiling: {body}"
+        );
+        assert!(
+            continuation_of(&body).is_some(),
+            "and it still mints a continuation, or the repos behind the cut are \
+             unreachable: {body}"
+        );
+    }
+
+    /// The property the old `!exhausted` condition protected, restated for the query
+    /// bound: a scan that genuinely covered the table must answer 404, never a permanent
+    /// 503.
+    ///
+    /// Under the query bound the taint no longer keys on "the page was short" but on
+    /// "the query left repos unloaded". A short final page whose rules all fit leaves
+    /// nothing unloaded, so it stays a complete scan and the absent object is a clean
+    /// 404. The budget here is finite and set by the fixture, so this is the guard being
+    /// exercised rather than the 4 MiB default never coming near.
+    #[sqlx::test]
+    async fn get_by_cid_short_final_page_under_the_rule_budget_still_404s(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 8;
+        state.ipfs_max_legacy_scan_rows = 1000;
+        // Roomy enough for all four repos' rules together, so no cut is possible.
+        state.ipfs_max_legacy_scan_rule_bytes = 64 * 1024;
+        seed_root_denying_repos(&state, "shortfit", 4, 1).await;
+        let cid = seed_legacy_pin(&state, &absent_oid()).await;
+
+        let peer: SocketAddr = "203.0.113.172:5000".parse().unwrap();
+        let (status, body) = status_and_body(
+            ipfs_router(state)
+                .oneshot(get_cid_scan(&cid, Some(peer), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a complete scan of an absent object is a verdict; turning it into a 503 \
+             would make the object permanently unresolvable: {body}"
+        );
+    }
+
+    /// The ladder MAKES PROGRESS under the query bound: every rung consumes at least one
+    /// repo, so the continuation always advances and the scan terminates.
+    ///
+    /// This is the failure mode the query bound could have introduced. If a page whose
+    /// FIRST repo alone exceeds the remaining budget loaded nothing, the cut would sit at
+    /// the cursor, the next request would reproduce it exactly, and the caller would be
+    /// wedged on a 503 forever for an object the node could otherwise settle. The bound
+    /// therefore always admits the first rule-carrying repo of a page whatever its size.
+    ///
+    /// The ladder ends on the tokenless shed, which is the design's "your ladder is
+    /// over" answer for a RESUMED scan (absence was only ever proven over
+    /// `[token, end)`), not on a 404.
+    #[sqlx::test]
+    async fn get_by_cid_rule_bytes_ladder_advances_to_a_tokenless_shed(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 1000;
+        // Every repo's rules alone clear the budget, so every page is cut at its first
+        // repo: the worst case for progress.
+        state.ipfs_max_legacy_scan_rule_bytes = 1;
+        let repos = 8usize;
+        seed_root_denying_repos(&state, "ladder", repos, 2).await;
+        let cid = seed_legacy_pin(&state, &absent_oid()).await;
+
+        let peer: SocketAddr = "203.0.113.173:5000".parse().unwrap();
+        let router = ipfs_router(state);
+        let mut token: Option<String> = None;
+        let mut rungs = 0usize;
+        let bound = repos + 2;
+        loop {
+            rungs += 1;
+            assert!(
+                rungs <= bound,
+                "the ladder must consume at least one repo per rung and terminate within \
+                 {bound} rungs; a rung that loaded nothing would repeat forever"
+            );
+            let (status, body) = status_and_body(
+                router
+                    .clone()
+                    .oneshot(get_cid_scan(&cid, Some(peer), token.as_deref()))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            if status == StatusCode::NOT_FOUND {
+                break;
+            }
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "rung {rungs} must be the retryable 503: {body}"
+            );
+            let next = continuation_of(&body);
+            if next.is_none() {
+                break;
+            }
+            assert_ne!(
+                next, token,
+                "rung {rungs} handed back the SAME continuation it was given, so the scan \
+                 made no progress and the caller is wedged: {body}"
+            );
+            token = next;
+        }
     }
 
     /// Scenario 8: interleaved callers stay isolated. Two source keys alternate

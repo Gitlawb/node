@@ -55,6 +55,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
     use clap::Parser;
 
     let keypair = Keypair::generate();
+    let scan_token_key = crate::state::AppState::derive_scan_token_key(&keypair);
     let node_did = keypair.did();
     let (ref_tx, _) = tokio::sync::broadcast::channel(1);
     let (task_tx, _) = tokio::sync::broadcast::channel(1);
@@ -85,7 +86,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         ipfs_legacy_scan_page_rows: crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS,
         ipfs_max_legacy_scan_rows: crate::api::ipfs::MAX_LEGACY_SCAN_ROWS_PER_REQUEST,
         ipfs_max_legacy_scan_rule_bytes: crate::api::ipfs::MAX_LEGACY_SCAN_RULE_BYTES_PER_REQUEST,
-        ipfs_scan_token_key: Arc::new(crate::state::AppState::new_scan_token_key()),
+        ipfs_scan_token_key: Arc::new(scan_token_key),
         ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust: crate::rate_limit::TrustedProxy::None,
         sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
@@ -8671,6 +8672,96 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+    }
+
+    /// The discovery load is bounded to ONE probe window, not to the whole repo table.
+    ///
+    /// The exhaustive load was justified as "background maintenance on a timer" whose
+    /// "paging cost is paid once". That was written when the sweep ran once per boot.
+    /// The sweep now re-arms on a timer, so a node carrying a single unrepairable
+    /// source-less row paid a full-table paging pass plus a stat of every warm repo on
+    /// every re-armed run, forever, to choose sixteen candidates. The idle backoff makes
+    /// that hourly rather than every five minutes, which is a smaller bill for the same
+    /// unbounded work.
+    ///
+    /// The window itself is unchanged, which is why the assertion is on the PAGING and
+    /// not on the outcome: an exhaustive load and a bounded one pick the same sixteen
+    /// candidates and reach the same verdict, so nothing about the result can go red on
+    /// the difference. The fixture puts more than one window of warm candidates at the
+    /// front of the `(created_at, id)` order and enough cold rows behind them to push the
+    /// table past a single page.
+    ///
+    /// MUTATION (RED): page to exhaustion and the load buys a second page it has no use
+    /// for.
+    #[sqlx::test]
+    async fn sweep_discovery_load_stops_once_the_window_is_full(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+
+        // The bytes live in a bare with no `repos` row, so no candidate ever holds them
+        // and the row stays source-less: the pass runs a full window of probes.
+        let fx = seed_cid_repos(&slug, &short, &["boundsrc"]);
+        let src = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("boundsrc.git");
+        let _warm = seed_candidate_ladder(
+            &state.db,
+            &owner_did,
+            &slug,
+            "boundwarm",
+            crate::ipfs_pin::MAX_LEGACY_DISCOVERY_PROBES + 4,
+            None,
+        )
+        .await;
+        // Cold rows: a `repos` row with nothing on disk. They cost a page each but can
+        // never fill a window slot, so they are what an exhaustive load pages through.
+        let page_rows = crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS;
+        for pos in 100..(100 + page_rows) {
+            let repo = seed_repo_at(&owner_did, &format!("boundcold{pos}"), pos as i64);
+            state.db.create_repo(&repo).await.expect("seed a cold row");
+        }
+        seed_legacy_pin(&pool, &src, &fx.public_oid, None).await;
+
+        crate::ipfs_pin::reset_discovery_paging();
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+                &mut Default::default(),
+            ),
+        )
+        .await
+        .expect("the traversal terminates");
+
+        let pages = crate::ipfs_pin::discovery_repo_pages();
+        let rows = crate::ipfs_pin::discovery_repo_rows();
+        assert_eq!(
+            pages, 1,
+            "the window fills inside the first page, so the load must stop there; it \
+             bought {pages} pages carrying {rows} rows"
+        );
+        assert!(
+            rows <= page_rows,
+            "a bounded load reads at most the pages it needs; it read {rows} rows out of \
+             a table of {}",
+            crate::ipfs_pin::MAX_LEGACY_DISCOVERY_PROBES + 4 + page_rows
+        );
+        assert_eq!(
+            stats.dead_row_reads,
+            crate::ipfs_pin::MAX_LEGACY_DISCOVERY_PROBES,
+            "and the window it picked is still a FULL one: bounding the load must not \
+             shrink the number of candidates the row actually probes"
+        );
     }
 
     /// F5 scenario 1 (#173 round 13): a holder past the probe cap is REACHED.

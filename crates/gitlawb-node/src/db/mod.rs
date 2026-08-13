@@ -4128,6 +4128,113 @@ impl Db {
         }
         Ok(out)
     }
+
+    /// Visibility rules for one scan page, bounded IN THE QUERY by a byte budget.
+    ///
+    /// The unbounded sibling above is right for the listing surfaces: they read a page
+    /// the caller is already authorized for. It is wrong for the resolver's legacy scan,
+    /// which runs on an anonymously reachable route while holding scarce walk admission.
+    /// A repo owner controls both how many rules their repos carry and how long each
+    /// `reader_dids` list is, so summing the bytes AFTER the rows arrive truncates the
+    /// request without bounding the work: the oversized page has already been transferred
+    /// and allocated by the time the sum is taken (INV-10 bounds work done, never results
+    /// measured afterwards).
+    ///
+    /// The cut lands on a REPO boundary, never inside one. A partially loaded rule set is
+    /// indistinguishable at the gate from a repo with no rules at all, so a mid-repo cut
+    /// would FAIL OPEN and serve a path-scoped object the missing rules would have
+    /// denied. Every repo this returns is therefore complete, and the caller drops the
+    /// page's tail from the cut onward rather than gating it against rules it does not
+    /// have.
+    ///
+    /// `repo_ids` must be in the page's `(created_at, id)` order; the returned cut is the
+    /// 0-based index into that slice of the first repo whose rules did NOT fit, or `None`
+    /// when the whole page fit. Repos carrying no rules never cut.
+    ///
+    /// The FIRST rule-carrying repo of a page is admitted whatever its size, so a page
+    /// always makes progress. Without that a repo whose rules alone exceed the remaining
+    /// budget would put the cut at the cursor, the caller's next request would reproduce
+    /// it exactly, and the ladder would be wedged on a permanent 503. One repo's rule set
+    /// is the residual bound this leaves; the whole page's was the bound before.
+    pub async fn list_visibility_rules_for_repos_bounded(
+        &self,
+        repo_ids: &[String],
+        byte_budget: usize,
+    ) -> Result<(
+        std::collections::HashMap<String, Vec<VisibilityRule>>,
+        Option<usize>,
+    )> {
+        use std::collections::HashMap;
+        if repo_ids.is_empty() {
+            return Ok((HashMap::new(), None));
+        }
+        // `running` is a sum of non-negative per-repo sizes over the page order, so it is
+        // monotonic: once it passes the budget every later repo is excluded too, which is
+        // what makes "the kept set is a prefix" true and the single cut index meaningful.
+        // `rn = 1` is the always-admit escape for the first rule-carrying repo.
+        let rows = sqlx::query(
+            "WITH sized AS (
+                 SELECT v.id, v.repo_id, v.path_glob, v.mode, v.reader_dids, v.created_by,
+                        v.created_at,
+                        octet_length(v.id) + octet_length(v.repo_id)
+                          + octet_length(v.path_glob) + octet_length(v.created_by)
+                          + octet_length(v.reader_dids) AS b,
+                        array_position($1::text[], v.repo_id) AS pos
+                 FROM visibility_rules v
+                 WHERE v.repo_id = ANY($1::text[])
+             ),
+             per_repo AS (
+                 SELECT repo_id, pos, SUM(b) AS repo_bytes FROM sized GROUP BY repo_id, pos
+             ),
+             cum AS (
+                 SELECT repo_id, pos,
+                        SUM(repo_bytes) OVER (ORDER BY pos ROWS UNBOUNDED PRECEDING) AS running,
+                        ROW_NUMBER() OVER (ORDER BY pos) AS rn
+                 FROM per_repo
+             ),
+             kept AS (
+                 SELECT repo_id, pos FROM cum WHERE running <= $2::bigint OR rn = 1
+             ),
+             cut AS (
+                 SELECT MIN(pos) AS cut_pos FROM cum WHERE running > $2::bigint AND rn > 1
+             )
+             SELECT s.id, s.repo_id, s.path_glob, s.mode, s.reader_dids, s.created_by,
+                    s.created_at, cut.cut_pos
+             FROM sized s
+             JOIN kept k ON k.repo_id = s.repo_id
+             CROSS JOIN cut
+             ORDER BY k.pos, s.path_glob",
+        )
+        .bind(repo_ids)
+        .bind(byte_budget.min(i64::MAX as usize) as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // `array_position` is 1-based and the caller indexes a slice. No rows means no
+        // rules matched the page at all, which is also no cut.
+        let cut_at = rows
+            .first()
+            .and_then(|r| r.get::<Option<i32>, _>("cut_pos"))
+            .map(|pos| (pos as usize).saturating_sub(1));
+        let mut out: HashMap<String, Vec<VisibilityRule>> = HashMap::new();
+        for r in rows {
+            let readers: String = r.get("reader_dids");
+            let created_at: String = r.get("created_at");
+            let rule = VisibilityRule {
+                id: r.get("id"),
+                repo_id: r.get("repo_id"),
+                path_glob: r.get("path_glob"),
+                mode: VisibilityMode::from_db(&r.get::<String, _>("mode")),
+                reader_dids: serde_json::from_str(&readers).unwrap_or_default(),
+                created_by: r.get("created_by"),
+                created_at: created_at
+                    .parse::<DateTime<Utc>>()
+                    .unwrap_or_else(|_| Utc::now()),
+            };
+            out.entry(rule.repo_id.clone()).or_default().push(rule);
+        }
+        Ok((out, cut_at))
+    }
 }
 
 // ── Repo Stars ────────────────────────────────────────────────────────────────

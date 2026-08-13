@@ -27,6 +27,39 @@ use std::time::{Duration, Instant};
 /// repos ONE background row may read. If either moves, the other does not follow.
 pub(crate) const MAX_LEGACY_DISCOVERY_PROBES: usize = 16;
 
+// Test-only cost counters for the sweep's discovery load: how many keyset PAGES of
+// `repos` one `load_discovery_ctx` bought, and how many ROWS they carried. A load that
+// pages the table to exhaustion and one that stops as soon as the probe window is full
+// are indistinguishable by outcome, so the window contents cannot go red on the
+// difference; the paging cost is the only thing that can.
+#[cfg(test)]
+thread_local! {
+    static DISCOVERY_REPO_PAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DISCOVERY_REPO_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_discovery_paging() {
+    DISCOVERY_REPO_PAGES.with(|c| c.set(0));
+    DISCOVERY_REPO_ROWS.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn discovery_repo_pages() -> usize {
+    DISCOVERY_REPO_PAGES.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn discovery_repo_rows() -> usize {
+    DISCOVERY_REPO_ROWS.with(|c| c.get())
+}
+
+#[cfg(test)]
+fn note_discovery_page(rows: usize) {
+    DISCOVERY_REPO_PAGES.with(|c| c.set(c.get() + 1));
+    DISCOVERY_REPO_ROWS.with(|c| c.set(c.get() + rows));
+}
+
 /// Attempts (including the first) for a transient DB-record retry.
 const PIN_RECORD_ATTEMPTS: u32 = 3;
 /// Backoff between DB-record retry attempts.
@@ -380,6 +413,14 @@ struct DiscoveryCtx {
     /// SQL order, so a key off by one character rotates the list to a boundary the query
     /// never had.
     candidates: Vec<(crate::db::RepoRecord, String, std::path::PathBuf)>,
+    /// Whether the node's WHOLE warm candidate set fits in one window, which is the
+    /// condition the traversal's continuation reset arm turns on.
+    ///
+    /// A separate field because `candidates` can no longer answer it. The load stops as
+    /// soon as the window is full, so `candidates.len()` is `MAX_LEGACY_DISCOVERY_PROBES`
+    /// on a node with seventeen warm repos and on a node with seventeen thousand alike.
+    /// `load_discovery_ctx` collects one candidate past the window purely to decide this.
+    warm_fits_under_cap: bool,
     /// The ceiling on the whole pass's discovery, so one pass costs at most one
     /// `git_timeout` in total on top of the per-row probe cap. Per PASS, not per run:
     /// `load_discovery_ctx` runs once per `sweep_pass` and a run loops passes.
@@ -491,95 +532,160 @@ async fn load_discovery_ctx(
     git_timeout: Duration,
     db: &crate::db::Db,
 ) -> Result<DiscoveryCtx> {
-    // Page to EXHAUSTION. The resolver's legacy scan drives this same query and
-    // deliberately does NOT (`api::ipfs`): it stops the moment its probe or visit budget
-    // is spent, because it runs on an anonymously reachable route while holding scarce
-    // walk admission, where reading the whole table is the amplification the budget
-    // exists to forbid. Same query, different threat model. This is background
-    // maintenance on a timer: no caller to amplify, no permit to pin, and the pass needs
-    // the whole warm candidate set before it can call a row settled. Do not "align" this
-    // loop with the resolver's: the budgets it stops on have no counterpart here.
+    // Paged only as far as the WINDOW needs, not to exhaustion.
     //
-    // Per PASS, not per row: `load_discovery_ctx` already runs once per pass and its
-    // result is reused for every source-less row, so the paging cost is paid once.
+    // The exhaustive load was defended as "background maintenance on a timer" whose
+    // "paging cost is paid once", and that was true when the sweep ran once per boot: one
+    // full-table pass per process lifetime to choose sixteen candidates. The sweep now
+    // re-arms on a timer, so the cost is paid on every run for as long as the node holds a
+    // single unrepairable source-less row. The idle backoff stretches that to hourly; it
+    // does not bound it. Same query as the resolver's legacy scan and still a different
+    // threat model (no caller to amplify, no scarce permit pinned), but an unbounded read
+    // that repeats forever is worth stopping on its own account.
+    //
+    // The window is unchanged. It is still the first `MAX_LEGACY_DISCOVERY_PROBES` WARM
+    // candidates strictly after the persisted continuation, wrapping to the front of the
+    // `(created_at, id)` order when the tail runs out, so the candidates picked here are
+    // byte for byte the ones the exhaustive load rotated to. What changed is that the
+    // rotation now STEERS the paging instead of being applied to a list already read:
+    // phase 0 reads forward from the continuation, phase 1 wraps to the front and stops
+    // where phase 0 began, and either may stop early once the window is full.
+    //
+    // Ordering is still the QUERY's `(created_at, id)` ASC, so non-steerability is
+    // untouched: `repo_id` derives from a grindable owner DID, but minted repos carry a
+    // fresh `created_at` and sort LAST, where they can only ever be reached after the
+    // older true holder rather than instead of it.
+    //
+    // Per PASS, not per row: `load_discovery_ctx` still runs once per pass and its result
+    // is still reused for every source-less row in that pass, so all of them share one
+    // window.
     let page_rows = crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS;
-    let mut cursor: Option<(String, String)> = None;
-    let mut candidates: Vec<(crate::db::RepoRecord, String)> = Vec::new();
-    loop {
-        let page = db
-            .list_repos_page_for_scan(
-                cursor
-                    .as_ref()
-                    .map(|(created_at, id)| (created_at.as_str(), id.as_str())),
-                page_rows as i64,
-            )
-            .await?;
-        let Some(last) = page.last() else { break };
-        cursor = Some((last.created_at_key.clone(), last.repo.id.clone()));
-        let last_page = page.len() < page_rows;
-        candidates.extend(
-            page.into_iter()
-                .filter(|r| !r.quarantined)
-                .map(|r| (r.repo, r.created_at_key)),
-        );
-        if last_page {
+
+    // Read BEFORE paging, because the load is steered by it now.
+    let (cont_created_at, cont_id) = db.discovery_continuation().await?;
+    let resumed = !cont_created_at.is_empty() || !cont_id.is_empty();
+
+    // ONE PAST the window. The exhaustive load could read "the whole warm list fits under
+    // the cap" off a total count it had in hand; a bounded load has no total. Collecting
+    // one extra candidate restores the decision without restoring the cost: a load that
+    // stops at `MAX + 1` has PROVEN there are more than `MAX` warm candidates, and a load
+    // that ends at `MAX` or fewer can only have done so by running the whole warm set to
+    // its end. So `warm.len() <= MAX` after the fact is exactly the old condition.
+    let want = MAX_LEGACY_DISCOVERY_PROBES + 1;
+
+    let repos_dir = repos_dir.to_path_buf();
+    let mut warm: Vec<(crate::db::RepoRecord, String, std::path::PathBuf)> = Vec::new();
+
+    for phase in 0..2 {
+        if warm.len() >= want {
             break;
+        }
+        // Nothing persisted means phase 0 already started at the front, so there is no
+        // prefix left to wrap into.
+        if phase == 1 && !resumed {
+            break;
+        }
+        let mut cursor: Option<(String, String)> = if phase == 0 && resumed {
+            Some((cont_created_at.clone(), cont_id.clone()))
+        } else {
+            None
+        };
+        // Phase 1 must not run past the point phase 0 started at, or the wrap would probe
+        // the same candidates twice and the window would be short by however many it
+        // repeated.
+        let stop_after: Option<(&str, &str)> = if phase == 1 {
+            Some((cont_created_at.as_str(), cont_id.as_str()))
+        } else {
+            None
+        };
+        loop {
+            let need = want.saturating_sub(warm.len());
+            if need == 0 {
+                break;
+            }
+            let page = db
+                .list_repos_page_for_scan(
+                    cursor
+                        .as_ref()
+                        .map(|(created_at, id)| (created_at.as_str(), id.as_str())),
+                    page_rows as i64,
+                )
+                .await?;
+            #[cfg(test)]
+            note_discovery_page(page.len());
+            let Some(last) = page.last() else { break };
+            let last_page = page.len() < page_rows;
+            cursor = Some((last.created_at_key.clone(), last.repo.id.clone()));
+            let mut wrapped_to_start = false;
+            let mut candidates: Vec<(crate::db::RepoRecord, String)> = Vec::new();
+            for r in page {
+                if let Some((created_at, id)) = stop_after {
+                    if (r.created_at_key.as_str(), r.repo.id.as_str()) > (created_at, id) {
+                        wrapped_to_start = true;
+                        break;
+                    }
+                }
+                // QUARANTINE, dropped before the stat so a hidden repo costs nothing.
+                if r.quarantined {
+                    continue;
+                }
+                candidates.push((r.repo, r.created_at_key));
+            }
+            warm.extend(warm_candidates(&repos_dir, candidates, need).await?);
+            if wrapped_to_start || last_page {
+                break;
+            }
         }
     }
 
-    let repos_dir = repos_dir.to_path_buf();
-    let warm = tokio::task::spawn_blocking(move || {
-        candidates
-            .into_iter()
-            .filter_map(|(repo, created_at_key)| {
-                match crate::git::repo_store::validated_repo_disk_path(
-                    &repos_dir,
-                    &repo.owner_did,
-                    &repo.name,
-                ) {
-                    Ok(p) if p.is_dir() => Some((repo, created_at_key, p)),
-                    // Cold: not on this node's disk right now. It is not evidence about
-                    // any row (see `discover_legacy_row`), so it is simply absent here.
-                    Ok(_) => None,
-                    Err(e) => {
-                        tracing::warn!(repo_id = %repo.id, err = %e, "sweep discovery: rejected unsafe repo path");
-                        None
-                    }
-                }
-            })
-            .collect::<Vec<_>>()
-    })
-    .await?;
-    let mut warm = warm;
-
-    // ROTATE to the traversal's window. The list is already in `(created_at, id)` order,
-    // so the window is the first `MAX_LEGACY_DISCOVERY_PROBES` entries strictly after the
-    // persisted continuation, wrapping through the prefix when it runs off the end.
-    //
-    // After the warm filter, deliberately: a cold or quarantined candidate is not a
-    // window slot the traversal spent, so rotating first would let a node full of cold
-    // repos advance the continuation past warm candidates nobody ever probed. The window
-    // is sixteen WARM candidates.
-    //
-    // Every pass of a traversal reads the same persisted value (it only moves in the
-    // traversal-ending pass), so the window is stable across the traversal by
-    // construction and two source-less rows in different passes probe the same repos.
-    let (cont_created_at, cont_id) = db.discovery_continuation().await?;
-    if !cont_created_at.is_empty() || !cont_id.is_empty() {
-        let split = warm
-            .iter()
-            .position(|(repo, created_at_key, _)| {
-                (created_at_key.as_str(), repo.id.as_str())
-                    > (cont_created_at.as_str(), cont_id.as_str())
-            })
-            .unwrap_or(warm.len());
-        warm.rotate_left(split);
-    }
+    // The fit-under-cap arm the traversal's continuation reset depends on, decided from
+    // the one extra candidate rather than from a whole-table count (see `want`).
+    let warm_fits_under_cap = warm.len() <= MAX_LEGACY_DISCOVERY_PROBES;
+    warm.truncate(MAX_LEGACY_DISCOVERY_PROBES);
 
     Ok(DiscoveryCtx {
         candidates: warm,
+        warm_fits_under_cap,
         pass_deadline: Instant::now() + git_timeout,
     })
+}
+
+/// Keep the WARM ones out of a batch of candidate rows, stopping after `need` of them.
+///
+/// The stat runs on the blocking pool because it is O(rows) filesystem calls and would
+/// otherwise park a tokio worker for the length of a sweep. `need` is what keeps a page's
+/// tail from being stat'd once the window is already full: the caller stops paging at that
+/// point, so those rows are never looked at again this pass either.
+///
+/// An UNSAFE PATH is dropped with a warn and is terminal, and a COLD repo is simply
+/// absent: neither is evidence about any row (see `discover_legacy_row`).
+async fn warm_candidates(
+    repos_dir: &std::path::Path,
+    candidates: Vec<(crate::db::RepoRecord, String)>,
+    need: usize,
+) -> Result<Vec<(crate::db::RepoRecord, String, std::path::PathBuf)>> {
+    let repos_dir = repos_dir.to_path_buf();
+    Ok(tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        for (repo, created_at_key) in candidates {
+            if out.len() >= need {
+                break;
+            }
+            match crate::git::repo_store::validated_repo_disk_path(
+                &repos_dir,
+                &repo.owner_did,
+                &repo.name,
+            ) {
+                Ok(p) if p.is_dir() => out.push((repo, created_at_key, p)),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(repo_id = %repo.id, err = %e, "sweep discovery: rejected unsafe repo path");
+                }
+            }
+        }
+        out
+    })
+    .await?)
 }
 
 /// What discovery did with one source-less legacy row, in the same three-way shape
@@ -667,7 +773,7 @@ async fn discover_legacy_row(
     // the whole warm list fits in one window. Together they pick the traversal's advance
     // arm once the row is done.
     let mut live_probes = 0usize;
-    let fits_under_cap = ctx.candidates.len() <= MAX_LEGACY_DISCOVERY_PROBES;
+    let fits_under_cap = ctx.warm_fits_under_cap;
     // Every candidate that gets this far is READ, so taking the first
     // MAX_LEGACY_DISCOVERY_PROBES bounds the expensive work exactly. Candidates the
     // filters already rejected never reach here and so cost nothing against the cap.
@@ -751,7 +857,7 @@ async fn discover_legacy_row(
         }
     }
     traversal.note_row(live_probes, fits_under_cap);
-    if ctx.candidates.len() > MAX_LEGACY_DISCOVERY_PROBES {
+    if !ctx.warm_fits_under_cap {
         // Cap exhausted with candidates left unprobed: RETRYABLE, never terminal. The
         // probe order is deterministic, but "a re-walk finds the same nothing" only
         // holds if the candidate set cannot be steered, and it can: repo ids derive

@@ -8,6 +8,19 @@ use crate::git::repo_store::RepoStore;
 use crate::p2p::P2pHandle;
 use crate::rate_limit::RateLimiter;
 
+/// HKDF salt for [`AppState::derive_scan_token_key`]. A constant, not a secret: HKDF's
+/// salt is a domain qualifier, and the confidentiality of the derived key rests entirely
+/// on the node's private seed being the input keying material.
+const SCAN_TOKEN_KEY_SALT: &[u8] = b"gitlawb/hkdf-salt/ipfs-scan-token";
+
+/// HKDF `info` for [`AppState::derive_scan_token_key`]: the domain separation AND the
+/// rotation handle in one string. Nothing else in the node derives from this label, so
+/// the token key is unrelated to the signing key it shares an input with; bumping the
+/// trailing version rotates every node's token key on its next boot, which invalidates
+/// outstanding continuations (they simply fail to open and the caller restarts at the
+/// front) and needs no migration, no config, and no change to this function.
+const SCAN_TOKEN_KEY_INFO: &[u8] = b"gitlawb/ipfs-scan-token/v1";
+
 #[derive(Clone, Debug)]
 pub struct RefUpdateBroadcast {
     pub repo: String,
@@ -119,21 +132,38 @@ pub struct AppState {
     /// row ceiling above bounds the row count but not the memory each row drags in: the
     /// pager keeps every fetched page's rules for the whole request, and neither the
     /// number of rules per repo nor the length of a rule's reader list is capped, so a
-    /// rule COUNT would be the wrong unit. Deliberately NOT an operator knob (it is a
+    /// rule COUNT would be the wrong unit. Enforced by the rules QUERY
+    /// (`Db::list_visibility_rules_for_repos_bounded`) rather than by a sum taken once the
+    /// page has landed, so the oversized page is never materialized at all. Deliberately
+    /// NOT an operator knob (it is a
     /// memory guard, not a reach tradeoff); a field only for the same test-seam reason as
     /// the sibling caps.
     pub ipfs_max_legacy_scan_rule_bytes: usize,
-    /// Per-boot key sealing the legacy scan's continuation tokens (INV-13).
+    /// Key sealing the legacy scan's continuation tokens (INV-13), derived from the
+    /// node's persistent identity by [`AppState::derive_scan_token_key`].
     ///
     /// The token is minted from a FETCHED row on a scan that served nothing, so by
     /// construction that row is a private or quarantined repo the caller may not read:
     /// its `created_at` and its `id` (which carries the owner's DID) are withheld
     /// fields. The token is therefore AEAD-SEALED, never signed plaintext and never
-    /// base64-of-plaintext, since integrity is not confidentiality. Random per boot rather
-    /// than derived or persisted: a scan continuation has no cross-restart meaning (a
-    /// stale token simply fails to open and the caller restarts at the front, which is
-    /// the same uniform absent behaviour a tampered token gets), and a per-boot key
-    /// bounds the window in which any single key seals anything.
+    /// base64-of-plaintext, since integrity is not confidentiality.
+    ///
+    /// DERIVED, not random per boot. This reverses an earlier revision of this design,
+    /// which argued that derivation "would make old tokens valid across restarts for no
+    /// benefit and tie a throwaway transport secret to a long-lived signing key." Both
+    /// halves were wrong. Surviving a restart IS the benefit: the token is the ONLY way
+    /// a caller resumes a ladder, an unopenable one is treated as absent, and a caller
+    /// treated as absent silently restarts at the front of the scan. A node whose
+    /// inventory needs several ladder steps and which deploys more often than a caller
+    /// can climb therefore keeps that caller from ever reaching a holder, which
+    /// contradicts the reach bound the README states. And the tie to the signing key is
+    /// what the HKDF domain separation removes: the derived key is a one-way function of
+    /// the seed under an `info` string nothing else uses, so it is not the signing key
+    /// and cannot be worked back into one.
+    ///
+    /// Persisting a random key instead would need a schema change for a value the node
+    /// already has on disk, so derivation is also the smaller mechanism. Rotation is a
+    /// bump of the version in [`SCAN_TOKEN_KEY_INFO`].
     pub ipfs_scan_token_key: Arc<[u8; 32]>,
     /// Hard ceiling on the byte size of an object `GET /ipfs/{cid}` will buffer and
     /// serve (default `api::ipfs::MAX_SERVED_OBJECT_BYTES`). The serve reads via a
@@ -358,10 +388,41 @@ impl AppState {
         config.ipfs_max_legacy_scan_rows
     }
 
-    /// A fresh random key for sealing legacy-scan continuation tokens (INV-13).
-    /// Drawn from the OS CSPRNG at construction; see `ipfs_scan_token_key`.
-    pub(crate) fn new_scan_token_key() -> [u8; 32] {
-        gitlawb_core::scan_token::new_key()
+    /// The key sealing legacy-scan continuation tokens (INV-13), DERIVED from the node's
+    /// persistent identity rather than minted per boot.
+    ///
+    /// HKDF-SHA256 over the node's Ed25519 seed, the same key material
+    /// `load_or_create_keypair` reads back from its PKCS#8 PEM on every boot, so the
+    /// derived key is byte-identical after a restart or a rolling deploy.
+    ///
+    /// Two properties the derivation has to carry, both load-bearing:
+    ///
+    ///   * DOMAIN SEPARATION. The `info` string below is unique to this use, so the
+    ///     derived key is not the signing seed and is not any other secret derived from
+    ///     it. HKDF is one-way, so a leaked token key yields nothing about the signing
+    ///     key and cannot be turned against a signature.
+    ///   * A VERSION component, carried in the same `info` string
+    ///     ([`SCAN_TOKEN_KEY_INFO`]) alongside a fixed [`SCAN_TOKEN_KEY_SALT`]. Bumping
+    ///     the version rotates every token key on the next boot without touching the
+    ///     identity, the token format, or any caller, so rotation is a constant change
+    ///     rather than a fork of this derivation.
+    pub(crate) fn derive_scan_token_key(keypair: &Keypair) -> [u8; 32] {
+        use hmac::{Hmac, Mac};
+        type HmacSha256 = Hmac<sha2::Sha256>;
+
+        let seed = keypair.to_seed();
+        // HKDF-Extract: PRK = HMAC(salt, ikm).
+        let mut extract =
+            HmacSha256::new_from_slice(SCAN_TOKEN_KEY_SALT).expect("HMAC takes a key of any size");
+        extract.update(seed.as_slice());
+        let prk = extract.finalize().into_bytes();
+        // HKDF-Expand, one block: T(1) = HMAC(PRK, info || 0x01). One 32-byte output
+        // needs exactly one block of SHA-256, so there is no counter loop to get wrong.
+        let mut expand =
+            HmacSha256::new_from_slice(prk.as_slice()).expect("HMAC takes a key of any size");
+        expand.update(SCAN_TOKEN_KEY_INFO);
+        expand.update(&[0x01]);
+        expand.finalize().into_bytes().into()
     }
 
     /// Work-budget capacity for [`ipfs_work_rate_limiter`](Self#structfield.ipfs_work_rate_limiter)
@@ -1367,5 +1428,80 @@ mod repo_write_lease_tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod scan_token_key_tests {
+    use super::AppState;
+    use gitlawb_core::identity::Keypair;
+    use gitlawb_core::scan_token::{open_scan_token, seal_scan_token, ScanPosition};
+
+    const CID: &str = "bafkreiscantokenkeyfixtureaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn pos() -> ScanPosition {
+        ScanPosition {
+            created_at_key: "2020-01-01T12:00:00+00:00".to_string(),
+            id: "did:key:z6MkScanTokenOwner/repo".to_string(),
+        }
+    }
+
+    /// The RESTART case. A token minted before a restart must still open after it, or a
+    /// caller laddering a deep inventory is silently returned to the front of the scan on
+    /// every rolling deploy and can never reach a holder buried past one window.
+    ///
+    /// The second key is derived from the identity RELOADED THROUGH ITS ON-DISK PEM,
+    /// which is exactly what `load_or_create_keypair` does on boot, so this exercises the
+    /// real restart path rather than a clone of the in-memory keypair.
+    #[test]
+    fn scan_token_key_survives_a_restart_of_the_same_identity() {
+        let kp = Keypair::generate();
+        let pem = kp.to_pem().expect("the identity serializes");
+        let reloaded = Keypair::from_pem(&pem).expect("the identity reloads");
+
+        let before = AppState::derive_scan_token_key(&kp);
+        let after = AppState::derive_scan_token_key(&reloaded);
+
+        let token = seal_scan_token(&before, CID, &pos(), i64::MAX - 1).expect("seal");
+        assert_eq!(
+            open_scan_token(&after, CID, &token, 0),
+            Some(pos()),
+            "a continuation minted before a restart must open after it: the node's \
+             identity is the same, so the derived sealing key must be too"
+        );
+    }
+
+    /// The must-not: a DIFFERENT node identity must derive a DIFFERENT key, so a token is
+    /// no more portable between nodes than it was when the key was random per boot.
+    #[test]
+    fn scan_token_key_does_not_open_under_a_different_identity() {
+        let mine = Keypair::generate();
+        let theirs = Keypair::generate();
+
+        let token = seal_scan_token(
+            &AppState::derive_scan_token_key(&mine),
+            CID,
+            &pos(),
+            i64::MAX - 1,
+        )
+        .expect("seal");
+        assert_eq!(
+            open_scan_token(&AppState::derive_scan_token_key(&theirs), CID, &token, 0),
+            None,
+            "a continuation sealed by one node must not open under another node's identity"
+        );
+    }
+
+    /// Domain separation, executed rather than asserted in prose: the derived token key
+    /// must not be the signing seed itself. Compromising a token key must not hand an
+    /// attacker the material that signs.
+    #[test]
+    fn scan_token_key_is_not_the_signing_seed() {
+        let kp = Keypair::generate();
+        assert_ne!(
+            AppState::derive_scan_token_key(&kp),
+            *kp.to_seed(),
+            "the token key must be a DERIVED secret, never the Ed25519 signing seed"
+        );
     }
 }

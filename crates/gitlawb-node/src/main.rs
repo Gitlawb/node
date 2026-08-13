@@ -116,6 +116,9 @@ async fn main() -> Result<()> {
 
     // Load or generate the node's identity keypair
     let keypair = load_or_create_keypair(&config)?;
+    // Sealing key for the legacy-scan continuation tokens, DERIVED from the identity
+    // just loaded so it is the same key after a restart (see `derive_scan_token_key`).
+    let scan_token_key = AppState::derive_scan_token_key(&keypair);
     let node_did = keypair.did();
 
     // One-time metrics init. Must run before any handler that calls into
@@ -434,7 +437,7 @@ async fn main() -> Result<()> {
         // helper shape as the probe budget so the knob cannot be a silent no-op.
         ipfs_max_legacy_scan_rows: AppState::ipfs_legacy_scan_row_budget(&config),
         ipfs_max_legacy_scan_rule_bytes: crate::api::ipfs::MAX_LEGACY_SCAN_RULE_BYTES_PER_REQUEST,
-        ipfs_scan_token_key: Arc::new(AppState::new_scan_token_key()),
+        ipfs_scan_token_key: Arc::new(scan_token_key),
         ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust,
         sync_trigger_rate_limiter,
