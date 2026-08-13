@@ -224,6 +224,48 @@ Notes:
   sends the bearer token **only** to your configured origin, never to a URL a
   node advertises, so a hostile node can't capture the key or redirect the solve.
 
+### Fetching an object by CID
+
+```bash
+gl ipfs list                                  # CIDs this node has pinned
+gl ipfs get bafkrei... > object.bin           # object bytes on stdout
+```
+
+Objects that were pinned before the node started recording which repo they came
+from are found by scanning its repo inventory, and that scan stops at the
+per-request ceilings in the [Configuration](#configuration) table. A stopped scan
+answers 503 with a resume token instead of a false "not found", and `gl ipfs get`
+follows the token automatically: up to 8 resumes after the first request, so at
+most 9 calls to the node, waiting between attempts for as long as the node's
+`Retry-After` asks and never longer than 5 seconds.
+
+The whole ladder runs under a 60 second wall-clock deadline. The deadline bounds
+the search, not the download: each attempt gets the time left on it to produce
+response headers, and once an object is found its bytes stream under the client's
+own 30 second HTTP timeout, so a large blob is never cut off part way. Adding the
+one clamped wait that can still fire before the give-up check, a single run tops
+out around 95 seconds.
+
+Two node-side brakes end a ladder early and are reported rather than retried
+around. A 429 is terminal, because the node's rate-limit window is an hour and
+that wait cannot be honored inside one invocation; a transient overload (a 503
+carrying no incomplete-scan code) is retried on the token already held, under the
+same cap, clamp and deadline. The per-IP fanout brake can also stop a ladder well
+short of the 9 calls, so automatic resumption is not a guarantee of reaching the
+object.
+
+When a bound stops the ladder with a usable token in hand, the command prints the
+token and the invocation that continues from it before exiting nonzero:
+
+```txt
+resume from where this stopped: gl ipfs get bafkrei... --scan <token>
+```
+
+Run that to carry on from where the scan stopped. Re-running without `--scan`
+restarts at the first row, reproduces the same truncation and spends the node's
+per-IP budget again, so the token is the only thing that makes progress. Tokens
+are valid for an hour.
+
 ---
 
 ## Architecture

@@ -29,6 +29,38 @@ pub enum IpfsCmd {
         dir: Option<PathBuf>,
     },
     /// Retrieve and display a git object from the node by its CIDv1
+    ///
+    /// Object bytes go to stdout so the command pipes; diagnostics go to stderr.
+    ///
+    /// Objects pinned before the node started recording which repo they came from
+    /// are found by scanning its repo inventory, and that scan stops at the node's
+    /// per-request ceilings. When it stops the node answers 503 with a resume token
+    /// rather than a false "not found", and this command follows it automatically:
+    /// up to 8 resumes after the first request, so at most 9 calls to the node,
+    /// waiting between attempts for as long as the node's Retry-After asks and never
+    /// longer than 5 seconds.
+    ///
+    /// The whole ladder runs under a 60 second wall-clock deadline. That deadline
+    /// bounds the search: each attempt gets only the time left on it to produce
+    /// response headers, and it deliberately does not cover the download of an
+    /// object once found, so a large blob already streaming is never cut off part
+    /// way. After the headers the transfer runs under the client's 30 second HTTP
+    /// timeout, and one final wait before the give-up check can add up to 5 seconds
+    /// more, so the longest a single run can take is about 95 seconds.
+    ///
+    /// A 429 ends the ladder immediately: the node's rate-limit window is an hour,
+    /// so the wait it asks for cannot be honored inside one invocation. A transient
+    /// overload (a 503 that carries no incomplete-scan code) is retried on the token
+    /// already held, under the same cap, clamp and deadline. The node's per-IP
+    /// fanout brake can also end a ladder well short of the cap, so automatic
+    /// resumption is not a guarantee that the object will be reached.
+    ///
+    /// Whenever one of those bounds stops the ladder with a usable token still in
+    /// hand, the command prints the token and the exact invocation that continues
+    /// from it, `gl ipfs get <cid> --scan <token>`, and exits nonzero. Re-running
+    /// without the token restarts the scan at the first row, reproduces the same
+    /// truncation and spends the node's per-IP budget again, so the token is the
+    /// only thing that makes progress. Tokens are valid for an hour.
     Get {
         /// The CIDv1 string (e.g. bafkrei...)
         cid: String,
@@ -190,10 +222,15 @@ async fn cmd_get_inner(
     // That wrap covers `get_authed` only, which resolves on the response HEADERS: the
     // deadline is here to stop a slow legacy SEARCH, and extending it over the body
     // read would abort a legitimate large download whose bytes are already flowing.
-    // The composed bounds that follow: headers by the deadline, then a body read under
-    // the client's blanket 30s, so a stalled body gives deadline + 30s; and on the
-    // give-up path a final clamped wait can overshoot the deadline by the clamp before
-    // the next check ends it, which is never followed by a body read.
+    // The composed bound that follows. The last attempt of any run starts strictly
+    // before the deadline, since both checks above run first, and reqwest's blanket
+    // 30s covers that whole request from its start through the end of its body, so it
+    // is over by deadline + 30s. Two reads sit under that 30s and not under the
+    // deadline: `write_object`'s success read, which ends the run, and
+    // `read_body_capped`'s error read, which on a retryable arm is followed by one
+    // clamped wait before the next iteration's check ends the loop. So the worst case
+    // is deadline + 30s + clamp, about 95s at the shipped defaults, and the give-up
+    // sleep is not a separate tail but the last term of that one.
     let start = tokio::time::Instant::now();
     let mut requests = 0usize;
     loop {
