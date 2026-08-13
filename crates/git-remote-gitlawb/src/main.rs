@@ -199,9 +199,7 @@ fn handle_connect<R: Read>(
         other => bail!("unsupported git service: {other}"),
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()?;
+    let client = build_http_client()?;
 
     // ── Phase 1: ref advertisement (GET /info/refs?service=<service>) ─────────
     //
@@ -318,6 +316,56 @@ fn handle_connect<R: Read>(
         request_body,
         &mut stdout,
     )
+}
+
+// ── HTTP client ───────────────────────────────────────────────────────────────
+
+/// Total request timeout. A pack transfer can be large and slow, so this is far
+/// wider than the CLI's.
+const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The one client both phases use, with the redirect policy the signing surfaces
+/// need.
+///
+/// Every request this client sends can carry RFC 9421 `Signature` and
+/// `Signature-Input` headers: a push signs from the first request, and a fetch of a
+/// private repo signs on the retry. reqwest strips only `Authorization`, `Cookie`,
+/// `Proxy-Authorization` and `WWW-Authenticate` across hosts, so under the default
+/// `Policy::limited(10)` those signature headers rode a 302 to whatever origin the
+/// node named, and on a 307/308 the pack body went with them. Scope the follow to
+/// the origin that issued the redirect, which is the same predicate `gl` uses.
+fn build_http_client() -> Result<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::custom(same_origin_redirect))
+        .build()?)
+}
+
+/// Refuse any redirect that leaves the issuing origin, and bound the chain.
+///
+/// Refusal is `stop`, not `error`: the 3xx comes back as an ordinary response and
+/// the caller reports it through the status path it already has.
+///
+/// `Policy::custom` replaces reqwest's built-in limit, so the chain bound is
+/// restated. It is not what makes the request finite (`HTTP_TIMEOUT` covers the whole
+/// chain); it is what keeps a node that redirects to itself from costing a request
+/// per round trip until that timeout. `>` and not `>=` because reqwest pushes the
+/// redirecting URL onto `previous` before consulting the policy, which is how
+/// `Policy::limited` reads the same counter.
+fn same_origin_redirect(attempt: reqwest::redirect::Attempt<'_>) -> reqwest::redirect::Action {
+    let Some(previous) = attempt.previous().last() else {
+        // Unreachable through reqwest, which pushes the redirecting URL first, but
+        // the safe reading of "cannot prove same-origin" is to refuse.
+        return attempt.stop();
+    };
+    if attempt.previous().len() > gitlawb_core::redirect::MAX_REDIRECTS {
+        return attempt.stop();
+    }
+    if gitlawb_core::redirect::may_follow(previous, attempt.url()) {
+        attempt.follow()
+    } else {
+        attempt.stop()
+    }
 }
 
 // ── Smart-protocol request builders ───────────────────────────────────────────
@@ -856,6 +904,147 @@ mod tests {
         }
 
         String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// The signed headers must not survive a redirect off the node's origin, on
+    /// EITHER phase.
+    ///
+    /// This is the binary git runs for `clone`, `fetch` and `push`. It built its
+    /// client with a timeout and nothing else, so it ran reqwest's default
+    /// `Policy::limited(10)`, and reqwest's cross-host header stripping covers
+    /// `Authorization`, `Cookie`, `Proxy-Authorization` and `WWW-Authenticate` only.
+    /// `Signature` and `Signature-Input` came straight through. A push signs from the
+    /// first request, so a hostile node answering 302 was handed a working credential,
+    /// and a 307/308 would have taken the pack body along.
+    ///
+    /// Two mockito servers are two ports on one host, which is the boundary this
+    /// policy draws. The second server answers everything and expects nothing, with a
+    /// second mock matching on the `signature` header also at zero, so a followed
+    /// redirect fails whether or not the signature came with it. Phase 1 is driven
+    /// with a 302 and Phase 2 with a 308, the status that would carry the body.
+    ///
+    /// MUTATION (RED): drop the `.redirect(...)` line from `build_http_client`.
+    #[test]
+    fn signed_requests_do_not_follow_a_redirect_off_the_node_origin() {
+        let kp = Keypair::generate();
+        let client = build_http_client().unwrap();
+
+        let mut elsewhere = mockito::Server::new();
+        let never = elsewhere
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body("bytes from the redirect target")
+            .expect(0)
+            .create();
+        let never_post = elsewhere
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(200)
+            .expect(0)
+            .create();
+        let signature_seen_get = elsewhere
+            .mock("GET", mockito::Matcher::Any)
+            .match_header("signature", mockito::Matcher::Any)
+            .with_status(200)
+            .expect(0)
+            .create();
+        let signature_seen_post = elsewhere
+            .mock("POST", mockito::Matcher::Any)
+            .match_header("signature", mockito::Matcher::Any)
+            .with_status(200)
+            .expect(0)
+            .create();
+
+        let mut node = mockito::Server::new();
+        let repo_base = format!("{}/zOwner/myrepo", node.url());
+        let bounce_get = node
+            .mock("GET", mockito::Matcher::Regex(r"/info/refs".to_string()))
+            .with_status(302)
+            .with_header("location", &format!("{}/info/refs", elsewhere.url()))
+            .expect(1)
+            .create();
+        let bounce_post = node
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"/git-receive-pack$".to_string()),
+            )
+            .with_status(308)
+            .with_header("location", &format!("{}/git-receive-pack", elsewhere.url()))
+            .expect(1)
+            .create();
+
+        let refs_url = format!("{repo_base}/info/refs?service=git-receive-pack");
+        let advertisement = build_advertisement_request(&client, &refs_url, Some(&kp))
+            .send()
+            .unwrap();
+
+        let body = b"0009done\n".to_vec();
+        let post_url = format!("{repo_base}/git-receive-pack");
+        let pack_post =
+            build_pack_post_request(&client, &post_url, "git-receive-pack", &body, Some(&kp))
+                .body(body.clone())
+                .send()
+                .unwrap();
+
+        // The other origin first: it is the assertion that names the leak, and it must
+        // be the one that speaks when a followed redirect makes every one of these
+        // fail at once.
+        never.assert();
+        never_post.assert();
+        signature_seen_get.assert();
+        signature_seen_post.assert();
+        bounce_get.assert();
+        bounce_post.assert();
+
+        assert_eq!(
+            advertisement.status(),
+            302,
+            "a refused redirect stops rather than errors, so the caller sees the 3xx"
+        );
+        assert!(
+            !advertisement
+                .text()
+                .unwrap()
+                .contains("bytes from the redirect target"),
+            "the redirect target's bytes must never reach the caller"
+        );
+        assert_eq!(
+            pack_post.status(),
+            308,
+            "the pack POST stops at the redirect too"
+        );
+    }
+
+    /// The other direction: a same-origin redirect is still followed, so a node
+    /// fronted by a proxy that normalizes a path keeps working. Without this the
+    /// policy could be tightened to `Policy::none()` and nothing would notice.
+    #[test]
+    fn a_same_origin_redirect_is_still_followed() {
+        let kp = Keypair::generate();
+        let client = build_http_client().unwrap();
+
+        let mut node = mockito::Server::new();
+        let bounce = node
+            .mock("GET", "/zOwner/myrepo/info/refs")
+            .with_status(301)
+            .with_header("location", "/zOwner/myrepo/info/refs/")
+            .expect(1)
+            .create();
+        let target = node
+            .mock("GET", "/zOwner/myrepo/info/refs/")
+            .with_status(200)
+            .with_body("normalized")
+            .expect(1)
+            .create();
+
+        let refs_url = format!("{}/zOwner/myrepo/info/refs", node.url());
+        let resp = build_advertisement_request(&client, &refs_url, Some(&kp))
+            .send()
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().unwrap(), "normalized");
+        bounce.assert();
+        target.assert();
     }
 
     /// The regression that round-1 missed: the Phase-2 `git-upload-pack` POST was

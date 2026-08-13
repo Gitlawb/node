@@ -246,8 +246,10 @@ deadline. They are not unbounded, though. The client's own 30 second HTTP timeou
 is a total request timeout, running from the start of a request until its body
 has finished, so a transfer still going 30 seconds after its request began is cut
 off. Waits between attempts never run past the deadline either, so a single run
-tops out around 90 seconds: the deadline plus the 30 second timeout covering the
-last attempt.
+spends at most around 90 seconds on the network: the deadline plus the 30 second
+timeout covering the last attempt. Writing the object out sits outside both
+bounds, so piping into a reader that stops reading can hold the command open
+longer than that.
 
 Two node-side brakes end a ladder early and are reported rather than retried
 around. A 429 is terminal, because the node's rate-limit window is an hour and

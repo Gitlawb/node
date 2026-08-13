@@ -27,12 +27,41 @@ use crate::identity::load_keypair_from_dir;
 /// can assert the loop actually says what it skipped rather than only that it
 /// returned nothing.
 fn warn_skip(oid: &str, why: &str) {
-    let line = sanitize_node_msg(&format!(
+    emit_warning(&format!(
         "warning: could not fetch encrypted blob {oid}: {why}; skipping"
     ));
-    eprintln!("{line}");
-    #[cfg(test)]
-    tests::record_warn(&line);
+}
+
+/// The same report for a manifest rather than a blob. The manifest is one step
+/// earlier in the same recovery: losing it silently means every blob it would have
+/// named is missing with no reason given anywhere.
+fn warn_skip_manifest(id: &str, why: &str) {
+    emit_warning(&format!(
+        "warning: could not fetch blob manifest {id}: {why}; skipping"
+    ));
+}
+
+/// Sanitize a warning and write it, once.
+///
+/// The write goes to [`warn_sink`], which is stderr in a normal build and the tests'
+/// per-thread mirror under `cfg(test)`. That indirection is the point: the mirror
+/// used to sit BESIDE an `eprintln!`, so deleting the user-visible write left every
+/// assertion on the mirror green and the shipped behaviour could be removed with the
+/// tests unchanged. There is one write now, and the tests observe it.
+fn emit_warning(line: &str) {
+    use std::io::Write;
+    let line = sanitize_node_msg(line);
+    let _ = writeln!(warn_sink(), "{line}");
+}
+
+#[cfg(not(test))]
+fn warn_sink() -> impl std::io::Write {
+    std::io::stderr()
+}
+
+#[cfg(test)]
+fn warn_sink() -> impl std::io::Write {
+    tests::WarnMirror
 }
 
 #[derive(Args)]
@@ -332,10 +361,25 @@ async fn recover_encrypted_blobs(
             .await
         {
             Ok(r) if r.status().is_success() => r,
-            _ => continue,
+            // The node path has the same silent exit the gateway path had: a 403, a
+            // 404, or a dead connection all reached the caller as "blob not
+            // recoverable" with no reason attached. One unreachable blob still must
+            // not end the recovery of the rest, so it warns and moves on.
+            Ok(r) => {
+                warn_skip(oid, &format!("node returned {}", r.status()));
+                continue;
+            }
+            Err(e) => {
+                warn_skip(oid, &format!("node request failed: {e}"));
+                continue;
+            }
         };
-        let Ok(envelope) = env_resp.bytes().await else {
-            continue;
+        let envelope = match env_resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn_skip(oid, &format!("reading the envelope failed: {e}"));
+                continue;
+            }
         };
         let plaintext = match open_blob(&envelope, keypair) {
             Ok(p) => p,
@@ -662,7 +706,14 @@ async fn recover_from_arweave(
     for r in refs {
         let m = match client.get(format!("{ag}/{}", r.id)).send().await {
             Ok(resp) if resp.status().is_success() => resp,
-            _ => continue,
+            Ok(resp) => {
+                warn_skip_manifest(&r.id, &format!("gateway returned {}", resp.status()));
+                continue;
+            }
+            Err(e) => {
+                warn_skip_manifest(&r.id, &format!("gateway request failed: {e}"));
+                continue;
+            }
         };
         if let Ok(parsed) = m.json::<Manifest>().await {
             manifests.push((parsed, r.height));
@@ -720,8 +771,15 @@ async fn recover_from_arweave(
                 continue;
             }
         };
-        let Ok(envelope) = env_resp.bytes().await else {
-            continue;
+        // A body that dies part-way through is the same mid-read failure the capped
+        // read exists to stop rendering as silence, and it sits INSIDE the loop whose
+        // status arms were already fixed.
+        let envelope = match env_resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn_skip(&oid, &format!("reading the envelope failed: {e}"));
+                continue;
+            }
         };
         // open_blob succeeds only if this caller is a recipient: this is the
         // authorization gate (no node, no DID check needed).
@@ -846,11 +904,21 @@ mod tests {
         static WARNINGS: RefCell<String> = const { RefCell::new(String::new()) };
     }
 
-    pub(super) fn record_warn(msg: &str) {
-        WARNINGS.with(|w| {
-            w.borrow_mut().push_str(msg);
-            w.borrow_mut().push('\n');
-        });
+    /// The `cfg(test)` warning sink. `emit_warning` writes here instead of to
+    /// stderr, so the assertions below observe the shipped write rather than a copy
+    /// made beside it: delete that write and they go red.
+    pub(super) struct WarnMirror;
+
+    impl std::io::Write for WarnMirror {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let text = String::from_utf8_lossy(buf).into_owned();
+            WARNINGS.with(|w| w.borrow_mut().push_str(&text));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     fn reset_warnings() {

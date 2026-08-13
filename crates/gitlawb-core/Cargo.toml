@@ -22,6 +22,7 @@ multihash-codetable = { workspace = true }
 cid = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+url = { workspace = true }
 zeroize = { version = "1", features = ["derive"] }
 pkcs8 = { version = "0.10", features = ["pem", "std"] }
 curve25519-dalek = "4"

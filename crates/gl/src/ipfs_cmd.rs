@@ -48,8 +48,10 @@ pub enum IpfsCmd {
     /// request starts connecting until its body has finished, so a transfer still
     /// going 30 seconds after its own request began is cut off. Waits between
     /// attempts are bounded by the time left on the deadline as well as by the 5
-    /// second clamp, so the longest a single run can take is about 90 seconds: the
-    /// deadline, plus the 30 second timeout covering the last attempt.
+    /// second clamp, so the longest a run can spend on the network is about 90
+    /// seconds: the deadline, plus the 30 second timeout covering the last attempt.
+    /// Writing the object out is not covered by either bound, so piping into a reader
+    /// that stops reading can hold the command open past that.
     ///
     /// A 429 ends the ladder immediately: the node's rate-limit window is an hour,
     /// so the wait it asks for cannot be honored inside one invocation. A transient
@@ -234,8 +236,10 @@ async fn cmd_get_inner(
     // 30s and not under the deadline: `write_object`'s success read, which ends the run,
     // and `read_body_capped`'s error read, which on a retryable arm is followed by one
     // wait. That wait adds no term of its own, because it is bounded by the time LEFT on
-    // the deadline as well as by the clamp. So the worst case is deadline + 30s, about
-    // 90s at the shipped defaults.
+    // the deadline as well as by the clamp. So the worst case ON THE NETWORK is
+    // deadline + 30s, about 90s at the shipped defaults. `write_object`'s writes to
+    // stdout are blocking and under neither bound, so a stalled consumer on the other
+    // end of the pipe can outlast that; nothing here can bound a caller's own reader.
     let start = tokio::time::Instant::now();
     let mut requests = 0usize;
     loop {
@@ -316,12 +320,17 @@ async fn cmd_get_inner(
             // it already holds. With no token there is nothing to resume, which falls to
             // the default arm below.
             //
-            // A body the cap CUT SHORT is excluded from this arm. A cut body cannot
-            // parse, so its code reads as absent and an oversized `search_incomplete`
+            // A body that did not arrive whole is excluded from this arm, whether the
+            // cap CUT it short or the read FAILED part-way. Either way it cannot parse,
+            // so its code reads as absent and an oversized or broken `search_incomplete`
             // would land here and be retried on the OLD token, replaying one position
             // for every rung while the fresh continuation it offered goes unread.
             // Unclassifiable is terminal, like any unrecognized code.
-            Some(_) | None if status == reqwest::StatusCode::SERVICE_UNAVAILABLE && !truncated => {
+            Some(_) | None
+                if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    && !truncated
+                    && !read_failed =>
+            {
                 token.clone()
             }
             _ => None,
@@ -370,6 +379,21 @@ async fn cmd_get_inner(
 /// Write a successful response: diagnostics to stderr, raw bytes to stdout so the
 /// output stays pipeable.
 async fn write_object(resp: reqwest::Response) -> Result<()> {
+    write_object_to(resp, &mut std::io::stdout()).await
+}
+
+/// `write_object` with the sink as a parameter, so a test can read back what a
+/// caller would have received on stdout. `write_object` supplies the real one.
+///
+/// The body is STREAMED. `resp.bytes()` buffers the whole object first, so a node
+/// answering 200 with a very large body delivered fast made the client allocate all
+/// of it before a byte reached stdout; the 30 second client timeout bounds how long
+/// that takes, not how much it costs. Chunk-at-a-time the peak is one chunk, and the
+/// sibling error read is already capped at 8 KiB.
+async fn write_object_to<W: std::io::Write>(
+    mut resp: reqwest::Response,
+    out: &mut W,
+) -> Result<()> {
     let headers = resp.headers().clone();
     if let Some(git_hash) = headers.get("x-git-hash") {
         diag(&format!(
@@ -384,15 +408,13 @@ async fn write_object(resp: reqwest::Response) -> Result<()> {
         ));
     }
 
-    let bytes = resp.bytes().await.context("failed to read response body")?;
-    use std::io::Write;
+    while let Some(chunk) = resp.chunk().await.context("failed to read response body")? {
+        out.write_all(&chunk).context("failed to write to stdout")?;
+    }
     // Flush explicitly rather than leaving the tail to the process-exit flush, which
     // discards its error: `gl ipfs get <cid> > object.bin` onto a full disk or a
     // closed pipe would otherwise leave a TRUNCATED file behind exit status 0, and on
     // a content-addressed fetch a silently short object is the worst possible answer.
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    out.write_all(&bytes).context("failed to write to stdout")?;
     out.flush().context("failed to flush stdout")?;
 
     Ok(())
@@ -1788,10 +1810,18 @@ mod tests {
              hostile Retry-After must not swallow the run: made {calls} calls",
             MAX_RETRY_AFTER.as_secs()
         );
+        // Tight enough to bind. The waits are also clamped by the time LEFT on the
+        // deadline, and at 12s that term was free: dropping `.min(left)` let the run
+        // overshoot to 10.04s and still pass, so the doc claim that waits never run
+        // past the deadline rested on a term no test could see. With a 6s deadline
+        // and a 5s clamp the bounded run lands near 6s and the unbounded one near
+        // 10s, and 8s separates them.
         assert!(
-            elapsed < Duration::from_secs(12),
-            "every wait is bounded by the clamp and by the time left on the 6s \
-             deadline, so the run ends near the deadline; took {elapsed:?}"
+            elapsed < Duration::from_secs(8),
+            "a wait is bounded by the time LEFT on the 6s deadline as well as by the \
+             {}s clamp, so the run ends near the deadline rather than a full clamp \
+             past it; took {elapsed:?}",
+            MAX_RETRY_AFTER.as_secs()
         );
         assert!(
             told(&err).to_lowercase().contains("deadline"),
@@ -1996,5 +2026,300 @@ mod tests {
 
         m1.assert_async().await;
         m2.assert_async().await;
+    }
+
+    /// The other half of the same defect: a `search_incomplete` 503 whose body read
+    /// FAILED part-way is just as unparseable as one the cap cut short, and it used to
+    /// fall through to the generic overload arm and be retried on the token ALREADY
+    /// HELD. Measured before the fix: rung 1 hands back t1, every later rung answers
+    /// headers plus a cut body, and the ladder made 9 calls with calls 2 through 9 all
+    /// carrying the identical `?scan=t1`, ending at the cap. That is the replay the
+    /// truncation exclusion exists to prevent, reached by the other door.
+    ///
+    /// mockito cannot express it: it always finishes the response it advertises. The
+    /// listener promises 512 bytes, writes a handful, and hangs up.
+    ///
+    /// MUTATION (RED): drop `&& !read_failed` from the retry arm and the count is 9.
+    #[tokio::test]
+    async fn test_cmd_get_unreadable_incomplete_body_is_terminal_not_a_replay() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        reset_diag();
+        let t = make_token("t1");
+        let complete = incomplete_body(Some(&t), "scan truncated");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let scans = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded = scans.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = seen.fetch_add(1, Ordering::SeqCst);
+                let mut scratch = [0u8; 4096];
+                let read = sock.read(&mut scratch).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&scratch[..read]).into_owned();
+                if let Some(line) = request.lines().next() {
+                    if let Some(target) = line.split_whitespace().nth(1) {
+                        recorded
+                            .lock()
+                            .unwrap()
+                            .push(scan_of(target).unwrap_or_default());
+                    }
+                }
+                let resp = if n == 0 {
+                    // Rung 1: a complete 503 offering a continuation.
+                    format!(
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n\
+                         Retry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{complete}",
+                        complete.len()
+                    )
+                } else {
+                    // Every later rung: headers, then a body that stops part-way.
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n\
+                     Retry-After: 0\r\nContent-Length: 512\r\nConnection: close\r\n\r\n\
+                     {\"error\":\"search_inc"
+                        .to_string()
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+                drop(sock);
+            }
+        });
+
+        let err = cmd_get_inner(
+            "bafkreiunreadable".to_string(),
+            format!("http://{addr}"),
+            None,
+            None,
+            SCAN_DEADLINE,
+            MAX_SCAN_RESUMES,
+        )
+        .await
+        .expect_err("an unclassifiable 503 body must be an error");
+        let told = told(&err);
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a body whose read failed must end the ladder, not replay the held token \
+             for every remaining rung; the scans seen were {:?}",
+            scans.lock().unwrap()
+        );
+        assert_eq!(
+            scans.lock().unwrap().as_slice(),
+            [String::new(), t.clone()],
+            "rung 1 carries no token and rung 2 carries the one it was handed"
+        );
+        assert!(
+            told.contains(&t) && told.contains(&format!("--scan {t}")),
+            "the still-held continuation and its resuming invocation must be \
+             surfaced, got: {told}"
+        );
+    }
+
+    /// A 404 after a resume is an ANSWER, so it must not come with a resume hint that
+    /// contradicts it. Deleting the `status != NOT_FOUND` guard (replacing it with
+    /// `if true`) left the suite green, because no test had ever reached that arm
+    /// holding a token, which is the only state in which the guard does anything.
+    ///
+    /// Rung 1 hands back a valid continuation, rung 2 answers 404.
+    ///
+    /// MUTATION (RED): replace the guard with `if true`.
+    #[tokio::test]
+    async fn test_cmd_get_a_404_after_a_resume_offers_no_hint() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+        let t = make_token("t1");
+
+        let rung1 = server
+            .mock("GET", "/ipfs/bafkreignotfound")
+            .match_query(mockito::Matcher::Missing)
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_header("retry-after", "0")
+            .with_body(incomplete_body(Some(&t), "scan truncated"))
+            .expect(1)
+            .create_async()
+            .await;
+        let rung2 = server
+            .mock("GET", "/ipfs/bafkreignotfound")
+            .match_query(mockito::Matcher::Exact(format!("scan={t}")))
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"not_found","message":"no such object"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = cmd_get("bafkreignotfound".to_string(), server.url(), None, None)
+            .await
+            .expect_err("a 404 is still an error exit");
+        let told = told(&err);
+
+        assert!(
+            told.contains("404"),
+            "the terminal must name the status, got: {told}"
+        );
+        assert!(
+            !told.contains("--scan") && !told.contains(&t),
+            "a definitive 404 is an answer; a resume hint beside it would invite a \
+             re-run that cannot do better, got: {told}"
+        );
+
+        rung1.assert_async().await;
+        rung2.assert_async().await;
+    }
+
+    /// `search_incomplete` with NO continuation is the node's "the scan wrapped and
+    /// finished" signal, so that arm deliberately withholds the hint too. Adding a
+    /// `surface_resume` call to it left the suite green for the same reason: nothing
+    /// reached it holding a token.
+    ///
+    /// MUTATION (RED): add `surface_resume(&cid, token.as_deref());` to the
+    /// no-continuation branch.
+    #[tokio::test]
+    async fn test_cmd_get_a_wrapped_scan_after_a_resume_offers_no_hint() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+        let t = make_token("t1");
+
+        let rung1 = server
+            .mock("GET", "/ipfs/bafkreigwrapped")
+            .match_query(mockito::Matcher::Missing)
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_header("retry-after", "0")
+            .with_body(incomplete_body(Some(&t), "scan truncated"))
+            .expect(1)
+            .create_async()
+            .await;
+        let rung2 = server
+            .mock("GET", "/ipfs/bafkreigwrapped")
+            .match_query(mockito::Matcher::Exact(format!("scan={t}")))
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_header("retry-after", "0")
+            .with_body(incomplete_body(None, "the scan wrapped"))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = cmd_get("bafkreigwrapped".to_string(), server.url(), None, None)
+            .await
+            .expect_err("an incomplete scan with nothing to resume from is an error");
+        let told = told(&err);
+
+        assert!(
+            told.contains("offered no continuation token"),
+            "the terminal must say why it stopped, got: {told}"
+        );
+        assert!(
+            !told.contains("--scan") && !told.contains(&t),
+            "a wrapped scan has nowhere further to go, so a resume hint here would \
+             invite a re-run that cannot find more, got: {told}"
+        );
+
+        rung1.assert_async().await;
+        rung2.assert_async().await;
+    }
+
+    /// The success path streams. `resp.bytes()` buffered the whole object first, so a
+    /// hostile node answering 200 with a very large body delivered fast made the
+    /// client allocate all of it before a byte reached stdout, while the sibling error
+    /// read was capped at 8 KiB.
+    ///
+    /// What is asserted here is the CORRECTNESS of streaming, not the allocation: a
+    /// body far larger than one chunk must arrive at the sink whole, in order, byte
+    /// for byte. A chunk loop that dropped or reordered a chunk would be the obvious
+    /// way to get the memory right and the object wrong, and on a content-addressed
+    /// fetch that is the worse failure.
+    #[tokio::test]
+    async fn write_object_streams_a_large_body_through_intact() {
+        reset_diag();
+        // 4 MiB of a non-repeating pattern, well past any single chunk.
+        let payload: Vec<u8> = (0..4 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("GET", "/ipfs/bafkreibig")
+            .with_status(200)
+            .with_header("x-git-hash", "deadbeef")
+            .with_body(payload.clone())
+            .create_async()
+            .await;
+
+        let resp = reqwest::get(format!("{}/ipfs/bafkreibig", server.url()))
+            .await
+            .unwrap();
+        let mut sink: Vec<u8> = Vec::new();
+        write_object_to(resp, &mut sink).await.unwrap();
+
+        assert_eq!(
+            sink.len(),
+            payload.len(),
+            "a streamed body must arrive whole"
+        );
+        assert!(sink == payload, "a streamed body must arrive unaltered");
+        assert!(
+            diag_text().contains("deadbeef"),
+            "the header diagnostics still go to stderr, got: {}",
+            diag_text()
+        );
+        m.assert_async().await;
+    }
+
+    /// `node_tail`'s partial-body arm: a body that arrived part-way and then failed.
+    /// The other three `(read_failed, msg.is_empty())` combinations were covered; this
+    /// one, the shape a real broken connection most often produces, was not, because
+    /// the existing fixture writes zero body bytes. It is also the only arm where
+    /// node-supplied partial text reaches the terminal.
+    ///
+    /// The listener promises 512 bytes, writes a few, and hangs up. The terminal must
+    /// carry BOTH what did arrive and the fact that the rest did not.
+    #[tokio::test]
+    async fn test_cmd_get_reports_partial_text_and_the_unfinished_read() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        reset_diag();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 2048];
+            let _ = sock.read(&mut scratch).await;
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\
+                      Content-Length: 512\r\nConnection: close\r\n\r\n\
+                      {\"error\":\"boom\",\"message\":\"half a sen",
+                )
+                .await;
+            let _ = sock.flush().await;
+        });
+
+        let err = cmd_get(
+            "bafkreipartial".to_string(),
+            format!("http://{addr}"),
+            None,
+            None,
+        )
+        .await
+        .expect_err("a 500 is an error whatever became of its body");
+        let told = told(&err);
+
+        assert!(
+            told.contains("half a sen"),
+            "the text that DID arrive must reach the caller, got: {told}"
+        );
+        assert!(
+            told.contains("could not be read in full"),
+            "and it must be marked as unfinished, or partial node text reads as the \
+             node's whole answer, got: {told}"
+        );
     }
 }

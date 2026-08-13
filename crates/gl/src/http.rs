@@ -19,33 +19,26 @@ const MAX_ICAPTCHA_RETRIES: usize = 2;
 /// response body, so it bounds a slow download and not just a slow handshake.
 const TOTAL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Longest redirect chain followed. `Policy::custom` replaces reqwest's built-in
-/// limit, so the loop bound has to be restated here; the value is reqwest's own
-/// default. Same-origin redirects can cycle, and without this a node answering 302
-/// to itself would spin forever.
-const MAX_REDIRECTS: usize = 10;
-
-/// Follow a redirect only when it stays on the origin that issued it.
+/// Follow a redirect only when it stays on the origin that issued it, and only for
+/// as long as the chain bound allows.
 ///
-/// Every request this client sends may carry RFC 9421 `Signature` and
-/// `Signature-Input` headers, and reqwest strips only `Authorization`, `Cookie`,
-/// `Proxy-Authorization` and `WWW-Authenticate` when a redirect crosses hosts. The
-/// signature would survive, and it binds `@method`, `@path` and `content-digest`
-/// with no authority component, so a node answering 302 could hand a working
-/// credential to a host of its choosing and read as the caller anywhere for as long
-/// as the node's clock-skew window lasts.
+/// The origin decision itself is [`gitlawb_core::redirect::may_follow`], shared with
+/// `git-remote-gitlawb` so the two signing clients cannot drift apart on it. Refusal
+/// is `stop`, not `error`: the 3xx comes back as an ordinary response and each caller
+/// reports it through the status path it already has.
 ///
-/// `Policy::none()` would have been the simpler answer, but same-origin redirects
-/// are legitimate here (a node fronted by a proxy that upgrades http to https, or
-/// normalizes a trailing slash), so the policy is scoped to the origin rather than
-/// switched off. Refusal is `stop`, not `error`: the 3xx comes back as an ordinary
-/// response and each caller reports it through the status path it already has.
+/// `Policy::custom` replaces reqwest's built-in limit, so the chain bound is restated
+/// here. Same-origin redirects can cycle, and this is what stops a node answering 302
+/// to itself from being followed indefinitely. It is not what makes the request
+/// finite: `.timeout(...)` on the same builder is a TOTAL request timeout covering the
+/// whole chain, so without this bound the worst case is a 30 second spin, not an
+/// endless one. The bound is what keeps that spin from costing the node a request per
+/// round trip for the full 30 seconds.
 ///
-/// Host and port must match exactly. Port is compared as `Url::port`, which is
-/// `None` for a scheme's default port, so http -> https on the same host compares
-/// equal while http -> http on a different port does not. A downgrade from https to
-/// http is refused as well: the target is the same host, but the signature would go
-/// out in cleartext, which is the same credential leak by a slower route.
+/// `>` and not `>=`: reqwest pushes the redirecting URL onto `previous` before
+/// consulting the policy, so on the first redirect `previous.len()` is already 1, and
+/// `>=` would permit `MAX_REDIRECTS - 1` follows. `Policy::limited(max)` refuses at
+/// `previous.len() > max`, and matching it is the point of reusing its value.
 fn same_origin_redirect(attempt: reqwest::redirect::Attempt<'_>) -> reqwest::redirect::Action {
     let Some(previous) = attempt.previous().last() else {
         // No previous URL to compare against. Unreachable through reqwest, which
@@ -53,23 +46,14 @@ fn same_origin_redirect(attempt: reqwest::redirect::Attempt<'_>) -> reqwest::red
         // reading of "cannot prove same-origin" is to refuse.
         return attempt.stop();
     };
-    if attempt.previous().len() >= MAX_REDIRECTS {
+    if attempt.previous().len() > gitlawb_core::redirect::MAX_REDIRECTS {
         return attempt.stop();
     }
-    if may_follow(previous, attempt.url()) {
+    if gitlawb_core::redirect::may_follow(previous, attempt.url()) {
         attempt.follow()
     } else {
         attempt.stop()
     }
-}
-
-/// The decision itself, split out because `redirect::Attempt` cannot be built outside
-/// reqwest, so this is the only way to run the scheme and port branches both ways
-/// rather than reasoning about them.
-fn may_follow(previous: &reqwest::Url, next: &reqwest::Url) -> bool {
-    let same_origin = next.host_str() == previous.host_str() && next.port() == previous.port();
-    let downgraded = previous.scheme() == "https" && next.scheme() != "https";
-    same_origin && !downgraded
 }
 
 pub struct NodeClient {
@@ -792,69 +776,56 @@ mod tests {
         signature_seen.assert_async().await;
     }
 
-    /// Every branch of the decision, both ways. The end-to-end test above drives one
-    /// pair of http origins, which is all mockito can serve; the scheme cases and the
-    /// default-port equivalence have no other way to be run.
-    #[test]
-    fn may_follow_covers_each_origin_branch() {
-        let url = |s: &str| reqwest::Url::parse(s).unwrap();
-        let cases: &[(&str, &str, bool, &str)] = &[
-            (
-                "http://node.example/a",
-                "http://node.example/b",
-                true,
-                "same origin, different path",
-            ),
-            (
-                "http://node.example/a",
-                "https://node.example/a",
-                true,
-                "http to https on one host: both ports are the scheme default",
-            ),
-            (
-                "https://node.example/a",
-                "https://node.example/a/",
-                true,
-                "trailing-slash normalization",
-            ),
-            (
-                "https://node.example:8443/a",
-                "https://node.example:8443/b",
-                true,
-                "same explicit port",
-            ),
-            (
-                "http://node.example/a",
-                "http://attacker.example/a",
-                false,
-                "different host",
-            ),
-            (
-                "http://node.example/a",
-                "http://node.example:8080/a",
-                false,
-                "same host, different port",
-            ),
-            (
-                "https://node.example/a",
-                "http://node.example/a",
-                false,
-                "https downgraded to cleartext on the same host",
-            ),
-            (
-                "https://node.example/a",
-                "http://node.example:443/a",
-                false,
-                "a downgrade dressed up as the https port",
-            ),
-        ];
-        for (previous, next, expected, why) in cases {
-            assert_eq!(
-                may_follow(&url(previous), &url(next)),
-                *expected,
-                "{previous} -> {next} ({why})"
-            );
-        }
+    /// A node redirecting to itself is same-origin, so the origin predicate follows it
+    /// every time and only the chain bound ends the loop. Deleting the bound left the
+    /// whole suite green, because nothing here had ever built a cycle.
+    ///
+    /// The route answers 301 pointing back at itself. Bounded, the handler is hit
+    /// once for the original request plus `MAX_REDIRECTS` follows and the call returns
+    /// the 301 (a refused redirect stops rather than errors). Unbounded, it runs until
+    /// the client's total request timeout cuts it off, which is a 30 second spin at the
+    /// shipped value and a request per round trip for the node.
+    ///
+    /// MUTATION (RED): delete the `previous().len()` check.
+    #[tokio::test]
+    async fn a_self_redirect_stops_at_the_chain_bound() {
+        let mut node = Server::new_async().await;
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        let loop_route = node
+            .mock("GET", "/api/v1/loop")
+            .with_status(301)
+            .with_header("location", "/api/v1/loop")
+            .with_body_from_request(move |_req| {
+                h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Vec::new()
+            })
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let client = NodeClient::with_timeout(
+            node.url(),
+            Some(test_keypair()),
+            std::time::Duration::from_secs(5),
+        );
+        let resp = client
+            .get_signed("/api/v1/loop")
+            .await
+            .expect("the bound must end the chain, not the timeout");
+
+        assert_eq!(
+            resp.status(),
+            301,
+            "the chain ends by refusing the next hop, so the last 3xx is what comes back"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            gitlawb_core::redirect::MAX_REDIRECTS + 1,
+            "one original request plus MAX_REDIRECTS follows, matching what \
+             Policy::limited(MAX_REDIRECTS) would have permitted"
+        );
+        loop_route.assert_async().await;
     }
 
     /// The other direction: a same-origin redirect is still followed, so a node
