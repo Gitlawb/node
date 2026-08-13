@@ -248,16 +248,30 @@ impl LegacyScanPager {
             .cursor
             .as_ref()
             .map(|(created_at, id)| (created_at.as_str(), id.as_str()));
+        // The row ceiling bounds what this REQUEST costs the database, so the ask is the
+        // smaller of one page and what is left of the budget. Capped in the LIMIT rather
+        // than by trimming the page once it has landed, because a trim bounds the result
+        // and leaves the selection, the transfer and the allocation already paid, which is
+        // the wrong half of the guarantee on an anonymously reachable route.
+        let remaining = state
+            .ipfs_max_legacy_scan_rows
+            .saturating_sub(self.fetched_rows);
+        let limit = state.ipfs_legacy_scan_page_rows.min(remaining);
+        // The caller's arm ordering is what guarantees this: `get_by_cid`'s row-ceiling
+        // arm breaks and mints a continuation before reaching this fetch once
+        // `fetched_rows >= ipfs_max_legacy_scan_rows`, so the budget always has room here.
+        debug_assert!(
+            limit >= 1,
+            "legacy scan LIMIT must ask for at least one row"
+        );
         // Record the DB-facing ask before it is made. It sits above the timeout opener
         // because the INV-22 guard reads a fixed lookback from the query call for that
         // wrapper, and anything inserted inside the window eats its margin.
         #[cfg(test)]
-        note_scan_limit(state.ipfs_legacy_scan_page_rows);
+        note_scan_limit(limit);
         let page = match tokio::time::timeout(
             request_deadline.saturating_duration_since(std::time::Instant::now()),
-            state
-                .db
-                .list_repos_page_for_scan(after, state.ipfs_legacy_scan_page_rows as i64),
+            state.db.list_repos_page_for_scan(after, limit as i64),
         )
         .await
         {
@@ -277,8 +291,13 @@ impl LegacyScanPager {
         self.fetched_rows += page.len();
         // Measured on the FULL page the query returned, before any rules cut shortens it:
         // this is the DB-facing row cost the row ceiling bounds, and a page that is short
-        // is a page with nothing behind it whatever the rules do.
-        if page.len() < state.ipfs_legacy_scan_page_rows {
+        // is a page with nothing behind it whatever the rules do. Compared against the
+        // limit ACTUALLY sent, not the page size: once the budget can shorten the ask, a
+        // page shorter than a full page proves nothing about the table, and marking the
+        // scan exhausted there breaks at the top-of-loop arm that sits ahead of every
+        // ceiling arm, taints nothing and mints no token, so existing content returns a
+        // false definitive 404.
+        if page.len() < limit {
             self.exhausted = true;
         }
         if page.is_empty() {
