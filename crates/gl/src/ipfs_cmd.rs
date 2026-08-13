@@ -37,13 +37,22 @@ pub enum IpfsCmd {
         /// Identity directory (default: ~/.gitlawb)
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// Resume token from a scan that stopped at a bound, as printed by a
+        /// previous run that gave up with the result incomplete
+        #[arg(long, value_name = "TOKEN")]
+        scan: Option<String>,
     },
 }
 
 pub async fn run(args: IpfsArgs) -> Result<()> {
     match args.cmd {
         IpfsCmd::List { node, dir } => cmd_list(node, dir).await,
-        IpfsCmd::Get { cid, node, dir } => cmd_get(cid, node, dir).await,
+        IpfsCmd::Get {
+            cid,
+            node,
+            dir,
+            scan,
+        } => cmd_get(cid, node, dir, scan).await,
     }
 }
 
@@ -120,8 +129,13 @@ fn diag(msg: &str) {
     tests::record_diag(msg);
 }
 
-async fn cmd_get(cid: String, node: String, dir: Option<PathBuf>) -> Result<()> {
-    cmd_get_inner(cid, node, dir, None, SCAN_DEADLINE, MAX_SCAN_RESUMES).await
+async fn cmd_get(
+    cid: String,
+    node: String,
+    dir: Option<PathBuf>,
+    scan: Option<String>,
+) -> Result<()> {
+    cmd_get_inner(cid, node, dir, scan, SCAN_DEADLINE, MAX_SCAN_RESUMES).await
 }
 
 /// The body of `gl ipfs get`, with the bounds and the starting continuation as
@@ -171,9 +185,15 @@ async fn cmd_get_inner(
     };
 
     // One deadline for the whole ladder, captured before the first request and used
-    // both as the loop's bound and as each request's own timeout, so the composed
-    // worst case is the deadline plus one clamped wait rather than the deadline plus
-    // the client's blanket 30s.
+    // both as the loop's bound and as each attempt's own timeout, so no attempt can
+    // start just under the deadline and then run a fresh unbounded 30s of its own.
+    // That wrap covers `get_authed` only, which resolves on the response HEADERS: the
+    // deadline is here to stop a slow legacy SEARCH, and extending it over the body
+    // read would abort a legitimate large download whose bytes are already flowing.
+    // The composed bounds that follow: headers by the deadline, then a body read under
+    // the client's blanket 30s, so a stalled body gives deadline + 30s; and on the
+    // give-up path a final clamped wait can overshoot the deadline by the clamp before
+    // the next check ends it, which is never followed by a body read.
     let start = tokio::time::Instant::now();
     let mut requests = 0usize;
     loop {
@@ -613,6 +633,7 @@ mod tests {
             "bafkreitestcid".to_string(),
             server.url(),
             Some(keystore.path().to_path_buf()),
+            None,
         )
         .await
         .expect("signed get of a resolvable object should succeed");
@@ -635,7 +656,7 @@ mod tests {
             .create_async()
             .await;
 
-        let err = cmd_get("bafkreidenied".to_string(), server.url(), None)
+        let err = cmd_get("bafkreidenied".to_string(), server.url(), None, None)
             .await
             .expect_err("a 404 denial must be an error, not masked success");
         assert!(
@@ -683,7 +704,7 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_get("bafkreiresume".to_string(), server.url(), None)
+        cmd_get("bafkreiresume".to_string(), server.url(), None, None)
             .await
             .expect("a search_incomplete 503 carrying a continuation must resume, not bail");
 
@@ -716,7 +737,7 @@ mod tests {
             .create_async()
             .await;
 
-        let err = cmd_get("bafkreicap".to_string(), server.url(), None)
+        let err = cmd_get("bafkreicap".to_string(), server.url(), None, None)
             .await
             .expect_err("a ladder that never completes must end in an error");
         let told = told(&err);
@@ -776,7 +797,7 @@ mod tests {
             .create_async()
             .await;
 
-        let err = cmd_get("bafkreiwedged".to_string(), server.url(), None)
+        let err = cmd_get("bafkreiwedged".to_string(), server.url(), None, None)
             .await
             .expect_err("a wedged ladder must end in an error");
         let told = told(&err);
@@ -816,7 +837,7 @@ mod tests {
             .create_async()
             .await;
 
-        let err = cmd_get("bafkreinotoken".to_string(), server.url(), None)
+        let err = cmd_get("bafkreinotoken".to_string(), server.url(), None, None)
             .await
             .expect_err("a truncation with no continuation must be an error");
         let told = told(&err);
@@ -860,7 +881,7 @@ mod tests {
             .create_async()
             .await;
 
-        let err = cmd_get("bafkreioverload".to_string(), server.url(), None)
+        let err = cmd_get("bafkreioverload".to_string(), server.url(), None, None)
             .await
             .expect_err("a first-request overload must be an error");
         let told = told(&err);
@@ -919,6 +940,7 @@ mod tests {
             "bafkreisigned".to_string(),
             server.url(),
             Some(keystore.path().to_path_buf()),
+            None,
         )
         .await
         .expect("the resumed request must be signed and served");
@@ -943,7 +965,7 @@ mod tests {
             .create_async()
             .await;
 
-        let err = cmd_get("bafkreihostilebody".to_string(), server.url(), None)
+        let err = cmd_get("bafkreihostilebody".to_string(), server.url(), None, None)
             .await
             .expect_err("a hostile truncation body must still be an error");
         let told = told(&err);
@@ -987,7 +1009,7 @@ mod tests {
             .create_async()
             .await;
 
-        let err = cmd_get("bafkreihostiletoken".to_string(), server.url(), None)
+        let err = cmd_get("bafkreihostiletoken".to_string(), server.url(), None, None)
             .await
             .expect_err("a malformed continuation must be terminal");
         let told = told(&err);
@@ -1043,7 +1065,7 @@ mod tests {
             .create_async()
             .await;
 
-        let err = cmd_get("bafkreithrottled".to_string(), server.url(), None)
+        let err = cmd_get("bafkreithrottled".to_string(), server.url(), None, None)
             .await
             .expect_err("a mid-ladder 429 must be an error");
         let told = told(&err);
@@ -1117,7 +1139,7 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_get("bafkreimidoverload".to_string(), server.url(), None)
+        cmd_get("bafkreimidoverload".to_string(), server.url(), None, None)
             .await
             .expect("a mid-ladder overload must be retried on the held token, not terminal");
 
@@ -1126,9 +1148,75 @@ mod tests {
         m3.assert_async().await;
     }
 
+    /// Scenario 10b. The classification default arm with a token ALREADY HELD. Every
+    /// other fixture reaches that arm token-less (scenario 5's first-request overload)
+    /// or never reaches it at all (scenario 9's 429 short-circuits on the status), so
+    /// the arm's terminality was certified only for the case where there was nothing
+    /// to resume with anyway. Here an unknown code arrives mid-ladder on a 500, which
+    /// is not the overload status, with a valid token in hand: it must still be
+    /// terminal. Two calls, and the fixture stops well short of the cap so a
+    /// misclassified retry shows up as a call count rather than a cap give-up.
+    #[tokio::test]
+    async fn test_cmd_get_mid_ladder_unknown_code_is_terminal_with_token_held() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+        let t = make_token("t1");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c1 = calls.clone();
+        let c2 = calls.clone();
+
+        let m1 = server
+            .mock("GET", "/ipfs/bafkreiunknowncode")
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_header("retry-after", "0")
+            .with_body_from_request({
+                let t = t.clone();
+                move |_req| {
+                    c1.fetch_add(1, Ordering::SeqCst);
+                    incomplete_body(Some(&t), "scan truncated").into_bytes()
+                }
+            })
+            .expect(1)
+            .create_async()
+            .await;
+        let m2 = server
+            .mock("GET", "/ipfs/bafkreiunknowncode")
+            .match_query(mockito::Matcher::Exact(format!("scan={t}")))
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |_req| {
+                c2.fetch_add(1, Ordering::SeqCst);
+                br#"{"error":"index_corrupt","message":"scan index unreadable"}"#.to_vec()
+            })
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = cmd_get("bafkreiunknowncode".to_string(), server.url(), None, None)
+            .await
+            .expect_err("an unknown code mid-ladder must be an error");
+        let told = told(&err);
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "an unrecognized code with a token held must be terminal, not retried"
+        );
+        assert!(
+            told.contains("500"),
+            "the terminal must name the status, got: {told}"
+        );
+
+        m1.assert_async().await;
+        m2.assert_async().await;
+    }
+
     /// Scenario 11. The wall-clock deadline bounds the whole loop, and it bounds each
-    /// request's own timeout, so the composed worst case is the deadline plus one
-    /// clamped wait. Injected through the seam because the shipped 60s is unreachable
+    /// attempt's own timeout. This drives the give-up tail, where the ladder never
+    /// reaches a body read, so its bound is the deadline plus one clamped wait (a
+    /// stalled body composes differently; see the note in `cmd_get_inner`). Injected
+    /// through the seam because the shipped 60s is unreachable
     /// under the 5s clamp and 8 resumes.
     #[tokio::test]
     async fn test_cmd_get_resume_ladder_stops_at_wall_clock_deadline() {
@@ -1156,7 +1244,7 @@ mod tests {
 
         let started = Instant::now();
         let err = cmd_get_inner(
-            "bafkreideadline".to_string(),
+            "bafkreislowscan".to_string(),
             server.url(),
             None,
             None,
@@ -1217,7 +1305,7 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_get("bafkreibound".to_string(), server.url(), None)
+        cmd_get("bafkreibound".to_string(), server.url(), None, None)
             .await
             .expect("a 2048-character token is within the bound and must be resumed with");
 
@@ -1247,7 +1335,7 @@ mod tests {
             .create_async()
             .await;
 
-        let err = cmd_get("bafkreioverbound".to_string(), server.url(), None)
+        let err = cmd_get("bafkreioverbound".to_string(), server.url(), None, None)
             .await
             .expect_err("an over-bound token must be terminal");
         let told = told(&err);
@@ -1303,6 +1391,47 @@ mod tests {
         front.assert_async().await;
         resumed.assert_async().await;
         res.expect("a supplied continuation must be used, not ignored");
+    }
+
+    /// R21, the wired half. The scenario above drives `cmd_get_inner` directly, so
+    /// it proves the resume INPUT works but says nothing about the `--scan` arg
+    /// reaching it. This one goes through `cmd_get`, the function clap dispatches
+    /// to, so a rewiring that drops the argument on the floor turns it red. Without
+    /// it the flag can be silently disconnected while every other resume test stays
+    /// green, and the invocation this command prints at a bound would be advice the
+    /// binary does not honor.
+    #[tokio::test]
+    async fn test_cmd_get_passes_the_scan_arg_through_to_the_resume_input() {
+        reset_diag();
+        let mut server = mockito::Server::new_async().await;
+        let t = make_token("t14");
+
+        let front = server
+            .mock("GET", "/ipfs/bafkreiwired")
+            .expect(0)
+            .create_async()
+            .await;
+        let resumed = server
+            .mock("GET", "/ipfs/bafkreiwired")
+            .match_query(mockito::Matcher::Exact(format!("scan={t}")))
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_body("object bytes")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let res = cmd_get(
+            "bafkreiwired".to_string(),
+            server.url(),
+            None,
+            Some(t.clone()),
+        )
+        .await;
+
+        front.assert_async().await;
+        resumed.assert_async().await;
+        res.expect("the --scan argument must reach the resume input through cmd_get");
     }
 
     /// #173 review (F1): a base64 CID (multibase prefix 'm') can contain '/', '+',
@@ -1363,6 +1492,7 @@ mod tests {
             "bafkreitestcid".to_string(),
             server.url(),
             Some(empty.path().to_path_buf()),
+            None,
         )
         .await
         .expect_err("an explicit --dir that fails to load must be an error");
