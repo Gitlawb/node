@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::Value;
 
-use crate::http::NodeClient;
+use crate::http::{read_body_capped, sanitize_node_msg, NodeClient};
 
 #[derive(Args)]
 pub struct IpfsArgs {
@@ -97,6 +97,20 @@ const MAX_SCAN_RESUMES: usize = 8;
 /// Wall-clock budget for a whole `gl ipfs get`, resumes included.
 const SCAN_DEADLINE: Duration = Duration::from_secs(60);
 
+/// Longest single wait honored between attempts, whatever `Retry-After` asks for.
+/// The node picks that number, so an unclamped sleep would let a hostile one stall
+/// the client for as long as it likes.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(5);
+
+/// Wait used when a retryable response carries no usable `Retry-After`.
+const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
+
+/// Generous ceiling on a continuation token. Real tokens are fixed-width (668
+/// base64url characters today), but the sealed layout has already changed once and
+/// a rejected token is terminal, so a tight bound would silently kill resume on a
+/// future version bump.
+const MAX_CONTINUATION_LEN: usize = 2048;
+
 /// Mirror a stderr diagnostic into a per-thread buffer under `cfg(test)` so the
 /// command-level tests can assert on what the caller is actually told. Callers
 /// see the same line either way; only the test-visible copy is conditional.
@@ -113,17 +127,13 @@ async fn cmd_get(cid: String, node: String, dir: Option<PathBuf>) -> Result<()> 
 /// The body of `gl ipfs get`, with the bounds and the starting continuation as
 /// parameters so tests can drive the resume ladder without waiting out the shipped
 /// defaults. `cmd_get` supplies those defaults.
-///
-/// The resume loop itself is not wired yet: `continuation`, `deadline`, and `cap`
-/// are accepted here so the ladder tests can address the seam, and the request
-/// behaviour below is still the single-shot, bail-on-any-non-success one.
 async fn cmd_get_inner(
     cid: String,
     node: String,
     dir: Option<PathBuf>,
-    _continuation: Option<String>,
-    _deadline: Duration,
-    _cap: usize,
+    continuation: Option<String>,
+    deadline: Duration,
+    cap: usize,
 ) -> Result<()> {
     // #173 (F5): the resolver now serves path-scoped objects to authorized readers,
     // so sign with an available identity like `gl ipfs list` — otherwise an owner or
@@ -147,19 +157,122 @@ async fn cmd_get_inner(
     // route nor points at the intended target. Percent-encode the CID as exactly
     // one path segment so the signed and sent target agree and the server's
     // `Path` extractor decodes it back to the original CID.
-    let path = format!("/ipfs/{}", encode_cid_segment(&cid));
-    let resp = client
-        .get_authed(&path)
-        .await
-        .with_context(|| format!("failed to fetch CID {cid} from {node}"))?;
+    let encoded_cid = encode_cid_segment(&cid);
 
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("node returned {status}: {body}");
+    // A caller-supplied continuation reaches the same signed target as a node-chosen
+    // one, so it clears the same bar before the first request.
+    let mut token = match continuation {
+        Some(t) if valid_continuation(&t) => Some(t),
+        Some(_) => anyhow::bail!(
+            "the supplied continuation is not a resume token: \
+             expected 1 to {MAX_CONTINUATION_LEN} base64url characters"
+        ),
+        None => None,
+    };
+
+    // One deadline for the whole ladder, captured before the first request and used
+    // both as the loop's bound and as each request's own timeout, so the composed
+    // worst case is the deadline plus one clamped wait rather than the deadline plus
+    // the client's blanket 30s.
+    let start = tokio::time::Instant::now();
+    let mut requests = 0usize;
+    loop {
+        if requests > cap {
+            diag(&format!(
+                "warning: the node's legacy scan is still incomplete after {cap} automatic \
+                 resumes; the object may sit beyond the rows scanned so far"
+            ));
+            surface_resume(&cid, token.as_deref());
+            anyhow::bail!(
+                "gave up on an incomplete scan for CID {cid} after {requests} node calls"
+            );
+        }
+        let remaining = deadline.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return Err(deadline_reached(&cid, token.as_deref(), deadline));
+        }
+
+        // The token joins the single `path` binding BEFORE `get_authed` signs, so the
+        // signature covers the query string and the bytes signed are the bytes sent.
+        // Percent-encoding is the identity over the accepted alphabet; it is here for
+        // the value that is not.
+        let path = match &token {
+            Some(t) => format!("/ipfs/{encoded_cid}?scan={}", urlencoding::encode(t)),
+            None => format!("/ipfs/{encoded_cid}"),
+        };
+        let resp = match tokio::time::timeout(remaining, client.get_authed(&path)).await {
+            Ok(r) => r.with_context(|| format!("failed to fetch CID {cid} from {node}"))?,
+            Err(_) => return Err(deadline_reached(&cid, token.as_deref(), deadline)),
+        };
+        requests += 1;
+
+        // Status first, before any body read.
+        let status = resp.status();
+        if status.is_success() {
+            return write_object(resp).await;
+        }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            // Terminal on the status alone: the fanout limiter's window is an hour, so
+            // the wait it advertises cannot be honored inside one invocation, and
+            // retrying only deepens the shedding the ladder itself caused.
+            diag(
+                "warning: the node is rate limiting this scan, so the result is incomplete; \
+                 its limit window outlasts a single invocation",
+            );
+            surface_resume(&cid, token.as_deref());
+            anyhow::bail!("node returned {status}: rate limited");
+        }
+
+        let retry_after = parse_retry_after(resp.headers());
+        let raw = read_body_capped(resp, 8 * 1024).await;
+        let parsed = serde_json::from_str::<Value>(&raw).ok();
+        let code = parsed.as_ref().and_then(|v| v["error"].as_str());
+        let node_msg = parsed
+            .as_ref()
+            .and_then(|v| v["message"].as_str())
+            .unwrap_or(raw.as_str());
+        let offered = parsed.as_ref().and_then(|v| v["continuation"].as_str());
+
+        // The one classification site. The node's error code picks the arm and the
+        // default is terminal, so an unrecognized code can never resolve to a retry.
+        let resume_with = match code {
+            Some("search_incomplete") => offered
+                .filter(|t| valid_continuation(t))
+                .map(str::to_string),
+            // A mid-ladder overload sheds a request whose permit is released at request
+            // end and asks the caller back shortly, so the ladder continues on the token
+            // it already holds. With no token there is nothing to resume, which falls to
+            // the default arm below.
+            Some(_) | None if status == reqwest::StatusCode::SERVICE_UNAVAILABLE => token.clone(),
+            _ => None,
+        };
+
+        let Some(next) = resume_with else {
+            let msg = sanitize_node_msg(node_msg);
+            if code == Some("search_incomplete") {
+                // Naming the bound, never echoing the value: a rejected token is
+                // node-chosen text and has no business in a terminal message.
+                let why = if offered.is_some() {
+                    format!(
+                        "the continuation it offered is not a resume token \
+                         (expected 1 to {MAX_CONTINUATION_LEN} base64url characters)"
+                    )
+                } else {
+                    "it offered no continuation token".to_string()
+                };
+                anyhow::bail!("node returned {status} with the scan incomplete and {why}: {msg}");
+            }
+            anyhow::bail!("node returned {status}: {msg}");
+        };
+
+        tokio::time::sleep(retry_after.min(MAX_RETRY_AFTER)).await;
+        token = Some(next);
     }
+}
 
-    // Print headers for diagnostics
+/// Write a successful response: diagnostics to stderr, raw bytes to stdout so the
+/// output stays pipeable.
+async fn write_object(resp: reqwest::Response) -> Result<()> {
     let headers = resp.headers().clone();
     if let Some(git_hash) = headers.get("x-git-hash") {
         diag(&format!(
@@ -174,7 +287,6 @@ async fn cmd_get_inner(
         ));
     }
 
-    // Write raw bytes to stdout (allows piping to files or other tools)
     let bytes = resp.bytes().await.context("failed to read response body")?;
     use std::io::Write;
     std::io::stdout()
@@ -182,6 +294,52 @@ async fn cmd_get_inner(
         .context("failed to write to stdout")?;
 
     Ok(())
+}
+
+/// Report the wall-clock give-up and hand the caller their token back.
+fn deadline_reached(cid: &str, token: Option<&str>, deadline: Duration) -> anyhow::Error {
+    diag(&format!(
+        "warning: the node's legacy scan is still incomplete at the {}s deadline; \
+         the object may sit beyond the rows scanned so far",
+        deadline.as_secs_f32()
+    ));
+    surface_resume(cid, token);
+    anyhow::anyhow!("gave up on an incomplete scan for CID {cid} at the wall-clock deadline")
+}
+
+/// Hand back the token that still points at where the scan stopped, together with
+/// the invocation that resumes from it. A bare re-run restarts at row 0, reproduces
+/// the same truncation, and re-spends the caller's per-IP budget, so the token is
+/// the only thing that makes progress.
+fn surface_resume(cid: &str, token: Option<&str>) {
+    if let Some(t) = token {
+        diag(&format!(
+            "resume from where this stopped: gl ipfs get {cid} --scan {t}"
+        ));
+    }
+}
+
+/// `Retry-After` in delta-seconds. Absent, non-numeric, or an HTTP-date all fall
+/// back to one second; the caller clamps whatever comes back.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Duration {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_RETRY_AFTER)
+}
+
+/// A continuation is node-chosen and goes straight into a signed request target, so
+/// accept only the alphabet the node's sealer emits. A value carrying `#`, `&`, `?`,
+/// `/`, whitespace, or control bytes could make the URL reqwest parses differ from
+/// the bytes signed.
+fn valid_continuation(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_CONTINUATION_LEN
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Percent-encode a CID so it occupies exactly one path segment of `/ipfs/<cid>`.
@@ -212,7 +370,12 @@ mod tests {
         DIAG.with(|d| {
             let mut d = d.borrow_mut();
             d.push_str(msg);
-            d.push('\n');
+            // A space, not a newline: the `has_control_or_bidi` assertions run over the
+            // whole telling, so a newline the harness inserts itself would make them
+            // fire on ANY stderr diagnostic and turn "node text is sanitized" into
+            // "nothing was printed to stderr", which R21 requires. A node-supplied
+            // control character is still caught.
+            d.push(' ');
         });
     }
 
@@ -893,10 +1056,15 @@ mod tests {
             !has_control_or_bidi(&told),
             "node text must be sanitized before it reaches the terminal, got: {told:?}"
         );
+        // The length bound is scoped to the error text, not to `told`: R21 requires a
+        // stderr line carrying the still-held 668-character token, so no implementation
+        // can keep the whole telling under 600 characters. The error text is where an
+        // uncapped node body would land on this path, so the property still binds.
+        let reported = format!("{err:#}");
         assert!(
-            told.chars().count() < 600,
+            reported.chars().count() < 600,
             "node text must be length-capped, got {} chars",
-            told.chars().count()
+            reported.chars().count()
         );
         assert!(
             told.contains(&t) && told.contains(&format!("--scan {t}")),
