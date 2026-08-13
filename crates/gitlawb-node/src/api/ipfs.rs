@@ -248,6 +248,11 @@ impl LegacyScanPager {
             .cursor
             .as_ref()
             .map(|(created_at, id)| (created_at.as_str(), id.as_str()));
+        // Record the DB-facing ask before it is made. It sits above the timeout opener
+        // because the INV-22 guard reads a fixed lookback from the query call for that
+        // wrapper, and anything inserted inside the window eats its margin.
+        #[cfg(test)]
+        note_scan_limit(state.ipfs_legacy_scan_page_rows);
         let page = match tokio::time::timeout(
             request_deadline.saturating_duration_since(std::time::Instant::now()),
             state
@@ -1876,6 +1881,31 @@ pub(crate) fn scan_rows() -> usize {
 #[cfg(test)]
 fn note_scan_rows(n: usize) {
     SCAN_ROWS.with(|c| c.set(c.get() + n));
+}
+
+// Test-only counter for the LIMIT the legacy scan actually sends to SQL, summed over
+// the request's fetches. The row counter above measures what came BACK, so it cannot
+// tell a query that asked for the remaining budget from one that asked for a full page
+// and then dropped the tail: both return the same rows. The limit is the DB-facing ask,
+// which is the quantity the operator ceiling is supposed to bound.
+#[cfg(test)]
+thread_local! {
+    static SCAN_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_scan_limit() {
+    SCAN_LIMIT.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn scan_limit() -> usize {
+    SCAN_LIMIT.with(|c| c.get())
+}
+
+#[cfg(test)]
+fn note_scan_limit(n: usize) {
+    SCAN_LIMIT.with(|c| c.set(c.get() + n));
 }
 
 // Test-only INV-10 cost counter: how many visibility-rule ROWS the legacy scan actually
@@ -3767,11 +3797,10 @@ mod tests {
         // The row COUNT first: it is the cost this ceiling exists to bound, and a
         // status-first ordering would attribute a missing ceiling to the tail instead.
         let rows = crate::api::ipfs::scan_rows();
-        assert!(
-            rows <= 4 + 2,
-            "the ceiling (4) bounds the DB-facing selection to at most one page (2) of \
-             overshoot; a denial-only inventory must not page the whole table. Read {rows} \
-             of 12 seeded rows"
+        assert_eq!(
+            rows, 4,
+            "the ceiling (4) bounds the DB-facing selection exactly; a denial-only \
+             inventory must not page the whole table. Read {rows} of 12 seeded rows"
         );
         assert_eq!(
             status,
@@ -3842,10 +3871,10 @@ mod tests {
         );
         assert_eq!(body["error"], "search_incomplete", "{body}");
         let rows = crate::api::ipfs::scan_rows();
-        assert!(
-            rows <= 4 + 2,
+        assert_eq!(
+            rows, 4,
             "quarantine costs neither a probe nor a visit, so only the ROW ceiling can \
-             stop this pager. Read {rows} of 12 seeded rows"
+             stop this pager, and it stops it exactly. Read {rows} of 12 seeded rows"
         );
         assert!(
             continuation_of(&body).is_some(),
@@ -4106,6 +4135,348 @@ mod tests {
             served_at.is_some(),
             "a holder past the ceiling must be served within ceil(10/4)+1 = {bound} \
              token-echoing requests, or the ceiling has made it permanently unservable"
+        );
+    }
+
+    /// Scenario 7 (#173 round 14, F4): an operator ceiling BELOW the page size must
+    /// bound the QUERY, not just the loop that reads its result.
+    ///
+    /// Page size 4, ceiling 2. The scan may prove two rows, so two rows is what it may
+    /// select and rule-load inside the admission-held, budget-clamped region. A fetch
+    /// that always asks for a full page buys twice the ceiling and the row arm only
+    /// notices afterwards, which makes the page size an implicit floor under the knob.
+    /// `scan_limit()` is what separates the fix from a post-fetch trim: it records the
+    /// DB-facing ask, so a trim that hands back the same two rows still reads 4 here.
+    ///
+    /// The fixture also carries the fail-open boundary case. The LAST row is a real bare
+    /// repo, public at "/", holding a real blob at /src/secret.txt behind a path-scoped
+    /// rule naming a reader the anonymous caller is not, and its pin is LEGACY (NULL
+    /// provenance) so the gate reads the page's own `pager.rules` rather than re-querying
+    /// per repo. Every fetch here is budget-shortened, so that repo arrives as the last
+    /// row of a shortened page: the boundary where a page carrying a rule set loaded for
+    /// a different row set would fail OPEN and serve a withheld object.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_scan_ceiling_below_page_size_bounds_the_query(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 4;
+        state.ipfs_max_legacy_scan_rows = 2;
+        // The probe, visit, and walk budgets stay at their defaults on purpose: the
+        // boundary repo below spends a probe, a visit, and a history walk that the
+        // denial-only rows do not, and a fixture that starved them would withhold it for
+        // a reason that has nothing to do with its rules.
+
+        seed_root_denying_repos(&state, "capbelow", 6, 0).await;
+        // Both repos below are mirror rows, so `upsert_mirror_repo` stamps `now` and they
+        // sort after every 2020-stamped denial row. The boundary repo is seeded second,
+        // so `(created_at, id)` puts it eighth and last.
+        let (_, holder_oid) = seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6capbelow",
+            "holder",
+            b"past a ceiling below the page size\n",
+        )
+        .await;
+        let holder_cid = seed_legacy_pin_for_oid(&state, &holder_oid).await;
+        let (_, withheld_oid) = seed_path_denying_repo(
+            &state,
+            tmp.path(),
+            "z6capbelow",
+            "boundary",
+            b"withheld at the boundary row\n",
+        )
+        .await;
+        let withheld_cid = seed_legacy_pin_for_oid(&state, &withheld_oid).await;
+
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.150:5000".parse().unwrap();
+
+        crate::api::ipfs::reset_scan_rows();
+        crate::api::ipfs::reset_scan_limit();
+        let (status, body) = status_and_body(
+            router
+                .clone()
+                .oneshot(get_cid_scan(&holder_cid, Some(peer), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        // Both counters sum over the whole request and are cleared only by their resets,
+        // so they are captured HERE, before the ladder below adds its own fetches.
+        let rows = crate::api::ipfs::scan_rows();
+        let limit = crate::api::ipfs::scan_limit();
+        assert_eq!(
+            limit, 2,
+            "one fetch, and it must ask the database for the ceiling (2), not the page \
+             size (4). Asked for {limit}"
+        );
+        assert_eq!(
+            rows, 2,
+            "a ceiling below the page size still bounds the selection exactly. Read \
+             {rows} of 8 seeded rows"
+        );
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the holder is row 7, past the ceiling, so this request must not serve it \
+             and must tail to the retryable 503: {body}"
+        );
+        assert_eq!(
+            body["error"], "search_incomplete",
+            "the shed must name the incomplete search: {body}"
+        );
+
+        // The ladder still reaches the holder: rungs covering rows 3-4, 5-6, then 7-8.
+        let bound = 8usize.div_ceil(2) + 1;
+        let mut token = Some(
+            continuation_of(&body)
+                .unwrap_or_else(|| panic!("rung 1 must carry a continuation: {body}")),
+        );
+        let mut served_at = None;
+        for step in 2..=bound {
+            let (status, body) = status_and_body(
+                router
+                    .clone()
+                    .oneshot(get_cid_scan(&holder_cid, Some(peer), token.as_deref()))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            if status == StatusCode::OK {
+                served_at = Some(step);
+                break;
+            }
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "an intermediate rung is the retryable 503 (step {step}): {body}"
+            );
+            token = Some(
+                continuation_of(&body)
+                    .unwrap_or_else(|| panic!("rung {step} must carry a continuation: {body}")),
+            );
+        }
+        assert!(
+            served_at.is_some(),
+            "a holder past the ceiling must still be served within ceil(8/2)+1 = {bound} \
+             token-echoing requests; a ceiling that shortens the query must not shorten \
+             the reach"
+        );
+
+        // The withheld blob gets its OWN full ladder, and is denied on every rung.
+        let mut token: Option<String> = None;
+        for step in 1..=bound {
+            let (status, body) = status_and_body(
+                router
+                    .clone()
+                    .oneshot(get_cid_scan(&withheld_cid, Some(peer), token.as_deref()))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_ne!(
+                status,
+                StatusCode::OK,
+                "the /src/** rule names a reader the anonymous caller is not, so the \
+                 boundary repo's blob must never be served, including on the rung that \
+                 reaches it as the last row of a shortened page (step {step}): {body}"
+            );
+            match continuation_of(&body) {
+                Some(t) => token = Some(t),
+                None => break,
+            }
+        }
+    }
+
+    /// The positive control for the fixture above: the identical inventory with the
+    /// `/src/**` rule ABSENT serves the same blob through the same ladder.
+    ///
+    /// Its job is attribution. Without it, a not-served assertion is satisfied by any
+    /// fixture that never reaches the repo at all (a spent probe, a skipped walk, a
+    /// budget cut), so a RED there could not be read as "the rules decided". This test
+    /// is GREEN before and after the ceiling fix; only the pairing carries meaning.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_boundary_repo_serves_the_same_blob_without_the_path_rule(
+        pool: sqlx::PgPool,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 4;
+        state.ipfs_max_legacy_scan_rows = 2;
+
+        seed_root_denying_repos(&state, "capbelowctl", 6, 0).await;
+        let (_, holder_oid) = seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6capbelowctl",
+            "holder",
+            b"past a ceiling below the page size\n",
+        )
+        .await;
+        let _ = seed_legacy_pin_for_oid(&state, &holder_oid).await;
+        // Same recipe as the fixture above, minus the path-scoped rule.
+        let (_, allowed_oid) = seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6capbelowctl",
+            "boundary",
+            b"withheld at the boundary row\n",
+        )
+        .await;
+        let allowed_cid = seed_legacy_pin_for_oid(&state, &allowed_oid).await;
+
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.151:5000".parse().unwrap();
+        let bound = 8usize.div_ceil(2) + 1;
+
+        let mut token: Option<String> = None;
+        let mut served_at = None;
+        for step in 1..=bound {
+            let (status, body) = status_and_body(
+                router
+                    .clone()
+                    .oneshot(get_cid_scan(&allowed_cid, Some(peer), token.as_deref()))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            if status == StatusCode::OK {
+                served_at = Some(step);
+                break;
+            }
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "an intermediate rung is the retryable 503 (step {step}): {body}"
+            );
+            token = Some(
+                continuation_of(&body)
+                    .unwrap_or_else(|| panic!("rung {step} must carry a continuation: {body}")),
+            );
+        }
+        assert!(
+            served_at.is_some(),
+            "the boundary repo is public at \"/\" and the rule is what withholds its \
+             blob, so with the rule absent the same blob must be served within {bound} \
+             rungs"
+        );
+    }
+
+    /// Scenario 8 (#173 round 14, F4): a ceiling that is not a multiple of the page size
+    /// must shorten the LAST fetch to what is left of the budget.
+    ///
+    /// Page size 2, ceiling 3. The first fetch may ask for a full page; the second may
+    /// ask for one row only. A pager that asks for a page either way overshoots the
+    /// operator's ceiling by a page on every scan whose ceiling is not an exact multiple,
+    /// which is the general case. `scan_limit()` reads 2 + 1 = 3 for the fix and 2 + 2 =
+    /// 4 for a pager that trims after the query.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_scan_ceiling_not_a_page_multiple_shortens_the_last_fetch(
+        pool: sqlx::PgPool,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 3;
+
+        seed_root_denying_repos(&state, "capodd", 6, 0).await;
+        // Seventh and last: `upsert_mirror_repo` stamps `now`, past every 2020 stamp.
+        let (_, holder_oid) = seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6capodd",
+            "holder",
+            b"past a ceiling that is not a page multiple\n",
+        )
+        .await;
+        let holder_cid = seed_legacy_pin_for_oid(&state, &holder_oid).await;
+
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.152:5000".parse().unwrap();
+
+        crate::api::ipfs::reset_scan_rows();
+        crate::api::ipfs::reset_scan_limit();
+        let (status, body) = status_and_body(
+            router
+                .clone()
+                .oneshot(get_cid_scan(&holder_cid, Some(peer), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        // Captured before the ladder: both counters sum across the whole request.
+        let rows = crate::api::ipfs::scan_rows();
+        let limit = crate::api::ipfs::scan_limit();
+        assert_eq!(
+            limit, 3,
+            "two fetches, of 2 then 1: the second may ask only for the remaining budget. \
+             Asked for {limit} rows in total"
+        );
+        assert_eq!(
+            rows, 3,
+            "the ceiling (3) bounds the selection exactly, page size (2) or not. Read \
+             {rows} of 7 seeded rows"
+        );
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the holder is row 7, past the ceiling, so this request must not serve it \
+             and must tail to the retryable 503: {body}"
+        );
+        assert_eq!(
+            body["error"], "search_incomplete",
+            "the shed must name the incomplete search: {body}"
+        );
+
+        let bound = 7usize.div_ceil(3) + 1;
+        let mut token = Some(
+            continuation_of(&body)
+                .unwrap_or_else(|| panic!("rung 1 must carry a continuation: {body}")),
+        );
+        let mut served_at = None;
+        for step in 2..=bound {
+            let (status, body) = status_and_body(
+                router
+                    .clone()
+                    .oneshot(get_cid_scan(&holder_cid, Some(peer), token.as_deref()))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            if status == StatusCode::OK {
+                served_at = Some(step);
+                break;
+            }
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "an intermediate rung is the retryable 503 (step {step}): {body}"
+            );
+            token = Some(
+                continuation_of(&body)
+                    .unwrap_or_else(|| panic!("rung {step} must carry a continuation: {body}")),
+            );
+        }
+        assert!(
+            served_at.is_some(),
+            "a holder past the ceiling must still be served within ceil(7/3)+1 = {bound} \
+             token-echoing requests"
         );
     }
 
