@@ -6146,17 +6146,6 @@ mod tests {
         );
     }
 
-    /// Reproduce `repo_store::advisory_lock_key` (private there) so a test can probe the
-    /// exact key `acquire_write` derives.
-    #[cfg(unix)]
-    fn write_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        owner_slug.hash(&mut hasher);
-        repo_name.hash(&mut hasher);
-        hasher.finish() as i64
-    }
-
     #[cfg(unix)]
     fn pid_alive(pid: i32) -> bool {
         // SAFETY: kill(2) with signal 0 only probes; it takes integers and borrows no
@@ -6262,7 +6251,10 @@ mod tests {
             .unwrap();
 
         // The mirror row stores the short owner as owner_did, so the slug is the owner.
-        let key = write_lock_key(&owner.replace([':', '/'], "_"), name);
+        // Import the production derivation rather than hand-copying it: a local copy
+        // silently diverged when the key moved to SHA-256 (#210).
+        use crate::git::repo_store::advisory_lock_key;
+        let key = advisory_lock_key(&owner.replace([':', '/'], "_"), name);
         // Probe from a pool that is NOT the store's lock pool and NOT the harness pool.
         let probe = sqlx::postgres::PgPoolOptions::new()
             .max_connections(2)
@@ -6427,7 +6419,8 @@ mod tests {
             .await
             .unwrap();
 
-        let key = write_lock_key(&owner.replace([':', '/'], "_"), name);
+        use crate::git::repo_store::advisory_lock_key;
+        let key = advisory_lock_key(&owner.replace([':', '/'], "_"), name);
         let probe = sqlx::postgres::PgPoolOptions::new()
             .max_connections(2)
             .connect_lazy_with((*pool.connect_options()).clone());
