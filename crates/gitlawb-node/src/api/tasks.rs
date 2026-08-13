@@ -119,6 +119,10 @@ fn task_to_read_json(t: &AgentTask) -> Value {
 /// request size controls how much the visibility filter has to scan.
 const MAX_VISIBLE_TASKS: i64 = 200;
 
+/// Maximum task candidates one list request may inspect while searching for
+/// visible rows. This keeps a denied request from walking the full task table.
+const MAX_TASK_SCAN_CANDIDATES: i64 = 1_000;
+
 /// Whether `task` should be visible to `caller` (`None` = anonymous).
 ///
 /// The delegator and assignee can always read a task they are already party
@@ -186,12 +190,14 @@ pub(crate) async fn collect_visible_tasks(
     }
     let mut visible = Vec::with_capacity(bounded_limit as usize);
     let mut cursor: Option<(String, String)> = None;
-    loop {
+    let mut scanned = 0;
+    while scanned < MAX_TASK_SCAN_CANDIDATES {
+        let batch_limit = MAX_VISIBLE_TASKS.min(MAX_TASK_SCAN_CANDIDATES - scanned);
         let tasks = db
             .list_tasks_keyset(
                 status,
                 assignee_did,
-                MAX_VISIBLE_TASKS,
+                batch_limit,
                 cursor
                     .as_ref()
                     .map(|(created_at, id)| (created_at.as_str(), id.as_str())),
@@ -200,6 +206,7 @@ pub(crate) async fn collect_visible_tasks(
         if tasks.is_empty() {
             break;
         }
+        scanned += tasks.len() as i64;
         let next_cursor = tasks
             .last()
             .map(|task| (task.created_at.clone(), task.id.clone()));
@@ -225,7 +232,7 @@ pub(crate) async fn collect_visible_tasks(
                 .take((bounded_limit as usize).saturating_sub(visible.len()))
                 .cloned(),
         );
-        if visible.len() == bounded_limit as usize || tasks.len() < MAX_VISIBLE_TASKS as usize {
+        if visible.len() == bounded_limit as usize || tasks.len() < batch_limit as usize {
             break;
         }
         cursor = next_cursor;
@@ -588,8 +595,12 @@ mod visible_tasks_tests {
             "anon must not see another party's repo-less task"
         );
         assert_eq!(body["count"], 0);
+        let serialized = body.to_string();
+        assert!(!serialized.contains("t1"));
+        assert!(!serialized.contains("payload-data"));
+        assert!(!serialized.contains(SECRET_UCAN));
 
-        let resp = list_router(state)
+        let resp = list_router(state.clone())
             .oneshot(anon_get("/api/v1/tasks/t1"))
             .await
             .unwrap();
@@ -598,6 +609,44 @@ mod visible_tasks_tests {
             StatusCode::NOT_FOUND,
             "anon get_task on an invisible task must 404, not leak it"
         );
+        let body = body_json(resp).await;
+        let serialized = body.to_string();
+        assert!(!serialized.contains("t1"));
+        assert!(!serialized.contains("payload-data"));
+        assert!(!serialized.contains(SECRET_UCAN));
+
+        let resp = list_router(state.clone())
+            .oneshot(signed_request_as(
+                STRANGER,
+                Method::GET,
+                "/api/v1/tasks",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["tasks"].as_array().unwrap().len(), 0);
+        assert_eq!(body["count"], 0);
+        let serialized = body.to_string();
+        assert!(!serialized.contains("t1"));
+        assert!(!serialized.contains("payload-data"));
+        assert!(!serialized.contains(SECRET_UCAN));
+
+        let resp = list_router(state)
+            .oneshot(signed_request_as(
+                STRANGER,
+                Method::GET,
+                "/api/v1/tasks/t1",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = body_json(resp).await;
+        let serialized = body.to_string();
+        assert!(!serialized.contains("t1"));
+        assert!(!serialized.contains("payload-data"));
+        assert!(!serialized.contains(SECRET_UCAN));
     }
 
     /// The delegator can always read their own repo-less task — the party who
@@ -833,5 +882,34 @@ mod visible_tasks_tests {
         let body = body_json(resp).await;
         assert_eq!(body["count"], 1);
         assert_eq!(body["tasks"][0]["id"], "visible");
+    }
+
+    #[sqlx::test]
+    async fn denied_history_scan_stops_at_candidate_ceiling(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("public-repo", DELEGATOR, "public", true))
+            .await
+            .unwrap();
+        let mut visible = task("past-ceiling", Some("public-repo"), DELEGATOR);
+        visible.created_at = "2026-01-01T00:00:00Z".into();
+        visible.updated_at = visible.created_at.clone();
+        state.db.create_task(&visible).await.unwrap();
+
+        for i in 0..MAX_TASK_SCAN_CANDIDATES {
+            let mut hidden = task(&format!("hidden-{i:04}"), None, DELEGATOR);
+            hidden.created_at = "2026-01-02T00:00:00Z".into();
+            hidden.updated_at = hidden.created_at.clone();
+            state.db.create_task(&hidden).await.unwrap();
+        }
+
+        let resp = list_router(state)
+            .oneshot(anon_get("/api/v1/tasks?limit=1"))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["count"], 0);
+        assert!(!body.to_string().contains("past-ceiling"));
     }
 }
