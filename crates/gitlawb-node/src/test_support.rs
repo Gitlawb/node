@@ -2172,6 +2172,142 @@ mod tests {
         );
     }
 
+    /// Delegated push, end to end through both auth layers.
+    ///
+    /// A non-owner presenting an invocation whose chain roots at the repo owner
+    /// clears the owner-push gate; the same signer without one, and with one that
+    /// names a different repository, are both refused. This is the regression the
+    /// owner-push default introduced: a CI or delegated key holding a valid
+    /// `git/push` capability was refused exactly like a stranger.
+    ///
+    /// Status codes are the discriminators. 500 means the request passed
+    /// `require_signature` (not 401), passed `require_ucan_chain` (not 401), and
+    /// cleared the owner gate (not 403), then reached git on a repo with no disk
+    /// backing — the same shape `git_upload_pack_post_is_read_gated_on_private_repo`
+    /// relies on. A bare `!= 403` would let a 401 regression pass.
+    ///
+    /// Not `#[cfg(unix)]`: no fake-git shim is involved, only HTTP and the gate.
+    #[sqlx::test]
+    async fn delegated_push_clears_the_owner_gate(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+        use gitlawb_core::ucan::{caps, Capability, Ucan};
+        use std::sync::Arc;
+
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+
+        let mut state = test_state(pool).await;
+        // Explicit rather than relying on the shipped default, so this test states
+        // the configuration it is about.
+        let mut cfg = (*state.config).clone();
+        cfg.enforce_owner_push = true;
+        state.config = Arc::new(cfg);
+
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "deleg"))
+            .await
+            .expect("seed repo");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/{owner}/{repo}/git-receive-pack",
+                    axum::routing::post(crate::api::repos::git_receive_pack),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::auth::require_ucan_chain,
+                ))
+                .layer(axum::middleware::from_fn(crate::auth::require_signature))
+                .with_state(state.clone())
+        };
+
+        let path = format!("/{short}/deleg.git/git-receive-pack");
+        let body = b"0000".to_vec();
+
+        // owner -> agent delegation, then agent -> node invocation carrying it.
+        let invocation_for = |resource: String| {
+            let delegation = Ucan::issue(
+                &owner,
+                agent.did(),
+                vec![Capability::new(resource, caps::GIT_PUSH)],
+                None,
+            )
+            .expect("issue delegation");
+            Ucan::delegate(
+                &agent,
+                state.node_did.clone(),
+                delegation.payload.att.clone(),
+                None,
+                &delegation,
+            )
+            .expect("wrap invocation")
+            .encode()
+            .expect("encode invocation")
+        };
+
+        let signed_push = |ucan: Option<String>| {
+            let signed = sign_request(&agent, "POST", &path, &body);
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri(&path)
+                .header("content-type", "application/x-git-receive-pack-request")
+                .header("content-digest", signed.content_digest)
+                .header("signature-input", signed.signature_input)
+                .header("signature", signed.signature);
+            if let Some(token) = ucan {
+                req = req.header("x-ucan", token);
+            }
+            req.body(Body::from(body.clone())).expect("request")
+        };
+
+        // 1. Valid delegation for THIS repo: clears the gate.
+        let resp = router()
+            .oneshot(signed_push(Some(invocation_for(format!(
+                "gitlawb://repos/{owner_did}/deleg"
+            )))))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "an owner-rooted git/push delegation must clear the owner gate and reach git"
+        );
+
+        // 2. Delegation naming a DIFFERENT repo: refused.
+        let other = router()
+            .oneshot(signed_push(Some(invocation_for(format!(
+                "gitlawb://repos/{owner_did}/someotherrepo"
+            )))))
+            .await
+            .unwrap();
+        assert_eq!(
+            other.status(),
+            StatusCode::FORBIDDEN,
+            "a delegation for another repository must not authorize this push"
+        );
+        let other_body = axum::body::to_bytes(other.into_body(), 4096).await.unwrap();
+
+        // 3. No delegation at all: refused, with a byte-identical body. A caller
+        //    must not be able to tell a non-applicable delegation from none, or the
+        //    denial becomes an oracle for which capabilities exist.
+        let none = router().oneshot(signed_push(None)).await.unwrap();
+        assert_eq!(
+            none.status(),
+            StatusCode::FORBIDDEN,
+            "a non-owner with no delegation must still be refused"
+        );
+        let none_body = axum::body::to_bytes(none.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            other_body, none_body,
+            "an inapplicable delegation and no delegation must be indistinguishable"
+        );
+    }
+
     /// A1 Phase-2 contract: the `git-upload-pack` POST (the actual fetch, after
     /// the advertisement) is itself read-visibility gated. An ANONYMOUS upload-pack
     /// POST against a private repo is denied (404), so signing only the Phase-1

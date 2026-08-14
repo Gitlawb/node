@@ -33,14 +33,20 @@ pub struct VerifiedUcan {
 
 /// Whether `caller` is authorized to push to `record`.
 ///
-/// Phase 1 (`GITLAWB_ENFORCE_OWNER_PUSH`): owner-only, via the canonical
-/// [`crate::api::did_matches`] owner comparison (DID-safe on both sides). This is
-/// intentionally a distinct, intent-named gate rather than a bare owner check so
-/// that Phase 2 can extend it to honor a verified UCAN `git/push` capability as a
-/// pure addition (`did_matches(..) || ucan_grants_push(..)`) without rewriting
-/// call sites.
-pub fn caller_authorized_to_push(record: &crate::db::RepoRecord, caller: &str) -> bool {
+/// The repo owner, or a caller presenting a verified UCAN whose chain roots at
+/// that owner and which carries `git/push` for this repo.
+///
+/// `verified` is optional because `X-Ucan` is: a push carrying no token reaches
+/// the same owner-only decision it always did. The owner check is unconditional
+/// and runs first, so this can only ever turn a refusal into an acceptance,
+/// never the reverse.
+pub fn caller_authorized_to_push(
+    record: &crate::db::RepoRecord,
+    caller: &str,
+    verified: Option<&VerifiedUcan>,
+) -> bool {
     crate::api::did_matches(caller, &record.owner_did)
+        || verified.is_some_and(|v| ucan_grants_push(record, v))
 }
 
 /// Whether `with` names this repository.
