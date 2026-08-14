@@ -148,13 +148,24 @@ const GOSSIP_SEEN_EVENTS_RETENTION: Duration = Duration::from_secs(
 /// record rate is bounded by the author brake: 500 per 60 seconds per
 /// registered DID. Occupancy is that rate times retention plus one sweep
 /// interval (an entry can outlive retention until the next tick reclaims it),
-/// so roughly 8,000 entries per author running flat out. Filling 100,000 takes
-/// twelve or thirteen registered DIDs sustaining the author cap for a full
-/// horizon, every event individually signed and durably written, which is
-/// 100,000 ref-update rows and 100,000 sync enqueues: an attack the database
-/// and the accepted counter announce long before this ceiling is reached. At
-/// roughly 100 bytes per entry the ceiling is about 10 MB, comparable to the
-/// limiters' own 200k-key maps.
+/// so roughly 8,000 entries per author running flat out.
+///
+/// Be exact about what does and does not bound the DID side of that: NOTHING
+/// does. A DID count is not a cost to an attacker, because `upsert_peer`
+/// accepts a `PeerWriteAuthority::Unproven` announce for an unseen did:key (see
+/// the ingest path's own note on why authentication is not authorization), so
+/// fresh DIDs are minted for free and each one arrives with its own author
+/// budget. Any rationale of the form "it would take N registered DIDs" is
+/// therefore not a bound at all.
+///
+/// The real cost is on the other side of the write. Every entry here
+/// corresponds to an event that was individually signed, durably written, and
+/// enqueued, so reaching this ceiling means 100,000 ref-update rows and 100,000
+/// sync enqueues inside one retention horizon. That is the bound worth citing,
+/// and it is loud in two places an operator already watches: the database, and
+/// the `accepted` ingest counter. What this constant buys is that the seen-set
+/// itself cannot be the thing that fails first. At roughly 100 bytes per entry
+/// the ceiling is about 10 MB, comparable to the limiters' own 200k-key maps.
 const GOSSIP_SEEN_EVENTS_MAX: usize = 100_000;
 /// The retention horizon cannot be shortened below the span the freshness
 /// window admits. Enforced at compile time for the same reason the limiter
@@ -576,8 +587,42 @@ enum Begin<'a> {
 /// the release path runs in `Drop`, which is synchronous and cannot await. The
 /// critical sections are a hash lookup and an insert, so holding a blocking
 /// lock across them costs nothing a runtime would notice.
+///
+/// IN-PROCESS, so a restart empties it, and that is a real exposure rather than
+/// an implementation detail worth leaving unstated. A captured event still
+/// inside its freshness window replays once more after each restart, because
+/// the node that already refused it no longer remembers doing so; a
+/// crash-looping node gives an attacker one replay per loop. Bound it honestly
+/// in both directions. The exposure is one extra admission per restart per
+/// event and not an unbounded one, since
+/// [`GOSSIP_REF_UPDATE_FRESHNESS_WINDOW`] still refuses the event outright ten
+/// minutes after its stamp no matter how many times the process has cycled, and
+/// the author brake still applies to the writes. Persisting the set was
+/// considered and is not worth it: it would put a durable write on the hot
+/// ingest path to close a window that the freshness check already closes for
+/// free, and a node restarting often enough for this to matter has a louder
+/// problem.
+/// Everything the guard's one mutex protects.
+///
+/// The map and the inline-sweep bookkeeping are behind the SAME lock rather
+/// than in two, because [`ReplayGuard::begin`] reads both inside one critical
+/// section and a second lock would only add a way for them to disagree.
+struct SeenState {
+    entries: HashMap<[u8; 32], SeenEntry>,
+    /// When [`ReplayGuard::begin`] last ran its inline sweep, or `None` if it
+    /// never has. Read on the guard-layer clock ([`ingest_now`]), like
+    /// everything else here.
+    last_inline_sweep: Option<DateTime<Utc>>,
+    /// How many inline sweeps have run. The throttle's whole subject is a count
+    /// that must NOT track the event count, and a test cannot see that from
+    /// outcomes alone: a throttled guard and an unthrottled one return the same
+    /// `Saturated` on every call.
+    #[cfg(test)]
+    inline_sweeps: usize,
+}
+
 pub(crate) struct ReplayGuard {
-    seen: std::sync::Mutex<HashMap<[u8; 32], SeenEntry>>,
+    seen: std::sync::Mutex<SeenState>,
     /// How long an entry stays authoritative. Production passes
     /// [`GOSSIP_SEEN_EVENTS_RETENTION`]; the parameter exists so an expiry test
     /// pins a clock instead of waiting out eleven minutes.
@@ -598,7 +643,12 @@ impl ReplayGuard {
     /// constants above document; nothing else about the guard varies.
     fn with_limits(retention: Duration, capacity: usize) -> Self {
         Self {
-            seen: std::sync::Mutex::new(HashMap::new()),
+            seen: std::sync::Mutex::new(SeenState {
+                entries: HashMap::new(),
+                last_inline_sweep: None,
+                #[cfg(test)]
+                inline_sweeps: 0,
+            }),
             retention,
             capacity,
         }
@@ -609,7 +659,7 @@ impl ReplayGuard {
     /// is a map of opaque keys to timestamps, and the worst a poisoned state
     /// can hold is one stale entry. Refusing to serve it would turn a panic
     /// somewhere else in the process into a replay window here.
-    fn lock_seen(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], SeenEntry>> {
+    fn lock_seen(&self) -> std::sync::MutexGuard<'_, SeenState> {
         self.seen.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -652,7 +702,7 @@ impl ReplayGuard {
     fn begin(&self, key: [u8; 32], now: DateTime<Utc>) -> Begin<'_> {
         let mut seen = self.lock_seen();
 
-        let present = match seen.get(&key) {
+        let present = match seen.entries.get(&key) {
             Some(entry) if !self.is_expired(entry, now) => return Begin::Replayed,
             Some(_) => true,
             None => false,
@@ -660,16 +710,32 @@ impl ReplayGuard {
 
         // Only a NEW key can grow the map, so an expired entry being replaced
         // in place never has to clear the capacity bar.
-        if !present && seen.len() >= self.capacity {
-            Self::sweep_locked(&mut seen, now, self.retention);
-            if seen.len() >= self.capacity {
+        if !present && seen.entries.len() >= self.capacity {
+            // THROTTLED, and the throttle is the difference between a guard and
+            // an amplifier. Once the map is full of unexpired entries every
+            // subsequent event lands here, and an unconditional sweep would pay
+            // an O(capacity) retain under this mutex, on the swarm loop, once
+            // per event, reclaiming nothing: the attacker driving the guard to
+            // capacity would be buying CPU with it. At most one sweep per second
+            // costs nothing in reclamation, because entries expire on an
+            // eleven-minute horizon and the periodic 300-second tick sweeps on
+            // its own cadence regardless. What the inline sweep is for is
+            // reclaiming BETWEEN those ticks, and a second's granularity is far
+            // finer than the horizon it is reclaiming against.
+            let owed = seen
+                .last_inline_sweep
+                .is_none_or(|last| now.signed_duration_since(last) >= chrono::Duration::seconds(1));
+            if owed {
+                Self::sweep_inline_locked(&mut seen, now, self.retention);
+            }
+            if seen.entries.len() >= self.capacity {
                 drop(seen);
                 crate::metrics::record_gossip_replay_guard_saturated();
                 return Begin::Saturated;
             }
         }
 
-        seen.insert(
+        seen.entries.insert(
             key,
             SeenEntry {
                 recorded_at: now,
@@ -698,20 +764,74 @@ impl ReplayGuard {
     /// inside its own critical section without releasing and reacquiring.
     ///
     /// [`begin`]: ReplayGuard::begin
-    fn sweep_locked(
-        seen: &mut HashMap<[u8; 32], SeenEntry>,
-        now: DateTime<Utc>,
-        retention: Duration,
-    ) {
-        let horizon = chrono::Duration::seconds(retention.as_secs() as i64);
-        seen.retain(|_, entry| now.signed_duration_since(entry.recorded_at) <= horizon);
+    /// The inline sweep [`begin`] runs when the map is full.
+    ///
+    /// [`begin`]: ReplayGuard::begin
+    fn sweep_inline_locked(seen: &mut SeenState, now: DateTime<Utc>, retention: Duration) {
+        Self::sweep_locked(seen, now, retention);
+        seen.last_inline_sweep = Some(now);
+        #[cfg(test)]
+        {
+            seen.inline_sweeps += 1;
+        }
     }
+
+    fn sweep_locked(seen: &mut SeenState, now: DateTime<Utc>, retention: Duration) {
+        let horizon = chrono::Duration::seconds(retention.as_secs() as i64);
+        seen.entries
+            .retain(|_, entry| now.signed_duration_since(entry.recorded_at) <= horizon);
+    }
+}
+
+/// Everything the swarm loop's sweep tick does, as a function a test can call.
+///
+/// Extracted rather than left inline because the seen-set's periodic sweep is
+/// the only thing reclaiming slots between saturation events, and while it
+/// lived entirely inside the `select!` arm, deleting the `replay_guard.cleanup`
+/// line left the whole suite green. What is now covered by execution is that a
+/// sweep reclaims expired entries from BOTH the limiters and the seen-set, and
+/// on one shared instant.
+///
+/// UNCOVERED SEAM, stated rather than implied: nothing here proves the `select!`
+/// arm still calls this, nor that `ingest_sweep` is built with
+/// `GOSSIP_INGEST_SWEEP_INTERVAL` and actually fires. That dispatch needs a live
+/// swarm, a real transport, and a 300-second interval to observe, which is not a
+/// test this suite can hold. Deleting the call from the arm above still leaves
+/// every test green. The reduction is real (the body is proven, only the wiring
+/// is not) but it is a reduction and not a closure.
+///
+/// `now` is a parameter rather than a call to [`ingest_now`] for the same
+/// reason it is on `check_freshness`: the seen-set is sized against the
+/// guard-layer clock, so the sweep must measure on the instant its caller
+/// already read rather than on a second independent one.
+async fn run_ingest_sweep(
+    limiters: &IngestLimiters,
+    replay_guard: &ReplayGuard,
+    now: DateTime<Utc>,
+) {
+    limiters.cleanup().await;
+    replay_guard.cleanup(now);
 }
 
 #[cfg(test)]
 impl ReplayGuard {
+    /// Entry count, which is what makes the sweep observable. Every outcome the
+    /// guard returns treats an expired entry as absent whether or not it was
+    /// ever swept, so a test asserting on `begin` alone stays green with the
+    /// sweep deleted.
+    fn len_for_test(&self) -> usize {
+        self.lock_seen().entries.len()
+    }
+
     fn is_confirmed_for_test(&self, key: &[u8; 32]) -> bool {
-        self.lock_seen().get(key).is_some_and(|e| e.confirmed)
+        self.lock_seen()
+            .entries
+            .get(key)
+            .is_some_and(|e| e.confirmed)
+    }
+
+    fn inline_sweeps_for_test(&self) -> usize {
+        self.lock_seen().inline_sweeps
     }
 }
 
@@ -743,7 +863,7 @@ impl ReplayReservation<'_> {
     fn confirm(mut self) {
         {
             let mut seen = self.guard.lock_seen();
-            if let Some(entry) = seen.get_mut(&self.key) {
+            if let Some(entry) = seen.entries.get_mut(&self.key) {
                 entry.confirmed = true;
             }
         }
@@ -760,7 +880,7 @@ impl Drop for ReplayReservation<'_> {
         if !self.armed {
             return;
         }
-        self.guard.lock_seen().remove(&self.key);
+        self.guard.lock_seen().entries.remove(&self.key);
     }
 }
 
@@ -828,6 +948,24 @@ fn check_freshness(timestamp: &str, now: DateTime<Utc>) -> Result<(), FreshnessV
         return Err(FreshnessViolation::TooFarFuture);
     }
     Ok(())
+}
+
+/// Render an attacker-controlled string safe to put in a log line.
+///
+/// Control characters are dropped rather than escaped, because the only caller
+/// is diagnosing a timestamp: a legal instant contains none of them, so their
+/// presence is itself the finding and their exact bytes add nothing an operator
+/// can act on. Dropping them is what stops a `\n` from forging a second log
+/// line and a `\x1b[` sequence from driving the operator's terminal.
+///
+/// The 64-character cap is measured in CHARS, not bytes, so the truncation
+/// cannot split a UTF-8 sequence. It is comfortably longer than any legal
+/// RFC-3339 instant (the longest form this parser accepts runs to the mid-30s
+/// with sub-second digits and a numeric offset), so nothing diagnostic is lost:
+/// what it removes is the unbounded case, where one refused event writes
+/// however much log the sender chose to send.
+fn sanitize_for_log(raw: &str) -> String {
+    raw.chars().filter(|c| !c.is_control()).take(64).collect()
 }
 
 /// What the ingest path decided about one inbound gossip message.
@@ -1098,7 +1236,16 @@ pub(crate) async fn ingest_ref_update(
     // `AuthorRateLimited`, which is the harm this guard exists to remove.
     let mut reservation = None;
     if verified {
-        if let Err(violation) = check_freshness(&event.timestamp, ingest_now()) {
+        // ONE reading, shared by the freshness comparison and the seen-set
+        // below. `ingest_now`'s whole reason to exist is that the two layers
+        // measure against the same instant: the retention horizon is derived
+        // from the freshness window, so a seen-set recording on a second,
+        // independently sampled `now` would put the two layers a scheduling
+        // delay apart on exactly the relation that derivation rests on. Two
+        // calls here left that invariant asserted in a doc comment and unheld
+        // in production.
+        let now = ingest_now();
+        if let Err(violation) = check_freshness(&event.timestamp, now) {
             let detail = match violation {
                 FreshnessViolation::TooOld => format!(
                     "ref-update timestamp {} is more than {}s old",
@@ -1110,9 +1257,19 @@ pub(crate) async fn ingest_ref_update(
                     event.timestamp,
                     GOSSIP_REF_UPDATE_FUTURE_SKEW.as_secs()
                 ),
+                // The one arm that must sanitize, and only this one. The two
+                // above ran through `DateTime::parse_from_rfc3339`
+                // successfully, so their `event.timestamp` is a legal RFC-3339
+                // instant by construction: bounded length, no control
+                // characters. This arm is reached precisely BECAUSE the parser
+                // refused the string, so what it holds is arbitrary
+                // attacker-chosen bytes of arbitrary length, and this detail
+                // reaches a `warn!`. Unsanitized that is two sinks at once: a
+                // newline or an ANSI escape forges log lines, and a megabyte of
+                // timestamp writes a megabyte of log per refused event.
                 FreshnessViolation::Unparseable => format!(
                     "ref-update timestamp {} is not a valid RFC-3339 instant",
-                    event.timestamp
+                    sanitize_for_log(&event.timestamp)
                 ),
             };
             return IngestOutcome::StaleTimestamp(detail);
@@ -1130,7 +1287,7 @@ pub(crate) async fn ingest_ref_update(
                 ));
             }
         };
-        match replay_guard.begin(key, ingest_now()) {
+        match replay_guard.begin(key, now) {
             Begin::Replayed => return IngestOutcome::Replayed,
             // Fail open. A saturated set that refused fresh gossip would turn a
             // loud resource attack into quiet mesh-wide censorship; the counter
@@ -1527,12 +1684,7 @@ pub async fn start(
                 // node. `tokio::time::interval` fires its first tick
                 // immediately, which sweeps an empty map and is a no-op.
                 _ = ingest_sweep.tick() => {
-                    ingest_limiters.cleanup().await;
-                    // Same tick, same clock. The seen-set is sized against
-                    // `ingest_now`, so sweeping it on a second independent
-                    // reading of the wall clock would reintroduce exactly the
-                    // disagreement `ingest_now` exists to remove.
-                    replay_guard.cleanup(ingest_now());
+                    run_ingest_sweep(&ingest_limiters, &replay_guard, ingest_now()).await;
                 }
                 // Graceful shutdown: exit the swarm loop when the
                 // process-wide signal flips. This drops the Swarm
@@ -3242,6 +3394,13 @@ mod tests {
         // re-signing gives 500 events that are all genuinely new to the
         // seen-set and all charged to the same proven author, which is the
         // state this test is about. Same idiom as the 61-ref push test.
+        //
+        // One timestamp, stamped here and reused by all 500 iterations, so the
+        // loop must finish inside the 600-second freshness window or the tail
+        // of the burst starts answering `StaleTimestamp` instead of exercising
+        // the budget. Measured at roughly 5 seconds in a debug build, so the
+        // margin is about two orders of magnitude, but the dependency is
+        // invisible from the loop body and worth naming.
         let mut event = event_for(&noisy);
         for i in 0..GOSSIP_AUTHOR_MAX_EVENTS {
             event.ref_name = format!("refs/heads/burst{i}");
@@ -4038,6 +4197,43 @@ mod tests {
         );
     }
 
+    /// The refusal detail for an unparseable stamp reaches a `warn!`, and the
+    /// string it interpolates is whatever the sender chose. Both properties are
+    /// asserted here because either one alone leaves a live sink: a bounded
+    /// string full of newlines still forges log lines, and a control-free
+    /// megabyte still writes a megabyte per refused event.
+    #[test]
+    fn an_unparseable_timestamp_is_neither_unbounded_nor_control_bearing_in_the_log() {
+        let hostile = format!(
+            "2026-07-02T12:00:00Z\n\u{1b}[31mFATAL forged line\r{}",
+            "A".repeat(4096)
+        );
+        let rendered = sanitize_for_log(&hostile);
+
+        assert!(
+            !rendered.chars().any(char::is_control),
+            "a control character in the log detail forges log lines and drives the operator's \
+             terminal, got {rendered:?}"
+        );
+        assert!(
+            rendered.chars().count() <= 64,
+            "the detail must be bounded, or one refused event writes as much log as the sender \
+             chose to send, got {} chars",
+            rendered.chars().count()
+        );
+        // Multi-byte input, because the cap is what would split a UTF-8
+        // sequence if it counted bytes.
+        assert_eq!(
+            sanitize_for_log(&"é".repeat(100)).chars().count(),
+            64,
+            "truncation counts characters, not bytes"
+        );
+        // A legal instant must survive untouched, or the cap would be removing
+        // the diagnostic value it exists to preserve.
+        let legal = "2026-07-02T12:00:00.123456789+05:30";
+        assert_eq!(sanitize_for_log(legal), legal);
+    }
+
     /// The frozen legacy artifact's own timestamp, driven through the parser
     /// by execution rather than accepted by inspection. `Z`-suffixed UTC is a
     /// legal RFC-3339 offset, but the guard that would break every event in
@@ -4132,12 +4328,19 @@ mod tests {
         [seed; 32]
     }
 
-    /// Serializes the two tests that assert on the saturation counter.
+    /// Serializes every test that can reach `Begin::Saturated`.
+    ///
+    /// STANDING RULE, because nothing compiles it: a new test that drives the
+    /// guard to capacity takes this lock, whether or not it asserts on the
+    /// counter. `begin` increments
+    /// `gitlawb_gossip_replay_guard_saturated_total` itself, so a saturating
+    /// test that skips the lock is a foreign increment landing inside another
+    /// test's exact delta, and it does not have to assert anything to break one.
     ///
     /// That counter carries no labels and lives in a process-wide registry, so
     /// concurrent increments are indistinguishable from the one under test.
     /// Every other guard test builds its own `ReplayGuard` and needs no lock;
-    /// only the counter is shared state. Holding this lets both tests keep an
+    /// only the counter is shared state. Holding this lets the tests keep an
     /// exact assertion instead of degrading to a lower bound, which would stay
     /// green if the fail-open branch ever double-counted.
     ///
@@ -4227,6 +4430,11 @@ mod tests {
         let guard = ReplayGuard::with_limits(retention, 2);
         let now = pinned();
 
+        // This test reaches `Begin::Saturated`, so it increments the shared
+        // counter even though it asserts nothing about it. See
+        // `SATURATION_COUNTER_LOCK`.
+        let _serial = SATURATION_COUNTER_LOCK.blocking_lock();
+
         for seed in [10, 11] {
             match guard.begin(key_of(seed), now) {
                 Begin::Reserved(reservation) => reservation.confirm(),
@@ -4245,6 +4453,109 @@ mod tests {
             matches!(guard.begin(key_of(12), later), Begin::Reserved(_)),
             "begin must sweep expired entries inline before answering Saturated, or the guard \
              stays saturated until the next 300-second tick"
+        );
+    }
+
+    /// The throttle on the inline sweep, and the case the saturation test above
+    /// structurally cannot reach.
+    ///
+    /// That test advances the clock so the entries EXPIRE, which is the state
+    /// where a rescan pays for itself. This one holds the clock still with the
+    /// map full of UNEXPIRED entries, which is the state an attacker driving the
+    /// guard to capacity actually produces: every sweep retains everything and
+    /// reclaims nothing, so an unthrottled `begin` runs an O(capacity) retain
+    /// under the mutex once per event and the guard becomes a CPU amplifier in
+    /// exactly the condition it was built to survive.
+    ///
+    /// Asserted on the sweep count rather than on outcomes on purpose. Both
+    /// implementations answer `Saturated` to every call here, so no outcome
+    /// assertion can tell them apart.
+    #[test]
+    fn a_saturated_guard_does_not_rescan_the_map_once_per_event() {
+        crate::metrics::init("0.0.0-test", "did:key:test");
+        let guard = ReplayGuard::with_limits(GOSSIP_SEEN_EVENTS_RETENTION, 2);
+        let now = pinned();
+
+        for seed in [40, 41] {
+            match guard.begin(key_of(seed), now) {
+                Begin::Reserved(reservation) => reservation.confirm(),
+                other => panic!("expected a reservation while filling the guard, got {other:?}"),
+            }
+        }
+
+        // This test increments the saturation counter, so it takes the lock the
+        // other saturating tests take. See `SATURATION_COUNTER_LOCK`.
+        let _serial = SATURATION_COUNTER_LOCK.blocking_lock();
+        let events = 50;
+        for seed in 0..events {
+            assert!(
+                matches!(guard.begin(key_of(100 + seed), now), Begin::Saturated),
+                "a full map of unexpired entries must stay saturated"
+            );
+        }
+        assert_eq!(
+            guard.inline_sweeps_for_test(),
+            1,
+            "the inline sweep must be throttled: {events} events at capacity may cost one rescan, \
+             not one each, or the guard amplifies the very load it is bounding"
+        );
+
+        // The throttle must not disable reclamation, only rate it. One second
+        // on, a sweep is owed again.
+        let later = now + chrono::Duration::seconds(1);
+        assert!(matches!(guard.begin(key_of(200), later), Begin::Saturated));
+        assert_eq!(
+            guard.inline_sweeps_for_test(),
+            2,
+            "once the throttle interval has elapsed the next saturating event must sweep again; a \
+             throttle that swept only once would leave reclamation entirely to the 300-second tick"
+        );
+    }
+
+    /// The periodic sweep the swarm loop runs, through the function the
+    /// `select!` arm calls.
+    ///
+    /// Asserted on the entry count, not on what `begin` answers. `begin` treats
+    /// an expired entry as absent whether or not anything swept it, so a test
+    /// written against outcomes is green with the sweep removed, which is how
+    /// the call went untested in the first place.
+    ///
+    /// This covers the sweep's body. It does NOT cover the `select!` dispatch;
+    /// see the note on `run_ingest_sweep` for what remains uncovered and why.
+    #[tokio::test]
+    async fn the_swarm_loops_sweep_reclaims_expired_seen_set_entries() {
+        let retention = GOSSIP_SEEN_EVENTS_RETENTION;
+        let limiters = IngestLimiters::new();
+        let guard = ReplayGuard::with_limits(retention, 8);
+        let now = pinned();
+
+        match guard.begin(key_of(50), now) {
+            Begin::Reserved(reservation) => reservation.confirm(),
+            other => panic!("expected a reservation, got {other:?}"),
+        }
+        assert_eq!(guard.len_for_test(), 1);
+
+        // Still inside the horizon: a sweep here must reclaim nothing, or the
+        // assertion below would pass under a sweep that simply cleared the map.
+        run_ingest_sweep(&limiters, &guard, now + chrono::Duration::seconds(1)).await;
+        assert_eq!(
+            guard.len_for_test(),
+            1,
+            "an entry inside its retention horizon must survive a sweep"
+        );
+
+        run_ingest_sweep(
+            &limiters,
+            &guard,
+            now + chrono::Duration::seconds(retention.as_secs() as i64 + 1),
+        )
+        .await;
+        assert_eq!(
+            guard.len_for_test(),
+            0,
+            "the periodic sweep is the only thing reclaiming seen-set slots between saturation \
+             events, so an entry past the horizon must actually be evicted rather than merely \
+             answered as absent"
         );
     }
 
@@ -4268,7 +4579,7 @@ mod tests {
         // by every test in this binary. The delta alone is not enough: it fixes
         // the baseline but not concurrent increments, and cargo runs these tests
         // on parallel threads. `SATURATION_COUNTER_LOCK` is what actually makes
-        // the exact assertion safe, so both saturation tests take it.
+        // the exact assertion safe, so every test that can saturate takes it.
         let _serial = SATURATION_COUNTER_LOCK.blocking_lock();
         let before = crate::metrics::replay_guard_saturated_count_for_test();
         assert!(matches!(guard.begin(key_of(21), now), Begin::Saturated));
@@ -4670,6 +4981,65 @@ mod tests {
         assert_nothing_written(&pool, "an event stamped far in the future").await;
     }
 
+    /// The third violation, driven through the real path like its two siblings
+    /// rather than proven only at the `check_freshness` unit level.
+    ///
+    /// This is the arm a self-signing attacker reaches for: if an unparseable
+    /// stamp were admitted, stamping garbage would opt the event out of the
+    /// freshness window entirely, which is a strictly better attack than
+    /// stamping a legal instant. So the refusal is asserted at the same four
+    /// points the `TooOld` case is, including the `peer_exists` tally, which is
+    /// what says the refusal happened ABOVE the database rather than merely
+    /// producing the same outcome from somewhere further down.
+    ///
+    /// The timestamp is set BEFORE signing on purpose. The signature covers the
+    /// timestamp, so signing first and overwriting after would produce an event
+    /// that fails verification, and the test would then pass without the
+    /// freshness check ever running.
+    #[sqlx::test]
+    async fn an_event_whose_timestamp_is_not_rfc_3339_is_refused(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        let replay_guard = ReplayGuard::new();
+        let source = PeerId::random();
+        let keypair = Keypair::generate();
+        seed_peer(&pool, &keypair.did().to_string()).await;
+
+        let mut event = event_for(&keypair);
+        event.timestamp = "yesterday afternoon".to_string();
+        sign_ref_update(&keypair, &mut event).unwrap();
+
+        reset_peer_exists_calls();
+        let outcome = ingest_ref_update(
+            &db,
+            &limiters,
+            &replay_guard,
+            true,
+            true,
+            &bytes_of(&event),
+            &source,
+        )
+        .await;
+        assert_eq!(
+            outcome.metric_label(),
+            "stale_timestamp",
+            "an unparseable stamp must count under the same label as its two siblings; a publisher \
+             emitting non-RFC-3339 is a freshness violation an operator reads off one series"
+        );
+        assert!(
+            matches!(outcome, IngestOutcome::StaleTimestamp(_)),
+            "a timestamp that cannot be parsed cannot be freshness-checked, so it must be refused \
+             rather than admitted, got {outcome:?}"
+        );
+        assert_nothing_written(&pool, "an event whose timestamp is not RFC-3339").await;
+        assert_eq!(
+            peer_exists_calls(),
+            0,
+            "the freshness check sits above the peer lookup, so an unparseable stamp must cost no \
+             Postgres round trip"
+        );
+    }
+
     /// The composition of the two layers, at the only point where a gap can
     /// open: an event stamped at the maximum future skew.
     ///
@@ -4867,7 +5237,7 @@ mod tests {
             "the admitted event must actually be written, not merely reported as accepted"
         );
         // Exact, not a lower bound: `SATURATION_COUNTER_LOCK` above serializes
-        // this against the only other test that reaches saturation, so exactly
+        // this against every other test that can reach saturation, so exactly
         // one increment is attributable to this ingest. A lower bound would
         // stay green if the fail-open branch counted twice, or if some future
         // path incremented on a non-saturating call.
