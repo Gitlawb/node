@@ -53,6 +53,38 @@ pub enum UcanCmd {
         /// UCAN JSON token (or path to file containing it)
         token: String,
     },
+    /// Store a delegation received from a repo owner, so `git push` can present it
+    Import {
+        /// UCAN JSON token (or path to a file containing it)
+        token: String,
+        /// Identity directory
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+}
+
+/// Where a delegation for `owner_did`/`repo` is stored.
+///
+/// Keyed on the bare base58 key rather than the full DID: `did:key:` contains a
+/// colon, which is not a legal filename character on Windows, and the same
+/// identity appears in both forms across this codebase — storing under one form
+/// and looking up by the other would silently miss.
+///
+/// `git-remote-gitlawb` derives the same path from a `gitlawb://` URL alone; the
+/// two must agree, and the helper carries a pointer back to this function.
+pub fn delegation_path(dir: &std::path::Path, owner_did: &str, repo: &str) -> PathBuf {
+    let bare = owner_did.strip_prefix("did:key:").unwrap_or(owner_did);
+    dir.join("delegations").join(format!("{bare}__{repo}.ucan"))
+}
+
+/// Pull the repo this capability names out of `gitlawb://repos/<owner>/<repo>`.
+fn repo_from_resource(with: &str) -> Option<(String, String)> {
+    let rest = with.strip_prefix("gitlawb://repos/")?;
+    let (owner, name) = rest.rsplit_once('/')?;
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some((owner.to_string(), name.to_string()))
 }
 
 pub async fn run(args: UcanArgs) -> Result<()> {
@@ -68,7 +100,57 @@ pub async fn run(args: UcanArgs) -> Result<()> {
         } => cmd_delegate(to, cap, can, expiry, out, dir, json_out).await,
         UcanCmd::Show { dir } => cmd_show(dir).await,
         UcanCmd::Verify { token } => cmd_verify(token).await,
+        UcanCmd::Import { token, dir } => cmd_import(token, dir).await,
     }
+}
+
+/// Store a delegation where `git-remote-gitlawb` will look for it on push.
+///
+/// The token is decoded here rather than at push time so a malformed delegation
+/// fails where the error is actionable, instead of surfacing as an unexplained
+/// 403 in the middle of a `git push`.
+async fn cmd_import(token: String, dir: Option<PathBuf>) -> Result<()> {
+    let raw = match std::fs::read_to_string(&token) {
+        Ok(contents) => contents.trim().to_string(),
+        Err(_) => token.clone(),
+    };
+
+    let ucan = Ucan::decode(&raw).context(
+        "not a valid UCAN token — pass the JSON emitted by `gl ucan delegate`, or a path to it",
+    )?;
+
+    let push_caps: Vec<(String, String)> = ucan
+        .payload
+        .att
+        .iter()
+        .filter_map(|cap| repo_from_resource(&cap.with))
+        .collect();
+
+    if push_caps.is_empty() {
+        anyhow::bail!(
+            "this delegation names no repository — expected a capability on \
+             gitlawb://repos/<owner>/<repo>, found: {}",
+            ucan.payload
+                .att
+                .iter()
+                .map(|c| c.with.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    let base = crate::identity::gitlawb_dir(dir)?;
+    std::fs::create_dir_all(base.join("delegations"))
+        .with_context(|| format!("could not create {}", base.join("delegations").display()))?;
+
+    for (owner, repo) in &push_caps {
+        let path = delegation_path(&base, owner, repo);
+        std::fs::write(&path, &raw)
+            .with_context(|| format!("could not write {}", path.display()))?;
+        println!("Stored delegation for {owner}/{repo} at {}", path.display());
+    }
+
+    Ok(())
 }
 
 async fn cmd_delegate(
@@ -346,5 +428,30 @@ mod tests {
         cmd_verify(path.to_string_lossy().to_string())
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod delegation_store_tests {
+    use super::*;
+
+    #[test]
+    fn delegation_path_strips_the_did_prefix_and_separates_owner_from_repo() {
+        let base = std::path::Path::new("/tmp/id");
+        let expected = base.join("delegations").join("z6MkAbc__myrepo.ucan");
+
+        assert_eq!(
+            delegation_path(base, "did:key:z6MkAbc", "myrepo"),
+            expected,
+            "the bare key keys the file: `did:key:` contains ':', which is not a \
+             legal filename character on Windows"
+        );
+        // A bare owner and a full DID must resolve to the same file, or a
+        // delegation stored under one form is invisible to a lookup by the other.
+        assert_eq!(
+            delegation_path(base, "z6MkAbc", "myrepo"),
+            expected,
+            "bare and full owner forms must address the same delegation"
+        );
     }
 }

@@ -63,7 +63,9 @@ pub async fn run(cmd: IdentityCmd) -> Result<()> {
     }
 }
 
-fn gitlawb_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
+/// Resolve the identity directory, honouring an explicit override.
+/// Public so sibling commands (`gl ucan import`) store alongside the identity.
+pub fn gitlawb_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(d) = override_dir {
         return Ok(d);
     }
