@@ -9,6 +9,13 @@
 //! as the caller anywhere until the clock-skew window closes. On a 307/308 the
 //! request body goes along with it, which for the remote helper is the pack.
 //!
+//! That same missing authority component is why the predicate also pins the
+//! request-target: `@path` is signed as the client sent it and verified as the node
+//! received it, so a same-origin hop that rewrites the path or the query (a
+//! trailing-slash or query normalization) makes the signature cover a target the
+//! node never saw and the read 401s. Only a hop that re-issues the identical target,
+//! an http-to-https upgrade being the one that matters in practice, is followed.
+//!
 //! The decision lives here rather than in either client because the two used to
 //! disagree: `gl` was scoped to the origin while the remote helper, the binary that
 //! actually runs `git clone gitlawb://`, still ran reqwest's default and followed
@@ -27,12 +34,25 @@
 /// too or it permits one hop fewer than it says.
 pub const MAX_REDIRECTS: usize = 10;
 
-/// Follow a redirect only when it stays on the origin that issued it.
+/// Follow a redirect only when it stays on the origin that issued it AND re-issues
+/// the identical request-target.
 ///
-/// `Policy::none()` would have been the simpler answer, but same-origin redirects
-/// are legitimate here (a node fronted by a proxy that upgrades http to https, or
-/// normalizes a trailing slash), so the policy is scoped to the origin rather than
-/// switched off.
+/// `Policy::none()` would have been the simpler answer, but one same-origin redirect
+/// shape is legitimate here: a node fronted by a proxy that upgrades http to https,
+/// or otherwise re-issues the same path and query, so the policy is scoped rather
+/// than switched off.
+///
+/// Path and query must match exactly, and that is the request-target clause rather
+/// than an origin one. `@path` is signed as the client sent it and verified as the
+/// node received it, so a hop that rewrites either half leaves a signature covering
+/// a target nobody asked for and the node answers 401. Refusing the hop turns a
+/// confusing 401 into the 3xx that names what actually happened. One policy covers
+/// signed and unsigned callers alike, for the same reason the predicate is shared:
+/// two rules would drift.
+///
+/// `Url::query` is `None` for `/a` and `Some("")` for `/a?`, and those are two
+/// different request-targets on the node side too, so the comparison is strict and
+/// needs no special case.
 ///
 /// Host and port must match exactly. Port is compared as `Url::port`, which is
 /// `None` for a scheme's default port, so http -> https on the same host compares
@@ -46,8 +66,9 @@ pub const MAX_REDIRECTS: usize = 10;
 /// matrix pins it: a move to raw string comparison would silently lose it.
 pub fn may_follow(previous: &url::Url, next: &url::Url) -> bool {
     let same_origin = next.host_str() == previous.host_str() && next.port() == previous.port();
+    let same_target = next.path() == previous.path() && next.query() == previous.query();
     let downgraded = previous.scheme() == "https" && next.scheme() != "https";
-    same_origin && !downgraded
+    same_origin && same_target && !downgraded
 }
 
 #[cfg(test)]
@@ -63,24 +84,25 @@ mod tests {
             (
                 "http://node.example/a",
                 "http://node.example/b",
-                true,
-                "same origin, different path",
+                false,
+                "same origin but the path changed: @path is signed as sent and verified as received",
             ),
             (
                 "http://node.example/a",
                 "https://node.example/a",
                 true,
-                "http to https on one host: both ports are the scheme default",
+                "http to https on one host with an identical request-target: both ports are \
+                 the scheme default, so the proxy upgrade is still followed",
             ),
             (
                 "https://node.example/a",
                 "https://node.example/a/",
-                true,
-                "trailing-slash normalization",
+                false,
+                "trailing-slash normalization changes the request-target, so it is refused",
             ),
             (
                 "https://node.example:8443/a",
-                "https://node.example:8443/b",
+                "https://node.example:8443/a",
                 true,
                 "same explicit port",
             ),
@@ -112,41 +134,74 @@ mod tests {
             // because anything here compares case-insensitively or decodes IDN. They
             // are the variants an attacker reaches for, so they are pinned: swapping
             // this predicate for a raw string comparison must break the suite.
+            // Each of these pairs an IDENTICAL path on both sides, deliberately. The
+            // request-target clause below would make every one of them false on the
+            // path alone, and a row that is false for two reasons has stopped pinning
+            // either. With the paths equal, the host or port comparison is the only
+            // thing left that can decide them.
             (
                 "https://node.example/a",
-                "https://NODE.EXAMPLE/b",
+                "https://NODE.EXAMPLE/a",
                 true,
                 "same host in a different case: parse lowercases it",
             ),
             (
                 "https://node.example/a",
-                "https://node.example./b",
+                "https://node.example./a",
                 false,
                 "a trailing dot is a different host to url, so the redirect is refused",
             ),
             (
                 "https://exämple.test/a",
-                "https://xn--exmple-cua.test/b",
+                "https://xn--exmple-cua.test/a",
                 true,
                 "unicode host and its punycode spelling are one host after parse",
             ),
             (
                 "https://node.example/a",
-                "https://user:pw@node.example/b",
+                "https://user:pw@node.example/a",
                 true,
                 "userinfo is not part of the origin: same host, still followed",
             ),
             (
                 "https://node.example/a",
-                "https://node.example@attacker.example/b",
+                "https://node.example@attacker.example/a",
                 false,
                 "the node's name smuggled into userinfo: the host is the attacker's",
             ),
             (
                 "https://node.example/a",
-                "https://attacker.example#node.example/b",
+                "https://attacker.example/a#node.example",
                 false,
                 "the node's name pushed into the fragment: the host is the attacker's",
+            ),
+            // The request-target clause, both directions. `@path` is the only thing a
+            // gitlawb signature binds the request to, so a hop that rewrites it hands
+            // the node a signature over a target it never received.
+            (
+                "https://node.example/a?x=1",
+                "https://node.example/a?x=1",
+                true,
+                "identical request-target: the same-origin hop that is still followed",
+            ),
+            (
+                "https://node.example/a?x=1",
+                "https://node.example/a?x=2",
+                false,
+                "same path but a different query: the request-target covers the query too",
+            ),
+            (
+                "https://node.example/a",
+                "https://node.example/a?x=1",
+                false,
+                "a query added where there was none",
+            ),
+            (
+                "http://node.example/a",
+                "http://node.example/a?",
+                false,
+                "an empty query added where there was none: a missing query and an empty \
+                 one are different request-targets",
             ),
         ];
         for (previous, next, expected, why) in cases {
