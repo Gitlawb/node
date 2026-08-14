@@ -28,10 +28,11 @@ We will acknowledge receipt within 48 hours and aim to release a fix within 14 d
 - Every git object is content-addressed via CIDv1 (SHA-256)
 - Tamper-evident by construction — a modified object changes its CID
 
-**UCAN capability tokens**
-- Bootstrap UCAN tokens issued at registration
-- Capability-scoped: `git:push`, `git:fetch`, `issue:create`, `pr:open`
-- JWT-format tokens with expiry
+**UCAN token validation**
+- Bootstrap UCAN tokens are issued at registration.
+- A supplied token's signature, audience, expiry, and proof-chain attenuation are validated.
+- Tokens use a signed JSON wire format with expiry.
+- Capability grants are not yet consulted by repository write authorization; see the limitations below.
 
 **Smart contracts (Base Sepolia testnet)**
 - `GitlawbDIDRegistry` — on-chain DID → document registry
@@ -48,21 +49,20 @@ We will acknowledge receipt within 48 hours and aim to release a fix within 14 d
 
 ---
 
-## Known Limitations (Planned for v0.2)
+## Known Limitations
 
-These are **documented, accepted limitations** for the current live release and should be prioritized without breaking existing nodes during rolling upgrades.
+These are documented limitations of the current live release. They should be prioritized without breaking existing nodes during rolling upgrades.
 
-### UCAN chain validation
-- The auth middleware verifies HTTP Signatures and token structure, but does not yet walk the full UCAN delegation chain.
-- **Impact:** A node cannot yet enforce fine-grained capability delegation. Currently, any registered agent with a valid HTTP Signature can push.
-- **Mitigation:** Keep write endpoints signed, treat public nodes as public infrastructure, and treat trust scores as soft rate-limiting signals rather than authorization.
-- **Fix target:** v0.2
+### Repository write authorization defaults
+- `git-receive-pack` verifies HTTP Signatures, but `GITLAWB_ENFORCE_OWNER_PUSH` defaults to `false` for compatibility during rollout.
+- **Impact:** With the default setting, a valid signature authenticates the pusher but does not require that DID to be the repository owner.
+- **Mitigation:** Set `GITLAWB_ENFORCE_OWNER_PUSH=true` on nodes where owner-only pushes are required. Confirm that every legitimate pusher uses the owner DID before enabling it.
 
-### UCAN revocation
-- Issued UCAN tokens cannot be revoked before expiry.
-- **Impact:** If a keypair is compromised, the attacker retains access until the UCAN expires (default: 30 days).
-- **Mitigation:** Regenerate your identity (`gl identity new --force`) and re-register to issue a new UCAN. Until revocation/blocklisting is implemented, operators should remove compromised DIDs directly from their local database.
-- **Fix target:** v0.2
+### UCAN delegation and revocation
+- The middleware validates a supplied UCAN's complete proof chain, but a root token is accepted without an independently trusted issuer anchor. `Ucan::can` is not yet used by write handlers, so a UCAN does not grant scoped repository access.
+- Agent lifecycle revocation is not checked by HTTP Signature authorization. Removing or revoking an agent record does not itself block a compromised DID from authenticating.
+- **Impact:** Do not use UCANs for collaborator permissions or rely on agent-record revocation as a key-compromise response.
+- **Mitigation:** Keep sensitive deployments behind operational network controls and enable owner-only push enforcement where it fits the deployment until trusted delegation and authorization-aware revocation are implemented.
 
 ### git-receive-pack authentication
 - The `git-receive-pack` endpoint enforces HTTP Signature auth. Plain Git smart-HTTP clients do not generate those headers, so the `git-remote-gitlawb` helper is required for pushes.
@@ -71,10 +71,17 @@ These are **documented, accepted limitations** for the current live release and 
 - **Fix target:** v0.2
 
 ### Private repository reads
-- Repository records have an `is_public` field and the node exposes `GITLAWB_PUBLIC_READ`, but per-repository private-read enforcement is not wired in the current live release.
-- **Impact:** Do not store private repositories or secrets on public nodes.
-- **Mitigation:** Run isolated nodes for non-public data and restrict network access at the reverse proxy or firewall layer.
-- **Fix target:** v0.2
+- Repository and path-scoped visibility checks are enforced for API and Git content reads. A denied read returns the same 404 shape as a missing repository, so the denial does not reveal repository or withheld-path existence.
+- **Impact:** Callers can read only repositories and paths their visibility rules permit.
+- **Remaining boundary:** This read control does not address the independent write-authorization and UCAN-delegation limitations described above.
+
+### Pull-request review enforcement
+- Pull-request review comments are not yet threaded or line-anchored, and merges do not enforce required approvals.
+- **Impact:** Teams must use their own review policy or external controls for merge approval requirements.
+
+### GraphQL mutation coverage
+- Existing GraphQL mutations require an authenticated signer, but a mutation-specific source-level guardrail has not yet been added for future mutations.
+- **Impact:** A new mutation could accidentally omit its signer check without an explicit test fence.
 
 ### Peer route hardening rollout
 - Peer announce and sync notification routes accept signed requests and verify DID matches when a signature is present.
