@@ -1049,7 +1049,10 @@ const MIGRATIONS: &[Migration] = &[
                        WHERE conrelid = 'repos'::regclass
                          AND conname = 'repos_mirror_state_valid'
                    ) THEN
-                       ALTER TABLE repos ADD CONSTRAINT repos_mirror_state_valid CHECK (
+                       -- PostgreSQL accepts a CHECK whose result is NULL. Wrap
+                       -- the complete invariant in IS TRUE so a missing status
+                       -- or phase cannot slip through three-valued logic.
+                       ALTER TABLE repos ADD CONSTRAINT repos_mirror_state_valid CHECK ((
                            (
                                upstream_url IS NULL
                                AND mirror_status IS NULL
@@ -1092,7 +1095,7 @@ const MIGRATIONS: &[Migration] = &[
                                    )
                                )
                            )
-                       ) NOT VALID;
+                       ) IS TRUE) NOT VALID;
                    END IF;
                END
                $$"#,
@@ -3550,6 +3553,47 @@ mod mirror_state_tests {
     }
 
     #[sqlx::test]
+    async fn inbound_configuration_never_resets_an_active_transition(pool: PgPool) {
+        let db = migrated_db(pool).await;
+        let existing = repo(Uuid::new_v4());
+        db.create_repo(&existing).await.unwrap();
+        db.configure_inbound_mirror(&existing.id, "https://github.com/Gitlawb/node.git")
+            .await
+            .unwrap();
+
+        let transition_id = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE repos
+             SET mirror_status = 'transitioning_inbound_to_outbound',
+                 mirror_transition_id = $2,
+                 mirror_transition_phase = 'draining_writes'
+             WHERE id = $1",
+        )
+        .bind(&existing.id)
+        .bind(transition_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let retry = db
+            .configure_inbound_mirror(&existing.id, "https://github.com/Gitlawb/node.git")
+            .await;
+        assert!(retry.is_err(), "configuration must not reset a transition");
+
+        let stored = db
+            .get_repo_mirror_state(&existing.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, MirrorStatus::TransitioningInboundToOutbound);
+        assert_eq!(stored.transition_id, Some(transition_id));
+        assert_eq!(
+            stored.transition_phase,
+            Some(MirrorTransitionPhase::DrainingWrites)
+        );
+    }
+
+    #[sqlx::test]
     async fn database_constraint_rejects_partial_or_insecure_mirror_state(pool: PgPool) {
         let db = migrated_db(pool).await;
         let existing = repo(Uuid::new_v4());
@@ -3566,6 +3610,54 @@ mod mirror_state_tests {
         .execute(db.pool())
         .await;
         assert!(partial.is_err(), "transition metadata must be durable");
+
+        // PostgreSQL CHECK constraints accept NULL results. These cases pin
+        // the outer `IS TRUE` guard so SQL three-valued logic cannot admit a
+        // row that the Rust reader rejects or panics while decoding.
+        struct InvalidNullState<'a> {
+            case: &'a str,
+            status: Option<&'a str>,
+            transition_id: Option<Uuid>,
+            transition_phase: Option<&'a str>,
+        }
+        let invalid_null_states = [
+            InvalidNullState {
+                case: "missing mirror status",
+                status: None,
+                transition_id: None,
+                transition_phase: None,
+            },
+            InvalidNullState {
+                case: "stable status with job but no phase",
+                status: Some("inbound"),
+                transition_id: Some(Uuid::new_v4()),
+                transition_phase: None,
+            },
+            InvalidNullState {
+                case: "transition with job but no phase",
+                status: Some("transitioning_inbound_to_outbound"),
+                transition_id: Some(Uuid::new_v4()),
+                transition_phase: None,
+            },
+        ];
+        for invalid in invalid_null_states {
+            let result = sqlx::query(
+                "UPDATE repos
+                 SET upstream_url = 'https://github.com/Gitlawb/node.git',
+                     mirror_status = $2,
+                     mirror_transition_id = $3,
+                     mirror_transition_phase = $4,
+                     mirror_updated_at = '2026-08-14T00:00:00Z'
+                 WHERE id = $1",
+            )
+            .bind(&existing.id)
+            .bind(invalid.status)
+            .bind(invalid.transition_id)
+            .bind(invalid.transition_phase)
+            .execute(db.pool())
+            .await;
+            assert!(result.is_err(), "constraint accepted {}", invalid.case);
+        }
 
         let insecure = sqlx::query(
             "UPDATE repos
