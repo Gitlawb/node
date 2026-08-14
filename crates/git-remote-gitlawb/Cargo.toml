@@ -14,12 +14,18 @@ path = "src/main.rs"
 gitlawb-core = { path = "../gitlawb-core" }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
+# Reading the node's DID from `GET /` so a delegated push can address its
+# invocation to the right executor.
+serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 mockito = "1"
 tempfile = "3"
+# Test-only: constructing an already-expired delegation needs a timestamp. The
+# helper itself never sets an expiry — the proof's own exp bounds the chain.
+chrono = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

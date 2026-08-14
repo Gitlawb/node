@@ -358,6 +358,115 @@ fn build_advertisement_request(
 /// Public-repo fetch still works anonymously when no keypair is present. The body
 /// is signed (content-digest) but NOT attached here, so the caller can move the
 /// (possibly large) pack bytes into `.body()` rather than clone them.
+/// Where a delegation for `owner_did`/`repo` is stored.
+///
+/// Must agree with `gl`'s `ucan_cmd::delegation_path`, which writes these files.
+/// `gl` is not a dependency of this crate, so the six lines are duplicated rather
+/// than shared; change both together. Keyed on the bare base58 key because
+/// `did:key:` contains a colon, which Windows rejects in a filename.
+fn delegation_path(dir: &std::path::Path, owner_did: &str, repo: &str) -> std::path::PathBuf {
+    let bare = owner_did.strip_prefix("did:key:").unwrap_or(owner_did);
+    dir.join("delegations").join(format!("{bare}__{repo}.ucan"))
+}
+
+/// Wrap a stored delegation into an invocation addressed to the node.
+///
+/// `iss=agent, aud=node, prf=[delegation]` is exactly the shape the node's
+/// `validate_ucan_chain` expects: it binds `iss` to the request signer and `aud`
+/// to its own DID, then walks `prf` to the root.
+///
+/// Capabilities are copied from the delegation unchanged, so the invocation is
+/// never broader than what was delegated and cannot fail attenuation. No expiry
+/// is set: the delegation's own `exp` still bounds the chain, because
+/// `verify_chain` checks each proof's expiry as it recurses.
+fn build_invocation(
+    agent: &Keypair,
+    node_did: &gitlawb_core::did::Did,
+    delegation: &gitlawb_core::ucan::Ucan,
+) -> Result<gitlawb_core::ucan::Ucan> {
+    gitlawb_core::ucan::Ucan::delegate(
+        agent,
+        node_did.clone(),
+        delegation.payload.att.clone(),
+        None,
+        delegation,
+    )
+    .map_err(|e| anyhow::anyhow!("failed to build UCAN invocation: {e}"))
+}
+
+/// Split a receive-pack POST URL into `(origin, owner, repo)`.
+///
+/// `https://node/zOwner/myrepo.git/git-receive-pack`
+///   -> ("https://node", "zOwner", "myrepo")
+fn split_pack_post_url(post_url: &str) -> Option<(String, String, String)> {
+    let path = url_path(post_url);
+    let origin = post_url.strip_suffix(&path)?.to_string();
+    let mut segs = path.trim_start_matches('/').split('/');
+    let owner = segs.next()?;
+    let repo = segs.next()?;
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    Some((origin, owner.to_string(), repo.to_string()))
+}
+
+/// Build the `X-Ucan` value for a delegated push, or `None` when this push does
+/// not need one.
+///
+/// Entirely best-effort. A missing delegation, an unreachable node, or an
+/// unreadable stored token all yield `None` and the push proceeds without the
+/// header — the node decides whether one was required, and a node denial must
+/// reach the user rather than being pre-empted by a local guess.
+fn delegation_header(
+    client: &reqwest::blocking::Client,
+    post_url: &str,
+    keypair: &Keypair,
+) -> Option<String> {
+    let (origin, owner, repo) = split_pack_post_url(post_url)?;
+
+    // The owner pushes on their own authority; no delegation is involved.
+    let bare = |d: &str| d.strip_prefix("did:key:").unwrap_or(d).to_string();
+    if bare(&keypair.did().to_string()) == bare(&owner) {
+        return None;
+    }
+
+    let dir = resolve_key_path().parent()?.to_path_buf();
+    let path = delegation_path(&dir, &owner, &repo);
+    let raw = std::fs::read_to_string(&path).ok()?;
+
+    let delegation = match gitlawb_core::ucan::Ucan::decode(raw.trim()) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!("stored delegation at {path:?} is unreadable: {e}");
+            return None;
+        }
+    };
+
+    // The invocation must be addressed to the node that will execute it.
+    let node_did: gitlawb_core::did::Did = client
+        .get(&origin)
+        .header("User-Agent", USER_AGENT)
+        .send()
+        .ok()
+        .and_then(|r| r.json::<serde_json::Value>().ok())
+        .and_then(|v| v.get("did")?.as_str().map(str::to_owned))
+        .or_else(|| {
+            tracing::warn!("could not read the node DID from {origin}; pushing without X-Ucan");
+            None
+        })?
+        .parse()
+        .ok()?;
+
+    match build_invocation(keypair, &node_did, &delegation) {
+        Ok(inv) => inv.encode().ok(),
+        Err(e) => {
+            tracing::warn!("could not build the UCAN invocation: {e}");
+            None
+        }
+    }
+}
+
 fn build_pack_post_request(
     client: &reqwest::blocking::Client,
     post_url: &str,
@@ -376,6 +485,15 @@ fn build_pack_post_request(
             .header("Signature-Input", signed.signature_input)
             .header("Signature", signed.signature);
         tracing::debug!("signed {service} POST (DID: {})", kp.did());
+
+        // A non-owner pushing under a delegation presents it here. Only on the
+        // push: a fetch is gated by read visibility, not by git/push.
+        if service == "git-receive-pack" {
+            if let Some(token) = delegation_header(client, post_url, kp) {
+                tracing::debug!("attaching a delegated push capability");
+                req = req.header("X-Ucan", token);
+            }
+        }
     } else if service == "git-receive-pack" {
         tracing::warn!("no identity keypair found, push will be unsigned (v0.1 local alpha only)");
     }
@@ -2168,5 +2286,80 @@ mod tests {
             1,
             "empty push must issue the GET only, no POST"
         );
+    }
+}
+
+#[cfg(test)]
+mod delegated_push_tests {
+    use super::*;
+    use gitlawb_core::ucan::{caps, Capability, Ucan};
+
+    #[test]
+    fn invocation_wraps_the_delegation_and_targets_the_node() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let delegation = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH)],
+            None,
+        )
+        .expect("issue");
+
+        let invocation = build_invocation(&agent, &node.did(), &delegation).expect("wrap");
+
+        assert_eq!(invocation.payload.iss, agent.did(), "the agent invokes");
+        assert_eq!(invocation.payload.aud, node.did(), "the node executes");
+        assert_eq!(
+            invocation.payload.prf.len(),
+            1,
+            "exactly one proof: chains are linear"
+        );
+        assert_eq!(
+            invocation.verify_chain().expect("must verify"),
+            owner.did(),
+            "the chain must still root at the owner after wrapping"
+        );
+    }
+
+    /// The invocation deliberately carries no expiry of its own. That is only safe
+    /// because `verify_chain` recurses into the proof and checks the delegation's
+    /// expiry there — so an expired delegation cannot be laundered into an
+    /// open-ended push capability by wrapping it.
+    #[test]
+    fn an_expired_delegation_cannot_be_laundered_by_wrapping_it() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let expired = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH)],
+            Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+        )
+        .expect("issue expired");
+
+        let invocation = build_invocation(&agent, &node.did(), &expired).expect("wrap");
+
+        assert!(
+            invocation.payload.exp.is_none(),
+            "the invocation sets no expiry of its own"
+        );
+        let err = invocation
+            .verify_chain()
+            .expect_err("an expired proof must fail the chain");
+        assert!(
+            err.to_string().contains("expired"),
+            "the failure must name expiry, got: {err}"
+        );
+    }
+
+    #[test]
+    fn delegation_path_matches_the_gl_layout() {
+        let base = std::path::Path::new("/tmp/id");
+        let expected = base.join("delegations").join("z6MkAbc__myrepo.ucan");
+        assert_eq!(delegation_path(base, "did:key:z6MkAbc", "myrepo"), expected);
+        assert_eq!(delegation_path(base, "z6MkAbc", "myrepo"), expected);
     }
 }
