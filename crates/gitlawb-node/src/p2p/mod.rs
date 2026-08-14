@@ -244,6 +244,43 @@ pub(crate) fn names_no_usable_directory(key_path: &Path) -> bool {
     !named_a_directory
 }
 
+/// Why a key file or key directory owned by another user is refused, if it is.
+///
+/// Mode bits alone do not make something node-owned. A `0700` directory or a
+/// `0600` file belonging to a different user passes every permission check here
+/// while that user keeps the ability to replace what is inside it, which means
+/// they choose the node's libp2p identity. That is the capability the persisted
+/// key exists to take away, so it is refused rather than warned about.
+///
+/// Unlike a loose mode this is not repairable: `chown` needs privilege the node
+/// should not have, and taking ownership of another user's file would be the
+/// wrong move even if it could. So the callers bail instead of tightening.
+///
+/// Pure, and takes both uids as arguments, so both directions are testable
+/// without privilege. A test cannot `chown` a fixture to another user without
+/// root, and a guard that can only be exercised in one direction is the shape
+/// that ships unproven.
+#[cfg(unix)]
+fn foreign_ownership_error(what: &str, path: &Path, owner_uid: u32, euid: u32) -> Option<String> {
+    if owner_uid == euid {
+        return None;
+    }
+    Some(format!(
+        "p2p {what} {} is owned by uid {} but this node runs as uid {}; that user can \
+         replace it and so decides the node's libp2p identity, which is what the persisted \
+         key exists to prevent. Point {} at a location this user owns, or have the owner \
+         hand it over; the node will not adopt it.",
+        path.display(),
+        owner_uid,
+        euid,
+        if what == "key directory" {
+            "GITLAWB_P2P_KEY's directory"
+        } else {
+            "GITLAWB_P2P_KEY"
+        }
+    ))
+}
+
 /// Load the node's persistent libp2p identity from `key_path`, generating and
 /// storing a fresh Ed25519 keypair the first time.
 pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
@@ -336,13 +373,24 @@ fn ensure_key_dir(dir: &Path) -> Result<()> {
 
     #[cfg(unix)]
     {
+        use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
 
-        let mode = std::fs::metadata(dir)
-            .with_context(|| format!("failed to stat key directory {}", dir.display()))?
-            .permissions()
-            .mode()
-            & 0o777;
+        let md = std::fs::metadata(dir)
+            .with_context(|| format!("failed to stat key directory {}", dir.display()))?;
+
+        // Before the mode repair below, not after. A directory we do not own
+        // cannot be repaired by us: the chmod would fail with EPERM and report
+        // "could not be tightened", which describes the symptom and hides the
+        // cause. It also matters that a foreign directory sitting at 0700
+        // passes the mode check silently today, so ownership is the only thing
+        // that catches it.
+        let euid = effective_uid();
+        if let Some(err) = foreign_ownership_error("key directory", dir, md.uid(), euid) {
+            anyhow::bail!(err);
+        }
+
+        let mode = md.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
             warn!(
                 dir = %dir.display(),
@@ -455,6 +503,27 @@ thread_local! {
     /// Test-only fault injection for the key write. Thread-local so an armed
     /// test cannot disturb the others running beside it.
     static FAIL_KEY_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Test-only override for the process effective uid, same thread-local
+    /// shape and for the same reason as `FAIL_KEY_WRITE`.
+    ///
+    /// The ownership refusal is otherwise untestable end to end: proving that
+    /// `read_p2p_keypair` and `ensure_key_dir` actually consult it needs a
+    /// fixture owned by a different user, and a test cannot `chown` one without
+    /// root. Pretending to be a different uid against a fixture we do own
+    /// exercises the identical branch and needs no privilege.
+    static EUID_OVERRIDE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The effective uid the ownership checks compare against.
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    #[cfg(test)]
+    if let Some(uid) = EUID_OVERRIDE.with(|c| c.get()) {
+        return uid;
+    }
+    // SAFETY: `geteuid` only reads the calling process's effective uid.
+    unsafe { libc::geteuid() }
 }
 
 /// Read an existing key file, refusing one whose permissions or contents make
@@ -463,13 +532,24 @@ thread_local! {
 fn read_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
     #[cfg(unix)]
     {
+        use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
 
-        let mode = std::fs::metadata(key_path)
-            .with_context(|| format!("failed to stat p2p key at {}", key_path.display()))?
-            .permissions()
-            .mode()
-            & 0o777;
+        // One stat feeds both checks. Statting twice would leave a window in
+        // which the file the ownership check approved is not the file the mode
+        // check measured.
+        let md = std::fs::metadata(key_path)
+            .with_context(|| format!("failed to stat p2p key at {}", key_path.display()))?;
+
+        // Ownership first: a key owned by someone else is not made safe by its
+        // mode, and saying "mode is fine" about a file we do not own would be
+        // the more misleading error of the two.
+        let euid = effective_uid();
+        if let Some(err) = foreign_ownership_error("key", key_path, md.uid(), euid) {
+            anyhow::bail!(err);
+        }
+
+        let mode = md.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
             anyhow::bail!(
                 "p2p key at {} has mode {:04o}, which grants access beyond its owner; \
@@ -973,6 +1053,135 @@ mod tests {
     /// direction is covered above, where nothing is created by construction,
     /// and the gate and the backstop call this same function so they cannot
     /// disagree.
+    /// Guard for the seam itself: with no override armed, the checks use the
+    /// real process uid. Without this, every ownership test below could pass
+    /// against a seam that had quietly stopped consulting `geteuid` at all.
+    #[cfg(unix)]
+    #[test]
+    fn effective_uid_defaults_to_the_real_process_uid() {
+        // SAFETY: `geteuid` only reads the calling process's effective uid.
+        assert_eq!(effective_uid(), unsafe { libc::geteuid() });
+    }
+
+    /// `read_p2p_keypair` actually consults the ownership check.
+    ///
+    /// The fixture is owned by this user (a test cannot chown one to anyone
+    /// else without root), so the override supplies a different euid instead.
+    /// That drives the identical branch: the file's uid and the process uid
+    /// disagree.
+    #[cfg(unix)]
+    #[test]
+    fn read_p2p_keypair_refuses_a_key_owned_by_another_user() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p2p.key");
+        let kp = identity::Keypair::generate_ed25519();
+        std::fs::write(&path, kp.to_protobuf_encoding().unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let real_uid = std::fs::metadata(&path).unwrap().uid();
+        let other = real_uid.wrapping_add(1);
+
+        EUID_OVERRIDE.with(|c| c.set(Some(other)));
+        let result = read_p2p_keypair(&path);
+        EUID_OVERRIDE.with(|c| c.set(None));
+
+        let err = format!(
+            "{:#}",
+            result.expect_err("a foreign-owned key must be refused")
+        );
+        assert!(
+            err.contains("owned by uid") && err.contains("will not adopt it"),
+            "must be refused for ownership, not something else, got: {err}"
+        );
+
+        // And the same file loads once the uids agree, so the refusal is about
+        // ownership and not about the fixture being broken.
+        assert!(
+            read_p2p_keypair(&path).is_ok(),
+            "the same key must load when the owner matches"
+        );
+    }
+
+    /// `ensure_key_dir` consults it too, and does so BEFORE trying to repair the
+    /// mode. A loose directory we do not own must report ownership, not a failed
+    /// chmod, and a 0700 directory we do not own must still be refused even
+    /// though the mode check alone would pass it.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_key_dir_refuses_a_directory_owned_by_another_user() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        for mode in [0o700, 0o777] {
+            let dir = tempfile::tempdir().unwrap();
+            let keys = dir.path().join("keys");
+            std::fs::create_dir(&keys).unwrap();
+            std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            let real_uid = std::fs::metadata(&keys).unwrap().uid();
+            EUID_OVERRIDE.with(|c| c.set(Some(real_uid.wrapping_add(1))));
+            let result = ensure_key_dir(&keys);
+            EUID_OVERRIDE.with(|c| c.set(None));
+
+            let err = format!(
+                "{:#}",
+                result.expect_err("a foreign-owned key directory must be refused")
+            );
+            assert!(
+                err.contains("owned by uid"),
+                "mode {mode:04o} must be refused for ownership, got: {err}"
+            );
+            assert!(
+                !err.contains("could not be tightened"),
+                "ownership must be reported before the chmod is attempted, got: {err}"
+            );
+        }
+    }
+
+    /// Both directions of the ownership refusal, without needing root.
+    ///
+    /// The reason this is a pure function taking two uids rather than a stat of
+    /// a real fixture: a test cannot chown a file to another user without
+    /// privilege, so a fixture-based version could only ever exercise the
+    /// matching case. That is the shape that ships a guard nobody has seen
+    /// refuse anything.
+    #[cfg(unix)]
+    #[test]
+    fn foreign_ownership_is_refused_and_matching_ownership_is_not() {
+        let path = Path::new("/data/keys/p2p.key");
+
+        // Same user: no complaint, whatever the uid happens to be.
+        for uid in [0u32, 1000, 65534] {
+            assert!(
+                foreign_ownership_error("key", path, uid, uid).is_none(),
+                "uid {uid} owning its own key must not be refused"
+            );
+        }
+
+        // Different user: refused, and the message has to name both uids or an
+        // operator cannot tell which side is wrong.
+        let err = foreign_ownership_error("key", path, 1000, 1001)
+            .expect("a key owned by another uid must be refused");
+        assert!(
+            err.contains("1000") && err.contains("1001"),
+            "the refusal must name both the owner and the running uid, got: {err}"
+        );
+        assert!(
+            err.contains("/data/keys/p2p.key"),
+            "the refusal must name the path, got: {err}"
+        );
+
+        // Root running against a user-owned file is still a mismatch. This is
+        // the case worth pinning: root can read it anyway, so it is tempting to
+        // treat it as fine, but the other user can still replace the file and
+        // therefore still chooses the identity.
+        assert!(
+            foreign_ownership_error("key directory", path, 1000, 0).is_some(),
+            "a user-owned path under a root-run node is still foreign"
+        );
+    }
+
     #[test]
     fn names_no_usable_directory_covers_both_directions() {
         for path in [
