@@ -358,6 +358,26 @@ fn build_advertisement_request(
 /// Public-repo fetch still works anonymously when no keypair is present. The body
 /// is signed (content-digest) but NOT attached here, so the caller can move the
 /// (possibly large) pack bytes into `.body()` rather than clone them.
+/// How long to wait for the node's DID before giving up and pushing without a
+/// delegation. Short on purpose: the answer is optional, and the node decides
+/// whether the header was required.
+const NODE_DID_TIMEOUT_SECS: u64 = 5;
+
+/// A path component safe to build a filename from. Mirrors `gl`'s
+/// `ucan_cmd::is_safe_component`; change both together.
+///
+/// Here the value comes from the remote URL rather than a token, and the path is
+/// only read — but a `..` owner would still read an arbitrary file and send its
+/// contents to the node as `X-Ucan`, so the same allow-list applies.
+fn is_safe_component(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.contains("..")
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
+}
+
 /// Where a delegation for `owner_did`/`repo` is stored.
 ///
 /// Must agree with `gl`'s `ucan_cmd::delegation_path`, which writes these files.
@@ -408,6 +428,9 @@ fn split_pack_post_url(post_url: &str) -> Option<(String, String, String)> {
         return None;
     }
     let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    if !is_safe_component(owner) || !is_safe_component(repo) {
+        return None;
+    }
     Some((origin, owner.to_string(), repo.to_string()))
 }
 
@@ -444,8 +467,12 @@ fn delegation_header(
     };
 
     // The invocation must be addressed to the node that will execute it.
+    // The shared client carries a 300s timeout, which is right for a pack transfer
+    // and wrong for a best-effort metadata probe: a stalled node would delay every
+    // delegated push by five minutes before falling back to sending no header.
     let node_did: gitlawb_core::did::Did = client
         .get(&origin)
+        .timeout(std::time::Duration::from_secs(NODE_DID_TIMEOUT_SECS))
         .header("User-Agent", USER_AGENT)
         .send()
         .ok()
@@ -2384,6 +2411,11 @@ mod delegated_push_tests {
             "https://node.example",
             "https://node.example/",
             "https://node.example/onlyowner",
+            // A traversing owner would read an arbitrary file and send it to the
+            // node as X-Ucan, so it must not resolve to a lookup at all.
+            "https://node.example/../../etc/passwd/git-receive-pack",
+            "https://node.example/../x/git-receive-pack",
+            "https://node.example/a%2Fb/x/git-receive-pack",
         ] {
             assert!(
                 split_pack_post_url(bad).is_none(),

@@ -77,11 +77,40 @@ pub fn delegation_path(dir: &std::path::Path, owner_did: &str, repo: &str) -> Pa
     dir.join("delegations").join(format!("{bare}__{repo}.ucan"))
 }
 
+/// A path component that is safe to build a filename from.
+///
+/// This is load-bearing, not defensive tidiness: the values it guards flow into
+/// [`delegation_path`], which `gl ucan import` WRITES to, and they come from a
+/// field of an untrusted token. `Path::join` with an absolute component discards
+/// the base entirely, so an owner of `/etc/cron.d/x` or `C:/Windows/...` escapes
+/// the delegations directory completely rather than merely climbing out of it.
+///
+/// Deliberately an allow-list. A DID carries `:` (`did:key:z6Mk…`) and repo names
+/// carry `.`, `-` and `_`; nothing else is needed, and a deny-list of separators
+/// would miss whichever ones the next platform introduces.
+fn is_safe_component(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.contains("..")
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
+}
+
 /// Pull the repo this capability names out of `gitlawb://repos/<owner>/<repo>`.
+///
+/// Requires exactly two components after the prefix. Anything else — extra
+/// segments, a trailing slash, an empty half — is refused rather than
+/// interpreted, so no input can address a location the caller did not intend.
 fn repo_from_resource(with: &str) -> Option<(String, String)> {
     let rest = with.strip_prefix("gitlawb://repos/")?;
-    let (owner, name) = rest.rsplit_once('/')?;
-    if owner.is_empty() || name.is_empty() {
+    let mut parts = rest.split('/');
+    let owner = parts.next()?;
+    let name = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if !is_safe_component(owner) || !is_safe_component(name) {
         return None;
     }
     Some((owner.to_string(), name.to_string()))
@@ -434,6 +463,52 @@ mod tests {
 #[cfg(test)]
 mod delegation_store_tests {
     use super::*;
+
+    /// `repo_from_resource` feeds `delegation_path`, which builds a filesystem
+    /// path that `gl ucan import` then WRITES to — from a field of an untrusted
+    /// token. A separator, a parent-directory hop, or an absolute prefix in the
+    /// owner escapes the delegations directory; `Path::join` with an absolute
+    /// component discards the base entirely, so an absolute owner writes anywhere
+    /// the user can write.
+    #[test]
+    fn repo_from_resource_rejects_anything_that_could_escape_the_store() {
+        for bad in [
+            "gitlawb://repos/../../evil/x",
+            "gitlawb://repos/../x",
+            "gitlawb://repos/a/../../x",
+            "gitlawb://repos//x",
+            "gitlawb://repos/C:/Windows/System32/x",
+            "gitlawb://repos//etc/cron.d/x",
+            "gitlawb://repos/a\\b/x",
+            "gitlawb://repos/owner/sub/dir/x",
+            "gitlawb://repos/owner/x/",
+            "gitlawb://repos/owner/",
+            "gitlawb://repos/owner",
+            "gitlawb://repos/",
+            "gitlawb://repos/owner/..",
+            "gitlawb://repos/owner/.",
+            "gitlawb://repos/./x",
+            "https://repos/owner/x",
+            "",
+        ] {
+            assert!(
+                repo_from_resource(bad).is_none(),
+                "{bad:?} must not yield a storable owner/repo pair"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_from_resource_accepts_the_canonical_shape() {
+        assert_eq!(
+            repo_from_resource("gitlawb://repos/did:key:z6MkAbc/myrepo"),
+            Some(("did:key:z6MkAbc".to_string(), "myrepo".to_string()))
+        );
+        assert_eq!(
+            repo_from_resource("gitlawb://repos/z6MkAbc/my-repo.rs"),
+            Some(("z6MkAbc".to_string(), "my-repo.rs".to_string()))
+        );
+    }
 
     #[test]
     fn delegation_path_strips_the_did_prefix_and_separates_owner_from_repo() {

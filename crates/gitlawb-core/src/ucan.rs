@@ -49,11 +49,32 @@ impl Capability {
     /// action field and `repo/admin` in the parent's action position act as
     /// wildcards that cover any delegated value; wildcards on `self` carry no
     /// special meaning.
+    ///
+    /// Constraints (`nb`) participate, and conservatively:
+    ///
+    /// | parent | child | verdict |
+    /// |---|---|---|
+    /// | none | anything | attenuated — adding constraints narrows |
+    /// | some | identical | attenuated |
+    /// | some | different | refused — narrowing is unprovable without semantics |
+    /// | some | none | refused — dropping constraints widens |
+    ///
+    /// The last row is the one that matters. Ignoring `nb` here let a holder of a
+    /// constrained capability re-delegate the same resource and action with the
+    /// constraints removed, and the chain still verified — so a consumer that
+    /// refuses constrained capabilities at the leaf saw an unconstrained one and
+    /// granted it. Since `nb` has no interpreted semantics yet, "different" cannot
+    /// be shown to be narrower and is refused with it.
     pub fn is_attenuated_by(&self, parent: &Capability) -> bool {
         let resource_ok = parent.with == self.with || parent.with == "*";
         let action_ok =
             parent.can == self.can || parent.can == "*" || parent.can == caps::REPO_ADMIN;
-        resource_ok && action_ok
+        let constraints_ok = match (&parent.constraints, &self.constraints) {
+            (None, _) => true,
+            (Some(p), Some(c)) => p == c,
+            (Some(_), None) => false,
+        };
+        resource_ok && action_ok && constraints_ok
     }
 }
 
@@ -719,6 +740,81 @@ mod tests {
             ucan.verify_chain().expect("a root token still verifies"),
             agent.did(),
             "a self-minted token roots at the minter, however permissive its capabilities"
+        );
+    }
+
+    /// Stripping `nb` is a widening, and a widening must fail attenuation.
+    ///
+    /// Without this, a constrained delegation is trivially escalated: the holder
+    /// re-delegates the same resource and action with the constraints removed,
+    /// `verify_chain` accepts the chain because attenuation only compared `with`
+    /// and `can`, and a consumer that refuses constrained capabilities at the leaf
+    /// (as the node's push gate does) then sees an unconstrained one and grants it.
+    /// Guarding only the leaf guards the wrong end of the chain.
+    #[test]
+    fn verify_chain_rejects_a_child_that_strips_the_parents_constraints() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+
+        let constrained = Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH)
+            .with_constraints(serde_json::json!({ "refs": ["refs/heads/feat/*"] }));
+        let delegation = Ucan::issue(&owner, agent.did(), vec![constrained], None)
+            .expect("issue constrained delegation");
+
+        // Same resource, same action, constraints dropped.
+        let widened = Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH);
+        let forged =
+            Ucan::delegate(&agent, node.did(), vec![widened], None, &delegation).expect("wrap");
+
+        let err = forged
+            .verify_chain()
+            .expect_err("dropping the parent's constraints must fail attenuation");
+        assert!(
+            err.to_string().contains("attenuation"),
+            "the failure must name attenuation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_chain_accepts_a_child_that_keeps_the_parents_constraints() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+
+        let nb = serde_json::json!({ "refs": ["refs/heads/feat/*"] });
+        let constrained = Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH)
+            .with_constraints(nb.clone());
+        let delegation =
+            Ucan::issue(&owner, agent.did(), vec![constrained.clone()], None).expect("issue");
+        let invocation =
+            Ucan::delegate(&agent, node.did(), vec![constrained], None, &delegation).expect("wrap");
+
+        assert_eq!(
+            invocation
+                .verify_chain()
+                .expect("an unchanged constraint must verify"),
+            owner.did()
+        );
+    }
+
+    #[test]
+    fn an_unconstrained_parent_still_allows_a_child_to_add_constraints() {
+        // Adding `nb` narrows, which is always a legal attenuation.
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+
+        let open = Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH);
+        let delegation = Ucan::issue(&owner, agent.did(), vec![open], None).expect("issue");
+        let narrowed = Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH)
+            .with_constraints(serde_json::json!({ "refs": ["refs/heads/main"] }));
+        let invocation =
+            Ucan::delegate(&agent, node.did(), vec![narrowed], None, &delegation).expect("wrap");
+
+        assert_eq!(
+            invocation.verify_chain().expect("narrowing must verify"),
+            owner.did()
         );
     }
 
