@@ -1022,11 +1022,13 @@ mod tests {
     }
 
     /// The `/ipfs` work-budget capacity is DERIVED from the route limit (R6, KTD6), with
-    /// a hard floor of one full legacy search per window (the effective
-    /// `ipfs_max_legacy_probes`). This guards the derived default so a single
-    /// default-config deep search never self-throttles mid-scan and recreates the F6
-    /// admit-then-429 for a legitimate caller. A `RateLimiter` sized to the derived
-    /// budget must admit the whole probe budget back to back.
+    /// a hard floor of one complete COMBINED resolution per window: the provenance
+    /// phase's walk term plus a full legacy search (the effective
+    /// `ipfs_max_legacy_probes` plus the row ceiling's page toll). This guards the
+    /// derived default so a single default-config deep search never self-throttles
+    /// mid-scan and recreates the F6 admit-then-429 for a legitimate caller. A
+    /// `RateLimiter` sized to the derived budget must admit the whole budget back to
+    /// back.
     #[test]
     fn ipfs_work_budget_derives_from_route_limit_and_clears_the_probe_floor() {
         use crate::state::AppState;
@@ -1041,23 +1043,45 @@ mod tests {
             "the work budget must clear one full legacy search per window"
         );
 
-        // Tight route limit (1): the floor lifts the work budget to a full deep scan,
-        // the 256-probe budget PLUS the page toll a 2048-row ceiling costs at 128 rows
-        // per page (16) = 272, NOT down to 1. A single deep search still completes its
-        // full scan without self-throttling on either charge.
+        // Tight route limit (1): the floor lifts the work budget to one complete
+        // COMBINED resolution, the 256-probe budget PLUS the page toll a 2048-row
+        // ceiling costs at 128 rows per page (16) PLUS the provenance phase's walk term
+        // min(17, 64) = 17, so 289, NOT down to 1. The provenance walks come off the
+        // same bucket before the fallback runs, so a floor without that term hands the
+        // legacy search a bucket the provenance phase already spent from. This case
+        // also carries the walk term's ABOVE-constant direction: the repos-walked knob
+        // is at its default 64, so `MAX_HISTORY_WALKS_PER_REQUEST` (17) is what binds.
         let tight = Config::parse_from(["gitlawb-node", "--ipfs-rate-limit", "1"]);
         assert_eq!(
             AppState::ipfs_work_budget(&tight),
-            272,
-            "a tight route limit is floored at probes + pages (256 + 16), not clamped to 1"
+            289,
+            "a tight route limit is floored at probes + pages + walks \
+             (256 + 16 + min(17, 64) = 17), not clamped to 1"
+        );
+
+        // The walk term's BELOW-constant direction: a repos-walked knob under the
+        // history-walk constant is what the resolver's own `walk_cap` min() selects, so
+        // it is what the floor must carry too. 256 + 16 + min(17, 3) = 275.
+        let narrow_walk = Config::parse_from([
+            "gitlawb-node",
+            "--ipfs-rate-limit",
+            "1",
+            "--ipfs-max-repos-walked",
+            "3",
+        ]);
+        assert_eq!(
+            AppState::ipfs_work_budget(&narrow_walk),
+            275,
+            "the walk term takes min(17, repos-walked 3) = 3, the resolver's own \
+             walk_cap, so the floor is 256 + 16 + 3"
         );
 
         // Raised probe budget lifts the floor with it (the work budget tracks the
-        // effective probe budget, not the constant). The walk cap is set to a DIFFERENT
-        // value in the same config on purpose: the two were one field before the split,
-        // so a floor that silently read the walk cap would return 7 here and still look
-        // plausible. Only the legacy-probe and legacy-scan-rows knobs may drive this
-        // budget.
+        // effective probe budget, not the constant). The walk cap here is a SECOND
+        // below-constant proof at a different pair of values: min(17, 7) = 7, and the
+        // probe knob is raised at the same time so a floor that folded the two terms
+        // together (they were one field before the split) reads visibly wrong rather
+        // than plausibly right.
         let raised = Config::parse_from([
             "gitlawb-node",
             "--ipfs-rate-limit",
@@ -1069,16 +1093,17 @@ mod tests {
         ]);
         assert_eq!(
             AppState::ipfs_work_budget(&raised),
-            1016,
+            1023,
             "the floor tracks the operator-raised legacy-probe budget (1000) plus the \
-             default row ceiling's page toll (16), not the walk cap"
+             default row ceiling's page toll (16) plus the walk term min(17, 7) = 7"
         );
 
         // The scan-rows knob is coupled to the floor too, and this EXECUTES the coupling
         // rather than describing it: every page the ceiling permits is charged to the
         // caller's work bucket, so a raised ceiling that did not lift the floor would
         // 429 an honest caller part-way down their own token ladder. 4096 rows at 128
-        // rows per page is 32 pages, so the floor is 256 + 32.
+        // rows per page is 32 pages, so the floor is 256 + 32 + the default walk term
+        // of 17.
         let wide_scan = Config::parse_from([
             "gitlawb-node",
             "--ipfs-rate-limit",
@@ -1088,9 +1113,10 @@ mod tests {
         ]);
         assert_eq!(
             AppState::ipfs_work_budget(&wide_scan),
-            288,
+            305,
             "raising the row ceiling must raise the work floor by the pages it buys \
-             (256 probes + 4096/128 = 32 pages), or a full deep scan self-throttles"
+             (256 probes + 4096/128 = 32 pages + min(17, 64) = 17 walks), or a full \
+             deep scan self-throttles"
         );
 
         // 0 route limit disables the derived bucket too (a 0-capacity limiter admits all).
@@ -1102,7 +1128,8 @@ mod tests {
         );
 
         // Behavioral floor: a limiter sized to the derived (tight-route) budget admits
-        // the whole probe budget back to back for one source, then sheds the next.
+        // a whole combined resolution's worth of charges back to back for one source,
+        // then sheds the next.
         let budget = AppState::ipfs_work_budget(&tight);
         let limiter =
             crate::rate_limit::RateLimiter::new(budget, std::time::Duration::from_secs(3600));
@@ -1114,7 +1141,7 @@ mod tests {
             for i in 0..budget {
                 assert!(
                     limiter.check("1.2.3.4").await,
-                    "probe {i} of one full default-config scan must be admitted (no mid-scan throttle)"
+                    "charge {i} of one full combined resolution must be admitted (no mid-scan throttle)"
                 );
             }
             assert!(

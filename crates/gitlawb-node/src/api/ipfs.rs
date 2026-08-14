@@ -2319,6 +2319,29 @@ mod tests {
             .expect("in-range stamp")
     }
 
+    /// Stamp an already-seeded repo row's `created_at` with [`scan_order_stamp`], for a
+    /// fixture whose RED depends on WHICH row the scan reaches last.
+    ///
+    /// `upsert_mirror_repo` (under `seed_repo_with_blob`) stamps `Utc::now()`, so a
+    /// mirror row's scan position is its seeding instant rendered by `to_rfc3339`, whose
+    /// fractional-second field is variable-width. The scan compares the stored TEXT, so
+    /// two rows seeded milliseconds apart can order by digit count rather than by time.
+    /// Restamping with the whole-second values keeps text order and seed order identical.
+    async fn stamp_scan_order(pool: &sqlx::PgPool, repo_id: &str, i: usize) {
+        let at = scan_order_stamp(i).to_rfc3339();
+        let done = sqlx::query("UPDATE repos SET created_at = $1 WHERE id = $2")
+            .bind(&at)
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .expect("restamp a seeded repo's scan position");
+        assert_eq!(
+            done.rows_affected(),
+            1,
+            "restamping {repo_id} must hit exactly the row the fixture seeded"
+        );
+    }
+
     /// Seed `n` PRIVATE repos owned by a foreign DID, in scan order, with `rules_each`
     /// path-scoped rules apiece. An anonymous caller is denied at the root gate on every
     /// one, and a root deny costs neither a probe nor a visit, which is exactly the
@@ -3101,6 +3124,187 @@ mod tests {
              is the truncated-search 503: {body}"
         );
         assert_eq!(body["error"], "search_incomplete", "{body}");
+    }
+
+    /// F2 (#173 round 15): the derived work floor must fit ONE COMPLETE COMBINED
+    /// resolution, provenance walks included, not just the legacy search.
+    ///
+    /// `AppState::ipfs_work_budget` floors the per-IP work bucket at
+    /// `ipfs_max_legacy_probes + pages`, but the SAME bucket is debited once per
+    /// provenance visibility walk, before the fallback the markers arm has run at all.
+    /// So with `GITLAWB_IPFS_RATE_LIMIT` below the floor (the only configuration where
+    /// the floor is what sizes the bucket), the provenance phase eats into the budget
+    /// the floor exists to reserve for the search, and the "one complete legacy search
+    /// per window" guarantee stops holding: the search 429s short of its configured
+    /// reach, and the retry re-pays the same provenance charges.
+    ///
+    /// The seams, stated the way the sibling fixtures do, and the ledger they produce:
+    ///
+    ///   * `ipfs_rate_limit = 1`, below the floor, so the floor is what binds.
+    ///   * `ipfs_max_legacy_probes = 4`, above the three probes the scan spends, so the
+    ///     probe ceiling is NOT what stops the holder (it is a second brake that can
+    ///     strand it independently of the work bucket, which is why the GREEN is
+    ///     asserted as a SERVED 200 rather than as merely not-429).
+    ///   * `ipfs_max_legacy_scan_rows = 128`, one page at the production page size, so
+    ///     the scan buys exactly one page toll.
+    ///   * `ipfs_max_repos_walked = 2`, so `walk_cap` is `min(17, 2) = 2` and exactly
+    ///     fits the two path-scoped provenance deniers per phase.
+    ///   * `ipfs_max_repo_visits` stays at its 1024 default against the 5 visits here,
+    ///     so no other ceiling binds.
+    ///
+    /// Debits, in order: 2 provenance walks (the `!legacy_scan` charge, one per denier,
+    /// with no probe toll on that phase), 1 page toll, then one probe per legacy
+    /// candidate. The two deniers are re-visited by the scan for free as far as WALKS
+    /// go (the allowed-set memo persists across phases) but each still pays its probe,
+    /// so the holder's own probe is the SIXTH debit.
+    ///
+    /// Old floor `4 + 1 = 5`: that sixth debit finds the bucket empty,
+    /// `gate_and_serve` returns `Throttled` WITHOUT tainting, and the tail renders the
+    /// work-path 429. New floor `4 + 1 + min(17, 2) = 7`: the holder is reached,
+    /// walked on the scan phase's own budget, and served, with one token to spare.
+    ///
+    /// The route limiter is deliberately left at `test_support`'s default rather than
+    /// sized from this cfg. `ipfs_router` layers no `rate_limit_by_ip` at all, so that
+    /// saves nothing today, but a route bucket sized from `ipfs_rate_limit = 1` would
+    /// shed the request at the door and the RED would be a 429-vs-429 collision with no
+    /// discriminant. For the same reason the RED assertion pins the "ipfs retrieval"
+    /// prefix: the route brake's body is "rate limit exceeded", a substring of the
+    /// work path's "ipfs retrieval rate limit exceeded", so a bare status check or the
+    /// shorter string cannot tell the two brakes apart.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_work_floor_fits_provenance_walks_plus_one_full_legacy_search(
+        pool: sqlx::PgPool,
+    ) {
+        use crate::state::AppState;
+        use clap::Parser;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool.clone());
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let cfg = crate::config::Config::parse_from([
+            "gitlawb-node",
+            "--ipfs-rate-limit",
+            "1",
+            "--ipfs-max-legacy-probes",
+            "4",
+            "--ipfs-max-legacy-scan-rows",
+            "128",
+            "--ipfs-max-repos-walked",
+            "2",
+        ]);
+        // The knobs live in TWO places: `build_state` seeds the probe and scan-row
+        // ceilings the resolver enforces as AppState fields from constants, independent
+        // of Config, while `walk_cap` reads `state.config.ipfs_max_repos_walked`. A cfg
+        // installed without the seams would size the bucket from one set of values and
+        // run the scan under another.
+        state.ipfs_max_legacy_probes = AppState::ipfs_legacy_probe_budget(&cfg);
+        state.ipfs_max_legacy_scan_rows = AppState::ipfs_legacy_scan_row_budget(&cfg);
+        assert_eq!(
+            state.ipfs_legacy_scan_page_rows,
+            crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS,
+            "fixture precondition: the page seam stays at the production page size, so \
+             the row ceiling above is exactly one page and the scan buys one page toll"
+        );
+        assert_eq!(
+            state.ipfs_max_history_walks,
+            crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
+            "fixture precondition: the history-walk seam stays at the constant, so \
+             walk_cap is min(17, 2) = 2 and the repos-walked knob is what binds"
+        );
+        state.config = Arc::new(cfg.clone());
+        // The bucket is sized from the seam under test, never by hand: that is what
+        // makes the floor change, and nothing else, the difference between RED and GREEN.
+        let floor = AppState::ipfs_work_budget(&cfg);
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(floor, std::time::Duration::from_secs(3600));
+
+        // Identical content everywhere, so one CID resolves to one oid all three repos
+        // carry. Scan order is `(created_at, id)` ASC and the holder must be paged AFTER
+        // both deniers, or its probe is not the debit that finds the bucket empty.
+        let content = b"one complete combined resolution\n";
+        let (prov_one, oid) =
+            seed_path_denying_repo(&state, tmp.path(), "z6f2floor", "provdeny-one", content).await;
+        let (prov_two, _) =
+            seed_path_denying_repo(&state, tmp.path(), "z6f2floor", "provdeny-two", content).await;
+        // The holder's rule IS path-scoped, so reaching its verdict still costs a walk,
+        // but it covers a path this object is not at, so the walk's allowed set decides
+        // on the mirror row's public flag and ALLOWS an anonymous reader.
+        let (holder_id, _) =
+            seed_repo_with_blob(&state, tmp.path(), "z6f2floor", "holder", content).await;
+        state
+            .db
+            .set_visibility_rule(
+                &holder_id,
+                "/decoy/**",
+                crate::db::VisibilityMode::B,
+                &[OTHER_READER.to_string()],
+                "z6f2floor",
+            )
+            .await
+            .unwrap();
+        stamp_scan_order(&pool, &prov_one, 0).await;
+        stamp_scan_order(&pool, &prov_two, 1).await;
+        stamp_scan_order(&pool, &holder_id, 2).await;
+
+        // The two deniers are the recorded sources; the holder is not, which is the
+        // dropped-source case. Two sources sits well under MAX_PIN_SOURCES (16), so
+        // `pin_sources_at_cap` cannot arm the fallback: the durable incomplete marker is
+        // what arms it.
+        state.db.record_pin_source(&oid, &prov_one).await.unwrap();
+        state.db.record_pin_source(&oid, &prov_two).await.unwrap();
+        state
+            .db
+            .mark_pin_sources_incomplete(&oid, "")
+            .await
+            .unwrap();
+        let cid = seed_legacy_pin_for_oid(&state, &oid).await;
+
+        let work_bucket = state.ipfs_work_rate_limiter.clone();
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.173:5000".parse().unwrap();
+        let resp = router.oneshot(get_cid(&cid, Some(peer))).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let rendered = String::from_utf8_lossy(&body).to_string();
+        // Drain what the request left, so the failure messages carry the measured
+        // ledger rather than only its consequence.
+        let mut spare = 0usize;
+        while work_bucket.check("203.0.113.173").await {
+            spare += 1;
+        }
+
+        assert!(
+            !rendered.contains("ipfs retrieval"),
+            "the work floor must reserve a full legacy search AFTER the provenance \
+             phase has taken its walks off the same bucket. The holder's own probe \
+             found the bucket empty and the tail rendered the work-path 429 (floor \
+             {floor}, {spare} of it unspent): {rendered}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the buried public holder must be SERVED within one window, not merely \
+             spared the 429: the probe ceiling is a second brake that can strand it on \
+             its own (floor {floor}, {spare} unspent): {rendered}"
+        );
+        assert_eq!(
+            &body[..],
+            content.as_slice(),
+            "the served bytes must be the holder's object"
+        );
+        assert_eq!(
+            spare, 1,
+            "the measured ledger is 2 provenance walks + 1 page toll + 3 legacy probes \
+             = 6 debits against a floor of {floor}, so exactly one token is left. A \
+             different remainder means the debit order moved and the RED above is no \
+             longer pinned on the holder's probe"
+        );
     }
 
     /// F2 visit ceiling: `ipfs_max_repo_visits` bounds the acquire+probe cost class
@@ -4122,14 +4326,21 @@ mod tests {
     /// `ceil(10 / 4) + 1 = 4` requests. Every intermediate response is the retryable
     /// 503 with a token, and no 429 interrupts the ladder, which is what the floor fix
     /// pins. The work bucket is sized to the DERIVED floor of a config whose page term
-    /// dominates (probe knob 1, row knob 896 = 7 pages, so floor = 8); under the old
-    /// floor (`max(route, probes)` = 1) the very first page would 429.
+    /// dominates (probe knob 1, row knob 896 = 7 pages, walk knob 1, so floor = 9);
+    /// under the old floor (`max(route, probes)` = 1) the very first page would 429.
     ///
-    /// The floor is 8 rather than the honest ladder's exact cost (6 pages + 1 probe = 7)
+    /// The walk knob is pinned at 1 rather than left at its default of 64. This ladder
+    /// is a pure legacy scan with no provenance phase, so the floor's walk term
+    /// (`min(17, ipfs_max_repos_walked)`, #173 round 15) buys nothing the fixture
+    /// spends; at the default it would hand the bucket 17 tokens of slack and the page
+    /// toll, which is the thing this test exists to hold the floor against, would stop
+    /// being what binds.
+    ///
+    /// The floor is 9 rather than the honest ladder's exact cost (6 pages + 1 probe = 7)
     /// on purpose. A ladder that never resumes re-pages from the front every request and
     /// costs 8, so at a bucket of 7 mutation C would trip the 429 guard one step before
     /// the reach guard and its RED would be attributed to the toll rather than to the
-    /// missing continuation. One token of headroom keeps each guard reporting its own
+    /// missing continuation. A token of headroom keeps each guard reporting its own
     /// property.
     ///
     /// MUTATION C (RED): emit the token but never open it on the way in, and the ladder
@@ -4167,11 +4378,13 @@ mod tests {
             "1",
             "--ipfs-max-legacy-scan-rows",
             "896",
+            "--ipfs-max-repos-walked",
+            "1",
         ]);
         let floor = AppState::ipfs_work_budget(&cfg);
         assert_eq!(
-            floor, 8,
-            "fixture precondition: 1 probe + 896/128 = 7 pages"
+            floor, 9,
+            "fixture precondition: 1 probe + 896/128 = 7 pages + min(17, 1) = 1 walk"
         );
         state.ipfs_work_rate_limiter =
             crate::rate_limit::RateLimiter::new(floor, std::time::Duration::from_secs(3600));

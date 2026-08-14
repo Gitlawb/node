@@ -429,16 +429,36 @@ impl AppState {
     /// (R6, KTD6), DERIVED from the route limit rather than a new operator knob. The route
     /// limiter (`ipfs_rate_limiter`) charges once per request; this separate bucket absorbs
     /// the resolver's per-probe/per-walk work charges so both the route "requests per hour"
-    /// contract and the amplification bound hold. Floor: at least one full legacy search per
-    /// window, the effective `ipfs_max_legacy_probes` (the `GITLAWB_IPFS_MAX_LEGACY_PROBES`
-    /// knob), so a single default-config deep search cannot self-throttle mid-scan and
-    /// recreate the admit-then-429 for a legitimate caller. `GITLAWB_IPFS_RATE_LIMIT=0`
+    /// contract and the amplification bound hold. Floor: at least one complete COMBINED
+    /// resolution per window, the provenance phase's walks plus a full legacy search
+    /// (probes plus page tolls), so a single default-config resolution cannot
+    /// self-throttle part-way and recreate the admit-then-429 for a legitimate caller.
+    /// `GITLAWB_IPFS_RATE_LIMIT=0`
     /// disables the route brake and this derived bucket alike (a 0-capacity limiter admits
     /// everything).
     ///
-    /// The floor is the LEGACY-PROBE knob, not `ipfs_max_repos_walked`. Those were one
-    /// field before the walk cap and the probe budget were split apart, and reading the
-    /// walk cap here would silently size this bucket at 64 instead of 256.
+    /// The floor carries a WALK term (#173 round 15, F2). The provenance visibility walk
+    /// in `gate_and_serve` debits this SAME bucket (its `!legacy_scan` charge), once per
+    /// path-scoped source, before the legacy fallback runs at all, and the walk cap is
+    /// charged per phase. A floor counting only the search therefore under-sizes the
+    /// window by up to that cap exactly when the floor binds (a route limit set below
+    /// it): the provenance phase spends from the budget the floor reserved for the
+    /// search, the fallback 429s short of its configured reach, and the retry re-pays the
+    /// same provenance charges. The term is
+    /// `min(MAX_HISTORY_WALKS_PER_REQUEST, ipfs_max_repos_walked)` because that is
+    /// textually the resolver's own `walk_cap` in `gate_and_serve`; the two `min()`s must
+    /// move together, so an edit to either finds the other from here. It reads the
+    /// CONSTANT and the CONFIG knob for the same reason the page term below reads the
+    /// constant page size: `ipfs_max_history_walks` is an `AppState` test seam, and
+    /// sizing a production floor from a seam would inflate the budget by whatever a test
+    /// chose.
+    ///
+    /// The PROBE term is the LEGACY-PROBE knob, not `ipfs_max_repos_walked`. Those were
+    /// one field before the walk cap and the probe budget were split apart, and sizing
+    /// the probe term off the walk cap would silently read 64 instead of 256. That is a
+    /// statement about which knob sizes the PROBE term; it is not a claim that the walk
+    /// cap has no place in the floor, since the walk term above is added to this one
+    /// rather than substituted for it.
     ///
     /// The floor also carries the scan's PAGE toll (#173 round 13, F2): every page the
     /// legacy scan buys is charged to this same bucket, so a deep scan spends
@@ -455,9 +475,13 @@ impl AppState {
         let pages = config
             .ipfs_max_legacy_scan_rows
             .div_ceil(crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS);
+        let walks = std::cmp::min(
+            crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST as usize,
+            config.ipfs_max_repos_walked,
+        );
         config
             .ipfs_rate_limit
-            .max(config.ipfs_max_legacy_probes + pages)
+            .max(config.ipfs_max_legacy_probes + pages + walks)
     }
 }
 
