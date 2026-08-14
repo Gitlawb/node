@@ -2472,7 +2472,14 @@ async fn post_receive_replication_tail(
                             timestamp: chrono::Utc::now().to_rfc3339(),
                             cert_id: None,
                             cid: cid.map(|s| s.to_string()),
-                            // Signing is U4's job; unsigned for now.
+                            // Left unsigned here on purpose. The swarm loop
+                            // signs the event with the node keypair via
+                            // `p2p::signed_publish_bytes` immediately before it
+                            // publishes, and skips the publish outright if
+                            // signing fails, so the wire always carries a
+                            // signature even though this construction site does
+                            // not. Setting one here would be signed over a
+                            // payload the publisher has not finished building.
                             sig: None,
                         })
                         .await;
