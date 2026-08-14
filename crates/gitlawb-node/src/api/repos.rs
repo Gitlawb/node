@@ -4993,6 +4993,13 @@ mod tests {
     /// task the global slot stays occupied until the walk finishes; on the pre-fix code
     /// the handler-local permits drop on future-drop and the slot frees instantly (RED),
     /// letting disconnect-spam exceed the cap while real git work keeps running.
+    ///
+    /// Unix-only: the fake git is a `/bin/sh` script made executable through
+    /// `PermissionsExt::set_mode`, and the hung `rev-list` is reaped with
+    /// `libc::kill(SIGKILL)`. Neither exists on Windows, so without this gate the
+    /// whole `gitlawb-node` test target fails to compile there (#228) and no test
+    /// in the crate can run on a Windows checkout.
+    #[cfg(unix)]
     #[sqlx::test]
     async fn upload_pack_permit_held_through_walk_after_disconnect(pool: sqlx::PgPool) {
         use axum::body::Body;
@@ -5860,6 +5867,11 @@ mod tests {
     /// sheds — releasing the permit lets the SAME walk run and pin (durability stays
     /// fail-closed). Exercises the gating seam directly; the detached push task calls
     /// this exact helper.
+    ///
+    /// Unix-only for the same reason as
+    /// `upload_pack_permit_held_through_walk_after_disconnect`: the fake git is a
+    /// `/bin/sh` script made executable through `PermissionsExt::set_mode` (#228).
+    #[cfg(unix)]
     #[tokio::test]
     async fn encrypt_walk_defers_when_pool_exhausted() {
         use std::sync::Arc;
