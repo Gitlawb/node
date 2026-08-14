@@ -3377,10 +3377,12 @@ name = "git-remote-gitlawb"
 version = "0.7.1"
 dependencies = [
  "anyhow",
+ "chrono",
  "gitlawb-core",
  "libc",
  "mockito",
  "reqwest",
+ "serde_json",
  "tempfile",
  "tracing",
  "tracing-subscriber",
