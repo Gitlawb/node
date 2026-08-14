@@ -184,9 +184,24 @@ async fn cmd_import(token: String, dir: Option<PathBuf>) -> Result<()> {
         );
     }
 
+    // The identity directory is a private-data contract, not a public one: it
+    // already holds `identity.pem`, whose disclosure is strictly worse than a
+    // delegation's. On Unix both get explicit modes. On other targets neither does
+    // — `std::fs` has no portable ACL API and `gitlawb_dir` accepts any directory —
+    // so the contract there is that the caller supplies a user-private directory,
+    // which is what the platform's per-user profile gives by default. Diverging for
+    // this one file while the private key beside it relies on the same assumption
+    // would be theatre.
     let base = crate::identity::gitlawb_dir(dir)?;
-    std::fs::create_dir_all(base.join("delegations"))
-        .with_context(|| format!("could not create {}", base.join("delegations").display()))?;
+    let store = base.join("delegations");
+    std::fs::create_dir_all(&store)
+        .with_context(|| format!("could not create {}", store.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("could not set permissions on {}", store.display()))?;
+    }
 
     for (owner, repo) in &push_caps {
         let path = delegation_path(&base, owner, repo);
