@@ -1196,6 +1196,17 @@ mod tests {
         std::fs::write(&path, kp.to_protobuf_encoding().unwrap()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
+        // Give the fixture a group that is NOT its owning uid, where the box
+        // allows it. On a machine where uid == gid (this one, and most
+        // single-user boxes) a check that read gid instead of uid would be
+        // indistinguishable from the correct one, so the mutation covering that
+        // mixup cannot fail. chgrp to a group we already belong to needs no
+        // privilege. If no such group exists the test still runs and simply
+        // does not carry that particular distinction.
+        if let Some(gid) = other_group() {
+            let _ = std::os::unix::fs::chown(&path, None, Some(gid));
+        }
+
         let real_uid = std::fs::metadata(&path).unwrap().uid();
         let other = real_uid.wrapping_add(1);
 
@@ -1239,9 +1250,15 @@ mod tests {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         for mode in [0o700, 0o777] {
+            // The tempdir ITSELF is the key directory under test, not a child of
+            // it. With the euid override armed the whole path chain looks
+            // foreign, so a nested fixture would trip the ancestor walk first
+            // and this test would pass through that error instead, leaving the
+            // leaf ownership check unbound. /tmp is root-owned and sticky, so
+            // the ancestors of the tempdir are trusted and only the leaf is
+            // foreign.
             let dir = tempfile::tempdir().unwrap();
-            let keys = dir.path().join("keys");
-            std::fs::create_dir(&keys).unwrap();
+            let keys = dir.path().to_path_buf();
             std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(mode)).unwrap();
 
             let real_uid = std::fs::metadata(&keys).unwrap().uid();
@@ -1272,6 +1289,23 @@ mod tests {
                 "a refused directory must not have been chmodded first"
             );
         }
+    }
+
+    /// A group this process belongs to that is not its effective gid, if there
+    /// is one. Used to build a fixture whose uid and gid differ so a uid/gid
+    /// mixup is observable; returns None on a box with no secondary groups,
+    /// where that distinction simply cannot be drawn.
+    #[cfg(unix)]
+    fn other_group() -> Option<u32> {
+        // SAFETY: getegid only reads the calling process's effective gid.
+        let egid = unsafe { libc::getegid() };
+        let mut buf = [0 as libc::gid_t; 64];
+        // SAFETY: writes at most buf.len() entries into buf and returns the count.
+        let n = unsafe { libc::getgroups(buf.len() as libc::c_int, buf.as_mut_ptr()) };
+        if n <= 0 {
+            return None;
+        }
+        buf[..n as usize].iter().copied().find(|g| *g != egid)
     }
 
     /// A foreign-owned ancestor is refused before anything is created under it.
