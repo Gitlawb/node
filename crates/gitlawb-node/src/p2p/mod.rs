@@ -48,22 +48,51 @@ const GOSSIP_SOURCE_MAX_EVENTS: usize = 2000;
 /// Post-auth budget, keyed on the authenticated `node_did`: 500 events per 60
 /// seconds.
 ///
-/// This is the tight bound, and it is where the tightness belongs, because by
-/// the time it runs the signature and the known-peer check have established
-/// WHO is asking. It bounds the two durable writes per event, charged to the
-/// principal that authored them rather than to a mesh edge. `api::repos`
+/// This is the tight bound, and it is where the tightness belongs, because it
+/// is charged ONLY when a signature has proven who is asking. An unsigned
+/// event's `node_did` is a claim anyone on the mesh can make, so charging this
+/// bucket on one would let an attacker deny a DID it names; unsigned traffic is
+/// bounded on the forwarder instead, below. It bounds the two durable writes
+/// per event, charged to the principal that authored them. `api::repos`
 /// publishes one event per updated ref, so the number has to admit a whole
 /// large push: 500 covers a tag-heavy push, an initial import, or a mirror
 /// backfill of a few hundred refs arriving in one window.
 const GOSSIP_AUTHOR_MAX_EVENTS: usize = 500;
-/// The pre-parse brake keys on a forwarder that aggregates many authors, so
-/// sizing it at or below the per-author budget puts the tight bound back on the
-/// mesh edge, which is the shape being fixed here. Enforced at compile time
-/// rather than in a test, because it is a relation between two constants and a
-/// test can only catch it after someone runs it.
+/// Budget for UNSIGNED events, keyed on `propagation_source`: 1500 events per
+/// 60 seconds.
+///
+/// An unsigned event's `node_did` is asserted, not proven, so it cannot be
+/// charged to an author without handing an attacker a way to deny a chosen
+/// victim. The forwarder is the only identity available, and this is the bound
+/// that keeps an unsigned flood from buying an unlimited number of `peer_exists`
+/// round trips and durable writes.
+///
+/// Sized deliberately, and NOT at the author cap. 500 is what ONE author's
+/// large push needs: `a_sixty_one_ref_push_from_one_known_peer_is_accepted_whole`
+/// exists because a 60-per-source bound broke a 61-ref push. A forwarder
+/// aggregates many unsigned authors, so sizing a forwarder-keyed bucket AT the
+/// per-author cap re-imposes exactly the mesh-edge denial the pre-parse brake's
+/// doc comment above warns against. 1500 is three times the largest legitimate
+/// single-author burst, which covers the aggregation this network can actually
+/// produce (one global topic, and a peers table in the low hundreds), while
+/// staying strictly below the 2000 pre-parse brake so it binds first.
+///
+/// It is defeated by `PeerId` rotation, like the pre-parse brake it sits under.
+/// That is inherent to keying on a free identity and is why the unsigned path
+/// is a rolling-upgrade allowance rather than a permanent one.
+const GOSSIP_UNSIGNED_SOURCE_MAX_EVENTS: usize = 1500;
+/// Two forwarder-keyed bounds now exist, and both must stay looser than the
+/// per-author budget: sizing either at or below it puts the tight bound back on
+/// the mesh edge, which is the shape being fixed here. The unsigned bound must
+/// in turn stay under the pre-parse brake, or the brake it nests inside never
+/// binds. Enforced at compile time rather than in a test, because it is a
+/// relation between constants and a test can only catch it after someone runs
+/// it.
 const _: () = assert!(
-    GOSSIP_SOURCE_MAX_EVENTS > GOSSIP_AUTHOR_MAX_EVENTS,
-    "the forwarder bound must stay looser than the per-author bound"
+    GOSSIP_SOURCE_MAX_EVENTS > GOSSIP_UNSIGNED_SOURCE_MAX_EVENTS
+        && GOSSIP_UNSIGNED_SOURCE_MAX_EVENTS > GOSSIP_AUTHOR_MAX_EVENTS,
+    "both forwarder-keyed bounds must stay looser than the per-author bound, \
+     and the unsigned bound must stay under the pre-parse brake"
 );
 const GOSSIP_INGEST_WINDOW: Duration = Duration::from_secs(60);
 /// Ceiling on tracked source peers, matching the bound the HTTP brakes use in
@@ -74,17 +103,23 @@ const GOSSIP_INGEST_MAX_SOURCES: usize = 200_000;
 /// path, so the bound is not left to that.
 const GOSSIP_INGEST_MAX_AUTHORS: usize = 200_000;
 
-/// The two gossip ingest budgets, built the same way for the swarm loop and for
-/// the tests so a test can never assert against a budget production does not
-/// run.
+/// The gossip ingest budgets, built the same way for the swarm loop and for the
+/// tests so a test can never assert against a budget production does not run.
 ///
 /// They are deliberately separate limiters rather than one: they key on
-/// different identities (a forwarder before parsing, an author after
-/// authentication) and sit at different points in the path.
+/// different identities (a forwarder before parsing, a forwarder again for
+/// unproven traffic, an author after authentication) and sit at different
+/// points in the path. `unsigned` is its own limiter rather than a second
+/// `check` against `source`, which would spend the same budget twice and bound
+/// nothing tighter than `source` already does.
 pub(crate) struct IngestLimiters {
     /// Keyed on `propagation_source`, checked before the parse.
     source: crate::rate_limit::RateLimiter,
-    /// Keyed on the authenticated `node_did`, checked before the writes.
+    /// Keyed on `propagation_source`, checked in the unsigned branch before the
+    /// `peer_exists` round trip, because an unsigned event names no principal
+    /// that could be charged instead.
+    unsigned: crate::rate_limit::RateLimiter,
+    /// Keyed on the `node_did` a signature PROVED, checked before the writes.
     author: crate::rate_limit::RateLimiter,
 }
 
@@ -96,12 +131,54 @@ impl IngestLimiters {
                 GOSSIP_INGEST_WINDOW,
                 GOSSIP_INGEST_MAX_SOURCES,
             ),
+            unsigned: crate::rate_limit::RateLimiter::new_bounded(
+                GOSSIP_UNSIGNED_SOURCE_MAX_EVENTS,
+                GOSSIP_INGEST_WINDOW,
+                GOSSIP_INGEST_MAX_SOURCES,
+            ),
             author: crate::rate_limit::RateLimiter::new_bounded(
                 GOSSIP_AUTHOR_MAX_EVENTS,
                 GOSSIP_INGEST_WINDOW,
                 GOSSIP_INGEST_MAX_AUTHORS,
             ),
         }
+    }
+}
+
+#[cfg(test)]
+impl IngestLimiters {
+    /// Every limiter in this struct, paired with the cap and key ceiling it is
+    /// documented to carry.
+    ///
+    /// Derived by DESTRUCTURING `Self` rather than listed by hand, so a fourth
+    /// limiter added later fails to compile here instead of quietly escaping
+    /// the wiring tests that assert each one is built as documented.
+    fn all(&self) -> Vec<(&'static str, &crate::rate_limit::RateLimiter, usize, usize)> {
+        let Self {
+            source,
+            unsigned,
+            author,
+        } = self;
+        vec![
+            (
+                "source",
+                source,
+                GOSSIP_SOURCE_MAX_EVENTS,
+                GOSSIP_INGEST_MAX_SOURCES,
+            ),
+            (
+                "unsigned",
+                unsigned,
+                GOSSIP_UNSIGNED_SOURCE_MAX_EVENTS,
+                GOSSIP_INGEST_MAX_SOURCES,
+            ),
+            (
+                "author",
+                author,
+                GOSSIP_AUTHOR_MAX_EVENTS,
+                GOSSIP_INGEST_MAX_AUTHORS,
+            ),
+        ]
     }
 }
 
@@ -255,6 +332,30 @@ pub(crate) enum IngestOutcome {
     /// The authenticated author is over its own write budget. Carries the DID
     /// so the drop names a principal and not just a mesh edge.
     AuthorRateLimited(String),
+    /// A forwarder is over the budget for UNSIGNED events relayed down its
+    /// edge. Carries the `propagation_source`.
+    ///
+    /// Deliberately not folded into `AuthorRateLimited`: that variant asserts a
+    /// proven principal, and an unsigned event's `node_did` is a claim. Naming
+    /// a forwarder as an author would be the same class of observability lie
+    /// that `WriteFailed` exists to avoid.
+    UnsignedSourceRateLimited(String),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only tally of the `peer_exists` round trips this path makes.
+    ///
+    /// It exists so a test can prove a guard runs BEFORE the database is
+    /// touched rather than merely before a debit. Asserting an outcome cannot
+    /// tell those two placements apart, and the difference is the whole point
+    /// of hoisting the slug check: a malformed event has to cost nothing, not
+    /// merely be charged to nobody.
+    ///
+    /// Thread-local rather than a global counter because `#[sqlx::test]` drives
+    /// each test on its own current-thread runtime, so the count is naturally
+    /// per-test and cannot be polluted by a test running in parallel.
+    static PEER_EXISTS_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Handle one inbound gossip ref-update: authenticate it, then write it.
@@ -281,8 +382,9 @@ pub(crate) async fn ingest_ref_update(
     // server.rs, which is layered outermost so it runs before auth.
     //
     // It is kept generous on purpose. The key is a forwarder, so a tight bound
-    // here denies an honest neighbour on someone else's flood; the tight bound
-    // lives below, on the authenticated author.
+    // here denies an honest neighbour on someone else's flood. The tighter
+    // bounds live below: unsigned traffic on a second forwarder-keyed bucket,
+    // and verified traffic on the author the signature proved.
     if !limiters.source.check(&propagation_source.to_string()).await {
         return IngestOutcome::SourceRateLimited;
     }
@@ -299,6 +401,26 @@ pub(crate) async fn ingest_ref_update(
         return IngestOutcome::Rejected(reason);
     }
 
+    // #272: the slug reaches a `PathBuf::join` in the sync worker, so it is
+    // rejected here, before the ref-update row and the queue row.
+    //
+    // It sits this high on purpose, above the signature verify and above the
+    // `peer_exists` round trip, not merely above the budgets. It depends on
+    // nothing but the parsed struct, so hoisting it costs nothing and removes
+    // the work entirely: a structurally invalid event now buys no Ed25519
+    // verify and no database query. Placing it below either of those would buy
+    // the fairness property (a malformed event charges nobody) while leaving
+    // the cost in place, charged only to the pre-parse brake that `PeerId`
+    // rotation defeats.
+    if let Err(e) = crate::git::repo_store::validate_repo_slug(&event.repo) {
+        return IngestOutcome::Rejected(format!("invalid repo field: {e}"));
+    }
+
+    // Whether `node_did` was PROVEN by a signature on this event, as opposed to
+    // merely asserted. Only a proven author may be charged the author budget
+    // below, and there is exactly one debit site reading this, so the two arms
+    // cannot drift apart.
+    let mut verified = false;
     match event.sig {
         // A signature that is present must verify. A present-but-invalid one is
         // forgery, never a peer that has not upgraded yet, so the flag does not
@@ -307,6 +429,7 @@ pub(crate) async fn ingest_ref_update(
             if let Err(reason) = verify_ref_update(&event) {
                 return IngestOutcome::Rejected(reason);
             }
+            verified = true;
         }
         None if require_signed => {
             return IngestOutcome::Rejected("unsigned ref-update event".to_string());
@@ -318,6 +441,24 @@ pub(crate) async fn ingest_ref_update(
                 did = %event.node_did,
                 "accepted unsigned gossip ref-update; set GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true after all peers upgrade"
             );
+            // Unsigned traffic is bounded here, on the forwarder, because it is
+            // the only identity this event establishes. Charged BEFORE
+            // `peer_exists`, which is a Postgres round trip per event: a brake
+            // sitting below it would not bound what an unsigned flood costs the
+            // node, leaving that cost to the deliberately loose pre-parse brake
+            // alone.
+            //
+            // No new key-farming axis: `propagation_source` is already a key in
+            // the pre-parse map, under the same ceiling.
+            //
+            // Only this arm. Charging it on the verified arm too would let a
+            // spent unsigned edge shed a peer's genuine signed pushes, which is
+            // the mesh-edge denial the source brake's doc comment above exists
+            // to avoid.
+            let source_key = propagation_source.to_string();
+            if !limiters.unsigned.check(&source_key).await {
+                return IngestOutcome::UnsignedSourceRateLimited(source_key);
+            }
         }
     }
 
@@ -335,6 +476,8 @@ pub(crate) async fn ingest_ref_update(
     // Keyed lookup, not `list_peers`: this runs on every event that survives
     // the parse, and scanning the whole table per event makes ingest cost grow
     // with the peer count.
+    #[cfg(test)]
+    PEER_EXISTS_CALLS.with(|calls| calls.set(calls.get() + 1));
     match db.peer_exists(&event.node_did).await {
         Ok(true) => {}
         Ok(false) => {
@@ -344,20 +487,28 @@ pub(crate) async fn ingest_ref_update(
     }
 
     // The tight budget, and the only one keyed on an identity the sender had to
-    // prove. Everything above this line establishes WHO is asking; everything
-    // below it costs durable writes, so the write budget is charged to the
-    // author rather than to whichever neighbour happened to relay the message.
-    // In the rolling-upgrade window an unsigned event's `node_did` is asserted
-    // rather than proven, but it is still a registered peer, so the key is at
-    // worst as strong as the gate above it.
-    if !limiters.author.check(&event.node_did).await {
+    // prove. It is charged ONLY when the signature verified, which is what
+    // `verified` carries down from the match above.
+    //
+    // Charging it on an unsigned event would make it a victim-selection
+    // mechanism rather than a fairness control. `peer_exists` proves the DID is
+    // registered; it does not prove this sender holds it, and in the
+    // rolling-upgrade window anyone on the open mesh can name a registered DID.
+    // An attacker would then spend a chosen victim's budget from an unrelated
+    // `PeerId` and the victim's own signed pushes would come back
+    // `AuthorRateLimited`. A rate-limit key derived from an unproven claim is
+    // worse than no key at all, because the denial it produces is targetable.
+    // Unsigned traffic is bounded on the forwarder instead, in the `None` arm
+    // above.
+    //
+    // What this does NOT buy: an aggregate write bound. A verified signature
+    // proves key possession, not a scarce principal, and the announce path
+    // registers fresh did:keys, so an attacker who rotates keys still gets a
+    // fresh budget each time. The aggregate per-edge bound remains the
+    // pre-parse source brake. What it buys is that a NAMED victim's budget is
+    // no longer spendable by anyone else.
+    if verified && !limiters.author.check(&event.node_did).await {
         return IngestOutcome::AuthorRateLimited(event.node_did.clone());
-    }
-
-    // #272: the slug reaches a `PathBuf::join` in the sync worker, so it is
-    // rejected here, before the ref-update row and the queue row.
-    if let Err(e) = crate::git::repo_store::validate_repo_slug(&event.repo) {
-        return IngestOutcome::Rejected(format!("invalid repo field: {e}"));
     }
 
     info!(
@@ -700,6 +851,12 @@ pub async fn start(
                                     limit = GOSSIP_AUTHOR_MAX_EVENTS,
                                     window_secs = GOSSIP_INGEST_WINDOW.as_secs(),
                                     "dropped gossip ref-update: authenticated peer over its write budget"
+                                ),
+                                IngestOutcome::UnsignedSourceRateLimited(source) => warn!(
+                                    from = %source,
+                                    limit = GOSSIP_UNSIGNED_SOURCE_MAX_EVENTS,
+                                    window_secs = GOSSIP_INGEST_WINDOW.as_secs(),
+                                    "dropped gossip ref-update: forwarding peer over its unsigned-event budget"
                                 ),
                             }
                         }
@@ -1203,6 +1360,18 @@ mod tests {
         serde_json::to_vec(event).expect("serialize event")
     }
 
+    /// Zero the `peer_exists` tally, then read it back. The pair exists so a
+    /// test can assert the DATABASE WAS NEVER TOUCHED, which no outcome value
+    /// can express: a guard that runs above the debit and a guard that runs
+    /// above the round trip return the identical `Rejected`.
+    fn reset_peer_exists_calls() {
+        PEER_EXISTS_CALLS.with(|calls| calls.set(0));
+    }
+
+    fn peer_exists_calls() -> usize {
+        PEER_EXISTS_CALLS.with(|calls| calls.get())
+    }
+
     /// Ingest one event against a limiter with no history, for the cases that
     /// are about a guard other than the rate brake. The rate-limit tests below
     /// hold one limiter across calls instead, since that is the state they
@@ -1232,7 +1401,9 @@ mod tests {
             IngestOutcome::WriteFailed(reason) => {
                 panic!("{context}: the event must be rejected by a guard, not admitted and then failed to write: {reason}")
             }
-            IngestOutcome::SourceRateLimited | IngestOutcome::AuthorRateLimited(_) => {
+            IngestOutcome::SourceRateLimited
+            | IngestOutcome::AuthorRateLimited(_)
+            | IngestOutcome::UnsignedSourceRateLimited(_) => {
                 panic!("{context}: the event must be rejected by a guard, not by a rate brake")
             }
         }
@@ -1558,13 +1729,27 @@ mod tests {
 
     // ── Ingest rate limits ────────────────────────────────────────────────
 
+    /// The documented numbers, and then the check that matters: each cap
+    /// actually reaches the limiter production builds. Asserting the constants
+    /// alone leaves `IngestLimiters::new` free to pass the wrong one, and the
+    /// three caps are close enough in shape that a copy-paste swap reads fine.
     #[test]
-    fn the_two_ingest_budgets_are_wired_as_documented() {
+    fn the_ingest_budgets_are_wired_as_documented() {
         assert_eq!(GOSSIP_SOURCE_MAX_EVENTS, 2000);
+        assert_eq!(GOSSIP_UNSIGNED_SOURCE_MAX_EVENTS, 1500);
         assert_eq!(GOSSIP_AUTHOR_MAX_EVENTS, 500);
         assert_eq!(GOSSIP_INGEST_WINDOW, Duration::from_secs(60));
         assert_eq!(GOSSIP_INGEST_MAX_SOURCES, 200_000);
         assert_eq!(GOSSIP_INGEST_MAX_AUTHORS, 200_000);
+
+        let limiters = IngestLimiters::new();
+        for (name, limiter, cap, _) in limiters.all() {
+            assert_eq!(
+                limiter.max_requests(),
+                cap,
+                "the {name} limiter must be built with the cap it is documented to carry"
+            );
+        }
     }
 
     /// The key ceilings have to reach the limiters production builds, not just
@@ -1577,18 +1762,15 @@ mod tests {
     /// test-only accessor instead. What it does NOT cover is the eviction
     /// behavior at the cap; that is `rate_limit`'s own test's job.
     #[test]
-    fn both_ingest_limiters_carry_their_key_ceiling() {
+    fn every_ingest_limiter_carries_its_key_ceiling() {
         let limiters = IngestLimiters::new();
-        assert_eq!(
-            limiters.source.max_keys(),
-            GOSSIP_INGEST_MAX_SOURCES,
-            "the source limiter must be built bounded by GOSSIP_INGEST_MAX_SOURCES"
-        );
-        assert_eq!(
-            limiters.author.max_keys(),
-            GOSSIP_INGEST_MAX_AUTHORS,
-            "the author limiter must be built bounded by GOSSIP_INGEST_MAX_AUTHORS"
-        );
+        for (name, limiter, _, ceiling) in limiters.all() {
+            assert_eq!(
+                limiter.max_keys(),
+                ceiling,
+                "the {name} limiter must be built bounded by its documented key ceiling"
+            );
+        }
     }
 
     /// The ordering test, and the reason the pre-parse brake exists at all.
@@ -1773,6 +1955,312 @@ mod tests {
             "a second author sharing the mesh edge keeps its own budget, got {outcome:?}"
         );
         assert_eq!(count(&pool, "received_ref_updates").await, accepted + 1);
+    }
+
+    /// The victim must-not, and the whole reason the author budget is charged
+    /// only to a proven author. With enforcement off, an unsigned event's
+    /// `node_did` is asserted, not proven: anyone on the open mesh can name a
+    /// registered DID. If that claim debits the author bucket, an attacker
+    /// spends a NAMED victim's budget from an unrelated `PeerId` and the
+    /// victim's own genuine signed pushes come back `AuthorRateLimited`. The
+    /// attacker picks the target, which is what makes this a P1 rather than a
+    /// fairness wart.
+    ///
+    /// The flood runs to exactly the author cap, so under the pre-fix shape the
+    /// signed event below is the first one past it.
+    #[sqlx::test]
+    async fn an_unsigned_flood_naming_a_victim_does_not_spend_the_victim_budget(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        let attacker_edge = PeerId::random();
+        let victim = Keypair::generate();
+        seed_peer(&pool, &victim.did().to_string()).await;
+
+        // Unsigned, claiming the victim's DID, relayed from an edge the victim
+        // has nothing to do with.
+        let claim = bytes_of(&event_for(&victim));
+        for i in 0..GOSSIP_AUTHOR_MAX_EVENTS {
+            let outcome =
+                ingest_ref_update(&db, &limiters, false, true, &claim, &attacker_edge).await;
+            assert!(
+                matches!(outcome, IngestOutcome::Accepted),
+                "unsigned event {i} is inside every budget and is admitted in the rolling-upgrade window, got {outcome:?}"
+            );
+        }
+
+        let mut genuine = event_for(&victim);
+        genuine.ref_name = "refs/heads/genuine".into();
+        sign_ref_update(&victim, &mut genuine).unwrap();
+        let outcome = ingest_ref_update(
+            &db,
+            &limiters,
+            false,
+            true,
+            &bytes_of(&genuine),
+            &PeerId::random(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, IngestOutcome::Accepted),
+            "the victim's own signed push must survive an unsigned flood that merely claimed its DID, got {outcome:?}"
+        );
+        // The sink moved, not just the outcome class: `Accepted` alone would
+        // still hold if the writes had been skipped.
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            GOSSIP_AUTHOR_MAX_EVENTS as i64 + 1,
+            "the victim's signed event must land its own row"
+        );
+        assert_eq!(
+            count(&pool, "sync_queue").await,
+            GOSSIP_AUTHOR_MAX_EVENTS as i64 + 1,
+            "the victim's signed event must land its own queue entry"
+        );
+    }
+
+    /// Exhaust one edge's unsigned budget and hand back the source that was
+    /// spent, so the callers below can assert what happens next.
+    async fn spend_unsigned_budget(db: &Db, limiters: &IngestLimiters, claim: &[u8]) -> PeerId {
+        let source = PeerId::random();
+        for i in 0..GOSSIP_UNSIGNED_SOURCE_MAX_EVENTS {
+            let outcome = ingest_ref_update(db, limiters, false, true, claim, &source).await;
+            assert!(
+                matches!(outcome, IngestOutcome::Accepted),
+                "unsigned event {i} is inside the unsigned budget and must be admitted, got {outcome:?}"
+            );
+        }
+        source
+    }
+
+    /// Taking the author debit off unsigned traffic must not leave that traffic
+    /// unbounded. It is charged to the forwarder instead, which is the only
+    /// identity an unsigned event actually establishes.
+    ///
+    /// The last assertion is the half that keeps the new bucket honest: a spent
+    /// unsigned budget must not gate VERIFIED traffic down the same edge. That
+    /// is what fails if the charge is put in both signature arms rather than
+    /// only the unsigned one.
+    #[sqlx::test]
+    async fn the_unsigned_path_is_bounded_on_the_forwarder(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        let author = Keypair::generate();
+        seed_peer(&pool, &author.did().to_string()).await;
+
+        let claim = bytes_of(&event_for(&author));
+        let source = spend_unsigned_budget(&db, &limiters, &claim).await;
+        let spent = GOSSIP_UNSIGNED_SOURCE_MAX_EVENTS as i64;
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            spent,
+            "every admitted unsigned event must land its row"
+        );
+        assert_eq!(
+            count(&pool, "sync_queue").await,
+            spent,
+            "every admitted unsigned event must land its queue entry"
+        );
+
+        let outcome = ingest_ref_update(&db, &limiters, false, true, &claim, &source).await;
+        match &outcome {
+            IngestOutcome::UnsignedSourceRateLimited(named) => assert_eq!(
+                named,
+                &source.to_string(),
+                "the refusal must name the forwarder it was charged to"
+            ),
+            other => panic!("the event past the unsigned budget must be shed, got {other:?}"),
+        }
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            spent,
+            "a shed unsigned event must write no received_ref_updates row"
+        );
+        assert_eq!(
+            count(&pool, "sync_queue").await,
+            spent,
+            "a shed unsigned event must enqueue no sync_queue row"
+        );
+
+        let mut signed = event_for(&author);
+        signed.ref_name = "refs/heads/signed".into();
+        sign_ref_update(&author, &mut signed).unwrap();
+        let outcome =
+            ingest_ref_update(&db, &limiters, false, true, &bytes_of(&signed), &source).await;
+        assert!(
+            matches!(outcome, IngestOutcome::Accepted),
+            "the unsigned budget must not gate verified traffic down the same edge, got {outcome:?}"
+        );
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            spent + 1,
+            "the signed event must land its own row"
+        );
+    }
+
+    /// The unsigned bucket keys on the FORWARDER, not on the DID the event
+    /// claims. Keying it on `node_did` would pass the victim must-not above
+    /// while rebuilding the same victim-selection hole one layer down: an
+    /// attacker would again spend a named victim's budget with events nobody
+    /// proved they authored.
+    #[sqlx::test]
+    async fn the_unsigned_budget_keys_on_the_forwarder_not_the_claimed_did(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        let author = Keypair::generate();
+        seed_peer(&pool, &author.did().to_string()).await;
+
+        let claim = bytes_of(&event_for(&author));
+        let spent_source = spend_unsigned_budget(&db, &limiters, &claim).await;
+        assert!(matches!(
+            ingest_ref_update(&db, &limiters, false, true, &claim, &spent_source).await,
+            IngestOutcome::UnsignedSourceRateLimited(_)
+        ));
+
+        // Same bytes, same claimed DID, a different forwarder.
+        let fresh_source = PeerId::random();
+        let outcome = ingest_ref_update(&db, &limiters, false, true, &claim, &fresh_source).await;
+        assert!(
+            matches!(outcome, IngestOutcome::Accepted),
+            "the claimed DID must not carry a spent budget between forwarders, got {outcome:?}"
+        );
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            GOSSIP_UNSIGNED_SOURCE_MAX_EVENTS as i64 + 1,
+            "the event from the fresh forwarder must land its own row"
+        );
+    }
+
+    /// The honest-relay cost of keying on the forwarder, made explicit rather
+    /// than discovered later: once an edge has spent its unsigned budget, a
+    /// perfectly legitimate unsigned event from a DIFFERENT author arriving
+    /// down that edge is shed too.
+    ///
+    /// This is the tradeoff the 1500 cap is sized against, and it is why the
+    /// cap is three times the largest legitimate single-author burst rather
+    /// than equal to it.
+    #[sqlx::test]
+    async fn a_spent_unsigned_edge_sheds_a_second_unsigned_author_too(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        let noisy = Keypair::generate();
+        let bystander = Keypair::generate();
+        seed_peer(&pool, &noisy.did().to_string()).await;
+        seed_peer(&pool, &bystander.did().to_string()).await;
+
+        let claim = bytes_of(&event_for(&noisy));
+        let source = spend_unsigned_budget(&db, &limiters, &claim).await;
+
+        let mut other = event_for(&bystander);
+        other.repo = "zOwner/otherrepo".into();
+        let outcome =
+            ingest_ref_update(&db, &limiters, false, true, &bytes_of(&other), &source).await;
+        match &outcome {
+            IngestOutcome::UnsignedSourceRateLimited(named) => assert_eq!(
+                named,
+                &source.to_string(),
+                "the shed must name the forwarder, not the bystanding author"
+            ),
+            other => panic!(
+                "a second unsigned author down a spent edge is shed by design, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            GOSSIP_UNSIGNED_SOURCE_MAX_EVENTS as i64,
+            "the shed event must write no row"
+        );
+    }
+
+    /// A structurally invalid event charges nobody AND costs nothing.
+    ///
+    /// Both halves are asserted, because they are different properties and only
+    /// the second is what the hoist actually buys. Charging nobody would hold
+    /// with the slug check merely above the debits; costing nothing needs it
+    /// above the `peer_exists` round trip and above the signature verify as
+    /// well. The `peer_exists` tally is what tells those two placements apart,
+    /// since both return the same `Rejected`.
+    ///
+    /// Run on both sides, because the two budgets are charged in different
+    /// branches: a malformed signed event must leave the author budget intact,
+    /// and a malformed unsigned event must leave the forwarder's unsigned
+    /// budget intact.
+    #[sqlx::test]
+    async fn a_malformed_slug_charges_nobody_and_costs_nothing(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        let author = Keypair::generate();
+        seed_peer(&pool, &author.did().to_string()).await;
+
+        // ── Signed side: a full author budget of invalid events. ──────────
+        let mut bad = event_for(&author);
+        bad.repo = "../../x".into();
+        sign_ref_update(&author, &mut bad).unwrap();
+        let bad_signed = bytes_of(&bad);
+        let signed_edge = PeerId::random();
+        reset_peer_exists_calls();
+        for i in 0..GOSSIP_AUTHOR_MAX_EVENTS {
+            let outcome =
+                ingest_ref_update(&db, &limiters, false, true, &bad_signed, &signed_edge).await;
+            assert!(
+                matches!(outcome, IngestOutcome::Rejected(_)),
+                "malformed-slug event {i} must be rejected, got {outcome:?}"
+            );
+        }
+        assert_nothing_written(&pool, "signed malformed-slug flood").await;
+        assert_eq!(
+            peer_exists_calls(),
+            0,
+            "a malformed event must cost no peer lookup: the slug check has to run above the \
+             round trip, not merely above the debit"
+        );
+
+        let mut good = event_for(&author);
+        sign_ref_update(&author, &mut good).unwrap();
+        let outcome =
+            ingest_ref_update(&db, &limiters, false, true, &bytes_of(&good), &signed_edge).await;
+        assert!(
+            matches!(outcome, IngestOutcome::Accepted),
+            "the author budget must be untouched by its own malformed events, got {outcome:?}"
+        );
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            1,
+            "the valid signed event must land its row"
+        );
+        assert_eq!(count(&pool, "sync_queue").await, 1);
+
+        // ── Unsigned side: a full unsigned budget of invalid events. ──────
+        let mut bad_unsigned = event_for(&author);
+        bad_unsigned.repo = "../../x".into();
+        let bad_unsigned = bytes_of(&bad_unsigned);
+        let unsigned_edge = PeerId::random();
+        reset_peer_exists_calls();
+        for i in 0..GOSSIP_UNSIGNED_SOURCE_MAX_EVENTS {
+            let outcome =
+                ingest_ref_update(&db, &limiters, false, true, &bad_unsigned, &unsigned_edge).await;
+            assert!(
+                matches!(outcome, IngestOutcome::Rejected(_)),
+                "unsigned malformed-slug event {i} must be rejected, got {outcome:?}"
+            );
+        }
+        assert_eq!(
+            peer_exists_calls(),
+            0,
+            "a malformed unsigned event must cost no peer lookup either"
+        );
+
+        let valid_unsigned = bytes_of(&event_for(&author));
+        let outcome =
+            ingest_ref_update(&db, &limiters, false, true, &valid_unsigned, &unsigned_edge).await;
+        assert!(
+            matches!(outcome, IngestOutcome::Accepted),
+            "the forwarder's unsigned budget must be untouched by malformed events, got {outcome:?}"
+        );
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            2,
+            "the valid unsigned event must land its row"
+        );
     }
 
     /// FINDING 1: one push, many refs. `api::repos` publishes ONE gossip event
