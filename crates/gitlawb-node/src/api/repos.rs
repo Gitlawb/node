@@ -9195,7 +9195,9 @@ mod tests {
         (state, log)
     }
 
-    const P2_PUSHER: &str = "did:key:z6p2tail";
+    // No shared pusher constant: the two P2 tests own different repos (`z6p2tail`
+    // and `z6p2fail`), and owner-only push is on by default, so the identity has to
+    // follow the repo each push targets rather than being fixed for both.
 
     fn p2_push(
         state: &AppState,
@@ -9208,7 +9210,7 @@ mod tests {
         git_receive_pack(
             State(state.clone()),
             Path((owner.to_string(), name.to_string())),
-            Extension(crate::auth::AuthenticatedDid(P2_PUSHER.to_string())),
+            Extension(crate::auth::AuthenticatedDid(format!("did:key:{owner}"))),
             crate::rate_limit::PeerAddr(Some("203.0.113.90:5000".parse::<SocketAddr>().unwrap())),
             axum::http::HeaderMap::new(),
             axum::body::Bytes::from_static(b"0000"),
