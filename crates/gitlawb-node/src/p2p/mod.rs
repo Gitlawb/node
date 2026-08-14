@@ -499,7 +499,6 @@ thread_local! {
 /// independent `Utc::now()` calls would reintroduce it as a race rather than a
 /// constant. The test override also means expiry tests pin an instant instead
 /// of sleeping out an eleven-minute horizon.
-#[allow(dead_code)] // wired into the ingest path in a follow-up
 fn ingest_now() -> DateTime<Utc> {
     #[cfg(test)]
     if let Some(pinned) = INGEST_NOW_OVERRIDE.with(|c| c.get()) {
@@ -533,7 +532,6 @@ fn ingest_now() -> DateTime<Utc> {
 /// key is fresh on every replay by construction; and `(repo, ref_name,
 /// new_sha)` would silently censor a legitimate revert republishing an earlier
 /// sha for the same ref.
-#[allow(dead_code)] // wired into the ingest path in a follow-up
 fn replay_key(event: &RefUpdateEvent) -> serde_json::Result<[u8; 32]> {
     Ok(gitlawb_core::cid::sha256_bytes(&signing_bytes(event)?))
 }
@@ -554,13 +552,11 @@ struct SeenEntry {
     /// set's state legible when a test or a debugger asks whether an entry
     /// survived a settled ingest or is merely in flight, which is the
     /// distinction the reserve-and-settle shape exists to draw.
-    #[cfg_attr(not(test), allow(dead_code))]
     confirmed: bool,
 }
 
 /// What [`ReplayGuard::begin`] decided about one key.
 #[derive(Debug)]
-#[allow(dead_code)] // matched by the ingest path in a follow-up
 enum Begin<'a> {
     /// The key was not in the set. The caller holds the slot until it either
     /// confirms the reservation or drops it.
@@ -593,7 +589,6 @@ pub(crate) struct ReplayGuard {
 }
 
 impl ReplayGuard {
-    #[allow(dead_code)] // constructed by the swarm loop in a follow-up
     pub(crate) fn new() -> Self {
         Self::with_limits(GOSSIP_SEEN_EVENTS_RETENTION, GOSSIP_SEEN_EVENTS_MAX)
     }
@@ -654,7 +649,6 @@ impl ReplayGuard {
     /// this one is the only evidence the guard has degraded.
     ///
     /// [`retention`]: ReplayGuard::retention
-    #[allow(dead_code)] // called by the ingest path in a follow-up
     fn begin(&self, key: [u8; 32], now: DateTime<Utc>) -> Begin<'_> {
         let mut seen = self.lock_seen();
 
@@ -695,7 +689,6 @@ impl ReplayGuard {
     /// inline by [`begin`] when the map is at capacity.
     ///
     /// [`begin`]: ReplayGuard::begin
-    #[allow(dead_code)] // called by the swarm loop in a follow-up
     fn cleanup(&self, now: DateTime<Utc>) {
         let mut seen = self.lock_seen();
         Self::sweep_locked(&mut seen, now, self.retention);
@@ -747,7 +740,6 @@ impl ReplayReservation<'_> {
     /// Settle the reservation as kept: the event was admitted and its writes
     /// landed, so the entry outlives this ingest and a later copy of the same
     /// bytes is a replay.
-    #[allow(dead_code)] // called by the ingest path in a follow-up
     fn confirm(mut self) {
         {
             let mut seen = self.guard.lock_seen();
@@ -792,7 +784,6 @@ impl std::fmt::Debug for ReplayReservation<'_> {
 /// that is not RFC-3339 at all. An operator reading a spike has to tell them
 /// apart.
 #[derive(Debug, PartialEq, Eq)]
-#[allow(dead_code)] // variants are matched by the ingest path in a follow-up
 enum FreshnessViolation {
     /// Older than [`GOSSIP_REF_UPDATE_FRESHNESS_WINDOW`].
     TooOld,
@@ -822,7 +813,6 @@ enum FreshnessViolation {
 /// `chrono::Utc::now().to_rfc3339()`), so nothing legitimate lands here, and
 /// admitting the unparseable case would let a self-signing attacker opt out of
 /// the window entirely by stamping garbage.
-#[allow(dead_code)] // wired into the ingest path in a follow-up
 fn check_freshness(timestamp: &str, now: DateTime<Utc>) -> Result<(), FreshnessViolation> {
     let stamped = DateTime::parse_from_rfc3339(timestamp)
         .map_err(|_| FreshnessViolation::Unparseable)?
@@ -880,7 +870,6 @@ pub(crate) enum IngestOutcome {
     /// horizon. Carries nothing: a replay names no principal that can be
     /// trusted, only the forwarder that handed it over, and the swarm loop
     /// already has that.
-    #[allow(dead_code)] // returned by the ingest path in a follow-up
     Replayed,
     /// The event's own `timestamp` put it outside the freshness window. Carries
     /// the direction (`TooOld`, `TooFarFuture`, or unparseable) as a sentence
@@ -893,7 +882,6 @@ pub(crate) enum IngestOutcome {
     /// broken clock, a partition healing and delivering a backlog, or a replay
     /// of something older than the set retains. An operator has to tell those
     /// apart, and one label for both would be an observability lie.
-    #[allow(dead_code)] // returned by the ingest path in a follow-up
     StaleTimestamp(String),
 }
 
@@ -954,6 +942,7 @@ thread_local! {
 pub(crate) async fn ingest_ref_update(
     db: &Db,
     limiters: &IngestLimiters,
+    replay_guard: &ReplayGuard,
     require_signed: bool,
     auto_sync: bool,
     data: &[u8],
@@ -1080,6 +1069,79 @@ pub(crate) async fn ingest_ref_update(
         }
     }
 
+    // The freshness window and the replay seen-set, on the VERIFIED path only
+    // and immediately below the signature that makes it verified.
+    //
+    // Be precise about what the window buys, because it is narrower than
+    // "events are recent". `timestamp` is covered by the signature, but it is
+    // self-asserted by `node_did`, and DIDs self-register through the open
+    // announce path, so a signer can re-mint fresh events with any timestamp it
+    // likes and this gate never sees it. What the window bounds is a THIRD
+    // PARTY replaying someone else's captured message: that attacker cannot
+    // move the timestamp without invalidating the signature, so a captured
+    // event is replayable for at most the window. The seen-set below then
+    // bounds it further, to once.
+    //
+    // Unsigned events skip both, and that is the point rather than an omission.
+    // Unsigned bytes carry no signature and are therefore predictable, so a
+    // node that deduplicated them would let an attacker pre-send a victim's
+    // expected event and have the genuine one dropped as a replay. Dedup on
+    // unauthenticated traffic is a censorship primitive, and it buys nothing
+    // in exchange: an attacker who can forge one unsigned event can forge a
+    // thousand distinct ones. The forwarder brake in the `None` arm above is
+    // what bounds that path.
+    //
+    // Both gates sit ABOVE the `peer_exists` round trip and above the author
+    // debit, not merely above the writes. Below the debit they would still stop
+    // the duplicate row and the duplicate sync, while leaving every replay free
+    // to drain the victim author's budget until their own next push came back
+    // `AuthorRateLimited`, which is the harm this guard exists to remove.
+    let mut reservation = None;
+    if verified {
+        if let Err(violation) = check_freshness(&event.timestamp, ingest_now()) {
+            let detail = match violation {
+                FreshnessViolation::TooOld => format!(
+                    "ref-update timestamp {} is more than {}s old",
+                    event.timestamp,
+                    GOSSIP_REF_UPDATE_FRESHNESS_WINDOW.as_secs()
+                ),
+                FreshnessViolation::TooFarFuture => format!(
+                    "ref-update timestamp {} is more than {}s ahead of this node's clock",
+                    event.timestamp,
+                    GOSSIP_REF_UPDATE_FUTURE_SKEW.as_secs()
+                ),
+                FreshnessViolation::Unparseable => format!(
+                    "ref-update timestamp {} is not a valid RFC-3339 instant",
+                    event.timestamp
+                ),
+            };
+            return IngestOutcome::StaleTimestamp(detail);
+        }
+
+        // Keyed on the canonical signing bytes, which is what makes the two
+        // wire encodings of one signature collapse to one key. A serde failure
+        // here is the same class of event as a parse failure at the top: bytes
+        // this build cannot render canonically, so it cannot judge them.
+        let key = match replay_key(&event) {
+            Ok(key) => key,
+            Err(e) => {
+                return IngestOutcome::Rejected(format!(
+                    "cannot derive replay key for ref-update event: {e}"
+                ));
+            }
+        };
+        match replay_guard.begin(key, ingest_now()) {
+            Begin::Replayed => return IngestOutcome::Replayed,
+            // Fail open. A saturated set that refused fresh gossip would turn a
+            // loud resource attack into quiet mesh-wide censorship; the counter
+            // `begin` already incremented is what makes the degraded state
+            // visible, since the event below is counted `accepted` exactly like
+            // a healthy one.
+            Begin::Saturated => {}
+            Begin::Reserved(held) => reservation = Some(held),
+        }
+    }
+
     // Authentication is not authorization: a freshly minted did:key signs its
     // own events perfectly well, so the signature alone says nothing about who
     // this peer is to us. Be precise about what this check buys, because it is
@@ -1196,8 +1258,25 @@ pub(crate) async fn ingest_ref_update(
     }
     match write_error {
         Some(reason) => IngestOutcome::WriteFailed(reason),
-        None if unsigned => IngestOutcome::UnsignedAdmitted,
-        None => IngestOutcome::Accepted,
+        None if unsigned => {
+            // No reservation to settle: the replay block above is gated on
+            // `verified`, so an unsigned admission never holds one. Kept as its
+            // own arm because the outcome differs, not because the guard does.
+            IngestOutcome::UnsignedAdmitted
+        }
+        None => {
+            // The ONE place a reservation is kept. Every other exit from this
+            // function, the early returns above and the `WriteFailed` arm
+            // beside this one, drops it and releases the slot, so a transient
+            // failure never permanently burns an event's key and the publisher
+            // can re-publish. That release is the drop guard's job rather than
+            // a call on each path, because a path added later would otherwise
+            // silently inherit the wrong behaviour.
+            if let Some(held) = reservation.take() {
+                held.confirm();
+            }
+            IngestOutcome::Accepted
+        }
     }
 }
 
@@ -1348,6 +1427,10 @@ pub async fn start(
     // accumulate per forwarding peer.
     let ingest_limiters = IngestLimiters::new();
 
+    // The replay seen-set, held for the same reason and for the same lifetime:
+    // a guard rebuilt per message remembers nothing and deduplicates nothing.
+    let replay_guard = ReplayGuard::new();
+
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<P2pCommand>(64);
 
     let handle = P2pHandle {
@@ -1445,6 +1528,11 @@ pub async fn start(
                 // immediately, which sweeps an empty map and is a no-op.
                 _ = ingest_sweep.tick() => {
                     ingest_limiters.cleanup().await;
+                    // Same tick, same clock. The seen-set is sized against
+                    // `ingest_now`, so sweeping it on a second independent
+                    // reading of the wall clock would reintroduce exactly the
+                    // disagreement `ingest_now` exists to remove.
+                    replay_guard.cleanup(ingest_now());
                 }
                 // Graceful shutdown: exit the swarm loop when the
                 // process-wide signal flips. This drops the Swarm
@@ -1467,6 +1555,7 @@ pub async fn start(
                             let outcome = ingest_ref_update(
                                 &db,
                                 &ingest_limiters,
+                                &replay_guard,
                                 require_signed,
                                 auto_sync,
                                 &message.data,
@@ -1983,6 +2072,26 @@ mod tests {
     const LEGACY_SIGNED_EVENT_V0_SHA256: &str =
         "2482e053c8ab1841d784f523f1ef5e3d0bd5f9d563565af8fca8dd34a1e264fc";
 
+    /// `LEGACY_SIGNED_EVENT_V0` with `"v":0,` injected as the leading key: the
+    /// exact malleability the review demonstrated, frozen beside the artifact
+    /// it was derived from.
+    ///
+    /// 460 bytes to the original's 454, a different gossipsub `message_id`, and
+    /// the SAME signature, because `v` is `skip_serializing_if = "is_zero"` and
+    /// therefore vanishes again when the parsed struct is re-serialized into
+    /// signing bytes. One captured signature, two wire encodings, and nothing
+    /// keyed on `msg.data` can see that they are the same event. It is kept as
+    /// a literal rather than built by injecting into the constant at runtime
+    /// for the reason the original is frozen: a fixture that regenerates itself
+    /// from current code cannot witness a change to current code.
+    const LEGACY_SIGNED_EVENT_V0_TWIN: &str = r#"{"v":0,"node_did":"did:key:z6MkiAJwX3dtfEY6KGeDDgxXB6ZZWCAxTSHDtJEyUVynqYtq","pusher_did":"did:key:zPusher","repo":"zOwner/myrepo","owner_did":"did:key:zOwner","ref_name":"refs/heads/main","old_sha":"0000000000000000000000000000000000000000","new_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","timestamp":"2026-07-02T12:00:00Z","cert_id":"cert-1","cid":"bafycid","sig":"-lH5aObROlqoTFjnjSXjbDgCVscLfVaKb1Y1gJL1tVsiBZlZnLKi55QgSo0ALTNtI_DyKo0ColzJMxL7w7ZODQ"}"#;
+
+    /// SHA-256 of `LEGACY_SIGNED_EVENT_V0_TWIN`, hex, lowercase, and pinned for
+    /// the same reason its sibling is: these bytes are evidence, and evidence
+    /// that can be edited without anything going red is not evidence.
+    const LEGACY_SIGNED_EVENT_V0_TWIN_SHA256: &str =
+        "324c9cfa24bbd06681a0a2176fb6977d54257d632589fff11cd0ebbf5734b42c";
+
     /// The compatibility test the rest of this module cannot substitute for:
     /// the only one here that verifies an artifact it did not itself sign.
     ///
@@ -2018,10 +2127,26 @@ mod tests {
         );
     }
 
-    /// Build a populated event whose `node_did` is the given keypair's DID.
+    /// Build a populated event whose `node_did` is the given keypair's DID and
+    /// whose `timestamp` is fresh on the guard-layer clock.
+    ///
+    /// The timestamp is overwritten HERE rather than in `populated_event`, and
+    /// the split is load-bearing in both directions. `populated_event` has to
+    /// stay frozen at `2026-07-02T12:00:00Z` because `GOLDEN_SIGNING_BYTES`
+    /// pins its exact encoding, and a fixture that moves with the clock cannot
+    /// pin bytes. But that same frozen instant is weeks outside the freshness
+    /// window, so every ingest test built on it would answer `StaleTimestamp`
+    /// and stop testing the guard it was written for. `event_for` feeds only
+    /// the ingest and verify tests and no byte-pinning golden, so it is the one
+    /// place the two requirements can be separated.
+    ///
+    /// Read through [`ingest_now`], not `Utc::now`, so a test that pins the
+    /// clock gets a fixture stamped on the same instant its assertions are
+    /// written against.
     fn event_for(keypair: &Keypair) -> RefUpdateEvent {
         let mut event = populated_event();
         event.node_did = keypair.did().to_string();
+        event.timestamp = ingest_now().to_rfc3339();
         event
     }
 
@@ -2262,6 +2387,7 @@ mod tests {
         ingest_ref_update(
             db,
             &IngestLimiters::new(),
+            &ReplayGuard::new(),
             require_signed,
             auto_sync,
             data,
@@ -2933,16 +3059,32 @@ mod tests {
         seed_peer(&pool, &event.node_did).await;
 
         for i in 0..GOSSIP_SOURCE_MAX_EVENTS {
-            let outcome =
-                ingest_ref_update(&db, &limiters, true, true, b"not json at all", &source).await;
+            let outcome = ingest_ref_update(
+                &db,
+                &limiters,
+                &ReplayGuard::new(),
+                true,
+                true,
+                b"not json at all",
+                &source,
+            )
+            .await;
             assert!(
                 matches!(outcome, IngestOutcome::Rejected(_)),
                 "flood message {i} is inside the budget, so it is admitted and then dropped as malformed, got {outcome:?}"
             );
         }
 
-        let outcome =
-            ingest_ref_update(&db, &limiters, true, true, &bytes_of(&event), &source).await;
+        let outcome = ingest_ref_update(
+            &db,
+            &limiters,
+            &ReplayGuard::new(),
+            true,
+            true,
+            &bytes_of(&event),
+            &source,
+        )
+        .await;
         assert!(
             matches!(outcome, IngestOutcome::SourceRateLimited),
             "the event past the budget from one source inside the window must be rate limited; \
@@ -2966,17 +3108,42 @@ mod tests {
         seed_peer(&pool, &event.node_did).await;
 
         for _ in 0..GOSSIP_SOURCE_MAX_EVENTS {
-            ingest_ref_update(&db, &limiters, true, true, b"not json at all", &throttled).await;
+            ingest_ref_update(
+                &db,
+                &limiters,
+                &ReplayGuard::new(),
+                true,
+                true,
+                b"not json at all",
+                &throttled,
+            )
+            .await;
         }
-        let outcome =
-            ingest_ref_update(&db, &limiters, true, true, &bytes_of(&event), &throttled).await;
+        let outcome = ingest_ref_update(
+            &db,
+            &limiters,
+            &ReplayGuard::new(),
+            true,
+            true,
+            &bytes_of(&event),
+            &throttled,
+        )
+        .await;
         assert!(
             matches!(outcome, IngestOutcome::SourceRateLimited),
             "the first source must be over budget, got {outcome:?}"
         );
 
-        let outcome =
-            ingest_ref_update(&db, &limiters, true, true, &bytes_of(&event), &other).await;
+        let outcome = ingest_ref_update(
+            &db,
+            &limiters,
+            &ReplayGuard::new(),
+            true,
+            true,
+            &bytes_of(&event),
+            &other,
+        )
+        .await;
         assert!(
             matches!(outcome, IngestOutcome::Accepted),
             "a second peer keeps its own budget while the first is throttled, got {outcome:?}"
@@ -3014,11 +3181,28 @@ mod tests {
         seed_peer(&pool, &event.node_did).await;
 
         for _ in 0..GOSSIP_SOURCE_MAX_EVENTS - 1 {
-            ingest_ref_update(&db, &limiters, true, true, b"not json at all", &neighbour).await;
+            ingest_ref_update(
+                &db,
+                &limiters,
+                &ReplayGuard::new(),
+                true,
+                true,
+                b"not json at all",
+                &neighbour,
+            )
+            .await;
         }
 
-        let outcome =
-            ingest_ref_update(&db, &limiters, true, true, &bytes_of(&event), &neighbour).await;
+        let outcome = ingest_ref_update(
+            &db,
+            &limiters,
+            &ReplayGuard::new(),
+            true,
+            true,
+            &bytes_of(&event),
+            &neighbour,
+        )
+        .await;
         assert!(
             matches!(outcome, IngestOutcome::Accepted),
             "an honest author must still get through an edge that carried a junk flood, got {outcome:?}"
@@ -3040,17 +3224,38 @@ mod tests {
     async fn the_author_budget_bounds_one_author_without_touching_another(pool: PgPool) {
         let db = ingest_db(&pool).await;
         let limiters = IngestLimiters::new();
+        let replay_guard = ReplayGuard::new();
         let source = PeerId::random();
         let noisy = Keypair::generate();
         let quiet = Keypair::generate();
         seed_peer(&pool, &noisy.did().to_string()).await;
         seed_peer(&pool, &quiet.did().to_string()).await;
 
+        // ONE guard across the whole burst, and a DISTINCT event per iteration.
+        //
+        // Both halves are deliberate. The obvious repair when the seen-set
+        // landed was a fresh guard per call, which keeps this test green while
+        // gutting the property it exists to prove: under a shared guard the
+        // same bytes answer `Replayed` from iteration two onward, so the author
+        // budget would never be exercised past a single event and the
+        // rate-limit assertion below would be vacuous. Varying `ref_name` and
+        // re-signing gives 500 events that are all genuinely new to the
+        // seen-set and all charged to the same proven author, which is the
+        // state this test is about. Same idiom as the 61-ref push test.
         let mut event = event_for(&noisy);
-        sign_ref_update(&noisy, &mut event).unwrap();
         for i in 0..GOSSIP_AUTHOR_MAX_EVENTS {
-            let outcome =
-                ingest_ref_update(&db, &limiters, true, true, &bytes_of(&event), &source).await;
+            event.ref_name = format!("refs/heads/burst{i}");
+            sign_ref_update(&noisy, &mut event).unwrap();
+            let outcome = ingest_ref_update(
+                &db,
+                &limiters,
+                &replay_guard,
+                true,
+                true,
+                &bytes_of(&event),
+                &source,
+            )
+            .await;
             assert!(
                 matches!(outcome, IngestOutcome::Accepted),
                 "event {i} is inside the author budget and must be accepted, got {outcome:?}"
@@ -3060,8 +3265,22 @@ mod tests {
         assert_eq!(count(&pool, "received_ref_updates").await, accepted);
         assert_eq!(count(&pool, "sync_queue").await, accepted);
 
-        let outcome =
-            ingest_ref_update(&db, &limiters, true, true, &bytes_of(&event), &source).await;
+        // Distinct again, for the same reason the burst above is: the budget is
+        // what must refuse this event, so it has to be new to the seen-set or
+        // the assertion would pass on a `Replayed` that says nothing about the
+        // author budget at all.
+        event.ref_name = "refs/heads/over-budget".into();
+        sign_ref_update(&noisy, &mut event).unwrap();
+        let outcome = ingest_ref_update(
+            &db,
+            &limiters,
+            &replay_guard,
+            true,
+            true,
+            &bytes_of(&event),
+            &source,
+        )
+        .await;
         match &outcome {
             IngestOutcome::AuthorRateLimited(did) => assert_eq!(
                 did, &event.node_did,
@@ -3085,8 +3304,16 @@ mod tests {
         let mut other_event = event_for(&quiet);
         other_event.repo = "zOwner/otherrepo".into();
         sign_ref_update(&quiet, &mut other_event).unwrap();
-        let outcome =
-            ingest_ref_update(&db, &limiters, true, true, &bytes_of(&other_event), &source).await;
+        let outcome = ingest_ref_update(
+            &db,
+            &limiters,
+            &replay_guard,
+            true,
+            true,
+            &bytes_of(&other_event),
+            &source,
+        )
+        .await;
         assert!(
             matches!(outcome, IngestOutcome::Accepted),
             "a second author sharing the mesh edge keeps its own budget, got {outcome:?}"
@@ -3117,8 +3344,16 @@ mod tests {
         // has nothing to do with.
         let claim = bytes_of(&event_for(&victim));
         for i in 0..GOSSIP_AUTHOR_MAX_EVENTS {
-            let outcome =
-                ingest_ref_update(&db, &limiters, false, true, &claim, &attacker_edge).await;
+            let outcome = ingest_ref_update(
+                &db,
+                &limiters,
+                &ReplayGuard::new(),
+                false,
+                true,
+                &claim,
+                &attacker_edge,
+            )
+            .await;
             assert!(
                 matches!(outcome, IngestOutcome::UnsignedAdmitted),
                 "unsigned event {i} is inside every budget and is admitted in the rolling-upgrade window, got {outcome:?}"
@@ -3131,6 +3366,7 @@ mod tests {
         let outcome = ingest_ref_update(
             &db,
             &limiters,
+            &ReplayGuard::new(),
             false,
             true,
             &bytes_of(&genuine),
@@ -3160,7 +3396,16 @@ mod tests {
     async fn spend_unsigned_budget(db: &Db, limiters: &IngestLimiters, claim: &[u8]) -> PeerId {
         let source = PeerId::random();
         for i in 0..GOSSIP_UNSIGNED_SOURCE_MAX_EVENTS {
-            let outcome = ingest_ref_update(db, limiters, false, true, claim, &source).await;
+            let outcome = ingest_ref_update(
+                db,
+                limiters,
+                &ReplayGuard::new(),
+                false,
+                true,
+                claim,
+                &source,
+            )
+            .await;
             assert!(
                 matches!(outcome, IngestOutcome::UnsignedAdmitted),
                 "unsigned event {i} is inside the unsigned budget and must be admitted, got {outcome:?}"
@@ -3198,7 +3443,16 @@ mod tests {
             "every admitted unsigned event must land its queue entry"
         );
 
-        let outcome = ingest_ref_update(&db, &limiters, false, true, &claim, &source).await;
+        let outcome = ingest_ref_update(
+            &db,
+            &limiters,
+            &ReplayGuard::new(),
+            false,
+            true,
+            &claim,
+            &source,
+        )
+        .await;
         match &outcome {
             IngestOutcome::UnsignedSourceRateLimited(named) => assert_eq!(
                 named,
@@ -3221,8 +3475,16 @@ mod tests {
         let mut signed = event_for(&author);
         signed.ref_name = "refs/heads/signed".into();
         sign_ref_update(&author, &mut signed).unwrap();
-        let outcome =
-            ingest_ref_update(&db, &limiters, false, true, &bytes_of(&signed), &source).await;
+        let outcome = ingest_ref_update(
+            &db,
+            &limiters,
+            &ReplayGuard::new(),
+            false,
+            true,
+            &bytes_of(&signed),
+            &source,
+        )
+        .await;
         assert!(
             matches!(outcome, IngestOutcome::Accepted),
             "the unsigned budget must not gate verified traffic down the same edge, got {outcome:?}"
@@ -3249,13 +3511,31 @@ mod tests {
         let claim = bytes_of(&event_for(&author));
         let spent_source = spend_unsigned_budget(&db, &limiters, &claim).await;
         assert!(matches!(
-            ingest_ref_update(&db, &limiters, false, true, &claim, &spent_source).await,
+            ingest_ref_update(
+                &db,
+                &limiters,
+                &ReplayGuard::new(),
+                false,
+                true,
+                &claim,
+                &spent_source
+            )
+            .await,
             IngestOutcome::UnsignedSourceRateLimited(_)
         ));
 
         // Same bytes, same claimed DID, a different forwarder.
         let fresh_source = PeerId::random();
-        let outcome = ingest_ref_update(&db, &limiters, false, true, &claim, &fresh_source).await;
+        let outcome = ingest_ref_update(
+            &db,
+            &limiters,
+            &ReplayGuard::new(),
+            false,
+            true,
+            &claim,
+            &fresh_source,
+        )
+        .await;
         assert!(
             matches!(outcome, IngestOutcome::UnsignedAdmitted),
             "the claimed DID must not carry a spent budget between forwarders, got {outcome:?}"
@@ -3289,8 +3569,16 @@ mod tests {
 
         let mut other = event_for(&bystander);
         other.repo = "zOwner/otherrepo".into();
-        let outcome =
-            ingest_ref_update(&db, &limiters, false, true, &bytes_of(&other), &source).await;
+        let outcome = ingest_ref_update(
+            &db,
+            &limiters,
+            &ReplayGuard::new(),
+            false,
+            true,
+            &bytes_of(&other),
+            &source,
+        )
+        .await;
         match &outcome {
             IngestOutcome::UnsignedSourceRateLimited(named) => assert_eq!(
                 named,
@@ -3336,8 +3624,16 @@ mod tests {
         let signed_edge = PeerId::random();
         reset_peer_exists_calls();
         for i in 0..GOSSIP_AUTHOR_MAX_EVENTS {
-            let outcome =
-                ingest_ref_update(&db, &limiters, false, true, &bad_signed, &signed_edge).await;
+            let outcome = ingest_ref_update(
+                &db,
+                &limiters,
+                &ReplayGuard::new(),
+                false,
+                true,
+                &bad_signed,
+                &signed_edge,
+            )
+            .await;
             assert!(
                 matches!(outcome, IngestOutcome::Rejected(_)),
                 "malformed-slug event {i} must be rejected, got {outcome:?}"
@@ -3353,8 +3649,16 @@ mod tests {
 
         let mut good = event_for(&author);
         sign_ref_update(&author, &mut good).unwrap();
-        let outcome =
-            ingest_ref_update(&db, &limiters, false, true, &bytes_of(&good), &signed_edge).await;
+        let outcome = ingest_ref_update(
+            &db,
+            &limiters,
+            &ReplayGuard::new(),
+            false,
+            true,
+            &bytes_of(&good),
+            &signed_edge,
+        )
+        .await;
         assert!(
             matches!(outcome, IngestOutcome::Accepted),
             "the author budget must be untouched by its own malformed events, got {outcome:?}"
@@ -3373,8 +3677,16 @@ mod tests {
         let unsigned_edge = PeerId::random();
         reset_peer_exists_calls();
         for i in 0..GOSSIP_UNSIGNED_SOURCE_MAX_EVENTS {
-            let outcome =
-                ingest_ref_update(&db, &limiters, false, true, &bad_unsigned, &unsigned_edge).await;
+            let outcome = ingest_ref_update(
+                &db,
+                &limiters,
+                &ReplayGuard::new(),
+                false,
+                true,
+                &bad_unsigned,
+                &unsigned_edge,
+            )
+            .await;
             assert!(
                 matches!(outcome, IngestOutcome::Rejected(_)),
                 "unsigned malformed-slug event {i} must be rejected, got {outcome:?}"
@@ -3387,8 +3699,16 @@ mod tests {
         );
 
         let valid_unsigned = bytes_of(&event_for(&author));
-        let outcome =
-            ingest_ref_update(&db, &limiters, false, true, &valid_unsigned, &unsigned_edge).await;
+        let outcome = ingest_ref_update(
+            &db,
+            &limiters,
+            &ReplayGuard::new(),
+            false,
+            true,
+            &valid_unsigned,
+            &unsigned_edge,
+        )
+        .await;
         assert!(
             matches!(outcome, IngestOutcome::UnsignedAdmitted),
             "the forwarder's unsigned budget must be untouched by malformed events, got {outcome:?}"
@@ -3424,8 +3744,16 @@ mod tests {
             let mut event = event_for(&keypair);
             event.ref_name = format!("refs/tags/v{i}");
             sign_ref_update(&keypair, &mut event).unwrap();
-            let outcome =
-                ingest_ref_update(&db, &limiters, true, true, &bytes_of(&event), &source).await;
+            let outcome = ingest_ref_update(
+                &db,
+                &limiters,
+                &ReplayGuard::new(),
+                true,
+                true,
+                &bytes_of(&event),
+                &source,
+            )
+            .await;
             assert!(
                 matches!(outcome, IngestOutcome::Accepted),
                 "ref {i} of a {REFS}-ref push must be accepted, got {outcome:?}"
@@ -3804,6 +4132,22 @@ mod tests {
         [seed; 32]
     }
 
+    /// Serializes the two tests that assert on the saturation counter.
+    ///
+    /// That counter carries no labels and lives in a process-wide registry, so
+    /// concurrent increments are indistinguishable from the one under test.
+    /// Every other guard test builds its own `ReplayGuard` and needs no lock;
+    /// only the counter is shared state. Holding this lets both tests keep an
+    /// exact assertion instead of degrading to a lower bound, which would stay
+    /// green if the fail-open branch ever double-counted.
+    ///
+    /// A tokio mutex rather than `std::sync::Mutex` because one of the two
+    /// holders is an `#[sqlx::test]` that awaits `ingest_ref_update` while
+    /// holding it, and a std guard held across an await is both a deadlock
+    /// risk and a `!Send` future. The sync holder takes it with
+    /// `blocking_lock`, which is correct outside a runtime.
+    static SATURATION_COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn pinned() -> DateTime<Utc> {
         freshness_now()
     }
@@ -3919,16 +4263,620 @@ mod tests {
             other => panic!("expected a reservation, got {other:?}"),
         }
 
-        // A before/after delta, not an equality against a literal. This counter
-        // carries no labels and lives in a process-wide registry shared by every
-        // test in this binary, so an equality would be a hostage to any second
-        // test that ever reaches saturation.
+        // A before/after delta, not an equality against a literal, because this
+        // counter carries no labels and lives in a process-wide registry shared
+        // by every test in this binary. The delta alone is not enough: it fixes
+        // the baseline but not concurrent increments, and cargo runs these tests
+        // on parallel threads. `SATURATION_COUNTER_LOCK` is what actually makes
+        // the exact assertion safe, so both saturation tests take it.
+        let _serial = SATURATION_COUNTER_LOCK.blocking_lock();
         let before = crate::metrics::replay_guard_saturated_count_for_test();
         assert!(matches!(guard.begin(key_of(21), now), Begin::Saturated));
         assert_eq!(
             crate::metrics::replay_guard_saturated_count_for_test(),
             before + 1,
             "each Saturated answer must increment the saturation counter"
+        );
+    }
+
+    // ---- The replay seen-set and the freshness window, through the real
+    // ingest path. Every one of these drives `ingest_ref_update` rather than a
+    // helper, because the guards' whole subject is WHERE they sit relative to
+    // the other gates, and a helper that calls the pieces in some order of its
+    // own would assert against a shape production does not run.
+
+    /// The core case: the same signed bytes twice. The second one must be
+    /// refused, and refused ABOVE the database.
+    ///
+    /// The row count alone would not say that. A second ingest dropped for any
+    /// unrelated reason leaves one row too, so the outcome variant, the metric
+    /// label, and the `peer_exists` tally are all asserted: the first says it
+    /// was the seen-set that refused it, the second says an operator can see
+    /// it, and the third says the refusal cost no round trip.
+    #[sqlx::test]
+    async fn a_replayed_signed_event_is_refused_without_touching_the_database(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        // ONE guard across both calls. A fresh guard per call remembers
+        // nothing, which is the shape that keeps this test green while the
+        // guard does nothing at all.
+        let replay_guard = ReplayGuard::new();
+        let source = PeerId::random();
+        let keypair = Keypair::generate();
+        seed_peer(&pool, &keypair.did().to_string()).await;
+
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        let bytes = bytes_of(&event);
+
+        let first =
+            ingest_ref_update(&db, &limiters, &replay_guard, true, true, &bytes, &source).await;
+        assert!(
+            matches!(first, IngestOutcome::Accepted),
+            "the first delivery of a signed event from a known peer must be accepted, got {first:?}"
+        );
+        assert_eq!(count(&pool, "received_ref_updates").await, 1);
+        assert_eq!(count(&pool, "sync_queue").await, 1);
+
+        reset_peer_exists_calls();
+        let second =
+            ingest_ref_update(&db, &limiters, &replay_guard, true, true, &bytes, &source).await;
+        assert_eq!(
+            second.metric_label(),
+            "replayed",
+            "the replay must be countable as a replay; folding it into another label hides the \
+             one signal that says the mesh is redelivering"
+        );
+        assert!(
+            matches!(second, IngestOutcome::Replayed),
+            "the exact same signed bytes must be refused as a replay, got {second:?}"
+        );
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            1,
+            "a replay must not write a second received_ref_updates row"
+        );
+        assert_eq!(
+            count(&pool, "sync_queue").await,
+            1,
+            "a replay must not enqueue a second sync"
+        );
+        assert_eq!(
+            peer_exists_calls(),
+            0,
+            "the seen-set sits above the peer lookup, so a replay must cost no Postgres round \
+             trip; a guard placed just above the writes returns the same outcome and this is the \
+             only assertion that can tell the two placements apart"
+        );
+    }
+
+    /// The incident itself, verbatim, not a fixture modelled on it.
+    ///
+    /// One captured signature reaches this node as two different byte strings,
+    /// 454 and 460, because injecting `"v":0` changes the wire form and not the
+    /// struct. Any dedup keyed on `msg.data` or on the gossipsub message id
+    /// sees two unrelated messages. Keyed on the canonical signing bytes, the
+    /// twin is what it is: the same event, arriving twice.
+    ///
+    /// A rebuilt fixture would inherit the blind spot the original tests had,
+    /// so both constants are frozen and digest-pinned and the ingest runs on
+    /// their exact bytes.
+    #[sqlx::test]
+    async fn the_v_zero_twin_of_the_frozen_legacy_artifact_is_refused_as_a_replay(pool: PgPool) {
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            hex::encode(Sha256::digest(LEGACY_SIGNED_EVENT_V0_TWIN.as_bytes())),
+            LEGACY_SIGNED_EVENT_V0_TWIN_SHA256,
+            "the frozen twin was edited; it is evidence from the review, not a fixture to \
+             regenerate"
+        );
+        assert_eq!(
+            LEGACY_SIGNED_EVENT_V0_TWIN.len(),
+            LEGACY_SIGNED_EVENT_V0.len() + r#""v":0,"#.len(),
+            "the twin must differ from the original by the injected version key and nothing else"
+        );
+
+        // The artifact is stamped 2026-07-02T12:00:00Z and frozen there
+        // forever, so the freshness window above the seen-set would refuse it
+        // on any real clock. Pinning is what lets the incident bytes reach the
+        // gate this test is about.
+        pin_ingest_now(freshness_now());
+
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        let replay_guard = ReplayGuard::new();
+        let source = PeerId::random();
+
+        let original: RefUpdateEvent =
+            serde_json::from_str(LEGACY_SIGNED_EVENT_V0).expect("the frozen artifact must parse");
+        seed_peer(&pool, &original.node_did).await;
+
+        let first = ingest_ref_update(
+            &db,
+            &limiters,
+            &replay_guard,
+            true,
+            true,
+            LEGACY_SIGNED_EVENT_V0.as_bytes(),
+            &source,
+        )
+        .await;
+        assert!(
+            matches!(first, IngestOutcome::Accepted),
+            "the original 454-byte artifact must be accepted, got {first:?}"
+        );
+
+        let second = ingest_ref_update(
+            &db,
+            &limiters,
+            &replay_guard,
+            true,
+            true,
+            LEGACY_SIGNED_EVENT_V0_TWIN.as_bytes(),
+            &source,
+        )
+        .await;
+        assert!(
+            matches!(second, IngestOutcome::Replayed),
+            "the 460-byte twin carries the same signature over the same signing bytes and must be \
+             refused as a replay, got {second:?}"
+        );
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            1,
+            "the twin must not land a second row"
+        );
+    }
+
+    /// The must-not that rules out the cheap key. A revert is a legitimate
+    /// push, and a guard keyed on `(repo, ref_name, new_sha)` censors it.
+    ///
+    /// Three events, not two, and the third is the whole test. Under that key a
+    /// two-event revert never collides: event 1 announces sha A, event 2
+    /// announces sha B, the keys differ and both are admitted exactly as
+    /// correct code admits them. Only event 3, re-announcing A on the same ref,
+    /// collides with event 1. A two-event version of this test is green under
+    /// the mutant it exists to catch.
+    #[sqlx::test]
+    async fn a_legitimate_revert_to_an_earlier_sha_is_not_censored(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        let replay_guard = ReplayGuard::new();
+        let source = PeerId::random();
+        let keypair = Keypair::generate();
+        seed_peer(&pool, &keypair.did().to_string()).await;
+
+        const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const ZERO: &str = "0000000000000000000000000000000000000000";
+
+        let mut event = event_for(&keypair);
+        for (i, (old_sha, new_sha)) in [(ZERO, SHA_A), (SHA_A, SHA_B), (SHA_B, SHA_A)]
+            .into_iter()
+            .enumerate()
+        {
+            event.old_sha = old_sha.into();
+            event.new_sha = new_sha.into();
+            sign_ref_update(&keypair, &mut event).unwrap();
+            let outcome = ingest_ref_update(
+                &db,
+                &limiters,
+                &replay_guard,
+                true,
+                true,
+                &bytes_of(&event),
+                &source,
+            )
+            .await;
+            assert!(
+                matches!(outcome, IngestOutcome::Accepted),
+                "event {i} of the revert sequence is a distinct signed event and must be \
+                 accepted; refusing it is censorship of a legitimate push, got {outcome:?}"
+            );
+        }
+
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            3,
+            "all three ref-updates in a revert sequence must land"
+        );
+    }
+
+    /// Record on `Accepted` only, in its executable form.
+    ///
+    /// The event reserves a slot, then fails a gate below the seen-set. If the
+    /// reservation were recorded at check time the publisher's re-publish would
+    /// come back `Replayed` forever and the update would be permanently lost
+    /// with nothing left to repair it. The drop guard is what makes the retry
+    /// work.
+    #[sqlx::test]
+    async fn an_event_refused_below_the_seen_set_is_still_republishable(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        let replay_guard = ReplayGuard::new();
+        let source = PeerId::random();
+        // Resolvable as a did:key, so it clears the method gate and the
+        // signature, and NOT seeded as a peer, so it fails at the gate below
+        // the reservation.
+        let keypair = Keypair::generate();
+
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        let bytes = bytes_of(&event);
+
+        let refused =
+            ingest_ref_update(&db, &limiters, &replay_guard, true, true, &bytes, &source).await;
+        let reason = rejection_reason(refused, "an unregistered author");
+        assert!(
+            reason.starts_with("unknown peer DID"),
+            "the first ingest must fail at the peer gate, below the reservation, got: {reason}"
+        );
+        assert_nothing_written(&pool, "an event refused at the peer gate").await;
+
+        seed_peer(&pool, &keypair.did().to_string()).await;
+        let retried =
+            ingest_ref_update(&db, &limiters, &replay_guard, true, true, &bytes, &source).await;
+        assert!(
+            matches!(retried, IngestOutcome::Accepted),
+            "the same bytes must be admitted once the downstream refusal is resolved; a slot \
+             burned by an ingest that never succeeded loses the update permanently, got {retried:?}"
+        );
+        assert_eq!(count(&pool, "received_ref_updates").await, 1);
+    }
+
+    /// KTD-1, executable. This is the harm the defect actually names.
+    ///
+    /// A captured signature replayed to the author cap drains the victim's
+    /// budget, and their next genuine push comes back `AuthorRateLimited`. That
+    /// is why the seen-set sits ABOVE the author debit and not just above the
+    /// writes: with the guard below the debit every assertion here about the
+    /// replays still passes and the last one, the victim's fresh push, goes
+    /// red.
+    #[sqlx::test]
+    async fn a_replay_flood_does_not_drain_the_victim_authors_budget(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        let replay_guard = ReplayGuard::new();
+        let source = PeerId::random();
+        let victim = Keypair::generate();
+        seed_peer(&pool, &victim.did().to_string()).await;
+
+        let mut captured = event_for(&victim);
+        sign_ref_update(&victim, &mut captured).unwrap();
+        let bytes = bytes_of(&captured);
+
+        let first =
+            ingest_ref_update(&db, &limiters, &replay_guard, true, true, &bytes, &source).await;
+        assert!(
+            matches!(first, IngestOutcome::Accepted),
+            "the victim's genuine event must be accepted, got {first:?}"
+        );
+
+        for i in 0..GOSSIP_AUTHOR_MAX_EVENTS {
+            let outcome =
+                ingest_ref_update(&db, &limiters, &replay_guard, true, true, &bytes, &source).await;
+            assert!(
+                matches!(outcome, IngestOutcome::Replayed),
+                "replay {i} of a captured signature must be refused by the seen-set, got {outcome:?}"
+            );
+        }
+
+        let mut fresh = event_for(&victim);
+        fresh.ref_name = "refs/heads/after-the-flood".into();
+        sign_ref_update(&victim, &mut fresh).unwrap();
+        let outcome = ingest_ref_update(
+            &db,
+            &limiters,
+            &replay_guard,
+            true,
+            true,
+            &bytes_of(&fresh),
+            &source,
+        )
+        .await;
+        assert!(
+            matches!(outcome, IngestOutcome::Accepted),
+            "the victim's next genuine push must survive a flood of replays of its own earlier \
+             event; anything else means the replays were charged to the victim's budget, got \
+             {outcome:?}"
+        );
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            2,
+            "exactly the two genuine events may land"
+        );
+    }
+
+    /// The past direction of the freshness window, and the placement assertion
+    /// that goes with it: a stale event costs no round trip either.
+    #[sqlx::test]
+    async fn an_event_older_than_the_freshness_window_is_refused(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        let replay_guard = ReplayGuard::new();
+        let source = PeerId::random();
+        let keypair = Keypair::generate();
+        seed_peer(&pool, &keypair.did().to_string()).await;
+
+        let mut event = event_for(&keypair);
+        event.timestamp = (ingest_now()
+            - chrono::Duration::seconds(GOSSIP_REF_UPDATE_FRESHNESS_WINDOW.as_secs() as i64 + 1))
+        .to_rfc3339();
+        sign_ref_update(&keypair, &mut event).unwrap();
+
+        reset_peer_exists_calls();
+        let outcome = ingest_ref_update(
+            &db,
+            &limiters,
+            &replay_guard,
+            true,
+            true,
+            &bytes_of(&event),
+            &source,
+        )
+        .await;
+        assert_eq!(
+            outcome.metric_label(),
+            "stale_timestamp",
+            "a stale event must count under its own label; sharing one with `replayed` would \
+             leave an operator unable to tell a broken clock from an attacker"
+        );
+        assert!(
+            matches!(outcome, IngestOutcome::StaleTimestamp(_)),
+            "an event one second past the window must be refused as stale, got {outcome:?}"
+        );
+        assert_nothing_written(&pool, "an event older than the freshness window").await;
+        assert_eq!(
+            peer_exists_calls(),
+            0,
+            "the freshness check sits above the peer lookup, so a stale event must cost no \
+             Postgres round trip"
+        );
+    }
+
+    /// The future direction, which is the one an `abs()` implementation gets
+    /// wrong: a distance check admits an event stamped a full window ahead, and
+    /// that event then holds its seen-set slot while sitting outside the
+    /// past-window check's reach until this node's clock catches up.
+    #[sqlx::test]
+    async fn an_event_stamped_far_in_the_future_is_refused(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        let replay_guard = ReplayGuard::new();
+        let source = PeerId::random();
+        let keypair = Keypair::generate();
+        seed_peer(&pool, &keypair.did().to_string()).await;
+
+        let mut event = event_for(&keypair);
+        event.timestamp = (ingest_now() + chrono::Duration::seconds(300)).to_rfc3339();
+        sign_ref_update(&keypair, &mut event).unwrap();
+
+        let outcome = ingest_ref_update(
+            &db,
+            &limiters,
+            &replay_guard,
+            true,
+            true,
+            &bytes_of(&event),
+            &source,
+        )
+        .await;
+        assert!(
+            matches!(outcome, IngestOutcome::StaleTimestamp(_)),
+            "an event stamped five minutes ahead is well past the {}-second skew allowance and \
+             must be refused, got {outcome:?}",
+            GOSSIP_REF_UPDATE_FUTURE_SKEW.as_secs()
+        );
+        assert_nothing_written(&pool, "an event stamped far in the future").await;
+    }
+
+    /// The composition of the two layers, at the only point where a gap can
+    /// open: an event stamped at the maximum future skew.
+    ///
+    /// Such an event is received at t0 but stays inside the freshness window
+    /// until stamp + 600, which is t0 + 660. If the seen-set forgot it at
+    /// t0 + 600 there would be a full minute in which it replays clean through
+    /// both layers. A past-stamped probe cannot see this: with a stamp of t0
+    /// and a re-ingest at t0 + 661, a 600-second retention drops the entry AND
+    /// freshness answers `StaleTimestamp`, so the test passes under exactly the
+    /// mutant it was written to catch.
+    ///
+    /// Phase A proves the seen-set outlives the freshness horizon. Phase B
+    /// proves the freshness window is what finally closes the event out, so the
+    /// two together leave no interval uncovered.
+    #[sqlx::test]
+    async fn the_seen_set_outlives_the_freshness_horizon_of_a_max_skew_event(pool: PgPool) {
+        let t0 = freshness_now();
+        pin_ingest_now(t0);
+
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        let replay_guard = ReplayGuard::new();
+        let source = PeerId::random();
+        let keypair = Keypair::generate();
+        seed_peer(&pool, &keypair.did().to_string()).await;
+
+        let mut event = event_for(&keypair);
+        event.timestamp = (t0
+            + chrono::Duration::seconds(GOSSIP_REF_UPDATE_FUTURE_SKEW.as_secs() as i64))
+        .to_rfc3339();
+        sign_ref_update(&keypair, &mut event).unwrap();
+        let bytes = bytes_of(&event);
+
+        let first =
+            ingest_ref_update(&db, &limiters, &replay_guard, true, true, &bytes, &source).await;
+        assert!(
+            matches!(first, IngestOutcome::Accepted),
+            "an event at exactly the skew allowance is admissible, got {first:?}"
+        );
+
+        // 610 seconds on: the event is 550 seconds old by its own stamp, so it
+        // is still fresh, and the entry recorded at t0 is 610 seconds old, so a
+        // 660-second retention still holds it. The sweep runs first, because a
+        // retention that only survives by never being swept is not a retention.
+        pin_ingest_now(t0 + chrono::Duration::seconds(610));
+        replay_guard.cleanup(ingest_now());
+        let replayed =
+            ingest_ref_update(&db, &limiters, &replay_guard, true, true, &bytes, &source).await;
+        assert!(
+            matches!(replayed, IngestOutcome::Replayed),
+            "the event is still inside its freshness window at t0+610, so the seen-set must still \
+             hold it; a retention of only the window length forgets it here and the replay lands, \
+             got {replayed:?}"
+        );
+
+        // 661 seconds on: the event is 601 seconds old by its own stamp, past
+        // the window, so freshness is what refuses it now and the seen-set is
+        // free to forget it.
+        pin_ingest_now(t0 + chrono::Duration::seconds(661));
+        replay_guard.cleanup(ingest_now());
+        let stale =
+            ingest_ref_update(&db, &limiters, &replay_guard, true, true, &bytes, &source).await;
+        assert!(
+            matches!(stale, IngestOutcome::StaleTimestamp(_)),
+            "past its own freshness horizon the event must be refused by the window, which is \
+             what bounds how long the seen-set has to remember it, got {stale:?}"
+        );
+
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            1,
+            "only the first delivery may land a row"
+        );
+    }
+
+    /// KTD-6: the guard runs on the verified path only, and this is the
+    /// must-not that keeps it there.
+    ///
+    /// Unsigned event bytes carry no signature, so they are fully predictable.
+    /// A node deduplicating them lets an attacker pre-send a victim's expected
+    /// unsigned event and have the genuine one dropped as a replay, which is a
+    /// censorship primitive handed out for nothing: unsigned traffic gains no
+    /// protection from dedup anyway, since the attacker can mint fresh unsigned
+    /// events at will. The forwarder brake is the bound on that path.
+    #[sqlx::test]
+    async fn unsigned_events_bypass_the_seen_set_and_the_freshness_window(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        let replay_guard = ReplayGuard::new();
+        let source = PeerId::random();
+        let keypair = Keypair::generate();
+        seed_peer(&pool, &keypair.did().to_string()).await;
+
+        let event = event_for(&keypair);
+        assert!(
+            event.sig.is_none(),
+            "this test is about the unsigned path; a signed fixture would prove nothing"
+        );
+        let bytes = bytes_of(&event);
+
+        for i in 0..2 {
+            let outcome =
+                ingest_ref_update(&db, &limiters, &replay_guard, false, true, &bytes, &source)
+                    .await;
+            match outcome {
+                IngestOutcome::Accepted => {}
+                IngestOutcome::Replayed => panic!(
+                    "delivery {i}: unsigned bytes must never reach the seen-set; deduplicating \
+                     them lets an attacker pre-send a victim's predictable event and have the \
+                     genuine one dropped"
+                ),
+                other => panic!("delivery {i}: expected an unsigned admission, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            2,
+            "both unsigned deliveries must land in the rolling-upgrade window"
+        );
+
+        let mut stale = event_for(&keypair);
+        stale.timestamp = (ingest_now()
+            - chrono::Duration::seconds(GOSSIP_REF_UPDATE_FRESHNESS_WINDOW.as_secs() as i64 + 1))
+        .to_rfc3339();
+        let outcome = ingest_ref_update(
+            &db,
+            &limiters,
+            &replay_guard,
+            false,
+            true,
+            &bytes_of(&stale),
+            &source,
+        )
+        .await;
+        assert!(
+            matches!(outcome, IngestOutcome::Accepted),
+            "the freshness window rides on the same verified path as the seen-set, so an unsigned \
+             event outside it is admitted rather than refused, got {outcome:?}"
+        );
+    }
+
+    /// The fail-open branch, which is the one an implementation gets
+    /// catastrophically wrong for free.
+    ///
+    /// Mapping `Saturated` to an early `Replayed` return passes every other
+    /// scenario in this file, because nothing else fills the guard, and ships a
+    /// node that refuses all fresh gossip the moment its seen-set is full:
+    /// mesh-wide censorship, converted from a loud resource attack. So a
+    /// saturated guard must admit the event, write it, and say so through the
+    /// counter.
+    #[sqlx::test]
+    async fn a_saturated_guard_admits_the_event_and_counts_the_degradation(pool: PgPool) {
+        crate::metrics::init("0.0.0-test", "did:key:test");
+        pin_ingest_now(freshness_now());
+
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        // Capacity 2 through the same constructor production uses, so the test
+        // fills two slots rather than a hundred thousand and still asserts
+        // against the real shape.
+        let replay_guard = ReplayGuard::with_limits(GOSSIP_SEEN_EVENTS_RETENTION, 2);
+        for seed in [30, 31] {
+            match replay_guard.begin(key_of(seed), ingest_now()) {
+                Begin::Reserved(reservation) => reservation.confirm(),
+                other => panic!("expected a reservation while filling the guard, got {other:?}"),
+            }
+        }
+
+        let source = PeerId::random();
+        let keypair = Keypair::generate();
+        seed_peer(&pool, &keypair.did().to_string()).await;
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+
+        let _serial = SATURATION_COUNTER_LOCK.lock().await;
+        let before = crate::metrics::replay_guard_saturated_count_for_test();
+        let outcome = ingest_ref_update(
+            &db,
+            &limiters,
+            &replay_guard,
+            true,
+            true,
+            &bytes_of(&event),
+            &source,
+        )
+        .await;
+        assert!(
+            matches!(outcome, IngestOutcome::Accepted),
+            "a saturated seen-set must admit a fresh signed event, not refuse it; refusing here \
+             is mesh-wide censorship, got {outcome:?}"
+        );
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            1,
+            "the admitted event must actually be written, not merely reported as accepted"
+        );
+        // Exact, not a lower bound: `SATURATION_COUNTER_LOCK` above serializes
+        // this against the only other test that reaches saturation, so exactly
+        // one increment is attributable to this ingest. A lower bound would
+        // stay green if the fail-open branch counted twice, or if some future
+        // path incremented on a non-saturating call.
+        assert_eq!(
+            crate::metrics::replay_guard_saturated_count_for_test(),
+            before + 1,
+            "the fail-open branch must be visible exactly once; while this counter is still it \
+             is impossible to tell a degraded node from a healthy one, since both count the \
+             event as accepted"
         );
     }
 }
