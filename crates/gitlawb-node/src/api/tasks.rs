@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthenticatedDid;
 use crate::db::{AgentTask, RepoRecord, VisibilityRule};
+use crate::error::AppError;
 use crate::state::{AppState, TaskEventBroadcast};
 
 /// 403 in this module's error shape (`(StatusCode, Json<Value>)`, not `AppError`).
@@ -52,6 +53,10 @@ pub struct ListTasksQuery {
     pub assignee_did: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: i64,
+    pub after_created_at: Option<String>,
+    pub after_id: Option<String>,
+    pub cursor_created_at: Option<String>,
+    pub cursor_id: Option<String>,
 }
 
 fn default_limit() -> i64 {
@@ -172,6 +177,14 @@ pub(crate) fn task_visible(
 }
 
 /// Collect up to `limit` tasks visible to `caller`, applying the same gate the
+#[derive(Debug, Clone)]
+pub(crate) struct VisibleTasks {
+    pub tasks: Vec<AgentTask>,
+    pub incomplete: bool,
+    pub next_cursor: Option<(String, String)>,
+}
+
+/// Collect up to `limit` tasks visible to `caller`, applying the same gate the
 /// GraphQL `tasks` query uses (`collect_visible_tasks` is called from both) so
 /// the two surfaces cannot drift, matching the `collect_visible_ref_updates`
 /// pattern in `api/events.rs`. `limit` is clamped here so a caller-supplied
@@ -182,15 +195,23 @@ pub(crate) async fn collect_visible_tasks(
     status: Option<&str>,
     assignee_did: Option<&str>,
     limit: i64,
+    after: Option<(&str, &str)>,
     caller: Option<&str>,
-) -> crate::error::Result<Vec<AgentTask>> {
+) -> crate::error::Result<VisibleTasks> {
     let bounded_limit = limit.clamp(0, MAX_VISIBLE_TASKS);
     if bounded_limit == 0 {
-        return Ok(Vec::new());
+        return Ok(VisibleTasks {
+            tasks: Vec::new(),
+            incomplete: false,
+            next_cursor: None,
+        });
     }
     let mut visible = Vec::with_capacity(bounded_limit as usize);
-    let mut cursor: Option<(String, String)> = None;
+    let mut cursor: Option<(String, String)> =
+        after.map(|(ts, id)| (ts.to_string(), id.to_string()));
     let mut scanned = 0;
+    let mut last_examined: Option<(String, String)> = None;
+
     while scanned < MAX_TASK_SCAN_CANDIDATES {
         let batch_limit = MAX_VISIBLE_TASKS.min(MAX_TASK_SCAN_CANDIDATES - scanned);
         let tasks = db
@@ -210,6 +231,8 @@ pub(crate) async fn collect_visible_tasks(
         let next_cursor = tasks
             .last()
             .map(|task| (task.created_at.clone(), task.id.clone()));
+        last_examined = next_cursor.clone();
+
         let referenced: Vec<String> = tasks
             .iter()
             .filter_map(|task| task.repo_id.clone())
@@ -225,19 +248,29 @@ pub(crate) async fn collect_visible_tasks(
         let repo_ids: Vec<String> = repos_by_id.keys().cloned().collect();
         let rules_by_repo = db.list_visibility_rules_for_repos(&repo_ids).await?;
 
-        visible.extend(
-            tasks
-                .iter()
-                .filter(|task| task_visible(task, caller, &repos_by_id, &rules_by_repo))
-                .take((bounded_limit as usize).saturating_sub(visible.len()))
-                .cloned(),
-        );
+        for task in &tasks {
+            if task_visible(task, caller, &repos_by_id, &rules_by_repo) {
+                visible.push(task.clone());
+                if visible.len() == bounded_limit as usize {
+                    break;
+                }
+            }
+        }
+
         if visible.len() == bounded_limit as usize || tasks.len() < batch_limit as usize {
             break;
         }
         cursor = next_cursor;
     }
-    Ok(visible)
+
+    let incomplete = visible.len() < bounded_limit as usize && scanned >= MAX_TASK_SCAN_CANDIDATES;
+    let next_cursor = if incomplete { last_examined } else { None };
+
+    Ok(VisibleTasks {
+        tasks: visible,
+        incomplete,
+        next_cursor,
+    })
 }
 
 /// Fetch a single task gated the same way `collect_visible_tasks` gates a
@@ -280,7 +313,7 @@ pub async fn create_task(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthenticatedDid>,
     Json(body): Json<CreateTaskBody>,
-) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+) -> std::result::Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     // Bind the delegator to the authenticated signer (N13).
     if !crate::api::did_matches(&auth.0, &body.delegator_did) {
         return Err(forbidden("delegator_did must be the authenticated signer"));
@@ -319,24 +352,35 @@ pub async fn list_tasks(
     State(state): State<AppState>,
     Query(q): Query<ListTasksQuery>,
     auth: Option<Extension<AuthenticatedDid>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> crate::error::Result<Json<Value>> {
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
-    let tasks = collect_visible_tasks(
+    let after = q
+        .after_created_at
+        .as_deref()
+        .or(q.cursor_created_at.as_deref())
+        .zip(q.after_id.as_deref().or(q.cursor_id.as_deref()));
+    let result = collect_visible_tasks(
         &state.db,
         q.status.as_deref(),
         q.assignee_did.as_deref(),
         q.limit,
+        after,
         caller,
     )
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-    })?;
-    let items: Vec<Value> = tasks.iter().map(task_to_read_json).collect();
-    Ok(Json(json!({ "tasks": items, "count": items.len() })))
+    .await?;
+    let items: Vec<Value> = result.tasks.iter().map(task_to_read_json).collect();
+    let next_cursor = result.next_cursor.map(|(created_at, id)| {
+        json!({
+            "created_at": created_at,
+            "id": id,
+        })
+    });
+    Ok(Json(json!({
+        "tasks": items,
+        "count": items.len(),
+        "incomplete": result.incomplete,
+        "next_cursor": next_cursor,
+    })))
 }
 
 /// GET /api/v1/tasks/{id}
@@ -347,18 +391,11 @@ pub async fn get_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
     auth: Option<Extension<AuthenticatedDid>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> crate::error::Result<Json<Value>> {
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
-    match get_visible_task(&state.db, &id, caller).await {
-        Ok(Some(t)) => Ok(Json(task_to_read_json(&t))),
-        Ok(None) => Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "task not found" })),
-        )),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )),
+    match get_visible_task(&state.db, &id, caller).await? {
+        Some(t) => Ok(Json(task_to_read_json(&t))),
+        None => Err(AppError::NotFound("task not found".into())),
     }
 }
 
@@ -885,7 +922,7 @@ mod visible_tasks_tests {
     }
 
     #[sqlx::test]
-    async fn denied_history_scan_stops_at_candidate_ceiling(pool: PgPool) {
+    async fn denied_history_scan_stops_at_candidate_ceiling_and_signals_incomplete(pool: PgPool) {
         let state = test_state(pool).await;
         state
             .db
@@ -904,12 +941,67 @@ mod visible_tasks_tests {
             state.db.create_task(&hidden).await.unwrap();
         }
 
-        let resp = list_router(state)
+        let resp = list_router(state.clone())
             .oneshot(anon_get("/api/v1/tasks?limit=1"))
             .await
             .unwrap();
         let body = body_json(resp).await;
         assert_eq!(body["count"], 0);
+        assert_eq!(body["incomplete"], true);
         assert!(!body.to_string().contains("past-ceiling"));
+
+        let next_cursor = &body["next_cursor"];
+        let cursor_ts = next_cursor["created_at"].as_str().expect("cursor ts");
+        let cursor_id = next_cursor["id"].as_str().expect("cursor id");
+
+        let resp = list_router(state)
+            .oneshot(anon_get(&format!(
+                "/api/v1/tasks?limit=1&after_created_at={}&after_id={}",
+                cursor_ts, cursor_id
+            )))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["incomplete"], false);
+        assert_eq!(body["tasks"][0]["id"], "past-ceiling");
+    }
+
+    #[sqlx::test]
+    async fn list_tasks_closed_pool_returns_503_db_unavailable(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        pool.close().await;
+
+        let resp = list_router(state)
+            .oneshot(anon_get("/api/v1/tasks"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "closed-pool outage must be retryable 503, not 500"
+        );
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "db_unavailable");
+    }
+
+    #[sqlx::test]
+    async fn get_task_closed_pool_returns_503_db_unavailable(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        pool.close().await;
+
+        let resp = list_router(state)
+            .oneshot(anon_get("/api/v1/tasks/t1"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "closed-pool outage must be retryable 503, not 500"
+        );
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "db_unavailable");
     }
 }

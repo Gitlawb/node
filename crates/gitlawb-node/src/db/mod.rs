@@ -5306,7 +5306,7 @@ mod dedup_db_tests {
         db.create_repo(&unrelated).await.unwrap();
 
         let out = db
-            .list_repos_deduped_by_ids(&[requested.id.clone()])
+            .list_repos_deduped_by_ids(std::slice::from_ref(&requested.id))
             .await
             .unwrap();
         assert_eq!(out.len(), 1);
