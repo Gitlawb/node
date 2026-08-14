@@ -4590,6 +4590,268 @@ mod tests {
         );
     }
 
+    /// A distinct key per index, for the two tests that need more keys than
+    /// `key_of`'s single byte can name. The index goes in the low bytes and the
+    /// rest stays zero, which is enough for uniqueness; nothing here depends on
+    /// the key being well distributed, since the map hashes it again.
+    fn key_from_index(i: usize) -> [u8; 32] {
+        let mut key = [0u8; 32];
+        key[..std::mem::size_of::<usize>()].copy_from_slice(&i.to_le_bytes());
+        key
+    }
+
+    /// A key that is PRESENT but expired, arriving while the map is full.
+    ///
+    /// `begin` computes `present` before it looks at capacity, so this case
+    /// replaces the entry in place and never consults the capacity bar at all.
+    /// The alternative reading, that a full map answers `Saturated` no matter
+    /// what is already in it, would take a re-publish of an event whose slot has
+    /// merely aged out and hand it the fail-open path: admitted, unrecorded, and
+    /// free to replay for as long as the map stays full. The map is full exactly
+    /// when the guard is under attack, so that is the moment the guard is least
+    /// entitled to forget things.
+    ///
+    /// Two entries and only ONE of them expired, on purpose. If both were
+    /// expired the inline sweep would empty the map and the in-place path would
+    /// be indistinguishable from sweep-then-insert. Here the sweep can reclaim
+    /// only the target's own slot, so the sweep counter is what separates the
+    /// two implementations: the correct one answers from the `present` arm and
+    /// runs NO sweep, while a version that treated an expired hit as absent
+    /// would pay an O(capacity) rescan to reach the same answer.
+    #[test]
+    fn replay_guard_replaces_an_expired_entry_in_place_at_capacity() {
+        let retention = GOSSIP_SEEN_EVENTS_RETENTION;
+        let horizon = chrono::Duration::seconds(retention.as_secs() as i64);
+        let guard = ReplayGuard::with_limits(retention, 2);
+        let t0 = pinned();
+
+        // The stale one, recorded at t0.
+        match guard.begin(key_of(60), t0) {
+            Begin::Reserved(reservation) => reservation.confirm(),
+            other => panic!("expected a reservation, got {other:?}"),
+        }
+        // The fresh one, recorded a full horizon later, so it is still inside
+        // its own retention at the instant the assertions below run.
+        match guard.begin(key_of(61), t0 + horizon) {
+            Begin::Reserved(reservation) => reservation.confirm(),
+            other => panic!("expected a reservation, got {other:?}"),
+        }
+        assert_eq!(
+            guard.len_for_test(),
+            2,
+            "the map must be at capacity, or this asserts nothing about the capacity bar"
+        );
+
+        let later = t0 + horizon + chrono::Duration::seconds(1);
+        let outcome = guard.begin(key_of(60), later);
+        assert!(
+            matches!(outcome, Begin::Reserved(_)),
+            "an expired entry is absent, so re-reserving its key must not have to clear the \
+             capacity bar; answering Saturated here fails a re-publish open and unrecorded at \
+             precisely the moment the guard is under load, got {outcome:?}"
+        );
+        assert_eq!(
+            guard.inline_sweeps_for_test(),
+            0,
+            "the expired-key path must answer from the lookup it already did; reaching the \
+             capacity branch to sweep the map would make a replaced entry cost an O(capacity) \
+             rescan"
+        );
+        drop(outcome);
+
+        assert!(
+            matches!(guard.begin(key_of(61), later), Begin::Replayed),
+            "the unexpired neighbour must be untouched: replacing one entry in place must not \
+             clear the rest of the map"
+        );
+    }
+
+    /// `confirm` on a reservation whose entry is already gone.
+    ///
+    /// Reachable by a sweep landing between the reservation and the write
+    /// settling: the sweep evicts on `recorded_at` alone and does not care that
+    /// an ingest is still in flight over that key.
+    ///
+    /// The silent no-op is the right answer, and the alternative is worse in
+    /// both directions. Re-inserting would resurrect an entry whose retention
+    /// horizon has already passed, which is the one thing the horizon is for.
+    /// Panicking would turn a benign schedule into a crash on the swarm loop.
+    /// So the entry stays gone and the event is simply admissible again, which
+    /// is the same fail-open the guard already takes when it forgets an entry
+    /// for any other reason, bounded by the freshness window like every other
+    /// admission.
+    ///
+    /// Unreachable on today's sequential swarm loop, where the sweep tick and
+    /// the ingest cannot interleave. It goes live the moment ingest becomes
+    /// concurrent, which is the same reason `begin` is one critical section
+    /// rather than two.
+    #[test]
+    fn confirming_a_reservation_whose_entry_was_already_swept_is_a_silent_no_op() {
+        let retention = GOSSIP_SEEN_EVENTS_RETENTION;
+        let guard = ReplayGuard::with_limits(retention, 8);
+        let now = pinned();
+
+        let Begin::Reserved(reservation) = guard.begin(key_of(62), now) else {
+            panic!("a key never seen before must be reserved")
+        };
+        assert_eq!(guard.len_for_test(), 1, "the reservation must be recorded");
+
+        // The sweep evicts the pending entry out from under the reservation.
+        guard.cleanup(now + chrono::Duration::seconds(retention.as_secs() as i64 + 1));
+        assert_eq!(
+            guard.len_for_test(),
+            0,
+            "the sweep must actually evict, or the confirm below is not the case this test names"
+        );
+
+        reservation.confirm();
+        assert_eq!(
+            guard.len_for_test(),
+            0,
+            "confirm must not resurrect an entry the sweep already retired; re-inserting would \
+             put an entry back past its own retention horizon"
+        );
+        assert!(
+            matches!(guard.begin(key_of(62), now), Begin::Reserved(_)),
+            "the key is genuinely forgotten, so the event is admissible again, bounded by the \
+             freshness window like any other admission"
+        );
+    }
+
+    /// The inline sweep at PRODUCTION capacity, which is the size the throttle
+    /// was actually written to defend.
+    ///
+    /// Every other saturation test here fills two slots, so the cost the
+    /// throttle bounds is two comparisons and the assertion holds under an
+    /// implementation that would be ruinous at the real number. This one builds
+    /// the guard through `ReplayGuard::new`, so the capacity is
+    /// `GOSSIP_SEEN_EVENTS_MAX` itself and nothing is extrapolated: no argument
+    /// is needed that a result at capacity 2 carries to capacity 100,000,
+    /// because the test IS at capacity 100,000.
+    ///
+    /// Asserted on the RATE, not the count. One sweep is not the interesting
+    /// number; one sweep for however many events arrive at the same instant is,
+    /// because the failing implementation is the one where sweeps track the
+    /// event count. Every entry here is unexpired and the clock is held still,
+    /// which is the state an attacker driving the guard to capacity produces:
+    /// each rescan visits all 100,000 entries under the mutex and reclaims
+    /// nothing, so an unthrottled `begin` would turn this burst into 50 million
+    /// pointless key visits on the swarm loop.
+    #[test]
+    fn a_guard_at_production_capacity_sweeps_once_for_a_burst_not_once_per_event() {
+        crate::metrics::init("0.0.0-test", "did:key:test");
+        let guard = ReplayGuard::new();
+        let now = pinned();
+
+        for i in 0..GOSSIP_SEEN_EVENTS_MAX {
+            match guard.begin(key_from_index(i), now) {
+                Begin::Reserved(reservation) => reservation.confirm(),
+                other => panic!("expected a reservation while filling the guard, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            guard.len_for_test(),
+            GOSSIP_SEEN_EVENTS_MAX,
+            "the guard must be at its production capacity before the burst"
+        );
+
+        // This test reaches `Begin::Saturated`, so it takes the lock every
+        // saturating test takes. See `SATURATION_COUNTER_LOCK`.
+        let _serial = SATURATION_COUNTER_LOCK.blocking_lock();
+        let events = 500;
+        for i in 0..events {
+            let outcome = guard.begin(key_from_index(GOSSIP_SEEN_EVENTS_MAX + i), now);
+            assert!(
+                matches!(outcome, Begin::Saturated),
+                "a full map of unexpired entries must stay saturated, got {outcome:?} at event {i}"
+            );
+        }
+
+        let sweeps = guard.inline_sweeps_for_test();
+        assert_eq!(
+            sweeps, 1,
+            "{events} events into a saturated guard cost {sweeps} rescans of a \
+             {GOSSIP_SEEN_EVENTS_MAX}-entry map; the per-event rate must not scale with the \
+             burst, or the guard is an amplifier at exactly the size it was built for"
+        );
+        assert_eq!(
+            guard.len_for_test(),
+            GOSSIP_SEEN_EVENTS_MAX,
+            "nothing was expired, so the one sweep reclaimed nothing: that is the state the \
+             throttle exists for, and it is the state this burst was run in"
+        );
+    }
+
+    /// The race `begin`'s single critical section exists to close, driven
+    /// concurrently rather than argued.
+    ///
+    /// Two OS threads meet at a barrier and call `begin` with the same key. The
+    /// property is on the pair, not on either thread: exactly one may hold a
+    /// reservation and the other must be told it is a replay. Check-then-insert
+    /// with the lock released in between passes every sequential test in this
+    /// file and fails here, because both threads look, both miss, and both are
+    /// admitted.
+    ///
+    /// The second barrier is load-bearing. A winner that released its
+    /// reservation before the loser called `begin` would hand the loser a
+    /// legitimate `Reserved`, and the test would fail on its own scheduling
+    /// rather than on the guard; holding both results until both calls have
+    /// returned is what makes the assertion about `begin` alone.
+    ///
+    /// Many rounds because one is not evidence. A torn implementation still
+    /// answers correctly whenever the threads happen not to overlap, so a single
+    /// round would mostly pass against the bug; the honest claim is that this
+    /// raises the odds of catching one, not that it forces the interleaving.
+    #[test]
+    fn two_concurrent_deliveries_of_one_key_yield_exactly_one_reservation() {
+        let guard = ReplayGuard::with_limits(GOSSIP_SEEN_EVENTS_RETENTION, 8);
+        let now = pinned();
+        let rounds = 200;
+        let barrier = std::sync::Barrier::new(2);
+
+        fn label(outcome: &Begin<'_>) -> &'static str {
+            match outcome {
+                Begin::Reserved(_) => "reserved",
+                Begin::Replayed => "replayed",
+                Begin::Saturated => "saturated",
+            }
+        }
+
+        let (left, right) = std::thread::scope(|scope| {
+            let run = || {
+                let mut labels = Vec::with_capacity(rounds);
+                for round in 0..rounds {
+                    barrier.wait();
+                    let outcome = guard.begin(key_from_index(round), now);
+                    labels.push(label(&outcome));
+                    // Both calls have returned before either reservation is
+                    // released, so the loser cannot have raced a release.
+                    barrier.wait();
+                    drop(outcome);
+                }
+                labels
+            };
+            let left = scope.spawn(run);
+            let right = scope.spawn(run);
+            (
+                left.join().expect("left racer must not panic"),
+                right.join().expect("right racer must not panic"),
+            )
+        });
+
+        for (round, (a, b)) in left.iter().zip(right.iter()).enumerate() {
+            let mut pair = [*a, *b];
+            pair.sort_unstable();
+            assert_eq!(
+                pair,
+                ["replayed", "reserved"],
+                "round {round}: two concurrent deliveries of one key must settle as exactly one \
+                 reservation and one replay, got {a} and {b}; two reservations means both copies \
+                 were admitted, which is the replay the guard exists to refuse"
+            );
+        }
+    }
+
     // ---- The replay seen-set and the freshness window, through the real
     // ingest path. Every one of these drives `ingest_ref_update` rather than a
     // helper, because the guards' whole subject is WHERE they sit relative to
@@ -5247,6 +5509,247 @@ mod tests {
             "the fail-open branch must be visible exactly once; while this counter is still it \
              is impossible to tell a degraded node from a healthy one, since both count the \
              event as accepted"
+        );
+    }
+
+    // ── The reservation's release, through the arm it was written for ─────
+    //
+    // The drop guard is what keeps a transient write failure from permanently
+    // burning an event's key, and until now it was proven only through an early
+    // return: the unknown-peer gate stops the ingest above both writes, so the
+    // reservation is released by a path that never reached the scenario the
+    // doc comment names. The two tests below drive the `WriteFailed` arm
+    // itself, once per write direction, because the two writes are attempted
+    // independently and a release that fired on only one of them would be a
+    // release with a hole in it.
+    //
+    // Each RENAMES its target table rather than dropping it, which is the one
+    // difference from the two `WriteFailed` tests above. The re-publish is the
+    // property under test, so the sink has to come back: with the table gone
+    // for good the second ingest fails too, and the strongest available
+    // assertion would be "not Replayed", which is satisfied by a guard that
+    // burned the slot and then reported a write failure for its own reasons.
+
+    /// The row write fails, and the publisher's re-publish still gets in.
+    #[sqlx::test]
+    async fn a_failed_ref_update_insert_releases_the_seen_set_slot(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        // ONE guard across both deliveries. A fresh guard per call is exactly
+        // the shape that stays green while the slot is burned forever.
+        let replay_guard = ReplayGuard::new();
+        let source = PeerId::random();
+        let keypair = Keypair::generate();
+        seed_peer(&pool, &keypair.did().to_string()).await;
+
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        let bytes = bytes_of(&event);
+
+        sqlx::query("ALTER TABLE received_ref_updates RENAME TO received_ref_updates_stashed")
+            .execute(&pool)
+            .await
+            .expect("stash the ref-update sink so its write genuinely fails");
+
+        let failed =
+            ingest_ref_update(&db, &limiters, &replay_guard, true, true, &bytes, &source).await;
+        match failed {
+            IngestOutcome::WriteFailed(reason) => assert!(
+                reason.contains("failed to store received ref-update"),
+                "the outcome must name the write that failed, got: {reason}"
+            ),
+            other => panic!(
+                "this test is about the WriteFailed arm, so the ingest must reach the write and \
+                 fail there rather than being refused above it, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            replay_guard.len_for_test(),
+            0,
+            "an ingest that settled without storing the event must leave no entry behind; the \
+             outcome assertion above cannot see this, since a burned slot returns the identical \
+             WriteFailed"
+        );
+
+        sqlx::query("ALTER TABLE received_ref_updates_stashed RENAME TO received_ref_updates")
+            .execute(&pool)
+            .await
+            .expect("restore the ref-update sink for the re-publish");
+
+        let republished =
+            ingest_ref_update(&db, &limiters, &replay_guard, true, true, &bytes, &source).await;
+        assert!(
+            matches!(republished, IngestOutcome::Accepted),
+            "the same bytes must be admitted after a transient failure; refused as a replay, the \
+             row is lost permanently and the publisher has no way to repair it, got {republished:?}"
+        );
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            1,
+            "the re-publish is what finally lands the row the failed ingest lost"
+        );
+        assert_eq!(
+            count(&pool, "sync_queue").await,
+            2,
+            "the enqueue is a separate write and succeeded on both passes, which is the same \
+             independence the WriteFailed pair above asserts"
+        );
+    }
+
+    /// The mirror: the enqueue fails, and the re-publish still gets in.
+    #[sqlx::test]
+    async fn a_failed_enqueue_releases_the_seen_set_slot(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        let replay_guard = ReplayGuard::new();
+        let source = PeerId::random();
+        let keypair = Keypair::generate();
+        seed_peer(&pool, &keypair.did().to_string()).await;
+
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        let bytes = bytes_of(&event);
+
+        sqlx::query("ALTER TABLE sync_queue RENAME TO sync_queue_stashed")
+            .execute(&pool)
+            .await
+            .expect("stash the queue sink so its write genuinely fails");
+
+        let failed =
+            ingest_ref_update(&db, &limiters, &replay_guard, true, true, &bytes, &source).await;
+        match failed {
+            IngestOutcome::WriteFailed(reason) => assert!(
+                reason.contains("failed to enqueue sync"),
+                "the outcome must name the write that failed, got: {reason}"
+            ),
+            other => panic!(
+                "this test is about the WriteFailed arm, so the ingest must reach the enqueue and \
+                 fail there rather than being refused above it, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            replay_guard.len_for_test(),
+            0,
+            "a failed enqueue settles the ingest as unstored just as a failed row insert does, so \
+             it must release the slot on the same terms"
+        );
+
+        sqlx::query("ALTER TABLE sync_queue_stashed RENAME TO sync_queue")
+            .execute(&pool)
+            .await
+            .expect("restore the queue sink for the re-publish");
+
+        let republished =
+            ingest_ref_update(&db, &limiters, &replay_guard, true, true, &bytes, &source).await;
+        assert!(
+            matches!(republished, IngestOutcome::Accepted),
+            "the same bytes must be admitted after a transient enqueue failure, or the sync the \
+             event exists to trigger never happens, got {republished:?}"
+        );
+        assert_eq!(
+            count(&pool, "sync_queue").await,
+            1,
+            "the re-publish is what finally lands the queue entry the failed ingest lost"
+        );
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            2,
+            "the row write is a separate write and succeeded on both passes"
+        );
+    }
+
+    /// The restart exposure, driven rather than described.
+    ///
+    /// The seen-set is in-process, so a restart empties it and an event this
+    /// node already refused is admissible again. That is stated at length on
+    /// `ReplayGuard`, and prose is not a bound. What makes the exposure
+    /// tolerable is the composition with the freshness window, so both halves
+    /// are asserted here: a fresh guard readmits the event, and a fresh guard
+    /// still refuses it once the event's own stamp has aged out. The second
+    /// half is what turns "one replay per restart" into a bound, since without
+    /// it a crash-looping node would readmit the same captured signature
+    /// forever.
+    ///
+    /// A fresh `ReplayGuard` is the whole of the post-restart state for this
+    /// layer, which is what lets the restart be modelled in-process: the guard
+    /// holds no handle to anything that survives the process, so a new one is
+    /// indistinguishable from a new node.
+    #[sqlx::test]
+    async fn a_restarted_guard_readmits_a_seen_event_and_the_window_still_bounds_it(pool: PgPool) {
+        let t0 = freshness_now();
+        pin_ingest_now(t0);
+
+        let db = ingest_db(&pool).await;
+        // ONE limiter set across all four deliveries, so nothing below is
+        // masked by a budget that was quietly reset alongside the guard.
+        let limiters = IngestLimiters::new();
+        let source = PeerId::random();
+        let keypair = Keypair::generate();
+        seed_peer(&pool, &keypair.did().to_string()).await;
+
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        let bytes = bytes_of(&event);
+
+        let before_restart = ReplayGuard::new();
+        let first =
+            ingest_ref_update(&db, &limiters, &before_restart, true, true, &bytes, &source).await;
+        assert!(
+            matches!(first, IngestOutcome::Accepted),
+            "the first delivery must be accepted, got {first:?}"
+        );
+        let replayed =
+            ingest_ref_update(&db, &limiters, &before_restart, true, true, &bytes, &source).await;
+        assert!(
+            matches!(replayed, IngestOutcome::Replayed),
+            "the same process must refuse the second copy, or the readmission below says nothing \
+             about the restart, got {replayed:?}"
+        );
+
+        // The restart. Same bytes, same clock, same everything else.
+        let after_restart = ReplayGuard::new();
+        let readmitted =
+            ingest_ref_update(&db, &limiters, &after_restart, true, true, &bytes, &source).await;
+        assert!(
+            matches!(readmitted, IngestOutcome::Accepted),
+            "a node that has forgotten the event admits it again; this is the documented \
+             exposure, asserted so a claim that a restart is free would fail here, got \
+             {readmitted:?}"
+        );
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            2,
+            "the readmission is a real write, which is exactly what makes it an exposure worth \
+             bounding"
+        );
+
+        // One second past the event's own freshness horizon, and a guard as
+        // empty as the one above. Nothing remembers this event now, so the
+        // window is the only thing left to refuse it.
+        pin_ingest_now(
+            t0 + chrono::Duration::seconds(GOSSIP_REF_UPDATE_FRESHNESS_WINDOW.as_secs() as i64 + 1),
+        );
+        let after_later_restart = ReplayGuard::new();
+        let stale = ingest_ref_update(
+            &db,
+            &limiters,
+            &after_later_restart,
+            true,
+            true,
+            &bytes,
+            &source,
+        )
+        .await;
+        assert!(
+            matches!(stale, IngestOutcome::StaleTimestamp(_)),
+            "past its stamp's window the event is refused however many times the process has \
+             cycled, which is what bounds the restart exposure at one replay per restart within \
+             ten minutes rather than one per restart forever, got {stale:?}"
+        );
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            2,
+            "the refused delivery must write nothing"
         );
     }
 }
