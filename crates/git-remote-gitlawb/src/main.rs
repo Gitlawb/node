@@ -2356,6 +2356,43 @@ mod delegated_push_tests {
     }
 
     #[test]
+    fn split_pack_post_url_separates_origin_owner_and_repo() {
+        assert_eq!(
+            split_pack_post_url("http://127.0.0.1:7545/z6Mk/myrepo.git/git-receive-pack"),
+            Some((
+                "http://127.0.0.1:7545".to_string(),
+                "z6Mk".to_string(),
+                "myrepo".to_string()
+            )),
+            "the origin must come back intact so the node DID can be fetched from it"
+        );
+        // The .git suffix is optional on the wire; the delegation is stored under
+        // the bare repo name either way, so both forms must resolve identically.
+        assert_eq!(
+            split_pack_post_url("https://node.example/z6Mk/myrepo/git-receive-pack")
+                .map(|(_, _, r)| r),
+            Some("myrepo".to_string())
+        );
+        // A repo genuinely named "x.git" keeps its name: only one suffix is stripped.
+        assert_eq!(
+            split_pack_post_url("https://node.example/z6Mk/x.git.git/git-receive-pack")
+                .map(|(_, _, r)| r),
+            Some("x.git".to_string())
+        );
+        for bad in [
+            "not-a-url",
+            "https://node.example",
+            "https://node.example/",
+            "https://node.example/onlyowner",
+        ] {
+            assert!(
+                split_pack_post_url(bad).is_none(),
+                "{bad} must not parse as a pack POST URL"
+            );
+        }
+    }
+
+    #[test]
     fn delegation_path_matches_the_gl_layout() {
         let base = std::path::Path::new("/tmp/id");
         let expected = base.join("delegations").join("z6MkAbc__myrepo.ucan");
