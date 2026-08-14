@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use libp2p_core::{muxing::StreamMuxerBox, Multiaddr, PeerId, Transport};
 use libp2p_gossipsub as gossipsub;
@@ -110,6 +110,62 @@ const GOSSIP_INGEST_MAX_AUTHORS: usize = 200_000;
 /// works: a key whose window has not elapsed is retained by `cleanup` anyway,
 /// so sweeping more often would cost lock traffic and reclaim nothing extra.
 const GOSSIP_INGEST_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+
+/// How far into the past a signed ref-update's own `timestamp` may sit and
+/// still be admitted: 10 minutes.
+///
+/// This is the outer bound on replay, and it is the bound that still holds when
+/// the seen-set below degrades. Sized for the delivery this mesh actually
+/// produces: gossipsub re-shares through several hops, a peer coming back from
+/// a partition drains a backlog, and clocks drift, so a window measured in
+/// seconds would refuse honest traffic. Ten minutes is short enough that a
+/// captured signature stops being useful quickly and long enough that no
+/// legitimate delivery path is near it.
+const GOSSIP_REF_UPDATE_FRESHNESS_WINDOW: Duration = Duration::from_secs(600);
+/// How far AHEAD of this node's clock a ref-update's `timestamp` may sit: 60
+/// seconds.
+///
+/// Deliberately much tighter than the past window, and checked as its own
+/// comparison rather than folded into a distance (see [`check_freshness`]). A
+/// publisher whose clock is a minute fast is ordinary; one whose events are
+/// stamped further ahead is either badly misconfigured or buying itself a
+/// longer replay lifetime, and both deserve the same refusal.
+const GOSSIP_REF_UPDATE_FUTURE_SKEW: Duration = Duration::from_secs(60);
+/// How long the replay seen-set keeps an entry.
+///
+/// DERIVED from the two constants above rather than written out, because the
+/// relation is what matters and a hand-written 660 drifts the moment either
+/// input moves. It must be at least window plus skew: an event stamped at the
+/// +60s future edge stays inside the freshness window until 660 seconds after
+/// receipt, so evicting its entry at 600 would open a 60-second gap in which
+/// that exact event replays clean past both layers.
+const GOSSIP_SEEN_EVENTS_RETENTION: Duration = Duration::from_secs(
+    GOSSIP_REF_UPDATE_FRESHNESS_WINDOW.as_secs() + GOSSIP_REF_UPDATE_FUTURE_SKEW.as_secs(),
+);
+/// Ceiling on entries in the replay seen-set.
+///
+/// Only events that were actually admitted and written are recorded, so the
+/// record rate is bounded by the author brake: 500 per 60 seconds per
+/// registered DID. Occupancy is that rate times retention plus one sweep
+/// interval (an entry can outlive retention until the next tick reclaims it),
+/// so roughly 8,000 entries per author running flat out. Filling 100,000 takes
+/// twelve or thirteen registered DIDs sustaining the author cap for a full
+/// horizon, every event individually signed and durably written, which is
+/// 100,000 ref-update rows and 100,000 sync enqueues: an attack the database
+/// and the accepted counter announce long before this ceiling is reached. At
+/// roughly 100 bytes per entry the ceiling is about 10 MB, comparable to the
+/// limiters' own 200k-key maps.
+const GOSSIP_SEEN_EVENTS_MAX: usize = 100_000;
+/// The retention horizon cannot be shortened below the span the freshness
+/// window admits. Enforced at compile time for the same reason the limiter
+/// ordering above is: it is a relation between constants, and a test can only
+/// catch it after someone runs it.
+const _: () = assert!(
+    GOSSIP_SEEN_EVENTS_RETENTION.as_secs()
+        >= GOSSIP_REF_UPDATE_FRESHNESS_WINDOW.as_secs() + GOSSIP_REF_UPDATE_FUTURE_SKEW.as_secs(),
+    "the seen-set must retain an entry for at least as long as the freshness window will keep \
+     admitting the event, or a future-dated event replays clean in the gap"
+);
 
 /// The gossip ingest budgets, built the same way for the swarm loop and for the
 /// tests so a test can never assert against a budget production does not run.
@@ -422,6 +478,368 @@ fn verify_ref_update(event: &RefUpdateEvent) -> Result<(), String> {
         .map_err(|_| "signature does not verify against node_did".to_string())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for [`ingest_now`].
+    ///
+    /// Thread-local rather than a global for the same reason `PEER_EXISTS_CALLS`
+    /// is: `#[sqlx::test]` drives each test on its own current-thread runtime,
+    /// so a pinned clock is naturally per-test and cannot be observed by a test
+    /// running in parallel.
+    static INGEST_NOW_OVERRIDE: std::cell::Cell<Option<DateTime<Utc>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The one clock the guard layer reads.
+///
+/// Both the freshness comparison and the seen-set's recorded-at and expiry go
+/// through this, so the two layers cannot disagree about what "now" is. A
+/// seen-set expiring on a different clock than the window it is sized against
+/// is exactly the gap [`GOSSIP_SEEN_EVENTS_RETENTION`] exists to close, and two
+/// independent `Utc::now()` calls would reintroduce it as a race rather than a
+/// constant. The test override also means expiry tests pin an instant instead
+/// of sleeping out an eleven-minute horizon.
+#[allow(dead_code)] // wired into the ingest path in a follow-up
+fn ingest_now() -> DateTime<Utc> {
+    #[cfg(test)]
+    if let Some(pinned) = INGEST_NOW_OVERRIDE.with(|c| c.get()) {
+        return pinned;
+    }
+    Utc::now()
+}
+
+/// The seen-set key for one signed ref-update: the full SHA-256 of its
+/// canonical [`signing_bytes`].
+///
+/// Three choices are load-bearing here.
+///
+/// SIGNING BYTES, not the raw `msg.data` the message arrived as. The signature
+/// covers a re-serialization of the parsed struct, so one signature verifies
+/// against a whole family of wire encodings (injecting `"v":0` into a v0
+/// artifact is the demonstrated case: different bytes, different gossipsub
+/// message id, same struct, same signature). Keyed on raw bytes, every member
+/// of that family gets its own slot and the guard deduplicates nothing.
+///
+/// FULL SHA-256, not a truncation and not the `DefaultHasher` idiom this file
+/// uses for node-identity seeding and `message_id_fn`. Those are keyed on
+/// attacker-supplied bytes too, but a collision there costs a routing hiccup.
+/// A collision here drops a DISTINCT legitimate event as a replay, which is
+/// censorship: strictly worse than the replay the guard is refusing. Derived by
+/// calling `gitlawb_core::cid::sha256_bytes` rather than by an open-coded sha2
+/// sequence, so there is one digest implementation to audit.
+///
+/// Not the event's identity fields either. There is no `id` on
+/// `RefUpdateEvent` and the row UUID is minted per ingest, so any id-derived
+/// key is fresh on every replay by construction; and `(repo, ref_name,
+/// new_sha)` would silently censor a legitimate revert republishing an earlier
+/// sha for the same ref.
+#[allow(dead_code)] // wired into the ingest path in a follow-up
+fn replay_key(event: &RefUpdateEvent) -> serde_json::Result<[u8; 32]> {
+    Ok(gitlawb_core::cid::sha256_bytes(&signing_bytes(event)?))
+}
+
+/// One entry in the replay seen-set.
+struct SeenEntry {
+    /// When [`ReplayGuard::begin`] admitted this key, on the guard-layer clock
+    /// ([`ingest_now`]) and never on a second independent one. Expiry is
+    /// measured against the same clock the freshness window uses, so the two
+    /// layers cannot disagree about how long an event stays interesting.
+    recorded_at: DateTime<Utc>,
+    /// Whether the ingest that reserved this key went on to succeed.
+    ///
+    /// Carries no decision: a pending entry answers `Replayed` exactly as a
+    /// confirmed one does (KTD-8, and the concurrent-delivery case it names),
+    /// and an unconfirmed reservation removes its entry on drop rather than
+    /// leaving it behind in some other state. It is kept because it makes the
+    /// set's state legible when a test or a debugger asks whether an entry
+    /// survived a settled ingest or is merely in flight, which is the
+    /// distinction the reserve-and-settle shape exists to draw.
+    #[cfg_attr(not(test), allow(dead_code))]
+    confirmed: bool,
+}
+
+/// What [`ReplayGuard::begin`] decided about one key.
+#[derive(Debug)]
+#[allow(dead_code)] // matched by the ingest path in a follow-up
+enum Begin<'a> {
+    /// The key was not in the set. The caller holds the slot until it either
+    /// confirms the reservation or drops it.
+    Reserved(ReplayReservation<'a>),
+    /// The key is already in the set, pending or confirmed. This is the replay.
+    Replayed,
+    /// The set is at capacity and an inline sweep of expired entries could not
+    /// make room. The caller ADMITS the event anyway; see
+    /// [`ReplayGuard::begin`] for why fail-open is the policy and what it
+    /// costs.
+    Saturated,
+}
+
+/// The bounded set of ref-update events this node has already admitted.
+///
+/// A `std::sync::Mutex` rather than the tokio mutex `RateLimiter` uses, because
+/// the release path runs in `Drop`, which is synchronous and cannot await. The
+/// critical sections are a hash lookup and an insert, so holding a blocking
+/// lock across them costs nothing a runtime would notice.
+pub(crate) struct ReplayGuard {
+    seen: std::sync::Mutex<HashMap<[u8; 32], SeenEntry>>,
+    /// How long an entry stays authoritative. Production passes
+    /// [`GOSSIP_SEEN_EVENTS_RETENTION`]; the parameter exists so an expiry test
+    /// pins a clock instead of waiting out eleven minutes.
+    retention: Duration,
+    /// Hard ceiling on entries. Production passes
+    /// [`GOSSIP_SEEN_EVENTS_MAX`]; the parameter exists so a saturation test
+    /// fills two slots rather than a hundred thousand.
+    capacity: usize,
+}
+
+impl ReplayGuard {
+    #[allow(dead_code)] // constructed by the swarm loop in a follow-up
+    pub(crate) fn new() -> Self {
+        Self::with_limits(GOSSIP_SEEN_EVENTS_RETENTION, GOSSIP_SEEN_EVENTS_MAX)
+    }
+
+    /// The single place a guard is built, so a test can never assert against a
+    /// shape production does not run. Both parameters are relations the
+    /// constants above document; nothing else about the guard varies.
+    fn with_limits(retention: Duration, capacity: usize) -> Self {
+        Self {
+            seen: std::sync::Mutex::new(HashMap::new()),
+            retention,
+            capacity,
+        }
+    }
+
+    /// A poisoned mutex is not a reason to stop deduplicating. Nothing behind
+    /// this lock is an invariant a panicking holder could have half-broken: it
+    /// is a map of opaque keys to timestamps, and the worst a poisoned state
+    /// can hold is one stale entry. Refusing to serve it would turn a panic
+    /// somewhere else in the process into a replay window here.
+    fn lock_seen(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], SeenEntry>> {
+        self.seen.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn is_expired(&self, entry: &SeenEntry, now: DateTime<Utc>) -> bool {
+        now.signed_duration_since(entry.recorded_at)
+            > chrono::Duration::seconds(self.retention.as_secs() as i64)
+    }
+
+    /// Look up `key` and, if it is new, reserve it. ONE critical section.
+    ///
+    /// Check-then-insert with the lock released in between admits two
+    /// concurrent deliveries of the same bytes: both look, both miss, both
+    /// insert, both are admitted. The swarm loop is sequential today so that
+    /// race is theoretical, but the guard must not depend on a caller property
+    /// it cannot see, and the atomic shape costs nothing given the lock is
+    /// already held.
+    ///
+    /// An entry past [`retention`] is treated as absent rather than as a
+    /// replay. The periodic sweep runs every 300 seconds, so an entry can
+    /// outlive its horizon by up to a tick, and answering `Replayed` on one
+    /// would make the retention constant mean whatever the sweep cadence
+    /// happened to be.
+    ///
+    /// At capacity the answer is `Saturated`, and the caller admits the event
+    /// unrecorded. Fail-closed was considered and rejected: a saturated set
+    /// that dropped all fresh gossip would convert a loud resource attack into
+    /// quiet mesh-wide censorship of legitimate events, while fail-open leaves
+    /// the freshness window as a hard 10-minute ceiling on any replay. Be exact
+    /// about what that costs: while saturated, a single captured signature can
+    /// again drain the victim author's budget, so
+    /// `gitlawb_gossip_replay_guard_saturated_total` is an alert-worthy signal
+    /// rather than a debug counter.
+    ///
+    /// The counter is incremented HERE rather than at the call site. There is
+    /// exactly one caller today so either would work, but a signal owned by the
+    /// data structure cannot be forgotten by a second caller added later, and
+    /// this one is the only evidence the guard has degraded.
+    ///
+    /// [`retention`]: ReplayGuard::retention
+    #[allow(dead_code)] // called by the ingest path in a follow-up
+    fn begin(&self, key: [u8; 32], now: DateTime<Utc>) -> Begin<'_> {
+        let mut seen = self.lock_seen();
+
+        let present = match seen.get(&key) {
+            Some(entry) if !self.is_expired(entry, now) => return Begin::Replayed,
+            Some(_) => true,
+            None => false,
+        };
+
+        // Only a NEW key can grow the map, so an expired entry being replaced
+        // in place never has to clear the capacity bar.
+        if !present && seen.len() >= self.capacity {
+            Self::sweep_locked(&mut seen, now, self.retention);
+            if seen.len() >= self.capacity {
+                drop(seen);
+                crate::metrics::record_gossip_replay_guard_saturated();
+                return Begin::Saturated;
+            }
+        }
+
+        seen.insert(
+            key,
+            SeenEntry {
+                recorded_at: now,
+                confirmed: false,
+            },
+        );
+        drop(seen);
+        Begin::Reserved(ReplayReservation {
+            guard: self,
+            key,
+            armed: true,
+        })
+    }
+
+    /// Evict every entry past the retention horizon. Called from the swarm
+    /// loop's existing sweep tick alongside `IngestLimiters::cleanup`, and
+    /// inline by [`begin`] when the map is at capacity.
+    ///
+    /// [`begin`]: ReplayGuard::begin
+    #[allow(dead_code)] // called by the swarm loop in a follow-up
+    fn cleanup(&self, now: DateTime<Utc>) {
+        let mut seen = self.lock_seen();
+        Self::sweep_locked(&mut seen, now, self.retention);
+    }
+
+    /// Takes the already-held map rather than locking, so [`begin`] can sweep
+    /// inside its own critical section without releasing and reacquiring.
+    ///
+    /// [`begin`]: ReplayGuard::begin
+    fn sweep_locked(
+        seen: &mut HashMap<[u8; 32], SeenEntry>,
+        now: DateTime<Utc>,
+        retention: Duration,
+    ) {
+        let horizon = chrono::Duration::seconds(retention.as_secs() as i64);
+        seen.retain(|_, entry| now.signed_duration_since(entry.recorded_at) <= horizon);
+    }
+}
+
+#[cfg(test)]
+impl ReplayGuard {
+    fn is_confirmed_for_test(&self, key: &[u8; 32]) -> bool {
+        self.lock_seen().get(key).is_some_and(|e| e.confirmed)
+    }
+}
+
+/// A slot held in the seen-set for an ingest still in flight.
+///
+/// The seen-set records on `Accepted` ONLY, and this is what makes that true
+/// without giving up atomic checking. Recording at check time would mean an
+/// event whose write failed transiently is remembered as seen, so the
+/// publisher's re-publish is dropped as a replay and the row is permanently
+/// lost with nothing left to repair it. Reserving instead means the entry
+/// exists for the duration of the ingest (so a concurrent delivery of the same
+/// bytes still answers `Replayed`) but only a CONFIRMED entry outlives it.
+pub(crate) struct ReplayReservation<'a> {
+    guard: &'a ReplayGuard,
+    key: [u8; 32],
+    /// Whether `Drop` still owes a release.
+    ///
+    /// This flag is why `confirm` is not the obvious `fn confirm(self)` that
+    /// moves the key out: a type with a `Drop` impl cannot have its fields
+    /// moved out (E0509). `confirm` disarms instead, and `Drop` releases only
+    /// while armed.
+    armed: bool,
+}
+
+impl ReplayReservation<'_> {
+    /// Settle the reservation as kept: the event was admitted and its writes
+    /// landed, so the entry outlives this ingest and a later copy of the same
+    /// bytes is a replay.
+    #[allow(dead_code)] // called by the ingest path in a follow-up
+    fn confirm(mut self) {
+        {
+            let mut seen = self.guard.lock_seen();
+            if let Some(entry) = seen.get_mut(&self.key) {
+                entry.confirmed = true;
+            }
+        }
+        // Disarm inside an explicit scope above rather than relying on drop
+        // order between this frame's lock guard and `self`: `Drop` for the
+        // reservation takes the same lock, and a release that ran while the
+        // guard above was still alive would deadlock the swarm loop.
+        self.armed = false;
+    }
+}
+
+impl Drop for ReplayReservation<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.guard.lock_seen().remove(&self.key);
+    }
+}
+
+impl std::fmt::Debug for ReplayReservation<'_> {
+    /// Hand-written because `ReplayGuard` holds a mutex and deriving would
+    /// print through it. The key is the digest of attacker-supplied bytes, so
+    /// only its armed state is worth a log line.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplayReservation")
+            .field("armed", &self.armed)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a ref-update's own timestamp put it outside the freshness window.
+///
+/// Three cases carried explicitly rather than one boolean, because the ingest
+/// path puts the direction in the log line: a mesh full of `TooOld` is a
+/// healing partition or a replay, a mesh full of `TooFarFuture` is one peer
+/// with a broken clock, and `Unparseable` is a publisher emitting something
+/// that is not RFC-3339 at all. An operator reading a spike has to tell them
+/// apart.
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)] // variants are matched by the ingest path in a follow-up
+enum FreshnessViolation {
+    /// Older than [`GOSSIP_REF_UPDATE_FRESHNESS_WINDOW`].
+    TooOld,
+    /// Ahead of this node's clock by more than
+    /// [`GOSSIP_REF_UPDATE_FUTURE_SKEW`].
+    TooFarFuture,
+    /// Not parseable as RFC-3339, so it cannot be freshness-checked at all.
+    Unparseable,
+}
+
+/// Decide whether a ref-update's `timestamp` is fresh enough to admit, against
+/// a caller-supplied `now`.
+///
+/// Pure, and `now` is a parameter rather than a call to [`ingest_now`], so the
+/// unit tests pin an instant without touching the thread-local override at all.
+///
+/// The two directions are TWO COMPARISONS and there is no `abs()` here on
+/// purpose. A distance check admits an event stamped up to a full window into
+/// the future, and a future-dated event is the worse of the two: it pins its
+/// slot in the seen-set while sitting outside the past-window check's reach
+/// until this node's clock catches up, so it outlives the bound the window is
+/// supposed to place on it. The 60-second skew allowance covers honest drift
+/// and nothing more.
+///
+/// An unparseable timestamp is a violation, not an admission. Every producer
+/// emits RFC-3339 (the sole production publish site writes
+/// `chrono::Utc::now().to_rfc3339()`), so nothing legitimate lands here, and
+/// admitting the unparseable case would let a self-signing attacker opt out of
+/// the window entirely by stamping garbage.
+#[allow(dead_code)] // wired into the ingest path in a follow-up
+fn check_freshness(timestamp: &str, now: DateTime<Utc>) -> Result<(), FreshnessViolation> {
+    let stamped = DateTime::parse_from_rfc3339(timestamp)
+        .map_err(|_| FreshnessViolation::Unparseable)?
+        .with_timezone(&Utc);
+
+    let window = chrono::Duration::seconds(GOSSIP_REF_UPDATE_FRESHNESS_WINDOW.as_secs() as i64);
+    let skew = chrono::Duration::seconds(GOSSIP_REF_UPDATE_FUTURE_SKEW.as_secs() as i64);
+
+    if now - stamped > window {
+        return Err(FreshnessViolation::TooOld);
+    }
+    if stamped - now > skew {
+        return Err(FreshnessViolation::TooFarFuture);
+    }
+    Ok(())
+}
+
 /// What the ingest path decided about one inbound gossip message.
 #[derive(Debug)]
 pub(crate) enum IngestOutcome {
@@ -458,6 +876,25 @@ pub(crate) enum IngestOutcome {
     /// a forwarder as an author would be the same class of observability lie
     /// that `WriteFailed` exists to avoid.
     UnsignedSourceRateLimited(String),
+    /// The exact event was already admitted inside the seen-set's retention
+    /// horizon. Carries nothing: a replay names no principal that can be
+    /// trusted, only the forwarder that handed it over, and the swarm loop
+    /// already has that.
+    #[allow(dead_code)] // returned by the ingest path in a follow-up
+    Replayed,
+    /// The event's own `timestamp` put it outside the freshness window. Carries
+    /// the direction (`TooOld`, `TooFarFuture`, or unparseable) as a sentence
+    /// for the log line.
+    ///
+    /// Deliberately not folded into `Replayed`, for the reason
+    /// `UnsignedSourceRateLimited` is not folded into `AuthorRateLimited`:
+    /// they diagnose different conditions. A spike of `Replayed` is a mesh
+    /// replay or an attacker. A spike of `StaleTimestamp` is a peer with a
+    /// broken clock, a partition healing and delivering a backlog, or a replay
+    /// of something older than the set retains. An operator has to tell those
+    /// apart, and one label for both would be an observability lie.
+    #[allow(dead_code)] // returned by the ingest path in a follow-up
+    StaleTimestamp(String),
 }
 
 impl IngestOutcome {
@@ -483,6 +920,8 @@ impl IngestOutcome {
             IngestOutcome::SourceRateLimited => "source_rate_limited",
             IngestOutcome::AuthorRateLimited(_) => "author_rate_limited",
             IngestOutcome::UnsignedSourceRateLimited(_) => "unsigned_source_rate_limited",
+            IngestOutcome::Replayed => "replayed",
+            IngestOutcome::StaleTimestamp(_) => "stale_timestamp",
         }
     }
 }
@@ -1076,6 +1515,26 @@ pub async fn start(
                                     limit = GOSSIP_UNSIGNED_SOURCE_MAX_EVENTS,
                                     window_secs = GOSSIP_INGEST_WINDOW.as_secs(),
                                     "dropped gossip ref-update: forwarding peer over its unsigned-event budget"
+                                ),
+                                // Both name the forwarder and nothing else. A
+                                // replayed event carries a signature that
+                                // proves who AUTHORED it, which is exactly the
+                                // party being impersonated, so logging that DID
+                                // as the source of the problem would point an
+                                // operator at the victim. The forwarder is the
+                                // only identity that says anything about where
+                                // the copy came from.
+                                IngestOutcome::Replayed => warn!(
+                                    from = %propagation_source,
+                                    window_secs = GOSSIP_REF_UPDATE_FRESHNESS_WINDOW.as_secs(),
+                                    "dropped gossip ref-update: already admitted this exact signed event"
+                                ),
+                                IngestOutcome::StaleTimestamp(reason) => warn!(
+                                    from = %propagation_source,
+                                    reason = %reason,
+                                    window_secs = GOSSIP_REF_UPDATE_FRESHNESS_WINDOW.as_secs(),
+                                    skew_secs = GOSSIP_REF_UPDATE_FUTURE_SKEW.as_secs(),
+                                    "dropped gossip ref-update: timestamp outside the freshness window"
                                 ),
                             }
                         }
@@ -1826,6 +2285,14 @@ mod tests {
             | IngestOutcome::UnsignedSourceRateLimited(_) => {
                 panic!("{context}: the event must be rejected by a guard, not by a rate brake")
             }
+            IngestOutcome::Replayed => {
+                panic!(
+                    "{context}: the event must be rejected by a guard, not by the replay seen-set"
+                )
+            }
+            IngestOutcome::StaleTimestamp(reason) => {
+                panic!("{context}: the event must be rejected by a guard, not by the freshness window: {reason}")
+            }
         }
     }
 
@@ -2403,7 +2870,7 @@ mod tests {
     /// Every outcome the ingest path can return has to reach the counter under
     /// its own label, because `/metrics` is the only externally observable
     /// surface this daemon exposes and an unlabelled outcome is an invisible
-    /// one. The exhaustive match in `metric_label` is what makes a seventh
+    /// one. The exhaustive match in `metric_label` is what makes the next
     /// variant a compile error; this pins the labels themselves, since a
     /// copy-paste that gave two variants the same string would still compile and
     /// would silently merge a shed reason into another on the dashboard.
@@ -2417,6 +2884,8 @@ mod tests {
             IngestOutcome::SourceRateLimited.metric_label(),
             IngestOutcome::AuthorRateLimited("did:key:a".into()).metric_label(),
             IngestOutcome::UnsignedSourceRateLimited("peer".into()).metric_label(),
+            IngestOutcome::Replayed.metric_label(),
+            IngestOutcome::StaleTimestamp("too old".into()).metric_label(),
         ];
         assert_eq!(
             labels,
@@ -2428,6 +2897,8 @@ mod tests {
                 "source_rate_limited",
                 "author_rate_limited",
                 "unsigned_source_rate_limited",
+                "replayed",
+                "stale_timestamp",
             ]
         );
 
@@ -3110,5 +3581,354 @@ mod tests {
             );
             assert!(!logs.saw_warn(), "E must not warn, got: {}", logs.text());
         }
+    }
+
+    // ── Freshness window ──────────────────────────────────────────
+    //
+    // `check_freshness` takes `now` as a parameter, so every case below pins a
+    // literal instant and nothing here sleeps or reads the wall clock. The
+    // clock seam (`ingest_now`) is exercised by the ingest-level tests; these
+    // are about the comparison itself.
+
+    /// A fixed instant every freshness case is measured against. Chosen to sit
+    /// 30 seconds after the frozen legacy artifact's timestamp so the
+    /// compatibility case at the bottom is a real admission and not an
+    /// accidental equality.
+    fn freshness_now() -> DateTime<Utc> {
+        "2026-07-02T12:00:30Z"
+            .parse()
+            .expect("the pinned instant must parse")
+    }
+
+    /// Offset `freshness_now()` by `secs` and render it the way a producer
+    /// does, through `to_rfc3339`, so the tests drive the same encoding
+    /// `api::repos` emits rather than a hand-written string.
+    fn stamp(secs: i64) -> String {
+        (freshness_now() + chrono::Duration::seconds(secs)).to_rfc3339()
+    }
+
+    /// Pin the guard-layer clock for the rest of this test's thread.
+    fn pin_ingest_now(at: DateTime<Utc>) {
+        INGEST_NOW_OVERRIDE.with(|c| c.set(Some(at)));
+    }
+
+    /// The seam itself, asserted rather than assumed. Every expiry and
+    /// saturation test below reads its instant back through `ingest_now`, so an
+    /// override that silently did nothing would leave those tests measuring the
+    /// wall clock and passing for the wrong reason.
+    #[test]
+    fn freshness_clock_seam_honours_the_pinned_instant() {
+        let real = ingest_now();
+        pin_ingest_now(freshness_now());
+        assert_eq!(ingest_now(), freshness_now());
+        assert_ne!(
+            freshness_now(),
+            real,
+            "the pinned instant must differ from the wall clock, or this proves nothing"
+        );
+        INGEST_NOW_OVERRIDE.with(|c| c.set(None));
+        assert!(
+            ingest_now() >= real,
+            "clearing the override must return the real clock"
+        );
+    }
+
+    #[test]
+    fn freshness_admits_an_event_stamped_now() {
+        assert_eq!(check_freshness(&stamp(0), freshness_now()), Ok(()));
+    }
+
+    #[test]
+    fn freshness_refuses_an_event_older_than_the_window() {
+        let window = GOSSIP_REF_UPDATE_FRESHNESS_WINDOW.as_secs() as i64;
+        assert_eq!(
+            check_freshness(&stamp(-(window + 1)), freshness_now()),
+            Err(FreshnessViolation::TooOld),
+            "an event one second past the window must be refused as stale-past"
+        );
+    }
+
+    #[test]
+    fn freshness_admits_an_event_just_inside_the_window() {
+        let window = GOSSIP_REF_UPDATE_FRESHNESS_WINDOW.as_secs() as i64;
+        assert_eq!(
+            check_freshness(&stamp(-(window - 1)), freshness_now()),
+            Ok(()),
+            "the window edge is inclusive on the admitting side"
+        );
+    }
+
+    /// The anti-`abs()` witness, and the reason the two directions are two
+    /// comparisons rather than one distance.
+    ///
+    /// An `abs(now - ts) > window` implementation admits everything from here
+    /// out to ten minutes in the future, and an admitted future-dated event is
+    /// worse than a stale one: it pins its seen-set slot while sitting outside
+    /// the past-window check's reach until the clock catches up. Five minutes
+    /// ahead is inside `abs`'s tolerance and outside the skew allowance, so it
+    /// separates the two implementations by itself.
+    #[test]
+    fn freshness_refuses_an_event_stamped_beyond_the_future_skew() {
+        let skew = GOSSIP_REF_UPDATE_FUTURE_SKEW.as_secs() as i64;
+        assert_eq!(
+            check_freshness(&stamp(skew + 1), freshness_now()),
+            Err(FreshnessViolation::TooFarFuture),
+            "one second past the skew allowance must be refused as stale-future"
+        );
+        assert_eq!(
+            check_freshness(&stamp(300), freshness_now()),
+            Err(FreshnessViolation::TooFarFuture),
+            "five minutes ahead is inside abs(delta) < window and must still be refused"
+        );
+    }
+
+    #[test]
+    fn freshness_admits_honest_clock_drift() {
+        assert_eq!(
+            check_freshness(&stamp(30), freshness_now()),
+            Ok(()),
+            "the skew allowance exists so a peer half a minute fast is not refused"
+        );
+    }
+
+    /// Rejecting an unparseable timestamp is safe because every producer emits
+    /// RFC-3339: the sole production publish site
+    /// (`api::repos::post_receive_replication_tail`) sets
+    /// `chrono::Utc::now().to_rfc3339()`, and every test builder in this module
+    /// uses the frozen literal below. An event whose timestamp cannot be parsed
+    /// cannot be freshness-checked at all, and admitting it would let a
+    /// self-signing attacker opt out of the window.
+    #[test]
+    fn freshness_refuses_an_unparseable_timestamp() {
+        assert_eq!(
+            check_freshness("not a time", freshness_now()),
+            Err(FreshnessViolation::Unparseable)
+        );
+        assert_eq!(
+            check_freshness("", freshness_now()),
+            Err(FreshnessViolation::Unparseable)
+        );
+    }
+
+    /// The frozen legacy artifact's own timestamp, driven through the parser
+    /// by execution rather than accepted by inspection. `Z`-suffixed UTC is a
+    /// legal RFC-3339 offset, but the guard that would break every event in
+    /// flight is exactly a parser that quietly disagrees, so it is observed.
+    #[test]
+    fn freshness_admits_the_frozen_legacy_artifacts_timestamp() {
+        let event: RefUpdateEvent = serde_json::from_slice(LEGACY_SIGNED_EVENT_V0.as_bytes())
+            .expect("the frozen artifact must parse");
+        assert_eq!(event.timestamp, "2026-07-02T12:00:00Z");
+        assert_eq!(
+            check_freshness(&event.timestamp, freshness_now()),
+            Ok(()),
+            "the timestamp form every deployed publisher emits must parse and be admitted"
+        );
+    }
+
+    // ── Replay key and the seen-set ───────────────────────────────
+
+    /// SHA-256 of the SIGNING bytes of the frozen legacy artifact, hex,
+    /// lowercase. Computed once by execution and frozen here.
+    ///
+    /// Deliberately NOT the same value as `LEGACY_SIGNED_EVENT_V0_SHA256` above,
+    /// and the difference is the whole point of the key. That constant pins the
+    /// raw wire artifact, `sig` included. This one pins `signing_bytes`, which
+    /// re-serializes the parsed struct with `sig` set to None, so the two digests
+    /// cover different byte strings and always will.
+    ///
+    /// Keying on the signing bytes is what makes the key survive encoding
+    /// malleability: one signature verifies against many wire encodings, and
+    /// only the canonical form collapses that family to a single seen-set slot.
+    /// A key derived from raw `msg.data` would give every re-encoding its own
+    /// slot, which is the defect this guard exists to close.
+    ///
+    /// If this fails, key derivation moved. That is a behaviour change for every
+    /// node in the mesh, not a constant to re-pin.
+    const LEGACY_SIGNED_EVENT_V0_REPLAY_KEY: &str =
+        "a2259888c7738bed38db5864428ab7a2ca502ef269eebe80ef5671aba66f92e7";
+
+    fn legacy_event() -> RefUpdateEvent {
+        serde_json::from_slice(LEGACY_SIGNED_EVENT_V0.as_bytes())
+            .expect("the frozen artifact must parse")
+    }
+
+    #[test]
+    fn replay_key_of_the_frozen_legacy_artifact_matches_the_golden_digest() {
+        let key = replay_key(&legacy_event()).expect("the frozen artifact must re-serialize");
+        assert_eq!(
+            hex::encode(key),
+            LEGACY_SIGNED_EVENT_V0_REPLAY_KEY,
+            "the replay key derivation changed; see the comment on \
+             LEGACY_SIGNED_EVENT_V0_REPLAY_KEY"
+        );
+        assert_ne!(
+            hex::encode(key),
+            LEGACY_SIGNED_EVENT_V0_SHA256,
+            "the replay key must be the digest of the signing bytes, not of the raw wire bytes"
+        );
+    }
+
+    /// The malleability property, at the unit level: two distinct wire
+    /// encodings, one key.
+    ///
+    /// The twin is the frozen artifact with `"v":0` injected. It is six bytes
+    /// longer, hashes differently as raw bytes, and carries a distinct
+    /// gossipsub message id, so the duplicate cache never sees it as the same
+    /// message. It parses to the identical struct, produces identical signing
+    /// bytes, and verifies under the identical signature, which is what makes
+    /// it a replay rather than a new event.
+    #[test]
+    fn replay_key_collapses_the_encoding_malleability_twin() {
+        let twin_json = LEGACY_SIGNED_EVENT_V0.replacen('{', r#"{"v":0,"#, 1);
+        assert_ne!(
+            twin_json, LEGACY_SIGNED_EVENT_V0,
+            "the twin must be a different wire encoding"
+        );
+
+        let twin: RefUpdateEvent =
+            serde_json::from_slice(twin_json.as_bytes()).expect("the twin must parse");
+        verify_ref_update(&twin)
+            .expect("the twin must verify under the same signature, or it is not a replay");
+
+        assert_eq!(
+            hex::encode(replay_key(&twin).unwrap()),
+            LEGACY_SIGNED_EVENT_V0_REPLAY_KEY,
+            "two wire encodings of one signed event must collapse to one seen-set key"
+        );
+    }
+
+    /// A distinct key per test, so nothing here depends on another test's
+    /// state even though each builds its own guard.
+    fn key_of(seed: u8) -> [u8; 32] {
+        [seed; 32]
+    }
+
+    fn pinned() -> DateTime<Utc> {
+        freshness_now()
+    }
+
+    #[test]
+    fn replay_guard_answers_replayed_for_a_key_already_reserved() {
+        let guard = ReplayGuard::with_limits(GOSSIP_SEEN_EVENTS_RETENTION, 8);
+        let now = pinned();
+
+        let first = guard.begin(key_of(1), now);
+        assert!(
+            matches!(first, Begin::Reserved(_)),
+            "a key never seen before must be reserved"
+        );
+        assert!(
+            matches!(guard.begin(key_of(1), now), Begin::Replayed),
+            "a PENDING reservation must already answer Replayed; a check that only counted \
+             confirmed entries would admit two concurrent deliveries of the same bytes"
+        );
+
+        let Begin::Reserved(reservation) = first else {
+            unreachable!("asserted above")
+        };
+        reservation.confirm();
+        assert!(
+            matches!(guard.begin(key_of(1), now), Begin::Replayed),
+            "a confirmed entry must answer Replayed"
+        );
+        assert!(
+            guard.is_confirmed_for_test(&key_of(1)),
+            "confirm must mark the entry, not merely leave it present"
+        );
+    }
+
+    /// The release path, which is what keeps a transient failure from
+    /// permanently burning an event's slot: an event whose write failed must be
+    /// re-publishable.
+    #[test]
+    fn replay_guard_releases_the_slot_when_a_reservation_drops_unconfirmed() {
+        let guard = ReplayGuard::with_limits(GOSSIP_SEEN_EVENTS_RETENTION, 8);
+        let now = pinned();
+
+        match guard.begin(key_of(2), now) {
+            Begin::Reserved(reservation) => drop(reservation),
+            other => panic!("expected a reservation, got {other:?}"),
+        }
+        assert!(
+            matches!(guard.begin(key_of(2), now), Begin::Reserved(_)),
+            "a reservation dropped unconfirmed must leave no trace"
+        );
+    }
+
+    #[test]
+    fn replay_guard_forgets_a_confirmed_entry_after_retention() {
+        let retention = GOSSIP_SEEN_EVENTS_RETENTION;
+        let guard = ReplayGuard::with_limits(retention, 8);
+        let now = pinned();
+
+        match guard.begin(key_of(3), now) {
+            Begin::Reserved(reservation) => reservation.confirm(),
+            other => panic!("expected a reservation, got {other:?}"),
+        }
+
+        let later = now + chrono::Duration::seconds(retention.as_secs() as i64 + 1);
+        guard.cleanup(later);
+        assert!(
+            matches!(guard.begin(key_of(3), later), Begin::Reserved(_)),
+            "an entry past the retention horizon must not answer Replayed"
+        );
+    }
+
+    /// Saturation, and the inline sweep that is the only thing reclaiming slots
+    /// between the swarm loop's 300-second ticks.
+    #[test]
+    fn replay_guard_answers_saturated_at_capacity_then_reclaims_expired_entries() {
+        let retention = GOSSIP_SEEN_EVENTS_RETENTION;
+        let guard = ReplayGuard::with_limits(retention, 2);
+        let now = pinned();
+
+        for seed in [10, 11] {
+            match guard.begin(key_of(seed), now) {
+                Begin::Reserved(reservation) => reservation.confirm(),
+                other => panic!("expected a reservation, got {other:?}"),
+            }
+        }
+
+        assert!(
+            matches!(guard.begin(key_of(12), now), Begin::Saturated),
+            "a full map must answer Saturated, never Replayed: mapping saturation onto Replayed \
+             turns a resource attack into mesh-wide censorship of legitimate events"
+        );
+
+        let later = now + chrono::Duration::seconds(retention.as_secs() as i64 + 1);
+        assert!(
+            matches!(guard.begin(key_of(12), later), Begin::Reserved(_)),
+            "begin must sweep expired entries inline before answering Saturated, or the guard \
+             stays saturated until the next 300-second tick"
+        );
+    }
+
+    /// The saturation signal is what makes the fail-open mode visible. A
+    /// saturated guard admits the event, so the existing ingest counter counts
+    /// it as accepted and nothing else distinguishes a degraded node from a
+    /// healthy one.
+    #[test]
+    fn replay_guard_counts_each_saturation() {
+        crate::metrics::init("0.0.0-test", "did:key:test");
+        let guard = ReplayGuard::with_limits(GOSSIP_SEEN_EVENTS_RETENTION, 1);
+        let now = pinned();
+
+        match guard.begin(key_of(20), now) {
+            Begin::Reserved(reservation) => reservation.confirm(),
+            other => panic!("expected a reservation, got {other:?}"),
+        }
+
+        // A before/after delta, not an equality against a literal. This counter
+        // carries no labels and lives in a process-wide registry shared by every
+        // test in this binary, so an equality would be a hostage to any second
+        // test that ever reaches saturation.
+        let before = crate::metrics::replay_guard_saturated_count_for_test();
+        assert!(matches!(guard.begin(key_of(21), now), Begin::Saturated));
+        assert_eq!(
+            crate::metrics::replay_guard_saturated_count_for_test(),
+            before + 1,
+            "each Saturated answer must increment the saturation counter"
+        );
     }
 }
