@@ -250,7 +250,7 @@ pub async fn announce(
     // the real peers under junk so node-origin repos stop replicating.
     if !is_public_http_url(&req.http_url) {
         return Err(AppError::BadRequest(
-            "http_url must be a public http(s) URL (no loopback, private, or .internal/.local hosts)".into(),
+            "http_url must be a public http(s) URL (no loopback, private, localhost, .localhost, .internal, or .local hosts)".into(),
         ));
     }
 
@@ -1530,6 +1530,31 @@ mod tests {
             "/api/v1/peers/announce",
             Body::from(body.to_string()),
         )
+    }
+
+    #[sqlx::test]
+    async fn announce_rejects_localhost_subdomains_with_an_accurate_error(pool: PgPool) {
+        let state = test_state(pool).await;
+        let did = Keypair::generate().did().to_string();
+        let resp = announce_only(state.clone())
+            .oneshot(announce_as(
+                &did,
+                &announce_body(&did, "https://node.localhost:7545"),
+            ))
+            .await
+            .unwrap();
+
+        let (status, error, message) = status_and_error(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error, "bad_request");
+        assert_eq!(
+            message,
+            "http_url must be a public http(s) URL (no loopback, private, localhost, .localhost, .internal, or .local hosts)"
+        );
+        assert!(
+            snapshot(&state.db, &did).await.is_none(),
+            "a rejected .localhost announce must leave no row behind"
+        );
     }
 
     /// U4 scenario 1, and the first test the keyid branch has ever had: a caller
