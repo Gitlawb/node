@@ -134,6 +134,9 @@ fn validate_mirror_upstream_url(raw: &str) -> Result<reqwest::Url> {
     if url.scheme() != "https" {
         anyhow::bail!("mirror upstream URL must use HTTPS");
     }
+    if !crate::api::peers::is_public_http_url(raw) {
+        anyhow::bail!("mirror upstream URL must use a public host");
+    }
     if url.host_str().is_none() || url.path().trim_matches('/').is_empty() {
         anyhow::bail!("mirror upstream URL must include a host and repository path");
     }
@@ -3416,6 +3419,17 @@ mod mirror_state_tests {
             "https://github.com/Gitlawb/node.git#main",
             "https://github.com/",
             "https://github.com/Gitlawb/node.git\n",
+            "https://localhost/Gitlawb/node.git",
+            "https://forge.localhost/Gitlawb/node.git",
+            "https://127.0.0.1/Gitlawb/node.git",
+            "https://[::1]/Gitlawb/node.git",
+            "https://169.254.169.254/Gitlawb/node.git",
+            "https://10.0.0.5/Gitlawb/node.git",
+            "https://172.16.0.5/Gitlawb/node.git",
+            "https://192.168.1.5/Gitlawb/node.git",
+            "https://forge.internal/Gitlawb/node.git",
+            "https://[::ffff:127.0.0.1]/Gitlawb/node.git",
+            "https://[64:ff9b::7f00:1]/Gitlawb/node.git",
         ] {
             assert!(
                 validate_mirror_upstream_url(invalid).is_err(),
@@ -3792,16 +3806,34 @@ mod mirror_state_tests {
     }
 
     #[sqlx::test]
-    async fn peer_mirror_rows_cannot_become_continuous_upstreams(pool: PgPool) {
+    async fn continuous_mirror_uuid_gate_leaves_peer_rows_untouched(pool: PgPool) {
         let db = migrated_db(pool).await;
         db.upsert_mirror_repo("z6MkPeer", "repo", "/srv/peer/repo.git", None, false)
             .await
             .unwrap();
 
-        let result = db
+        let error = db
             .configure_inbound_mirror("z6MkPeer/repo", "https://github.com/Gitlawb/node.git")
-            .await;
-        assert!(result.is_err());
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("continuous mirrors require a canonical UUID repository id"),
+            "unexpected error: {error:#}"
+        );
+
+        let unchanged: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT upstream_url, mirror_status FROM repos WHERE id = $1")
+                .bind("z6MkPeer/repo")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(unchanged, (None, None));
+        assert!(db
+            .get_repo_mirror_state("z6MkPeer/repo")
+            .await
+            .unwrap()
+            .is_none());
     }
 }
 

@@ -104,8 +104,8 @@ fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
 
 /// Whether a peer `http_url` is a public http(s) endpoint safe to register.
 /// Rejects non-http(s) schemes, loopback/unspecified/private/link-local IPs,
-/// and `localhost` / `.local` / `.internal` hostnames. Used at announce time
-/// and by the boot-time prune of already-poisoned rows.
+/// and `localhost` / `.localhost` / `.local` / `.internal` hostnames. Used at
+/// announce time and by the boot-time prune of already-poisoned rows.
 pub fn is_public_http_url(raw: &str) -> bool {
     let url = match reqwest::Url::parse(raw) {
         Ok(u) => u,
@@ -125,6 +125,7 @@ pub fn is_public_http_url(raw: &str) -> bool {
     }
     if host.is_empty()
         || host == "localhost"
+        || host.ends_with(".localhost")
         || host.ends_with(".local")
         || host.ends_with(".internal")
     {
@@ -529,6 +530,7 @@ mod tests {
     fn rejects_loopback_private_and_internal() {
         for bad in [
             "http://localhost:7545",
+            "http://node.localhost:7545",
             "http://127.0.0.1:5432/",
             "http://localhost:22/",
             "http://0.0.0.0:7545",
