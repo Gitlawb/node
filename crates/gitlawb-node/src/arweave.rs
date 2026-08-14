@@ -11,10 +11,15 @@
 //! the bundler only serves items backed by a funded account, and refuses
 //! under-funded uploads with "Not enough balance" — which the push path degrades
 //! to a warning, so an unfunded node silently loses every anchor. Funding is
-//! therefore mandatory configuration, not optional: set `GITLAWB_BUNDLER_ACCOUNT`
-//! to the funded account you created for this node (top up via the bundler's
-//! devnet faucet on devnet hosts); `Config::validate()` refuses to start with a
-//! bundler URL but no funded account.
+//! therefore mandatory configuration, not optional. Irys bills each upload
+//! against a payment token at `/tx/{token}` and reads the funded address from
+//! the `x-irys-paid-by` header (see the `@irys/upload` js-sdk,
+//! `UploadHeaders.PAID_BY`), so the node sends:
+//!   - `GITLAWB_BUNDLER_ACCOUNT` — the funded address/identity, as `x-irys-paid-by`
+//!   - `GITLAWB_BUNDLER_TOKEN` — the payment-token slug (e.g. "matic")
+//!   - `GITLAWB_BUNDLER_URL` — the node base URL; uploads go to `{url}/tx/{token}`
+//!   - `Config::validate()` refuses to start with a bundler URL but no funded
+//!     account or payment token.
 //!
 //! Set `GITLAWB_BUNDLER_URL` (deprecated name: `GITLAWB_IRYS_URL`) to override the default endpoint:
 //!   - devnet (faucet-funded):  https://devnet.irys.xyz
@@ -27,7 +32,6 @@
 //! The permanent Arweave URL is: <gateway>/<tx_id>
 //!
 //! Anchors are stored in the `arweave_anchors` table for auditability.
-
 use anyhow::Result;
 use base64::Engine as _;
 use futures::StreamExt;
@@ -36,7 +40,6 @@ use serde_json::json;
 use sha2::Digest;
 use std::collections::HashMap;
 use std::str::FromStr;
-
 /// Data describing a ref-update event to be anchored.
 #[derive(Debug, Clone)]
 pub struct RefAnchor {
@@ -54,7 +57,6 @@ pub struct RefAnchor {
     /// serialized and embedded so a verifier can validate the chain.
     pub certificate: Option<crate::db::RefCertificate>,
 }
-
 /// Anchor a ref-update to Arweave via Irys.
 ///
 /// The payload is uploaded as a signed ANS-104 data item: `node_keypair` signs
@@ -66,13 +68,13 @@ pub async fn anchor_ref_update(
     client: &reqwest::Client,
     bundler_url: &str,
     bundler_account: &str,
+    bundler_token: &str,
     anchor: &RefAnchor,
     node_keypair: &gitlawb_core::identity::Keypair,
 ) -> Result<String> {
     if bundler_url.is_empty() {
         return Ok(String::new());
     }
-
     let mut payload = json!({
         "schema": "gitlawb/ref-update/v1",
         "repo": anchor.repo,
@@ -86,14 +88,11 @@ pub async fn anchor_ref_update(
         "node_did": anchor.node_did,
         "network": "alpha",
     });
-
     // Embed the signed certificate so verifiers can validate the chain.
     if let Some(cert) = &anchor.certificate {
         payload["certificate"] = serde_json::to_value(cert)?;
     }
-
     let body = serde_json::to_vec(&payload)?;
-
     let tags: Vec<(String, String)> = [
         "App-Name:gitlawb".to_string(),
         "Schema:gitlawb/ref-update/v1".to_string(),
@@ -108,50 +107,53 @@ pub async fn anchor_ref_update(
         (name.to_string(), value.to_string())
     })
     .collect();
-
     let data_item = crate::ans104::build_signed_data_item(node_keypair, &tag_refs(&tags), &body)?;
-
-    // Irys upload endpoint
-    let url = format!("{}/v1/tx", bundler_url.trim_end_matches('/'));
-
+    // Irys upload target: {bundler_url}/tx/{token}. Built structurally so a
+    // query on the base URL is preserved and a fragment is rejected outright.
+    let url = bundler_upload_url(bundler_url, bundler_token)?;
+    let display_url = crate::server::mask_credential_url(&url);
     let resp = client
         .post(&url)
         .header("Content-Type", "application/octet-stream")
-        .header("x-bundler-address", bundler_account)
+        .header("x-irys-paid-by", bundler_account)
         .body(data_item)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("Bundler upload failed: {e}"))?;
-
+        .map_err(|e| {
+            // reqwest embeds the request URL verbatim; swap in the masked form.
+            let safe_err = e.to_string().replace(&url, &display_url);
+            anyhow::anyhow!("Bundler upload failed: {safe_err}")
+        })?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = truncate_for_error(&resp.text().await.unwrap_or_default(), 512);
         return Err(anyhow::anyhow!("Bundler returned {status}: {body}"));
     }
-
     let json: serde_json::Value = resp
         .json()
         .await
         .map_err(|e| anyhow::anyhow!("failed to parse Bundler response: {e}"))?;
-
     // Bundler response: {"id": "<data_item_id>", "timestamp": ..., "version": ...}
     let tx_id = json["id"]
         .as_str()
-        .ok_or_else(|| anyhow::anyhow!("no 'id' in Bundler response: {json}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no 'id' in Bundler response: {}",
+                truncate_for_error(&json.to_string(), 512)
+            )
+        })?
         .to_string();
-
     tracing::info!(
         repo = %anchor.repo,
         ref_name = %anchor.ref_name,
         new_sha = %anchor.new_sha,
         tx_id = %tx_id,
         bundler_account = %bundler_account,
+        bundler_token = %bundler_token,
         "anchored ref update to Arweave via bundler"
     );
-
     Ok(tx_id)
 }
-
 /// A per-push manifest of the blobs encrypted this push (Option B3). The
 /// `blobs` slice is `(oid, cid)` tuples. Anchored directly to Arweave as its JSON
 /// body so the discovery index survives total node loss. Recipient identities are
@@ -163,7 +165,6 @@ pub struct EncryptedManifest<'a> {
     pub timestamp: &'a str,
     pub blobs: &'a [(String, String)],
 }
-
 /// Anchor a per-push encrypted-blob manifest to Arweave via Irys. The manifest
 /// JSON body is the payload (not a CID pointer to IPFS), so the index is
 /// permanent and self-contained. Recipient identities are deliberately omitted:
@@ -179,19 +180,18 @@ pub async fn anchor_encrypted_manifest(
     client: &reqwest::Client,
     bundler_url: &str,
     bundler_account: &str,
+    bundler_token: &str,
     manifest: &EncryptedManifest<'_>,
     node_keypair: &gitlawb_core::identity::Keypair,
 ) -> Result<String> {
     if bundler_url.is_empty() || manifest.blobs.is_empty() {
         return Ok(String::new());
     }
-
     let blobs_json: Vec<serde_json::Value> = manifest
         .blobs
         .iter()
         .map(|(oid, cid)| manifest_blob_json(oid, cid))
         .collect();
-
     let payload = json!({
         "schema": "gitlawb/encrypted-manifest/v1",
         "repo": manifest.repo,
@@ -200,9 +200,7 @@ pub async fn anchor_encrypted_manifest(
         "timestamp": manifest.timestamp,
         "blobs": blobs_json,
     });
-
     let body = serde_json::to_vec(&payload)?;
-
     let tags: Vec<(String, String)> = [
         "App-Name:gitlawb".to_string(),
         "Schema:gitlawb/encrypted-manifest/v1".to_string(),
@@ -216,59 +214,62 @@ pub async fn anchor_encrypted_manifest(
         (name.to_string(), value.to_string())
     })
     .collect();
-
     let data_item = crate::ans104::build_signed_data_item(node_keypair, &tag_refs(&tags), &body)?;
-    let url = format!("{}/v1/tx", bundler_url.trim_end_matches('/'));
-
+    // Irys upload target: {bundler_url}/tx/{token}. Built structurally so a
+    // query on the base URL is preserved and a fragment is rejected outright.
+    let url = bundler_upload_url(bundler_url, bundler_token)?;
+    let display_url = crate::server::mask_credential_url(&url);
     let resp = client
         .post(&url)
         .header("Content-Type", "application/octet-stream")
-        .header("x-bundler-address", bundler_account)
+        .header("x-irys-paid-by", bundler_account)
         .body(data_item)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("Bundler upload failed: {e}"))?;
-
+        .map_err(|e| {
+            // reqwest embeds the request URL verbatim; swap in the masked form.
+            let safe_err = e.to_string().replace(&url, &display_url);
+            anyhow::anyhow!("Bundler upload failed: {safe_err}")
+        })?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = truncate_for_error(&resp.text().await.unwrap_or_default(), 512);
         return Err(anyhow::anyhow!("Bundler returned {status}: {body}"));
     }
-
     let json: serde_json::Value = resp
         .json()
         .await
         .map_err(|e| anyhow::anyhow!("failed to parse Bundler response: {e}"))?;
-
     let tx_id = json["id"]
         .as_str()
-        .ok_or_else(|| anyhow::anyhow!("no 'id' in Bundler response: {json}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no 'id' in Bundler response: {}",
+                truncate_for_error(&json.to_string(), 512)
+            )
+        })?
         .to_string();
-
     tracing::info!(
         repo = %manifest.repo,
         tx_id = %tx_id,
         blobs = manifest.blobs.len(),
         bundler_account = %bundler_account,
+        bundler_token = %bundler_token,
         "anchored encrypted manifest to Arweave via bundler"
     );
-
     Ok(tx_id)
 }
-
 /// Serialize one blob for the Arweave manifest. Recipient identities are
 /// intentionally absent so the permanent public anchor never records who can
 /// read a blob.
 fn manifest_blob_json(oid: &str, cid: &str) -> serde_json::Value {
     json!({ "oid": oid, "cid": cid })
 }
-
 /// Borrow `(name, value)` string slices from owned tag pairs for
 /// [`crate::ans104::build_signed_data_item`].
 fn tag_refs(tags: &[(String, String)]) -> Vec<(&str, &str)> {
     tags.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect()
 }
-
 /// Strip characters that are invalid in bundler/Arweave tag values.
 fn sanitize_tag(s: &str) -> String {
     s.chars()
@@ -276,13 +277,58 @@ fn sanitize_tag(s: &str) -> String {
         .take(128)
         .collect()
 }
-
 /// Arweave URL for a given transaction ID, resolved through a configurable gateway.
 #[allow(dead_code)]
 pub fn arweave_url(gateway: &str, tx_id: &str) -> String {
     format!("{}/{}", gateway.trim_end_matches('/'), tx_id)
 }
-
+/// Structurally join a base URL onto a path (`/tx/{token}` for uploads, a tx_id
+/// for gateway reads), preserving the base's query string and rejecting
+/// fragments. String concatenation would silently drop or garble a
+/// query/fragment form and could smuggle credentials into the request target;
+/// joining through `Url` keeps every part where it belongs. The returned string
+/// is also the exact request target, so tests can assert it verbatim.
+fn join_url_path(base: &str, segments: &[&str], what: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse(base).map_err(|e| anyhow::anyhow!("invalid {what}: {e}"))?;
+    if url.fragment().is_some() {
+        return Err(anyhow::anyhow!(
+            "{what} must not contain a URL fragment (a fragment is never sent to the \
+             bundler/gateway and would silently change the request)"
+        ));
+    }
+    let query = url.query().map(str::to_string);
+    {
+        let mut segments_mut = url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("{what} must be a hierarchical URL"))?;
+        segments_mut.pop_if_empty();
+        for seg in segments {
+            segments_mut.push(seg);
+        }
+    }
+    if let Some(q) = query {
+        url.set_query(Some(&q));
+    }
+    Ok(url.to_string())
+}
+/// Irys upload request target: `{bundler_url}/tx/{token}`, structurally joined.
+fn bundler_upload_url(bundler_url: &str, token: &str) -> Result<String> {
+    join_url_path(bundler_url, &["tx", token], "bundler URL")
+}
+/// Gateway request target for a transaction ID: `{gateway_url}/{tx_id}`.
+fn gateway_tx_url(gateway_url: &str, tx_id: &str) -> Result<String> {
+    join_url_path(gateway_url, &[tx_id], "gateway URL")
+}
+/// Cap a value for error messages/logs so a hostile or misbehaving endpoint
+/// cannot drive unbounded allocations or output through an error string.
+fn truncate_for_error(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut out = s.chars().take(max).collect::<String>();
+    out.push_str("…(truncated)");
+    out
+}
 /// Result of verifying an Arweave anchor against the stored certificate chain.
 #[derive(Debug, Clone, Serialize)]
 pub struct VerifyResult {
@@ -291,7 +337,6 @@ pub struct VerifyResult {
     pub certificate: Option<crate::db::RefCertificate>,
     pub errors: Vec<String>,
 }
-
 /// Fetch an anchor from Arweave, extract the embedded certificate, and verify
 /// the full chain: certificate signature, prev hash linkage, and pusher signature.
 pub async fn verify_anchor(
@@ -303,15 +348,23 @@ pub async fn verify_anchor(
 ) -> Result<VerifyResult> {
     // Fetch the data item from the Arweave gateway's data path.
     // Gateways serve data at /{tx_id}, not /v1/tx/{id} (which is the bundler API).
-    let url = format!("{}/{}", gateway_url.trim_end_matches('/'), tx_id);
+    // Built structurally: a query on the gateway config is preserved, and a
+    // fragment is rejected (it would never be sent to the gateway).
+    let url = match gateway_tx_url(gateway_url, tx_id) {
+        Ok(u) => u,
+        Err(e) => {
+            return Ok(VerifyResult {
+                valid: false,
+                anchor: serde_json::Value::Null,
+                certificate: None,
+                errors: vec![e.to_string()],
+            });
+        }
+    };
     // Public-facing display form of the same URL: reqwest's connection error
     // embeds the request URL verbatim, so if the gateway config carries
     // credentials the error text would otherwise leak them into VerifyResult.
-    let display_url = format!(
-        "{}/{}",
-        crate::server::mask_credential_url(gateway_url).trim_end_matches('/'),
-        tx_id
-    );
+    let display_url = crate::server::mask_credential_url(&url);
     let resp = match client.get(&url).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -359,7 +412,6 @@ pub async fn verify_anchor(
         }
         body_bytes.extend_from_slice(&data);
     }
-
     // Parse the payload — could be JSON or raw bytes depending on gateway.
     // Non-JSON responses are handled as an invalid result rather than an error.
     let anchor: serde_json::Value = match serde_json::from_slice(&body_bytes) {
@@ -374,14 +426,11 @@ pub async fn verify_anchor(
         }
     };
     let cert_value = anchor.get("certificate");
-
     let cert: Option<crate::db::RefCertificate> = match cert_value {
         Some(v) => serde_json::from_value(v.clone()).ok(),
         None => None,
     };
-
     let mut errors = Vec::new();
-
     if let Some(ref c) = cert {
         // 0a. Verify the certificate was issued by this node.
         if c.node_did != node_did {
@@ -390,7 +439,6 @@ pub async fn verify_anchor(
                 c.node_did, node_did
             ));
         }
-
         // 0b. Cross-check the outer anchor fields against the embedded certificate.
         //    A valid anchor must commit to the same identities and ref state.
         //    The outer repo_id (UUID) is compared against the cert's repo_id (UUID)
@@ -448,7 +496,6 @@ pub async fn verify_anchor(
                 c.node_did
             ));
         }
-
         // 0c. Corroborate outer repo slug and owner_did against the node's own
         //    record for the certificate's repo_id.  The certificate signs the
         //    repo_id UUID but not the human-readable slug or owner DID, so a
@@ -500,17 +547,18 @@ pub async fn verify_anchor(
                 }
             }
             Err(e) => {
+                // The raw DB error never reaches the caller (it can embed
+                // connection details); it is logged server-side only, and the
+                // deny is stated without it, like the not-found branch above.
+                tracing::warn!("repo lookup failed for {}: {e}", c.repo_id);
                 if outer_identity_present {
                     errors.push(format!(
-                        "repo lookup failed for {} — outer repo/owner_did cannot be corroborated: {e}",
+                        "repo lookup failed for {} — outer repo/owner_did cannot be corroborated",
                         c.repo_id
                     ));
-                } else {
-                    tracing::warn!("repo lookup failed for {}: {e}", c.repo_id);
                 }
             }
         }
-
         // 1. Verify node signature on the certificate payload.
         //    Certificates produced after this PR use a 13-field payload
         //    that includes seq, prev, and proof fields.  Pre-PR certificates
@@ -521,7 +569,6 @@ pub async fn verify_anchor(
             && c.signature_input.is_none()
             && c.content_digest.is_none()
             && c.request_path.is_none();
-
         // Resolve node DID to public key
         let node_did = match gitlawb_core::did::Did::from_str(&c.node_did) {
             Ok(did) => did,
@@ -547,7 +594,6 @@ pub async fn verify_anchor(
                 });
             }
         };
-
         let sig_array: [u8; 64] =
             match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&c.signature) {
                 Ok(bytes) => match bytes.as_slice().try_into() {
@@ -572,7 +618,6 @@ pub async fn verify_anchor(
                     });
                 }
             };
-
         // Try 13-field payload first.
         let payload_13 = serde_json::json!({
             "repo_id":    c.repo_id,
@@ -592,7 +637,6 @@ pub async fn verify_anchor(
         let payload_bytes_13 = serde_json::to_vec(&payload_13)?;
         let sig_valid_13 =
             gitlawb_core::identity::verify(&verifying_key, &payload_bytes_13, &sig_array);
-
         let mut legacy_7_field_verified = false;
         if proof_fields_null && sig_valid_13.is_err() {
             // Fall back to 7-field payload for pre-PR certificates.
@@ -615,7 +659,6 @@ pub async fn verify_anchor(
         } else if let Err(e) = sig_valid_13 {
             errors.push(format!("certificate signature verification failed: {e}"));
         }
-
         // 1b. Corroborate chain position for legacy certificates.
         //    The 7-field fallback covers only repo_id, ref, old, new, pusher,
         //    node, ts.  seq and prev are NOT covered on that path, so a tampered
@@ -665,7 +708,6 @@ pub async fn verify_anchor(
                 }
             }
         }
-
         // 2. Verify prev hash linkage against the predecessor at seq - 1.
         //    The prev hash covers the 7-field payload (repo_id, ref, old, new,
         //    pusher, node, ts) — seq, prev, and proof fields are excluded so
@@ -721,7 +763,6 @@ pub async fn verify_anchor(
                 }
             }
         }
-
         // 3. Verify the pusher authorization proof (RFC 9421 HTTP Signature).
         //    The context fields (signature_input, content_digest, request_path)
         //    are bound into the node signing payload, so a certificate whose
@@ -754,12 +795,10 @@ pub async fn verify_anchor(
                             request_values.insert("@path".to_string(), request_path.clone());
                             request_values
                                 .insert("content-digest".to_string(), content_digest.clone());
-
                             let sig_params_value =
                                 sig_input.strip_prefix("sig1=").unwrap_or(sig_input);
                             let components_ref: Vec<&str> =
                                 http_sig.components.iter().map(String::as_str).collect();
-
                             match gitlawb_core::http_sig::build_signing_string(
                                 &components_ref,
                                 sig_params_value,
@@ -844,7 +883,6 @@ pub async fn verify_anchor(
     } else {
         errors.push("no embedded certificate found in anchor".to_string());
     }
-
     Ok(VerifyResult {
         valid: errors.is_empty(),
         anchor,
@@ -852,22 +890,24 @@ pub async fn verify_anchor(
         errors,
     })
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::StatusCode;
     use gitlawb_core::identity::Keypair;
-
     /// Spin up an in-process bundler that *enforces* the signed data item
     /// contract: it parses the posted bytes as an ANS-104 item, verifies the
     /// Ed25519 signature against `kp`, checks that every `expected_tag` is
     /// present inside the item, and requires the embedded JSON payload to pass
-    /// `validate`. Any failure returns 400 (surfacing as `Err` from the anchor
-    /// functions); success returns `{"id": <tx_id>}`.
+    /// `validate`. It also asserts the Irys wire contract verbatim: the request
+    /// target must equal `expected_request_target` (i.e. `/tx/{token}`, possibly
+    /// with a path prefix or query) and the `x-irys-paid-by` header must carry
+    /// `expected_bundler_account`. Any failure returns 400 (surfacing as `Err`
+    /// from the anchor functions); success returns `{"id": <tx_id>}`.
     async fn spawn_enforcing_bundler(
         kp: &Keypair,
         expected_bundler_account: &'static str,
+        expected_request_target: &'static str,
         expected_tags: &[(&str, &str)],
         validate: impl Fn(&serde_json::Value) -> bool + Send + Sync + Clone + 'static,
         tx_id: &'static str,
@@ -879,25 +919,47 @@ mod tests {
             .collect();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        // Serve the exact path the client must request (path portion of the
+        // expected request target), so prefixed or query-carrying bases are
+        // exercised structurally rather than special-cased.
+        let route_path = expected_request_target
+            .split('?')
+            .next()
+            .unwrap_or(expected_request_target);
         let router = axum::Router::new().route(
-            "/v1/tx",
+            route_path,
             axum::routing::post(
-                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                move |uri: axum::http::Uri,
+                      headers: axum::http::HeaderMap,
+                      body: axum::body::Bytes| {
                     let vk = vk;
                     let expected = expected.clone();
                     async move {
+                        // The request target is the Irys contract: /tx/{token}
+                        // with the base's query preserved. Assert it verbatim so
+                        // the structural URL join cannot regress.
+                        let target = uri.path_and_query().map(|q| q.as_str()).unwrap_or("");
+                        if target != expected_request_target {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                format!(
+                                    "wrong request target: got {target:?}, want \
+                                     {expected_request_target:?}"
+                                ),
+                            );
+                        }
                         // The funded-account identity must be part of the request,
                         // not just the config: the item signature is authorship.
                         if !expected_bundler_account.is_empty() {
                             let got = headers
-                                .get("x-bundler-address")
+                                .get("x-irys-paid-by")
                                 .and_then(|v| v.to_str().ok())
                                 .unwrap_or_default();
                             if got != expected_bundler_account {
                                 return (
                                     StatusCode::BAD_REQUEST,
                                     format!(
-                                        "missing/wrong x-bundler-address: got {got:?}, want \
+                                        "missing/wrong x-irys-paid-by: got {got:?}, want \
                                      {expected_bundler_account:?}"
                                     ),
                                 );
@@ -945,7 +1007,6 @@ mod tests {
         });
         format!("http://{addr}")
     }
-
     #[tokio::test]
     async fn test_anchor_noop_when_url_empty() {
         let kp = Keypair::generate();
@@ -962,17 +1023,17 @@ mod tests {
             node_did: "did:key:z6MknndwexV9...".into(),
             certificate: None,
         };
-        let result = anchor_ref_update(&client, "", "", &anchor, &kp).await;
+        let result = anchor_ref_update(&client, "", "", "", &anchor, &kp).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "");
     }
-
     #[tokio::test]
     async fn test_anchor_success() {
         let kp = Keypair::generate();
         let server = spawn_enforcing_bundler(
             &kp,
             "zBundlerAccount",
+            "/tx/matic",
             &[
                 ("App-Name", "gitlawb"),
                 ("Schema", "gitlawb/ref-update/v1"),
@@ -982,7 +1043,6 @@ mod tests {
             "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuOk",
         )
         .await;
-
         let client = reqwest::Client::new();
         let anchor = RefAnchor {
             repo: "alice/myrepo".into(),
@@ -996,15 +1056,14 @@ mod tests {
             node_did: "did:key:z6Mknnd...".into(),
             certificate: None,
         };
-
-        let result = anchor_ref_update(&client, &server, "zBundlerAccount", &anchor, &kp).await;
+        let result =
+            anchor_ref_update(&client, &server, "zBundlerAccount", "matic", &anchor, &kp).await;
         assert!(result.is_ok(), "anchor should succeed: {result:?}");
         assert_eq!(
             result.unwrap(),
             "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuOk"
         );
     }
-
     /// The funded bundler account must ride on the upload request: the item
     /// signature is authorship, not payment, so an upload that omits the
     /// account must be refused — it would otherwise be billed to nobody.
@@ -1024,24 +1083,22 @@ mod tests {
             node_did: "did:key:z6Mknnd...".into(),
             certificate: None,
         };
-
         let server = spawn_enforcing_bundler(
             &kp,
             "zBundlerAccount",
+            "/tx/matic",
             &[("App-Name", "gitlawb"), ("Schema", "gitlawb/ref-update/v1")],
             |_| true,
             "NEVER_RETURNED",
         )
         .await;
-
-        let result = anchor_ref_update(&client, &server, "", &anchor, &kp).await;
+        let result = anchor_ref_update(&client, &server, "", "matic", &anchor, &kp).await;
         let err = result.expect_err("missing bundler account must fail the upload");
         assert!(
-            err.to_string().contains("x-bundler-address"),
+            err.to_string().contains("x-irys-paid-by"),
             "error should name the missing account header: {err}"
         );
     }
-
     #[tokio::test]
     async fn test_anchor_body_carries_real_old_sha() {
         // The anchored body must serialize the real old→new transition the
@@ -1055,12 +1112,12 @@ mod tests {
         let server = spawn_enforcing_bundler(
             &kp,
             "zBundlerAccount",
+            "/tx/matic",
             &[("App-Name", "gitlawb")],
             move |j| j["old_sha"] == real_old && j["new_sha"] == real_new,
             "TX_REAL_OLD_SHA",
         )
         .await;
-
         let client = reqwest::Client::new();
         let anchor = RefAnchor {
             repo: "alice/myrepo".into(),
@@ -1074,11 +1131,10 @@ mod tests {
             node_did: "did:key:z6Mknnd...".into(),
             certificate: None,
         };
-
-        let result = anchor_ref_update(&client, &server, "zBundlerAccount", &anchor, &kp).await;
+        let result =
+            anchor_ref_update(&client, &server, "zBundlerAccount", "matic", &anchor, &kp).await;
         assert_eq!(result.unwrap(), "TX_REAL_OLD_SHA");
     }
-
     #[tokio::test]
     async fn test_anchor_rejected_when_signed_by_other_key() {
         // The bundler enforces the node's public key; an item signed by a
@@ -1088,12 +1144,12 @@ mod tests {
         let server = spawn_enforcing_bundler(
             &node_kp,
             "zBundlerAccount",
+            "/tx/matic",
             &[("App-Name", "gitlawb")],
             |_| true,
             "NEVER_RETURNED",
         )
         .await;
-
         let client = reqwest::Client::new();
         let anchor = RefAnchor {
             repo: "alice/myrepo".into(),
@@ -1107,15 +1163,20 @@ mod tests {
             node_did: "did:key:z6Mknnd...".into(),
             certificate: None,
         };
-
-        let result =
-            anchor_ref_update(&client, &server, "zBundlerAccount", &anchor, &impostor_kp).await;
+        let result = anchor_ref_update(
+            &client,
+            &server,
+            "zBundlerAccount",
+            "matic",
+            &anchor,
+            &impostor_kp,
+        )
+        .await;
         assert!(
             result.is_err(),
             "upload signed by the wrong key must be denied by the bundler"
         );
     }
-
     #[test]
     fn test_arweave_url() {
         let url = arweave_url(
@@ -1127,7 +1188,6 @@ mod tests {
             "https://arweave.net/7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuOk"
         );
     }
-
     #[tokio::test]
     async fn test_manifest_anchor_noop_when_url_empty() {
         let client = reqwest::Client::new();
@@ -1141,13 +1201,12 @@ mod tests {
             blobs: &blobs,
         };
         assert_eq!(
-            anchor_encrypted_manifest(&client, "", "", &m, &kp)
+            anchor_encrypted_manifest(&client, "", "", "", &m, &kp)
                 .await
                 .unwrap(),
             ""
         );
     }
-
     #[tokio::test]
     async fn test_manifest_anchor_noop_when_no_blobs() {
         let client = reqwest::Client::new();
@@ -1162,19 +1221,19 @@ mod tests {
         };
         // Non-empty URL, but no blobs: still a no-op.
         assert_eq!(
-            anchor_encrypted_manifest(&client, "https://example.invalid", "", &m, &kp)
+            anchor_encrypted_manifest(&client, "https://example.invalid", "", "", &m, &kp)
                 .await
                 .unwrap(),
             ""
         );
     }
-
     #[tokio::test]
     async fn test_manifest_anchor_success() {
         let kp = Keypair::generate();
         let server = spawn_enforcing_bundler(
             &kp,
             "zBundlerAccount",
+            "/tx/matic",
             &[
                 ("App-Name", "gitlawb"),
                 ("Schema", "gitlawb/encrypted-manifest/v1"),
@@ -1186,7 +1245,6 @@ mod tests {
             "MANIFESTTX123",
         )
         .await;
-
         let client = reqwest::Client::new();
         let blobs = vec![("oid1".to_string(), "cid1".to_string())];
         let m = EncryptedManifest {
@@ -1196,10 +1254,170 @@ mod tests {
             timestamp: "2026-06-11T00:00:00Z",
             blobs: &blobs,
         };
-        let r = anchor_encrypted_manifest(&client, &server, "zBundlerAccount", &m, &kp).await;
+        let r =
+            anchor_encrypted_manifest(&client, &server, "zBundlerAccount", "matic", &m, &kp).await;
         assert_eq!(r.unwrap(), "MANIFESTTX123");
     }
-
+    /// A minimal ref-update anchor for the URL-join tests.
+    fn test_anchor(repo: &str, new_sha: &str) -> RefAnchor {
+        RefAnchor {
+            repo: repo.into(),
+            repo_id: "repo-uuid".into(),
+            owner_did: "did:key:z6Mk...".into(),
+            ref_name: "refs/heads/main".into(),
+            old_sha: "0".repeat(40),
+            new_sha: new_sha.into(),
+            cid: None,
+            timestamp: "2026-03-14T00:00:00Z".into(),
+            node_did: "did:key:z6Mknnd...".into(),
+            certificate: None,
+        }
+    }
+    /// The upload target must survive a path-prefixed bundler base: joining
+    /// `{url}/prefix` must produce `/prefix/tx/matic`, never a dropped prefix.
+    #[tokio::test]
+    async fn test_anchor_preserves_bundler_path_prefix() {
+        let kp = Keypair::generate();
+        let server = spawn_enforcing_bundler(
+            &kp,
+            "zBundlerAccount",
+            "/prefix/tx/matic",
+            &[("App-Name", "gitlawb")],
+            |_| true,
+            "PREFIXED_TX",
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let base = format!("{server}/prefix");
+        let result = anchor_ref_update(
+            &client,
+            &base,
+            "zBundlerAccount",
+            "matic",
+            &test_anchor(
+                "alice/myrepo",
+                "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4",
+            ),
+            &kp,
+        )
+        .await;
+        assert_eq!(result.unwrap(), "PREFIXED_TX");
+    }
+    /// A query on the bundler base must ride along on the upload request target
+    /// (`/tx/matic?token=secret`) rather than being dropped by string concat.
+    #[tokio::test]
+    async fn test_anchor_preserves_bundler_query() {
+        let kp = Keypair::generate();
+        let server = spawn_enforcing_bundler(
+            &kp,
+            "zBundlerAccount",
+            "/tx/matic?token=secret",
+            &[("App-Name", "gitlawb")],
+            |_| true,
+            "QUERY_TX",
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let base = format!("{server}?token=secret");
+        let result = anchor_ref_update(
+            &client,
+            &base,
+            "zBundlerAccount",
+            "matic",
+            &test_anchor(
+                "alice/myrepo",
+                "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4",
+            ),
+            &kp,
+        )
+        .await;
+        assert_eq!(result.unwrap(), "QUERY_TX");
+    }
+    /// A fragment in the bundler URL must be rejected outright for both upload
+    /// paths: it is never sent to the bundler, so sending it silently would
+    /// change the request target in a way the operator cannot see.
+    #[tokio::test]
+    async fn test_anchor_rejects_fragment_in_bundler_url() {
+        let kp = Keypair::generate();
+        let client = reqwest::Client::new();
+        let bad = "https://example.invalid/#fragment";
+        let anchor = test_anchor(
+            "alice/myrepo",
+            "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4",
+        );
+        let err = anchor_ref_update(&client, bad, "acct", "matic", &anchor, &kp)
+            .await
+            .expect_err("a fragment in the bundler URL must fail the upload");
+        assert!(
+            err.to_string().contains("fragment"),
+            "error should name the fragment: {err}"
+        );
+        let blobs = vec![("oid1".to_string(), "cid1".to_string())];
+        let m = EncryptedManifest {
+            repo: "alice/r",
+            owner_did: "did:key:zO",
+            node_did: "did:key:zN",
+            timestamp: "2026-06-11T00:00:00Z",
+            blobs: &blobs,
+        };
+        let err = anchor_encrypted_manifest(&client, bad, "acct", "matic", &m, &kp)
+            .await
+            .expect_err("a fragment in the bundler URL must fail the manifest upload");
+        assert!(
+            err.to_string().contains("fragment"),
+            "error should name the fragment: {err}"
+        );
+    }
+    /// The gateway read must preserve a query on the gateway config (structural
+    /// join), so the mock only answers a request whose target carries it.
+    #[tokio::test]
+    async fn test_verify_anchor_preserves_gateway_query() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/some-tx-id?token=secret")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"valid":false}"#)
+            .create_async()
+            .await;
+        let client = reqwest::Client::new();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
+            .expect("lazy pool creation should not fail");
+        let db = crate::db::Db::for_testing(pool);
+        let gateway = format!("{}?token=secret", server.url());
+        let r = verify_anchor(&client, &gateway, "some-tx-id", &db, "did:key:zNODE")
+            .await
+            .expect("verify_anchor should return Ok");
+        assert!(!r.valid, "non-certificate JSON should be invalid");
+        mock.assert_async().await;
+    }
+    /// A fragment in the gateway URL must be rejected without ever issuing an
+    /// HTTP request: a fragment is never sent to the gateway, so a config that
+    /// carries one is a configuration error, surfaced as an invalid result.
+    #[tokio::test]
+    async fn test_verify_anchor_rejects_fragment_in_gateway_url() {
+        let client = reqwest::Client::new();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
+            .expect("lazy pool creation should not fail");
+        let db = crate::db::Db::for_testing(pool);
+        let r = verify_anchor(
+            &client,
+            "https://gateway.example/#fragment",
+            "some-tx-id",
+            &db,
+            "did:key:zNODE",
+        )
+        .await
+        .expect("verify_anchor should return Ok");
+        assert!(!r.valid, "fragment in gateway URL must be invalid");
+        assert!(
+            r.errors.iter().any(|e| e.contains("fragment")),
+            "errors should name the fragment: {:?}",
+            r.errors
+        );
+    }
     #[test]
     fn manifest_blob_json_omits_recipients() {
         let v = manifest_blob_json("oid1", "cidA");
@@ -1210,13 +1428,11 @@ mod tests {
             "Arweave manifest must not anchor recipient identities"
         );
     }
-
     #[test]
     fn test_sanitize_tag() {
         assert_eq!(sanitize_tag("alice/myrepo"), "alice/myrepo");
         assert_eq!(sanitize_tag("hello world!"), "helloworld");
     }
-
     #[tokio::test]
     async fn test_verify_anchor_uses_correct_gateway_url() {
         let mut server = mockito::Server::new_async().await;
@@ -1227,7 +1443,6 @@ mod tests {
             .with_body(r#"{"valid":false}"#)
             .create_async()
             .await;
-
         let client = reqwest::Client::new();
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
@@ -1241,12 +1456,10 @@ mod tests {
             "did:key:zNODE",
         )
         .await;
-
         let r = result.expect("verify_anchor should return Ok for gateway errors");
         assert!(!r.valid, "non-certificate JSON should be invalid");
         mock.assert_async().await;
     }
-
     /// A gateway URL carrying a query token must never surface that token in
     /// the public VerifyResult error text: reqwest embeds the request URL in
     /// its connection error, so the error must be rebuilt from the masked URL.
@@ -1257,7 +1470,6 @@ mod tests {
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
             .expect("lazy pool creation should not fail");
         let db = crate::db::Db::for_testing(pool);
-
         // Port 1 on loopback refuses connections deterministically.
         let result = verify_anchor(
             &client,
@@ -1267,7 +1479,6 @@ mod tests {
             "did:key:zNODE",
         )
         .await;
-
         let r = result.expect("verify_anchor should return Ok for gateway connection errors");
         assert!(!r.valid);
         let err_text = r.errors.join(" ");
@@ -1276,11 +1487,9 @@ mod tests {
             "gateway query token leaked into VerifyResult: {err_text}"
         );
     }
-
     #[tokio::test]
     async fn test_verify_anchor_malformed_node_did() {
         let mut server = mockito::Server::new_async().await;
-
         let bad_cert_json = serde_json::json!({
             "certificate": {
                 "id": "cert-1",
@@ -1301,7 +1510,6 @@ mod tests {
             "new_sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
             "node_did": "malformed-node-did",
         });
-
         let _mock = server
             .mock("GET", "/test-tx")
             .with_status(200)
@@ -1309,13 +1517,11 @@ mod tests {
             .with_body(serde_json::to_string(&bad_cert_json).unwrap())
             .create_async()
             .await;
-
         let client = reqwest::Client::new();
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
             .expect("lazy pool creation should not fail");
         let db = crate::db::Db::for_testing(pool);
-
         // Verify as "malformed-node-did" itself so the issuer check passes and
         // the DID-parse guard is what must fire. This pins the `invalid node
         // DID` error push: with the anchor claiming the node IS the malformed
@@ -1327,7 +1533,6 @@ mod tests {
             "Expected Ok response, got Err: {:?}",
             result
         );
-
         let verify_result = result.unwrap();
         assert!(!verify_result.valid, "VerifyResult should be invalid");
         assert!(
@@ -1339,7 +1544,6 @@ mod tests {
             verify_result.errors
         );
     }
-
     /// Pins the issuer guard (`c.node_did != node_did`): a cert that is fully
     /// authentic — real node signature over the real 13-field payload, real
     /// pusher proof — but names a DIFFERENT node as its issuer must fail with
@@ -1354,7 +1558,6 @@ mod tests {
         let other_did = other_kp.did().as_str().to_string();
         let pusher_kp = gitlawb_core::identity::Keypair::generate();
         let pusher_did = pusher_kp.did().as_str().to_string();
-
         let repo_id = "repo-uuid";
         let ref_name = "refs/heads/main";
         let old_sha = "0".repeat(40);
@@ -1362,7 +1565,6 @@ mod tests {
         let issued_at = "2026-07-22T00:00:00+00:00";
         let seq = 1i64;
         let prev = "0".repeat(64);
-
         let request_path = "/repo-uuid.git/git-receive-pack";
         let signed =
             gitlawb_core::http_sig::sign_request(&pusher_kp, "POST", request_path, b"push-body");
@@ -1372,7 +1574,6 @@ mod tests {
             .and_then(|s| s.strip_suffix(':'))
             .unwrap()
             .to_string();
-
         // Signed by `other_kp`, which the payload names as node_did — so the
         // cert is internally self-consistent and its signature verifies.
         let payload = serde_json::json!({
@@ -1391,7 +1592,6 @@ mod tests {
             "request_path": request_path,
         });
         let signature = other_kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
-
         let cert = crate::db::RefCertificate {
             id: "cert-other-node".to_string(),
             repo_id: repo_id.to_string(),
@@ -1409,7 +1609,6 @@ mod tests {
             content_digest: Some(signed.content_digest),
             request_path: Some(request_path.to_string()),
         };
-
         let anchor_json = serde_json::json!({
             "repo_id": repo_id,
             "ref_name": ref_name,
@@ -1418,7 +1617,6 @@ mod tests {
             "node_did": other_did,
             "certificate": cert,
         });
-
         let mut server = mockito::Server::new_async().await;
         let _mock = server
             .mock("GET", "/other-node-tx")
@@ -1427,13 +1625,11 @@ mod tests {
             .with_body(serde_json::to_string(&anchor_json).unwrap())
             .create_async()
             .await;
-
         let client = reqwest::Client::new();
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
             .expect("lazy pool creation should not fail");
         let db = crate::db::Db::for_testing(pool);
-
         let result = verify_anchor(&client, &server.url(), "other-node-tx", &db, &node_did).await;
         let verify_result = result.expect("verify_anchor should return Ok for a served anchor");
         assert!(
@@ -1450,7 +1646,6 @@ mod tests {
         );
         _mock.assert_async().await;
     }
-
     /// Pins the 13-field signature-failure error push: an authentic cert whose
     /// node signature was tampered must fail with the 13-field signature error.
     /// If the push were removed, no other guard would catch it (the proof
@@ -1462,7 +1657,6 @@ mod tests {
         let node_did = node_kp.did().as_str().to_string();
         let pusher_kp = gitlawb_core::identity::Keypair::generate();
         let pusher_did = pusher_kp.did().as_str().to_string();
-
         let repo_id = "repo-uuid";
         let ref_name = "refs/heads/main";
         let old_sha = "0".repeat(40);
@@ -1470,7 +1664,6 @@ mod tests {
         let issued_at = "2026-07-22T00:00:00+00:00";
         let seq = 1i64;
         let prev = "0".repeat(64);
-
         let request_path = "/repo-uuid.git/git-receive-pack";
         let signed =
             gitlawb_core::http_sig::sign_request(&pusher_kp, "POST", request_path, b"push-body");
@@ -1480,7 +1673,6 @@ mod tests {
             .and_then(|s| s.strip_suffix(':'))
             .unwrap()
             .to_string();
-
         let payload = serde_json::json!({
             "repo_id": repo_id,
             "ref": ref_name,
@@ -1497,9 +1689,19 @@ mod tests {
             "request_path": request_path,
         });
         let signature = node_kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
-        // Tamper: flip one byte in the node signature.
-        let tampered_signature = format!("A{}", &signature[1..]);
-
+        // Tamper: decode the b64url signature, flip one byte (guaranteed to
+        // change the value — unlike prefix replacement, which is a 1-in-64
+        // no-op), and re-encode.
+        let tampered_signature = {
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            let mut bytes = URL_SAFE_NO_PAD
+                .decode(&signature)
+                .expect("signature should decode");
+            bytes[0] ^= 0x01;
+            let tampered = URL_SAFE_NO_PAD.encode(&bytes);
+            assert_ne!(tampered, signature, "tamper must change the signature");
+            tampered
+        };
         let cert = crate::db::RefCertificate {
             id: "cert-tampered-13".to_string(),
             repo_id: repo_id.to_string(),
@@ -1517,7 +1719,6 @@ mod tests {
             content_digest: Some(signed.content_digest),
             request_path: Some(request_path.to_string()),
         };
-
         let anchor_json = serde_json::json!({
             "repo_id": repo_id,
             "ref_name": ref_name,
@@ -1526,7 +1727,6 @@ mod tests {
             "node_did": node_did,
             "certificate": cert,
         });
-
         let mut server = mockito::Server::new_async().await;
         let _mock = server
             .mock("GET", "/tampered-13-tx")
@@ -1535,13 +1735,11 @@ mod tests {
             .with_body(serde_json::to_string(&anchor_json).unwrap())
             .create_async()
             .await;
-
         let client = reqwest::Client::new();
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
             .expect("lazy pool creation should not fail");
         let db = crate::db::Db::for_testing(pool);
-
         let result = verify_anchor(&client, &server.url(), "tampered-13-tx", &db, &node_did).await;
         let verify_result = result.expect("verify_anchor should return Ok for a served anchor");
         assert!(
@@ -1558,7 +1756,6 @@ mod tests {
         );
         _mock.assert_async().await;
     }
-
     /// Pins the 7-field signature-failure error push: a legacy cert (proof
     /// fields NULL) whose node signature was tampered must fail with the
     /// 7-field signature error.
@@ -1566,13 +1763,11 @@ mod tests {
     async fn test_verify_anchor_rejects_tampered_7_field_signature() {
         let node_kp = gitlawb_core::identity::Keypair::generate();
         let node_did = node_kp.did().as_str().to_string();
-
         let repo_id = "repo-uuid";
         let ref_name = "refs/heads/main";
         let old_sha = "0".repeat(40);
         let new_sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
         let issued_at = "2026-07-22T00:00:00+00:00";
-
         let payload = serde_json::json!({
             "repo_id": repo_id,
             "ref": ref_name,
@@ -1583,8 +1778,19 @@ mod tests {
             "ts": issued_at,
         });
         let signature = node_kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
-        let tampered_signature = format!("A{}", &signature[1..]);
-
+        // Tamper: decode the b64url signature, flip one byte (guaranteed to
+        // change the value — unlike prefix replacement, which is a 1-in-64
+        // no-op), and re-encode.
+        let tampered_signature = {
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            let mut bytes = URL_SAFE_NO_PAD
+                .decode(&signature)
+                .expect("signature should decode");
+            bytes[0] ^= 0x01;
+            let tampered = URL_SAFE_NO_PAD.encode(&bytes);
+            assert_ne!(tampered, signature, "tamper must change the signature");
+            tampered
+        };
         let cert = crate::db::RefCertificate {
             id: "cert-tampered-7".to_string(),
             repo_id: repo_id.to_string(),
@@ -1602,7 +1808,6 @@ mod tests {
             content_digest: None,
             request_path: None,
         };
-
         let anchor_json = serde_json::json!({
             "repo_id": repo_id,
             "ref_name": ref_name,
@@ -1611,7 +1816,6 @@ mod tests {
             "node_did": node_did,
             "certificate": cert,
         });
-
         let mut server = mockito::Server::new_async().await;
         let _mock = server
             .mock("GET", "/tampered-7-tx")
@@ -1620,13 +1824,11 @@ mod tests {
             .with_body(serde_json::to_string(&anchor_json).unwrap())
             .create_async()
             .await;
-
         let client = reqwest::Client::new();
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
             .expect("lazy pool creation should not fail");
         let db = crate::db::Db::for_testing(pool);
-
         let result = verify_anchor(&client, &server.url(), "tampered-7-tx", &db, &node_did).await;
         let verify_result = result.expect("verify_anchor should return Ok for a served anchor");
         assert!(
@@ -1640,7 +1842,6 @@ mod tests {
         );
         _mock.assert_async().await;
     }
-
     /// A true end-to-end accept: a cert signed by a real node keypair over a
     /// real 13-field payload, with a real RFC 9421 pusher proof, served through
     /// a mock gateway, must verify to `valid: true` with empty errors.
@@ -1669,7 +1870,6 @@ mod tests {
             .and_then(|s| s.strip_suffix(':'))
             .unwrap()
             .to_string();
-
         let payload = serde_json::json!({
             "repo_id": repo_id,
             "ref": ref_name,
@@ -1686,7 +1886,6 @@ mod tests {
             "request_path": request_path,
         });
         let signature = node_kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
-
         crate::db::RefCertificate {
             id: "cert-accept-1".to_string(),
             repo_id: repo_id.to_string(),
@@ -1705,7 +1904,6 @@ mod tests {
             request_path: Some(request_path.to_string()),
         }
     }
-
     /// Run the current schema on a fresh `#[sqlx::test]` pool so DB-backed
     /// anchor tests share one seeding path.
     async fn migrated_db(pool: sqlx::PgPool) -> crate::db::Db {
@@ -1713,13 +1911,11 @@ mod tests {
         db.run_migrations().await.expect("migrations should apply");
         db
     }
-
     #[sqlx::test]
     async fn test_verify_anchor_accepts_authentic_13_field_certificate(pool: sqlx::PgPool) {
         let node_kp = gitlawb_core::identity::Keypair::generate();
         let node_did = node_kp.did().as_str().to_string();
         let pusher_kp = gitlawb_core::identity::Keypair::generate();
-
         let owner_did = "did:key:z6MkOwner";
         let repo_id = "repo-uuid";
         let ref_name = "refs/heads/main";
@@ -1728,7 +1924,6 @@ mod tests {
         let issued_at = "2026-07-22T00:00:00+00:00";
         let seq = 1i64;
         let prev = "0".repeat(64);
-
         let db = migrated_db(pool).await;
         // Seed the repo so the outer identity corroboration actually runs
         // against a real row instead of being skipped by a lazy pool.
@@ -1747,12 +1942,10 @@ mod tests {
         })
         .await
         .unwrap();
-
         let cert = authentic_13_field_cert(
             &node_kp, &pusher_kp, repo_id, ref_name, &old_sha, new_sha, &node_did, issued_at, seq,
             &prev,
         );
-
         // The outer identity fields are present and must corroborate against
         // the seeded repo row: expected_repo = normalize_owner_key(owner) / name.
         let anchor_json = serde_json::json!({
@@ -1765,7 +1958,6 @@ mod tests {
             "node_did": node_did,
             "certificate": cert,
         });
-
         let mut server = mockito::Server::new_async().await;
         let _mock = server
             .mock("GET", "/accept-tx")
@@ -1774,7 +1966,6 @@ mod tests {
             .with_body(serde_json::to_string(&anchor_json).unwrap())
             .create_async()
             .await;
-
         let client = reqwest::Client::new();
         let result = verify_anchor(&client, &server.url(), "accept-tx", &db, &node_did).await;
         let r = result.expect("verify_anchor should return Ok for a served anchor");
@@ -1790,7 +1981,6 @@ mod tests {
         );
         _mock.assert_async().await;
     }
-
     /// Fail closed: when the anchor carries outer `repo`/`owner_did` claims but
     /// the node has no record of the repo, corroboration cannot run — and the
     /// verdict must not rest on the certificate signature alone.
@@ -1801,17 +1991,14 @@ mod tests {
         let node_kp = gitlawb_core::identity::Keypair::generate();
         let node_did = node_kp.did().as_str().to_string();
         let pusher_kp = gitlawb_core::identity::Keypair::generate();
-
         let owner_did = "did:key:zVictim";
         let repo_id = "repo-uuid";
         let ref_name = "refs/heads/main";
         let old_sha = "0".repeat(40);
         let new_sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
         let issued_at = "2026-07-22T00:00:00+00:00";
-
         let db = migrated_db(pool).await;
         // Deliberately do NOT seed the repo row: the lookup must come up empty.
-
         let cert = authentic_13_field_cert(
             &node_kp,
             &pusher_kp,
@@ -1824,7 +2011,6 @@ mod tests {
             1,
             &"0".repeat(64),
         );
-
         // Forged outer identity fields, no way to corroborate them.
         let anchor_json = serde_json::json!({
             "repo": "victim-owner/victim-repo",
@@ -1836,7 +2022,6 @@ mod tests {
             "node_did": node_did,
             "certificate": cert,
         });
-
         let mut server = mockito::Server::new_async().await;
         let _mock = server
             .mock("GET", "/uncorroborated-tx")
@@ -1845,7 +2030,6 @@ mod tests {
             .with_body(serde_json::to_string(&anchor_json).unwrap())
             .create_async()
             .await;
-
         let client = reqwest::Client::new();
         let result =
             verify_anchor(&client, &server.url(), "uncorroborated-tx", &db, &node_did).await;
@@ -1863,7 +2047,6 @@ mod tests {
         );
         _mock.assert_async().await;
     }
-
     /// A tampered seq on an authentic legacy 7-field cert must fail: the
     /// 7-field signature does not cover seq/prev, so the node's stored row
     /// must be corroborated rather than accepting a blanket valid: true.
@@ -1871,13 +2054,11 @@ mod tests {
     async fn test_verify_anchor_legacy_seq_tamper_fails_closed() {
         let node_kp = gitlawb_core::identity::Keypair::generate();
         let node_did = node_kp.did().as_str().to_string();
-
         let repo_id = "repo-uuid";
         let ref_name = "refs/heads/main";
         let old_sha = "0".repeat(40);
         let new_sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
         let issued_at = "2026-07-22T00:00:00+00:00";
-
         // Sign the 7-field payload exactly as pre-PR nodes did.
         let payload_7 = serde_json::json!({
             "repo_id": repo_id,
@@ -1889,7 +2070,6 @@ mod tests {
             "ts": issued_at,
         });
         let signature = node_kp.sign_b64(&serde_json::to_vec(&payload_7).unwrap());
-
         let cert = crate::db::RefCertificate {
             id: "cert-legacy-tamper".to_string(),
             repo_id: repo_id.to_string(),
@@ -1907,7 +2087,6 @@ mod tests {
             content_digest: None,
             request_path: None,
         };
-
         let anchor_json = serde_json::json!({
             "repo_id": repo_id,
             "ref_name": ref_name,
@@ -1916,7 +2095,6 @@ mod tests {
             "node_did": node_did,
             "certificate": cert,
         });
-
         let mut server = mockito::Server::new_async().await;
         let _mock = server
             .mock("GET", "/legacy-tamper-tx")
@@ -1925,13 +2103,11 @@ mod tests {
             .with_body(serde_json::to_string(&anchor_json).unwrap())
             .create_async()
             .await;
-
         let client = reqwest::Client::new();
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
             .expect("lazy pool creation should not fail");
         let db = crate::db::Db::for_testing(pool);
-
         // The cert is not present in the (lazy) node database — no stored row
         // matches its signed (repo_id, ref_name, old_sha, new_sha, ts), so the
         // legacy corroboration must fail closed instead of returning valid.
@@ -1952,7 +2128,6 @@ mod tests {
         );
         _mock.assert_async().await;
     }
-
     /// The legacy corroboration must key on the fields the 7-field signature
     /// actually covers — never on `id`, which appears in no signed payload.
     /// A forged cert that copies `id`/`seq`/`prev` from a stored row at seq 7
@@ -1967,7 +2142,6 @@ mod tests {
         let node_did = node_kp.did().as_str().to_string();
         let db = crate::db::Db::for_testing(pool.clone());
         db.run_migrations().await.expect("migrations should apply");
-
         // Build a full stored chain seq 1..7 for the repo so every chain check
         // the forged cert must survive (prev-linkage against seq-1, predecessor
         // lookups) has a real row to pass against. Each cert's `prev` is the
@@ -2017,7 +2191,6 @@ mod tests {
             }
         }
         let stored_seq_7 = stored_at_seq_7.expect("seq-7 cert was inserted");
-
         // The forged anchor: signed tuple says the transition (repo, ref,
         // forged_old, forged_new, forged_ts) — a DIFFERENT, never-recorded
         // transition — but id/seq/prev are copied verbatim from the seq-7
@@ -2038,7 +2211,6 @@ mod tests {
             "ts": forged_ts,
         });
         let forged_signature = forged_kp.sign_b64(&serde_json::to_vec(&forged_payload).unwrap());
-
         let forged_cert = crate::db::RefCertificate {
             id: stored_seq_7.id.clone(),
             repo_id: repo_id.to_string(),
@@ -2056,7 +2228,6 @@ mod tests {
             content_digest: None,
             request_path: None,
         };
-
         let anchor_json = serde_json::json!({
             "repo_id": repo_id,
             "ref_name": ref_name,
@@ -2065,7 +2236,6 @@ mod tests {
             "node_did": forged_did,
             "certificate": forged_cert,
         });
-
         let mut server = mockito::Server::new_async().await;
         let _mock = server
             .mock("GET", "/forged-borrowed-position-tx")
@@ -2074,7 +2244,6 @@ mod tests {
             .with_body(serde_json::to_string(&anchor_json).unwrap())
             .create_async()
             .await;
-
         let client = reqwest::Client::new();
         // Verify as the forger's own node: node_did, the issuer check, the
         // outer-field cross-check, the signature, and the chain-position

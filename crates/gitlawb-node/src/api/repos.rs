@@ -859,6 +859,7 @@ struct EncryptTaskCtx {
     repo_name: String,
     irys_url: String,
     bundler_account: String,
+    bundler_token: String,
     http_client: Arc<reqwest::Client>,
     node_did: String,
     node_keypair: Arc<gitlawb_core::identity::Keypair>,
@@ -1494,6 +1495,7 @@ async fn pin_and_encrypt_objects(
                     &ctx.http_client,
                     &ctx.irys_url,
                     &ctx.bundler_account,
+                    &ctx.bundler_token,
                     &manifest,
                     &ctx.node_keypair,
                 )
@@ -2280,13 +2282,23 @@ pub async fn git_receive_pack(
     // The tail is read-only on `disk_path` (walk plus plumbing) and takes neither the
     // write lease nor the advisory lock, so running it concurrently with the upload
     // below waits on nothing this handler still holds. Everything after (touch_repo,
-    // metrics, trust score, certificates, webhooks) stays in the cancellable handler.
+    // metrics, webhooks) stays in the cancellable handler.
     //
     // The tail also runs CONCURRENTLY with certificate issuance rather than after it,
     // so a ref can be announced before its signed certificate exists. That window is
     // accepted: cert issuance already fails open (errors are logged and skipped) and
     // the gossip event carries `cert_id: None` regardless, so no announce consumer
     // reads a certificate out of it. Each push owns its own tail, including its own
+    // The durable-success bookkeeping — record_push, trust score, and the per-ref
+    // signed certificates — also runs INSIDE the continuation, not here: it used to
+    // live in the cancellable handler between `receive_pack` returning Ok and the
+    // tail spawn, so a client/proxy disconnect during those DB awaits dropped a
+    // durable push with no certificates and no tail. Certificate issuance runs at
+    // the START of the continuation, so the tail always has the per-ref signed
+    // certificates in hand: the gossip event carries the real `cert_id`, and the
+    // Arweave anchor embeds the certificate itself. Issuance fails open (errors are
+    // logged and skipped), so a cert outage degrades to a cert-less announce rather
+    // than a dropped push. Each push owns its own tail, including its own
     // always-spawned announce, so per-push announcements are never coalesced away.
     //
     // ACCEPTED RESIDUAL, and it is the cost of this ordering: the tail also runs
@@ -2352,7 +2364,6 @@ pub async fn git_receive_pack(
     crate::metrics::record_push(&record.id);
     crate::metrics::observe_pack_size(body_len as f64);
 
-    // Record push event for trust score and issue a signed ref certificate.
     // The route is behind `require_signature`, so the verified pusher identity is
     // always present; use it directly rather than re-parsing the headers.
     let did = auth.0.as_str();
@@ -2404,6 +2415,63 @@ pub async fn git_receive_pack(
         }
     }
 
+    if push_succeeded {
+        // Everything a landed push owes after git accepted the pack — record_push,
+        // trust score, per-ref signed certificates, and the replication tail — runs
+        // in this owned continuation. It used to live here in the cancellable
+        // handler between `receive_pack` returning Ok and the tail spawn, so a
+        // client/proxy disconnect during those DB awaits dropped a durable push
+        // with no certificates and no tail. Spawned above `guard.release()` for
+        // the same reason the tail was: `release` is itself cancellable, and the
+        // pack has already landed on disk by now. The continuation takes neither
+        // the write lease nor the advisory lock, so it waits on nothing this
+        // handler still holds.
+        tokio::spawn(post_receive_continuation(
+            state.clone(),
+            record.clone(),
+            ref_updates.clone(),
+            disk_path.clone(),
+            did.to_string(),
+            PusherAttestation {
+                sig: Some(pusher_sig.0.clone()),
+                signature_input: Some(pusher_proof.signature_input.clone()),
+                content_digest: Some(pusher_proof.content_digest.clone()),
+                request_path: Some(pusher_proof.request_path.clone()),
+            },
+        ));
+    }
+
+    // Always release the advisory lock — even on error — to prevent stale locks
+    // from blocking subsequent pushes. Only upload to Tigris when the push
+    // succeeded; uploading a half-applied repo would propagate corruption.
+    guard.release(push_succeeded).await;
+    // Clean path: clone (a) already dropped inside run_git_service when the receive-pack
+    // group was reaped; clone (b) held here spanned the success-only Tigris upload that
+    // ran inside release() above. Drop it now so a second same-repo push proceeds the
+    // moment this write is durable, rather than at end of the (longer) handler tail. On
+    // the disconnect path this line is never reached — clone (a) rides the reaper (F3).
+    drop(lease);
+
+    let result = receive_result.map_err(|e| {
+        let app = git_service_app_error(&e);
+        match &app {
+            AppError::Timeout(_) => tracing::warn!(repo = %name, "git receive-pack timed out"),
+            AppError::BadRequest(msg) => {
+                tracing::warn!(repo = %name, err = %msg, "git receive-pack: bad client request")
+            }
+            _ => tracing::error!(repo = %name, err = %e, "git receive-pack failed"),
+        }
+        app
+    })?;
+
+    // Update the repo's updated_at timestamp after a successful push
+    let _ = state.db.touch_repo(&record.id).await;
+
+    // Record the successful push for metrics. The body has already been
+    // consumed by smart_http::receive_pack so we observe size up front.
+    crate::metrics::record_push(&record.id);
+    crate::metrics::observe_pack_size(body_len as f64);
+
     // Fire push webhooks — one per ref update
     if !ref_updates.is_empty() {
         let base_url = state
@@ -2443,6 +2511,92 @@ pub async fn git_receive_pack(
     }
 
     Ok(result)
+}
+
+/// The pusher's RFC 9421 attestation, owned and detached with the continuation.
+/// Flattened from the handler's `PusherSignature` / `PusherProof` extractors so
+/// the continuation can issue per-ref certificates after the client is gone.
+struct PusherAttestation {
+    sig: Option<String>,
+    signature_input: Option<String>,
+    content_digest: Option<String>,
+    request_path: Option<String>,
+}
+
+/// The owned post-receive continuation (#224 review): everything a landed push
+/// owes after git accepted the pack — the trust-score `record_push`, the
+/// per-ref signed certificates, and the replication tail itself — runs in one
+/// detached task. The handler spawns this immediately after `receive_pack`
+/// returns Ok and before `guard.release()`, so a client/proxy disconnect after
+/// the pack has landed can no longer cancel the bookkeeping or drop the tail
+/// (previously they lived in the cancellable handler between receive and the
+/// tail spawn). The continuation owns everything it reads and takes neither the
+/// write lease nor the advisory lock.
+///
+/// Certificate issuance runs at the START of the continuation, so the tail
+/// always has the per-ref signed certificates in hand: the gossip event carries
+/// the real `cert_id`, and the Arweave anchor embeds the certificate itself.
+/// Issuance fails open (errors are logged and skipped), so a cert outage
+/// degrades to a cert-less announce rather than a dropped push.
+async fn post_receive_continuation(
+    state: AppState,
+    record: RepoRecord,
+    ref_updates: Vec<RefUpdate>,
+    disk_path: std::path::PathBuf,
+    did: String,
+    attestation: PusherAttestation,
+) {
+    // Collect certs keyed by ref_name so the anchoring loop below uses
+    // the correct per-update certificate rather than a repo-wide latest.
+    let mut ref_certs: std::collections::HashMap<String, crate::db::RefCertificate> =
+        std::collections::HashMap::new();
+
+    // Use the first new commit hash we parsed, fall back to timestamp
+    let commit_hash = ref_updates
+        .first()
+        .map(|u| u.new_sha.clone())
+        .unwrap_or_else(|| Utc::now().timestamp().to_string());
+
+    let _ = state
+        .db
+        .record_push(&did, &record.id, &commit_hash, 0)
+        .await;
+    if let Ok(push_count) = state.db.get_push_count(&did).await {
+        // 0.05 base (from registration) + 0.05 per push, capped at 1.0
+        // 1 push → 0.10, 5 pushes → 0.30, 19 pushes → 1.0
+        let new_score = (push_count as f64 * 0.05 + 0.05).min(1.0);
+        let _ = state.db.update_trust_score(&did, new_score).await;
+    }
+
+    // Issue a signed certificate for every ref this push advanced, each
+    // carrying that ref's real old→new transition. A multi-ref push must
+    // not collapse to a single cert covering only the first ref.
+    for update in &ref_updates {
+        match cert::issue_ref_certificate(
+            &state,
+            &record.id,
+            &update.ref_name,
+            &update.old_sha,
+            &update.new_sha,
+            &did,
+            attestation.sig.clone(),
+            attestation.signature_input.clone(),
+            attestation.content_digest.clone(),
+            attestation.request_path.clone(),
+        )
+        .await
+        {
+            Ok(c) => {
+                tracing::info!(cert_id = %c.id, repo = %record.name, ref_name = %update.ref_name, pusher = %did, "issued ref certificate");
+                ref_certs.insert(update.ref_name.clone(), c);
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, ref_name = %update.ref_name, "failed to issue ref certificate")
+            }
+        }
+    }
+
+    post_receive_replication_tail(state, record, ref_updates, disk_path, did, ref_certs).await;
 }
 
 /// The detached post-receive replication tail (#174 F2): everything a landed push
@@ -2613,6 +2767,7 @@ async fn post_receive_replication_tail(
             repo_name: record.name.clone(),
             irys_url: state.config.bundler_url.clone(),
             bundler_account: state.config.bundler_account.clone(),
+            bundler_token: state.config.bundler_token.clone(),
             http_client: std::sync::Arc::clone(&state.http_client),
             node_did: state.node_did.to_string(),
             node_keypair: std::sync::Arc::clone(&state.node_keypair),
@@ -2671,6 +2826,7 @@ async fn post_receive_replication_tail(
         let ref_update_tx = state.ref_update_tx.clone();
         let bundler_url = state.config.bundler_url.clone();
         let bundler_account = state.config.bundler_account.clone();
+        let bundler_token = state.config.bundler_token.clone();
         let owner_did_for_arweave = record.owner_did.clone();
         let self_public_url = state.config.public_url.clone();
         let node_keypair = Arc::clone(&state.node_keypair);
@@ -2855,6 +3011,7 @@ async fn post_receive_replication_tail(
                         &http_client,
                         &bundler_url,
                         &bundler_account,
+                        &bundler_token,
                         &anchor,
                         &node_keypair,
                     )
@@ -2888,9 +3045,11 @@ async fn post_receive_replication_tail(
                             tracing::warn!(
                                 repo=%repo_slug,
                                 bundler_account=%bundler_account,
+                                bundler_token=%bundler_token,
                                 err=%e,
                                 "Arweave anchor failed — if the bundler reports 'Not enough \
-                                 balance', fund GITLAWB_BUNDLER_ACCOUNT; an unfunded node \
+                                 balance', fund GITLAWB_BUNDLER_ACCOUNT (for the token in \
+                                 GITLAWB_BUNDLER_TOKEN); an unfunded node \
                                  silently loses every anchor"
                             )
                         }
@@ -7920,6 +8079,7 @@ mod tests {
             repo_name: rec.name.clone(),
             irys_url: String::new(),
             bundler_account: String::new(),
+            bundler_token: String::new(),
             http_client: std::sync::Arc::clone(&state.http_client),
             node_did: state.node_did.to_string(),
             node_keypair: std::sync::Arc::clone(&state.node_keypair),
@@ -10522,6 +10682,105 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "and the unvetted push still maps no CID"
+        );
+    }
+
+    // ---- #224 review, P1: the continuation survives a disconnect after the pack lands ----
+
+    /// The owned post-receive continuation survives a client/proxy disconnect
+    /// after git accepted the pack.
+    ///
+    /// Before the fix, `record_push`, the trust-score update, and the per-ref
+    /// certificate issuance ran in the CANCELLABLE handler between `receive_pack`
+    /// returning Ok and the tail spawn; a disconnect during those DB awaits
+    /// dropped a durable push with no certificates and no tail. The fix spawns
+    /// `post_receive_continuation` (which owns that bookkeeping and then runs the
+    /// replication tail) before the handler does anything else cancellable.
+    ///
+    /// This test drives the fix's exact shape: a simulated handler spawns the
+    /// continuation, the simulated handler is aborted mid-flight (the disconnect),
+    /// and the continuation must still run to completion — the push row, the
+    /// trust score, the per-ref certificate, and the tail's withheld walk all
+    /// land. The tail's walk is asserted on the same git shim the F2a suite uses.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn post_receive_continuation_survives_handler_abort(pool: sqlx::PgPool) {
+        let repo = tempfile::TempDir::new().unwrap();
+        let bin = tempfile::TempDir::new().unwrap();
+        u5_init_repo(repo.path());
+        let c1 = u5_commit_file(repo.path(), "a.txt", "one\n");
+        let log = bin.path().join("git.log");
+        let git_bin = f2a_logging_git(bin.path(), &log);
+        let (state, rec) = f2a_state(pool, &git_bin, "z6abort", "c1", true).await;
+        // The trust-score update only mutates an existing agents row (never
+        // inserts); register the pusher so the update is observable.
+        state
+            .db
+            .register_agent(F2A_PUSHER, &["agent".to_string()])
+            .await
+            .unwrap();
+
+        // Simulated handler: after `receive_pack` returned Ok it spawns the
+        // continuation, then it is still on the wire — the response has not been
+        // sent. The abort below is the disconnect.
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let handler_sim = tokio::spawn({
+            let state = state.clone();
+            let rec = rec.clone();
+            let disk = repo.path().to_path_buf();
+            let update = f2a_update("refs/heads/main", &c1);
+            async move {
+                let cont = tokio::spawn(post_receive_continuation(
+                    state,
+                    rec,
+                    update,
+                    disk,
+                    F2A_PUSHER.to_string(),
+                    PusherAttestation {
+                        sig: None,
+                        signature_input: None,
+                        content_digest: None,
+                        request_path: None,
+                    },
+                ));
+                let _ = sent.send(cont);
+                std::future::pending::<()>().await
+            }
+        });
+        let cont = received.await.expect("handler spawned the continuation");
+
+        // Give the continuation time to be mid-bookkeeping — the exact window the
+        // finding described — then sever the client.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        handler_sim.abort();
+        let _ = handler_sim.await;
+
+        // The detached continuation must still finish its whole job.
+        cont.await
+            .expect("the continuation must run to completion after the handler is aborted");
+
+        assert_eq!(
+            state.db.get_push_count(F2A_PUSHER).await.unwrap(),
+            1,
+            "the push must still be recorded after the disconnect"
+        );
+        assert!(
+            (state.db.get_trust_score(F2A_PUSHER).await.unwrap() - 0.10).abs() < 1e-9,
+            "the trust-score update (0.05 base + 0.05 per push) must still land"
+        );
+        let certs = state.db.list_ref_certificates(&rec.id, 10).await.unwrap();
+        assert_eq!(
+            certs.len(),
+            1,
+            "the per-ref certificate must still be issued after the disconnect"
+        );
+        assert_eq!(certs[0].ref_name, "refs/heads/main");
+        assert_eq!(certs[0].new_sha, c1);
+        assert_eq!(certs[0].pusher_did, F2A_PUSHER);
+        assert!(
+            f2a_walks(&log) >= 1,
+            "the replication tail's withheld walk must still run after the disconnect; log:\n{}",
+            f2a_log(&log)
         );
     }
 }

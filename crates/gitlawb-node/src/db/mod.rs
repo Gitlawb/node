@@ -488,7 +488,9 @@ impl Db {
 // is added by migration v18 as ALTER TABLE; signature_input, content_digest,
 // and request_path are added by v19.  New installs reach v18/v19 via sequential
 // migration; existing installs with the columns already present are no-ops via
-// IF NOT EXISTS.
+// IF NOT EXISTS. v20 drops the superseded (repo_id, ref_name) unique index that
+// v1 bundled; that drop is one-way and rollback-unsupported (see the
+// migration's own comment).
 //
 // Each migration runs in a single transaction, so statements that Postgres
 // forbids inside a transaction (notably `CREATE INDEX CONCURRENTLY`) cannot be
@@ -1140,6 +1142,14 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 20,
         name: "drop_ref_certs_repo_ref_unique",
+        // ONE-WAY, ROLLBACK-UNSUPPORTED: this drops the unique index that v1
+        // bundled. Rolling back to v19 would require re-creating
+        // `idx_ref_certs_repo_ref`, which a release built at v20+ cannot do
+        // (the migration that created it has been superseded). Operators must
+        // treat v20 as terminal: there is no supported downgrade past it. The
+        // drop itself is the point of the migration — the old index would
+        // reject the second cert insert for a ref, which the append-only cert
+        // chain (v19) requires.
         stmts: &[
             // Remove the superseded (repo_id, ref_name) unique index.  v19 makes
             // the cert chain append-only, which requires multiple rows per

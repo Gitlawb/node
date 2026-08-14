@@ -140,8 +140,10 @@ async fn main() -> Result<()> {
         tracing::info!(
             bundler_url = %crate::server::mask_credential_url(&config.bundler_url),
             bundler_account = %config.bundler_account,
+            bundler_token = %config.bundler_token,
             "arweave anchoring enabled; uploads billed to the funded bundler account \
-             (the node's ANS-104 signature is authorship, not payment)"
+             at /tx/{{token}} via x-irys-paid-by (the node's ANS-104 signature is \
+             authorship, not payment)"
         );
     }
 

@@ -155,6 +155,19 @@ pub struct Config {
     )]
     pub bundler_account: String,
 
+    /// Irys payment-token slug billed for uploads (e.g. "matic", "ethereum",
+    /// "solana", "usdc" — see the Irys devnet faucet). Irys serves uploads at
+    /// `/tx/{token}` and reads the funded address from the `x-irys-paid-by`
+    /// header, so when `bundler_url` is set this must name the token the
+    /// funded account holds. `validate()` refuses to start without it.
+    #[arg(
+        long,
+        env = "GITLAWB_BUNDLER_TOKEN",
+        default_value = "",
+        alias = "irys-token"
+    )]
+    pub bundler_token: String,
+
     /// Arweave gateway URL for resolving arweave_tx_id to data items.
     /// Used by the verify endpoint. Default: https://arweave.net
     #[arg(
@@ -811,8 +824,20 @@ impl Config {
             return Err(
                 "GITLAWB_BUNDLER_URL is set but GITLAWB_BUNDLER_ACCOUNT is not: the data item \
                  signature is not bundler payment. Create a funded account for this node (top up \
-                 via the bundler's faucet for devnet hosts) and set GITLAWB_BUNDLER_ACCOUNT to its \
+                 via the bundler's devnet faucet for devnet hosts) and set GITLAWB_BUNDLER_ACCOUNT to its \
                  address/identity, or clear GITLAWB_BUNDLER_URL to disable anchoring."
+                    .to_string(),
+            );
+        }
+        // Irys uploads are billed against a payment token at /tx/{token}; the
+        // header the node sends is pointless if the operator has not said which
+        // token the funded account holds.
+        if !self.bundler_url.trim().is_empty() && self.bundler_token.trim().is_empty() {
+            return Err(
+                "GITLAWB_BUNDLER_URL is set but GITLAWB_BUNDLER_TOKEN is not: Irys bills uploads \
+                 against a payment token at /tx/{token} and reads x-irys-paid-by for the funded \
+                 address. Set GITLAWB_BUNDLER_TOKEN to the token the funded account holds (e.g. \
+                 'matic' on the Irys devnet), or clear GITLAWB_BUNDLER_URL to disable anchoring."
                     .to_string(),
             );
         }
@@ -1481,8 +1506,9 @@ mod tests {
 
     /// Anchoring is paid, not free: the ANS-104 signature proves authorship,
     /// and the bundler bills the funded account the upload names. A bundler URL
-    /// without a declared funded account must refuse to start, or every anchor
-    /// silently fails with "Not enough balance" behind a push-time warning.
+    /// without a declared funded account and payment token must refuse to start,
+    /// or every anchor silently fails with "Not enough balance" behind a
+    /// push-time warning.
     #[test]
     fn bundler_url_requires_a_funded_account() {
         // Defaults (no bundler) validate.
@@ -1501,16 +1527,89 @@ mod tests {
             "error must name the missing account: {err}"
         );
 
-        // URL plus account validates.
+        // Account without a payment token must still be rejected: Irys bills
+        // at /tx/{token}, so the header alone cannot be charged.
+        let no_token = Config::parse_from([
+            "gitlawb-node",
+            "--bundler-url",
+            "https://devnet.irys.xyz",
+            "--bundler-account",
+            "zBundlerAccount",
+        ]);
+        let err = no_token
+            .validate()
+            .expect_err("bundler URL with an account but no token must be rejected");
+        assert!(
+            err.contains("GITLAWB_BUNDLER_TOKEN"),
+            "error must name the missing token: {err}"
+        );
+
+        // URL plus account plus token validates.
         Config::parse_from([
             "gitlawb-node",
             "--bundler-url",
             "https://devnet.irys.xyz",
             "--bundler-account",
             "zBundlerAccount",
+            "--bundler-token",
+            "matic",
         ])
         .validate()
-        .expect("bundler URL with a funded account must validate");
+        .expect("bundler URL with a funded account and token must validate");
+    }
+
+    /// The shipped `.env.example` must stay startable. Anchoring is paid, and
+    /// `validate()` refuses a bundler URL without both a funded account and a
+    /// payment token, so the example must never ship a non-empty
+    /// `GITLAWB_BUNDLER_URL` that the file itself does not also back with a
+    /// `GITLAWB_BUNDLER_ACCOUNT` and `GITLAWB_BUNDLER_TOKEN`. The app has no
+    /// dotenv loader, so this test keys on the file's active (non-commented)
+    /// lines the way a user `source`-ing the example would.
+    #[test]
+    fn env_example_bundler_block_is_startable() {
+        let example_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.env.example");
+        let contents = std::fs::read_to_string(&example_path).unwrap_or_else(|e| {
+            panic!("cannot read shipped .env.example at {example_path:?}: {e}")
+        });
+
+        let active = |key: &str| -> String {
+            contents
+                .lines()
+                .map(str::trim)
+                .find(|l| l.starts_with(key) && !l.starts_with('#'))
+                .map(|l| l[key.len()..].trim().to_string())
+                .unwrap_or_default()
+        };
+
+        let url = active("GITLAWB_BUNDLER_URL=");
+        let account = active("GITLAWB_BUNDLER_ACCOUNT=");
+        let token = active("GITLAWB_BUNDLER_TOKEN=");
+        if !url.is_empty() {
+            assert!(
+                !account.is_empty(),
+                ".env.example sets GITLAWB_BUNDLER_URL but no active GITLAWB_BUNDLER_ACCOUNT"
+            );
+            assert!(
+                !token.is_empty(),
+                ".env.example sets GITLAWB_BUNDLER_URL but no active GITLAWB_BUNDLER_TOKEN"
+            );
+        }
+
+        // Whatever the example ships, it must be a shape `validate()` accepts, so a
+        // user who exports the example as-is can start the node.
+        let args = [
+            "gitlawb-node",
+            "--bundler-url",
+            &url,
+            "--bundler-account",
+            &account,
+            "--bundler-token",
+            &token,
+        ];
+        Config::parse_from(args)
+            .validate()
+            .unwrap_or_else(|e| panic!("the shipped .env.example must be startable: {e}"));
     }
 
     /// #247: an explicit `--arweave-gateway` must not be overwritten by the
