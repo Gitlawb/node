@@ -25,6 +25,7 @@ use libp2p_swarm::{NetworkBehaviour, Swarm, SwarmEvent};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::db::{Db, ReceivedRefUpdate};
 
@@ -272,9 +273,13 @@ pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> 
     }
 
     let kp = identity::Keypair::generate_ed25519();
-    let bytes = kp
-        .to_protobuf_encoding()
-        .map_err(|e| anyhow::anyhow!("failed to serialize p2p key: {e}"))?;
+    // The serialized form carries the private key, so scrub it on drop rather
+    // than leaving it in a heap buffer for the rest of the process. Same
+    // convention `gitlawb-core` applies to its own key material.
+    let bytes = Zeroizing::new(
+        kp.to_protobuf_encoding()
+            .map_err(|e| anyhow::anyhow!("failed to serialize p2p key: {e}"))?,
+    );
 
     match write_key_atomically(key_path, &bytes) {
         Ok(()) => {
@@ -476,8 +481,12 @@ fn read_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
         }
     }
 
-    let bytes = std::fs::read(key_path)
-        .with_context(|| format!("failed to read p2p key from {}", key_path.display()))?;
+    // Same reason as the write path: this is the private key, so it gets
+    // scrubbed on drop instead of lingering in a heap buffer.
+    let bytes = Zeroizing::new(
+        std::fs::read(key_path)
+            .with_context(|| format!("failed to read p2p key from {}", key_path.display()))?,
+    );
 
     // An empty file decodes as a valid protobuf with a key type of RSA, so
     // without this the operator gets a misleading complaint about a missing
