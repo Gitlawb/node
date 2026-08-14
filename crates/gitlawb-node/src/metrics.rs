@@ -13,6 +13,9 @@
 //!     `gitlawb_webhook_deliveries_total{result}`
 //!   * is inbound gossip being admitted or shed, and for which reason?
 //!     `gitlawb_gossip_ingest_events_total{outcome}`
+//!   * is the gossip replay seen-set full, and therefore admitting events it
+//!     cannot deduplicate?
+//!     `gitlawb_gossip_replay_guard_saturated_total`
 //!   * how big are the packs we're sending and receiving? —
 //!     `gitlawb_pack_size_bytes`
 //!   * a single `gitlawb_info{version, did}` gauge = 1, for joins/dashboards
@@ -35,8 +38,8 @@
 use std::sync::OnceLock;
 
 use prometheus::{
-    Encoder, Histogram, HistogramOpts, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
-    TextEncoder,
+    Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 
 /// The single, process-wide metrics registry. Initialized by [`init`].
@@ -52,6 +55,7 @@ static AUTH_FAILURES: OnceLock<IntCounterVec> = OnceLock::new();
 static SYNC_PROCESSED: OnceLock<IntCounterVec> = OnceLock::new();
 static WEBHOOK_DELIVERIES: OnceLock<IntCounterVec> = OnceLock::new();
 static GOSSIP_INGEST: OnceLock<IntCounterVec> = OnceLock::new();
+static GOSSIP_REPLAY_GUARD_SATURATED: OnceLock<IntCounter> = OnceLock::new();
 static PACK_SIZE: OnceLock<Histogram> = OnceLock::new();
 static PEERS_CONNECTED: OnceLock<IntGauge> = OnceLock::new();
 
@@ -186,6 +190,18 @@ fn init_inner(version: &str, node_did: &str) {
         .set(gossip_ingest)
         .expect("set GOSSIP_INGEST once");
 
+    let gossip_replay_guard_saturated = IntCounter::with_opts(Opts::new(
+        "gitlawb_gossip_replay_guard_saturated_total",
+        "Inbound gossip ref-updates admitted without being recorded because the replay seen-set was at capacity",
+    ))
+    .expect("gitlawb_gossip_replay_guard_saturated_total definition");
+    registry
+        .register(Box::new(gossip_replay_guard_saturated.clone()))
+        .expect("register gitlawb_gossip_replay_guard_saturated_total");
+    GOSSIP_REPLAY_GUARD_SATURATED
+        .set(gossip_replay_guard_saturated)
+        .expect("set GOSSIP_REPLAY_GUARD_SATURATED once");
+
     let pack_size = Histogram::with_opts(
         HistogramOpts::new(
             "gitlawb_pack_size_bytes",
@@ -290,7 +306,8 @@ pub fn record_webhook_delivery(result: &str) {
 
 /// Record what the gossip ingest path decided about one inbound ref-update.
 /// `outcome` ∈ {accepted, unsigned_admitted, write_failed, rejected,
-/// source_rate_limited, author_rate_limited, unsigned_source_rate_limited}.
+/// source_rate_limited, author_rate_limited, unsigned_source_rate_limited,
+/// replayed, stale_timestamp}.
 ///
 /// `accepted` is reserved for signature-verified events. An unsigned event that
 /// survives the rolling-upgrade window is `unsigned_admitted`, so the
@@ -313,6 +330,38 @@ pub fn record_gossip_ingest(outcome: &str) {
     if let Some(c) = GOSSIP_INGEST.get() {
         c.with_label_values(&[outcome]).inc();
     }
+}
+
+/// Record one inbound gossip ref-update that the replay seen-set could not
+/// record because it was at capacity.
+///
+/// Label-less on purpose: there is one degradation mode and nothing about it
+/// varies per event, so a label would only add cardinality.
+///
+/// This is an alert-worthy signal, not a debug counter, and it is the ONLY way
+/// the degraded state is visible. At capacity the guard fails open, which means
+/// the event is admitted and `gitlawb_gossip_ingest_events_total{outcome=
+/// "accepted"}` counts it exactly as it counts a healthy admission. Fail-open is
+/// the right policy (a saturated set that dropped all fresh gossip would convert
+/// a loud resource attack into quiet mesh-wide censorship), but it is not a free
+/// one: while this counter is moving, a captured signature can again be replayed
+/// against the freshness window's full 10 minutes, spending a `peer_exists`
+/// round trip and a debit from the victim author's budget on every replay.
+pub fn record_gossip_replay_guard_saturated() {
+    if let Some(c) = GOSSIP_REPLAY_GUARD_SATURATED.get() {
+        c.inc();
+    }
+}
+
+/// Test-only: current `gitlawb_gossip_replay_guard_saturated_total` value (0 if
+/// the registry is not initialized). Lets the seen-set tests assert the
+/// saturation signal fires without scraping the encoded text.
+#[cfg(test)]
+pub fn replay_guard_saturated_count_for_test() -> u64 {
+    GOSSIP_REPLAY_GUARD_SATURATED
+        .get()
+        .map(|c| c.get())
+        .unwrap_or(0)
 }
 
 /// Record a pack body size observation (bytes).
@@ -410,6 +459,11 @@ mod tests {
         record_auth_failure("test/route", "test_reason");
         record_sync_processed("done");
         record_webhook_delivery("ok");
+        // `record_gossip_replay_guard_saturated` is deliberately NOT called
+        // here. It is a label-less process-wide counter and the seen-set test
+        // that asserts it asserts a before/after delta, so an increment from a
+        // second test running concurrently in this binary would be a flake with
+        // no diagnostic value.
         record_gossip_ingest("accepted");
         observe_pack_size(1024.0);
         set_peers_connected(0);
