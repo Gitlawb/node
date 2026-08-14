@@ -776,12 +776,28 @@ impl Config {
         // every container's first boot), and comparing against the process
         // working directory would reject `/data/p2p.key` under the image's
         // WORKDIR, an absolute directory the operator did name.
+        // `resolved_p2p_key_path` expands a leading `~/` only when a home
+        // directory is resolvable, and otherwise hands back the literal string.
+        // That would leave the shipped default naming a directory called `~`
+        // relative to wherever the process started, which is a real directory
+        // the node would create and chmod, and whose location moves with the
+        // working directory. It passes the check below because `~` is an
+        // ordinary path component, so it has to be caught separately.
         let p2p_key_path = self.resolved_p2p_key_path();
-        if crate::p2p::key_parent(&p2p_key_path) == Path::new(".") {
+        if self.p2p_key_path.starts_with("~/") && p2p_key_path == Path::new(&self.p2p_key_path) {
             return Err(format!(
-                "GITLAWB_P2P_KEY ({}) must include a directory, such as ./keys/p2p.key or \
-                 /data/keys/p2p.key: the node will not store its p2p identity key in the \
-                 working directory, where the directory holding it cannot be secured.",
+                "GITLAWB_P2P_KEY ({}) starts with `~/` but no home directory could be resolved, \
+                 so it would name a literal `~` directory relative to the working directory. \
+                 Set an absolute path such as /data/keys/p2p.key.",
+                self.p2p_key_path
+            ));
+        }
+        if crate::p2p::names_no_usable_directory(&p2p_key_path) {
+            return Err(format!(
+                "GITLAWB_P2P_KEY ({}) must include a directory that does not walk back through \
+                 `..`, such as ./keys/p2p.key or /data/keys/p2p.key: the node will not store its \
+                 p2p identity key in the working directory, where the directory holding it \
+                 cannot be secured.",
                 self.p2p_key_path
             ));
         }
@@ -1498,7 +1514,20 @@ mod tests {
     /// operator never nominated. Reject it at boot instead.
     #[test]
     fn p2p_key_path_without_a_directory_component_is_rejected() {
-        for path in ["p2p.key", "./p2p.key", "././p2p.key", "p2p.key/", ""] {
+        for path in [
+            // No directory component at all.
+            "p2p.key",
+            "./p2p.key",
+            "././p2p.key",
+            "p2p.key/",
+            "",
+            // Looks like it names a directory and does not: each of these
+            // resolves back to the working directory or above it, so accepting
+            // them would defeat the check and chmod an unnominated directory.
+            "a/../p2p.key",
+            "./keys/../p2p.key",
+            "../p2p.key",
+        ] {
             let err = config_with_p2p_key(path)
                 .validate()
                 .expect_err(&format!("{path:?} names no directory and must be rejected"));
@@ -1520,6 +1549,9 @@ mod tests {
             "/data/keys/p2p.key",
             "/data/p2p.key",
             "~/.gitlawb/p2p.key",
+            // Absolute paths are judged unambiguously, so `..` inside one is
+            // fine: it cannot depend on where the process was started.
+            "/data/keys/../p2p.key",
         ] {
             assert!(
                 config_with_p2p_key(path).validate().is_ok(),
