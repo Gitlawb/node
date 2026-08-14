@@ -215,23 +215,32 @@ pub(crate) fn key_parent(key_path: &Path) -> &Path {
 /// `/data/p2p.key` under a `/data` WORKDIR, an absolute directory the operator
 /// named).
 pub(crate) fn names_no_usable_directory(key_path: &Path) -> bool {
-    if key_path.is_absolute() {
-        return false;
-    }
-    match key_path.parent() {
-        None => true,
-        Some(parent) => {
-            let mut named_a_directory = false;
-            for component in parent.components() {
-                match component {
-                    Component::ParentDir => return true,
-                    Component::Normal(_) => named_a_directory = true,
-                    _ => {}
-                }
+    let Some(parent) = key_path.parent() else {
+        return true;
+    };
+
+    let mut named_a_directory = false;
+    for component in parent.components() {
+        match component {
+            // Rejected wherever it appears, absolute paths included. An earlier
+            // version exempted absolute paths on the reasoning that they cannot
+            // depend on the working directory, which is true and beside the
+            // point: `key_parent` hands `ensure_key_dir` the LEXICAL parent, so
+            // `/data/keys/../p2p.key` chmods `/data` rather than the `keys`
+            // directory the path appears to name, and `/data/../p2p.key` run as
+            // root would try to tighten `/` to 0700. The hazard is chmodding a
+            // resolved ancestor nobody nominated, and that does not care whether
+            // the path was absolute.
+            Component::ParentDir => return true,
+            // `/` is a directory the operator named, so an absolute path's root
+            // counts the same way a normal component does.
+            Component::Normal(_) | Component::RootDir | Component::Prefix(_) => {
+                named_a_directory = true
             }
-            !named_a_directory
+            Component::CurDir => {}
         }
     }
+    !named_a_directory
 }
 
 /// Load the node's persistent libp2p identity from `key_path`, generating and
@@ -969,6 +978,11 @@ mod tests {
             "./keys/../p2p.key",
             "../p2p.key",
             "keys/../../p2p.key",
+            // Absolute paths are rejected on `..` too. The lexical parent is
+            // what gets chmodded, so these tighten `/data` and `/` rather than
+            // the directory the path appears to name.
+            "/data/keys/../p2p.key",
+            "/data/../p2p.key",
         ] {
             assert!(
                 names_no_usable_directory(Path::new(path)),
@@ -982,9 +996,7 @@ mod tests {
             "keys/nested/p2p.key",
             "/data/keys/p2p.key",
             "/data/p2p.key",
-            // `..` inside an absolute path cannot depend on the working
-            // directory, so it stays accepted.
-            "/data/keys/../p2p.key",
+            "/p2p.key",
         ] {
             assert!(
                 !names_no_usable_directory(Path::new(path)),

@@ -1527,6 +1527,10 @@ mod tests {
             "a/../p2p.key",
             "./keys/../p2p.key",
             "../p2p.key",
+            // Absolute too: the lexical parent is what gets chmodded, so these
+            // would tighten /data and / rather than the named directory.
+            "/data/keys/../p2p.key",
+            "/data/../p2p.key",
         ] {
             let err = config_with_p2p_key(path)
                 .validate()
@@ -1549,9 +1553,6 @@ mod tests {
             "/data/keys/p2p.key",
             "/data/p2p.key",
             "~/.gitlawb/p2p.key",
-            // Absolute paths are judged unambiguously, so `..` inside one is
-            // fine: it cannot depend on where the process was started.
-            "/data/keys/../p2p.key",
         ] {
             assert!(
                 config_with_p2p_key(path).validate().is_ok(),
