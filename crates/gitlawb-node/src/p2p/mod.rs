@@ -182,17 +182,52 @@ impl IngestLimiters {
     }
 }
 
+/// The event format version this build emits and understands.
+///
+/// 0 is the versionless form: the field set this struct shipped with, before
+/// `v` existed. It is not a placeholder for "unset", it is a real version whose
+/// wire encoding happens to omit the key.
+const CURRENT_REF_UPDATE_VERSION: u32 = 0;
+
+/// True for the version whose key is omitted from the wire form. Free function
+/// because `skip_serializing_if` takes a path, not a closure.
+fn is_zero(v: &u32) -> bool {
+    *v == 0
+}
+
 /// A ref-update event published to Gossipsub when a push lands.
 ///
 /// The signing bytes are this struct serialized with `sig` set to None (see
-/// [`signing_bytes`]), so ANY future field added here changes the signing bytes
-/// for every event that carries it. In a mixed fleet, a node that does not know
-/// the new field re-serializes without it and computes different bytes, so
-/// verification fails. A field addition therefore needs its own rollout plan
-/// (ship the field to the whole fleet before anything emits it), not just a
-/// struct edit.
+/// [`signing_bytes`]), so the FIELD SET IS A WIRE FORMAT, not a struct that can
+/// be extended. Any field added here changes the signing bytes for every event
+/// that carries it: a node that does not know the new field re-serializes
+/// without it, computes different bytes, and rejects the event as a bad
+/// signature. That failure names forgery while describing a version skew, which
+/// is the worst direction for it to fail in.
+///
+/// So `v` carries the format version INSIDE the signed bytes, and a field
+/// addition means bumping it and keeping a verification path for every version
+/// still in the wild, not just editing this struct. A version alongside the
+/// signature rather than under it would be attacker-mutable and prove nothing.
+/// `ingest_ref_update` refuses anything above [`CURRENT_REF_UPDATE_VERSION`] in
+/// its own words, so a newer publisher's events fail as an unsupported version
+/// rather than as a signature mismatch; that guard is what makes the loud
+/// failure real, and it cannot be retrofitted into receivers already deployed.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RefUpdateEvent {
+    /// Format version of the signed field set, 0 being the versionless form
+    /// this struct shipped with.
+    ///
+    /// Declared FIRST so a later version's signing bytes lead with it, and
+    /// skipped when zero so a v0 event's wire bytes and signing bytes stay
+    /// byte-identical to what the pre-version build emits: no `"v"` key
+    /// appears, `GOLDEN_SIGNING_BYTES` is unchanged, and every signature
+    /// already in flight still verifies. `#[serde(default)]` is the other half:
+    /// an event from a peer that predates the field parses as 0, and
+    /// re-serializing reproduces its exact original bytes, which IS the v0
+    /// verification path.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub v: u32,
     /// gitlawb DID of the node publishing the event
     pub node_did: String,
     /// DID of the agent who pushed
@@ -393,6 +428,33 @@ pub(crate) async fn ingest_ref_update(
         Ok(event) => event,
         Err(e) => return IngestOutcome::Rejected(format!("malformed ref-update event: {e}")),
     };
+
+    // Version gate, immediately after the parse and ahead of every gate that
+    // reads a field, the signature match included.
+    //
+    // A version this build does not know means the meaning of every field below
+    // is unknown, so no gate down there is entitled to judge the event, and
+    // admitting it would write rows whose semantics this node cannot state.
+    //
+    // The reason it must run ahead of the SIGNATURE specifically is
+    // observability, and it is the whole point of carrying a version at all.
+    // The signing bytes cover the version, so a newer publisher's correctly
+    // signed event reaches a v0 receiver as bytes that receiver cannot
+    // reproduce: without this gate it lands as "signature does not verify
+    // against node_did", which is an accusation of forgery levelled at an
+    // honest peer, and it reads that way in the logs and counters an operator
+    // would use to notice a mesh partition forming. Same class of lie
+    // `UnsignedSourceRateLimited` was split out to avoid.
+    //
+    // It goes in now, with the version, because it cannot be added later: the
+    // receivers that need it are the ones already deployed by the time a v1
+    // publisher exists.
+    if event.v > CURRENT_REF_UPDATE_VERSION {
+        return IngestOutcome::Rejected(format!(
+            "unsupported ref-update event version {}; this build understands version {}",
+            event.v, CURRENT_REF_UPDATE_VERSION
+        ));
+    }
 
     // did-method gate first, and in BOTH enforcement modes: a non-did:key peer
     // is unauthenticatable by design, and running this before the flag branch
@@ -978,6 +1040,7 @@ mod tests {
     #[test]
     fn ref_update_event_round_trip_with_owner_did() {
         let event = RefUpdateEvent {
+            v: 0,
             node_did: "did:key:zNode".into(),
             pusher_did: "did:key:zPusher".into(),
             repo: "zOwner/myrepo".into(),
@@ -1039,6 +1102,7 @@ mod tests {
     /// field is Some so the serialized form exercises the widest field set.
     fn populated_event() -> RefUpdateEvent {
         RefUpdateEvent {
+            v: 0,
             node_did: "did:key:zNode".into(),
             pusher_did: "did:key:zPusher".into(),
             repo: "zOwner/myrepo".into(),
@@ -1211,6 +1275,65 @@ mod tests {
         );
     }
 
+    /// A complete wire artifact signed by a build that had no version field.
+    ///
+    /// Captured at commit e3dc6f07, from a tree where `RefUpdateEvent` carried
+    /// no `v` field at all, and confirmed to pass `verify_ref_update` there.
+    /// The capture ORDER is the whole value. A v0 event re-serializes with no
+    /// `"v"` key under `skip_serializing_if`, so an artifact captured after the
+    /// field was added is byte-identical to this one, and nothing in a test run
+    /// would distinguish the two. The only thing that makes this artifact
+    /// evidence rather than decoration is that the code under test did not
+    /// exist when it was produced.
+    ///
+    /// Never regenerate it. A signature the test just produced is
+    /// self-consistent by construction: it proves the current encoder agrees
+    /// with the current verifier, which stays true of an encoding that has
+    /// silently stopped accepting every event already in flight. That is the
+    /// only failure this constant can see, and regenerating it is precisely
+    /// how you blind it. Same discipline as `GOLDEN_SIGNING_BYTES`, for the
+    /// same reason: freeze it forever.
+    ///
+    /// Non-degenerate on purpose: `owner_did`, `cert_id`, and `cid` are all
+    /// populated, so the interaction between the optional fields' encoding and
+    /// the version field's is pinned rather than left unexercised by an
+    /// artifact that happened to carry none of them.
+    const LEGACY_SIGNED_EVENT_V0: &str = r#"{"node_did":"did:key:z6MkiAJwX3dtfEY6KGeDDgxXB6ZZWCAxTSHDtJEyUVynqYtq","pusher_did":"did:key:zPusher","repo":"zOwner/myrepo","owner_did":"did:key:zOwner","ref_name":"refs/heads/main","old_sha":"0000000000000000000000000000000000000000","new_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","timestamp":"2026-07-02T12:00:00Z","cert_id":"cert-1","cid":"bafycid","sig":"-lH5aObROlqoTFjnjSXjbDgCVscLfVaKb1Y1gJL1tVsiBZlZnLKi55QgSo0ALTNtI_DyKo0ColzJMxL7w7ZODQ"}"#;
+
+    /// The compatibility test the rest of this module cannot substitute for:
+    /// the only one here that verifies an artifact it did not itself sign.
+    ///
+    /// Every other signature test in this file signs and verifies in one
+    /// breath, which is self-consistent under any field set. Change the signed
+    /// field set on both sides and they all stay green forever while every
+    /// event a deployed peer already emitted becomes unverifiable. Driving a
+    /// pre-change artifact through the post-change verifier is the one
+    /// observation that can tell those two worlds apart.
+    #[test]
+    fn an_event_signed_before_the_version_field_existed_still_verifies() {
+        // The artifact's legacy shape is CHECKED, not attested in a comment.
+        // If a later edit ever regenerates the constant from current code, a
+        // `"v"` key could appear in it and this test would quietly decay into
+        // the fresh-artifact round trip it exists to not be.
+        let raw: serde_json::Value = serde_json::from_str(LEGACY_SIGNED_EVENT_V0)
+            .expect("the frozen artifact must be valid JSON");
+        assert!(
+            !raw.as_object()
+                .expect("the frozen artifact must be a JSON object")
+                .contains_key("v"),
+            "the frozen artifact must carry no version key; it predates the field and \
+             re-capturing it from current code is what this assertion refuses"
+        );
+
+        // Exactly the bytes a peer would receive, straight off the wire.
+        let event: RefUpdateEvent = serde_json::from_slice(LEGACY_SIGNED_EVENT_V0.as_bytes())
+            .expect("an event from before the version field must still parse");
+        verify_ref_update(&event).expect(
+            "an event signed before the version field existed must still verify; the signed \
+             field set is a wire format and this build has changed it",
+        );
+    }
+
     /// Build a populated event whose `node_did` is the given keypair's DID.
     fn event_for(keypair: &Keypair) -> RefUpdateEvent {
         let mut event = populated_event();
@@ -1276,6 +1399,75 @@ mod tests {
             verify_ref_update(&tampered)
                 .expect_err("mutating any signed field must fail verification");
         }
+    }
+
+    /// The version is inside the signed region, in both directions, and the
+    /// second direction is the one skip-when-zero creates.
+    ///
+    /// A version key beside the signature rather than under it is
+    /// attacker-mutable and proves nothing, so downgrading a v1 event to v0
+    /// has to be as detectable as upgrading a v0 event to v1. The two
+    /// directions are not symmetric here: flipping 0 to 1 ADDS a key to the
+    /// signing bytes, while flipping 1 to 0 REMOVES one, and only the second
+    /// exercises the `skip_serializing_if` arm. Testing one direction would
+    /// leave an encoding that emits the key unconditionally, or one that never
+    /// emits it, indistinguishable from the correct one.
+    #[test]
+    fn the_version_is_covered_by_the_signature_in_both_directions() {
+        let keypair = Keypair::generate();
+
+        // Signed at v0, where the key is absent from the signing bytes.
+        // Raising it on the received copy makes the key appear.
+        let mut at_zero = event_for(&keypair);
+        sign_ref_update(&keypair, &mut at_zero).unwrap();
+        verify_ref_update(&at_zero).expect("baseline must verify before tampering");
+        let mut raised = at_zero.clone();
+        raised.v = 1;
+        verify_ref_update(&raised)
+            .expect_err("raising the version on a signed event must fail verification");
+
+        // Signed at v1, where the key IS in the signing bytes. Lowering it to
+        // zero on the received copy makes the key vanish, which is the arm a
+        // one-directional test never reaches.
+        let mut at_one = event_for(&keypair);
+        at_one.v = 1;
+        sign_ref_update(&keypair, &mut at_one).unwrap();
+        verify_ref_update(&at_one).expect("a v1 event must verify against its own signature");
+        let mut lowered = at_one.clone();
+        lowered.v = 0;
+        verify_ref_update(&lowered)
+            .expect_err("lowering the version on a signed event must fail verification");
+    }
+
+    /// An event from a peer that predates the field parses as v0, and
+    /// re-serializing it reproduces the versionless bytes. That round trip IS
+    /// the v0 verification path: there is no separate legacy code path to keep
+    /// working, only the property that the default and the skip agree.
+    #[test]
+    fn json_without_a_version_key_parses_as_v0_and_signs_without_one() {
+        let old_json = serde_json::json!({
+            "node_did": "did:key:zNode",
+            "pusher_did": "did:key:zPusher",
+            "repo": "zOwner/myrepo",
+            "ref_name": "refs/heads/main",
+            "old_sha": "0000000000000000000000000000000000000000",
+            "new_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "timestamp": "2026-07-02T12:00:00Z",
+            "cert_id": null,
+            "cid": null
+        });
+        let deserialized: RefUpdateEvent = serde_json::from_value(old_json).unwrap();
+        assert_eq!(
+            deserialized.v, 0,
+            "an event with no version key is the versionless form, which is v0"
+        );
+
+        let bytes = String::from_utf8(signing_bytes(&deserialized).unwrap()).unwrap();
+        assert!(
+            !bytes.contains("\"v\""),
+            "a v0 event's signing bytes must carry no version key, or every peer \
+             running the pre-version build computes different bytes; got: {bytes}"
+        );
     }
 
     #[test]
@@ -1424,6 +1616,54 @@ mod tests {
 
         assert_nothing_written(&pool, "unsigned event with enforcement on").await;
         rejection_reason(outcome, "unsigned event with enforcement on");
+    }
+
+    /// An event from a build newer than this one is refused AS a version
+    /// problem, in its own words.
+    ///
+    /// The witness is valid in every other respect on purpose: correctly
+    /// signed by a key that resolves from its own `node_did`, seeded as a known
+    /// peer, well-formed slug. So the version is the only rule that can reject
+    /// it, and without the guard it is not rejected at all, it is ACCEPTED, and
+    /// this node writes rows whose field semantics it does not know.
+    ///
+    /// The assertion is on the SENTENCE, not merely on the refusal, and that is
+    /// the point of the test rather than a detail of it. An honest v1
+    /// publisher's events would otherwise land as a signature mismatch,
+    /// indistinguishable in logs and counters from forgery, and an operator
+    /// watching a partition form would be reading an accusation instead of a
+    /// version skew. Asserting only that the event was rejected cannot tell the
+    /// two apart.
+    #[sqlx::test]
+    async fn an_unknown_version_is_refused_as_an_unknown_version(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        event.v = CURRENT_REF_UPDATE_VERSION + 1;
+        sign_ref_update(&keypair, &mut event).unwrap();
+        seed_peer(&pool, &event.node_did).await;
+        // The witness must be rejectable only by the version rule, so confirm
+        // the signature path would have admitted it.
+        verify_ref_update(&event).expect("the witness must be correctly signed");
+
+        for require_signed in [true, false] {
+            let context = format!("v1 event, require_signed={require_signed}");
+            let outcome = ingest_with_fresh_limiter(
+                &db,
+                require_signed,
+                true,
+                &bytes_of(&event),
+                &PeerId::random(),
+            )
+            .await;
+            assert_nothing_written(&pool, &context).await;
+            assert_eq!(
+                rejection_reason(outcome, &context),
+                "unsupported ref-update event version 1; this build understands version 0",
+                "{context}: an unknown version must be named as one, never reported as a \
+                 signature failure"
+            );
+        }
     }
 
     /// R2: a cryptographically valid signature that does not bind the claimed

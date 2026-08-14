@@ -2461,6 +2461,7 @@ async fn post_receive_replication_tail(
                 if announce {
                     if let Some(p2p) = &p2p_handle {
                         p2p.publish_ref_update(crate::p2p::RefUpdateEvent {
+                            v: 0,
                             node_did: node_did_str.clone(),
                             pusher_did: pusher_did_clone.clone(),
                             repo: repo_slug.clone(),
