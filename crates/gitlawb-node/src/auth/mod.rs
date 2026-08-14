@@ -17,6 +17,20 @@ use crate::state::AppState;
 #[derive(Clone, Debug)]
 pub struct AuthenticatedDid(pub String);
 
+/// A UCAN that passed full chain validation, with the root issuer the chain
+/// rests on. Inserted into request extensions by [`require_ucan_chain`] when
+/// `X-Ucan` is present; absent when the header is.
+///
+/// `root` is carried rather than recomputed so the chain is walked once per
+/// request. Holding this is not itself an authorization decision — a caller must
+/// still compare `root` against an identity it independently trusts, because
+/// `did:key` is self-certifying and anyone can mint a chain that verifies.
+#[derive(Clone, Debug)]
+pub struct VerifiedUcan {
+    pub ucan: Ucan,
+    pub root: Did,
+}
+
 /// Whether `caller` is authorized to push to `record`.
 ///
 /// Phase 1 (`GITLAWB_ENFORCE_OWNER_PUSH`): owner-only, via the canonical
@@ -270,7 +284,7 @@ fn validate_ucan_chain(
     token: &str,
     expected_aud: &Did,
     signer_did: &Did,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<VerifiedUcan, (StatusCode, Json<serde_json::Value>)> {
     let ucan = Ucan::decode(token).map_err(|e| {
         (
             StatusCode::UNAUTHORIZED,
@@ -298,14 +312,14 @@ fn validate_ucan_chain(
         )
     })?;
 
-    ucan.verify_chain().map_err(|e| {
+    let root = ucan.verify_chain().map_err(|e| {
         (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "invalid_ucan", "message": e.to_string() })),
         )
     })?;
 
-    Ok(())
+    Ok(VerifiedUcan { ucan, root })
 }
 
 /// Axum middleware that validates a UCAN chain when `X-Ucan` is present.
@@ -358,11 +372,18 @@ pub async fn require_ucan_chain(
         }
     };
 
-    if let Err((status, body)) = validate_ucan_chain(&token, &state.node_did, &signer_did) {
-        return (status, body).into_response();
-    }
+    let verified = match validate_ucan_chain(&token, &state.node_did, &signer_did) {
+        Ok(v) => v,
+        Err((status, body)) => return (status, body).into_response(),
+    };
 
-    tracing::debug!(did = %signer_did, "UCAN chain validated");
+    tracing::debug!(did = %signer_did, root = %verified.root, "UCAN chain validated");
+
+    // Park the verified token where a handler can reach it. Validation alone
+    // grants nothing; the authorization decision is made downstream, by a caller
+    // that knows which identity it trusts for the resource being touched.
+    let mut request = request;
+    request.extensions_mut().insert(verified);
     next.run(request).await
 }
 
@@ -396,6 +417,37 @@ mod tests {
 
     fn bootstrap_ucan(node: &Keypair, agent_did: Did) -> Ucan {
         Ucan::bootstrap(node, agent_did).unwrap()
+    }
+
+    /// The middleware validated a token and threw the result away, so no handler
+    /// could ever read it and `Ucan::can` had no call site in the node. Validation
+    /// must hand back both the token and the root the chain rests on.
+    #[test]
+    fn validate_ucan_chain_hands_back_the_root_and_the_token() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let caps_vec = vec![Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH)];
+
+        let delegation =
+            Ucan::issue(&owner, agent.did(), caps_vec.clone(), None).expect("issue delegation");
+        let invocation = Ucan::delegate(&agent, node.did(), caps_vec, None, &delegation)
+            .expect("wrap invocation");
+        let token = invocation.encode().expect("encode");
+
+        let verified = validate_ucan_chain(&token, &node.did(), &agent.did())
+            .expect("a well-formed owner-rooted invocation must validate");
+
+        assert_eq!(
+            verified.root,
+            owner.did(),
+            "the root must be the owner, so a caller can anchor against the repo record"
+        );
+        assert_eq!(
+            verified.ucan.payload.iss,
+            agent.did(),
+            "the token itself must come back so a caller can read its capabilities"
+        );
     }
 
     fn delegation_ucan(agent: &Keypair, node_did: Did, proof: &Ucan) -> Ucan {
