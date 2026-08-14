@@ -343,6 +343,29 @@ fn signed_publish_bytes(keypair: &Keypair, event: &RefUpdateEvent) -> serde_json
     serde_json::to_vec(&event)
 }
 
+/// Exactly the pair the swarm loop hands `gossipsub.publish` for one outbound
+/// ref-update: the topic, and the signed bytes.
+///
+/// Extracted from the publish arm so a test can hold what the loop publishes.
+/// The arm itself sits inside a `select!` that no test drives, so before this
+/// existed the only thing standing between a regression and the mesh was that
+/// the arm happened to call `signed_publish_bytes`; an arm rewritten to
+/// `serde_json::to_vec(&event)` would have published unsigned bytes with the
+/// whole suite green. Now that regression has to be made HERE to stay silent.
+///
+/// Be exact about what this does and does not close. It closes
+/// sign-before-publish and the topic the bytes go out on. It does NOT observe
+/// the `select!` arm dispatching to it, and it does not observe `require_signed`
+/// arriving from `main.rs`; both need a live swarm. Those remain uncovered
+/// seams, named rather than implied away.
+fn ref_update_publish_args(
+    keypair: &Keypair,
+    event: &RefUpdateEvent,
+) -> serde_json::Result<(gossipsub::IdentTopic, Vec<u8>)> {
+    let bytes = signed_publish_bytes(keypair, event)?;
+    Ok((gossipsub::IdentTopic::new(REF_UPDATES_TOPIC), bytes))
+}
+
 /// Resolve the public key behind a claimed `node_did`, refusing anything that
 /// is not a resolvable `did:key`.
 ///
@@ -1069,9 +1092,8 @@ pub async fn start(
                 Some(cmd) = cmd_rx.recv() => {
                     match cmd {
                         P2pCommand::PublishRefUpdate(event) => {
-                            match signed_publish_bytes(&keypair, &event) {
-                                Ok(bytes) => {
-                                    let topic = gossipsub::IdentTopic::new(REF_UPDATES_TOPIC);
+                            match ref_update_publish_args(&keypair, &event) {
+                                Ok((topic, bytes)) => {
                                     match swarm.behaviour_mut().gossipsub.publish(topic, bytes) {
                                         Ok(id) => info!(msg_id = %id, repo = %event.repo, "published ref-update"),
                                         Err(e) => warn!(err = %e, "failed to publish ref-update"),
@@ -1360,6 +1382,55 @@ mod tests {
         );
     }
 
+    /// The same golden discipline, applied to the optional shape production
+    /// actually emits.
+    ///
+    /// `GOLDEN_SIGNING_BYTES` above pins an event with `owner_did`, `cert_id`,
+    /// and `cid` all populated, and no real publish looks like that. The sole
+    /// production publish site, `api::repos::post_receive_replication_tail`,
+    /// always passes `cert_id: None`, and `cid` is None on every push whose
+    /// pinning has not finished. So the encoding of a null-valued optional, the
+    /// one carried by essentially every live event, was pinned nowhere.
+    ///
+    /// What this catches that the all-`Some` constant structurally cannot:
+    /// adding `skip_serializing_if = "Option::is_none"` to any of those three
+    /// fields omits the key rather than writing `null`, which changes the
+    /// signing input for every event in flight while leaving the all-`Some`
+    /// golden byte-identical. That is not hypothetical; injecting exactly that
+    /// attribute on `cert_id` left the whole suite green, both goldens passing,
+    /// with the production signing input silently changed.
+    ///
+    /// Frozen for the same reason as the constant above: a failure here is a
+    /// wire-format change that needs a rollout plan, not a constant to re-pin.
+    const GOLDEN_SIGNING_BYTES_ALL_NONE: &str = concat!(
+        r#"{"node_did":"did:key:zNode","pusher_did":"did:key:zPusher","#,
+        r#""repo":"zOwner/myrepo","owner_did":null,"#,
+        r#""ref_name":"refs/heads/main","#,
+        r#""old_sha":"0000000000000000000000000000000000000000","#,
+        r#""new_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","#,
+        r#""timestamp":"2026-07-02T12:00:00Z","cert_id":null,"cid":null}"#,
+    );
+
+    /// The all-`None` optional shape: what the production publish site emits.
+    fn all_none_optionals_event() -> RefUpdateEvent {
+        RefUpdateEvent {
+            owner_did: None,
+            cert_id: None,
+            cid: None,
+            ..populated_event()
+        }
+    }
+
+    #[test]
+    fn signing_bytes_of_the_all_none_shape_match_the_golden_constant() {
+        let bytes = signing_bytes(&all_none_optionals_event()).unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            GOLDEN_SIGNING_BYTES_ALL_NONE,
+            "the wire signing input for null-valued optionals changed; see the comment on GOLDEN_SIGNING_BYTES_ALL_NONE"
+        );
+    }
+
     /// The signature must be excluded from its own input, so a signed event and
     /// its unsigned original produce identical signing bytes.
     #[test]
@@ -1389,13 +1460,32 @@ mod tests {
     /// silently stopped accepting every event already in flight. That is the
     /// only failure this constant can see, and regenerating it is precisely
     /// how you blind it. Same discipline as `GOLDEN_SIGNING_BYTES`, for the
-    /// same reason: freeze it forever.
+    /// same reason: freeze it forever. `LEGACY_SIGNED_EVENT_V0_SHA256` below is
+    /// what makes "never regenerate it" a check rather than a request.
     ///
     /// Non-degenerate on purpose: `owner_did`, `cert_id`, and `cid` are all
     /// populated, so the interaction between the optional fields' encoding and
     /// the version field's is pinned rather than left unexercised by an
     /// artifact that happened to carry none of them.
     const LEGACY_SIGNED_EVENT_V0: &str = r#"{"node_did":"did:key:z6MkiAJwX3dtfEY6KGeDDgxXB6ZZWCAxTSHDtJEyUVynqYtq","pusher_did":"did:key:zPusher","repo":"zOwner/myrepo","owner_did":"did:key:zOwner","ref_name":"refs/heads/main","old_sha":"0000000000000000000000000000000000000000","new_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","timestamp":"2026-07-02T12:00:00Z","cert_id":"cert-1","cid":"bafycid","sig":"-lH5aObROlqoTFjnjSXjbDgCVscLfVaKb1Y1gJL1tVsiBZlZnLKi55QgSo0ALTNtI_DyKo0ColzJMxL7w7ZODQ"}"#;
+
+    /// SHA-256 of `LEGACY_SIGNED_EVENT_V0`, hex, lowercase. This is what makes
+    /// the capture claim above checkable instead of merely attested.
+    ///
+    /// The obvious guard does not work, which is why this one exists. Asserting
+    /// the artifact carries no `"v"` key proves nothing about its provenance: a
+    /// v0 event re-serializes with no version key under `skip_serializing_if`,
+    /// so an artifact regenerated from CURRENT code carries no `"v"` key either
+    /// and that assertion passes against precisely the regeneration it was meant
+    /// to refuse. A digest has no such blind spot. Any edit to those bytes,
+    /// regeneration included, moves it.
+    ///
+    /// Frozen alongside the artifact. If it fails, the constant was edited:
+    /// restore the original from commit e3dc6f07 rather than re-pinning the
+    /// digest, since re-pinning is exactly the act of blinding the test that the
+    /// "never regenerate it" paragraph above warns against.
+    const LEGACY_SIGNED_EVENT_V0_SHA256: &str =
+        "2482e053c8ab1841d784f523f1ef5e3d0bd5f9d563565af8fca8dd34a1e264fc";
 
     /// The compatibility test the rest of this module cannot substitute for:
     /// the only one here that verifies an artifact it did not itself sign.
@@ -1408,18 +1498,19 @@ mod tests {
     /// observation that can tell those two worlds apart.
     #[test]
     fn an_event_signed_before_the_version_field_existed_still_verifies() {
-        // The artifact's legacy shape is CHECKED, not attested in a comment.
-        // If a later edit ever regenerates the constant from current code, a
-        // `"v"` key could appear in it and this test would quietly decay into
-        // the fresh-artifact round trip it exists to not be.
-        let raw: serde_json::Value = serde_json::from_str(LEGACY_SIGNED_EVENT_V0)
-            .expect("the frozen artifact must be valid JSON");
-        assert!(
-            !raw.as_object()
-                .expect("the frozen artifact must be a JSON object")
-                .contains_key("v"),
-            "the frozen artifact must carry no version key; it predates the field and \
-             re-capturing it from current code is what this assertion refuses"
+        // What this checks, exactly: that the constant still holds the bytes
+        // captured at e3dc6f07, byte for byte. It does not, and cannot, observe
+        // that those bytes predate the version field; that is established by the
+        // capture commit and by review, not by anything a test run can see. What
+        // the digest does buy is that a later edit which regenerates the artifact
+        // from current code fails HERE, loudly, instead of quietly decaying this
+        // test into the fresh-artifact round trip it exists to not be.
+        use sha2::{Digest, Sha256};
+        let digest = hex::encode(Sha256::digest(LEGACY_SIGNED_EVENT_V0.as_bytes()));
+        assert_eq!(
+            digest, LEGACY_SIGNED_EVENT_V0_SHA256,
+            "the frozen legacy artifact was edited; restore it from commit e3dc6f07 rather than \
+             re-pinning this digest"
         );
 
         // Exactly the bytes a peer would receive, straight off the wire.
@@ -2062,6 +2153,147 @@ mod tests {
             "bytes from the emit path must survive ingest with enforcement on, got {outcome:?}"
         );
         assert_eq!(count(&pool, "received_ref_updates").await, 1);
+    }
+
+    /// The publish arm's own output, driven end to end: whatever
+    /// `ref_update_publish_args` hands gossipsub must be signed, must go out on
+    /// the wire topic peers subscribe to, and must survive ingest with
+    /// enforcement ON.
+    ///
+    /// This is deliberately not a second copy of the round trip above. That test
+    /// calls `signed_publish_bytes`, one layer below the loop; this one calls
+    /// the function the `select!` arm calls, so an arm that stopped signing
+    /// would have to be rewritten rather than merely reordered to keep the suite
+    /// green. The topic is asserted against the literal string, not against
+    /// `REF_UPDATES_TOPIC`, because comparing the constant to itself proves
+    /// nothing: the topic name is a wire format shared with every deployed peer,
+    /// and renaming it silently partitions the mesh into two meshes that each
+    /// look healthy.
+    ///
+    /// What is still NOT observed, and is not implied to be: the `select!` arm
+    /// dispatching a `P2pCommand::PublishRefUpdate` into this function, and
+    /// `require_signed` reaching `ingest_ref_update` from `main.rs` the right
+    /// way round. Both live inside `p2p::start`, which needs a live swarm to
+    /// drive, so an inverted flag threaded from the config would still leave
+    /// this green. Uncovered seam, named.
+    #[sqlx::test]
+    async fn the_publish_arms_output_is_signed_and_survives_enforced_ingest(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        // Unsigned on the way in, exactly as `publish_ref_update` hands it over.
+        let event = event_for(&keypair);
+        assert_eq!(
+            event.sig, None,
+            "the publish path is what adds the signature"
+        );
+        seed_peer(&pool, &event.node_did).await;
+
+        let (topic, bytes) =
+            ref_update_publish_args(&keypair, &event).expect("the publish arm must produce args");
+
+        assert_eq!(
+            topic.to_string(),
+            "gitlawb/ref-updates/v1",
+            "the publish topic is a wire format; renaming it partitions the mesh"
+        );
+
+        let published: RefUpdateEvent =
+            serde_json::from_slice(&bytes).expect("published bytes must parse");
+        assert!(
+            published.sig.is_some(),
+            "the bytes the loop hands gossipsub must carry a signature"
+        );
+
+        let outcome = ingest_with_fresh_limiter(&db, true, true, &bytes, &PeerId::random()).await;
+        assert!(
+            matches!(outcome, IngestOutcome::Accepted),
+            "the publish arm's bytes must survive ingest with enforcement on, got {outcome:?}"
+        );
+        assert_eq!(count(&pool, "received_ref_updates").await, 1);
+    }
+
+    // ── Durable-write failure ─────────────────────────────────────────────
+    //
+    // `WriteFailed` is unreachable from every other test here: a rejection stops
+    // above both writes, and an acceptance has both succeed. So the variant that
+    // exists to stop `Accepted` from meaning "authenticated but never stored"
+    // was never once observed, and `rejection_reason` panics rather than
+    // distinguishes if it turns up.
+    //
+    // The failure is made REAL by dropping the target table on the live test
+    // database, so the error comes back from Postgres on the actual write rather
+    // than from a stub standing in for one. Both directions are driven, because
+    // the property is that the two writes are attempted INDEPENDENTLY: a test
+    // that only broke the first could not tell that from "the first failure
+    // aborts the rest", and each case therefore asserts what landed in the sink
+    // that was left intact.
+
+    /// The ref-update row fails, the queue entry still lands.
+    #[sqlx::test]
+    async fn a_failed_ref_update_insert_reports_write_failed_and_still_enqueues(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        seed_peer(&pool, &event.node_did).await;
+
+        sqlx::query("DROP TABLE received_ref_updates")
+            .execute(&pool)
+            .await
+            .expect("drop the ref-update sink so its write genuinely fails");
+
+        let outcome =
+            ingest_with_fresh_limiter(&db, true, true, &bytes_of(&event), &PeerId::random()).await;
+
+        match outcome {
+            IngestOutcome::WriteFailed(reason) => assert!(
+                reason.contains("failed to store received ref-update"),
+                "the outcome must name the write that failed, got: {reason}"
+            ),
+            other => panic!(
+                "an event whose durable write failed must not be reported as accepted, got {other:?}"
+            ),
+        }
+
+        assert_eq!(
+            count(&pool, "sync_queue").await,
+            1,
+            "the queue entry is a separate write and must not be lost to the row's failure"
+        );
+    }
+
+    /// The mirror: the queue entry fails, the ref-update row still lands.
+    #[sqlx::test]
+    async fn a_failed_enqueue_reports_write_failed_and_still_stores_the_row(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        seed_peer(&pool, &event.node_did).await;
+
+        sqlx::query("DROP TABLE sync_queue")
+            .execute(&pool)
+            .await
+            .expect("drop the queue sink so its write genuinely fails");
+
+        let outcome =
+            ingest_with_fresh_limiter(&db, true, true, &bytes_of(&event), &PeerId::random()).await;
+
+        match outcome {
+            IngestOutcome::WriteFailed(reason) => assert!(
+                reason.contains("failed to enqueue sync"),
+                "the outcome must name the write that failed, got: {reason}"
+            ),
+            other => panic!(
+                "an event whose enqueue failed must not be reported as accepted, got {other:?}"
+            ),
+        }
+
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            1,
+            "the ref-update row is a separate write and must not be lost to the enqueue failure"
+        );
     }
 
     // ── Ingest rate limits ────────────────────────────────────────────────
