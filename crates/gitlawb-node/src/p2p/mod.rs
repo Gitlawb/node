@@ -733,23 +733,56 @@ mod tests {
         );
     }
 
+    // ---- Permission probe, run in a child process -------------------------
+    //
+    // The probe has to create the key under a zeroed umask, otherwise a
+    // restrictive ambient umask masks the bits down to 0600 by itself and the
+    // assertion passes whether or not the code pins the mode. That zeroing is
+    // the problem: `umask` is process-global and cargo runs these tests on
+    // threads, so any test creating a file in that window inherits 000. Measured
+    // before this change, an unrelated concurrent test's file was created 0666.
+    //
+    // So the probe runs in a dedicated child process, where the zeroed umask
+    // cannot reach a sibling and dies with the child. The parent test below is
+    // an ordinary `#[test]` that runs concurrently with everything else.
+    //
+    // Two halves, and the split is worth naming: the child's assertions are the
+    // committed deterministic guard, and the concurrency leak itself was proven
+    // out of band by a throwaway probe rather than by a committed test. A race
+    // on process-global state has no reliable committed red-green.
+
+    /// Re-invoke this test binary to run one `#[ignore]`d fixture test.
+    #[cfg(unix)]
+    fn fixture_command(fixture_test: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+        cmd.args([fixture_test, "--exact", "--ignored", "--nocapture"])
+            .env("GITLAWB_TEST_FIXTURE", "p2p-key-perms");
+        cmd
+    }
+
+    /// Fixture: create the key under a zeroed umask and assert the modes the
+    /// code is supposed to pin. Double-gated so it is inert unless the parent
+    /// invoked it: `#[ignore]` keeps it out of a normal run, and the env check
+    /// keeps it inert even under a bare `--ignored` sweep, which would otherwise
+    /// zero the umask inside the shared test process.
     #[cfg(unix)]
     #[test]
-    fn p2p_key_file_is_0600_on_unix() {
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=p2p-key-perms"]
+    fn fixture_p2p_key_perms_under_zero_umask() {
         use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("p2p-key-perms") {
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("keys").join("p2p.key");
 
-        // Create the key under a fully permissive umask, otherwise a restrictive
-        // ambient umask masks the bits down to 0600 on its own and the assertion
-        // below passes whether or not the code pins the mode.
-        // SAFETY: `umask` is always safe to call; it only reads and replaces the
-        // process-wide value.
-        let prev_umask = unsafe { libc::umask(0o000) };
-        let result = load_or_create_p2p_keypair(&path);
-        unsafe { libc::umask(prev_umask) };
-        result.unwrap();
+        // SAFETY: `umask` only reads and replaces the process-wide value, and
+        // this process exists solely for this probe. No restore: the value dies
+        // with the child.
+        unsafe { libc::umask(0o000) };
+        load_or_create_p2p_keypair(&path).expect("key creation under a permissive umask");
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(
@@ -767,6 +800,33 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(dir_mode & 0o777, 0o700, "key directory must be owner-only");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p2p_key_file_is_0600_on_unix() {
+        let output = fixture_command("p2p::tests::fixture_p2p_key_perms_under_zero_umask")
+            .output()
+            .expect("spawn the permission fixture");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "the permission fixture must pass in its child process\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+
+        // Not redundant with the status check, and this is the assertion that
+        // keeps the whole fixture from passing vacuously: a filter matching no
+        // test runs zero tests and still exits 0, so a renamed or mistyped
+        // fixture would look like a green permission check while asserting
+        // nothing at all.
+        assert!(
+            stdout.contains("1 passed"),
+            "the fixture filter must select exactly one test that passed; a filter matching \
+             nothing exits 0 and would make this check vacuous\n--- stdout ---\n{stdout}"
+        );
     }
 
     #[cfg(unix)]
