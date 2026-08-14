@@ -315,13 +315,6 @@ When `GITLAWB_REQUIRE_SIGNED_PEER_WRITES=false`, unsigned legacy peers are accep
 GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true
 ```
 
-**Planned cutover: this default flips to `true` on 15 September 2026.** Until then a
-node started with no configuration still accepts unsigned announces, which is an open
-write surface kept open only so live peers can finish upgrading. Operators should set it
-to `true` now; after the cutover, setting it to `false` becomes the explicit opt-out.
-This mirrors what `GITLAWB_ENFORCE_OWNER_PUSH` has already done — that one defaults to
-`true` today.
-
 `POST /api/v1/sync/trigger` is not part of the staged rollout: it always requires a signature in both config modes and returns 401 without one, because each call drives an O(peers) outbound fan-out.
 
 ---

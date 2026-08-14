@@ -1780,7 +1780,7 @@ pub async fn git_receive_pack(
         "parsed ref updates from pack"
     );
 
-    // ── Owner-only push enforcement (opt-in: GITLAWB_ENFORCE_OWNER_PUSH) ──
+    // ── Owner-only push enforcement (on by default; GITLAWB_ENFORCE_OWNER_PUSH) ──
     // Runs before branch protection on purpose: when enabled, a non-owner is
     // rejected here regardless of whether the target branch is protected, so a
     // single rejection never yields two different error bodies. The identity is
@@ -1903,9 +1903,12 @@ pub async fn git_receive_pack(
     // (INV-10) and a saturated pool sheds 503 before spawning git.
     //
     // Per-source sub-cap first (#174 P1-d): one source IP cannot occupy the whole write
-    // pool via many slow pushes. Owner enforcement defaults off, so any valid did:key is
-    // accepted (auth != authz) and the push rate limiter bounds arrival RATE, not in-flight
-    // concurrency. Keyed on the resolved source IP, NEVER the signed DID (a DID farm defeats
+    // pool via many slow pushes. The push rate limiter bounds arrival RATE, not in-flight
+    // concurrency, so this cap is what bounds occupancy. Owner enforcement is on by
+    // default now, but it is not what makes this cap load-bearing: an operator may turn it
+    // off for a rolling upgrade, and even with it on a single owner can open many
+    // concurrent slow pushes to their own repo.
+    // Keyed on the resolved source IP, NEVER the signed DID (a DID farm defeats
     // a DID key); no resolvable key -> global write pool only. Then the global write permit:
     // pushes draw from the dedicated WRITE pool, separate from reads, and it is held for the
     // whole op (moved into the AdmissionGuard below).
@@ -5595,8 +5598,9 @@ mod tests {
 
     /// #174 U4 (P1-d, RED-before/GREEN-after): the authenticated receive-pack POST
     /// carries a per-source WRITE sub-cap so one source IP cannot monopolize the write
-    /// pool with many slow pushes (owner enforcement defaults off, so disposable DIDs
-    /// are free). Global write pool has capacity; the source is pre-held at its single
+    /// pool with many slow pushes (the cap keys on source IP, not the DID, so it holds
+    /// whether or not owner enforcement is on — and it can be turned off for a rolling
+    /// upgrade). Global write pool has capacity; the source is pre-held at its single
     /// write slot. A push from THAT source sheds (Overloaded/503) — which also proves
     /// the PeerAddr+HeaderMap extractors resolve a key (without them the key is None and
     /// the cap is inert, never shedding). A push from a DIFFERENT source is NOT shed by
@@ -8499,19 +8503,22 @@ mod tests {
             let r = state.db.get_repo("z6u1nat", "n1").await.unwrap().unwrap();
             crate::state::repo_identity_key(&r.owner_did, &r.name)
         };
-        f1_add_repo(&state, "z6u1nat", "n2").await;
-        // Every pusher arrives from the one edge IP, so they share a source key. All
-        // three sign as the repos' owner because owner-only push is on by default; the
-        // source key is the resolved peer IP, never the DID, so the three concurrent
-        // pushes still contend exactly as they did under distinct pusher identities.
+        // n2 belongs to a DIFFERENT owner, so the third push is a genuinely different
+        // tenant — which is what this test is named for. Owner-only push forces each
+        // push to sign as the owner of the repo it targets, so the tenants are
+        // distinguished by which repo they push to rather than by an arbitrary DID.
+        f1_add_repo(&state, "z6u1nat2", "n2").await;
+        // Every pusher arrives from the one edge IP, so they share a source key: the
+        // per-source cap keys on the resolved peer address and never on the DID, which
+        // is exactly the property under test.
         let edge: SocketAddr = "203.0.113.85:5000".parse().unwrap();
-        let push = |pusher: &'static str, repo: &'static str| {
+        let push = |owner: &'static str, repo: &'static str| {
             let st = state.clone();
             async move {
                 git_receive_pack(
                     State(st),
-                    Path(("z6u1nat".to_string(), repo.to_string())),
-                    Extension(crate::auth::AuthenticatedDid(pusher.to_string())),
+                    Path((owner.to_string(), repo.to_string())),
+                    Extension(crate::auth::AuthenticatedDid(format!("did:key:{owner}"))),
                     crate::rate_limit::PeerAddr(Some(edge)),
                     axum::http::HeaderMap::new(),
                     axum::body::Bytes::from_static(b"0000"),
@@ -8520,12 +8527,12 @@ mod tests {
             }
         };
 
-        let handle_a = tokio::spawn(push("did:key:z6u1nat", "n1"));
+        let handle_a = tokio::spawn(push("z6u1nat", "n1"));
         assert!(
             f1_wait_for(F1_BACKSTOP, || a_inpack.exists()).await,
             "pusher one never reached receive-pack within {F1_BACKSTOP:?}"
         );
-        let handle_b = tokio::spawn(push("did:key:z6u1nat", "n1"));
+        let handle_b = tokio::spawn(push("z6u1nat", "n1"));
         assert!(
             f1_wait_for(F1_BACKSTOP, || state.repo_write_leases.waiters_for(&repo1)
                 == 1)
@@ -8533,8 +8540,8 @@ mod tests {
             "pusher two never parked on n1's contended lease within {F1_BACKSTOP:?}"
         );
 
-        // A third, unrelated pusher behind the same edge IP, on a different repo.
-        let c = tokio::time::timeout(F1_BACKSTOP, push("did:key:z6u1nat", "n2"))
+        // A third pusher — a different tenant — behind the same edge IP, on its own repo.
+        let c = tokio::time::timeout(F1_BACKSTOP, push("z6u1nat2", "n2"))
             .await
             .expect("an unrelated pusher's push to an uncontended repo must not park");
         let resp = c.unwrap_or_else(|e| {
@@ -8622,10 +8629,13 @@ mod tests {
             );
         }
         let r = push(other, "k2").await;
+        // Positive, for the same reason as `f1_write_cap_is_inert_without_a_resolvable
+        // _source_key`: `!matches!(.., Overloaded)` is satisfied by a Forbidden, so a
+        // gate that started rejecting this pusher would leave the test green and inert.
         assert!(
-            !matches!(r, Err(AppError::Overloaded(_))),
+            matches!(r, Err(AppError::Git(_))),
             "a different source must not be shed on any repo while the capped source \
-             holds its slot; got {r:?}"
+             holds its slot, and must reach git; got {r:?}"
         );
     }
 
@@ -8660,17 +8670,22 @@ mod tests {
             State(state.clone()),
             Path(("z6f1none".to_string(), "n1".to_string())),
             Extension(crate::auth::AuthenticatedDid(
-                "did:key:z6MkF1NoKeyPusherAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                "did:key:z6f1none".to_string(),
             )),
             crate::rate_limit::PeerAddr(None),
             axum::http::HeaderMap::new(),
             axum::body::Bytes::from_static(b"0000"),
         )
         .await;
+        // Assert the POSITIVE outcome, not the absence of one error. Reaching git on
+        // the missing on-disk repo is proof the request cleared BOTH the owner gate
+        // and the per-caller cap. The previous shape — `!matches!(r, Overloaded)` —
+        // was satisfied by any other error, so when owner-only push began rejecting
+        // this pusher the test kept reporting ok while measuring nothing.
         assert!(
-            !matches!(r, Err(AppError::Overloaded(_))),
+            matches!(r, Err(AppError::Git(_))),
             "a caller with no resolvable source key must fall back to the global write \
-             pool only, never shed on the per-caller cap; got {r:?}"
+             pool only, never shed on the per-caller cap, and must reach git; got {r:?}"
         );
     }
 

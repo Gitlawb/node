@@ -2172,6 +2172,66 @@ mod tests {
         );
     }
 
+    /// The behaviour this change exists to produce, through the handler, on a
+    /// DEFAULT config.
+    ///
+    /// The gate's own unit tests pass `enforce` as a literal, so they are insensitive
+    /// to the default and stay green if it is flipped back. No fixture sets the field.
+    /// This test takes `test_state`'s untouched `Config` and asserts the outcome, so
+    /// reverting `default_value_t` turns it red on behaviour rather than on a parse.
+    ///
+    /// 403 rather than 401 is the discriminator: the request carries a real RFC 9421
+    /// signature and passes `require_signature`, so it is authenticated and refused on
+    /// authorization — which is the whole distinction the change rests on.
+    #[sqlx::test]
+    async fn default_config_refuses_a_non_owner_push(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let stranger = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+
+        // Deliberately NOT overridden: the shipped default is the subject.
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "defrepo"))
+            .await
+            .expect("seed repo");
+
+        let router = Router::new()
+            .route(
+                "/{owner}/{repo}/git-receive-pack",
+                axum::routing::post(crate::api::repos::git_receive_pack),
+            )
+            .layer(axum::middleware::from_fn(crate::auth::require_signature))
+            .with_state(state);
+
+        let path = format!("/{short}/defrepo.git/git-receive-pack");
+        let body = b"0000".to_vec();
+        let signed = sign_request(&stranger, "POST", &path, &body);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(&path)
+            .header("content-type", "application/x-git-receive-pack-request")
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "with no configuration at all, a signed push from a non-owner must be \
+             refused: a did:key is self-certifying, so authentication alone is not \
+             authorization"
+        );
+    }
+
     /// A1 Phase-2 contract: the `git-upload-pack` POST (the actual fetch, after
     /// the advertisement) is itself read-visibility gated. An ANONYMOUS upload-pack
     /// POST against a private repo is denied (404), so signing only the Phase-1
