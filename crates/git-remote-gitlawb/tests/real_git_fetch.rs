@@ -128,19 +128,6 @@ impl Drop for Shim {
     }
 }
 
-/// Wait until the shim accept loop is polling. Without this, Windows CI can
-/// race: `git fetch` connects before the spawned thread enters `accept()`.
-fn wait_for_shim_ready(addr: std::net::SocketAddr) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    panic!("shim at {addr} did not accept connections within 10s");
-}
-
 /// Start a minimal smart-HTTP shim serving `repo` on 127.0.0.1. Handles the
 /// upload-pack advertisement (GET) and pack negotiation (POST), counting POSTs.
 fn start_shim(repo: PathBuf, mode: ShimMode) -> Shim {
@@ -166,8 +153,6 @@ fn start_shim(repo: PathBuf, mode: ShimMode) -> Shim {
             }
         }
     });
-
-    wait_for_shim_ready(addr);
 
     Shim {
         base_url,
@@ -262,26 +247,6 @@ fn write_response(mut stream: TcpStream, status: &str, content_type: &str, body:
 /// Run `git fetch` in `clone` through the helper, with a hard timeout so a
 /// regression to the deadlock fails fast instead of hanging the suite.
 fn fetch_with_helper(clone: &Path, node_url: &str) -> (bool, std::process::Output) {
-    let mut last = fetch_with_helper_once(clone, node_url);
-    for attempt in 1..3u32 {
-        if last.0 && last.1.status.success() {
-            return last;
-        }
-        let stderr = String::from_utf8_lossy(&last.1.stderr);
-        let transient = stderr.contains("10053")
-            || stderr.contains("connection error")
-            || stderr.contains("connection was aborted")
-            || stderr.contains("error sending request");
-        if !transient {
-            return last;
-        }
-        std::thread::sleep(Duration::from_millis(250 * attempt as u64));
-        last = fetch_with_helper_once(clone, node_url);
-    }
-    last
-}
-
-fn fetch_with_helper_once(clone: &Path, node_url: &str) -> (bool, std::process::Output) {
     let helper_bin = PathBuf::from(env!("CARGO_BIN_EXE_git-remote-gitlawb"));
     let helper_dir = helper_bin.parent().unwrap().to_path_buf();
     let path_env = match std::env::var_os("PATH") {
