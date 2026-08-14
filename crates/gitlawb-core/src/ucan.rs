@@ -167,6 +167,29 @@ impl Ucan {
         }
     }
 
+    /// Whether every link in this chain carries a finite `exp`.
+    ///
+    /// `exp` is optional in the format, and [`Self::is_expired`] reports `false`
+    /// when it is absent — so a link without one never expires. With no revocation
+    /// mechanism, a chain containing such a link is a permanent grant: a leaked
+    /// token cannot be withdrawn, and the issuer's only remedy is to rotate the
+    /// identity the resource is keyed on.
+    ///
+    /// Consumers that turn a UCAN into write authority should require this. It is
+    /// deliberately not enforced inside [`Self::verify_chain`], because a
+    /// non-expiring token is well-formed and may be perfectly appropriate for a
+    /// read-only or advisory capability; whether an unbounded grant is acceptable
+    /// is the consumer's policy, not the format's.
+    pub fn chain_lifetime_is_bounded(&self) -> bool {
+        if self.payload.exp.is_none() {
+            return false;
+        }
+        self.payload
+            .prf
+            .iter()
+            .all(|token| Self::decode(token).is_ok_and(|proof| proof.chain_lifetime_is_bounded()))
+    }
+
     /// Check if this UCAN's not-before time is in the future (token not yet valid).
     pub fn is_before_valid(&self) -> bool {
         if let Some(nbf) = self.payload.nbf {
@@ -723,6 +746,78 @@ mod tests {
             invocation.verify_chain().expect("chain must verify"),
             owner.did(),
             "the root issuer is the owner who started the chain, not the agent presenting it"
+        );
+    }
+
+    /// A chain is only bounded if EVERY link is. An unbounded link anywhere makes
+    /// the whole grant permanent, because `is_expired` reports false for it and
+    /// there is no revocation path to withdraw it.
+    #[test]
+    fn chain_lifetime_is_bounded_requires_an_expiry_on_every_link() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let cap = || vec![Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH)];
+        let hour = Utc::now() + chrono::Duration::hours(1);
+
+        let bounded_root = Ucan::issue(&owner, agent.did(), cap(), Some(hour)).expect("issue");
+        let unbounded_root = Ucan::issue(&owner, agent.did(), cap(), None).expect("issue");
+
+        assert!(
+            Ucan::delegate(&agent, node.did(), cap(), Some(hour), &bounded_root)
+                .expect("wrap")
+                .chain_lifetime_is_bounded(),
+            "both links finite"
+        );
+        assert!(
+            !Ucan::delegate(&agent, node.did(), cap(), None, &bounded_root)
+                .expect("wrap")
+                .chain_lifetime_is_bounded(),
+            "the leaf has no expiry, so the grant never lapses"
+        );
+        assert!(
+            !Ucan::delegate(&agent, node.did(), cap(), Some(hour), &unbounded_root)
+                .expect("wrap")
+                .chain_lifetime_is_bounded(),
+            "a bounded leaf cannot rescue an unbounded proof: the holder can always \
+             mint a fresh leaf from it"
+        );
+        assert!(
+            !unbounded_root.chain_lifetime_is_bounded(),
+            "a self-issued token with no expiry is itself unbounded"
+        );
+    }
+
+    /// A three-link chain: owner -> lead -> agent, which is the real shape of an
+    /// org delegating to a team lead who delegates to a CI identity.
+    ///
+    /// Every other chain here is depth two, where the immediate proof IS the root —
+    /// so nothing distinguishes recursing to the true root from simply returning the
+    /// proof's issuer. Both `assert_eq!` and `assert_ne!` below are load-bearing:
+    /// without the second, returning the middle issuer would still satisfy a test
+    /// that only checked "not the leaf".
+    #[test]
+    fn verify_chain_walks_past_the_immediate_proof_to_the_true_root() {
+        let owner = Keypair::generate();
+        let lead = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let cap = || vec![Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH)];
+
+        let root = Ucan::issue(&owner, lead.did(), cap(), None).expect("owner -> lead");
+        let mid = Ucan::delegate(&lead, agent.did(), cap(), None, &root).expect("lead -> agent");
+        let leaf = Ucan::delegate(&agent, node.did(), cap(), None, &mid).expect("agent -> node");
+
+        let found = leaf.verify_chain().expect("a three-link chain must verify");
+        assert_eq!(
+            found,
+            owner.did(),
+            "the root is the owner who started the chain, two hops up"
+        );
+        assert_ne!(
+            found,
+            lead.did(),
+            "returning the immediate proof's issuer is not walking to the root"
         );
     }
 

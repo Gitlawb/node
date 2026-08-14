@@ -403,35 +403,92 @@ fn build_invocation(
     agent: &Keypair,
     node_did: &gitlawb_core::did::Did,
     delegation: &gitlawb_core::ucan::Ucan,
+    owner: &str,
+    repo: &str,
 ) -> Result<gitlawb_core::ucan::Ucan> {
-    gitlawb_core::ucan::Ucan::delegate(
-        agent,
-        node_did.clone(),
-        delegation.payload.att.clone(),
-        None,
-        delegation,
-    )
-    .map_err(|e| anyhow::anyhow!("failed to build UCAN invocation: {e}"))
+    use gitlawb_core::ucan::{caps, Capability};
+
+    // Narrow to the repo this push actually targets rather than copying `att`
+    // wholesale. A delegation written as `with: "*"` otherwise grows without
+    // limit — it would cover every repo the owner creates AFTER signing, a scope
+    // nobody chose. `is_attenuated_by` accepts a concrete resource under a `*`
+    // parent, so narrowing is always a legal attenuation.
+    //
+    // Constraints are copied from the covering capability, not dropped: dropping
+    // them is a widening and `verify_chain` refuses it.
+    let resource = format!("gitlawb://repos/{owner}/{repo}");
+    let source = delegation
+        .payload
+        .att
+        .iter()
+        .find(|c| {
+            (c.with == resource || c.with == "*")
+                && (c.can == caps::GIT_PUSH || c.can == "*" || c.can == caps::REPO_ADMIN)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("stored delegation carries no git/push capability for {resource}")
+        })?;
+
+    let mut narrowed = Capability::new(resource, caps::GIT_PUSH);
+    narrowed.constraints = source.constraints.clone();
+
+    // Carry the delegation's own expiry onto the invocation. The node refuses a
+    // chain with any unbounded link, because without a revocation path an
+    // unbounded write capability can never be withdrawn.
+    let exp = delegation
+        .payload
+        .exp
+        .and_then(|e| chrono::DateTime::from_timestamp(e, 0));
+
+    gitlawb_core::ucan::Ucan::delegate(agent, node_did.clone(), vec![narrowed], exp, delegation)
+        .map_err(|e| anyhow::anyhow!("failed to build UCAN invocation: {e}"))
 }
 
-/// Split a receive-pack POST URL into `(origin, owner, repo)`.
+/// Split a pack POST URL into `(node_base, owner, repo)`.
 ///
-/// `https://node/zOwner/myrepo.git/git-receive-pack`
-///   -> ("https://node", "zOwner", "myrepo")
+/// ```text
+/// https://node/zOwner/myrepo/git-receive-pack        -> ("https://node",         "zOwner", "myrepo")
+/// https://node/gitlawb/zOwner/myrepo/git-receive-pack -> ("https://node/gitlawb", "zOwner", "myrepo")
+/// ```
+///
+/// Strips the KNOWN trailing `<owner>/<repo>/<service>` rather than reading the
+/// first two segments, because `GITLAWB_NODE` may carry a path prefix — a
+/// reverse-proxied `https://host/gitlawb` is a supported base, and `repo_base` is
+/// built as `{node_base}/{owner}/{repo}` with the service appended after it.
+/// Reading from the front makes the prefix the owner, which fails the delegation
+/// lookup and probes the wrong URL for the node DID.
+///
+/// This is coupled to how `repo_base` is constructed in `main`; the two must
+/// change together.
 fn split_pack_post_url(post_url: &str) -> Option<(String, String, String)> {
     let path = url_path(post_url);
-    let origin = post_url.strip_suffix(&path)?.to_string();
-    let mut segs = path.trim_start_matches('/').split('/');
-    let owner = segs.next()?;
-    let repo = segs.next()?;
-    if owner.is_empty() || repo.is_empty() {
+    let origin = post_url.strip_suffix(&path)?;
+
+    let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    // owner, repo, service — plus any base-path prefix ahead of them.
+    if segs.len() < 3 {
         return None;
     }
+    let repo = segs[segs.len() - 2];
+    let owner = segs[segs.len() - 3];
+    let prefix = &segs[..segs.len() - 3];
+
     let repo = repo.strip_suffix(".git").unwrap_or(repo);
     if !is_safe_component(owner) || !is_safe_component(repo) {
         return None;
     }
-    Some((origin, owner.to_string(), repo.to_string()))
+    // Every prefix segment stays part of the base the node DID is fetched from, so
+    // it gets the same allow-list: a `..` here would redirect that probe, and an
+    // encoded separator would smuggle structure past this split.
+    if !prefix.iter().all(|s| is_safe_component(s)) {
+        return None;
+    }
+    let node_base = if prefix.is_empty() {
+        origin.to_string()
+    } else {
+        format!("{origin}/{}", prefix.join("/"))
+    };
+    Some((node_base, owner.to_string(), repo.to_string()))
 }
 
 /// Build the `X-Ucan` value for a delegated push, or `None` when this push does
@@ -485,7 +542,7 @@ fn delegation_header(
         .parse()
         .ok()?;
 
-    match build_invocation(keypair, &node_did, &delegation) {
+    match build_invocation(keypair, &node_did, &delegation, &owner, &repo) {
         Ok(inv) => inv.encode().ok(),
         Err(e) => {
             tracing::warn!("could not build the UCAN invocation: {e}");
@@ -2334,7 +2391,8 @@ mod delegated_push_tests {
         )
         .expect("issue");
 
-        let invocation = build_invocation(&agent, &node.did(), &delegation).expect("wrap");
+        let invocation =
+            build_invocation(&agent, &node.did(), &delegation, "zowner", "r").expect("wrap");
 
         assert_eq!(invocation.payload.iss, agent.did(), "the agent invokes");
         assert_eq!(invocation.payload.aud, node.did(), "the node executes");
@@ -2350,10 +2408,13 @@ mod delegated_push_tests {
         );
     }
 
-    /// The invocation deliberately carries no expiry of its own. That is only safe
-    /// because `verify_chain` recurses into the proof and checks the delegation's
-    /// expiry there — so an expired delegation cannot be laundered into an
-    /// open-ended push capability by wrapping it.
+    /// An expired delegation cannot be laundered into a live one by wrapping it.
+    ///
+    /// Two independent guards now cover this: the invocation inherits the
+    /// delegation's `exp`, so it is expired on its own terms, AND `verify_chain`
+    /// recurses into the proof and rejects it there. Inheriting the expiry is what
+    /// keeps the node's "every link must be bounded" rule satisfiable — a leaf with
+    /// no expiry would be refused outright.
     #[test]
     fn an_expired_delegation_cannot_be_laundered_by_wrapping_it() {
         let owner = Keypair::generate();
@@ -2367,11 +2428,16 @@ mod delegated_push_tests {
         )
         .expect("issue expired");
 
-        let invocation = build_invocation(&agent, &node.did(), &expired).expect("wrap");
+        let invocation =
+            build_invocation(&agent, &node.did(), &expired, "zowner", "r").expect("wrap");
 
+        assert_eq!(
+            invocation.payload.exp, expired.payload.exp,
+            "the invocation inherits the delegation's expiry, never a longer one"
+        );
         assert!(
-            invocation.payload.exp.is_none(),
-            "the invocation sets no expiry of its own"
+            !invocation.chain_lifetime_is_bounded() || invocation.is_expired(),
+            "an inherited expiry in the past leaves the invocation expired"
         );
         let err = invocation
             .verify_chain()
@@ -2392,6 +2458,29 @@ mod delegated_push_tests {
                 "myrepo".to_string()
             )),
             "the origin must come back intact so the node DID can be fetched from it"
+        );
+        // A reverse-proxied GITLAWB_NODE carries a path prefix, which survives into
+        // the pack URL through `repo_base`. Reading the FIRST two segments as
+        // owner/repo makes the prefix the owner: the delegation lookup misses, the
+        // DID probe hits the wrong URL, no X-Ucan is sent, and a valid delegate is
+        // refused with 403 — silently, because every failure here is best-effort.
+        assert_eq!(
+            split_pack_post_url("https://host/gitlawb/z6Mk/myrepo/git-receive-pack"),
+            Some((
+                "https://host/gitlawb".to_string(),
+                "z6Mk".to_string(),
+                "myrepo".to_string()
+            )),
+            "a path-prefixed node base must keep its prefix and still find owner/repo"
+        );
+        assert_eq!(
+            split_pack_post_url("https://host/a/b/c/z6Mk/myrepo/git-receive-pack"),
+            Some((
+                "https://host/a/b/c".to_string(),
+                "z6Mk".to_string(),
+                "myrepo".to_string()
+            )),
+            "prefix depth is not fixed"
         );
         // The .git suffix is optional on the wire; the delegation is stored under
         // the bare repo name either way, so both forms must resolve identically.

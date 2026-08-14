@@ -1603,8 +1603,14 @@ fn owner_push_rejection(
     }
     match caller {
         Some(did) if caller_authorized_to_push(record, did, verified) => None,
+        // One message for every refusal. It must not say whether a delegation was
+        // presented, was expired, or named another repository: varying it would turn
+        // the denial into an oracle for which capabilities exist. It only has to be
+        // TRUE in all of those cases, which the previous owner-only wording no
+        // longer was once a delegation could authorize a push.
         _ => Some(AppError::Forbidden(
-            "push rejected — only the repo owner may push to this repository \
+            "push rejected — you must be the repo owner, or hold a valid \
+             owner-issued git/push delegation for this repository \
              (GITLAWB_ENFORCE_OWNER_PUSH is enabled)"
                 .into(),
         )),
@@ -1807,9 +1813,17 @@ pub async fn git_receive_pack(
     }
 
     // ── Branch protection check ──────────────────────────────────────────
-    // Uses the same verified identity as the owner-push gate above. (When that
-    // gate is enabled a non-owner never reaches here; this still applies when it
-    // is off, gating only the branches an owner has explicitly protected.)
+    // Uses the same verified identity as the owner-push gate above, but a STRICTER
+    // predicate: owner-only, deliberately not `caller_authorized_to_push`.
+    //
+    // A delegate can therefore clear the gate above and still be refused here. That
+    // is the intended policy, not an oversight: a protected branch is the owner's
+    // explicit marker that even routine writes should stop, so a `git/push`
+    // delegation must not silently override it. Widening this to accept a
+    // delegation would make every existing protection weaker the moment the owner
+    // issues any capability.
+    //
+    // `delegated_push_is_still_refused_on_a_protected_branch` pins this.
     for update in &ref_updates {
         // Strip refs/heads/ prefix to get plain branch name
         let branch = update
@@ -3377,7 +3391,9 @@ mod tests {
                 format!("gitlawb://repos/{}/{}", repo.owner_did, repo.name),
                 gitlawb_core::ucan::caps::GIT_PUSH,
             )],
-            None,
+            // Finite: a write capability that never lapses is refused, since there
+            // is no revocation path to withdraw a leaked one.
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
         )
         .expect("issue delegation");
         crate::auth::VerifiedUcan {

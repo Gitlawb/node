@@ -155,17 +155,48 @@ To require the authenticated pusher to be the repo owner on **every** branch, se
 GITLAWB_ENFORCE_OWNER_PUSH=true
 ```
 
-- **Default `false`** — preserves current behavior so live nodes are unaffected by
-  an upgrade. Turn it on once you're ready for owner-only writes.
+- **Default `false`** on this release — preserves current behavior so live nodes
+  are unaffected by an upgrade. Turn it on once you're ready for owner-only writes.
 - **When `true`** — a push whose authenticated DID is not the repo owner is
   rejected (HTTP 403) before any ref update is applied. The owner is matched in
   both the full `did:key:z6Mk…` form and its bare `z6Mk…` suffix.
-- **Caution: this blocks every non-owner pusher, including your own delegated and
-  CI agents.** Push authorization is owner-only today — a UCAN `git/push`
-  capability is verified but not yet honored for authorization, so delegated keys
-  cannot push while this is on. Don't enable it until every identity that pushes
-  to your repos is the owner, or you'll lock out your own automation. Scoped
-  collaborator / UCAN-delegated push rights are a planned follow-up.
+- **A delegated key can still push.** A non-owner clears this gate by presenting a
+  UCAN whose proof chain roots at the repo owner and which carries `git/push` for
+  this repository. See *Delegating push to a CI agent* below.
+
+### Delegating push to a CI agent
+
+The owner issues a capability, the agent stores it, and the git helper presents it
+automatically on every push:
+
+```bash
+# Owner, once per agent per repo:
+gl ucan delegate --to did:key:z6MkAgent… \
+  --cap gitlawb://repos/<owner-did>/<repo> --can git/push --expiry 168
+
+# Agent:
+gl ucan import <token-or-path>
+git push origin main          # git-remote-gitlawb attaches it as X-Ucan
+```
+
+What the node requires, and why:
+
+| Requirement | Reason |
+|---|---|
+| The chain's **root issuer** is the repo owner | A `did:key` is self-certifying, so anyone can mint a chain. The owner is the only anchor the node holds independently of the token. |
+| The capability names **this** repository | A `*` capability would otherwise grow to cover every repo the owner creates later. The helper narrows to the concrete repo when it builds the invocation. |
+| **Every link carries an expiry** | There is no revocation path yet. An unbounded delegation could never be withdrawn once leaked, so the node refuses one outright. `gl ucan delegate` defaults to 30 days. |
+| No `nb` constraints | Constraints are reserved but not yet interpreted, so a capability carrying them authorizes nothing rather than silently granting more than the owner intended. |
+
+**A delegation does not override branch protection.** A protected branch is your
+explicit marker that even routine writes should stop, so a delegate is still
+refused there and only the owner may push. That is deliberate: if a delegation
+overrode it, issuing any capability would weaken every protection you had set.
+
+**Withdrawal is by expiry only.** There is no revocation today. If a delegated
+token leaks, it remains valid until its `exp`, and the only faster remedy is
+rotating the owner DID the repository is keyed on. Choose `--expiry` accordingly —
+short lifetimes reissued often are safer than one long-lived grant.
 
 ---
 

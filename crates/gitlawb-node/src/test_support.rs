@@ -2230,25 +2230,29 @@ mod tests {
         let body = b"0000".to_vec();
 
         // owner -> agent delegation, then agent -> node invocation carrying it.
-        let invocation_for = |resource: String| {
+        // Both links carry a finite expiry: a write capability that never lapses is
+        // refused, since there is no revocation path to withdraw a leaked one.
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+        let invocation_with_exp = |resource: String, exp: Option<chrono::DateTime<chrono::Utc>>| {
             let delegation = Ucan::issue(
                 &owner,
                 agent.did(),
                 vec![Capability::new(resource, caps::GIT_PUSH)],
-                None,
+                exp,
             )
             .expect("issue delegation");
             Ucan::delegate(
                 &agent,
                 state.node_did.clone(),
                 delegation.payload.att.clone(),
-                None,
+                exp,
                 &delegation,
             )
             .expect("wrap invocation")
             .encode()
             .expect("encode invocation")
         };
+        let invocation_for = |resource: String| invocation_with_exp(resource, Some(hour));
 
         let signed_push = |ucan: Option<String>| {
             let signed = sign_request(&agent, "POST", &path, &body);
@@ -2305,6 +2309,126 @@ mod tests {
         assert_eq!(
             other_body, none_body,
             "an inapplicable delegation and no delegation must be indistinguishable"
+        );
+
+        // 4. A delegation that never expires: refused, however otherwise valid.
+        //    Owner-rooted, right repo, right action — but with no revocation path an
+        //    unbounded grant cannot be withdrawn once the token leaks.
+        let perpetual = router()
+            .oneshot(signed_push(Some(invocation_with_exp(
+                format!("gitlawb://repos/{owner_did}/deleg"),
+                None,
+            ))))
+            .await
+            .unwrap();
+        assert_eq!(
+            perpetual.status(),
+            StatusCode::FORBIDDEN,
+            "a delegation with no expiry must not authorize a push"
+        );
+    }
+
+    /// A valid delegation clears the owner gate but is still refused on a branch
+    /// the owner has explicitly protected.
+    ///
+    /// Two predicates deliberately disagree: the owner gate accepts a delegate, the
+    /// branch-protection loop is owner-only. A protected branch is the owner's
+    /// marker that even routine writes should stop, so a `git/push` delegation must
+    /// not silently override it — otherwise issuing any capability would weaken
+    /// every protection the owner had already set.
+    ///
+    /// The 403 body is the discriminator: it must name the branch, proving the
+    /// request reached branch protection rather than being turned away by the owner
+    /// gate for lacking a delegation.
+    #[sqlx::test]
+    async fn delegated_push_is_still_refused_on_a_protected_branch(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+        use gitlawb_core::ucan::{caps, Capability, Ucan};
+        use std::sync::Arc;
+
+        const ZERO: &str = "0000000000000000000000000000000000000000";
+        let new_sha = "1111111111111111111111111111111111111111";
+
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+
+        let mut state = test_state(pool).await;
+        let mut cfg = (*state.config).clone();
+        cfg.enforce_owner_push = true;
+        state.config = Arc::new(cfg);
+
+        let rec = seed_repo(&owner_did, "protrepo");
+        state.db.create_repo(&rec).await.expect("seed repo");
+        state
+            .db
+            .protect_branch(&rec.id, "main", &owner_did)
+            .await
+            .expect("protect main");
+
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+        let delegation = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{owner_did}/protrepo"),
+                caps::GIT_PUSH,
+            )],
+            Some(hour),
+        )
+        .expect("issue delegation");
+        let invocation = Ucan::delegate(
+            &agent,
+            state.node_did.clone(),
+            delegation.payload.att.clone(),
+            Some(hour),
+            &delegation,
+        )
+        .expect("wrap")
+        .encode()
+        .expect("encode");
+
+        let router = Router::new()
+            .route(
+                "/{owner}/{repo}/git-receive-pack",
+                axum::routing::post(crate::api::repos::git_receive_pack),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::auth::require_ucan_chain,
+            ))
+            .layer(axum::middleware::from_fn(crate::auth::require_signature))
+            .with_state(state.clone());
+
+        let path = format!("/{short}/protrepo.git/git-receive-pack");
+        let line = format!("{ZERO} {new_sha} refs/heads/main");
+        let body = format!("{:04x}{}0000", line.len() + 4, line).into_bytes();
+
+        let signed = sign_request(&agent, "POST", &path, &body);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(&path)
+            .header("content-type", "application/x-git-receive-pack-request")
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .header("x-ucan", invocation)
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a delegation must not override branch protection"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("protected"),
+            "the refusal must come from branch protection, not the owner gate; got {text}"
         );
     }
 

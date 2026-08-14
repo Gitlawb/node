@@ -264,7 +264,7 @@ metadata        local disk / optional S3
 | DID | A user, agent, or node identity derived from an Ed25519 public key. |
 | HTTP Signature | RFC 9421 signature proving control of the DID key for write requests. |
 | Ref certificate | Signed record of a ref update. Useful for audit and replication. |
-| UCAN | Delegation token for future capability-based workflows. |
+| UCAN | Capability token. An owner delegates `git/push` on a repo to another DID; the node honors it when the proof chain roots at that owner. See [`docs/RUN-A-NODE.md`](docs/RUN-A-NODE.md). |
 | Peer announce | Node-to-node HTTP announcement of DID + public URL. |
 | Gossipsub | libp2p topic for ref-update events. |
 | Smart HTTP | Standard git protocol over HTTP for clone/fetch/push. |

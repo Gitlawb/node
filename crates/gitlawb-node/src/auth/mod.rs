@@ -92,6 +92,14 @@ pub fn ucan_grants_push(record: &crate::db::RepoRecord, verified: &VerifiedUcan)
     if !crate::api::did_matches(&verified.root.to_string(), &record.owner_did) {
         return false;
     }
+    // A write capability must lapse on its own. `exp` is optional in the format and
+    // there is no revocation path, so a chain with an unbounded link is a permanent
+    // grant: once the token leaks, the owner cannot withdraw it short of rotating
+    // the DID the repo is keyed on. Refusing here is what makes "the damage window
+    // is the token's expiry" a true statement rather than an aspiration.
+    if !verified.ucan.chain_lifetime_is_bounded() {
+        return false;
+    }
     verified.ucan.payload.att.iter().any(|cap| {
         cap.constraints.is_none()
             && (cap.can == gitlawb_core::ucan::caps::GIT_PUSH
@@ -768,9 +776,21 @@ mod ucan_push_tests {
     /// middleware has already bound `iss` to the request signer and `aud` to this
     /// node. Only the capabilities and the chain's root matter here.
     fn verified(root: &str, caps_vec: Vec<Capability>) -> VerifiedUcan {
+        verified_with_exp(
+            root,
+            caps_vec,
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        )
+    }
+
+    fn verified_with_exp(
+        root: &str,
+        caps_vec: Vec<Capability>,
+        exp: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> VerifiedUcan {
         let agent = Keypair::generate();
         let node = Keypair::generate();
-        let ucan = Ucan::issue(&agent, node.did(), caps_vec, None).expect("issue");
+        let ucan = Ucan::issue(&agent, node.did(), caps_vec, exp).expect("issue");
         VerifiedUcan {
             ucan,
             root: root.parse().expect("root DID must parse"),
@@ -799,6 +819,20 @@ mod ucan_push_tests {
         let rec = repo(OWNER_KEY, "myrepo");
         let v = verified(&owner_full(), vec![push_cap_for(&owner_full(), "myrepo")]);
         assert!(ucan_grants_push(&rec, &v));
+    }
+
+    /// A perpetual grant is refused even when it is otherwise perfectly valid:
+    /// owner-rooted, right repo, right action. Without revocation, an unbounded
+    /// delegation cannot be withdrawn once it leaks.
+    #[test]
+    fn refuses_a_delegation_that_never_expires() {
+        let rec = repo(&owner_full(), "myrepo");
+        let v = verified_with_exp(
+            &owner_full(),
+            vec![push_cap_for(&owner_full(), "myrepo")],
+            None,
+        );
+        assert!(!ucan_grants_push(&rec, &v));
     }
 
     #[test]

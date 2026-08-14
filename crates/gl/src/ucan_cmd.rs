@@ -29,9 +29,17 @@ pub enum UcanCmd {
         /// Action, e.g. "git/push", "pr/open", "repo/admin"
         #[arg(long)]
         can: String,
-        /// Expiry in hours (default: no expiry)
-        #[arg(long)]
-        expiry: Option<u64>,
+        /// Expiry in hours. Defaults to 720 (30 days).
+        ///
+        /// A capability that authorizes a write must lapse on its own: there is no
+        /// revocation path yet, so an unbounded delegation cannot be withdrawn once
+        /// the token leaks. A node refuses an unbounded `git/push` chain outright.
+        #[arg(long, default_value_t = DEFAULT_DELEGATION_EXPIRY_HOURS)]
+        expiry: u64,
+        /// Issue with no expiry. The result cannot authorize a push, and cannot be
+        /// withdrawn — only use it for advisory or read-shaped capabilities.
+        #[arg(long, conflicts_with = "expiry")]
+        no_expiry: bool,
         /// Save the UCAN to a file instead of printing
         #[arg(long)]
         out: Option<PathBuf>,
@@ -116,6 +124,10 @@ fn repo_from_resource(with: &str) -> Option<(String, String)> {
     Some((owner.to_string(), name.to_string()))
 }
 
+/// Default delegation lifetime. Finite on purpose: an unbounded write capability
+/// cannot be withdrawn while there is no revocation path, and the node refuses one.
+pub const DEFAULT_DELEGATION_EXPIRY_HOURS: u64 = 720;
+
 pub async fn run(args: UcanArgs) -> Result<()> {
     match args.cmd {
         UcanCmd::Delegate {
@@ -123,10 +135,14 @@ pub async fn run(args: UcanArgs) -> Result<()> {
             cap,
             can,
             expiry,
+            no_expiry,
             out,
             dir,
             json: json_out,
-        } => cmd_delegate(to, cap, can, expiry, out, dir, json_out).await,
+        } => {
+            let exp_hours = if no_expiry { None } else { Some(expiry) };
+            cmd_delegate(to, cap, can, exp_hours, out, dir, json_out).await
+        }
         UcanCmd::Show { dir } => cmd_show(dir).await,
         UcanCmd::Verify { token } => cmd_verify(token).await,
         UcanCmd::Import { token, dir } => cmd_import(token, dir).await,
@@ -176,6 +192,16 @@ async fn cmd_import(token: String, dir: Option<PathBuf>) -> Result<()> {
         let path = delegation_path(&base, owner, repo);
         std::fs::write(&path, &raw)
             .with_context(|| format!("could not write {}", path.display()))?;
+        // 0600, like the sibling identity key. The token is not itself sufficient to
+        // push — the node requires `iss` to equal the request signer, so a reader
+        // still needs the delegate's private key — but it does disclose the
+        // delegation graph and which identities hold capabilities on which repos.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("could not set permissions on {}", path.display()))?;
+        }
         println!("Stored delegation for {owner}/{repo} at {}", path.display());
     }
 
