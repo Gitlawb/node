@@ -238,7 +238,7 @@ impl IngestLimiters {
 /// 0 is the versionless form: the field set this struct shipped with, before
 /// `v` existed. It is not a placeholder for "unset", it is a real version whose
 /// wire encoding happens to omit the key.
-const CURRENT_REF_UPDATE_VERSION: u32 = 0;
+pub(crate) const CURRENT_REF_UPDATE_VERSION: u32 = 0;
 
 /// True for the version whose key is omitted from the wire form. Free function
 /// because `skip_serializing_if` takes a path, not a closure.
@@ -583,6 +583,16 @@ pub(crate) async fn ingest_ref_update(
     // below, and there is exactly one debit site reading this, so the two arms
     // cannot drift apart.
     let mut verified = false;
+    // Whether this event arrived with no signature at all and was let through
+    // by the rolling-upgrade window. Carried down the same way `verified` is,
+    // and for the same reason: the warning it drives belongs below the gates
+    // that can still drop the event, not in the arm that merely reached them.
+    //
+    // Deliberately a second flag rather than `!verified`. Those two coincide
+    // only because the present-but-invalid case returns early above, which is a
+    // property of the arms as they stand today, not something this variable's
+    // meaning should depend on.
+    let mut unsigned = false;
     match event.sig {
         // A signature that is present must verify. A present-but-invalid one is
         // forgery, never a peer that has not upgraded yet, so the flag does not
@@ -599,10 +609,7 @@ pub(crate) async fn ingest_ref_update(
         // Rolling-upgrade window, same posture and same pointer at the flag as
         // the HTTP twin's unsigned-notify warning.
         None => {
-            warn!(
-                did = %event.node_did,
-                "accepted unsigned gossip ref-update; set GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true after all peers upgrade"
-            );
+            unsigned = true;
             // Unsigned traffic is bounded here, on the forwarder, because it is
             // the only identity this event establishes. Charged BEFORE
             // `peer_exists`, which is a Postgres round trip per event: a brake
@@ -671,6 +678,24 @@ pub(crate) async fn ingest_ref_update(
     // no longer spendable by anyone else.
     if verified && !limiters.author.check(&event.node_did).await {
         return IngestOutcome::AuthorRateLimited(event.node_did.clone());
+    }
+
+    // Below every gate that can still drop the event, so "accepted" is a report
+    // of an outcome rather than a prediction of one.
+    //
+    // It used to sit up in the `None` arm, which put it above the unsigned
+    // forwarder budget and above `peer_exists`. An event shed by either of
+    // those left a log that said the node accepted it and a database that had
+    // never heard of it, which is the same class of lie as an accusation of
+    // forgery for a version skew: it misdirects whoever is reading the logs to
+    // find out why gossip is not landing. Single site on purpose. A warning
+    // emitted in the arm AND again down here would double-count in anything
+    // grepping for it.
+    if unsigned {
+        warn!(
+            did = %event.node_did,
+            "accepted unsigned gossip ref-update; set GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true after all peers upgrade"
+        );
     }
 
     info!(
@@ -1789,6 +1814,42 @@ mod tests {
         }
     }
 
+    /// Drive one prepared event through ingest in BOTH flag modes and assert it
+    /// is refused by a guard, with no row and no queue entry either way.
+    ///
+    /// Six tests wrote this loop out by hand. Sharing it is not only less
+    /// repetition: it means "in both modes" has ONE definition, so a case that
+    /// only ever exercised `require_signed=true` cannot creep in unnoticed under
+    /// a name that promises both.
+    ///
+    /// `label` names the witness ("tampered event"), and the mode is appended,
+    /// so a failure still says which of the two directions broke.
+    ///
+    /// `expected_reason` is `Some((reason, why))` for the cases where the
+    /// SENTENCE is the thing under test, carrying its own explanation of why
+    /// that wording is load-bearing, since a shared assertion message could not
+    /// say anything specific enough to be useful. `None` where the test only
+    /// claims a guard refused it, and the particular guard is pinned by the
+    /// witness rather than by the string.
+    async fn assert_rejected_in_both_modes(
+        db: &Db,
+        pool: &PgPool,
+        data: &[u8],
+        label: &str,
+        expected_reason: Option<(&str, &str)>,
+    ) {
+        for require_signed in [true, false] {
+            let context = format!("{label}, require_signed={require_signed}");
+            let outcome =
+                ingest_with_fresh_limiter(db, require_signed, true, data, &PeerId::random()).await;
+            assert_nothing_written(pool, &context).await;
+            let reason = rejection_reason(outcome, &context);
+            if let Some((expected, why)) = expected_reason {
+                assert_eq!(reason, expected, "{context}: {why}");
+            }
+        }
+    }
+
     /// R1, the core must-not: enforcement on, an unsigned event that merely
     /// CLAIMS a known peer's DID writes nothing. Anyone on the open mesh can
     /// send these, so this is the whole point of the unit.
@@ -1834,24 +1895,17 @@ mod tests {
         // the signature path would have admitted it.
         verify_ref_update(&event).expect("the witness must be correctly signed");
 
-        for require_signed in [true, false] {
-            let context = format!("v1 event, require_signed={require_signed}");
-            let outcome = ingest_with_fresh_limiter(
-                &db,
-                require_signed,
-                true,
-                &bytes_of(&event),
-                &PeerId::random(),
-            )
-            .await;
-            assert_nothing_written(&pool, &context).await;
-            assert_eq!(
-                rejection_reason(outcome, &context),
+        assert_rejected_in_both_modes(
+            &db,
+            &pool,
+            &bytes_of(&event),
+            "v1 event",
+            Some((
                 "unsupported ref-update event version 1; this build understands version 0",
-                "{context}: an unknown version must be named as one, never reported as a \
-                 signature failure"
-            );
-        }
+                "an unknown version must be named as one, never reported as a signature failure",
+            )),
+        )
+        .await;
     }
 
     /// R2: a cryptographically valid signature that does not bind the claimed
@@ -1866,19 +1920,8 @@ mod tests {
         sign_ref_update(&signer, &mut event).unwrap();
         seed_peer(&pool, &event.node_did).await;
 
-        for require_signed in [true, false] {
-            let context = format!("foreign-key signature, require_signed={require_signed}");
-            let outcome = ingest_with_fresh_limiter(
-                &db,
-                require_signed,
-                true,
-                &bytes_of(&event),
-                &PeerId::random(),
-            )
+        assert_rejected_in_both_modes(&db, &pool, &bytes_of(&event), "foreign-key signature", None)
             .await;
-            assert_nothing_written(&pool, &context).await;
-            rejection_reason(outcome, &context);
-        }
     }
 
     /// R2: a signed event whose payload was edited after signing.
@@ -1891,19 +1934,7 @@ mod tests {
         seed_peer(&pool, &event.node_did).await;
         event.new_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
 
-        for require_signed in [true, false] {
-            let context = format!("tampered event, require_signed={require_signed}");
-            let outcome = ingest_with_fresh_limiter(
-                &db,
-                require_signed,
-                true,
-                &bytes_of(&event),
-                &PeerId::random(),
-            )
-            .await;
-            assert_nothing_written(&pool, &context).await;
-            rejection_reason(outcome, &context);
-        }
+        assert_rejected_in_both_modes(&db, &pool, &bytes_of(&event), "tampered event", None).await;
     }
 
     /// R11: a non-did:key `node_did` cannot be authenticated by design, and the
@@ -1924,23 +1955,17 @@ mod tests {
         sign_ref_update(&keypair, &mut event).unwrap();
         seed_peer(&pool, &event.node_did).await;
 
-        for require_signed in [true, false] {
-            let context = format!("did:web node_did, require_signed={require_signed}");
-            let outcome = ingest_with_fresh_limiter(
-                &db,
-                require_signed,
-                true,
-                &bytes_of(&event),
-                &PeerId::random(),
-            )
-            .await;
-            assert_nothing_written(&pool, &context).await;
-            assert_eq!(
-                rejection_reason(outcome, &context),
+        assert_rejected_in_both_modes(
+            &db,
+            &pool,
+            &bytes_of(&event),
+            "did:web node_did",
+            Some((
                 "methodNotSupported: only did:key peers can be registered without a proof of control: did:web:example.com",
-                "{context}: the gossip surface must reuse the peers-table refusal sentence"
-            );
-        }
+                "the gossip surface must reuse the peers-table refusal sentence",
+            )),
+        )
+        .await;
     }
 
     /// The load-bearing test for the did-method gate, and the ONLY
@@ -1990,19 +2015,8 @@ mod tests {
         sign_ref_update(&keypair, &mut event).unwrap();
         // Deliberately NOT seeded into the peers table.
 
-        for require_signed in [true, false] {
-            let context = format!("unknown peer DID, require_signed={require_signed}");
-            let outcome = ingest_with_fresh_limiter(
-                &db,
-                require_signed,
-                true,
-                &bytes_of(&event),
-                &PeerId::random(),
-            )
+        assert_rejected_in_both_modes(&db, &pool, &bytes_of(&event), "unknown peer DID", None)
             .await;
-            assert_nothing_written(&pool, &context).await;
-            rejection_reason(outcome, &context);
-        }
     }
 
     /// R4: the #272 slug guard, on this transport too. The slug reaches a
@@ -2017,19 +2031,7 @@ mod tests {
         sign_ref_update(&keypair, &mut event).unwrap();
         seed_peer(&pool, &event.node_did).await;
 
-        for require_signed in [true, false] {
-            let context = format!("traversal slug, require_signed={require_signed}");
-            let outcome = ingest_with_fresh_limiter(
-                &db,
-                require_signed,
-                true,
-                &bytes_of(&event),
-                &PeerId::random(),
-            )
-            .await;
-            assert_nothing_written(&pool, &context).await;
-            rejection_reason(outcome, &context);
-        }
+        assert_rejected_in_both_modes(&db, &pool, &bytes_of(&event), "traversal slug", None).await;
     }
 
     /// R6: the acceptance path, which is what keeps federation alive. A guard
@@ -2968,5 +2970,125 @@ mod tests {
             !err.ends_with(": "),
             "the sentence must carry the underlying reason, got: {err}"
         );
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedWarnings(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl CapturedWarnings {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+        }
+        fn saw_warn(&self) -> bool {
+            self.text().contains("accepted unsigned gossip ref-update")
+        }
+    }
+    impl std::io::Write for CapturedWarnings {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedWarnings {
+        type Writer = CapturedWarnings;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+    fn capture_warnings() -> (CapturedWarnings, tracing::subscriber::DefaultGuard) {
+        let logs = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (logs, guard)
+    }
+
+    #[sqlx::test]
+    async fn the_unsigned_warn_fires_only_on_admission(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let author = Keypair::generate();
+        let event = event_for(&author);
+        let claim = bytes_of(&event);
+
+        // A: unsigned, peer NOT registered -> refused by peer_exists, no warn.
+        {
+            let (logs, _g) = capture_warnings();
+            let outcome =
+                ingest_with_fresh_limiter(&db, false, true, &claim, &PeerId::random()).await;
+            assert!(
+                matches!(outcome, IngestOutcome::Rejected(_)),
+                "A outcome {outcome:?}"
+            );
+            assert!(!logs.saw_warn(), "A must not warn, got: {}", logs.text());
+        }
+
+        seed_peer(&pool, &event.node_did).await;
+
+        // B: unsigned, registered peer -> admitted, warn fires exactly once.
+        {
+            let (logs, _g) = capture_warnings();
+            let outcome =
+                ingest_with_fresh_limiter(&db, false, true, &claim, &PeerId::random()).await;
+            assert!(
+                matches!(outcome, IngestOutcome::Accepted),
+                "B outcome {outcome:?}"
+            );
+            assert!(logs.saw_warn(), "B must warn, got: {}", logs.text());
+            assert_eq!(
+                logs.text()
+                    .matches("accepted unsigned gossip ref-update")
+                    .count(),
+                1,
+                "B must warn once, got: {}",
+                logs.text()
+            );
+        }
+
+        // C: unsigned budget spent -> shed on the forwarder, no warn.
+        {
+            let limiters = IngestLimiters::new();
+            let source = spend_unsigned_budget(&db, &limiters, &claim).await;
+            let (logs, _g) = capture_warnings();
+            let outcome = ingest_ref_update(&db, &limiters, false, true, &claim, &source).await;
+            assert!(
+                matches!(outcome, IngestOutcome::UnsignedSourceRateLimited(_)),
+                "C outcome {outcome:?}"
+            );
+            assert!(!logs.saw_warn(), "C must not warn, got: {}", logs.text());
+        }
+
+        // D: unsigned with enforcement ON -> refused, no warn.
+        {
+            let (logs, _g) = capture_warnings();
+            let outcome =
+                ingest_with_fresh_limiter(&db, true, true, &claim, &PeerId::random()).await;
+            assert!(
+                matches!(outcome, IngestOutcome::Rejected(_)),
+                "D outcome {outcome:?}"
+            );
+            assert!(!logs.saw_warn(), "D must not warn, got: {}", logs.text());
+        }
+
+        // E: SIGNED and admitted -> the unsigned warn must not fire.
+        {
+            let signer = Keypair::generate();
+            let mut signed = event_for(&signer);
+            sign_ref_update(&signer, &mut signed).unwrap();
+            seed_peer(&pool, &signed.node_did).await;
+            let (logs, _g) = capture_warnings();
+            let outcome =
+                ingest_with_fresh_limiter(&db, true, true, &bytes_of(&signed), &PeerId::random())
+                    .await;
+            assert!(
+                matches!(outcome, IngestOutcome::Accepted),
+                "E outcome {outcome:?}"
+            );
+            assert!(!logs.saw_warn(), "E must not warn, got: {}", logs.text());
+        }
     }
 }

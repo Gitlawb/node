@@ -2461,7 +2461,11 @@ async fn post_receive_replication_tail(
                 if announce {
                     if let Some(p2p) = &p2p_handle {
                         p2p.publish_ref_update(crate::p2p::RefUpdateEvent {
-                            v: 0,
+                            // Named, not literal: the ingest gate compares `v`
+                            // against this same constant, so a bump has to move
+                            // both ends together rather than leaving the emitter
+                            // on a version the gate no longer accepts.
+                            v: crate::p2p::CURRENT_REF_UPDATE_VERSION,
                             node_did: node_did_str.clone(),
                             pusher_did: pusher_did_clone.clone(),
                             repo: repo_slug.clone(),

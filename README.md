@@ -326,6 +326,8 @@ The flag is not HTTP-only. It also gates inbound gossip ref-update events on the
 
 Because the flag now spans both transports, the rollout order matters in one direction: **upgrade every gossip-publishing peer to a build that signs events before you set this to `true`.** Enabling it while an old publisher is still live drops that publisher's ref-updates on arrival, and the publisher sees no error, because gossip has no response to carry one. Upgrading the HTTP peers alone is not sufficient.
 
+There is a second precondition on gossip ingest that the flag does not control. A publisher's `node_did` must already exist in the receiving node's peers table, or the event is dropped as an unknown peer DID. This holds in both modes, signed and unsigned alike: a valid signature proves key possession, not membership. Rows reach that table over HTTP, either from `GITLAWB_BOOTSTRAP_PEERS` when this node contacts a bootstrap peer and records the DID it reports, or from a prior `POST /api/v1/peers/announce`. So a peer that only ever joined the libp2p mesh, with no HTTP announce and no bootstrap contact in either direction, will have its ref-updates dropped even with a good signature and the flag off. If gossip is silently not landing from a peer you can see on the mesh, check that its DID is in `GET /api/v1/peers` on the receiving side first.
+
 ---
 
 ## Configuration
