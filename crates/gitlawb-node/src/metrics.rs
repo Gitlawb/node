@@ -11,6 +11,8 @@
 //!     `gitlawb_sync_queue_processed_total{status}`
 //!   * are webhooks reaching their endpoints? —
 //!     `gitlawb_webhook_deliveries_total{result}`
+//!   * is inbound gossip being admitted or shed, and for which reason?
+//!     `gitlawb_gossip_ingest_events_total{outcome}`
 //!   * how big are the packs we're sending and receiving? —
 //!     `gitlawb_pack_size_bytes`
 //!   * a single `gitlawb_info{version, did}` gauge = 1, for joins/dashboards
@@ -49,6 +51,7 @@ static AUTH_SUCCESSES: OnceLock<IntCounterVec> = OnceLock::new();
 static AUTH_FAILURES: OnceLock<IntCounterVec> = OnceLock::new();
 static SYNC_PROCESSED: OnceLock<IntCounterVec> = OnceLock::new();
 static WEBHOOK_DELIVERIES: OnceLock<IntCounterVec> = OnceLock::new();
+static GOSSIP_INGEST: OnceLock<IntCounterVec> = OnceLock::new();
 static PACK_SIZE: OnceLock<Histogram> = OnceLock::new();
 static PEERS_CONNECTED: OnceLock<IntGauge> = OnceLock::new();
 
@@ -168,6 +171,21 @@ fn init_inner(version: &str, node_did: &str) {
         .set(webhook_deliveries)
         .expect("set WEBHOOK_DELIVERIES once");
 
+    let gossip_ingest = IntCounterVec::new(
+        Opts::new(
+            "gitlawb_gossip_ingest_events_total",
+            "Total inbound gossip ref-update events and what the ingest path decided about each",
+        ),
+        &["outcome"],
+    )
+    .expect("gitlawb_gossip_ingest_events_total definition");
+    registry
+        .register(Box::new(gossip_ingest.clone()))
+        .expect("register gitlawb_gossip_ingest_events_total");
+    GOSSIP_INGEST
+        .set(gossip_ingest)
+        .expect("set GOSSIP_INGEST once");
+
     let pack_size = Histogram::with_opts(
         HistogramOpts::new(
             "gitlawb_pack_size_bytes",
@@ -270,6 +288,27 @@ pub fn record_webhook_delivery(result: &str) {
     }
 }
 
+/// Record what the gossip ingest path decided about one inbound ref-update.
+/// `outcome` ∈ {accepted, write_failed, rejected, source_rate_limited,
+/// author_rate_limited, unsigned_source_rate_limited}.
+///
+/// The three shed reasons stay separate labels rather than one `rate_limited`
+/// because they answer different operator questions: `source_rate_limited` is a
+/// forwarding peer over the pre-parse brake, `unsigned_source_rate_limited` is
+/// that same forwarder relaying unproven traffic, and `author_rate_limited`
+/// names a principal a signature actually proved. Collapsing them would make a
+/// flood of unauthenticated garbage indistinguishable from one registered peer
+/// pushing too hard, which is exactly the distinction an alert needs.
+///
+/// The label is the variant, never the free-form reason string that
+/// `Rejected`/`WriteFailed` carry: those are attacker-influenced and would blow
+/// up the label cardinality of a process-wide registry.
+pub fn record_gossip_ingest(outcome: &str) {
+    if let Some(c) = GOSSIP_INGEST.get() {
+        c.with_label_values(&[outcome]).inc();
+    }
+}
+
 /// Record a pack body size observation (bytes).
 pub fn observe_pack_size(bytes: f64) {
     if let Some(h) = PACK_SIZE.get() {
@@ -365,6 +404,7 @@ mod tests {
         record_auth_failure("test/route", "test_reason");
         record_sync_processed("done");
         record_webhook_delivery("ok");
+        record_gossip_ingest("accepted");
         observe_pack_size(1024.0);
         set_peers_connected(0);
     }

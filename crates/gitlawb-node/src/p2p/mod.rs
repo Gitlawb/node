@@ -102,6 +102,14 @@ const GOSSIP_INGEST_MAX_SOURCES: usize = 200_000;
 /// registered peer row per key, but registration is open through the announce
 /// path, so the bound is not left to that.
 const GOSSIP_INGEST_MAX_AUTHORS: usize = 200_000;
+/// How often the swarm loop evicts expired keys from the ingest limiters.
+///
+/// Matches the 300s the HTTP-side sweeper in `main.rs` runs on, so both halves
+/// of the node reclaim limiter keys on the same cadence rather than each having
+/// its own tuning. Any interval comfortably above [`GOSSIP_INGEST_WINDOW`]
+/// works: a key whose window has not elapsed is retained by `cleanup` anyway,
+/// so sweeping more often would cost lock traffic and reclaim nothing extra.
+const GOSSIP_INGEST_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 
 /// The gossip ingest budgets, built the same way for the swarm loop and for the
 /// tests so a test can never assert against a budget production does not run.
@@ -125,22 +133,65 @@ pub(crate) struct IngestLimiters {
 
 impl IngestLimiters {
     pub(crate) fn new() -> Self {
+        Self::with_window(GOSSIP_INGEST_WINDOW)
+    }
+
+    /// The single place the three limiters are built. `new` is the only
+    /// production caller and passes the real window; the parameter exists so a
+    /// test can exercise expiry without sleeping a minute, and it deliberately
+    /// leaves the caps and key ceilings alone so a test still asserts against
+    /// the budgets production runs.
+    fn with_window(window: Duration) -> Self {
         Self {
             source: crate::rate_limit::RateLimiter::new_bounded(
                 GOSSIP_SOURCE_MAX_EVENTS,
-                GOSSIP_INGEST_WINDOW,
+                window,
                 GOSSIP_INGEST_MAX_SOURCES,
             ),
             unsigned: crate::rate_limit::RateLimiter::new_bounded(
                 GOSSIP_UNSIGNED_SOURCE_MAX_EVENTS,
-                GOSSIP_INGEST_WINDOW,
+                window,
                 GOSSIP_INGEST_MAX_SOURCES,
             ),
             author: crate::rate_limit::RateLimiter::new_bounded(
                 GOSSIP_AUTHOR_MAX_EVENTS,
-                GOSSIP_INGEST_WINDOW,
+                window,
                 GOSSIP_INGEST_MAX_AUTHORS,
             ),
+        }
+    }
+
+    /// Every limiter in this struct, by DESTRUCTURING `Self` rather than by a
+    /// hand-written list. A fourth limiter added later fails to compile here
+    /// (both the pattern and the array length), which is what keeps [`cleanup`]
+    /// from silently skipping it.
+    ///
+    /// This is the same completeness idea `sweep_rate_limiters` in `main.rs`
+    /// documents for the `AppState` limiters, except that one is driven off a
+    /// hand-written list and a missed field there costs only a review; here the
+    /// compiler refuses.
+    ///
+    /// [`cleanup`]: IngestLimiters::cleanup
+    fn each(&self) -> [&crate::rate_limit::RateLimiter; 3] {
+        let Self {
+            source,
+            unsigned,
+            author,
+        } = self;
+        [source, unsigned, author]
+    }
+
+    /// Evict expired entries from every ingest limiter.
+    ///
+    /// These limiters are locals of the swarm task, not fields of `AppState`,
+    /// so the periodic `sweep_rate_limiters` in `main.rs` cannot reach them and
+    /// the swarm loop has to sweep its own. Without this a key stays resident
+    /// from the first event a peer forwards until the map hits its 200k ceiling
+    /// and the inline capacity sweep fires, so a node that has merely SEEN a lot
+    /// of forwarders over its uptime pays for all of them at once.
+    async fn cleanup(&self) {
+        for limiter in self.each() {
+            limiter.cleanup().await;
         }
     }
 }
@@ -375,6 +426,32 @@ pub(crate) enum IngestOutcome {
     /// a forwarder as an author would be the same class of observability lie
     /// that `WriteFailed` exists to avoid.
     UnsignedSourceRateLimited(String),
+}
+
+impl IngestOutcome {
+    /// The `outcome` label this decision is counted under in
+    /// `gitlawb_gossip_ingest_events_total`.
+    ///
+    /// A method with an exhaustive match rather than a label written at each
+    /// call site: a seventh variant added later fails to compile here instead of
+    /// landing in production as an outcome no dashboard can see. `/metrics` is
+    /// the only externally observable surface this daemon has, so an uncounted
+    /// outcome is an invisible one.
+    ///
+    /// Returns `&'static str` on purpose. The reason strings `Rejected` and
+    /// `WriteFailed` carry are shaped by the sender and would make the label set
+    /// unbounded in a process-wide registry, so they stay in the log line and
+    /// only the variant reaches the counter.
+    fn metric_label(&self) -> &'static str {
+        match self {
+            IngestOutcome::Accepted => "accepted",
+            IngestOutcome::WriteFailed(_) => "write_failed",
+            IngestOutcome::Rejected(_) => "rejected",
+            IngestOutcome::SourceRateLimited => "source_rate_limited",
+            IngestOutcome::AuthorRateLimited(_) => "author_rate_limited",
+            IngestOutcome::UnsignedSourceRateLimited(_) => "unsigned_source_rate_limited",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -856,8 +933,21 @@ pub async fn start(
     // Start the event loop as a background task
     tokio::spawn(async move {
         let mut shutdown_rx = shutdown_rx;
+        // The ingest limiters are owned by this task, so this loop is the only
+        // thing that can sweep them. Delay on a missed tick because a sweep the
+        // loop was too busy to run has no value in being run twice back to back.
+        let mut ingest_sweep = tokio::time::interval(GOSSIP_INGEST_SWEEP_INTERVAL);
+        ingest_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
+                // Reclaim ingest-limiter keys whose window has elapsed. Kept in
+                // the select! rather than a second task so the limiters stay
+                // task-local and need no Arc or lock shared with the rest of the
+                // node. `tokio::time::interval` fires its first tick
+                // immediately, which sweeps an empty map and is a no-op.
+                _ = ingest_sweep.tick() => {
+                    ingest_limiters.cleanup().await;
+                }
                 // Graceful shutdown: exit the swarm loop when the
                 // process-wide signal flips. This drops the Swarm
                 // which closes all libp2p connections cleanly.
@@ -876,14 +966,21 @@ pub async fn start(
                         SwarmEvent::Behaviour(GitlawbBehaviourEvent::Gossipsub(
                             gossipsub::Event::Message { propagation_source, message, .. }
                         )) => {
-                            match ingest_ref_update(
+                            let outcome = ingest_ref_update(
                                 &db,
                                 &ingest_limiters,
                                 require_signed,
                                 auto_sync,
                                 &message.data,
                                 &propagation_source,
-                            ).await {
+                            ).await;
+                            // Counted before the log match, once, for every
+                            // variant including `Accepted`. The logs describe an
+                            // individual drop; the counter is what an alert can
+                            // read, and without an accepted count the shed
+                            // reasons have no denominator to be a rate of.
+                            crate::metrics::record_gossip_ingest(outcome.metric_label());
+                            match outcome {
                                 IngestOutcome::Accepted => {}
                                 IngestOutcome::WriteFailed(reason) => warn!(
                                     from = %propagation_source,
@@ -2011,6 +2108,81 @@ mod tests {
                 "the {name} limiter must be built bounded by its documented key ceiling"
             );
         }
+    }
+
+    /// The ingest limiters live as locals of the swarm task, so the periodic
+    /// `sweep_rate_limiters` in `main.rs` cannot see them and its completeness
+    /// test cannot cover them. This is that pair's counterpart: it proves the
+    /// swarm loop's own sweep actually reclaims a key from EVERY ingest limiter,
+    /// not just the first one someone remembered.
+    ///
+    /// Both loops walk `all()`, which destructures `Self`, and `cleanup` walks
+    /// `each()`, which does the same. So a fourth limiter added later cannot
+    /// slip past this the way `/ipfs` slipped past the `AppState` sweeper: it
+    /// fails to compile in three places before it can fail silently in one.
+    ///
+    /// The short window comes from `with_window` rather than a limiter built by
+    /// hand, so the thing under test is the real struct with its real caps.
+    #[tokio::test]
+    async fn the_swarm_sweep_evicts_expired_keys_from_every_ingest_limiter() {
+        let window = Duration::from_millis(30);
+        let limiters = IngestLimiters::with_window(window);
+
+        for (name, limiter, _, _) in limiters.all() {
+            assert!(
+                limiter.check("forwarding-peer").await,
+                "the {name} limiter must admit the first event, or this test proves nothing"
+            );
+            assert_eq!(limiter.tracked_keys().await, 1);
+        }
+
+        tokio::time::sleep(window * 3).await;
+        limiters.cleanup().await;
+
+        for (name, limiter, _, _) in limiters.all() {
+            assert_eq!(
+                limiter.tracked_keys().await,
+                0,
+                "the {name} ingest limiter was not swept"
+            );
+        }
+    }
+
+    /// Every outcome the ingest path can return has to reach the counter under
+    /// its own label, because `/metrics` is the only externally observable
+    /// surface this daemon exposes and an unlabelled outcome is an invisible
+    /// one. The exhaustive match in `metric_label` is what makes a seventh
+    /// variant a compile error; this pins the labels themselves, since a
+    /// copy-paste that gave two variants the same string would still compile and
+    /// would silently merge a shed reason into another on the dashboard.
+    #[test]
+    fn every_ingest_outcome_carries_a_distinct_metric_label() {
+        let labels = [
+            IngestOutcome::Accepted.metric_label(),
+            IngestOutcome::WriteFailed("db down".into()).metric_label(),
+            IngestOutcome::Rejected("malformed".into()).metric_label(),
+            IngestOutcome::SourceRateLimited.metric_label(),
+            IngestOutcome::AuthorRateLimited("did:key:a".into()).metric_label(),
+            IngestOutcome::UnsignedSourceRateLimited("peer".into()).metric_label(),
+        ];
+        assert_eq!(
+            labels,
+            [
+                "accepted",
+                "write_failed",
+                "rejected",
+                "source_rate_limited",
+                "author_rate_limited",
+                "unsigned_source_rate_limited",
+            ]
+        );
+
+        let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "two outcomes share a label, which would merge them in the counter"
+        );
     }
 
     /// The ordering test, and the reason the pre-parse brake exists at all.
