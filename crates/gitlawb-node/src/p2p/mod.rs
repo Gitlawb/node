@@ -187,6 +187,53 @@ pub(crate) fn key_parent(key_path: &Path) -> &Path {
     }
 }
 
+/// Whether `key_path` fails to name a directory the node is willing to manage.
+///
+/// This is the gate `Config::validate` applies, kept next to `key_parent`
+/// because the two answer the same question and drifting apart is how the
+/// original defect happened.
+///
+/// An absolute path always names its directory unambiguously, so it passes.
+/// A relative path is judged lexically against two ways of failing to name one:
+///
+///   * no directory at all, so the parent is empty or nothing but `.`
+///     (`p2p.key`, `./p2p.key`, `p2p.key/`, `""`), and
+///   * a parent that walks back out through `..` (`a/../p2p.key`,
+///     `./keys/../p2p.key`, `../p2p.key`).
+///
+/// The second case is the one that is easy to miss and was missed once: those
+/// paths look like they name a directory, and they do not. `a/..` and
+/// `./keys/..` resolve to the working directory itself, and `..` resolves above
+/// it, so accepting them would put the key exactly where this check exists to
+/// keep it out of, and would have the node chmod that directory to 0700 on the
+/// way. Any `..` in a relative parent makes the target depend on where the
+/// process was started, which is the property being refused, so the whole class
+/// is rejected rather than resolved.
+///
+/// Lexical on purpose: no `canonicalize` (the parent legitimately does not exist
+/// yet on a first start) and no `current_dir` comparison (it would reject
+/// `/data/p2p.key` under a `/data` WORKDIR, an absolute directory the operator
+/// named).
+pub(crate) fn names_no_usable_directory(key_path: &Path) -> bool {
+    if key_path.is_absolute() {
+        return false;
+    }
+    match key_path.parent() {
+        None => true,
+        Some(parent) => {
+            let mut named_a_directory = false;
+            for component in parent.components() {
+                match component {
+                    Component::ParentDir => return true,
+                    Component::Normal(_) => named_a_directory = true,
+                    _ => {}
+                }
+            }
+            !named_a_directory
+        }
+    }
+}
+
 /// Load the node's persistent libp2p identity from `key_path`, generating and
 /// storing a fresh Ed25519 keypair the first time.
 pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
@@ -198,9 +245,10 @@ pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> 
     // config validation cannot quietly resurrect the old behaviour of writing
     // the key into the working directory and chmodding whatever that happens
     // to be.
-    if parent == Path::new(".") {
+    if names_no_usable_directory(key_path) {
         return Err(anyhow::anyhow!(
-            "p2p key path {} names no directory; give it one, such as ./keys/p2p.key",
+            "p2p key path {} names no directory the node can manage; give it one that does not \
+             walk back through `..`, such as ./keys/p2p.key",
             key_path.display()
         ));
     }
@@ -751,6 +799,12 @@ mod tests {
     // out of band by a throwaway probe rather than by a committed test. A race
     // on process-global state has no reliable committed red-green.
 
+    /// Printed by the permission fixture only after its assertions have run,
+    /// and required by the parent. See the parent test for why "1 passed" is
+    /// not sufficient on its own.
+    #[cfg(unix)]
+    const FIXTURE_SENTINEL: &str = "p2p-key-perms: asserted";
+
     /// Re-invoke this test binary to run one `#[ignore]`d fixture test.
     #[cfg(unix)]
     fn fixture_command(fixture_test: &str) -> std::process::Command {
@@ -800,6 +854,13 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(dir_mode & 0o777, 0o700, "key directory must be owner-only");
+
+        // Proof-of-work sentinel, printed only after both assertions have run.
+        // "1 passed" alone does not prove this fixture asserted anything: the
+        // early return above is itself a passing test, so an env-var mismatch
+        // (a renamed variable, a changed value) would report 1 passed while
+        // checking nothing. The parent requires this line.
+        println!("{FIXTURE_SENTINEL}");
     }
 
     #[cfg(unix)]
@@ -817,16 +878,119 @@ mod tests {
              --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
         );
 
-        // Not redundant with the status check, and this is the assertion that
-        // keeps the whole fixture from passing vacuously: a filter matching no
-        // test runs zero tests and still exits 0, so a renamed or mistyped
-        // fixture would look like a green permission check while asserting
-        // nothing at all.
+        // Two separate vacuity holes, and each assertion closes one the other
+        // does not.
+        //
+        // A filter matching no test runs zero tests and still exits 0, so a
+        // renamed or mistyped fixture name would look like a green permission
+        // check. "1 passed" closes that.
         assert!(
             stdout.contains("1 passed"),
             "the fixture filter must select exactly one test that passed; a filter matching \
              nothing exits 0 and would make this check vacuous\n--- stdout ---\n{stdout}"
         );
+
+        // But "1 passed" does not prove the fixture ASSERTED anything: its
+        // env-var gate returns early, and an early return is itself a passing
+        // test. A renamed variable or a changed value would report 1 passed
+        // having checked nothing. The sentinel is printed only after both mode
+        // assertions, so requiring it closes that second hole.
+        assert!(
+            stdout.contains(FIXTURE_SENTINEL),
+            "the fixture must print {FIXTURE_SENTINEL:?} after its assertions; without it the \
+             child may have returned early at its env gate and still reported 1 passed\
+             \n--- stdout ---\n{stdout}"
+        );
+    }
+
+    /// The backstop inside `load_or_create_p2p_keypair`, exercised directly.
+    ///
+    /// `Config::validate` rejects these paths before the node starts, so in a
+    /// running node this branch is unreachable. That is exactly why it needs its
+    /// own test: it exists for a future caller that does not go through config
+    /// validation, and a guard whose only justification is a caller that does
+    /// not exist yet is otherwise never executed by anything.
+    ///
+    /// No file is created for any of these, so there is nothing to clean up.
+    #[test]
+    fn p2p_key_path_naming_no_directory_is_refused_without_the_config_gate() {
+        for path in [
+            "p2p.key",
+            "./p2p.key",
+            "a/../p2p.key",
+            "./keys/../p2p.key",
+            "../p2p.key",
+        ] {
+            let result = load_or_create_p2p_keypair(Path::new(path));
+
+            // Clean up BEFORE asserting, and unconditionally. When the guard is
+            // working none of these paths is ever created, so this is a no-op.
+            // When it is not, the call really does write a key relative to the
+            // test process's working directory, which is the crate root, and
+            // leaving that behind breaks every later run in this checkout. That
+            // is not hypothetical: a mutation run that removed the guard left a
+            // real 0600 key and an `a/` directory in crates/gitlawb-node, and
+            // the next baseline failed because of it.
+            let leaked = Path::new(path).exists();
+            let _ = std::fs::remove_file(path);
+            for stray_dir in ["a", "keys"] {
+                let _ = std::fs::remove_dir(stray_dir);
+            }
+
+            let err = result.expect_err(&format!("{path:?} must be refused by the backstop"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("names no directory the node can manage"),
+                "{path:?} must be refused for naming no usable directory, got: {msg}"
+            );
+            assert!(!leaked, "{path:?} must not have been created");
+        }
+    }
+
+    /// The predicate itself, over the whole input space in both directions.
+    ///
+    /// Deliberately does not call `load_or_create_p2p_keypair` on the accepted
+    /// paths: that would create directories and write a real key relative to
+    /// whatever directory the test process happens to run in. The rejected
+    /// direction is covered above, where nothing is created by construction,
+    /// and the gate and the backstop call this same function so they cannot
+    /// disagree.
+    #[test]
+    fn names_no_usable_directory_covers_both_directions() {
+        for path in [
+            // No directory component.
+            "p2p.key",
+            "./p2p.key",
+            "././p2p.key",
+            "p2p.key/",
+            "",
+            // Resolves back to the working directory or above it.
+            "a/../p2p.key",
+            "./keys/../p2p.key",
+            "../p2p.key",
+            "keys/../../p2p.key",
+        ] {
+            assert!(
+                names_no_usable_directory(Path::new(path)),
+                "{path:?} must be rejected"
+            );
+        }
+
+        for path in [
+            "keys/p2p.key",
+            "./keys/p2p.key",
+            "keys/nested/p2p.key",
+            "/data/keys/p2p.key",
+            "/data/p2p.key",
+            // `..` inside an absolute path cannot depend on the working
+            // directory, so it stays accepted.
+            "/data/keys/../p2p.key",
+        ] {
+            assert!(
+                !names_no_usable_directory(Path::new(path)),
+                "{path:?} must be accepted"
+            );
+        }
     }
 
     #[cfg(unix)]
