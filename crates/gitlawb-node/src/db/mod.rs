@@ -1237,7 +1237,7 @@ impl Db {
                  mirror_status = 'inbound',
                  mirror_transition_id = NULL,
                  mirror_transition_phase = NULL,
-                 mirror_updated_at = $3
+                 mirror_updated_at = COALESCE(mirror_updated_at, $3)
              WHERE id = $1
                AND (
                    upstream_url IS NULL
@@ -3320,22 +3320,36 @@ impl Db {
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn row_to_repo_mirror_state(r: sqlx::postgres::PgRow) -> Result<RepoMirrorState> {
-    let status = MirrorStatus::from_db(&r.get::<String, _>("mirror_status"))?;
+    let repo_id = r
+        .try_get("id")
+        .context("reading mirror repository id from database")?;
+    let upstream_url = r
+        .try_get("upstream_url")
+        .context("reading mirror upstream URL from database")?;
+    let status = r
+        .try_get::<String, _>("mirror_status")
+        .context("reading mirror status from database")?;
+    let status = MirrorStatus::from_db(&status)?;
+    let transition_id = r
+        .try_get("mirror_transition_id")
+        .context("reading mirror transition id from database")?;
     let transition_phase = r
-        .get::<Option<String>, _>("mirror_transition_phase")
+        .try_get::<Option<String>, _>("mirror_transition_phase")
+        .context("reading mirror transition phase from database")?
         .as_deref()
         .map(MirrorTransitionPhase::from_db)
         .transpose()?;
     let updated_at = r
-        .get::<String, _>("mirror_updated_at")
+        .try_get::<String, _>("mirror_updated_at")
+        .context("reading mirror update timestamp from database")?
         .parse::<DateTime<Utc>>()
         .context("invalid mirror_updated_at stored in database")?;
 
     let state = RepoMirrorState {
-        repo_id: r.get("id"),
-        upstream_url: r.get("upstream_url"),
+        repo_id,
+        upstream_url,
         status,
-        transition_id: r.get("mirror_transition_id"),
+        transition_id,
         transition_phase,
         updated_at,
     };
@@ -3346,8 +3360,8 @@ fn row_to_repo_mirror_state(r: sqlx::postgres::PgRow) -> Result<RepoMirrorState>
 #[cfg(test)]
 mod mirror_state_tests {
     use super::{
-        validate_mirror_upstream_url, Db, MirrorStatus, MirrorTransitionPhase, RepoMirrorState,
-        RepoRecord,
+        row_to_repo_mirror_state, validate_mirror_upstream_url, Db, MirrorStatus,
+        MirrorTransitionPhase, RepoMirrorState, RepoRecord,
     };
     use chrono::{DateTime, Utc};
     use sqlx::PgPool;
@@ -3535,9 +3549,20 @@ mod mirror_state_tests {
         assert_eq!(first.transition_phase, None);
 
         // An exact retry is safe, but a different source cannot replace it.
-        db.configure_inbound_mirror(&existing.id, "https://github.com/Gitlawb/node.git")
+        let original_updated_at = DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        sqlx::query("UPDATE repos SET mirror_updated_at = $2 WHERE id = $1")
+            .bind(&existing.id)
+            .bind(original_updated_at.to_rfc3339())
+            .execute(db.pool())
             .await
             .unwrap();
+        let retry = db
+            .configure_inbound_mirror(&existing.id, "https://github.com/Gitlawb/node.git")
+            .await
+            .unwrap();
+        assert_eq!(retry.updated_at, original_updated_at);
         assert!(db
             .configure_inbound_mirror(&existing.id, "https://github.com/Gitlawb/other.git",)
             .await
@@ -3550,6 +3575,30 @@ mod mirror_state_tests {
             .unwrap();
         assert_eq!(stored.upstream_url, first.upstream_url);
         assert_eq!(stored.status, MirrorStatus::Inbound);
+        assert_eq!(stored.updated_at, original_updated_at);
+    }
+
+    #[sqlx::test]
+    async fn malformed_mirror_row_returns_an_error_instead_of_panicking(pool: PgPool) {
+        let row = sqlx::query(
+            "SELECT 'repo-id'::text AS id,
+                    'https://github.com/Gitlawb/node.git'::text AS upstream_url,
+                    'inbound'::text AS mirror_status,
+                    NULL::uuid AS mirror_transition_id,
+                    NULL::text AS mirror_transition_phase,
+                    NULL::text AS mirror_updated_at",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let error = row_to_repo_mirror_state(row).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reading mirror update timestamp from database"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[sqlx::test]
