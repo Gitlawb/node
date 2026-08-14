@@ -9,7 +9,7 @@
 
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -165,15 +165,50 @@ struct GitlawbBehaviour {
     identify: identify::Behaviour,
 }
 
+/// The directory holding `key_path`, and the single answer to that question for
+/// every site in this module plus `Config::validate`.
+///
+/// `Path::parent` is not enough on its own. A bare filename yields `Some("")`
+/// and `./p2p.key` yields `Some(".")`, both naming the process working
+/// directory while looking different; an empty path yields `None`. Collapsing
+/// all of those to `.` keeps the callers from each inventing their own answer,
+/// which is what they used to do: one filtered the empty case out and skipped
+/// the directory guard entirely, one already normalized correctly, and one
+/// opened `""` and silently did nothing.
+///
+/// The `.` return is the "names no directory" signal, not a usable directory.
+/// `Config::validate` rejects a p2p key path that lands here, so a validated
+/// config never reaches it; `load_or_create_p2p_keypair` refuses it as well, as
+/// a backstop rather than the gate.
+pub(crate) fn key_parent(key_path: &Path) -> &Path {
+    match key_path.parent() {
+        Some(parent) if parent.components().any(|c| c != Component::CurDir) => parent,
+        _ => Path::new("."),
+    }
+}
+
 /// Load the node's persistent libp2p identity from `key_path`, generating and
 /// storing a fresh Ed25519 keypair the first time.
 pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
+    let parent = key_parent(key_path);
+
+    // Backstop, not the gate. `Config::validate` rejects a key path naming no
+    // directory before the node starts, which is where the operator gets a
+    // useful error. Refusing it here too means a future caller that skips
+    // config validation cannot quietly resurrect the old behaviour of writing
+    // the key into the working directory and chmodding whatever that happens
+    // to be.
+    if parent == Path::new(".") {
+        return Err(anyhow::anyhow!(
+            "p2p key path {} names no directory; give it one, such as ./keys/p2p.key",
+            key_path.display()
+        ));
+    }
+
     // Runs on both the load and the create path: the directory guards the key
     // just as much as the key's own mode does, and an existing directory keeps
     // whatever mode it was made with.
-    if let Some(parent) = key_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        ensure_key_dir(parent)?;
-    }
+    ensure_key_dir(parent)?;
 
     if key_path.exists() {
         return read_p2p_keypair(key_path);
@@ -283,7 +318,7 @@ fn ensure_key_dir(dir: &Path) -> Result<()> {
 /// without a check-then-act gap. The scratch file is unlinked either way, so a
 /// failed start leaves the key directory as it found it.
 fn write_key_atomically(key_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = key_path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = key_parent(key_path);
     let (tmp_path, mut file) = create_scratch_key_file(dir)?;
     let result = fill_and_publish(&mut file, bytes, &tmp_path, key_path);
     drop(file);
@@ -344,11 +379,11 @@ fn fill_and_publish(
     std::fs::hard_link(tmp_path, key_path)?;
 
     // Make the new directory entry itself durable. Best-effort: the key is
-    // already written and linked, and not every platform allows this.
-    if let Some(dir) = key_path.parent() {
-        if let Ok(dir_file) = std::fs::File::open(dir) {
-            let _ = dir_file.sync_all();
-        }
+    // already written and linked, and not every platform allows this. Goes
+    // through `key_parent` like every other site; opening a bare `""` here used
+    // to fail silently, which looked like a working fsync and was not.
+    if let Ok(dir_file) = std::fs::File::open(key_parent(key_path)) {
+        let _ = dir_file.sync_all();
     }
     Ok(())
 }
