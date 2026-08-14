@@ -1,5 +1,5 @@
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Upper bound on `git_service_timeout_secs` and `ipfs_request_budget_secs`, in seconds
 /// (100 years).
@@ -597,6 +597,32 @@ impl Config {
                 floor
             ));
         }
+
+        // A p2p key path naming no directory puts the node's private key in
+        // whatever directory the process was started from. The node cannot
+        // protect that: `ensure_key_dir` would have to chmod a directory the
+        // operator never nominated as a key directory, and a directory it
+        // cannot secure is one where any local user with write access can
+        // replace the key and choose the node's libp2p identity. Refuse it here,
+        // where the denial actually stops the process, rather than in the p2p
+        // start path, where main.rs logs the error and keeps serving with a
+        // green /health.
+        //
+        // Decided lexically on the resolved path: `canonicalize` would fail on a
+        // parent that does not exist yet (the shipped `~/.gitlawb` default, and
+        // every container's first boot), and comparing against the process
+        // working directory would reject `/data/p2p.key` under the image's
+        // WORKDIR, an absolute directory the operator did name.
+        let p2p_key_path = self.resolved_p2p_key_path();
+        if crate::p2p::key_parent(&p2p_key_path) == Path::new(".") {
+            return Err(format!(
+                "GITLAWB_P2P_KEY ({}) must include a directory, such as ./keys/p2p.key or \
+                 /data/keys/p2p.key: the node will not store its p2p identity key in the \
+                 working directory, where the directory holding it cannot be secured.",
+                self.p2p_key_path
+            ));
+        }
+
         Ok(())
     }
 }
@@ -985,6 +1011,67 @@ mod tests {
         assert!(
             at_floor.validate().is_ok(),
             "db_max_connections at the floor (pushes + headroom) must validate"
+        );
+    }
+
+    fn config_with_p2p_key(path: &str) -> Config {
+        Config::parse_from(["gitlawb-node", "--p2p-key-path", path])
+    }
+
+    /// A p2p key path that names no directory component would put the node's
+    /// private key in whatever directory the process happens to be started from,
+    /// which `ensure_key_dir` cannot protect without tightening a directory the
+    /// operator never nominated. Reject it at boot instead.
+    #[test]
+    fn p2p_key_path_without_a_directory_component_is_rejected() {
+        for path in ["p2p.key", "./p2p.key", "././p2p.key", "p2p.key/", ""] {
+            let err = config_with_p2p_key(path)
+                .validate()
+                .expect_err(&format!("{path:?} names no directory and must be rejected"));
+            assert!(
+                err.contains("directory"),
+                "{path:?} must be rejected for naming no directory, got: {err}"
+            );
+        }
+    }
+
+    /// The mirror of the above, and the case that stops the predicate widening
+    /// into "reject every relative path". The shipped default is included on
+    /// purpose: a predicate that rejects it is a boot failure for every node.
+    #[test]
+    fn p2p_key_path_naming_a_directory_is_accepted() {
+        for path in [
+            "keys/p2p.key",
+            "./keys/p2p.key",
+            "/data/keys/p2p.key",
+            "../p2p.key",
+            "/data/p2p.key",
+            "~/.gitlawb/p2p.key",
+        ] {
+            assert!(
+                config_with_p2p_key(path).validate().is_ok(),
+                "{path:?} names a directory and must be accepted"
+            );
+        }
+
+        Config::parse_from(["gitlawb-node"])
+            .validate()
+            .expect("the shipped default p2p key path must validate");
+    }
+
+    /// The one input that separates validating the raw config string from
+    /// validating `resolved_p2p_key_path()`. Raw, `~/` has an empty parent and
+    /// would be rejected; resolved, it is the home directory, whose parent is a
+    /// real directory, so it is accepted. Every other tilde path is accepted
+    /// under both readings and therefore proves nothing.
+    #[test]
+    fn p2p_key_path_is_checked_after_tilde_expansion() {
+        if dirs_next::home_dir().is_none() {
+            panic!("this test needs a home directory to distinguish raw from resolved");
+        }
+        assert!(
+            config_with_p2p_key("~/").validate().is_ok(),
+            "`~/` resolves to the home directory, whose parent is a real directory"
         );
     }
 }
