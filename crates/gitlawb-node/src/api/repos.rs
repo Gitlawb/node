@@ -6378,15 +6378,17 @@ mod tests {
         // Scan pool of ONE: at most one post-receive walk may run at a time.
         state.git_encrypt_semaphore = Arc::new(Semaphore::new(1));
 
-        let did = "did:key:z6MkF4BurstPusherAAAAAAAAAAAAAAAAAAAAAAAA";
         let new_sha = "1111111111111111111111111111111111111111";
+        // The two repos have different owners, and owner-only push is on by default,
+        // so each push signs as the owner of the repo it targets. The subject here is
+        // the scan pool serializing two concurrent bursts, not authorization.
         let push = |owner: &'static str, name: &'static str, peer: &'static str| {
             let state = state.clone();
             tokio::spawn(async move {
                 git_receive_pack(
                     State(state),
                     Path((owner.to_string(), name.to_string())),
-                    Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                    Extension(crate::auth::AuthenticatedDid(format!("did:key:{owner}"))),
                     crate::rate_limit::PeerAddr(Some(peer.parse::<SocketAddr>().unwrap())),
                     axum::http::HeaderMap::new(),
                     ref_update_body(new_sha),
@@ -6479,7 +6481,7 @@ mod tests {
                 State(state),
                 Path(("z6f4fast".to_string(), "f1".to_string())),
                 Extension(crate::auth::AuthenticatedDid(
-                    "did:key:z6MkF4FastPusherAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                    "did:key:z6f4fast".to_string(),
                 )),
                 crate::rate_limit::PeerAddr(Some(peer)),
                 axum::http::HeaderMap::new(),
@@ -6539,7 +6541,7 @@ mod tests {
                 State(state),
                 Path(("z6f4park".to_string(), "p1".to_string())),
                 Extension(crate::auth::AuthenticatedDid(
-                    "did:key:z6MkF4ParkPusherAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                    "did:key:z6f4park".to_string(),
                 )),
                 crate::rate_limit::PeerAddr(Some(peer)),
                 axum::http::HeaderMap::new(),
@@ -7758,7 +7760,7 @@ mod tests {
         // + flush-only body -> no post-receive scans to muddy the observation.
         let state =
             f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f3repo", "r1", false).await;
-        let did = "did:key:z6MkF3PusherAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let did = "did:key:z6f3repo";
 
         // Push A: drive its handler future in slices until it reaches receive-pack and the
         // fake records its descendant pid (A now holds the lease and is hung).
@@ -7881,7 +7883,7 @@ mod tests {
         let git_bin = write_fake_git(tmp.path(), body);
         let state =
             f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f3clean", "c1", false).await;
-        let did = "did:key:z6MkF3CleanPusherAAAAAAAAAAAAAAAAAAAAAAAA";
+        let did = "did:key:z6f3clean";
 
         let push = |st: AppState, peer: &'static str| async move {
             tokio::time::timeout(
@@ -7975,7 +7977,7 @@ mod tests {
         // free, and a pool-holding waiter (B, pre-fix) would drain it to zero. Sizing to
         // 1 would 503 B on the pool before it could block on the lease, hiding the bug.
         state.git_write_semaphore = Arc::new(Semaphore::new(2));
-        let did = "did:key:z6MkF3DosPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let did = "did:key:z6f3dos";
 
         // Push A: drive its handler future in slices until it reaches receive-pack (it now
         // holds the lease and one write permit and is hung). available_permits() drops to 1.
@@ -8184,7 +8186,7 @@ mod tests {
             "the identity key must differ from the row id, or this test proves nothing"
         );
 
-        let did = "did:key:z6MkU2KeyPusherAAAAAAAAAAAAAAAAAAAAAAAA";
+        let did = "did:key:z6u2key";
         let peer: SocketAddr = "203.0.113.91:5000".parse().unwrap();
         let handle = tokio::spawn({
             let st = state.clone();
@@ -8265,7 +8267,7 @@ mod tests {
             State(state),
             Path(("z6ovflow".to_string(), "o1".to_string())),
             Extension(crate::auth::AuthenticatedDid(
-                "did:key:z6MkOverflowPusherAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                "did:key:z6ovflow".to_string(),
             )),
             crate::rate_limit::PeerAddr(Some("203.0.113.90:5000".parse::<SocketAddr>().unwrap())),
             axum::http::HeaderMap::new(),
@@ -8312,7 +8314,7 @@ mod tests {
             let r = state.db.get_repo("z6u1cap", "c1").await.unwrap().unwrap();
             crate::state::repo_identity_key(&r.owner_did, &r.name)
         };
-        let did = "did:key:z6MkU1CapPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let did = "did:key:z6u1cap";
         let push = |peer: SocketAddr| {
             let st = state.clone();
             let did = did.to_string();
@@ -8416,7 +8418,7 @@ mod tests {
             crate::state::repo_identity_key(&r.owner_did, &r.name)
         };
         f1_add_repo(&state, "z6u1two", "r2").await;
-        let did = "did:key:z6MkU1TwoPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let did = "did:key:z6u1two";
         let src: SocketAddr = "203.0.113.84:5000".parse().unwrap();
         let push = |repo: &'static str| {
             let st = state.clone();
@@ -8498,7 +8500,10 @@ mod tests {
             crate::state::repo_identity_key(&r.owner_did, &r.name)
         };
         f1_add_repo(&state, "z6u1nat", "n2").await;
-        // Every pusher arrives from the one edge IP, so they share a source key.
+        // Every pusher arrives from the one edge IP, so they share a source key. All
+        // three sign as the repos' owner because owner-only push is on by default; the
+        // source key is the resolved peer IP, never the DID, so the three concurrent
+        // pushes still contend exactly as they did under distinct pusher identities.
         let edge: SocketAddr = "203.0.113.85:5000".parse().unwrap();
         let push = |pusher: &'static str, repo: &'static str| {
             let st = state.clone();
@@ -8515,18 +8520,12 @@ mod tests {
             }
         };
 
-        let handle_a = tokio::spawn(push(
-            "did:key:z6MkU1NatPusherOneAAAAAAAAAAAAAAAAAAAAAA",
-            "n1",
-        ));
+        let handle_a = tokio::spawn(push("did:key:z6u1nat", "n1"));
         assert!(
             f1_wait_for(F1_BACKSTOP, || a_inpack.exists()).await,
             "pusher one never reached receive-pack within {F1_BACKSTOP:?}"
         );
-        let handle_b = tokio::spawn(push(
-            "did:key:z6MkU1NatPusherTwoAAAAAAAAAAAAAAAAAAAAAA",
-            "n1",
-        ));
+        let handle_b = tokio::spawn(push("did:key:z6u1nat", "n1"));
         assert!(
             f1_wait_for(F1_BACKSTOP, || state.repo_write_leases.waiters_for(&repo1)
                 == 1)
@@ -8535,12 +8534,9 @@ mod tests {
         );
 
         // A third, unrelated pusher behind the same edge IP, on a different repo.
-        let c = tokio::time::timeout(
-            F1_BACKSTOP,
-            push("did:key:z6MkU1NatPusherThreeAAAAAAAAAAAAAAAAAA", "n2"),
-        )
-        .await
-        .expect("an unrelated pusher's push to an uncontended repo must not park");
+        let c = tokio::time::timeout(F1_BACKSTOP, push("did:key:z6u1nat", "n2"))
+            .await
+            .expect("an unrelated pusher's push to an uncontended repo must not park");
         let resp = c.unwrap_or_else(|e| {
             panic!(
                 "U1 scenario 3 RED: one repo's parked push shed an UNRELATED pusher's push \
@@ -8695,7 +8691,7 @@ mod tests {
         let mut state =
             f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f1seq", "s1", false).await;
         state.git_write_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
-        let did = "did:key:z6MkF1SeqPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let did = "did:key:z6f1seq";
         let src: SocketAddr = "203.0.113.68:5000".parse().unwrap();
 
         for attempt in 1..=2 {
@@ -9199,7 +9195,7 @@ mod tests {
         (state, log)
     }
 
-    const P2_PUSHER: &str = "did:key:z6MkP2TailPusherAAAAAAAAAAAAAAAAAAAAAA";
+    const P2_PUSHER: &str = "did:key:z6p2tail";
 
     fn p2_push(
         state: &AppState,
