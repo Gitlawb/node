@@ -134,14 +134,21 @@ impl HttpSignature {
 
         let now = Utc::now().timestamp();
 
-        let age = now - self.created;
+        // Saturating, not plain subtraction. `created` is parsed as an
+        // unrestricted i64 straight from the Signature-Input header, so a
+        // sender picks it: at i64::MIN the past-side subtraction overflows,
+        // which panics a debug build and wraps a release one into an absurd
+        // value that can read as acceptable. Saturating gives the answer the
+        // check wants at both extremes, since a timestamp that far away is
+        // refused by whichever side it saturates toward.
+        let age = now.saturating_sub(self.created);
         if age > MAX_AGE_SECS {
             return Err(Error::HttpSignature(format!(
                 "clock skew too large: created {age}s in the past (max {MAX_AGE_SECS}s)"
             )));
         }
 
-        let ahead = self.created - now;
+        let ahead = self.created.saturating_sub(now);
         if ahead > MAX_FUTURE_SECS {
             return Err(Error::HttpSignature(format!(
                 "clock skew too large: created {ahead}s in the future (max {MAX_FUTURE_SECS}s)"
@@ -371,6 +378,36 @@ mod tests {
             r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created={created}"#
         );
         HttpSignature::parse(&sig_input, "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:").unwrap()
+    }
+
+    /// Build a signature at an ABSOLUTE `created`, so a test can drive the
+    /// extremes an offset from now cannot reach.
+    fn sig_created_absolute(created: i64) -> HttpSignature {
+        let kp = Keypair::generate();
+        let did = kp.did();
+        let sig_input = format!(
+            r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created={created}"#
+        );
+        HttpSignature::parse(&sig_input, "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:").unwrap()
+    }
+
+    /// `created` is parsed as an unrestricted i64 from a header the sender
+    /// writes, so the window check has to survive both ends of the type. Before
+    /// the saturating form this panicked with "attempt to subtract with
+    /// overflow" on the past side, which is a debug-build crash any client
+    /// could trigger by sending one header value.
+    #[test]
+    fn extreme_created_values_are_refused_rather_than_overflowing() {
+        for created in [i64::MIN, i64::MIN + 1, i64::MAX - 1, i64::MAX] {
+            let err = sig_created_absolute(created)
+                .check_created()
+                .expect_err("an extreme created must be refused, not accepted");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("past") || msg.contains("future"),
+                "created={created} must be refused by a named direction, got: {msg}"
+            );
+        }
     }
 
     #[test]
