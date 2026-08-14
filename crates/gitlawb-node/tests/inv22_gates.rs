@@ -546,7 +546,9 @@ fn inv22_replication_tail_spawns_at_the_durability_boundary() {
         .expect("U5 gate missing: the tail spawn must be gated on the push having succeeded");
     let spawn = production
         .find("tokio::spawn(post_receive_continuation(")
-        .expect("U5 gate missing: the post-receive continuation must be spawned by git_receive_pack");
+        .expect(
+            "U5 gate missing: the post-receive continuation must be spawned by git_receive_pack",
+        );
     let release = production
         .find(".release(push_succeeded)")
         .expect("U5 gate stale: release must consume the same success flag as the tail gate");
