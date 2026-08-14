@@ -1962,6 +1962,127 @@ mod tests {
         );
     }
 
+    /// A signed request body reused by the request-target trio below. Non-empty so
+    /// the content-digest the signature covers is a real hash rather than the
+    /// empty-body constant, which keeps `@path` the only component under test.
+    const TARGET_PIN_BODY: &[u8] = br#"{"task_type":"noop","payload":{}}"#;
+
+    /// Send `body` to `uri` carrying a signature made over `signed_over`, through
+    /// the PRODUCTION router (`app`, which goes through `server::build_router`, where
+    /// `add_auth_layers` installs `require_signature` on the write routes). Returns
+    /// the status and the parsed JSON body (`Null` when the response is not JSON, as
+    /// a handler response past the middleware may be). Going through `app` rather
+    /// than a hand-mounted `Router::new().route(...)` probe is the point: a bare
+    /// router answers whether the middleware rejects the request, not whether that
+    /// is how a caller is actually gated.
+    async fn signed_over_then_sent(
+        pool: PgPool,
+        signed_over: &str,
+        uri: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let kp = Keypair::generate();
+        let signed = sign_request(&kp, "POST", signed_over, TARGET_PIN_BODY);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::from(TARGET_PIN_BODY))
+            .unwrap();
+
+        let resp = app(pool).await.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// The server half of the redirect finding: `require_signature` rebuilds `@path`
+    /// from the URI of the request it actually received, so a signature minted over
+    /// `/api/v1/repos` and presented at `POST /api/v1/tasks` verifies against the
+    /// wrong request-target and is refused 401 `invalid_signature`. Both routes sit
+    /// behind `add_auth_layers` in `build_router`, so the request really does reach
+    /// the middleware instead of 404ing at the fallback. This is the node-side proof
+    /// that a client which lets a redirect rewrite the target gets a 401, which is
+    /// what the production report showed.
+    ///
+    /// No pre-fix RED is obtainable here: the verifier already gates on `@path` (that
+    /// is precisely why the client bug surfaced as a 401 rather than as a silently
+    /// accepted request), so there is no broken state to observe first. The test is a
+    /// must-not guard, green by design, and its RED proof is by mutation of the
+    /// reconstruction it pins.
+    #[sqlx::test]
+    async fn require_signature_refuses_a_stale_request_target_path(pool: PgPool) {
+        let (status, json) = signed_over_then_sent(pool, "/api/v1/repos", "/api/v1/tasks").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a signature minted over one route path must not verify when replayed on another"
+        );
+        assert_eq!(
+            json["error"], "invalid_signature",
+            "the refusal must come from the signature check, not from a handler or a later gate"
+        );
+    }
+
+    /// The query half of the same reconstruction: `@path` is path-and-query, not path
+    /// alone, so a signature minted over `/api/v1/tasks` and sent to
+    /// `/api/v1/tasks?x=1` is refused 401 `invalid_signature` too. Without this case a
+    /// reconstruction narrowed to `parts.uri.path()` would keep the sibling test above
+    /// green while admitting every query rewrite, so both components of the received
+    /// target are pinned rather than just the first.
+    ///
+    /// No pre-fix RED is obtainable here either, for the reason given on the sibling
+    /// above: the verifier already covers the query, so this is a green-by-design
+    /// must-not guard whose RED proof is by mutation.
+    #[sqlx::test]
+    async fn require_signature_refuses_a_stale_request_target_query(pool: PgPool) {
+        let (status, json) =
+            signed_over_then_sent(pool, "/api/v1/tasks", "/api/v1/tasks?x=1").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a signature minted over the bare task path \
+             must not verify on a request that carries a query"
+        );
+        assert_eq!(
+            json["error"], "invalid_signature",
+            "the query refusal must come from the signature check, \
+             not from a handler rejecting the unknown parameter"
+        );
+    }
+
+    /// The paired positive control the two refusals need to mean anything: signed and
+    /// sent over the identical target `/api/v1/tasks?x=1`, the request clears
+    /// `require_signature`. Without it a reconstruction that produced garbage for
+    /// every request would satisfy both refusals above and look like coverage. The
+    /// request carries no `x-ucan` header, so `require_ucan_chain` passes it through
+    /// and whatever status arrives past the auth pair is the handler's own; the
+    /// assertion is therefore that the response is NOT the 401 `invalid_signature` the
+    /// mismatch cases get, not a pin on some particular handler outcome.
+    ///
+    /// Green by design like its siblings, and for the same reason: the verifier
+    /// already reconstructs the received target, so there is no pre-fix RED to
+    /// observe and the proof that this assertion is load-bearing comes from degrading
+    /// the reconstruction under mutation.
+    #[sqlx::test]
+    async fn require_signature_admits_the_exact_request_target(pool: PgPool) {
+        let (status, json) =
+            signed_over_then_sent(pool, "/api/v1/tasks?x=1", "/api/v1/tasks?x=1").await;
+        assert!(
+            !(status == StatusCode::UNAUTHORIZED && json["error"] == "invalid_signature"),
+            "an identically signed and sent request-target must clear require_signature, \
+             so this control must not draw the same refusal as the mismatch cases; got {status}"
+        );
+    }
+
     /// Issue #6 / jatmn finding 2: `/api/v1/stats` counts logical repos, not raw
     /// rows. With a mirror+canonical pair and a standalone repo present, the
     /// `repos` count is 2.
