@@ -115,6 +115,8 @@ impl QueryRoot {
             desc = "Max 200; larger requests are clamped to 200 (no error). Negative values clamp to 0."
         )]
         limit: i64,
+        after_created_at: Option<String>,
+        after_id: Option<String>,
     ) -> Result<Vec<AgentTaskReadType>> {
         let db = ctx.data_unchecked::<Arc<Db>>();
         // #268: gate rows via the same collector the REST list route uses (like
@@ -125,16 +127,22 @@ impl QueryRoot {
             .data::<crate::auth::AuthenticatedDid>()
             .ok()
             .map(|d| d.0.as_str());
-        let tasks = crate::api::tasks::collect_visible_tasks(
+        let after = after_created_at.as_deref().zip(after_id.as_deref());
+        let result = crate::api::tasks::collect_visible_tasks(
             db,
             status.as_deref(),
             assignee_did.as_deref(),
             limit,
+            after,
             caller,
         )
         .await
         .map_err(crate::graphql::graphql_app_err)?;
-        Ok(tasks.into_iter().map(AgentTaskReadType::from).collect())
+        Ok(result
+            .tasks
+            .into_iter()
+            .map(AgentTaskReadType::from)
+            .collect())
     }
 
     async fn task(&self, ctx: &Context<'_>, id: String) -> Result<Option<AgentTaskReadType>> {
@@ -636,6 +644,50 @@ mod tests {
         let resp = anon(&schema, "{ tasks(limit: 1) { id } }").await;
         assert_eq!(count_tasks(&resp), 1);
         assert!(format!("{:?}", resp.data).contains("visible"));
+    }
+
+    #[sqlx::test]
+    async fn tasks_continuation_past_candidate_ceiling(pool: PgPool) {
+        let db = db(pool).await;
+        db.create_repo(&repo("public-repo", OWNER, "public", true))
+            .await
+            .unwrap();
+        let visible = crate::db::AgentTask {
+            id: "past-ceiling".into(),
+            repo_id: Some("public-repo".into()),
+            kind: "build".into(),
+            status: "pending".into(),
+            delegator_did: OWNER.into(),
+            assignee_did: None,
+            capability: "repo:write".into(),
+            ucan_token: None,
+            payload: None,
+            result: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            deadline: None,
+        };
+        db.create_task(&visible).await.unwrap();
+        for i in 0..1000 {
+            let mut hidden = visible.clone();
+            hidden.id = format!("hidden-{i:04}");
+            hidden.repo_id = None;
+            hidden.created_at = "2026-01-02T00:00:00Z".into();
+            hidden.updated_at = hidden.created_at.clone();
+            db.create_task(&hidden).await.unwrap();
+        }
+
+        let schema = schema(db);
+        let resp = anon(&schema, "{ tasks(limit: 1) { id } }").await;
+        assert_eq!(count_tasks(&resp), 0);
+
+        let resp = anon(
+            &schema,
+            r#"{ tasks(limit: 1, afterCreatedAt: "2026-01-02T00:00:00Z", afterId: "hidden-0999") { id } }"#,
+        )
+        .await;
+        assert_eq!(count_tasks(&resp), 1);
+        assert!(format!("{:?}", resp.data).contains("past-ceiling"));
     }
 
     fn count_tasks(resp: &async_graphql::Response) -> usize {
