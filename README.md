@@ -322,6 +322,10 @@ GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true
 
 `POST /api/v1/sync/trigger` is not part of the staged rollout: it always requires a signature in both config modes and returns 401 without one, because each call drives an O(peers) outbound fan-out.
 
+The flag is not HTTP-only. It also gates inbound gossip ref-update events on the libp2p mesh, which carry an Ed25519 payload signature rather than RFC 9421 headers because there are no HTTP headers to sign. Set to `true`, an unsigned gossip event is dropped. Set to `false`, an unsigned event is accepted with a warning during the rolling-upgrade window, and the write budget it consumes is charged to the forwarding peer rather than to the DID it claims, since an unsigned event's claimed DID is asserted and not proven. A present-but-invalid signature is refused in both modes; that is forgery, not an un-upgraded peer.
+
+Because the flag now spans both transports, the rollout order matters in one direction: **upgrade every gossip-publishing peer to a build that signs events before you set this to `true`.** Enabling it while an old publisher is still live drops that publisher's ref-updates on arrival, and the publisher sees no error, because gossip has no response to carry one. Upgrading the HTTP peers alone is not sufficient.
+
 ---
 
 ## Configuration
@@ -345,7 +349,7 @@ Important node settings:
 | `GITLAWB_BOOTSTRAP_PEERS` | Comma-separated HTTP peer URLs. |
 | `GITLAWB_P2P_BOOTSTRAP` | Comma-separated libp2p multiaddrs. |
 | `GITLAWB_BOOTSTRAP_DISABLE_SEEDS` | Disable embedded seed peers for isolated dev/test networks. |
-| `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` | Require signed peer announce/sync writes. |
+| `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` | Require peer writes to prove their DID on every transport: RFC 9421 signatures on the announce/sync routes, and an Ed25519 payload signature on gossip ref-update events. Upgrade every gossip publisher before enabling, or their updates are dropped with no error on their side. |
 | `GITLAWB_AUTO_SYNC` | Enable automatic sync from known peers. |
 | `GITLAWB_MAX_PACK_BYTES` | Max git pack body size for smart-HTTP routes. |
 | `GITLAWB_GIT_SERVICE_TIMEOUT_SECS` | Max seconds a served git upload-pack, receive-pack, or `info/refs` advertisement may run before it is aborted (504). Default 600. Also bounds the withheld-blob classification walk (on both the upload-pack serve and receive-pack replication paths) and the push-side pin-candidate discovery (`rev-list` / `cat-file`), each reaped via process-group teardown at the deadline. On the path-scoped upload-pack path the classification walk and the pack serve share ONE deadline, so this value bounds their combined duration rather than granting each stage a full budget: a walk that consumes it leaves the serve nothing and the clone gets a 504. Serving large path-scoped repos may therefore need a higher value than they did when each stage was budgeted separately. Accepted range is 1 to 3153600000 (100 years), since the node derives deadlines from this value and a larger one cannot be represented. |
