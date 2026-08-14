@@ -5622,7 +5622,10 @@ mod tests {
             .await
             .unwrap();
 
-        let did = "did:key:z6MkReceivePackWriteCapProofDidAAAAAAAAAA";
+        // Owner of the `rp4` row, so the push reaches the per-source write cap instead
+        // of stopping at the owner-push gate (on by default). `did_matches` collapses
+        // the `did:key:` prefix against the bare stored owner.
+        let did = "did:key:z6rp4wr";
         let capped: SocketAddr = "203.0.113.44:5000".parse().unwrap();
         let other: SocketAddr = "203.0.113.45:5000".parse().unwrap();
 
@@ -5741,7 +5744,10 @@ mod tests {
             .await
             .expect("hold the advisory lock on the second connection");
 
-        let did = "did:key:z6MkAcquireDeadlineProofDidAAAAAAAAAAAAAAAA";
+        // Owner of the seeded rows, so the push reaches `acquire_write` instead of
+        // stopping at the owner-push gate (on by default). `did_matches` collapses the
+        // `did:key:` prefix against the bare `owner` above.
+        let did = "did:key:z6acqdead";
         let peer: SocketAddr = "203.0.113.61:5000".parse().unwrap();
 
         let sem = state.git_write_semaphore.clone();
@@ -8584,7 +8590,11 @@ mod tests {
                 .unwrap();
         }
 
-        let did = "did:key:z6MkF1KeyPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        // The pusher must be the repos' owner: this test is about the write-cap key's
+        // shape, so the push has to reach the cap rather than stop at the owner-push
+        // gate, which is on by default. `did_matches` collapses the `did:key:` prefix,
+        // so this is the same identity as the bare `z6f1key` the rows are owned by.
+        let did = "did:key:z6f1key";
         let capped: SocketAddr = "203.0.113.65:5000".parse().unwrap();
         let other: SocketAddr = "203.0.113.66:5000".parse().unwrap();
         let _slot = state

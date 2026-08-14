@@ -78,10 +78,21 @@ pub struct Config {
 
     /// Require the authenticated pusher to be the repo owner on `git-receive-pack`.
     /// Authentication (a valid did:key signature) is not authorization on its own:
-    /// any party can sign as their own DID. When true, pushes whose authenticated
-    /// DID is not the repo owner are rejected. Keep false during rolling upgrades;
-    /// flip it on once owners are ready for owner-only writes.
-    #[arg(long, env = "GITLAWB_ENFORCE_OWNER_PUSH", default_value_t = false)]
+    /// any party can mint a did:key and sign as it, so with this off every signed
+    /// caller may push to every repository, private ones included. On by default.
+    ///
+    /// Turn it off only for a rolling upgrade whose pushers are not yet the repo
+    /// owner. The argument takes a value so there is a way back —
+    /// `--enforce-owner-push false` and `GITLAWB_ENFORCE_OWNER_PUSH=false` both
+    /// disable it — while the bare `--enforce-owner-push` form still means `true`.
+    #[arg(
+        long,
+        env = "GITLAWB_ENFORCE_OWNER_PUSH",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_value_t = true,
+        default_missing_value = "true"
+    )]
     pub enforce_owner_push: bool,
 
     /// URL of local IPFS/Kubo node HTTP API (e.g. http://127.0.0.1:5001)
@@ -971,6 +982,45 @@ mod tests {
         assert!(
             at_floor.validate().is_ok(),
             "db_max_connections at the floor (pushes + headroom) must validate"
+        );
+    }
+
+    /// A node that is configured with nothing must refuse a non-owner push.
+    ///
+    /// Authentication is not authorization here: a `did:key` is self-certifying, so
+    /// anyone can mint one and sign. While `enforce_owner_push` defaulted to `false`,
+    /// `owner_push_rejection` short-circuited (`api/repos.rs`) and every
+    /// `git-receive-pack` that carried any valid signature was accepted — including
+    /// pushes to a repository the signer does not own, and including private ones.
+    /// The default is the whole point of this test: the gate already worked when
+    /// switched on, and no reachable default configuration switched it on.
+    #[test]
+    fn enforce_owner_push_defaults_to_true() {
+        assert!(
+            Config::parse_from(["gitlawb-node"]).enforce_owner_push,
+            "a node started with no configuration must enforce owner-only push"
+        );
+    }
+
+    /// The flip must not strand an operator mid-upgrade.
+    ///
+    /// Turning the gate on is a breaking change for any deployment whose pushers are
+    /// not yet the repo owner, so the escape hatch has to keep working: the argument
+    /// must take a value rather than being presence-only, or `--enforce-owner-push
+    /// false` parses as `true` and there is no way back. Asserting the CLI form pins
+    /// that the argument is value-taking, which is also what makes
+    /// `GITLAWB_ENFORCE_OWNER_PUSH=false` resolve to `false` — env and CLI share one
+    /// value parser. The env form is not exercised directly because process
+    /// environment is global and these tests run in parallel.
+    #[test]
+    fn enforce_owner_push_stays_disableable_for_rolling_upgrades() {
+        assert!(
+            !Config::parse_from(["gitlawb-node", "--enforce-owner-push", "false"])
+                .enforce_owner_push,
+            "operators must still be able to opt out during a rolling upgrade"
+        );
+        assert!(
+            Config::parse_from(["gitlawb-node", "--enforce-owner-push", "true"]).enforce_owner_push
         );
     }
 }
