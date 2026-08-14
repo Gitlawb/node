@@ -281,6 +281,85 @@ fn foreign_ownership_error(what: &str, path: &Path, owner_uid: u32, euid: u32) -
     ))
 }
 
+/// Refuse a key directory whose existing ancestors are controlled by someone
+/// else, before creating anything inside them.
+///
+/// Checking only the key directory and the key file is not enough, and the way
+/// it fails is worth spelling out because it looks safe. A user who owns
+/// `/home/them/base` can have the node use `/home/them/base/keys/p2p.key`. On
+/// first start the node creates `keys` and the key itself, so both are
+/// node-owned, `0700` and `0600`, and pass every check here. That owner never
+/// needs to own either one: they can rename `keys` aside, let the node generate
+/// a fresh identity in a new `keys`, and move the old directory back before a
+/// later restart. Both directories pass, and they decide which identity the
+/// node presents and when it rolls back.
+///
+/// So the trust boundary is the whole existing chain, not the leaf. Walking up
+/// from the deepest component that exists today, every ancestor must be owned by
+/// this user or by root, and must not be group or other writable.
+///
+/// Root counts as trusted on purpose. Requiring every ancestor to be
+/// node-owned would refuse `/data/keys` under a root-owned `/data`, and `/`
+/// itself, which is most real deployments. Root can already replace the binary,
+/// so treating it as an attacker here would buy nothing.
+///
+/// Only existing ancestors are inspected. The ones this call is about to create
+/// inherit their parent, which the walk has already cleared.
+#[cfg(unix)]
+fn foreign_ancestor_error(dir: &Path, euid: u32) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    // `ancestors()` yields the path itself first, and that one is deliberately
+    // skipped. `ensure_key_dir` exists to create and tighten the key directory,
+    // so judging it here would refuse exactly the loose-but-ours case the repair
+    // is written for.
+    for ancestor in dir.ancestors().skip(1) {
+        let md = match std::fs::metadata(ancestor) {
+            Ok(md) => md,
+            // Does not exist yet, so it is one of the directories this call
+            // creates; keep walking up to the part of the path that is real.
+            Err(_) => continue,
+        };
+
+        let owner = md.uid();
+        if owner != euid && owner != 0 {
+            return Some(format!(
+                "p2p key directory {} sits under {}, which is owned by uid {} rather than this \
+                 node (uid {}) or root; that user can rename or replace the directory holding \
+                 the key and so control which identity the node presents. Put the key somewhere \
+                 this user or root owns the whole path.",
+                dir.display(),
+                ancestor.display(),
+                owner,
+                euid
+            ));
+        }
+
+        let mode = md.permissions().mode() & 0o777;
+        // The sticky bit is what makes a shared directory like /tmp survivable,
+        // since it stops non-owners removing entries someone else created.
+        let sticky = md.permissions().mode() & 0o1000 != 0;
+        // World-writable only, not group-writable. Group write on an ancestor is
+        // a real but much narrower capability (it needs group membership), and
+        // refusing it would reject an ordinary umask-002 home or service
+        // directory, which is most of them. The residual is stated in the PR
+        // rather than papered over: someone in the group of an ancestor can
+        // still rename the key directory.
+        if mode & 0o002 != 0 && !sticky {
+            return Some(format!(
+                "p2p key directory {} sits under {}, which has mode {:04o} and is writable \
+                 beyond its owner; anyone with that write access can rename or replace the \
+                 directory holding the key and so control which identity the node presents.",
+                dir.display(),
+                ancestor.display(),
+                mode
+            ));
+        }
+    }
+    None
+}
+
 /// Load the node's persistent libp2p identity from `key_path`, generating and
 /// storing a fresh Ed25519 keypair the first time.
 pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
@@ -359,6 +438,19 @@ pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> 
 /// keys. Issue #231 owns the sibling gap in `main.rs`'s own creation path for
 /// that file; nothing here touches it.
 fn ensure_key_dir(dir: &Path) -> Result<()> {
+    // Before anything is created. Creating the directory first and checking
+    // afterwards is what lets a foreign-owned ancestor launder an unsafe path
+    // into a node-owned 0700 child: the child passes every check precisely
+    // because the node made it, while the ancestor's owner keeps the ability to
+    // swap it out.
+    #[cfg(unix)]
+    {
+        let euid = effective_uid();
+        if let Some(err) = foreign_ancestor_error(dir, euid) {
+            anyhow::bail!(err);
+        }
+    }
+
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -505,7 +597,8 @@ thread_local! {
     static FAIL_KEY_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
     /// Test-only override for the process effective uid, same thread-local
-    /// shape and for the same reason as `FAIL_KEY_WRITE`.
+    /// shape and for the same reason as `FAIL_KEY_WRITE`. Unix-gated like its
+    /// only reader, or a non-unix test build carries it as dead code.
     ///
     /// The ownership refusal is otherwise untestable end to end: proving that
     /// `read_p2p_keypair` and `ensure_key_dir` actually consult it needs a
@@ -530,15 +623,40 @@ fn effective_uid() -> u32 {
 /// it untrustworthy. Never regenerates: a node that silently replaces an
 /// unreadable key file would change its PeerId without the operator knowing.
 fn read_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
+    // One open, then everything is answered from that handle: the ownership
+    // check, the mode check, and the read itself.
+    //
+    // Statting the path and then reading the path again is the window that
+    // matters, and an earlier version of this had it. Between the two lookups
+    // the name can be pointed somewhere else, so the file approved by uid is
+    // not provably the file whose bytes become the identity. `fstat` on the fd
+    // cannot drift like that.
+    //
+    // `O_NOFOLLOW` refuses a symlink at the final component outright rather
+    // than reading through it. Planting one needs write access to the key
+    // directory, which the checks above are meant to deny, so this is the
+    // belt to that brace.
     #[cfg(unix)]
-    {
+    let bytes = {
+        use std::io::Read;
         use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::fs::PermissionsExt;
 
-        // One stat feeds both checks. Statting twice would leave a window in
-        // which the file the ownership check approved is not the file the mode
-        // check measured.
-        let md = std::fs::metadata(key_path)
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(key_path)
+            .with_context(|| {
+                format!(
+                    "failed to open p2p key at {} (a symlink here is refused rather than \
+                     followed)",
+                    key_path.display()
+                )
+            })?;
+
+        let md = file
+            .metadata()
             .with_context(|| format!("failed to stat p2p key at {}", key_path.display()))?;
 
         // Ownership first: a key owned by someone else is not made safe by its
@@ -559,10 +677,16 @@ fn read_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
                 key_path.display()
             );
         }
-    }
 
-    // Same reason as the write path: this is the private key, so it gets
-    // scrubbed on drop instead of lingering in a heap buffer.
+        // Same reason as the write path: this is the private key, so it gets
+        // scrubbed on drop instead of lingering in a heap buffer.
+        let mut buf = Zeroizing::new(Vec::new());
+        file.read_to_end(&mut buf)
+            .with_context(|| format!("failed to read p2p key from {}", key_path.display()))?;
+        buf
+    };
+
+    #[cfg(not(unix))]
     let bytes = Zeroizing::new(
         std::fs::read(key_path)
             .with_context(|| format!("failed to read p2p key from {}", key_path.display()))?,
@@ -1045,14 +1169,6 @@ mod tests {
         }
     }
 
-    /// The predicate itself, over the whole input space in both directions.
-    ///
-    /// Deliberately does not call `load_or_create_p2p_keypair` on the accepted
-    /// paths: that would create directories and write a real key relative to
-    /// whatever directory the test process happens to run in. The rejected
-    /// direction is covered above, where nothing is created by construction,
-    /// and the gate and the backstop call this same function so they cannot
-    /// disagree.
     /// Guard for the seam itself: with no override armed, the checks use the
     /// real process uid. Without this, every ownership test below could pass
     /// against a seam that had quietly stopped consulting `geteuid` at all.
@@ -1091,9 +1207,18 @@ mod tests {
             "{:#}",
             result.expect_err("a foreign-owned key must be refused")
         );
+        // Naming both uids in the expected order is what makes this fail if the
+        // last two arguments are ever swapped, or if the check reads gid rather
+        // than uid. A shared substring like "owned by uid" passes under both.
         assert!(
-            err.contains("owned by uid") && err.contains("will not adopt it"),
-            "must be refused for ownership, not something else, got: {err}"
+            err.contains(&format!(
+                "owned by uid {real_uid} but this node runs as uid {other}"
+            )),
+            "the refusal must name the file's owner and the running uid in that order, got: {err}"
+        );
+        assert!(
+            err.contains("GITLAWB_P2P_KEY") && !err.contains("GITLAWB_P2P_KEY's directory"),
+            "the key path refusal must point at the key knob, not the directory one, got: {err}"
         );
 
         // And the same file loads once the uids agree, so the refusal is about
@@ -1136,7 +1261,74 @@ mod tests {
                 !err.contains("could not be tightened"),
                 "ownership must be reported before the chmod is attempted, got: {err}"
             );
+            // The message check above passes under EITHER ordering, because the
+            // fixture is test-owned so the chmod would succeed and never emit
+            // "could not be tightened". This is the assertion that actually
+            // separates them: if the ownership check ran after the repair, the
+            // mode would have been rewritten to 0700 before the bail.
+            assert_eq!(
+                std::fs::metadata(&keys).unwrap().permissions().mode() & 0o777,
+                mode,
+                "a refused directory must not have been chmodded first"
+            );
         }
+    }
+
+    /// A foreign-owned ancestor is refused before anything is created under it.
+    ///
+    /// This is the case that survived the leaf checks: the node creates the key
+    /// directory and the key itself, so both are node-owned and correctly moded
+    /// and pass every other guard, while whoever owns the directory above can
+    /// rename the whole thing aside and swap an older one back. They choose the
+    /// identity without ever owning anything the leaf checks look at.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_key_dir_refuses_a_foreign_owned_ancestor() {
+        use std::os::unix::fs::MetadataExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let nested = base.path().join("keys");
+
+        let real_uid = std::fs::metadata(base.path()).unwrap().uid();
+        EUID_OVERRIDE.with(|c| c.set(Some(real_uid.wrapping_add(1))));
+        let result = ensure_key_dir(&nested);
+        EUID_OVERRIDE.with(|c| c.set(None));
+
+        let err = format!(
+            "{:#}",
+            result.expect_err("a directory under a foreign-owned ancestor must be refused")
+        );
+        assert!(
+            err.contains("sits under") && err.contains("control which identity"),
+            "must be refused for the ancestor, got: {err}"
+        );
+        // Refused BEFORE creation: this is the whole point, since a directory
+        // the node created would pass the leaf ownership check afterwards.
+        assert!(
+            !nested.exists(),
+            "the key directory must not have been created under a foreign ancestor"
+        );
+    }
+
+    /// Root-owned ancestors are trusted, or nearly every real deployment breaks.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_key_dir_accepts_a_root_owned_ancestor() {
+        use std::os::unix::fs::MetadataExt;
+
+        // /usr is root-owned and not group/other writable on any sane system;
+        // skip rather than assert if this box disagrees.
+        let probe = Path::new("/usr");
+        let Ok(md) = std::fs::metadata(probe) else {
+            return;
+        };
+        if md.uid() != 0 {
+            return;
+        }
+        assert!(
+            foreign_ancestor_error(&probe.join("nonexistent-gitlawb-keys"), 1000).is_none(),
+            "a root-owned ancestor must be trusted for a non-root node"
+        );
     }
 
     /// Both directions of the ownership refusal, without needing root.
@@ -1182,6 +1374,14 @@ mod tests {
         );
     }
 
+    /// The predicate itself, over the whole input space in both directions.
+    ///
+    /// Deliberately does not call `load_or_create_p2p_keypair` on the accepted
+    /// paths: that would create directories and write a real key relative to
+    /// whatever directory the test process happens to run in. The rejected
+    /// direction is covered above, where nothing is created by construction,
+    /// and the gate and the backstop call this same function so they cannot
+    /// disagree.
     #[test]
     fn names_no_usable_directory_covers_both_directions() {
         for path in [
