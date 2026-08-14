@@ -103,6 +103,17 @@ pub struct RepoMirrorState {
     pub updated_at: DateTime<Utc>,
 }
 
+/// One canonical repository eligible for a scheduled external-forge fetch.
+/// The worker keyset-pages these rows by `repo_id`; transition metadata is not
+/// exposed because the selecting query admits only stable INBOUND state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundMirrorTarget {
+    pub repo_id: String,
+    pub owner_did: String,
+    pub name: String,
+    pub upstream_url: String,
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 impl RepoMirrorState {
     fn validate(&self) -> Result<()> {
@@ -122,7 +133,7 @@ impl RepoMirrorState {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn validate_mirror_upstream_url(raw: &str) -> Result<reqwest::Url> {
+pub(crate) fn validate_mirror_upstream_url(raw: &str) -> Result<reqwest::Url> {
     if raw.is_empty() || raw.len() > 2048 {
         anyhow::bail!("mirror upstream URL must contain 1 to 2048 bytes");
     }
@@ -1275,6 +1286,51 @@ impl Db {
         .await?;
 
         row.map(row_to_repo_mirror_state).transpose()
+    }
+
+    /// Keyset-page stable INBOUND mirrors for the external-forge worker.
+    /// Transitioning/outbound rows are excluded at the database boundary so a
+    /// cycle cannot intentionally schedule them. The worker rechecks the state
+    /// after taking the repo write lock to close the selection-to-fetch window.
+    pub async fn list_inbound_mirror_targets(
+        &self,
+        after_repo_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<InboundMirrorTarget>> {
+        let rows = sqlx::query(
+            "SELECT id, owner_did, name, upstream_url
+             FROM repos
+             WHERE mirror_status = 'inbound'
+               AND upstream_url IS NOT NULL
+               AND mirror_transition_id IS NULL
+               AND mirror_transition_phase IS NULL
+               AND ($1::text IS NULL OR id > $1)
+             ORDER BY id ASC
+             LIMIT $2",
+        )
+        .bind(after_repo_id)
+        .bind(limit.clamp(1, 1_000))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(InboundMirrorTarget {
+                    repo_id: row
+                        .try_get("id")
+                        .context("reading inbound mirror repository id")?,
+                    owner_did: row
+                        .try_get("owner_did")
+                        .context("reading inbound mirror owner DID")?,
+                    name: row
+                        .try_get("name")
+                        .context("reading inbound mirror repository name")?,
+                    upstream_url: row
+                        .try_get("upstream_url")
+                        .context("reading inbound mirror upstream URL")?,
+                })
+            })
+            .collect()
     }
 
     /// Register a mirrored repo from a peer in the local DB so git smart HTTP can serve it.
@@ -3636,6 +3692,65 @@ mod mirror_state_tests {
         assert_eq!(stored.upstream_url, first.upstream_url);
         assert_eq!(stored.status, MirrorStatus::Inbound);
         assert_eq!(stored.updated_at, original_updated_at);
+    }
+
+    #[sqlx::test]
+    async fn inbound_worker_pages_all_and_only_stable_inbound_mirrors(pool: PgPool) {
+        let db = migrated_db(pool).await;
+        let ids = [
+            Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap(),
+            Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap(),
+        ];
+        for (index, id) in ids.into_iter().enumerate() {
+            let mut existing = repo(id);
+            existing.name = format!("mirror-{index}");
+            db.create_repo(&existing).await.unwrap();
+            db.configure_inbound_mirror(
+                &existing.id,
+                &format!("https://github.example/org/mirror-{index}.git"),
+            )
+            .await
+            .unwrap();
+        }
+
+        // The middle row simulates a transition selected by the next B1 slice.
+        // It must not be scheduled while authority is changing.
+        sqlx::query(
+            "UPDATE repos
+             SET mirror_status = 'transitioning_inbound_to_outbound',
+                 mirror_transition_id = $2,
+                 mirror_transition_phase = 'queued'
+             WHERE id = $1",
+        )
+        .bind(ids[1].to_string())
+        .bind(Uuid::new_v4())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let first = db.list_inbound_mirror_targets(None, 1).await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].repo_id, ids[0].to_string());
+        assert_eq!(first[0].name, "mirror-0");
+        assert_eq!(first[0].owner_did, "did:key:z6MkMirrorOwner");
+        assert_eq!(
+            first[0].upstream_url,
+            "https://github.example/org/mirror-0.git"
+        );
+
+        let second = db
+            .list_inbound_mirror_targets(Some(&first[0].repo_id), 1)
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].repo_id, ids[2].to_string());
+
+        let exhausted = db
+            .list_inbound_mirror_targets(Some(&second[0].repo_id), 1)
+            .await
+            .unwrap();
+        assert!(exhausted.is_empty());
     }
 
     #[sqlx::test]

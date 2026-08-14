@@ -104,6 +104,63 @@ fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
     None
 }
 
+/// Whether an IP literal is outside the local/private ranges that an
+/// attacker-controlled outbound URL must never reach. Kept separate from URL
+/// parsing so callers that resolve a DNS name themselves can apply the same
+/// classification to every answer and then pin the approved addresses.
+pub(crate) fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    // Reject loopback/unspecified on the literal as given — catches `::1` and
+    // `::` before the IPv4-folding below (`::1`.to_ipv4() would otherwise map
+    // to a non-loopback `0.0.0.1`).
+    if ip.is_loopback() || ip.is_unspecified() {
+        return false;
+    }
+    // Fold any IPv6 literal that embeds an IPv4 address (mapped, compatible,
+    // 6to4, NAT64) down to that IPv4 so the v4 range checks catch
+    // loopback/private addresses smuggled in via an IPv6 encoding, then
+    // re-check loopback/unspecified.
+    let ip = match ip {
+        std::net::IpAddr::V6(v6) => embedded_ipv4(v6).map(std::net::IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    };
+    if ip.is_loopback() || ip.is_unspecified() {
+        return false;
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            // RFC1918 private, link-local, CGNAT (100.64.0.0/10), or the
+            // RFC1122 "this host" block 0.0.0.0/8 (never a valid destination;
+            // 0.0.0.0 itself is already caught by the is_unspecified check).
+            if v4.is_private()
+                || v4.is_link_local()
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                || o[0] == 0
+            {
+                return false;
+            }
+        }
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            // fc00::/7 (unique-local) or fe80::/10 (link-local)
+            if (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80 {
+                return false;
+            }
+            // Any NAT64 address (64:ff9b::/32) that is not the cleanly
+            // decodable well-known /96 — e.g. the RFC 8215 local-use
+            // 64:ff9b:1::/48 — carries a translated target whose embedded v4
+            // sits at a prefix-length-dependent offset (RFC 6052 §2.2).
+            // Rather than risk a wrong decode across every prefix length we
+            // reject the whole NAT64 space here. The well-known /96 was already
+            // folded to its v4 above and never reaches this arm.
+            if s[0] == 0x0064 && s[1] == 0xff9b {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Whether a peer `http_url` is a public http(s) endpoint safe to register.
 /// Rejects non-http(s) schemes, loopback/unspecified/private/link-local IPs,
 /// and `localhost` / `.localhost` / `.local` / `.internal` hostnames. Used at
@@ -137,55 +194,7 @@ pub fn is_public_http_url(raw: &str) -> bool {
     // before parsing as an IP.
     let ip_candidate = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = ip_candidate.parse::<std::net::IpAddr>() {
-        // Reject loopback/unspecified on the literal as given — catches `::1`
-        // and `::` before the IPv4-folding below (`::1`.to_ipv4() would
-        // otherwise map to a non-loopback `0.0.0.1`).
-        if ip.is_loopback() || ip.is_unspecified() {
-            return false;
-        }
-        // Fold any IPv6 literal that embeds an IPv4 address (mapped, compatible,
-        // 6to4, NAT64) down to that IPv4 so the v4 range checks catch
-        // loopback/private addresses smuggled in via an IPv6 encoding, then
-        // re-check loopback/unspecified.
-        let ip = match ip {
-            std::net::IpAddr::V6(v6) => embedded_ipv4(v6).map(std::net::IpAddr::V4).unwrap_or(ip),
-            v4 => v4,
-        };
-        if ip.is_loopback() || ip.is_unspecified() {
-            return false;
-        }
-        match ip {
-            std::net::IpAddr::V4(v4) => {
-                let o = v4.octets();
-                // RFC1918 private, link-local, CGNAT (100.64.0.0/10), or the
-                // RFC1122 "this host" block 0.0.0.0/8 (never a valid destination;
-                // 0.0.0.0 itself is already caught by the is_unspecified check).
-                if v4.is_private()
-                    || v4.is_link_local()
-                    || (o[0] == 100 && (o[1] & 0xc0) == 64)
-                    || o[0] == 0
-                {
-                    return false;
-                }
-            }
-            std::net::IpAddr::V6(v6) => {
-                let s = v6.segments();
-                // fc00::/7 (unique-local) or fe80::/10 (link-local)
-                if (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80 {
-                    return false;
-                }
-                // Any NAT64 address (64:ff9b::/32) that is not the cleanly
-                // decodable well-known /96 — e.g. the RFC 8215 local-use
-                // 64:ff9b:1::/48 — carries a translated target whose embedded v4
-                // sits at a prefix-length-dependent offset (RFC 6052 §2.2).
-                // Rather than risk a wrong decode across every prefix length we
-                // reject the whole NAT64 space here. The well-known /96 was
-                // already folded to its v4 above and never reaches this arm.
-                if s[0] == 0x0064 && s[1] == 0xff9b {
-                    return false;
-                }
-            }
-        }
+        return is_public_ip(ip);
     }
     true
 }
