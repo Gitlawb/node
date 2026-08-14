@@ -780,6 +780,12 @@ mod tests {
     /// every time and only the chain bound ends the loop. Deleting the bound left the
     /// whole suite green, because nothing here had ever built a cycle.
     ///
+    /// It has a second job now. A redirect back to the identical path and query is the
+    /// only same-origin hop the predicate still follows, so the eleven hits below are
+    /// also this crate's executed proof that such a hop IS followed. The old positive
+    /// fixture drove a trailing-slash rewrite, which the request-target rule refuses,
+    /// and an http-to-https upgrade cannot be mocked over mockito's plain http.
+    ///
     /// The route answers 301 pointing back at itself. Bounded, the handler is hit
     /// once for the original request plus `MAX_REDIRECTS` follows and the call returns
     /// the 301 (a refused redirect stops rather than errors). Unbounded, it runs until
@@ -828,11 +834,20 @@ mod tests {
         loop_route.assert_async().await;
     }
 
-    /// The other direction: a same-origin redirect is still followed, so a node
-    /// fronted by a proxy that normalizes a path keeps working. Without this the
-    /// policy could be tightened to `Policy::none()` and nothing would notice.
+    /// A same-origin hop that REWRITES the request-target is refused, even though the
+    /// origin never changes.
+    ///
+    /// The signature binds `@path` as the literal path-and-query the client signed, and
+    /// the node rebuilds it from the URI it received. A `/api/v1/thing` to
+    /// `/api/v1/thing/` bounce therefore presents a signature over a target the node
+    /// never saw, and every signed read behind such a proxy 401s. Refusing the hop
+    /// hands the caller the 3xx that names what happened instead.
+    ///
+    /// The target mock expects zero hits and is asserted: mockito only checks
+    /// `.expect(N)` when `.assert()` runs, so an unbound or unasserted mock passes
+    /// vacuously.
     #[tokio::test]
-    async fn same_origin_redirect_is_followed() {
+    async fn same_origin_path_changing_redirect_is_refused() {
         let mut node = Server::new_async().await;
         let bounce = node
             .mock("GET", "/api/v1/thing")
@@ -844,18 +859,243 @@ mod tests {
         let target = node
             .mock("GET", "/api/v1/thing/")
             .with_status(200)
-            .with_body("normalized")
-            .expect(1)
+            .with_body("bytes from the rewritten target")
+            .expect(0)
             .create_async()
             .await;
 
         let client = NodeClient::new(node.url(), Some(test_keypair()));
         let resp = client.get_signed("/api/v1/thing").await.unwrap();
 
-        assert_eq!(resp.status(), 200);
-        assert_eq!(resp.text().await.unwrap(), "normalized");
+        assert_eq!(
+            resp.status(),
+            301,
+            "a refused redirect stops rather than errors, so the caller sees the 3xx \
+             and reports it through the status path it already has"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(
+            !body.contains("bytes from the rewritten target"),
+            "the rewritten target's bytes must never reach the caller, got: {body}"
+        );
         bounce.assert_async().await;
         target.assert_async().await;
+    }
+
+    // ── the node's own verification, run over what the client actually sent ──
+
+    /// What the verifying mock made of a request that reached it.
+    ///
+    /// The empty slot (`None`) is its own state and means the mock was never hit at
+    /// all, which is what the refusal test asserts. It must stay distinguishable from
+    /// [`Verdict::WrongIdentity`], because "nobody verified anything" and "something
+    /// verified against the wrong key" are opposite findings.
+    ///
+    /// The payloads are read through `Debug` in the assertion messages and nowhere
+    /// else, which the dead-code pass does not count; they carry the detail that makes
+    /// a failure legible, so they stay.
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    enum Verdict {
+        /// The chain accepted the signature AND the key it resolved is the test's DID.
+        Accepted,
+        /// The chain refused it. Carries the error so a failure reads as the actual
+        /// rejection rather than a bare hit count.
+        Rejected(String),
+        /// The chain accepted a signature made by somebody else. A key resolved from
+        /// the parsed `key_id` is read out of the artifact under verification, so an
+        /// accept on it alone proves consistency, never authenticity.
+        WrongIdentity { expected: String, got: String },
+    }
+
+    /// The node's `require_signature` verification, over a request this crate did not
+    /// build: parse the headers, recompute the content-digest from the body, rebuild
+    /// the signing string over `@method`/`@path`/`content-digest`, Ed25519-verify.
+    /// Returns the DID the signature resolved to, so a caller can pin the identity.
+    ///
+    /// A hand-copy of its twin in `crates/git-remote-gitlawb/src/main.rs`, which gl
+    /// cannot import (`git-remote-gitlawb` is a binary crate and this is its test
+    /// module). Keep the two textually identical apart from the mockito seam around
+    /// them, so an edit to one is visibly an edit to both.
+    ///
+    /// It asserts internally, which is deliberate but constrains its callers: inside
+    /// `with_body_from_request` those assertions fire on the server thread and reach
+    /// the client as a transport error, not as a recorded verdict. So the identity
+    /// check lives in the caller as a [`Verdict`] variant, never as an assert in here.
+    fn node_verifies(
+        method: &str,
+        path_and_query: &str,
+        body: &[u8],
+        sig_input: &str,
+        sig_header: &str,
+        content_digest: &str,
+    ) -> anyhow::Result<String> {
+        use gitlawb_core::http_sig::{build_signing_string, compute_content_digest, HttpSignature};
+        use gitlawb_core::identity::verify;
+        use std::collections::HashMap;
+
+        let sig = HttpSignature::parse(sig_input, sig_header)?;
+        sig.check_created()?;
+        assert!(
+            sig.missing_components().is_empty(),
+            "signature must cover all required components"
+        );
+        assert_eq!(sig.alg, "ed25519");
+        assert_eq!(
+            content_digest,
+            compute_content_digest(body),
+            "content-digest must match the body"
+        );
+        let vk = sig.key_id.to_verifying_key()?;
+        let mut values = HashMap::new();
+        values.insert("@method".to_string(), method.to_uppercase());
+        values.insert("@path".to_string(), path_and_query.to_string());
+        values.insert("content-digest".to_string(), content_digest.to_string());
+        let sig_params_value = sig_input.strip_prefix("sig1=").unwrap_or(sig_input);
+        let components: Vec<&str> = sig.components.iter().map(String::as_str).collect();
+        let signing_string = build_signing_string(&components, sig_params_value, &values)?;
+        let sig_array: [u8; 64] = sig.signature_bytes.as_slice().try_into()?;
+        verify(&vk, signing_string.as_bytes(), &sig_array)?;
+        Ok(sig.key_id.to_string())
+    }
+
+    /// Pull a header value off a received mockito request, or explain which one the
+    /// client failed to send.
+    fn received_header(req: &mockito::Request, name: &str) -> String {
+        req.header(name)
+            .first()
+            .unwrap_or_else(|| panic!("the client sent no {name} header"))
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Run [`node_verifies`] over a GET that arrived at the mock and record what the
+    /// node would have made of it, pinned to `expected_did`.
+    fn record_get_verdict(
+        req: &mockito::Request,
+        expected_did: &str,
+        slot: &std::sync::Arc<std::sync::Mutex<Option<Verdict>>>,
+    ) {
+        let verdict = match node_verifies(
+            "GET",
+            req.path_and_query(),
+            b"",
+            &received_header(req, "signature-input"),
+            &received_header(req, "signature"),
+            &received_header(req, "content-digest"),
+        ) {
+            Ok(did) if did == expected_did => Verdict::Accepted,
+            Ok(did) => Verdict::WrongIdentity {
+                expected: expected_did.to_string(),
+                got: did,
+            },
+            Err(e) => Verdict::Rejected(e.to_string()),
+        };
+        *slot.lock().unwrap() = Some(verdict);
+    }
+
+    /// The finding's repro, now a guard: a rewritten same-origin target must never
+    /// receive the signature, and the proof is the node's own verification, not a hit
+    /// count.
+    ///
+    /// The target mock runs the full `require_signature` chain over the request it
+    /// receives. Post-fix the hop is refused, so the slot stays empty. Pre-fix the hop
+    /// is followed and the slot records the Ed25519 rejection of a signature made over
+    /// `/api/v1/thing` and presented at `/api/v1/thing/`, which is the 401 an operator
+    /// behind such a proxy actually sees. The verdict is asserted first, so a failure
+    /// speaks about verification rather than about reachability.
+    ///
+    /// Its paired positive control is
+    /// `a_direct_signed_get_verifies_under_the_node_verifier`: without it, an empty
+    /// slot would be satisfied just as well by a harness that can never record
+    /// anything.
+    #[tokio::test]
+    async fn a_rewritten_target_never_receives_the_signature() {
+        let kp = test_keypair();
+        let expected_did = kp.did().to_string();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<Verdict>));
+
+        let mut node = Server::new_async().await;
+        let bounce = node
+            .mock("GET", "/api/v1/thing")
+            .with_status(301)
+            .with_header("location", "/api/v1/thing/")
+            .expect(1)
+            .create_async()
+            .await;
+        let recorder = slot.clone();
+        let did_for_target = expected_did.clone();
+        let target = node
+            .mock("GET", "/api/v1/thing/")
+            .with_status(200)
+            .with_body_from_request(move |req| {
+                record_get_verdict(req, &did_for_target, &recorder);
+                Vec::new()
+            })
+            .expect(0)
+            .create_async()
+            .await;
+
+        let client = NodeClient::new(node.url(), Some(kp));
+        let resp = client.get_signed("/api/v1/thing").await.unwrap();
+
+        let verdict = slot.lock().unwrap().take();
+        assert!(
+            verdict.is_none(),
+            "the node's own verifier must never see this request: the signature covers \
+             /api/v1/thing and the rewritten target is /api/v1/thing/, so what arrives \
+             there is a stale request-target; recorded verdict: {verdict:?}"
+        );
+        assert_eq!(
+            resp.status(),
+            301,
+            "the caller sees the 3xx, not the rewritten target's answer"
+        );
+        bounce.assert_async().await;
+        target.assert_async().await;
+    }
+
+    /// The positive control for the test above, and the proof that the client signs
+    /// the query it sends.
+    ///
+    /// A direct signed GET, no redirect anywhere, through the same verifying mock. The
+    /// verdict must be `Accepted`, which is what makes the refusal test's empty slot
+    /// attributable to the refusal rather than to a harness that cannot record. The
+    /// path carries a query, so a client that signed the bare path would land here as
+    /// `Rejected`.
+    #[tokio::test]
+    async fn a_direct_signed_get_verifies_under_the_node_verifier() {
+        let kp = test_keypair();
+        let expected_did = kp.did().to_string();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<Verdict>));
+
+        let mut node = Server::new_async().await;
+        let recorder = slot.clone();
+        let did_for_target = expected_did.clone();
+        let route = node
+            .mock("GET", "/api/v1/thing?x=1")
+            .with_status(200)
+            .with_body_from_request(move |req| {
+                record_get_verdict(req, &did_for_target, &recorder);
+                Vec::new()
+            })
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = NodeClient::new(node.url(), Some(kp));
+        let resp = client.get_signed("/api/v1/thing?x=1").await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let verdict = slot.lock().unwrap().take();
+        assert!(
+            matches!(verdict, Some(Verdict::Accepted)),
+            "a direct signed GET must verify under the node's own chain and resolve to \
+             {expected_did}, or the refusal test's empty slot proves nothing; recorded \
+             verdict: {verdict:?}"
+        );
+        route.assert_async().await;
     }
 
     // ── read_body_capped ────────────────────────────────────────────────
