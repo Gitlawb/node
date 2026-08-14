@@ -91,13 +91,32 @@ User-data only runs at first boot, so upgrades go through SSM:
 $(terraform output -raw upgrade_command)
 ```
 
-This runs `docker compose pull && docker compose up -d` on the instance.
+This reinstalls the rendered `/opt/gitlawb/compose.yaml`, then runs
+`docker compose pull && docker compose up -d` on the instance.
+
+**Run `terraform apply` before the upgrade command.** The command is an SSM
+document managed by Terraform, and it embeds the compose file rendered from your
+current variables. An instance that has not had a fresh `apply` still holds the
+previous document and will reinstall the previous compose file.
 
 - With `image_tag = "latest"` (default) that picks up the newest release.
-- With a **pinned tag**, first edit the tag in `/opt/gitlawb/compose.yaml` on
-  the instance (via SSM session), then run the upgrade command — and keep
-  `image_tag` in terraform.tfvars in sync so a future instance replacement
-  boots the same version.
+- With a **pinned tag**, set `image_tag` in `terraform.tfvars` and `apply` — the
+  rendered compose carries it, so the upgrade installs the right version.
+- **`compose.yaml` is Terraform-owned and is overwritten on every upgrade.**
+  Per-instance settings belong in `/opt/gitlawb/.env`, which is never touched.
+
+### Why the upgrade rewrites the compose file
+
+`aws_instance` deliberately ignores `user_data` drift, so an instance keeps the
+compose file it was created with. Compose passes only the variables named in a
+service's `environment:` block into the container, so **a node setting added to
+the template never reaches an existing instance** — writing it to
+`/opt/gitlawb/.env` and restarting leaves the node on its built-in default, with
+no error to indicate it. `pull && up -d` alone cannot fix that, because the file
+on disk is the authoritative one.
+
+Reinstalling the rendering first makes the upgrade a real migration. It is
+idempotent: on an already-current instance it writes identical bytes.
 
 Replace the instance itself (OS/AMI/instance-type changes) with
 `terraform apply -replace=aws_instance.node` — the data volume reattaches and

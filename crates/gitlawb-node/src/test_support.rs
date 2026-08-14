@@ -30,12 +30,37 @@ use crate::state::AppState;
 
 /// Build an [`AppState`] over a real, migrated Postgres pool (from `#[sqlx::test]`).
 /// Runs the schema migrations first, because the per-test database starts empty.
+///
+/// **The config here is parsed from the process environment.** `Config` sources 47
+/// fields from `GITLAWB_*` variables, so a developer or CI environment that sets one
+/// silently changes what this state does. Never assert a behaviour that a config
+/// field controls on top of this state — use [`test_state_with`] and set the field,
+/// so the test states the configuration it is about instead of inheriting it.
 pub(crate) async fn test_state(pool: PgPool) -> AppState {
     let db = Arc::new(crate::db::Db::for_testing(pool.clone()));
     db.run_migrations()
         .await
         .expect("test schema migrations should apply");
     build_state(db, pool)
+}
+
+/// [`test_state`] with an explicit config override, so a test that depends on a
+/// setting pins it rather than inheriting whatever the environment supplies.
+///
+/// The shipped default is proved separately and env-independently by
+/// `config::tests::enforce_owner_push_is_declared_true_independent_of_the_environment`,
+/// which reads the declaration off the parser. Splitting the two keeps a parser
+/// question and an authorization question from sharing one failure mode.
+#[allow(dead_code)]
+pub(crate) async fn test_state_with(
+    pool: PgPool,
+    configure: impl FnOnce(&mut crate::config::Config),
+) -> AppState {
+    let mut state = test_state(pool).await;
+    let mut cfg = (*state.config).clone();
+    configure(&mut cfg);
+    state.config = Arc::new(cfg);
+    state
 }
 
 /// DB-free [`AppState`] for middleware/auth tests that return before any query.
@@ -2172,19 +2197,25 @@ mod tests {
         );
     }
 
-    /// The behaviour this change exists to produce, through the handler, on a
-    /// DEFAULT config.
+    /// The handler wiring: with the gate on, a signed non-owner push is refused.
     ///
-    /// The gate's own unit tests pass `enforce` as a literal, so they are insensitive
-    /// to the default and stay green if it is flipped back. No fixture sets the field.
-    /// This test takes `test_state`'s untouched `Config` and asserts the outcome, so
-    /// reverting `default_value_t` turns it red on behaviour rather than on a parse.
+    /// The gate's own unit tests pass `enforce` as a literal and never exercise the
+    /// handler, so this is what proves the flag is actually consulted on the request
+    /// path. It sets the field EXPLICITLY rather than leaning on the default: on a
+    /// host exporting `GITLAWB_ENFORCE_OWNER_PUSH=false` — which is exactly what the
+    /// rolling-upgrade guidance tells operators to set — an ambient config would
+    /// build a disabled state, let the push through to git, and fail this test for a
+    /// reason that has nothing to do with the code under test.
+    ///
+    /// The shipped default is proved env-independently in `config::tests`, off the
+    /// parser declaration. Authorization behaviour and parser defaults are separate
+    /// questions and get separate tests.
     ///
     /// 403 rather than 401 is the discriminator: the request carries a real RFC 9421
     /// signature and passes `require_signature`, so it is authenticated and refused on
     /// authorization — which is the whole distinction the change rests on.
     #[sqlx::test]
-    async fn default_config_refuses_a_non_owner_push(pool: PgPool) {
+    async fn enforced_owner_push_refuses_a_signed_non_owner(pool: PgPool) {
         use gitlawb_core::http_sig::sign_request;
         use gitlawb_core::identity::Keypair;
 
@@ -2193,8 +2224,7 @@ mod tests {
         let owner_did = owner.did().to_string();
         let short = owner_did.split(':').next_back().unwrap().to_string();
 
-        // Deliberately NOT overridden: the shipped default is the subject.
-        let state = test_state(pool).await;
+        let state = test_state_with(pool, |cfg| cfg.enforce_owner_push = true).await;
         state
             .db
             .create_repo(&seed_repo(&owner_did, "defrepo"))

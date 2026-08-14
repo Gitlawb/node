@@ -437,12 +437,29 @@ resource "aws_ssm_document" "upgrade" {
 
   content = jsonencode({
     schemaVersion = "2.2"
-    description   = "Pull the latest gitlawb node image and restart the compose stack"
+    description   = "Reinstall the rendered compose file, pull the latest image, and restart"
     mainSteps = [{
       action = "aws:runShellScript"
       name   = "upgrade"
       inputs = {
         runCommand = [
+          "set -euo pipefail",
+          # Reinstall the CURRENT rendering before restarting.
+          #
+          # `aws_instance` ignores user_data drift, so an instance created before a
+          # template change keeps the compose file it was born with. Compose passes
+          # only the variables named in its `environment:` block into the container,
+          # so a node setting added to the template never reaches an existing
+          # instance — the operator writes it to /opt/gitlawb/.env, restarts, and the
+          # node silently keeps the built-in default. `docker compose pull && up -d`
+          # cannot fix that: the authoritative file is the one on disk.
+          #
+          # Idempotent: writing the same bytes and restarting is a no-op. This does
+          # overwrite hand-edits to compose.yaml, which is intended — the file is
+          # Terraform-owned; per-instance settings belong in /opt/gitlawb/.env.
+          "install -d -m 0755 /opt/gitlawb",
+          "cat > /opt/gitlawb/compose.yaml.new <<'COMPOSE_EOF'\n${local.compose_yaml}\nCOMPOSE_EOF",
+          "mv /opt/gitlawb/compose.yaml.new /opt/gitlawb/compose.yaml",
           "cd /opt/gitlawb && docker compose pull && docker compose up -d --remove-orphans && docker image prune -f"
         ]
       }
