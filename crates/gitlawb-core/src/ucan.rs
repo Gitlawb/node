@@ -248,8 +248,16 @@ impl Ucan {
     /// 3. Check the proof is not expired
     /// 4. Recursively verify the proof's own chain
     ///
-    /// A UCAN with no proofs (root capability) passes trivially.
-    pub fn verify_chain(&self) -> Result<()> {
+    /// A UCAN with no proofs is its own root, so it returns its own issuer.
+    ///
+    /// **This establishes internal consistency, not trust.** `did:key` is
+    /// self-certifying, so anyone can mint a keypair and produce a chain that
+    /// verifies. A caller making an authorization decision MUST compare the
+    /// returned root against an identity it trusts for some reason outside this
+    /// token — a repo owner, a configured value, a registry lookup. Discarding
+    /// the return value is only correct when the caller is checking that a token
+    /// is well-formed and deliberately does not care who issued it.
+    pub fn verify_chain(&self) -> Result<Did> {
         // First verify our own signature
         self.verify_signature()?;
 
@@ -261,34 +269,44 @@ impl Ucan {
             return Err(Error::Ucan("token is not yet valid".to_string()));
         }
 
-        for proof_token in &self.payload.prf {
-            let proof = Self::decode(proof_token)
-                .map_err(|e| Error::Ucan(format!("failed to decode proof: {e}")))?;
-
-            // The proof's audience must be this UCAN's issuer
-            if proof.payload.aud != self.payload.iss {
-                return Err(Error::Ucan(format!(
-                    "proof chain broken: proof audience {} does not match issuer {}",
-                    proof.payload.aud, self.payload.iss
-                )));
-            }
-
-            // Every delegated capability must be covered by the proof (attenuation).
-            for cap in &self.payload.att {
-                let covered = proof.payload.att.iter().any(|p| cap.is_attenuated_by(p));
-                if !covered {
-                    return Err(Error::Ucan(format!(
-                        "capability attenuation violated: '{}' on '{}' not covered by proof",
-                        cap.can, cap.with
-                    )));
-                }
-            }
-
-            // Verify the proof's signature and chain recursively
-            proof.verify_chain()?;
+        if self.payload.prf.len() > 1 {
+            return Err(Error::Ucan(
+                "multi-proof chains are not supported: more than one proof means \
+                 more than one root, and which root authorized a given capability \
+                 is ambiguous"
+                    .to_string(),
+            ));
         }
 
-        Ok(())
+        let Some(proof_token) = self.payload.prf.first() else {
+            // No proofs: this token is its own root.
+            return Ok(self.payload.iss.clone());
+        };
+
+        let proof = Self::decode(proof_token)
+            .map_err(|e| Error::Ucan(format!("failed to decode proof: {e}")))?;
+
+        // The proof's audience must be this UCAN's issuer
+        if proof.payload.aud != self.payload.iss {
+            return Err(Error::Ucan(format!(
+                "proof chain broken: proof audience {} does not match issuer {}",
+                proof.payload.aud, self.payload.iss
+            )));
+        }
+
+        // Every delegated capability must be covered by the proof (attenuation).
+        for cap in &self.payload.att {
+            let covered = proof.payload.att.iter().any(|p| cap.is_attenuated_by(p));
+            if !covered {
+                return Err(Error::Ucan(format!(
+                    "capability attenuation violated: '{}' on '{}' not covered by proof",
+                    cap.can, cap.with
+                )));
+            }
+        }
+
+        // Recurse; the root of the proof's chain is the root of ours.
+        proof.verify_chain()
     }
 }
 
@@ -663,5 +681,83 @@ mod tests {
         .unwrap();
 
         delegated.verify_chain().unwrap();
+    }
+
+    #[test]
+    fn verify_chain_returns_the_root_issuer_of_a_delegated_chain() {
+        // owner -> agent (delegation), agent -> node (invocation).
+        // The root is the owner: that is the identity the whole chain rests on,
+        // and the only one a caller can meaningfully anchor a trust decision to.
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let caps_vec = vec![Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH)];
+
+        let delegation =
+            Ucan::issue(&owner, agent.did(), caps_vec.clone(), None).expect("issue delegation");
+        let invocation = Ucan::delegate(&agent, node.did(), caps_vec, None, &delegation)
+            .expect("wrap invocation");
+
+        assert_eq!(
+            invocation.verify_chain().expect("chain must verify"),
+            owner.did(),
+            "the root issuer is the owner who started the chain, not the agent presenting it"
+        );
+    }
+
+    #[test]
+    fn verify_chain_returns_self_as_root_for_a_self_issued_token() {
+        // A token with no proofs roots at its own issuer. This is what makes a
+        // self-minted token useless: the caller compares this against the repo
+        // owner and it will only ever match when the presenter IS the owner.
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let ucan =
+            Ucan::issue(&agent, node.did(), vec![Capability::new("*", "*")], None).expect("issue");
+
+        assert_eq!(
+            ucan.verify_chain().expect("a root token still verifies"),
+            agent.did(),
+            "a self-minted token roots at the minter, however permissive its capabilities"
+        );
+    }
+
+    #[test]
+    fn verify_chain_rejects_a_multi_proof_chain() {
+        // Two proofs mean two roots, and nothing says which root authorized a
+        // given capability. Returning either one would be unsound, so refuse.
+        let owner_a = Keypair::generate();
+        let owner_b = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let caps_vec = vec![Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH)];
+
+        let proof_a = Ucan::issue(&owner_a, agent.did(), caps_vec.clone(), None).expect("issue a");
+        let proof_b = Ucan::issue(&owner_b, agent.did(), caps_vec.clone(), None).expect("issue b");
+
+        // `delegate` only ever writes one proof, so build the two-proof payload by hand.
+        let payload = UcanPayload {
+            ucan: "1.0.0".to_string(),
+            iss: agent.did(),
+            aud: node.did(),
+            att: caps_vec,
+            exp: None,
+            nbf: None,
+            prf: vec![
+                proof_a.encode().expect("encode a"),
+                proof_b.encode().expect("encode b"),
+            ],
+        };
+        let signing_bytes = serde_json::to_vec(&payload).expect("serialize payload");
+        let s = agent.sign_b64(&signing_bytes);
+        let multi = Ucan { payload, s };
+
+        let err = multi
+            .verify_chain()
+            .expect_err("a two-proof chain must be refused");
+        assert!(
+            err.to_string().contains("multi-proof"),
+            "the error must name the reason, got: {err}"
+        );
     }
 }
