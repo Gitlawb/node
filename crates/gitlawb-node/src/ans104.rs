@@ -27,11 +27,13 @@
 //!
 //! The signature covers `deepHash(["dataitem", "1", type, owner, target,
 //! anchor, tags, data])` using the bundler deepHash (recursive length-tagged
-//! SHA-384, identical to `@irys/arbundles`), so a bundler, gateway, or the
-//! node itself can re-derive it from the item's own fields and verify against
-//! the owner. Per ANS-104 the `tags` element of the preimage is a nested list
-//! of `[tag.name, tag.value]` byte blobs — not the serialized tag stream — and
-//! `deepHash` recurses into it exactly as a bundler does.
+//! SHA-384, identical to the published `arbundles` package), so a bundler,
+//! gateway, or the node itself can re-derive it from the item's own fields and
+//! verify against the owner. The `tags` element is the FLAT serialized tag
+//! stream (`item.rawTags` in `arbundles`' `getSignatureData`) — NOT a nested
+//! list. The nested `[[name, value], ...]` form is what Arweave layer-one
+//! transactions use; data items deep-hash the serialized tag blob. Zero tags is
+//! an empty blob.
 
 use anyhow::Result;
 #[cfg(test)]
@@ -80,23 +82,14 @@ pub fn build_signed_data_item(
     item.extend_from_slice(data);
 
     let signature_data = deep_hash(&[
-        DeepHashChunk::Blob(b"dataitem"),
-        DeepHashChunk::Blob(b"1"),
-        DeepHashChunk::Blob(SIGNATURE_TYPE_ED25519.to_string().as_bytes()),
-        DeepHashChunk::Blob(&owner),
-        DeepHashChunk::Blob(&[]),
-        DeepHashChunk::Blob(&[]),
-        DeepHashChunk::List(
-            tags.iter()
-                .map(|(n, v)| {
-                    DeepHashChunk::List(vec![
-                        DeepHashChunk::Blob(n.as_bytes()),
-                        DeepHashChunk::Blob(v.as_bytes()),
-                    ])
-                })
-                .collect(),
-        ),
-        DeepHashChunk::Blob(data),
+        b"dataitem",
+        b"1",
+        SIGNATURE_TYPE_ED25519.to_string().as_bytes(),
+        &owner,
+        &[],
+        &[],
+        &serialized_tags,
+        data,
     ]);
     let signature = keypair.sign(&signature_data).to_bytes();
     item[2..2 + SIGNATURE_LEN].copy_from_slice(&signature);
@@ -178,14 +171,14 @@ pub fn verify_data_item(
     }
 
     let signature_data = deep_hash(&[
-        DeepHashChunk::Blob(b"dataitem"),
-        DeepHashChunk::Blob(b"1"),
-        DeepHashChunk::Blob(signature_type.to_string().as_bytes()),
-        DeepHashChunk::Blob(&owner),
-        DeepHashChunk::Blob(raw_target),
-        DeepHashChunk::Blob(raw_anchor),
-        DeepHashChunk::List(tags_preimage(&tags)),
-        DeepHashChunk::Blob(raw_data),
+        b"dataitem",
+        b"1",
+        signature_type.to_string().as_bytes(),
+        &owner,
+        raw_target,
+        raw_anchor,
+        raw_tags,
+        raw_data,
     ]);
     let sig = ed25519_dalek::Signature::from_bytes(&signature);
     verifying_key
@@ -200,25 +193,18 @@ pub fn verify_data_item(
     })
 }
 
-/// One element of a `deepHash` list: a byte blob or a nested list (recursion is
-/// required for the ANS-104 tags preimage element).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeepHashChunk<'a> {
-    Blob(&'a [u8]),
-    List(Vec<DeepHashChunk<'a>>),
-}
-
-/// The bundler's recursive `deepHash` over the data item's signature fields,
-/// byte-for-byte identical to `@irys/arbundles` `deepHash` (decimal-ASCII
-/// length tags, chained SHA-384 for lists, seeded by SHA-384("list<N>"); blobs
-/// hashed as SHA-384(SHA-384("blob<len>") || SHA-384(data))).
-pub fn deep_hash(elems: &[DeepHashChunk]) -> [u8; 48] {
+/// The bundler's `deepHash` over the data item's signature fields,
+/// byte-for-byte identical to the published `arbundles` `deepHash` for the
+/// all-blob preimage a data item uses: seeded by SHA-384("list<N>") over the
+/// element count, then each element chained as SHA-384(acc || blob-chunk)
+/// where a blob-chunk is SHA-384(SHA-384("blob<len>") || SHA-384(data)). The
+/// bundler also recurses for nested list elements, but a data item's signature
+/// fields are all blobs (tags included — see the module docs), so no nesting
+/// is needed here.
+pub fn deep_hash(elems: &[&[u8]]) -> [u8; 48] {
     let mut acc = sha384(format!("list{}", elems.len()).as_bytes());
     for elem in elems {
-        let chunk = match elem {
-            DeepHashChunk::Blob(data) => deep_hash_blob(data),
-            DeepHashChunk::List(children) => deep_hash(children),
-        };
+        let chunk = deep_hash_blob(elem);
         let mut pair = [0u8; 96];
         pair[..48].copy_from_slice(&acc);
         pair[48..].copy_from_slice(&chunk);
@@ -234,28 +220,15 @@ fn deep_hash_blob(data: &[u8]) -> [u8; 48] {
     sha384(&tagged)
 }
 
-/// ANS-104 tags preimage element: a nested list of `[name, value]` blobs.
-/// Zero tags is an empty list, which `deepHash`s to SHA-384("list0") — a
-/// different value than an empty blob, and the one a bundler recomputes.
-#[cfg(test)]
-fn tags_preimage(tags: &[(String, String)]) -> Vec<DeepHashChunk<'_>> {
-    tags.iter()
-        .map(|(name, value)| {
-            DeepHashChunk::List(vec![
-                DeepHashChunk::Blob(name.as_bytes()),
-                DeepHashChunk::Blob(value.as_bytes()),
-            ])
-        })
-        .collect()
-}
-
 fn sha384(data: &[u8]) -> [u8; 48] {
     let mut h = Sha384::new();
     h.update(data);
     h.finalize().into()
 }
 
-/// Avro-style tag encoding matching `@irys/arbundles` `serializeTags`.
+/// Avro-style tag encoding matching the published `arbundles` `serializeTags`.
+/// The serialized stream is the `tags` preimage element (`item.rawTags`), so a
+/// bundler recomputes the signature from the exact bytes the item carries.
 ///
 /// For `n > 0` tags: zigzag-varint(n), then for each tag the zigzag-varint
 /// length + UTF-8 bytes of name and value, then a terminating zigzag-varint(0).
@@ -368,42 +341,36 @@ mod tests {
     use super::*;
     use gitlawb_core::identity::Keypair;
 
-    /// Independent reference vector, generated with `@irys/arbundles`
-    /// `deepHash` (not the code under test) over the ANS-104 spec preimage.
-    /// Pins the deepHash wire format — decimal-ASCII length tags, recursive
-    /// list handling, chained SHA-384 — so an accidental divergence in the
-    /// length-tagging (e.g. reintroducing the old pairwise chaining) or in the
-    /// tags element turns this test red and every previously-signed anchor
-    /// would no longer verify.
+    /// Independent reference vector, generated with the published `arbundles`
+    /// package's `deepHash` (not the code under test) over the ANS-104 spec
+    /// preimage. Pins the deepHash wire format — decimal-ASCII length tags,
+    /// recursive list handling, chained SHA-384 — so an accidental divergence
+    /// in the length-tagging (e.g. reintroducing the old pairwise chaining) or
+    /// in the tags element turns this test red and every previously-signed
+    /// anchor would no longer verify.
     #[test]
     fn deep_hash_matches_independent_reference_vector() {
         let owner = [0x41u8; 32];
         // Elements: "dataitem", "1", "2", owner, target, anchor, tags, data.
-        // 0 tags -> tags element is an EMPTY LIST (deepHash([]) = SHA384("list0")),
-        // which differs from an empty blob and matches what a bundler recomputes.
-        let hash = deep_hash(&[
-            DeepHashChunk::Blob(b"dataitem"),
-            DeepHashChunk::Blob(b"1"),
-            DeepHashChunk::Blob(b"2"),
-            DeepHashChunk::Blob(&owner),
-            DeepHashChunk::Blob(&[]),
-            DeepHashChunk::Blob(&[]),
-            DeepHashChunk::List(vec![]),
-            DeepHashChunk::Blob(b"hi"),
-        ]);
-        let expected = "a6d558f6f16e49b5224dc59740ca570f68d6d7c0f0f4045aa29f6305d47b3f5820aaff1792e93fa184f1ac238438fad8";
+        // 0 tags -> tags element is an EMPTY BLOB (deepHash([]) = SHA384("list0")
+        // would be a different value): data items hash the flat serialized tag
+        // stream, and an empty tag stream is zero bytes.
+        let hash = deep_hash(&[b"dataitem", b"1", b"2", &owner, &[], &[], &[], b"hi"]);
+        let expected = "98a0a3b931f9c5cc370e822ca06b6e9635f690f81979b70b6dfe92d0af3f601169b0d8dc72d518241e3caba7f9daad1d";
         assert_eq!(hex::encode(hash), expected);
     }
 
-    /// Full-serialization interoperability fixture produced by an independent
-    /// implementation: `@irys/arbundles` `deepHash` over the spec preimage plus
-    /// Node's Ed25519 (`crypto.sign(null, ...)`), with NONEMPTY tags. Proves the
-    /// nested-list tags preimage and the binary layout interop with the real
-    /// bundler toolchain — a round trip through this module alone is not enough.
+    /// Full-serialization interoperability fixture produced by the published
+    /// `arbundles` package: `createData` + `sign` (its own `getSignatureData`
+    /// deepHash over the flat `item.rawTags`, plus its Ed25519 signer) with
+    /// NONEMPTY tags. Proves the flat-tags preimage and the binary layout
+    /// interop with the real bundler toolchain — a round trip through this
+    /// module alone is not enough, and the node's own signer must produce
+    /// items a bundler (and this verifier) accepts.
     #[test]
     fn verify_data_item_matches_independent_interop_fixture() {
-        let owner_hex = "192d13b846ce90f8b77461c47621cd3f5df04486dbe2d0e2cd5708e9b4c75d51";
-        let item_hex = "0200002a34414b302c282969c75103927f5efe0b1f793605c47ba1e1057bf0ea70d580c2846305f96ef27d943a1d56e977d85e9e70fd20e65533dfa9a71a7c5e5705192d13b846ce90f8b77461c47621cd3f5df04486dbe2d0e2cd5708e9b4c75d5100000300000000000000420000000000000006104170702d4e616d650e6769746c617762085265706f18616c6963652f6d797265706f0c536368656d612a6769746c6177622f7265662d7570646174652f7631007b22736368656d61223a226769746c6177622f7265662d7570646174652f7631222c227265706f223a22616c6963652f6d797265706f227d";
+        let owner_hex = "d520b4cc5001a7ce12d1aaad57d6fd8e4b1c7b9926f699e6f778fb69f7e6f98b";
+        let item_hex = "0200611e031059cf0395a990a1cd59e7c73f877cd36a065795630f9d1858a111d34e9db705dd01b6e2dbf0f5bbe9d6f8d5111d420512f60b80b7dfa7448a83c22e0bd520b4cc5001a7ce12d1aaad57d6fd8e4b1c7b9926f699e6f778fb69f7e6f98b00000300000000000000420000000000000006104170702d4e616d650e6769746c617762085265706f18616c6963652f6d797265706f0c536368656d612a6769746c6177622f7265662d7570646174652f7631007b22736368656d61223a226769746c6177622f7265662d7570646174652f7631222c227265706f223a22616c6963652f6d797265706f227d";
         let owner: [u8; 32] = hex::decode(owner_hex).unwrap().try_into().unwrap();
         let item = hex::decode(item_hex).unwrap();
         let key = ed25519_dalek::VerifyingKey::from_bytes(&owner).unwrap();

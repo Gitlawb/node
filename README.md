@@ -415,6 +415,8 @@ Important node settings:
 | `GITLAWB_TIGRIS_BUCKET` | Optional S3/Tigris shared repo storage bucket. |
 | `GITLAWB_PINATA_JWT` | Optional Pinata/IPFS warm-storage pinning. |
 | `GITLAWB_BUNDLER_URL` | Bundler URL for Arweave permanent anchoring (e.g., https://devnet.irys.xyz). Leave empty to disable. (Legacy name: `GITLAWB_IRYS_URL`). |
+| `GITLAWB_BUNDLER_ACCOUNT` | Irys bundler account (public address) for Arweave permanent anchoring. Must be set together with `GITLAWB_BUNDLER_TOKEN` for anchoring to enable. |
+| `GITLAWB_BUNDLER_TOKEN` | Irys bundler token (API key) for Arweave permanent anchoring. Sent as the `x-irys-paid-by` header with the account. Must be set together with `GITLAWB_BUNDLER_ACCOUNT` for anchoring to enable. |
 | `GITLAWB_ARWEAVE_GATEWAY` | Arweave gateway URL for resolving anchors (defaults to `https://arweave.net`). |
 | `GITLAWB_ARWEAVE_RATE_LIMIT` | Per-client-IP rate limit for the verify endpoint, requests per hour (defaults to 120; `0` disables). |
 

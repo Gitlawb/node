@@ -2418,27 +2418,62 @@ pub async fn git_receive_pack(
     if push_succeeded {
         // Everything a landed push owes after git accepted the pack — record_push,
         // trust score, per-ref signed certificates, and the replication tail — runs
-        // in this owned continuation. It used to live here in the cancellable
-        // handler between `receive_pack` returning Ok and the tail spawn, so a
-        // client/proxy disconnect during those DB awaits dropped a durable push
-        // with no certificates and no tail. Spawned above `guard.release()` for
-        // the same reason the tail was: `release` is itself cancellable, and the
-        // pack has already landed on disk by now. The continuation takes neither
-        // the write lease nor the advisory lock, so it waits on nothing this
-        // handler still holds.
-        tokio::spawn(post_receive_continuation(
-            state.clone(),
-            record.clone(),
-            ref_updates.clone(),
-            disk_path.clone(),
-            did.to_string(),
-            PusherAttestation {
+        // inside a DURABLE POST-RECEIVE JOB, not a bare spawned task. The job is
+        // persisted BEFORE the response is returned: Tokio cancels spawned tasks on
+        // restart/shutdown, so a continuation spawned only in memory left the window
+        // open where a crash between the pack landing and the bookkeeping reaching
+        // record_push/cert dropped a durable push with no cert, accounting, anchor,
+        // or replication and no recovery record. Once the job row is durable the
+        // effects can be replayed idempotently after a crash (see
+        // `process_post_receive_job` and the startup drain in main).
+        //
+        // The enqueue itself is NOT skippable: if it fails, the pack is on disk but
+        // its post-receive work has no recovery record, so acknowledging the push
+        // would be a lie. Refuse the 200 (the client/operator can investigate) and
+        // release the lock exactly like the error path below does. The ordinary
+        // failure here is a DB write failing while other paths still work — rare,
+        // and returning 500 is the honest outcome; retrying the push will not
+        // re-derive the ref updates (git sees them as already applied), so the
+        // operator must treat a 500 as "the push landed but was not recorded".
+        let job = crate::db::PostReceiveJob {
+            id: Uuid::new_v4().to_string(),
+            pusher_did: did.to_string(),
+            owner_did: record.owner_did.clone(),
+            repo_name: record.name.clone(),
+            repo_id: record.id.clone(),
+            ref_updates: ref_updates
+                .iter()
+                .map(|u| crate::db::JobRefUpdate {
+                    old_sha: u.old_sha.clone(),
+                    new_sha: u.new_sha.clone(),
+                    ref_name: u.ref_name.clone(),
+                })
+                .collect(),
+            attestation: crate::db::PostReceiveAttestation {
                 sig: Some(pusher_sig.0.clone()),
                 signature_input: Some(pusher_proof.signature_input.clone()),
                 content_digest: Some(pusher_proof.content_digest.clone()),
                 request_path: Some(pusher_proof.request_path.clone()),
             },
-        ));
+            status: "pending".to_string(),
+            enqueued_at: chrono::Utc::now().to_rfc3339(),
+            attempts: 0,
+            error: None,
+        };
+        if let Err(e) = state.db.enqueue_post_receive_job(&job).await {
+            tracing::error!(
+                repo = %name,
+                err = %e,
+                "failed to persist post-receive job — the pack landed but its \
+                 bookkeeping has no recovery record; refusing the push success"
+            );
+            guard.release(push_succeeded).await;
+            drop(lease);
+            return Err(AppError::Internal(anyhow::anyhow!(
+                "push landed but the node could not record its post-receive work"
+            )));
+        }
+        tokio::spawn(process_post_receive_job(state.clone(), job));
     }
 
     // Always release the advisory lock — even on error — to prevent stale locks
@@ -2513,43 +2548,113 @@ pub async fn git_receive_pack(
     Ok(result)
 }
 
-/// The pusher's RFC 9421 attestation, owned and detached with the continuation.
-/// Flattened from the handler's `PusherSignature` / `PusherProof` extractors so
-/// the continuation can issue per-ref certificates after the client is gone.
-struct PusherAttestation {
-    sig: Option<String>,
-    signature_input: Option<String>,
-    content_digest: Option<String>,
-    request_path: Option<String>,
+/// Deterministic certificate id for a (job, ref) pair (#224): the same job
+/// replayed after a restart must mint the SAME id so `insert_ref_certificate_tx`
+///'s `ON CONFLICT (id) DO NOTHING` turns the replay into a no-op instead of a
+/// second certificate for the same transition. Any collision-resistant hash of
+/// the job id + ref is sufficient; sha256 hex is used (the column is TEXT, not
+/// a UUID type).
+fn deterministic_cert_id(job_id: &str, ref_name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"post-receive/");
+    h.update(job_id.as_bytes());
+    h.update(b"/");
+    h.update(ref_name.as_bytes());
+    hex::encode(h.finalize())
 }
 
-/// The owned post-receive continuation (#224 review): everything a landed push
-/// owes after git accepted the pack — the trust-score `record_push`, the
-/// per-ref signed certificates, and the replication tail itself — runs in one
-/// detached task. The handler spawns this immediately after `receive_pack`
-/// returns Ok and before `guard.release()`, so a client/proxy disconnect after
-/// the pack has landed can no longer cancel the bookkeeping or drop the tail
-/// (previously they lived in the cancellable handler between receive and the
-/// tail spawn). The continuation owns everything it reads and takes neither the
-/// write lease nor the advisory lock.
+/// Process a durable post-receive job (#224). Everything a landed push owes
+/// after git accepted the pack — the trust-score `record_push`, the per-ref
+/// signed certificates, and the replication tail — runs here, driven from the
+/// `post_receive_jobs` row rather than from the request handler. The handler
+/// enqueued the job BEFORE acking the push, so a crash or restart between the
+/// pack landing and these effects is recovered by the startup drain in main,
+/// which resets stale rows to `pending` and re-runs this function. Every effect
+/// is idempotent, so a replay is safe:
 ///
-/// Certificate issuance runs at the START of the continuation, so the tail
-/// always has the per-ref signed certificates in hand: the gossip event carries
-/// the real `cert_id`, and the Arweave anchor embeds the certificate itself.
-/// Issuance fails open (errors are logged and skipped), so a cert outage
-/// degrades to a cert-less announce rather than a dropped push.
-async fn post_receive_continuation(
-    state: AppState,
-    record: RepoRecord,
-    ref_updates: Vec<RefUpdate>,
-    disk_path: std::path::PathBuf,
-    did: String,
-    attestation: PusherAttestation,
-) {
-    // Collect certs keyed by ref_name so the anchoring loop below uses
-    // the correct per-update certificate rather than a repo-wide latest.
-    let mut ref_certs: std::collections::HashMap<String, crate::db::RefCertificate> =
-        std::collections::HashMap::new();
+/// - `record_push_job` keys the `push_events` row on the job id with
+///   `ON CONFLICT (id) DO NOTHING`, so a replay never double-counts the push.
+/// - certificate ids are deterministic per (job, ref) (above), and
+///   `insert_ref_certificate_tx` skips ids that already exist.
+/// - the Arweave anchor upload is skipped when this exact transition already
+///   has a recorded anchor (`arweave_anchor_exists`), so a replay does not mint
+///   a second permanent on-chain artifact for the same transition.
+/// - the replication tail re-announces, which is the same per-push per-ref
+///   work the original run did — a replay is no worse than the original.
+///
+/// The job's DB status marks progress (`processing` → `done`/`failed`); a
+/// restart is the retry policy, matching the durable-queue pattern used
+/// elsewhere. This task is spawned by the handler on success and by the startup
+/// drain for every row a previous process left pending.
+pub(crate) async fn process_post_receive_job(state: AppState, job: crate::db::PostReceiveJob) {
+    if let Err(e) = state
+        .db
+        .update_post_receive_job(&job.id, "processing", None)
+        .await
+    {
+        tracing::error!(job_id = %job.id, err = %e, "failed to mark post-receive job processing");
+    }
+
+    match run_post_receive_job(&state, &job).await {
+        Ok(()) => {
+            if let Err(e) = state
+                .db
+                .update_post_receive_job(&job.id, "done", None)
+                .await
+            {
+                tracing::error!(job_id = %job.id, err = %e, "failed to mark post-receive job done");
+            }
+        }
+        Err(e) => {
+            tracing::error!(job_id = %job.id, err = %e, "post-receive job failed");
+            if let Err(mark_err) = state
+                .db
+                .update_post_receive_job(&job.id, "failed", Some(&e.to_string()))
+                .await
+            {
+                tracing::error!(
+                    job_id = %job.id,
+                    err = %mark_err,
+                    "failed to mark post-receive job failed"
+                );
+            }
+        }
+    }
+}
+
+/// The durable job's body, factored out of `process_post_receive_job` so the
+/// status transitions above stay visible next to the work they bookend.
+async fn run_post_receive_job(
+    state: &AppState,
+    job: &crate::db::PostReceiveJob,
+) -> anyhow::Result<()> {
+    // The RepoRecord is re-read from the DB rather than captured: the durable
+    // job may run after a restart, when the handler's in-memory record is gone.
+    let record = state
+        .db
+        .get_repo_by_id(&job.repo_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("repo {} vanished for post-receive job", job.repo_id))?;
+    // The local copy the original push wrote is exactly what a replay should
+    // read. `local_path` never touches Tigris or the network (unlike
+    // `acquire_fresh`, which would re-download), and the job's repo was written
+    // locally by that push moments earlier.
+    let (_, disk_path) = state
+        .repo_store
+        .local_path(&job.owner_did, &job.repo_name)?;
+
+    let ref_updates: Vec<RefUpdate> = job
+        .ref_updates
+        .iter()
+        .map(|u| RefUpdate {
+            old_sha: u.old_sha.clone(),
+            new_sha: u.new_sha.clone(),
+            ref_name: u.ref_name.clone(),
+        })
+        .collect();
+
+    let did = &job.pusher_did;
 
     // Use the first new commit hash we parsed, fall back to timestamp
     let commit_hash = ref_updates
@@ -2557,32 +2662,39 @@ async fn post_receive_continuation(
         .map(|u| u.new_sha.clone())
         .unwrap_or_else(|| Utc::now().timestamp().to_string());
 
-    let _ = state
+    // Idempotent accounting: the push_events row is keyed on the job id, so a
+    // startup replay of this job is a no-op rather than a double-counted push
+    // that would inflate the pusher's trust score.
+    state
         .db
-        .record_push(&did, &record.id, &commit_hash, 0)
-        .await;
-    if let Ok(push_count) = state.db.get_push_count(&did).await {
+        .record_push_job(&job.id, did, &record.id, &commit_hash, 0)
+        .await?;
+    if let Ok(push_count) = state.db.get_push_count(did).await {
         // 0.05 base (from registration) + 0.05 per push, capped at 1.0
         // 1 push → 0.10, 5 pushes → 0.30, 19 pushes → 1.0
         let new_score = (push_count as f64 * 0.05 + 0.05).min(1.0);
-        let _ = state.db.update_trust_score(&did, new_score).await;
+        let _ = state.db.update_trust_score(did, new_score).await;
     }
 
     // Issue a signed certificate for every ref this push advanced, each
     // carrying that ref's real old→new transition. A multi-ref push must
     // not collapse to a single cert covering only the first ref.
+    let mut ref_certs: std::collections::HashMap<String, crate::db::RefCertificate> =
+        std::collections::HashMap::new();
     for update in &ref_updates {
+        let cert_id = deterministic_cert_id(&job.id, &update.ref_name);
         match cert::issue_ref_certificate(
-            &state,
+            state,
             &record.id,
             &update.ref_name,
             &update.old_sha,
             &update.new_sha,
-            &did,
-            attestation.sig.clone(),
-            attestation.signature_input.clone(),
-            attestation.content_digest.clone(),
-            attestation.request_path.clone(),
+            did,
+            &cert_id,
+            job.attestation.sig.clone(),
+            job.attestation.signature_input.clone(),
+            job.attestation.content_digest.clone(),
+            job.attestation.request_path.clone(),
         )
         .await
         {
@@ -2596,7 +2708,47 @@ async fn post_receive_continuation(
         }
     }
 
-    post_receive_replication_tail(state, record, ref_updates, disk_path, did, ref_certs).await;
+    post_receive_replication_tail(
+        state.clone(),
+        record,
+        ref_updates,
+        disk_path,
+        did.to_string(),
+        ref_certs,
+    )
+    .await;
+    Ok(())
+}
+
+/// Startup recovery (#224): replay post-receive jobs a previous process left
+/// mid-flight. Called once from main right after the AppState is built, before
+/// the HTTP listener serves traffic.
+///
+/// Rows a previous process left `processing` or `failed` are reset to
+/// `pending` — a fresh process has no in-flight jobs, so resetting is safe —
+/// and every pending row is spawned through the same processor the handler
+/// uses. Each effect is idempotent (`record_push_job` keys on the job id,
+/// certificate ids are deterministic per (job, ref), the Arweave anchor is
+/// gated on an existence check), so a replay completes exactly the work the
+/// original run owed without double-counting or double-issuing. A drain that
+/// errors out is logged; the unprocessed rows stay `pending` and are retried on
+/// the next restart (the job table IS the retry policy).
+pub(crate) async fn drain_post_receive_jobs(state: AppState) -> anyhow::Result<usize> {
+    state.db.reset_stale_post_receive_jobs().await?;
+    let pending = state.db.list_pending_post_receive_jobs().await?;
+    let count = pending.len();
+    for job in pending {
+        tracing::info!(
+            job_id = %job.id,
+            repo_id = %job.repo_id,
+            "replaying post-receive job left by the previous process"
+        );
+        tokio::spawn(process_post_receive_job(state.clone(), job));
+    }
+    if count > 0 {
+        tracing::info!(jobs = count, "startup post-receive job drain scheduled");
+    }
+    Ok(count)
 }
 
 /// The detached post-receive replication tail (#174 F2): everything a landed push
@@ -2995,6 +3147,30 @@ async fn post_receive_replication_tail(
                         continue;
                     }
                     let cert_id = cert.as_ref().map(|c| c.id.clone());
+                    // #224: a startup replay of this push's job would otherwise
+                    // re-run this loop and upload a SECOND permanent artifact
+                    // for the same transition. The anchor existence check makes
+                    // the upload idempotent: the exact (repo, ref, old→new)
+                    // transition already anchored skips the upload entirely
+                    // (the recorded anchor, cert, and tx_id from the original
+                    // run stand). Narrow TOCTOU window between check and upload
+                    // is accepted: the node's own anchor is single-flight per
+                    // transition in practice, and the duplicate would at worst
+                    // be an extra on-chain artifact, not data corruption.
+                    if db_clone
+                        .arweave_anchor_exists(&repo_slug, ref_name, old_sha, new_sha)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        tracing::debug!(
+                            repo = %repo_slug,
+                            ref_name,
+                            old_sha,
+                            new_sha,
+                            "skipping arweave anchor — transition already anchored"
+                        );
+                        continue;
+                    }
                     let anchor = crate::arweave::RefAnchor {
                         repo: repo_slug.clone(),
                         repo_id: record.id.clone(),
@@ -10685,33 +10861,39 @@ mod tests {
         );
     }
 
-    // ---- #224 review, P1: the continuation survives a disconnect after the pack lands ----
+    // ---- #224 review, P1: the durable post-receive job survives a crash ----
 
-    /// The owned post-receive continuation survives a client/proxy disconnect
-    /// after git accepted the pack.
+    /// A post-receive job enqueued by the handler survives the handler being
+    /// aborted (a client/proxy disconnect — or, harder, a process crash) between
+    /// the pack landing and the job's bookkeeping running.
     ///
     /// Before the fix, `record_push`, the trust-score update, and the per-ref
     /// certificate issuance ran in the CANCELLABLE handler between `receive_pack`
     /// returning Ok and the tail spawn; a disconnect during those DB awaits
-    /// dropped a durable push with no certificates and no tail. The fix spawns
-    /// `post_receive_continuation` (which owns that bookkeeping and then runs the
-    /// replication tail) before the handler does anything else cancellable.
+    /// dropped a durable push with no certificates and no tail. The fix makes the
+    /// job DURABLE: the handler persists the job row BEFORE acking the push, and
+    /// the startup drain replays rows a previous process left pending.
     ///
-    /// This test drives the fix's exact shape: a simulated handler spawns the
-    /// continuation, the simulated handler is aborted mid-flight (the disconnect),
-    /// and the continuation must still run to completion — the push row, the
-    /// trust score, the per-ref certificate, and the tail's withheld walk all
-    /// land. The tail's walk is asserted on the same git shim the F2a suite uses.
+    /// This test drives the hardest shape of that fix: the simulated handler
+    /// enqueues the job, then is aborted BEFORE it even spawns the processor —
+    /// the crash-between-enqueue-and-spawn window. The startup drain
+    /// (`reset_stale_post_receive_jobs` + replay each pending row) must recover
+    /// it completely: the push row, the trust score, the per-ref certificate, and
+    /// the tail's withheld walk all land. Running the drain a second time must
+    /// not double-count the push (idempotent replay).
     #[cfg(unix)]
     #[sqlx::test]
-    async fn post_receive_continuation_survives_handler_abort(pool: sqlx::PgPool) {
-        let repo = tempfile::TempDir::new().unwrap();
+    async fn post_receive_job_survives_handler_abort(pool: sqlx::PgPool) {
         let bin = tempfile::TempDir::new().unwrap();
-        u5_init_repo(repo.path());
-        let c1 = u5_commit_file(repo.path(), "a.txt", "one\n");
         let log = bin.path().join("git.log");
         let git_bin = f2a_logging_git(bin.path(), &log);
-        let (state, rec) = f2a_state(pool, &git_bin, "z6abort", "c1", true).await;
+        let (mut state, rec) = f2a_state(pool.clone(), &git_bin, "z6abort", "c1", true).await;
+        // Point the store at a per-run temp dir: the shared `for_testing` /tmp
+        // layout persists between test runs, and a stale repo dir makes the
+        // fixture's `git commit` a no-op ("nothing to commit").
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        state.repo_store =
+            crate::git::repo_store::RepoStore::for_testing(repos_dir.path().to_path_buf(), pool);
         // The trust-score update only mutates an existing agents row (never
         // inserts); register the pusher so the update is observable.
         state
@@ -10720,49 +10902,81 @@ mod tests {
             .await
             .unwrap();
 
-        // Simulated handler: after `receive_pack` returned Ok it spawns the
-        // continuation, then it is still on the wire — the response has not been
-        // sent. The abort below is the disconnect.
+        // The durable job re-locates the repo via repo_store.local_path, so the
+        // repo must exist exactly where the store will look for it.
+        let (_, repo_path) = state
+            .repo_store
+            .local_path(&rec.owner_did, &rec.name)
+            .unwrap();
+        std::fs::create_dir_all(&repo_path).unwrap();
+        u5_init_repo(&repo_path);
+        let c1 = u5_commit_file(&repo_path, "a.txt", "one\n");
+
+        let update = f2a_update("refs/heads/main", &c1);
+        let job = crate::db::PostReceiveJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            pusher_did: F2A_PUSHER.to_string(),
+            owner_did: rec.owner_did.clone(),
+            repo_name: rec.name.clone(),
+            repo_id: rec.id.clone(),
+            ref_updates: update
+                .iter()
+                .map(|u| crate::db::JobRefUpdate {
+                    old_sha: u.old_sha.clone(),
+                    new_sha: u.new_sha.clone(),
+                    ref_name: u.ref_name.clone(),
+                })
+                .collect(),
+            attestation: crate::db::PostReceiveAttestation::default(),
+            status: "pending".to_string(),
+            enqueued_at: chrono::Utc::now().to_rfc3339(),
+            attempts: 0,
+            error: None,
+        };
+
+        // Simulated handler: after `receive_pack` returned Ok it persists the
+        // job (the durability boundary) — then, BEFORE spawning the processor,
+        // it is aborted: the crash-between-enqueue-and-spawn window. The startup
+        // drain is the only thing that can recover this job.
         let (sent, received) = tokio::sync::oneshot::channel();
+        let job_for_handler = job.clone();
         let handler_sim = tokio::spawn({
             let state = state.clone();
-            let rec = rec.clone();
-            let disk = repo.path().to_path_buf();
-            let update = f2a_update("refs/heads/main", &c1);
             async move {
-                let cont = tokio::spawn(post_receive_continuation(
-                    state,
-                    rec,
-                    update,
-                    disk,
-                    F2A_PUSHER.to_string(),
-                    PusherAttestation {
-                        sig: None,
-                        signature_input: None,
-                        content_digest: None,
-                        request_path: None,
-                    },
-                ));
-                let _ = sent.send(cont);
+                state
+                    .db
+                    .enqueue_post_receive_job(&job_for_handler)
+                    .await
+                    .unwrap();
+                let _ = sent.send(());
                 std::future::pending::<()>().await
             }
         });
-        let cont = received.await.expect("handler spawned the continuation");
+        received.await.expect("handler enqueued the job");
 
-        // Give the continuation time to be mid-bookkeeping — the exact window the
-        // finding described — then sever the client.
+        // Sever the client: the handler never spawns the processor.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         handler_sim.abort();
         let _ = handler_sim.await;
 
-        // The detached continuation must still finish its whole job.
-        cont.await
-            .expect("the continuation must run to completion after the handler is aborted");
+        assert_eq!(
+            state.db.get_push_count(F2A_PUSHER).await.unwrap(),
+            0,
+            "nothing has run yet — the job is pending and unprocessed"
+        );
+
+        // Startup drain: reset stale rows, then replay every pending row.
+        state.db.reset_stale_post_receive_jobs().await.unwrap();
+        let pending = state.db.list_pending_post_receive_jobs().await.unwrap();
+        assert_eq!(pending.len(), 1, "the enqueued job must be drained");
+        for job in pending {
+            process_post_receive_job(state.clone(), job).await;
+        }
 
         assert_eq!(
             state.db.get_push_count(F2A_PUSHER).await.unwrap(),
             1,
-            "the push must still be recorded after the disconnect"
+            "the push must still be recorded after the crash"
         );
         assert!(
             (state.db.get_trust_score(F2A_PUSHER).await.unwrap() - 0.10).abs() < 1e-9,
@@ -10772,15 +10986,40 @@ mod tests {
         assert_eq!(
             certs.len(),
             1,
-            "the per-ref certificate must still be issued after the disconnect"
+            "the per-ref certificate must still be issued after the crash"
         );
         assert_eq!(certs[0].ref_name, "refs/heads/main");
         assert_eq!(certs[0].new_sha, c1);
         assert_eq!(certs[0].pusher_did, F2A_PUSHER);
         assert!(
             f2a_walks(&log) >= 1,
-            "the replication tail's withheld walk must still run after the disconnect; log:\n{}",
+            "the replication tail's withheld walk must still run after the crash; log:\n{}",
             f2a_log(&log)
+        );
+
+        // Idempotent replay: the job is `done`, so a second drain finds nothing
+        // pending, and even a forced re-run of the processor does not double-count
+        // the push (push_events is keyed on the job id with ON CONFLICT DO NOTHING).
+        let pending = state.db.list_pending_post_receive_jobs().await.unwrap();
+        assert!(
+            pending.is_empty(),
+            "a processed job must not be drained a second time"
+        );
+        process_post_receive_job(state.clone(), job.clone()).await;
+        assert_eq!(
+            state.db.get_push_count(F2A_PUSHER).await.unwrap(),
+            1,
+            "replaying the job must not double-count the push"
+        );
+        assert_eq!(
+            state
+                .db
+                .list_ref_certificates(&rec.id, 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "replaying the job must not mint a second certificate"
         );
     }
 }

@@ -496,33 +496,38 @@ fn inv22_ipfs_walk_admission_reaches_every_blocking_site() {
 
 /// #174 U5, #224 review: the post-receive work is detached at the DURABILITY
 /// BOUNDARY, which is the moment receive-pack returns success, not the end of the
-/// handler and not after `guard.release()`. As of #224 the handler spawns the
-/// owned `post_receive_continuation` (record_push, trust score, certificates,
-/// and the replication tail) at that boundary; everything below the spawn stays
-/// in the cancellable request future, so anything the continuation is spawned
-/// after is a window where a client disconnect drops that work while the pack
-/// is already durable on disk. `guard.release()` is such a window: on success
-/// it awaits the Tigris upload and then the advisory unlock.
+/// handler and not after `guard.release()`. Since #224 the handler persists the
+/// push's post-receive JOB (`enqueue_post_receive_job` — record_push, trust
+/// score, certificates, and the replication tail all run inside the job) at
+/// that boundary and spawns `process_post_receive_job` to run it; everything
+/// below the enqueue stays in the cancellable request future, so anything the
+/// enqueue is after is a window where a client disconnect drops that work while
+/// the pack is already durable on disk. `guard.release()` is such a window: on
+/// success it awaits the Tigris upload and then the advisory unlock.
 ///
 /// The lower bound matters just as much as the upper one: `release` runs on
-/// failure too, so an ungated spawn would fire for a push git rejected, pinning
-/// and announcing a half-applied repo. Above `release` the `?` on
+/// failure too, so an ungated enqueue would fire for a push git rejected,
+/// pinning and announcing a half-applied repo. Above `release` the `?` on
 /// `receive_result` can no longer be what gates it, so the success check is
-/// explicit and this gate binds it: the spawn must sit inside
-/// `if push_succeeded`, and `release` must consume the same flag so the two
-/// cannot drift apart.
+/// explicit and this gate binds it: the enqueue AND the processor spawn must
+/// sit inside `if push_succeeded`, the enqueue must come before the spawn (the
+/// durable row is the job's recovery record, so the processor must never run
+/// against an unpersisted job), and `release` must consume the same flag so the
+/// gate and the release cannot drift apart.
 ///
 /// This is an ordering check rather than a cancellation-race test on purpose:
 /// it is the companion to
 /// `receive_pack_tail_survives_a_disconnect_during_release`, which drives the
 /// actual disconnect through a parked `release`, and to
-/// `post_receive_continuation_survives_handler_abort` (in `api/repos.rs`),
-/// which drives the disconnect through the bookkeeping the continuation now
-/// owns. Same instrument the F3 gate above uses.
+/// `post_receive_job_survives_handler_abort` (in `api/repos.rs`), which drives
+/// the disconnect (and a crash-before-spawn) through the durable job the
+/// handler persisted. Same instrument the F3 gate above uses.
 ///
-/// MUTATION (RED): move the `tokio::spawn(post_receive_continuation` call below
+/// MUTATION (RED): move the `enqueue_post_receive_job` call below
 /// `guard.release(` and the ordering assertion fails; take it out of the
-/// `if push_succeeded` block and the failed-push assertion fails.
+/// `if push_succeeded` block and the failed-push assertion fails; move the
+/// `process_post_receive_job` spawn above the enqueue and the durability
+/// assertion fails.
 #[test]
 fn inv22_replication_tail_spawns_at_the_durability_boundary() {
     let repos = src("api/repos.rs");
@@ -544,11 +549,18 @@ fn inv22_replication_tail_spawns_at_the_durability_boundary() {
     let gate_open = production
         .find("if push_succeeded {")
         .expect("U5 gate missing: the tail spawn must be gated on the push having succeeded");
-    let spawn = production
-        .find("tokio::spawn(post_receive_continuation(")
+    let enqueue = production
+        .find("state.db.enqueue_post_receive_job(&job)")
         .expect(
-            "U5 gate missing: the post-receive continuation must be spawned by git_receive_pack",
+            "U5 gate missing: the post-receive job must be persisted by git_receive_pack \
+             before the push is acknowledged",
         );
+    let spawn = production
+        .find("tokio::spawn(process_post_receive_job(state.clone(), job));")
+        .expect("U5 gate missing: the post-receive job must be spawned by git_receive_pack");
+    // The success-path `release` is the LAST one in the handler (the enqueue
+    // error branch has its own, earlier); `rfind` picks it so the ordering
+    // assertions bind the normal success path.
     let release = production
         .find(".release(push_succeeded)")
         .expect("U5 gate stale: release must consume the same success flag as the tail gate");
@@ -560,20 +572,33 @@ fn inv22_replication_tail_spawns_at_the_durability_boundary() {
         .expect("U5 gate stale: git_receive_pack no longer fires push webhooks");
 
     assert!(
-        success_flag < gate_open && gate_open < spawn,
-        "U5 gate bypassed: the continuation must be spawned inside `if push_succeeded`, \
-         or a rejected push spawns a tail that pins and announces a half-applied repo"
+        success_flag < gate_open && gate_open < enqueue && enqueue < spawn,
+        "U5 gate bypassed: the post-receive job must be enqueued (the durability \
+         boundary) then spawned inside `if push_succeeded`, or a rejected push spawns \
+         a job that pins and announces a half-applied repo — or the processor runs \
+         against a job that has no recovery record yet"
     );
-    // Still inside that block: no `}` may close it between the gate and the spawn.
+    // Still inside that block: between the `if push_succeeded {` and the enqueue
+    // the brace balance must never go negative — the block's opening `{` is
+    // matched by the struct literals' own braces (job construction), but a `}`
+    // that closed the `if` block before the enqueue would unbalance it. The
+    // enqueue's own `if let Err` error branch closes a brace after it, which is
+    // fine — the spawn is asserted after the enqueue separately.
+    let prefix = &production[gate_open + "if push_succeeded {".len()..enqueue];
+    let depth = prefix.chars().fold(1i64, |depth, c| match c {
+        '{' => depth + 1,
+        '}' => depth - 1,
+        _ => depth,
+    });
     assert!(
-        !production[gate_open + "if push_succeeded {".len()..spawn].contains('}'),
-        "U5 gate bypassed: the continuation spawn left the `if push_succeeded` block, so a \
-         rejected push now spawns a tail"
+        depth >= 1,
+        "U5 gate bypassed: the enqueue left the `if push_succeeded` block, so a \
+         rejected push now enqueues a job"
     );
     assert!(
         spawn < release && spawn < touch && spawn < webhook,
-        "U5 gate bypassed: the continuation must be spawned BEFORE guard.release, \
-         touch_repo and the webhook fan-out, so a disconnect in any of those windows \
-         cannot drop this push's pins, recovery copy, and announcements"
+        "U5 gate bypassed: the post-receive job must be enqueued and spawned BEFORE \
+         guard.release, touch_repo and the webhook fan-out, so a disconnect in any of \
+         those windows cannot drop this push's pins, recovery copy, and announcements"
     );
 }

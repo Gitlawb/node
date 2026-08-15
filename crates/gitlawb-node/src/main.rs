@@ -98,12 +98,36 @@ async fn main() -> Result<()> {
 
     let mut config = Config::parse();
 
-    // Fallback to legacy GITLAWB_IRYS_URL for backward compatibility during rename
+    // Fallback to legacy GITLAWB_IRYS_URL for backward compatibility during rename.
+    // A bare URL no longer enables paid anchoring: uploads are billed to a funded
+    // account via x-irys-paid-by at /tx/{token}, which this release introduced,
+    // so validate() below refuses to start with a URL but no account/token.
+    // Config::legacy_bundler_url_fallback therefore honors the legacy value only
+    // when the operator has opted into the new funded-account pair; otherwise we
+    // warn that the legacy URL alone leaves anchoring disabled and start anyway.
     if config.bundler_url.is_empty() {
         if let Ok(legacy) = std::env::var("GITLAWB_IRYS_URL") {
-            if !legacy.is_empty() {
-                config.bundler_url = legacy;
-                tracing::warn!("GITLAWB_IRYS_URL is deprecated, use GITLAWB_BUNDLER_URL instead");
+            match Config::legacy_bundler_url_fallback(
+                &legacy,
+                &config.bundler_account,
+                &config.bundler_token,
+            ) {
+                Some(url) => {
+                    config.bundler_url = url;
+                    tracing::warn!(
+                        "GITLAWB_IRYS_URL is deprecated, use GITLAWB_BUNDLER_URL instead"
+                    );
+                }
+                None if !legacy.is_empty() => {
+                    tracing::warn!(
+                        "GITLAWB_IRYS_URL is set but GITLAWB_BUNDLER_ACCOUNT and \
+                         GITLAWB_BUNDLER_TOKEN are not: a bundler URL alone no longer \
+                         enables anchoring (uploads are billed to a funded account via \
+                         x-irys-paid-by). Set the funded-account pair to enable it, or \
+                         use GITLAWB_BUNDLER_URL. Starting with anchoring disabled."
+                    );
+                }
+                None => {}
             }
         }
     }
@@ -580,6 +604,31 @@ async fn main() -> Result<()> {
     };
     if config.ipfs_rate_limit == 0 {
         tracing::warn!("GITLAWB_IPFS_RATE_LIMIT=0 — per-IP /ipfs rate limiting disabled");
+    }
+
+    // #224: replay durable post-receive jobs a previous process left mid-flight.
+    // The receive-pack handler persists each push's job BEFORE acknowledging it,
+    // so a crash between the pack landing and the job's bookkeeping (record_push,
+    // certificates, anchor, replication) is recovered here on the next start —
+    // and the drained jobs are spawned before traffic is served, so no push can
+    // be acknowledged against a queue this process has not yet replayed. Each
+    // effect is idempotent, so a replay completes exactly the work owed without
+    // double-counting or double-issuing.
+    {
+        let drain_state = state.clone();
+        match crate::api::repos::drain_post_receive_jobs(drain_state).await {
+            Ok(0) => {}
+            Ok(count) => {
+                info!("startup post-receive job drain found {count} job(s) to replay")
+            }
+            Err(e) => {
+                tracing::error!(
+                    err = %e,
+                    "startup post-receive job drain failed; unprocessed jobs stay queued \
+                     and are retried on the next restart"
+                );
+            }
+        }
     }
 
     // Periodic peer-count poll for the metrics gauge. If p2p is disabled

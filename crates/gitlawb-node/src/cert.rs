@@ -3,7 +3,6 @@ use std::ops::DerefMut;
 use anyhow::Result;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
 use crate::db::RefCertificate;
 use crate::state::AppState;
@@ -57,7 +56,10 @@ fn prev_hash(c: &RefCertificate) -> Result<String> {
     Ok(hex::encode(Sha256::digest(&prev_bytes)))
 }
 
-/// Attempt a single cert-issuance within an active transaction.
+/// Attempt a single cert-issuance within an active transaction. `cert_id` is
+/// the certificate id: a deterministic per-(job, ref) value on the durable
+/// post-receive job path so a startup replay is a no-op (see
+/// [`Db::insert_ref_certificate_tx`]'s `ON CONFLICT (id) DO NOTHING`).
 #[allow(clippy::too_many_arguments)]
 async fn issue_once(
     state: &AppState,
@@ -66,6 +68,7 @@ async fn issue_once(
     old_sha: &str,
     new_sha: &str,
     pusher_did: &str,
+    cert_id: &str,
     pusher_sig: &Option<String>,
     signature_input: &Option<String>,
     content_digest: &Option<String>,
@@ -102,7 +105,7 @@ async fn issue_once(
     let signature = state.node_keypair.sign_b64(&payload_bytes);
 
     let cert = RefCertificate {
-        id: Uuid::new_v4().to_string(),
+        id: cert_id.to_string(),
         repo_id: repo_id.to_string(),
         ref_name: ref_name.to_string(),
         old_sha: old_sha.to_string(),
@@ -124,6 +127,12 @@ async fn issue_once(
 
 /// Issue a signed ref-update certificate for a successful push.
 ///
+/// `cert_id` is the certificate id to use. The durable post-receive job path
+/// passes a deterministic per-(job, ref) value so a startup replay re-issues
+/// the SAME id and `insert_ref_certificate_tx`'s `ON CONFLICT (id) DO NOTHING`
+/// makes it a no-op — a replayed push must not mint a second certificate for
+/// the same transition.
+///
 /// Acquires a per-repo advisory lock to atomically allocate the chain
 /// sequence number within a single database transaction, preventing race
 /// conditions with concurrent pushes to the same repository.
@@ -135,6 +144,7 @@ pub async fn issue_ref_certificate(
     old_sha: &str,
     new_sha: &str,
     pusher_did: &str,
+    cert_id: &str,
     pusher_sig: Option<String>,
     signature_input: Option<String>,
     content_digest: Option<String>,
@@ -156,6 +166,7 @@ pub async fn issue_ref_certificate(
         old_sha,
         new_sha,
         pusher_did,
+        cert_id,
         &pusher_sig,
         &signature_input,
         &content_digest,
@@ -187,6 +198,7 @@ pub async fn issue_ref_certificate(
                     old_sha,
                     new_sha,
                     pusher_did,
+                    cert_id,
                     &pusher_sig,
                     &signature_input,
                     &content_digest,

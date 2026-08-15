@@ -119,15 +119,18 @@ pub async fn anchor_ref_update(
         .body(data_item)
         .send()
         .await
-        .map_err(|e| {
-            // reqwest embeds the request URL verbatim; swap in the masked form.
-            let safe_err = e.to_string().replace(&url, &display_url);
-            anyhow::anyhow!("Bundler upload failed: {safe_err}")
-        })?;
+        .map_err(|e| remote_send_error("Bundler upload failed", &e, &url, &display_url))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = truncate_for_error(&resp.text().await.unwrap_or_default(), 512);
-        return Err(anyhow::anyhow!("Bundler returned {status}: {body}"));
+        let body = resp.text().await.unwrap_or_default();
+        return Err(remote_response_error(
+            "Bundler upload",
+            &status,
+            &body,
+            &url,
+            &display_url,
+            &[bundler_account, bundler_token],
+        ));
     }
     let json: serde_json::Value = resp
         .json()
@@ -226,15 +229,18 @@ pub async fn anchor_encrypted_manifest(
         .body(data_item)
         .send()
         .await
-        .map_err(|e| {
-            // reqwest embeds the request URL verbatim; swap in the masked form.
-            let safe_err = e.to_string().replace(&url, &display_url);
-            anyhow::anyhow!("Bundler upload failed: {safe_err}")
-        })?;
+        .map_err(|e| remote_send_error("Bundler upload failed", &e, &url, &display_url))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = truncate_for_error(&resp.text().await.unwrap_or_default(), 512);
-        return Err(anyhow::anyhow!("Bundler returned {status}: {body}"));
+        let body = resp.text().await.unwrap_or_default();
+        return Err(remote_response_error(
+            "Bundler manifest upload",
+            &status,
+            &body,
+            &url,
+            &display_url,
+            &[bundler_account, bundler_token],
+        ));
     }
     let json: serde_json::Value = resp
         .json()
@@ -329,6 +335,57 @@ fn truncate_for_error(s: &str, max: usize) -> String {
     out.push_str("…(truncated)");
     out
 }
+/// Central redaction boundary for every error that comes from a remote
+/// endpoint the node talked to. reqwest embeds the request URL verbatim in its
+/// error text, and a remote server can reflect anything the node sent — the
+/// funded-account identity (`x-irys-paid-by`), the payment token riding in the
+/// URL path, and any credentials in the base URL — back through an error or a
+/// response body. Routing every such error through this module guarantees a raw
+/// URL or a credential-bearing remote body never reaches a log (`err = %e`) or
+/// a caller.
+///
+/// `detail` is any string that may contain the raw URL or the secrets; the raw
+/// URL is swapped for `display_url` (its credential-masked form) and each
+/// non-empty secret is replaced with `<redacted>`.
+fn redact_remote_detail(detail: &str, url: &str, display_url: &str, secrets: &[&str]) -> String {
+    let mut out = detail.replace(url, display_url);
+    for secret in secrets {
+        if !secret.is_empty() {
+            out = out.replace(secret, "<redacted>");
+        }
+    }
+    out
+}
+/// Build the error for a remote request that failed before a response body was
+/// available (connection refused, TLS failure, dropped stream). The reqwest
+/// error text may embed the raw request URL, so it is masked and any secrets
+/// scrubbed before the error is constructed.
+fn remote_send_error(
+    prefix: &str,
+    err: &reqwest::Error,
+    url: &str,
+    display_url: &str,
+) -> anyhow::Error {
+    let detail = redact_remote_detail(&err.to_string(), url, display_url, &[]);
+    anyhow::anyhow!("{prefix}: {detail}")
+}
+/// Build the error for a non-success response whose body the remote may have
+/// populated by reflecting the request (including credential-bearing pieces).
+/// The body is truncated, its raw URL swapped for the masked form, and the
+/// secrets the node actually sent scrubbed — so a hostile bundler/gateway
+/// cannot echo the operator's funded-account identity or payment token into
+/// logs or an error surfaced to a caller.
+fn remote_response_error(
+    prefix: &str,
+    status: &reqwest::StatusCode,
+    body: &str,
+    url: &str,
+    display_url: &str,
+    secrets: &[&str],
+) -> anyhow::Error {
+    let body = truncate_for_error(&redact_remote_detail(body, url, display_url, secrets), 512);
+    anyhow::anyhow!("{prefix} returned {status}: {body}")
+}
 /// Result of verifying an Arweave anchor against the stored certificate chain.
 #[derive(Debug, Clone, Serialize)]
 pub struct VerifyResult {
@@ -368,13 +425,15 @@ pub async fn verify_anchor(
     let resp = match client.get(&url).send().await {
         Ok(r) => r,
         Err(e) => {
-            let safe_err = e.to_string().replace(&url, &display_url);
-            tracing::warn!("Arweave gateway connection failed: {safe_err}");
+            let safe_err =
+                remote_send_error("Arweave gateway connection failed", &e, &url, &display_url)
+                    .to_string();
+            tracing::warn!("{safe_err}");
             return Ok(VerifyResult {
                 valid: false,
                 anchor: serde_json::Value::Null,
                 certificate: None,
-                errors: vec![format!("Arweave gateway connection failed: {safe_err}")],
+                errors: vec![safe_err],
             });
         }
     };
@@ -394,11 +453,18 @@ pub async fn verify_anchor(
         let data = match chunk {
             Ok(d) => d,
             Err(e) => {
+                // Mid-stream transport errors carry the same risk as connection
+                // errors: reqwest can embed the raw request URL in the error
+                // text, so it is masked through the same boundary as above.
+                let safe_err =
+                    remote_send_error("failed to read response body", &e, &url, &display_url)
+                        .to_string();
+                tracing::warn!("{safe_err}");
                 return Ok(VerifyResult {
                     valid: false,
                     anchor: serde_json::Value::Null,
                     certificate: None,
-                    errors: vec![format!("failed to read response body: {e}")],
+                    errors: vec![safe_err],
                 });
             }
         };
@@ -2271,5 +2337,204 @@ mod tests {
             r.errors
         );
         _mock.assert_async().await;
+    }
+    /// A bundler that returns 500 with a body reflecting the request back — the
+    /// scenario a hostile or buggy endpoint uses to leak the credential-bearing
+    /// pieces (the `x-irys-paid-by` funded account and the payment token riding
+    /// in the path) through the error path. The error path must redact them.
+    async fn spawn_echoing_error_bundler() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = axum::Router::new().route(
+            "/tx/matic",
+            axum::routing::post(
+                move |uri: axum::http::Uri, headers: axum::http::HeaderMap| async move {
+                    let paid_by = headers
+                        .get("x-irys-paid-by")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default();
+                    let target = uri.path_and_query().map(|q| q.as_str()).unwrap_or("");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(r#"{{"error":"rejected for {paid_by} at {target}"}}"#),
+                    )
+                },
+            ),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+    /// A non-success bundler response must not let the remote reflect the
+    /// credential-bearing request back into the error text: the funded-account
+    /// identity and the payment token are sent by the node, so a bundler that
+    /// echoes them (hostile or buggy) must be defeated by the redaction
+    /// boundary, not surfaced verbatim in logs or a caller-visible error.
+    #[tokio::test]
+    async fn test_anchor_ref_update_redacts_credentials_in_error_body() {
+        let kp = Keypair::generate();
+        let client = reqwest::Client::new();
+        let server = spawn_echoing_error_bundler().await;
+        let account = "zSecretFundedAccount";
+        let result = anchor_ref_update(
+            &client,
+            &server,
+            account,
+            "matic",
+            &test_anchor(
+                "alice/myrepo",
+                "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4",
+            ),
+            &kp,
+        )
+        .await;
+        let err = result.expect_err("a 500 bundler response must fail the upload");
+        let text = err.to_string();
+        assert!(
+            text.contains("500"),
+            "error should carry the status: {text}"
+        );
+        assert!(
+            !text.contains(account),
+            "funded account echoed by the bundler must be redacted: {text}"
+        );
+        assert!(
+            !text.contains("matic"),
+            "payment token echoed by the bundler must be redacted: {text}"
+        );
+        assert!(
+            text.contains("<redacted>"),
+            "expected a redaction marker: {text}"
+        );
+    }
+    /// The manifest upload path shares the same redaction boundary: a 500 body
+    /// that echoes the funded account and token must not reach the error text.
+    #[tokio::test]
+    async fn test_manifest_anchor_redacts_credentials_in_error_body() {
+        let kp = Keypair::generate();
+        let client = reqwest::Client::new();
+        let server = spawn_echoing_error_bundler().await;
+        let account = "zSecretFundedAccount";
+        let blobs = vec![("oid1".to_string(), "cid1".to_string())];
+        let m = EncryptedManifest {
+            repo: "alice/r",
+            owner_did: "did:key:zO",
+            node_did: "did:key:zN",
+            timestamp: "2026-06-11T00:00:00Z",
+            blobs: &blobs,
+        };
+        let err = anchor_encrypted_manifest(&client, &server, account, "matic", &m, &kp)
+            .await
+            .expect_err("a 500 bundler response must fail the manifest upload");
+        let text = err.to_string();
+        assert!(
+            !text.contains(account),
+            "funded account must be redacted: {text}"
+        );
+        assert!(
+            !text.contains("matic"),
+            "payment token must be redacted: {text}"
+        );
+        assert!(
+            text.contains("<redacted>"),
+            "expected a redaction marker: {text}"
+        );
+    }
+    /// A gateway that announces a body it never delivers (headers promise
+    /// Content-Length, connection dropped mid-body) surfaces a mid-stream error.
+    /// That error must be rebuilt through the redaction boundary so a
+    /// credential-bearing gateway URL never leaks into the public VerifyResult.
+    #[tokio::test]
+    async fn test_verify_anchor_interrupted_stream_error_is_masked() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                              content-length: 1000\r\n\r\n{\"certificate\":",
+                        )
+                        .await;
+                    // Drop the connection mid-body: the promised length is never
+                    // delivered, forcing a stream error on the client.
+                    drop(socket);
+                });
+            }
+        });
+        let gateway = format!("http://{addr}/?token=SECRET");
+        let client = reqwest::Client::new();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
+            .expect("lazy pool creation should not fail");
+        let db = crate::db::Db::for_testing(pool);
+        let r = verify_anchor(&client, &gateway, "txid", &db, "did:key:zNODE")
+            .await
+            .expect("verify_anchor should return Ok for a stream error");
+        assert!(!r.valid);
+        let err_text = r.errors.join(" ");
+        assert!(
+            err_text.contains("failed to read response body"),
+            "expected a masked stream error, got: {err_text}"
+        );
+        assert!(
+            !err_text.contains("SECRET"),
+            "gateway query token leaked through the stream error: {err_text}"
+        );
+    }
+    /// The redaction helpers must scrub a raw URL (userinfo, token in the path)
+    /// and every secret the node sent out of an error string, and the scrub
+    /// must apply to remote bodies that reflect the request.
+    #[test]
+    fn redaction_helpers_scrub_urls_and_secrets() {
+        let url = "https://user:pw@example.invalid/tx/matic";
+        let display = "https://***@example.invalid/tx/matic";
+        let body = format!(r#"{{"error":"rejected for zFundedAccount at {url}"}}"#);
+        let err = remote_response_error(
+            "Bundler upload",
+            &StatusCode::INTERNAL_SERVER_ERROR,
+            &body,
+            url,
+            display,
+            &["zFundedAccount", "matic"],
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("Bundler upload returned 500"),
+            "error should carry prefix and status: {text}"
+        );
+        assert!(
+            !text.contains("zFundedAccount"),
+            "funded account leaked: {text}"
+        );
+        assert!(!text.contains("matic"), "payment token leaked: {text}");
+        assert!(!text.contains("user:pw"), "URL userinfo leaked: {text}");
+        assert!(
+            !text.contains("example.invalid/tx/matic"),
+            "raw URL leaked: {text}"
+        );
+        assert!(
+            text.contains("<redacted>"),
+            "expected a redaction marker: {text}"
+        );
+
+        // A reqwest-style detail that embeds the raw URL is masked through the
+        // same boundary (used for connection and mid-stream errors).
+        let detail = format!("error sending request for url ({url})");
+        let detail = redact_remote_detail(&detail, url, display, &["matic"]);
+        assert!(!detail.contains("user:pw"), "URL userinfo leaked: {detail}");
+        assert!(!detail.contains("matic"), "payment token leaked: {detail}");
+        assert!(
+            detail.contains("<redacted>"),
+            "expected a redaction marker: {detail}"
+        );
     }
 }

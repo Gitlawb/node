@@ -843,6 +843,31 @@ impl Config {
         }
         Ok(())
     }
+
+    /// Decide whether to adopt a legacy `GITLAWB_IRYS_URL` as the bundler URL.
+    ///
+    /// A bare URL no longer enables paid anchoring — uploads are billed to a
+    /// funded account via `x-irys-paid-by` at `/tx/{token}`, and `validate()`
+    /// refuses to start with a URL but no funded account/token. Adopting the
+    /// legacy value unconditionally would therefore break every deployment that
+    /// only ever set the URL. The legacy value is honored only when the operator
+    /// has opted into the new funded-account pair; otherwise `None` is returned
+    /// (anchoring stays disabled and the node starts, with a warning at the call
+    /// site).
+    pub fn legacy_bundler_url_fallback(
+        legacy_url: &str,
+        bundler_account: &str,
+        bundler_token: &str,
+    ) -> Option<String> {
+        if legacy_url.is_empty() {
+            return None;
+        }
+        if !bundler_account.trim().is_empty() && !bundler_token.trim().is_empty() {
+            Some(legacy_url.to_string())
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -863,6 +888,41 @@ mod tests {
         // 0 is a footgun (immediate-504 on every request); clap must reject it.
         assert!(
             Config::try_parse_from(["gitlawb-node", "--git-service-timeout-secs", "0"]).is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_irys_url_is_adopted_only_with_funded_account_pair() {
+        // Full opt-in: legacy URL + the new funded-account pair -> adopted.
+        assert_eq!(
+            Config::legacy_bundler_url_fallback("https://devnet.irys.xyz", "0xabc", "matic"),
+            Some("https://devnet.irys.xyz".to_string())
+        );
+        // Legacy URL alone no longer enables anchoring: validate() would refuse
+        // to start, so the fallback stays disabled and the node boots.
+        assert_eq!(
+            Config::legacy_bundler_url_fallback("https://devnet.irys.xyz", "", ""),
+            None
+        );
+        // Partial opt-in (account but no token, or vice versa) is also refused:
+        // both halves of the funded-account pair are required.
+        assert_eq!(
+            Config::legacy_bundler_url_fallback("https://devnet.irys.xyz", "0xabc", ""),
+            None
+        );
+        assert_eq!(
+            Config::legacy_bundler_url_fallback("https://devnet.irys.xyz", "", "matic"),
+            None
+        );
+        // Whitespace-only account/token are not an opt-in.
+        assert_eq!(
+            Config::legacy_bundler_url_fallback("https://devnet.irys.xyz", "  ", " "),
+            None
+        );
+        // Empty legacy value: nothing to adopt.
+        assert_eq!(
+            Config::legacy_bundler_url_fallback("", "0xabc", "matic"),
+            None
         );
     }
 

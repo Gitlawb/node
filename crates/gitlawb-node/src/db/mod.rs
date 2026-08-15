@@ -167,6 +167,57 @@ pub struct RefCertificate {
     pub request_path: Option<String>,
 }
 
+/// One ref transition a durable post-receive job owes, in a serde-friendly form
+/// so it can be persisted in the `post_receive_jobs` JSONB column and replayed
+/// after a crash.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobRefUpdate {
+    pub old_sha: String,
+    pub new_sha: String,
+    pub ref_name: String,
+}
+
+/// The pusher's RFC 9421 attestation, persisted with the post-receive job so
+/// per-ref certificates can be issued during a replay with the same proof the
+/// original push carried.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PostReceiveAttestation {
+    pub sig: Option<String>,
+    pub signature_input: Option<String>,
+    pub content_digest: Option<String>,
+    pub request_path: Option<String>,
+}
+
+/// A durable post-receive job (#224 review): everything a landed push owes
+/// after git accepted the pack — trust-score `record_push`, per-ref signed
+/// certificates, and the replication tail — with its inputs persisted BEFORE
+/// the push is acknowledged. Tokio cancels spawned tasks on restart/shutdown,
+/// so a push whose continuation task died before reaching the bookkeeping left
+/// a durable ref update with no certificate, accounting, anchor, or replication
+/// and no way to recover it. Persisting the job first makes that interval
+/// recoverable: startup resets stale rows to `pending` and replays them, and
+/// each effect is idempotent (`record_push` keys on the job id, certificates on
+/// a deterministic per-(job, ref) id, the Arweave anchor on an existence
+/// check), so a replay never double-counts, double-issues, or double-anchors.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostReceiveJob {
+    pub id: String,
+    /// The DID that pushed — the signer of the RFC 9421 attestation, and the
+    /// subject of the trust-score `record_push`. Persisted because a startup
+    /// replay runs long after the handler that knew the caller is gone.
+    pub pusher_did: String,
+    pub owner_did: String,
+    pub repo_name: String,
+    pub repo_id: String,
+    pub ref_updates: Vec<JobRefUpdate>,
+    pub attestation: PostReceiveAttestation,
+    /// pending | processing | done | failed
+    pub status: String,
+    pub enqueued_at: String,
+    pub attempts: i64,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerRecord {
     pub did: String,
@@ -482,15 +533,17 @@ impl Db {
 // appended to v1. Operators can read `schema_migrations` to confirm a node
 // is at the expected version.
 //
-// NOTE: the v1 migration includes columns (seq, prev, pusher_sig on
-// ref_certificates) that were historically added by later migrations. These
-// were bundled into v1 for development convenience. cert_id on arweave_anchors
-// is added by migration v18 as ALTER TABLE; signature_input, content_digest,
-// and request_path are added by v19.  New installs reach v18/v19 via sequential
-// migration; existing installs with the columns already present are no-ops via
-// IF NOT EXISTS. v20 drops the superseded (repo_id, ref_name) unique index that
-// v1 bundled; that drop is one-way and rollback-unsupported (see the
-// migration's own comment).
+// NOTE: the released v1 schema has NO cert-chain columns: `ref_certificates`
+// carries only (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did,
+// signature, issued_at). The chain fields seq, prev, and pusher_sig are added
+// by migration v18 (alongside `arweave_anchors.cert_id` and the
+// `irys_tx_id` → `arweave_tx_id` rename); the proof columns
+// signature_input, content_digest, and request_path are added by v19.
+// New installs reach v18/v19 via sequential migration; existing installs with
+// the columns already present are no-ops via IF NOT EXISTS. v20 drops the
+// superseded (repo_id, ref_name) unique index that v1 bundled; that drop is
+// one-way and rollback-unsupported (see the migration's own comment).
+// v21 adds the durable post-receive job table.
 //
 // Each migration runs in a single transaction, so statements that Postgres
 // forbids inside a transaction (notably `CREATE INDEX CONCURRENTLY`) cannot be
@@ -1161,6 +1214,33 @@ const MIGRATIONS: &[Migration] = &[
             "DROP INDEX IF EXISTS idx_ref_certs_repo_ref",
         ],
     },
+    // Durable post-receive jobs (#224 review). Numbered 21: versions 12–16 are
+    // claimed by other in-flight branches, and 17 is main's prior max (18–20
+    // are this same branch's earlier migrations; #173 renumbers before merge).
+    // The runner keys the applied set on the integer alone, so gaps are
+    // harmless.
+    Migration {
+        version: 21,
+        name: "durable_post_receive_jobs",
+        stmts: &[
+            r#"CREATE TABLE IF NOT EXISTS post_receive_jobs (
+                id             TEXT NOT NULL PRIMARY KEY,
+                pusher_did     TEXT NOT NULL,
+                owner_did      TEXT NOT NULL,
+                repo_name      TEXT NOT NULL,
+                repo_id        TEXT NOT NULL,
+                ref_updates    JSONB NOT NULL,
+                attestation    JSONB NOT NULL,
+                status         TEXT NOT NULL DEFAULT 'pending',
+                attempts       INTEGER NOT NULL DEFAULT 0,
+                enqueued_at    TEXT NOT NULL,
+                attempted_at   TEXT,
+                processed_at   TEXT,
+                error          TEXT
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_post_receive_jobs_status ON post_receive_jobs(status, enqueued_at)",
+        ],
+    },
 ];
 
 /// Max distinct source repos recorded per pinned object (F1, #173 jatmn round 8).
@@ -1798,8 +1878,13 @@ impl Db {
         Ok(())
     }
 
-    pub async fn record_push(
+    /// Idempotent `record_push` for the durable post-receive job path (#224):
+    /// the push event's `id` is the job id, so a replay of the same job is a
+    /// no-op (`ON CONFLICT (id) DO NOTHING`) instead of double-counting the
+    /// push — which would inflate the pusher's trust score.
+    pub async fn record_push_job(
         &self,
+        job_id: &str,
         agent_did: &str,
         repo_id: &str,
         commit_hash: &str,
@@ -1807,9 +1892,10 @@ impl Db {
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO push_events (id, agent_did, repo_id, commit_hash, object_count, pushed_at)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (id) DO NOTHING",
         )
-        .bind(Uuid::new_v4().to_string())
+        .bind(job_id)
         .bind(agent_did)
         .bind(repo_id)
         .bind(commit_hash)
@@ -2061,6 +2147,128 @@ impl Db {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+}
+
+// ── Durable post-receive jobs ─────────────────────────────────────────────────
+
+impl Db {
+    /// Persist a post-receive job BEFORE the push is acknowledged (#224): a
+    /// push whose detached continuation task is cancelled by a restart before
+    /// reaching record_push/cert/anchor would otherwise leave a durable ref
+    /// update with no bookkeeping and no recovery record. `ON CONFLICT (id) DO
+    /// NOTHING` makes a retried enqueue a no-op.
+    pub async fn enqueue_post_receive_job(&self, job: &PostReceiveJob) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO post_receive_jobs
+             (id, pusher_did, owner_did, repo_name, repo_id, ref_updates, attestation, status, attempts, enqueued_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', 0, $8)
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&job.id)
+        .bind(&job.pusher_did)
+        .bind(&job.owner_did)
+        .bind(&job.repo_name)
+        .bind(&job.repo_id)
+        .bind(serde_json::to_value(&job.ref_updates)?)
+        .bind(serde_json::to_value(&job.attestation)?)
+        .bind(&job.enqueued_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Advance a job's status. `done` stamps `processed_at`; `processing`
+    /// stamps `attempted_at` and increments `attempts`. `failed` records the
+    /// error so operators can see why a job never completed.
+    pub async fn update_post_receive_job(
+        &self,
+        id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let result =
+            match status {
+                "done" => sqlx::query(
+                    "UPDATE post_receive_jobs SET status = 'done', processed_at = $1, error = NULL
+                     WHERE id = $2",
+                )
+                .bind(&now)
+                .bind(id)
+                .execute(&self.pool)
+                .await?,
+                "failed" => {
+                    sqlx::query(
+                        "UPDATE post_receive_jobs SET status = 'failed', error = $1
+                     WHERE id = $2",
+                    )
+                    .bind(error)
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await?
+                }
+                _ => {
+                    sqlx::query(
+                        "UPDATE post_receive_jobs SET status = $1, attempted_at = $2,
+                     attempts = attempts + 1, error = NULL
+                     WHERE id = $3",
+                    )
+                    .bind(status)
+                    .bind(&now)
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await?
+                }
+            };
+        if result.rows_affected() == 0 {
+            tracing::warn!(job_id = %id, status, "post-receive job not found for status update");
+        }
+        Ok(())
+    }
+
+    /// Startup recovery (#224): every job that a previous process left
+    /// mid-flight (`processing`) or failed is reset to `pending` so the startup
+    /// drain replays it. A fresh process has no in-flight jobs, so resetting is
+    /// safe; a job that keeps failing stays `failed` between drains and its
+    /// error is preserved for operators until the next restart resets it.
+    pub async fn reset_stale_post_receive_jobs(&self) -> Result<()> {
+        sqlx::query(
+            "UPDATE post_receive_jobs SET status = 'pending', error = NULL
+             WHERE status IN ('processing', 'failed')",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Pending jobs in enqueue order, for the startup drain.
+    pub async fn list_pending_post_receive_jobs(&self) -> Result<Vec<PostReceiveJob>> {
+        let rows = sqlx::query(
+            "SELECT id, pusher_did, owner_did, repo_name, repo_id, ref_updates, attestation, status,
+                    attempts, enqueued_at, error
+             FROM post_receive_jobs
+             WHERE status = 'pending'
+             ORDER BY enqueued_at ASC, id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| PostReceiveJob {
+                id: r.get("id"),
+                pusher_did: r.get("pusher_did"),
+                owner_did: r.get("owner_did"),
+                repo_name: r.get("repo_name"),
+                repo_id: r.get("repo_id"),
+                ref_updates: serde_json::from_value(r.get("ref_updates")).unwrap_or_default(),
+                attestation: serde_json::from_value(r.get("attestation")).unwrap_or_default(),
+                status: r.get("status"),
+                enqueued_at: r.get("enqueued_at"),
+                attempts: r.get::<i32, _>("attempts") as i64,
+                error: r.get("error"),
+            })
+            .collect())
     }
 }
 
@@ -2404,10 +2612,17 @@ impl Db {
         cert: &RefCertificate,
         conn: &mut sqlx::postgres::PgConnection,
     ) -> Result<RefCertificate> {
+        // Idempotent insert (#224): a durable post-receive job re-issues its
+        // certificates with a deterministic per-(job, ref) id during a replay,
+        // so a re-run must not duplicate the row. `ON CONFLICT (id) DO NOTHING`
+        // returns no row for the already-inserted case; the existing row is
+        // then read back so the caller gets the certificate that actually
+        // landed (which, for a deterministic id, is the same one it computed).
         let row = sqlx::query(
             "INSERT INTO ref_certificates
               (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path)
               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+              ON CONFLICT (id) DO NOTHING
               RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path",
         )
         .bind(&cert.id)
@@ -2425,9 +2640,19 @@ impl Db {
         .bind(&cert.signature_input)
         .bind(&cert.content_digest)
         .bind(&cert.request_path)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if let Some(row) = row {
+            return Ok(row_to_cert(row));
+        }
+        let existing = sqlx::query(
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path
+             FROM ref_certificates WHERE id = $1",
+        )
+        .bind(&cert.id)
         .fetch_one(&mut *conn)
         .await?;
-        Ok(row_to_cert(row))
+        Ok(row_to_cert(existing))
     }
 
     pub async fn list_ref_certificates(
@@ -4010,6 +4235,33 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Whether this exact ref transition (same repo slug, ref, old→new SHAs)
+    /// already has a recorded Arweave anchor. The durable post-receive job
+    /// checks this BEFORE uploading, so a startup replay of an already-anchored
+    /// job skips the upload instead of writing a second permanent on-chain
+    /// artifact for the same transition (#224).
+    pub async fn arweave_anchor_exists(
+        &self,
+        repo: &str,
+        ref_name: &str,
+        old_sha: &str,
+        new_sha: &str,
+    ) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT EXISTS(
+                SELECT 1 FROM arweave_anchors
+                WHERE repo = $1 AND ref_name = $2 AND old_sha = $3 AND new_sha = $4
+             ) AS present",
+        )
+        .bind(repo)
+        .bind(ref_name)
+        .bind(old_sha)
+        .bind(new_sha)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<bool, _>("present"))
     }
 
     pub async fn list_arweave_anchors(
