@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::db::Db;
 
-use super::types::{AgentTaskReadType, RefUpdateType, RepoType};
+use super::types::{AgentTaskReadType, RefUpdateType, RepoType, TaskPageType};
 
 pub struct QueryRoot;
 
@@ -117,7 +117,7 @@ impl QueryRoot {
         limit: i64,
         after_created_at: Option<String>,
         after_id: Option<String>,
-    ) -> Result<Vec<AgentTaskReadType>> {
+    ) -> Result<TaskPageType> {
         let db = ctx.data_unchecked::<Arc<Db>>();
         // #268: gate rows via the same collector the REST list route uses (like
         // `ref_updates` shares `collect_visible_ref_updates` with its REST feed),
@@ -127,7 +127,9 @@ impl QueryRoot {
             .data::<crate::auth::AuthenticatedDid>()
             .ok()
             .map(|d| d.0.as_str());
-        let after = after_created_at.as_deref().zip(after_id.as_deref());
+        let after =
+            crate::api::tasks::parse_after_cursor(after_created_at.as_deref(), after_id.as_deref())
+                .map_err(crate::graphql::graphql_app_err)?;
         let result = crate::api::tasks::collect_visible_tasks(
             db,
             status.as_deref(),
@@ -138,11 +140,14 @@ impl QueryRoot {
         )
         .await
         .map_err(crate::graphql::graphql_app_err)?;
-        Ok(result
-            .tasks
-            .into_iter()
-            .map(AgentTaskReadType::from)
-            .collect())
+        Ok(TaskPageType {
+            items: result
+                .tasks
+                .into_iter()
+                .map(AgentTaskReadType::from)
+                .collect(),
+            incomplete: result.incomplete,
+        })
     }
 
     async fn task(&self, ctx: &Context<'_>, id: String) -> Result<Option<AgentTaskReadType>> {
@@ -487,7 +492,7 @@ mod tests {
     async fn tasks_negative_limit_clamped(pool: PgPool) {
         let db = db(pool).await;
         let schema = schema(db);
-        let resp = anon(&schema, "{ tasks(limit: -1) { id } }").await;
+        let resp = anon(&schema, "{ tasks(limit: -1) { items { id } } }").await;
         assert!(
             resp.errors.is_empty(),
             "negative limit must clamp, not fail: {:?}",
@@ -525,7 +530,7 @@ mod tests {
         // surface is visibility-gated, and an anonymous caller sees none of
         // these repo-less tasks at all. The clamp is what this test pins, so it
         // needs a caller who can legitimately see all 201 rows.
-        let resp = authed(&schema, "{ tasks(limit: 5000) { id } }", OWNER).await;
+        let resp = authed(&schema, "{ tasks(limit: 5000) { items { id } } }", OWNER).await;
         assert_eq!(count_tasks(&resp), 200, "limit above 200 must clamp to 200");
     }
 
@@ -562,7 +567,7 @@ mod tests {
         let db = db(pool).await;
         seed_task(&db, "t1", OWNER).await;
         let schema = schema(db);
-        let resp = anon(&schema, "{ tasks { id } }").await;
+        let resp = anon(&schema, "{ tasks { items { id } } }").await;
         assert_eq!(
             count_tasks(&resp),
             0,
@@ -641,11 +646,18 @@ mod tests {
         }
 
         let schema = schema(db);
-        let resp = anon(&schema, "{ tasks(limit: 1) { id } }").await;
+        let resp = anon(&schema, "{ tasks(limit: 1) { items { id } incomplete } }").await;
         assert_eq!(count_tasks(&resp), 1);
+        assert!(!task_incomplete(&resp));
         assert!(format!("{:?}", resp.data).contains("visible"));
     }
 
+    /// The candidate scan wall reports `incomplete: true` with no cursor
+    /// (#268 follow-up review): the server never discloses the id/created_at
+    /// of a denied row it stopped scanning on. A caller that wants to push
+    /// past the wall in one more request must supply `after`/`id` it already
+    /// legitimately knows, which this test stands in for directly rather than
+    /// reading it from a prior response, since none is offered.
     #[sqlx::test]
     async fn tasks_continuation_past_candidate_ceiling(pool: PgPool) {
         let db = db(pool).await;
@@ -678,26 +690,67 @@ mod tests {
         }
 
         let schema = schema(db);
-        let resp = anon(&schema, "{ tasks(limit: 1) { id } }").await;
+        let resp = anon(&schema, "{ tasks(limit: 1) { items { id } incomplete } }").await;
         assert_eq!(count_tasks(&resp), 0);
+        assert!(task_incomplete(&resp));
+        assert!(!format!("{:?}", resp.data).contains("hidden-"));
 
         let resp = anon(
             &schema,
-            r#"{ tasks(limit: 1, afterCreatedAt: "2026-01-02T00:00:00Z", afterId: "hidden-0999") { id } }"#,
+            r#"{ tasks(limit: 1, afterCreatedAt: "2026-01-02T00:00:00Z", afterId: "hidden-0999") { items { id } incomplete } }"#,
         )
         .await;
         assert_eq!(count_tasks(&resp), 1);
+        assert!(!task_incomplete(&resp));
         assert!(format!("{:?}", resp.data).contains("past-ceiling"));
     }
 
-    fn count_tasks(resp: &async_graphql::Response) -> usize {
+    #[sqlx::test]
+    async fn tasks_rejects_partial_cursor_pair(pool: PgPool) {
+        let db = db(pool).await;
+        let schema = schema(db);
+        let resp = anon(
+            &schema,
+            r#"{ tasks(afterCreatedAt: "2026-01-01T00:00:00Z") { items { id } } }"#,
+        )
+        .await;
+        assert!(
+            !resp.errors.is_empty(),
+            "a half-supplied cursor must be rejected, not treated as page one"
+        );
+    }
+
+    fn task_items(resp: &async_graphql::Response) -> &Vec<async_graphql::Value> {
         assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
         let async_graphql::Value::Object(obj) = &resp.data else {
             panic!("data not an object: {:?}", resp.data);
         };
-        let async_graphql::Value::List(rows) = obj.get("tasks").expect("tasks key") else {
-            panic!("tasks not a list");
+        let async_graphql::Value::Object(page) = obj.get("tasks").expect("tasks key") else {
+            panic!("tasks not an object");
         };
-        rows.len()
+        let async_graphql::Value::List(rows) = page.get("items").expect("items key") else {
+            panic!("items not a list");
+        };
+        rows
+    }
+
+    fn count_tasks(resp: &async_graphql::Response) -> usize {
+        task_items(resp).len()
+    }
+
+    fn task_incomplete(resp: &async_graphql::Response) -> bool {
+        assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
+        let async_graphql::Value::Object(obj) = &resp.data else {
+            panic!("data not an object: {:?}", resp.data);
+        };
+        let async_graphql::Value::Object(page) = obj.get("tasks").expect("tasks key") else {
+            panic!("tasks not an object");
+        };
+        let async_graphql::Value::Boolean(incomplete) =
+            page.get("incomplete").expect("incomplete key")
+        else {
+            panic!("incomplete not a bool");
+        };
+        *incomplete
     }
 }

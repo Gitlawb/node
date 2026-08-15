@@ -180,8 +180,15 @@ pub(crate) fn task_visible(
 #[derive(Debug, Clone)]
 pub(crate) struct VisibleTasks {
     pub tasks: Vec<AgentTask>,
+    /// True when the candidate scan hit `MAX_TASK_SCAN_CANDIDATES` before
+    /// filling `limit`, so the caller cannot tell an empty/short page from an
+    /// exhaustive one. Deliberately carries no cursor: the scan position at
+    /// that point is the last *examined* candidate, which may be a task the
+    /// caller was denied, and handing that back would let a denied read leak
+    /// the id/created_at of a row `GET /tasks/{id}` otherwise 404s (the same
+    /// id `claim_task` accepts). A caller can still page with
+    /// `after_created_at`/`after_id` set to the last row *they* received.
     pub incomplete: bool,
-    pub next_cursor: Option<(String, String)>,
 }
 
 /// Collect up to `limit` tasks visible to `caller`, applying the same gate the
@@ -203,14 +210,12 @@ pub(crate) async fn collect_visible_tasks(
         return Ok(VisibleTasks {
             tasks: Vec::new(),
             incomplete: false,
-            next_cursor: None,
         });
     }
     let mut visible = Vec::with_capacity(bounded_limit as usize);
     let mut cursor: Option<(String, String)> =
         after.map(|(ts, id)| (ts.to_string(), id.to_string()));
     let mut scanned = 0;
-    let mut last_examined: Option<(String, String)> = None;
 
     while scanned < MAX_TASK_SCAN_CANDIDATES {
         let batch_limit = MAX_VISIBLE_TASKS.min(MAX_TASK_SCAN_CANDIDATES - scanned);
@@ -231,7 +236,6 @@ pub(crate) async fn collect_visible_tasks(
         let next_cursor = tasks
             .last()
             .map(|task| (task.created_at.clone(), task.id.clone()));
-        last_examined = next_cursor.clone();
 
         let referenced: Vec<String> = tasks
             .iter()
@@ -264,12 +268,10 @@ pub(crate) async fn collect_visible_tasks(
     }
 
     let incomplete = visible.len() < bounded_limit as usize && scanned >= MAX_TASK_SCAN_CANDIDATES;
-    let next_cursor = if incomplete { last_examined } else { None };
 
     Ok(VisibleTasks {
         tasks: visible,
         incomplete,
-        next_cursor,
     })
 }
 
@@ -354,11 +356,12 @@ pub async fn list_tasks(
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> crate::error::Result<Json<Value>> {
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
-    let after = q
-        .after_created_at
-        .as_deref()
-        .or(q.cursor_created_at.as_deref())
-        .zip(q.after_id.as_deref().or(q.cursor_id.as_deref()));
+    let after = parse_after_cursor(
+        q.after_created_at
+            .as_deref()
+            .or(q.cursor_created_at.as_deref()),
+        q.after_id.as_deref().or(q.cursor_id.as_deref()),
+    )?;
     let result = collect_visible_tasks(
         &state.db,
         q.status.as_deref(),
@@ -369,18 +372,27 @@ pub async fn list_tasks(
     )
     .await?;
     let items: Vec<Value> = result.tasks.iter().map(task_to_read_json).collect();
-    let next_cursor = result.next_cursor.map(|(created_at, id)| {
-        json!({
-            "created_at": created_at,
-            "id": id,
-        })
-    });
     Ok(Json(json!({
         "tasks": items,
         "count": items.len(),
         "incomplete": result.incomplete,
-        "next_cursor": next_cursor,
     })))
+}
+
+/// A cursor is two independently optional query fields (`created_at`, `id`);
+/// treating a half-supplied pair as absent would silently restart the caller
+/// at page one instead of surfacing the lost half. Require both together.
+pub(crate) fn parse_after_cursor<'a>(
+    created_at: Option<&'a str>,
+    id: Option<&'a str>,
+) -> crate::error::Result<Option<(&'a str, &'a str)>> {
+    match (created_at, id) {
+        (Some(ts), Some(id)) => Ok(Some((ts, id))),
+        (None, None) => Ok(None),
+        _ => Err(AppError::BadRequest(
+            "after_created_at and after_id must be supplied together".into(),
+        )),
+    }
 }
 
 /// GET /api/v1/tasks/{id}
@@ -949,15 +961,23 @@ mod visible_tasks_tests {
         assert_eq!(body["count"], 0);
         assert_eq!(body["incomplete"], true);
         assert!(!body.to_string().contains("past-ceiling"));
+        assert!(
+            body.get("next_cursor").is_none(),
+            "response must not disclose the last examined (denied) row's id/created_at: {body}"
+        );
+        assert!(
+            !body.to_string().contains("hidden-"),
+            "response must not leak any denied row's id: {body}"
+        );
 
-        let next_cursor = &body["next_cursor"];
-        let cursor_ts = next_cursor["created_at"].as_str().expect("cursor ts");
-        let cursor_id = next_cursor["id"].as_str().expect("cursor id");
-
+        // No cursor is disclosed above, so resuming past the scan wall in one
+        // more request requires `after_created_at`/`after_id` the caller
+        // already legitimately knows. This stands in for that out-of-band
+        // knowledge with the last seeded row's known position.
         let resp = list_router(state)
             .oneshot(anon_get(&format!(
-                "/api/v1/tasks?limit=1&after_created_at={}&after_id={}",
-                cursor_ts, cursor_id
+                "/api/v1/tasks?limit=1&after_created_at=2026-01-02T00:00:00Z&after_id=hidden-{:04}",
+                MAX_TASK_SCAN_CANDIDATES - 1
             )))
             .await
             .unwrap();
@@ -965,6 +985,24 @@ mod visible_tasks_tests {
         assert_eq!(body["count"], 1);
         assert_eq!(body["incomplete"], false);
         assert_eq!(body["tasks"][0]["id"], "past-ceiling");
+    }
+
+    #[sqlx::test]
+    async fn list_tasks_rejects_partial_cursor_pair(pool: PgPool) {
+        let state = test_state(pool).await;
+        let resp = list_router(state.clone())
+            .oneshot(anon_get(
+                "/api/v1/tasks?after_created_at=2026-01-01T00:00:00Z",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = list_router(state)
+            .oneshot(anon_get("/api/v1/tasks?after_id=some-id"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[sqlx::test]
