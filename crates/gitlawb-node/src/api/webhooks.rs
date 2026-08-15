@@ -46,9 +46,10 @@ pub async fn create_webhook(
     // endpoints (SSRF). Delivery runs on the shared no-redirect client
     // (main.rs), which closes the 3xx-to-internal bounce.
     if !crate::api::peers::is_public_http_url(&req.url) {
-        return Err(AppError::BadRequest(
-            "webhook URL must be a public http(s) URL (no loopback, private, or .internal/.local hosts)".into(),
-        ));
+        return Err(AppError::BadRequest(format!(
+            "webhook URL {}",
+            crate::api::peers::PUBLIC_HTTP_URL_REQUIREMENT
+        )));
     }
 
     let events = req.events.unwrap_or_else(|| vec!["*".into()]);
@@ -141,7 +142,19 @@ pub async fn delete_webhook(
 
 #[cfg(test)]
 mod tests {
-    use crate::api::peers::is_public_http_url;
+    use axum::extract::{Extension, Path, State};
+    use axum::Json;
+    use chrono::Utc;
+    use gitlawb_core::identity::Keypair;
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    use super::{create_webhook, CreateWebhookRequest};
+    use crate::api::peers::{is_public_http_url, PUBLIC_HTTP_URL_REQUIREMENT};
+    use crate::auth::AuthenticatedDid;
+    use crate::db::RepoRecord;
+    use crate::error::AppError;
+    use crate::test_support::test_state;
 
     // create_webhook gates req.url through is_public_http_url. Pin the exact
     // SSRF targets from issue #81 so the webhook path can never regress to the
@@ -152,6 +165,7 @@ mod tests {
             "http://127.0.0.1:5432/",
             "http://169.254.169.254/latest/meta-data/",
             "http://localhost/",
+            "http://node.localhost/",
             "http://10.0.0.5/",
             "http://[::1]/",
             // IPv6 transition encodings smuggling loopback v4 (6to4 / NAT64).
@@ -168,5 +182,54 @@ mod tests {
     fn webhook_url_gate_allows_public_targets() {
         assert!(is_public_http_url("https://hooks.example.com/gitlawb"));
         assert!(is_public_http_url("http://203.0.113.10:7545/"));
+    }
+
+    #[sqlx::test]
+    async fn webhook_localhost_rejection_uses_shared_public_url_contract(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = Keypair::generate().did().to_string();
+        let repo_id = Uuid::new_v4().to_string();
+        state
+            .db
+            .create_repo(&RepoRecord {
+                id: repo_id.clone(),
+                name: "webhook-contract".to_string(),
+                owner_did: owner.clone(),
+                description: None,
+                is_public: true,
+                default_branch: "main".to_string(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                disk_path: "/tmp/webhook-contract.git".to_string(),
+                forked_from: None,
+                machine_id: None,
+            })
+            .await
+            .unwrap();
+
+        let result = create_webhook(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.clone())),
+            Path((owner, "webhook-contract".to_string())),
+            Json(CreateWebhookRequest {
+                url: "https://node.localhost/hook".to_string(),
+                secret: None,
+                events: None,
+            }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::BadRequest(message)) => assert_eq!(
+                message,
+                format!("webhook URL {PUBLIC_HTTP_URL_REQUIREMENT}")
+            ),
+            Err(error) => panic!("unexpected webhook rejection: {error}"),
+            Ok(_) => panic!("a .localhost webhook must be rejected"),
+        }
+        assert!(
+            state.db.list_webhooks(&repo_id).await.unwrap().is_empty(),
+            "a rejected .localhost webhook must leave no row behind"
+        );
     }
 }

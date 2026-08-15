@@ -1043,19 +1043,14 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE repos ADD COLUMN IF NOT EXISTS mirror_transition_id UUID",
             "ALTER TABLE repos ADD COLUMN IF NOT EXISTS mirror_transition_phase TEXT",
             "ALTER TABLE repos ADD COLUMN IF NOT EXISTS mirror_updated_at TEXT",
-            // PostgreSQL has no ADD CONSTRAINT IF NOT EXISTS, so guard by name
-            // to keep manual/idempotent recovery safe.
-            r#"DO $$
-               BEGIN
-                   IF NOT EXISTS (
-                       SELECT 1 FROM pg_constraint
-                       WHERE conrelid = 'repos'::regclass
-                         AND conname = 'repos_mirror_state_valid'
-                   ) THEN
-                       -- PostgreSQL accepts a CHECK whose result is NULL. Wrap
-                       -- the complete invariant in IS TRUE so a missing status
-                       -- or phase cannot slip through three-valued logic.
-                       ALTER TABLE repos ADD CONSTRAINT repos_mirror_state_valid CHECK ((
+            // A constraint name does not prove its definition. Replace any
+            // same-named manual or partial-recovery artifact before installing
+            // the exact invariant this migration promises.
+            "ALTER TABLE repos DROP CONSTRAINT IF EXISTS repos_mirror_state_valid",
+            // PostgreSQL accepts a CHECK whose result is NULL. Wrap the complete
+            // invariant in IS TRUE so a missing status or phase cannot slip
+            // through three-valued logic.
+            r#"ALTER TABLE repos ADD CONSTRAINT repos_mirror_state_valid CHECK ((
                            (
                                upstream_url IS NULL
                                AND mirror_status IS NULL
@@ -1098,10 +1093,7 @@ const MIGRATIONS: &[Migration] = &[
                                    )
                                )
                            )
-                       ) IS TRUE) NOT VALID;
-                   END IF;
-               END
-               $$"#,
+                       ) IS TRUE) NOT VALID"#,
         ],
     },
     Migration {
@@ -3540,6 +3532,60 @@ mod mirror_state_tests {
 
         // Production entry point remains idempotent after the upgrade.
         db.run_migrations().await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn migration_replaces_a_same_named_weaker_constraint(pool: PgPool) {
+        let db = migrated_db(pool).await;
+
+        sqlx::query("ALTER TABLE repos DROP CONSTRAINT repos_mirror_state_valid")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "ALTER TABLE repos ADD CONSTRAINT repos_mirror_state_valid CHECK (TRUE) NOT VALID",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version IN (30, 31)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        db.run_migrations().await.unwrap();
+
+        let definition: String = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(oid)
+             FROM pg_constraint
+             WHERE conrelid = 'repos'::regclass
+               AND conname = 'repos_mirror_state_valid'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(
+            definition.contains("transitioning_inbound_to_outbound")
+                && !definition.eq_ignore_ascii_case("CHECK (true)"),
+            "migration preserved an impostor constraint: {definition}"
+        );
+
+        let existing = repo(Uuid::new_v4());
+        db.create_repo(&existing).await.unwrap();
+        let malformed = sqlx::query(
+            "UPDATE repos
+             SET upstream_url = 'https://github.com/Gitlawb/node.git',
+                 mirror_status = 'transitioning_inbound_to_outbound',
+                 mirror_updated_at = '2026-08-14T00:00:00Z'
+             WHERE id = $1",
+        )
+        .bind(&existing.id)
+        .execute(db.pool())
+        .await;
+        assert!(
+            malformed.is_err(),
+            "replacement constraint accepted missing transition metadata"
+        );
     }
 
     #[sqlx::test]

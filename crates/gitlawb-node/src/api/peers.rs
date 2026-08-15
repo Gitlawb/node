@@ -70,6 +70,8 @@ pub struct PeerResponse {
     pub reachable: bool,
 }
 
+pub(crate) const PUBLIC_HTTP_URL_REQUIREMENT: &str = "must be a public http(s) URL (no loopback, private, localhost, .localhost, .internal, or .local hosts)";
+
 /// Extract an IPv4 address embedded in an IPv6 literal across the transition
 /// formats that carry one: IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible
 /// (`::a.b.c.d`), 6to4 (`2002:WWXX:YYZZ::/16`), and the NAT64 well-known prefix
@@ -249,9 +251,9 @@ pub async fn announce(
     // and turn our outbound sync-notify fan-out into an SSRF probe — and bury
     // the real peers under junk so node-origin repos stop replicating.
     if !is_public_http_url(&req.http_url) {
-        return Err(AppError::BadRequest(
-            "http_url must be a public http(s) URL (no loopback, private, localhost, .localhost, .internal, or .local hosts)".into(),
-        ));
+        return Err(AppError::BadRequest(format!(
+            "http_url {PUBLIC_HTTP_URL_REQUIREMENT}"
+        )));
     }
 
     // Reject self-announcements: a peer row whose http_url is our own public
