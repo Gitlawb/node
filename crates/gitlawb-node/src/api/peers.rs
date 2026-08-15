@@ -118,11 +118,11 @@ pub fn is_public_http_url(raw: &str) -> bool {
         Some(h) => h.to_ascii_lowercase(),
         None => return false,
     };
-    // Drop a single trailing dot (FQDN root): `localhost.` resolves the same as
+    // Drop trailing dots (FQDN root): `localhost.` resolves the same as
     // `localhost`, so normalize before the suffix/equality checks below.
-    if let Some(stripped) = host.strip_suffix('.') {
-        host = stripped.to_string();
-    }
+    // Strip to fixation rather than once, or `localhost..` reduces to
+    // `localhost.` and matches neither the equality nor the suffix check.
+    host.truncate(host.trim_end_matches('.').len());
     if host.is_empty()
         || host == "localhost"
         || host.ends_with(".local")
@@ -167,8 +167,13 @@ pub fn is_public_http_url(raw: &str) -> bool {
             }
             std::net::IpAddr::V6(v6) => {
                 let s = v6.segments();
-                // fc00::/7 (unique-local) or fe80::/10 (link-local)
-                if (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80 {
+                // fc00::/7 (unique-local), fe80::/10 (link-local), or fec0::/10
+                // (site-local, deprecated by RFC 3879 and so never a legitimate
+                // peer address, but still routable on networks that kept it).
+                if (s[0] & 0xfe00) == 0xfc00
+                    || (s[0] & 0xffc0) == 0xfe80
+                    || (s[0] & 0xffc0) == 0xfec0
+                {
                     return false;
                 }
                 // Any NAT64 address (64:ff9b::/32) that is not the cleanly
@@ -183,6 +188,13 @@ pub fn is_public_http_url(raw: &str) -> bool {
                 }
             }
         }
+    } else if !host.contains('.') {
+        // A name with no dot at all. The `.local` / `.internal` rules above are
+        // suffix checks, so a single label slips both, and the resolver decides
+        // what it means by appending a search domain we cannot see from here.
+        // Only reachable when the host did not parse as an IP literal, which is
+        // what keeps bracketed IPv6 (also dotless) on the accepting path.
+        return false;
     }
     true
 }
@@ -573,6 +585,46 @@ mod tests {
             // rejected: the block is prefix-based, not payload-based.
             "http://[64:ff9b:1::cb00:710a]/",
         ] {
+            assert!(!is_public_http_url(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_dotless_single_label_hosts() {
+        // `.local` and `.internal` are suffix checks, so a name with no dot at
+        // all never matches one. A single-label name is completed by whatever
+        // search domain the resolver is configured with, which is not a
+        // destination we can reason about from the URL.
+        for bad in [
+            "http://local/",
+            "http://internal/",
+            "http://intranet/",
+            "http://wpad/",
+            "http://metadata/",
+            "http://local./",
+            "http://internal.:7545",
+        ] {
+            assert!(!is_public_http_url(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_deprecated_site_local_v6() {
+        // fec0::/10, deprecated by RFC 3879. The link-local mask (0xffc0 ==
+        // 0xfe80) does not cover it: 0xfec0 & 0xffc0 is 0xfec0.
+        for bad in ["http://[fec0::1]/", "http://[feff:ffff::1]:7545"] {
+            assert!(!is_public_http_url(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_repeated_trailing_root_dots() {
+        // Stripping a single root dot leaves `localhost.`, which matches
+        // neither the equality nor the suffix check. The subdomain form
+        // (`node.localhost..`) is not asserted here: `.localhost` is not yet a
+        // rejected suffix on this base, so that case belongs to whichever
+        // change adds it rather than to this one.
+        for bad in ["http://localhost../", "http://localhost...:7545"] {
             assert!(!is_public_http_url(bad), "{bad:?} must be rejected");
         }
     }
