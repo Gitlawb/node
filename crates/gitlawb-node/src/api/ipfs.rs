@@ -824,6 +824,14 @@ pub async fn get_by_cid(
                     throttled = true;
                     continue;
                 }
+                // The provenance path targets a bounded source list rather than the
+                // table, so there is no scan position to resume from: taint and move on,
+                // exactly as before. Only the visit ceiling can reach here (the probe
+                // ceiling is `legacy_scan`-only).
+                GateOutcome::CeilingStop(reason) => {
+                    record_scan_truncation(&mut walk, &mut scan_continuation, reason, None);
+                    continue;
+                }
                 GateOutcome::Skip => continue,
             }
         }
@@ -958,13 +966,21 @@ pub async fn get_by_cid(
                     // byte-identical to the wrapped-scan answer that tells the caller
                     // their ladder is over.
                     if walk.probes >= state.ipfs_max_legacy_probes {
-                        walk.taint("probe-ceiling");
-                        scan_continuation = pager.cursor.clone();
+                        record_scan_truncation(
+                            &mut walk,
+                            &mut scan_continuation,
+                            "probe-ceiling",
+                            pager.cursor.clone(),
+                        );
                         break;
                     }
                     if walk.visits >= state.config.ipfs_max_repo_visits {
-                        walk.taint("visit-ceiling");
-                        scan_continuation = pager.cursor.clone();
+                        record_scan_truncation(
+                            &mut walk,
+                            &mut scan_continuation,
+                            "visit-ceiling",
+                            pager.cursor.clone(),
+                        );
                         break;
                     }
                     // Row ceiling (F2). The two checks above only bind once a probe or a
@@ -974,8 +990,12 @@ pub async fn get_by_cid(
                     // probes, anonymously, while holding a scarce walk permit. This is
                     // the check that actually stops that scan.
                     if pager.fetched_rows >= state.ipfs_max_legacy_scan_rows {
-                        walk.taint("row-ceiling");
-                        scan_continuation = pager.cursor.clone();
+                        record_scan_truncation(
+                            &mut walk,
+                            &mut scan_continuation,
+                            "row-ceiling",
+                            pager.cursor.clone(),
+                        );
                         break;
                     }
                     // Rule-bytes ceiling: the row ceiling bounds rows, not the rules each
@@ -984,8 +1004,12 @@ pub async fn get_by_cid(
                     // tail is never materialized; `fetch_next_page` drops the rows behind
                     // it and the request that asked for them is the one that truncates.
                     if pager.rule_bytes_exceeded {
-                        walk.taint("rules-ceiling");
-                        scan_continuation = pager.cursor.clone();
+                        record_scan_truncation(
+                            &mut walk,
+                            &mut scan_continuation,
+                            "rules-ceiling",
+                            pager.cursor.clone(),
+                        );
                         break;
                     }
                     // Page toll (F2). Every page is work bought by an anonymous caller,
@@ -1038,6 +1062,32 @@ pub async fn get_by_cid(
                     // A throttled walk-requiring candidate is skipped, not fatal:
                     // keep scanning for a later walk-free copy (#173 review, F-C).
                     GateOutcome::Throttled => throttled = true,
+                    // A ceiling refused THIS row, so the resume position is the row in
+                    // front of it, not `pager.cursor`, which by now sits at the end of
+                    // the fetched page and would skip every row the ceiling refused. The
+                    // four arms at the top of the loop seal `pager.cursor` legitimately:
+                    // they only fire once every fetched row has been walked.
+                    //
+                    // Stopping here rather than skipping on is also why the FINAL page is
+                    // covered: the `pager.exhausted` break sits ahead of every mint arm,
+                    // so a ceiling reached while walking the last page used to shed with
+                    // no token at all.
+                    GateOutcome::CeilingStop(reason) => {
+                        // Nothing in front of it means nothing was settled, so there is
+                        // no position to seal and this stop contributes none. The first
+                        // oid candidate cannot get here (the ceiling arms above run
+                        // before every fetch, so a spent budget breaks there instead);
+                        // a LATER candidate can, because it re-walks the already-fetched
+                        // rows from the front without passing those arms. Sealing
+                        // `pager.cursor` for it would push the resume position past rows
+                        // that candidate never examined.
+                        let resume = (idx >= 2).then(|| {
+                            let prev = &pager.rows[idx - 2];
+                            (prev.created_at_key.clone(), prev.repo.id.clone())
+                        });
+                        record_scan_truncation(&mut walk, &mut scan_continuation, reason, resume);
+                        break;
+                    }
                     GateOutcome::Skip => {}
                 }
             }
@@ -1058,9 +1108,13 @@ pub async fn get_by_cid(
     //
     // A wrapped scan emits NO continuation: there is nothing left to resume, and the
     // absence of the token is what tells the caller their ladder is over.
-    if pager.resumed && pager.exhausted {
+    //
+    // Gated on nothing having been sealed: a ceiling can stop a resumed scan PART WAY
+    // through the last page, which leaves `exhausted` set with rows still unwalked in
+    // front of the cursor. Clearing the seal there would strand exactly those rows,
+    // which is the same tokenless dead end this clause exists to describe honestly.
+    if pager.resumed && pager.exhausted && scan_continuation.is_none() {
         walk.taint("scan-wrapped");
-        scan_continuation = None;
     }
 
     // Nothing served — four distinct tails, in precedence order:
@@ -1151,6 +1205,36 @@ enum GateOutcome {
     /// A walk-requiring candidate hit the per-IP walk quota; skip it but let the caller
     /// record the throttle so a later walk-free copy can still serve.
     Throttled,
+    /// A per-request CEILING (probes, repo visits) refused this row before it could reach
+    /// a verdict, and will refuse every row after it too. Distinct from `Skip` because the
+    /// caller must both taint AND seal a resume position in front of this row: the taint
+    /// alone sheds a 503 whose missing token reads as "ladder over", stranding this row
+    /// and everything behind it on an inventory that never changes.
+    CeilingStop(&'static str),
+}
+
+/// The one site that records a scan truncation: taint the walk with the reason and seal
+/// the position the caller echoes back, together.
+///
+/// Keeping the two together is the point. Every earlier drip on this path was a ceiling
+/// that tainted somewhere the mint could not see, so the shed carried no token.
+///
+/// The position only ever moves FORWARD. A later oid candidate re-walks the same fetched
+/// rows from the front with the request's budget already spent, so it stops earlier than
+/// the candidate before it; letting that overwrite the seal would hand back a token the
+/// caller already echoed and the ladder would never advance.
+fn record_scan_truncation(
+    walk: &mut WalkState,
+    slot: &mut Option<(String, String)>,
+    reason: &'static str,
+    pos: Option<(String, String)>,
+) {
+    walk.taint(reason);
+    if let Some(pos) = pos {
+        if slot.as_ref().is_none_or(|sealed| pos > *sealed) {
+            *slot = Some(pos);
+        }
+    }
 }
 
 /// Outcome of the bounded, off-worker object read for one gated candidate (F6, #173).
@@ -1323,9 +1407,10 @@ async fn gate_and_serve(
     if legacy_scan {
         if walk.probes >= state.ipfs_max_legacy_probes {
             // Budget spent: stop probing and mark the scan truncated so the tail
-            // reports an incomplete search (503), not a false 404 (#173, F2).
-            walk.taint("probe-ceiling");
-            return GateOutcome::Skip;
+            // reports an incomplete search (503), not a false 404 (#173, F2). The
+            // CALLER records it, because the resume position belongs to the row this
+            // refused and only the caller knows it.
+            return GateOutcome::CeilingStop("probe-ceiling");
         }
         if let Some(key) =
             crate::rate_limit::client_key(ctx.headers, ctx.peer, state.push_limiter_trust)
@@ -1346,8 +1431,7 @@ async fn gate_and_serve(
             "/ipfs request hit the per-request repo-visit ceiling \
              (GITLAWB_IPFS_MAX_REPO_VISITS); skipping repo without a verdict"
         );
-        walk.taint("visit-ceiling");
-        return GateOutcome::Skip;
+        return GateOutcome::CeilingStop("visit-ceiling");
     }
     walk.visits += 1;
 
@@ -5002,6 +5086,235 @@ mod tests {
             served_at.is_some(),
             "a holder past the probe ceiling must be reached within {bound} \
              token-echoing requests, not stranded forever"
+        );
+    }
+
+    /// The probe ceiling must ladder past the row it STOPPED ON, not past the page.
+    ///
+    /// The sibling test above sets `ipfs_legacy_scan_page_rows == ipfs_max_legacy_probes`,
+    /// so the budget runs out exactly at a page boundary and the page-boundary cursor
+    /// happens to be the right resume point. Misalign the two and it is not: the ceiling
+    /// taints INSIDE `gate_and_serve`, the loop keeps consuming the rest of the page as
+    /// `Skip`, and the mint arms at the top of the loop seal `pager.cursor`, which by
+    /// then sits PAST every row the ceiling refused to probe. Those rows are skipped on
+    /// the resume as well, and the inventory is stable, so every ladder step reproduces
+    /// the same gap.
+    ///
+    /// Two rows, one probe: the filler spends the budget, the holder is the row the
+    /// ceiling stops on.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_probe_ceiling_ladders_past_the_row_it_stopped_on(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool.clone());
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 1024;
+        // Deliberately NOT equal to the page size: one probe, two rows per page.
+        state.ipfs_max_legacy_probes = 1;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1024, std::time::Duration::from_secs(3600));
+
+        seed_root_readable_repos(&state, "midpage", 1).await;
+        stamp_scan_order(&pool, "z6readablemidpage/midpage-0000", 0).await;
+        let (holder_id, oid) = seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6midpage",
+            "holder",
+            b"stopped on this row\n",
+        )
+        .await;
+        stamp_scan_order(&pool, &holder_id, 1).await;
+        let cid = seed_legacy_pin_for_oid(&state, &oid).await;
+
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.161:5000".parse().unwrap();
+
+        let mut token: Option<String> = None;
+        let mut served_at = None;
+        for step in 1..=4 {
+            let (status, body) = status_and_body(
+                router
+                    .clone()
+                    .oneshot(get_cid_scan(&cid, Some(peer), token.as_deref()))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            if status == StatusCode::OK {
+                served_at = Some(step);
+                break;
+            }
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "an intermediate rung is the retryable 503 (step {step}): {body}"
+            );
+            token = Some(continuation_of(&body).unwrap_or_else(|| {
+                panic!("the probe-ceiling shed at step {step} must carry a continuation: {body}")
+            }));
+        }
+        assert!(
+            served_at.is_some(),
+            "the row the probe ceiling stopped on must be reachable on the ladder; \
+             a cursor sealed past it strands it on every retry"
+        );
+    }
+
+    /// A ceiling reached on the FINAL page must still mint a continuation.
+    ///
+    /// `pager.exhausted` breaks at the top of the loop AHEAD of every mint arm, so a
+    /// probe or visit ceiling that taints inside `gate_and_serve` while the last page is
+    /// being walked sheds `search_incomplete` with no token at all. `gl ipfs get` reads a
+    /// tokenless shed as "the ladder is over" (that is the wrapped-scan contract), so a
+    /// holder on that page is unreachable, permanently, on an inventory that never
+    /// changes.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_probe_ceiling_on_the_final_page_still_mints_a_continuation(
+        pool: sqlx::PgPool,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool.clone());
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        // One page holds the whole inventory, so the scan is exhausted the moment it
+        // starts and the break at `pager.exhausted` is the one that fires.
+        state.ipfs_legacy_scan_page_rows = 8;
+        state.ipfs_max_legacy_scan_rows = 1024;
+        state.ipfs_max_legacy_probes = 1;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1024, std::time::Duration::from_secs(3600));
+
+        seed_root_readable_repos(&state, "finalpage", 1).await;
+        stamp_scan_order(&pool, "z6readablefinalpage/finalpage-0000", 0).await;
+        let (holder_id, oid) = seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6finalpage",
+            "holder",
+            b"on the last page\n",
+        )
+        .await;
+        stamp_scan_order(&pool, &holder_id, 1).await;
+        let cid = seed_legacy_pin_for_oid(&state, &oid).await;
+
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.162:5000".parse().unwrap();
+
+        let (status, body) = status_and_body(
+            router
+                .clone()
+                .oneshot(get_cid_scan(&cid, Some(peer), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a probe ceiling on the final page is an incomplete search, not a verdict: {body}"
+        );
+        let token = continuation_of(&body).unwrap_or_else(|| {
+            panic!(
+                "a ceiling reached on the final page must still carry a continuation; \
+                 a tokenless shed tells the caller their ladder is over: {body}"
+            )
+        });
+        let (status, body) = status_and_body(
+            router
+                .oneshot(get_cid_scan(&cid, Some(peer), Some(&token)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "echoing the final-page continuation must reach the holder: {body}"
+        );
+    }
+
+    /// A ceiling on the final page of a RESUMED scan must keep its continuation.
+    ///
+    /// `pager.resumed && pager.exhausted` is the wrapped-scan tail: the caller has walked
+    /// to the end of the table, so there is nothing left to resume and the absent token
+    /// is the signal. That is only true when the walk actually reached the end. A ceiling
+    /// stopping part way through the last page leaves rows unwalked in front of the
+    /// cursor, and clearing the seal there strands them exactly as a tokenless shed does.
+    ///
+    /// Four rows, three per page, one probe: the third rung is the one that resumes into
+    /// a short page and stops on the holder.
+    ///
+    /// MUTATION (RED): drop `scan_continuation.is_none()` from the wrap clause.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_ceiling_on_a_resumed_final_page_keeps_its_continuation(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool.clone());
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 3;
+        state.ipfs_max_legacy_scan_rows = 1024;
+        state.ipfs_max_legacy_probes = 1;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1024, std::time::Duration::from_secs(3600));
+
+        seed_root_readable_repos(&state, "wrapguard", 3).await;
+        for i in 0..3 {
+            stamp_scan_order(&pool, &format!("z6readablewrapguard/wrapguard-{i:04}"), i).await;
+        }
+        let (holder_id, oid) = seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6wrapguard",
+            "holder",
+            b"behind a resumed ceiling\n",
+        )
+        .await;
+        stamp_scan_order(&pool, &holder_id, 3).await;
+        let cid = seed_legacy_pin_for_oid(&state, &oid).await;
+
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.163:5000".parse().unwrap();
+
+        let mut token: Option<String> = None;
+        let mut served_at = None;
+        for step in 1..=6 {
+            let (status, body) = status_and_body(
+                router
+                    .clone()
+                    .oneshot(get_cid_scan(&cid, Some(peer), token.as_deref()))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            if status == StatusCode::OK {
+                served_at = Some(step);
+                break;
+            }
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "an intermediate rung is the retryable 503 (step {step}): {body}"
+            );
+            token = Some(
+                continuation_of(&body)
+                    .unwrap_or_else(|| panic!("rung {step} must carry a continuation: {body}")),
+            );
+        }
+        assert!(
+            served_at.is_some(),
+            "a ceiling that stops part way through the last page of a resumed scan must \
+             still ladder; the wrap tail is for a walk that reached the end"
         );
     }
 
