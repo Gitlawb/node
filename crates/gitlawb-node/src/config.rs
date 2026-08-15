@@ -152,17 +152,6 @@ pub struct Config {
     )]
     pub upstream_mirror_page_size: usize,
 
-    /// Exact upstream hostnames permitted to resolve to RFC1918/ULA addresses,
-    /// for operator-approved GitHub Enterprise or other on-prem forges.
-    /// Public addresses need no entry. Loopback and link-local destinations are
-    /// always rejected, even when listed. Wildcards are not supported.
-    #[arg(
-        long,
-        env = "GITLAWB_UPSTREAM_MIRROR_ALLOWED_PRIVATE_HOSTS",
-        value_delimiter = ','
-    )]
-    pub upstream_mirror_allowed_private_hosts: Vec<String>,
-
     /// Irys URL for Arweave permanent anchoring.
     /// Leave empty to disable. Use https://devnet.irys.xyz for free devnet.
     #[arg(long, env = "GITLAWB_IRYS_URL", default_value = "")]
@@ -655,7 +644,6 @@ mod tests {
         assert_eq!(config.upstream_mirror_interval_secs, 300);
         assert_eq!(config.upstream_mirror_fetch_timeout_secs, 600);
         assert_eq!(config.upstream_mirror_page_size, 100);
-        assert!(config.upstream_mirror_allowed_private_hosts.is_empty());
         config.validate().unwrap();
 
         assert!(

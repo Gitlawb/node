@@ -8,7 +8,7 @@
 //! recursion, and non-HTTPS protocols are disabled at the command boundary.
 
 use anyhow::{Context, Result};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -21,12 +21,11 @@ use crate::git::repo_store::RepoStore;
 use crate::state::{repo_identity_key, RepoWriteLeases};
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_PINNED_ADDRESSES: usize = 32;
 const MIN_CURL_OPT_RESOLVE_GIT: (u64, u64) = (2, 37);
 
-#[derive(Debug, Clone)]
-struct EgressPolicy {
-    allowed_private_hosts: HashSet<String>,
-}
+#[derive(Debug, Clone, Copy)]
+struct EgressPolicy;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PinnedUpstream {
@@ -35,16 +34,6 @@ struct PinnedUpstream {
 }
 
 impl EgressPolicy {
-    fn new(allowed_private_hosts: &[String]) -> Result<Self> {
-        let allowed_private_hosts = allowed_private_hosts
-            .iter()
-            .map(|host| normalize_allowlisted_host(host))
-            .collect::<Result<HashSet<_>>>()?;
-        Ok(Self {
-            allowed_private_hosts,
-        })
-    }
-
     async fn resolve(&self, url: reqwest::Url) -> Result<PinnedUpstream> {
         let raw_host = url.host_str().context("mirror upstream URL has no host")?;
         let connect_host = raw_host
@@ -53,13 +42,12 @@ impl EgressPolicy {
             .to_ascii_lowercase();
         let policy_host = normalize_policy_host(&connect_host);
         reject_always_local_hostname(&policy_host)?;
-        let allow_private = self.allowed_private_hosts.contains(&policy_host);
         let port = url
             .port_or_known_default()
             .context("mirror upstream URL has no known port")?;
 
         if let Ok(ip) = connect_host.parse::<IpAddr>() {
-            self.validate_addresses(&policy_host, &[ip], allow_private)?;
+            self.validate_addresses(&policy_host, &[ip])?;
             return Ok(PinnedUpstream {
                 url: url.to_string(),
                 // An IP literal performs no DNS lookup, so there is no rebinding
@@ -80,7 +68,7 @@ impl EgressPolicy {
             anyhow::bail!("mirror upstream host resolved to no addresses");
         }
         let addresses: Vec<IpAddr> = addresses.into_iter().collect();
-        self.validate_addresses(&policy_host, &addresses, allow_private)?;
+        self.validate_addresses(&policy_host, &addresses)?;
 
         let pinned = addresses
             .iter()
@@ -96,14 +84,14 @@ impl EgressPolicy {
         })
     }
 
-    fn validate_addresses(
-        &self,
-        host: &str,
-        addresses: &[IpAddr],
-        allow_private: bool,
-    ) -> Result<()> {
+    fn validate_addresses(&self, host: &str, addresses: &[IpAddr]) -> Result<()> {
+        if addresses.is_empty() || addresses.len() > MAX_PINNED_ADDRESSES {
+            anyhow::bail!(
+                "mirror upstream host must resolve to 1..={MAX_PINNED_ADDRESSES} addresses"
+            );
+        }
         for &ip in addresses {
-            if !address_is_permitted(ip, allow_private) {
+            if !address_is_permitted(ip) {
                 anyhow::bail!("mirror upstream host {host:?} resolved to disallowed address {ip}");
             }
         }
@@ -120,57 +108,21 @@ fn reject_always_local_hostname(host: &str) -> Result<()> {
         || host == "localhost"
         || host.ends_with(".localhost")
         || host.ends_with(".local")
+        || host.ends_with(".internal")
     {
         anyhow::bail!("mirror upstream host is local-only and cannot be fetched");
     }
     Ok(())
 }
 
-fn normalize_allowlisted_host(raw: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty()
-        || trimmed.contains(|c: char| c.is_whitespace() || c.is_control())
-        || trimmed.contains(['/', '?', '#', '@', '*'])
-    {
-        anyhow::bail!("invalid private mirror host allowlist entry {raw:?}");
-    }
-    let unbracketed = trimmed
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .unwrap_or(trimmed);
-    let normalized = normalize_policy_host(unbracketed);
-    reject_always_local_hostname(&normalized)?;
-
-    if normalized.parse::<IpAddr>().is_err()
-        && !normalized
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-    {
-        anyhow::bail!("invalid private mirror host allowlist entry {raw:?}");
-    }
-    Ok(normalized)
-}
-
-fn address_is_permitted(ip: IpAddr, allow_private: bool) -> bool {
+fn address_is_permitted(ip: IpAddr) -> bool {
     // Broadcast/multicast/reserved destinations are never forge endpoints.
     match ip {
         IpAddr::V4(v4) if v4.octets()[0] >= 224 => return false,
         IpAddr::V6(v6) if v6.is_multicast() => return false,
         _ => {}
     }
-    if crate::api::peers::is_public_ip(ip) {
-        return true;
-    }
-    if !allow_private {
-        return false;
-    }
-    // An exact operator allowlist may admit only normal private address space
-    // used by an on-prem forge. Loopback, link-local, CGNAT, unspecified, and
-    // transition encodings remain denied because neither arm includes them.
-    match ip {
-        IpAddr::V4(v4) => v4.is_private(),
-        IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00,
-    }
+    crate::api::peers::is_public_ip(ip)
 }
 
 fn parse_git_version(output: &str) -> Option<(u64, u64)> {
@@ -204,6 +156,9 @@ fn ensure_safe_git_runtime(git_bin: &str) -> Result<()> {
 }
 
 fn fetch_args(upstream: &PinnedUpstream) -> Vec<String> {
+    let http_scope = |name: &str, value: &str| format!("http.{}.{name}={value}", upstream.url);
+    let credential_scope =
+        |name: &str, value: &str| format!("credential.{}.{name}={value}", upstream.url);
     let mut args = vec![
         "-c".to_string(),
         "http.proxy=".to_string(),
@@ -224,17 +179,54 @@ fn fetch_args(upstream: &PinnedUpstream) -> Vec<String> {
         "http.saveCookies=false".to_string(),
         "-c".to_string(),
         "http.sslVerify=true".to_string(),
+        // URL-specific configuration outranks generic `http.*` values even
+        // when the generic value came from `-c`. Repeat every security control
+        // at the exact validated URL so a repository-local scoped setting
+        // cannot re-enable redirects/proxies/headers/cookies or disable TLS.
+        "-c".to_string(),
+        http_scope("proxy", ""),
+        "-c".to_string(),
+        http_scope("followRedirects", "false"),
+        "-c".to_string(),
+        http_scope("curloptResolve", ""),
+        "-c".to_string(),
+        http_scope("extraHeader", ""),
+        "-c".to_string(),
+        http_scope("cookieFile", ""),
+        "-c".to_string(),
+        http_scope("saveCookies", "false"),
+        "-c".to_string(),
+        http_scope("sslVerify", "true"),
+        "-c".to_string(),
+        http_scope("sslCert", ""),
+        "-c".to_string(),
+        http_scope("sslKey", ""),
     ];
     if let Some(resolve) = &upstream.curlopt_resolve {
-        args.extend(["-c".to_string(), format!("http.curloptResolve={resolve}")]);
+        args.extend([
+            "-c".to_string(),
+            format!("http.curloptResolve={resolve}"),
+            "-c".to_string(),
+            http_scope("curloptResolve", resolve),
+        ]);
     }
     args.extend([
         "-c".to_string(),
         "credential.helper=".to_string(),
         "-c".to_string(),
+        credential_scope("helper", ""),
+        "-c".to_string(),
+        "credential.interactive=false".to_string(),
+        "-c".to_string(),
         "core.askPass=false".to_string(),
         "-c".to_string(),
         "fetch.recurseSubmodules=false".to_string(),
+        "-c".to_string(),
+        // Do not let a smart server or repository-local config introduce a
+        // second, unvalidated pack/bundle URL outside the pinned upstream.
+        "fetch.uriprotocols=".to_string(),
+        "-c".to_string(),
+        "fetch.bundleURI=".to_string(),
         "-c".to_string(),
         "protocol.allow=never".to_string(),
         "-c".to_string(),
@@ -254,6 +246,32 @@ fn fetch_args(upstream: &PinnedUpstream) -> Vec<String> {
     args
 }
 
+fn reject_local_url_rewrite(
+    git_bin: &str,
+    repo_path: &Path,
+    upstream_url: &str,
+    deadline: Instant,
+) -> Result<()> {
+    let args = ["ls-remote", "--get-url", upstream_url];
+    let (status, stdout, stderr) = crate::git::visibility_pack::run_bounded_git_raw_isolated_https(
+        git_bin, &args, repo_path, b"", deadline,
+    )?;
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
+        anyhow::bail!(
+            "checking mirror upstream URL rewrite failed: {}",
+            stderr.chars().take(4_096).collect::<String>()
+        );
+    }
+    let expanded = std::str::from_utf8(&stdout)
+        .context("Git returned a non-UTF-8 expanded mirror upstream URL")?
+        .trim_end_matches(['\r', '\n']);
+    if expanded != upstream_url {
+        anyhow::bail!("repository-local Git config attempted to rewrite the mirror upstream URL");
+    }
+    Ok(())
+}
+
 fn run_fetch(
     git_bin: &str,
     repo_path: &Path,
@@ -265,9 +283,11 @@ fn run_fetch(
     let deadline = Instant::now()
         .checked_add(timeout)
         .context("upstream mirror fetch timeout is not representable")?;
-    let (status, _stdout, stderr) = crate::git::visibility_pack::run_bounded_git_raw(
-        git_bin, &borrowed, repo_path, b"", deadline,
-    )?;
+    reject_local_url_rewrite(git_bin, repo_path, &upstream.url, deadline)?;
+    let (status, _stdout, stderr) =
+        crate::git::visibility_pack::run_bounded_git_raw_isolated_https(
+            git_bin, &borrowed, repo_path, b"", deadline,
+        )?;
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr);
         let stderr = stderr.chars().take(4_096).collect::<String>();
@@ -287,8 +307,14 @@ struct Worker {
     git_bin: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchOutcome {
+    Updated,
+    SkippedStale,
+}
+
 impl Worker {
-    async fn fetch_target(&self, target: InboundMirrorTarget) -> Result<()> {
+    async fn fetch_target(&self, target: InboundMirrorTarget) -> Result<FetchOutcome> {
         let url = crate::db::validate_mirror_upstream_url(&target.upstream_url)?;
         let upstream = self.policy.resolve(url).await?;
 
@@ -342,7 +368,7 @@ impl Worker {
         {
             guard.release(false).await;
             info!(repo_id = %target.repo_id, "upstream mirror state changed before fetch; skipping stale target");
-            return Ok(());
+            return Ok(FetchOutcome::SkippedStale);
         }
 
         let git_bin = self.git_bin.clone();
@@ -354,7 +380,7 @@ impl Worker {
         .context("upstream mirror fetch task panicked")?;
         let success = fetch.is_ok();
         guard.release(success).await;
-        fetch
+        fetch.map(|()| FetchOutcome::Updated)
     }
 
     async fn scan_once(&self) {
@@ -383,9 +409,10 @@ impl Worker {
                 let repo_id = target.repo_id.clone();
                 let upstream_url = target.upstream_url.clone();
                 match self.fetch_target(target).await {
-                    Ok(()) => {
+                    Ok(FetchOutcome::Updated) => {
                         info!(repo_id, upstream = %upstream_url, "upstream mirror fetch completed")
                     }
+                    Ok(FetchOutcome::SkippedStale) => {}
                     Err(error) => {
                         warn!(repo_id, upstream = %upstream_url, err = %error, "upstream mirror fetch failed")
                     }
@@ -411,7 +438,7 @@ pub fn start(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     ensure_safe_git_runtime("git")?;
-    let policy = EgressPolicy::new(&config.upstream_mirror_allowed_private_hosts)?;
+    let policy = EgressPolicy;
     let worker = Worker {
         db,
         config: Arc::clone(&config),
@@ -445,6 +472,104 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    async fn test_worker(
+        pool: sqlx::PgPool,
+        git_bin: PathBuf,
+        page_size: usize,
+    ) -> (Worker, Arc<Db>, tempfile::TempDir) {
+        let db = Arc::new(Db::for_testing(pool.clone()));
+        db.run_migrations().await.unwrap();
+        let repos = tempfile::tempdir().unwrap();
+        let config = Arc::new(Config::parse_from([
+            "gitlawb-node".to_string(),
+            "--upstream-mirror-enabled".to_string(),
+            "--enforce-owner-push".to_string(),
+            "--upstream-mirror-fetch-timeout-secs".to_string(),
+            "5".to_string(),
+            "--upstream-mirror-page-size".to_string(),
+            page_size.to_string(),
+        ]));
+        config.validate().unwrap();
+        let worker = Worker {
+            db: Arc::clone(&db),
+            config,
+            repo_store: RepoStore::for_testing(repos.path().to_path_buf(), pool),
+            repo_write_leases: RepoWriteLeases::new(8),
+            git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+            policy: EgressPolicy,
+            git_bin: git_bin.to_string_lossy().into_owned(),
+        };
+        (worker, db, repos)
+    }
+
+    async fn add_inbound_mirror(
+        worker: &Worker,
+        db: &Db,
+        id: &str,
+        name: &str,
+        upstream_url: &str,
+    ) -> InboundMirrorTarget {
+        let now = chrono::Utc::now();
+        let record = crate::db::RepoRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            owner_did: "did:key:z6MkMirrorWorker".to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: format!("/test/{id}.git"),
+            forked_from: None,
+            machine_id: None,
+        };
+        db.create_repo(&record).await.unwrap();
+        worker
+            .repo_store
+            .init(&record.owner_did, &record.name)
+            .await
+            .unwrap();
+        let state = db
+            .configure_inbound_mirror(&record.id, upstream_url)
+            .await
+            .unwrap();
+        InboundMirrorTarget {
+            repo_id: record.id,
+            owner_did: record.owner_did,
+            name: record.name,
+            upstream_url: state.upstream_url,
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_git(repos: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let git = repos.path().join("fake-git");
+        let calls = repos.path().join("fetch-calls");
+        let script = format!(
+            r#"#!/bin/sh
+if [ "$1" = "ls-remote" ]; then
+  printf '%s\n' "$3"
+  exit 0
+fi
+case "$*" in
+  *fail.git*) printf '%s\n' fail >> '{}'; exit 7 ;;
+  *) printf '%s\n' ok >> '{}'; exit 0 ;;
+esac
+"#,
+            calls.display(),
+            calls.display()
+        );
+        std::fs::write(&git, script).unwrap();
+        let mut permissions = std::fs::metadata(&git).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&git, permissions).unwrap();
+        (git, calls)
+    }
 
     #[test]
     fn git_version_gate_requires_curlopt_resolve_support() {
@@ -458,36 +583,48 @@ mod tests {
     }
 
     #[test]
-    fn private_targets_require_an_exact_operator_allowlist() {
-        let policy = EgressPolicy::new(&["ghe.internal".to_string()]).unwrap();
+    fn every_resolved_address_must_be_public() {
+        let policy = EgressPolicy;
         let public_v4: IpAddr = "8.8.8.8".parse().unwrap();
         let private_v4: IpAddr = "10.2.3.4".parse().unwrap();
         let private_v6: IpAddr = "fd00::20".parse().unwrap();
         assert!(policy
-            .validate_addresses("ghe.internal", &[private_v4, private_v6], true)
+            .validate_addresses("public.example", &[public_v4])
             .is_ok());
         assert!(policy
-            .validate_addresses("other.internal", &[private_v4], false)
+            .validate_addresses("private.example", &[private_v4, private_v6])
             .is_err());
         assert!(policy
-            .validate_addresses("public.example", &[public_v4, private_v4], false)
+            .validate_addresses("mixed.example", &[public_v4, private_v4])
+            .is_err());
+        let too_many = (1..=MAX_PINNED_ADDRESSES + 1)
+            .map(|last| IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 0, last as u8)))
+            .collect::<Vec<_>>();
+        assert!(policy
+            .validate_addresses("oversized.example", &too_many)
             .is_err());
 
         for never in ["127.0.0.1", "169.254.169.254", "::1", "fe80::1"] {
             let ip = never.parse().unwrap();
-            assert!(!address_is_permitted(ip, true), "{never} must stay denied");
+            assert!(!address_is_permitted(ip), "{never} must stay denied");
         }
     }
 
     #[test]
-    fn private_host_allowlist_rejects_wildcards_and_localhost() {
-        for invalid in ["", "*.internal", "localhost", "forge.local", "host/path"] {
-            assert!(normalize_allowlisted_host(invalid).is_err(), "{invalid:?}");
+    fn local_only_hostnames_are_always_rejected() {
+        for invalid in [
+            "",
+            "localhost",
+            "forge.localhost",
+            "forge.local",
+            "ghe.internal",
+        ] {
+            assert!(
+                reject_always_local_hostname(invalid).is_err(),
+                "{invalid:?}"
+            );
         }
-        assert_eq!(
-            normalize_allowlisted_host("GHE.INTERNAL.").unwrap(),
-            "ghe.internal"
-        );
+        assert!(reject_always_local_hostname("github.example").is_ok());
     }
 
     #[test]
@@ -506,26 +643,135 @@ mod tests {
         assert!(args.contains(
             &"http.curloptResolve=+github.example:443:203.0.113.10,[2001:db8::10]".to_string()
         ));
+        assert!(args.contains(
+            &"http.https://github.example/org/repo.git.followRedirects=false".to_string()
+        ));
+        assert!(args.contains(&"http.https://github.example/org/repo.git.proxy=".to_string()));
+        assert!(args.contains(&"http.https://github.example/org/repo.git.extraHeader=".to_string()));
+        assert!(args.contains(
+            &"http.https://github.example/org/repo.git.curloptResolve=+github.example:443:203.0.113.10,[2001:db8::10]".to_string()
+        ));
+        assert!(
+            args.contains(&"credential.https://github.example/org/repo.git.helper=".to_string())
+        );
         assert!(args.contains(&"protocol.allow=never".to_string()));
         assert!(args.contains(&"protocol.https.allow=always".to_string()));
+        assert!(args.contains(&"fetch.uriprotocols=".to_string()));
+        assert!(args.contains(&"fetch.bundleURI=".to_string()));
         assert!(args.contains(&"--atomic".to_string()));
         assert!(args.contains(&"+refs/heads/*:refs/heads/*".to_string()));
         assert!(args.contains(&"+refs/tags/*:refs/tags/*".to_string()));
         assert!(!args.iter().any(|arg| arg == "+refs/*:refs/*"));
     }
 
+    #[test]
+    fn repository_local_instead_of_rewrite_is_rejected() {
+        let repo = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+        let config = std::process::Command::new("git")
+            .args([
+                "config",
+                "url.https://evil.example/.insteadOf",
+                "https://github.example/",
+            ])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(config.status.success());
+
+        let error = reject_local_url_rewrite(
+            "git",
+            repo.path(),
+            "https://github.example/org/repo.git",
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("attempted to rewrite"));
+    }
+
     #[tokio::test]
     async fn literal_addresses_are_checked_without_dns() {
-        let policy = EgressPolicy::new(&["10.2.3.4".to_string()]).unwrap();
+        let policy = EgressPolicy;
         let allowed = policy
-            .resolve(reqwest::Url::parse("https://10.2.3.4/org/repo.git").unwrap())
+            .resolve(reqwest::Url::parse("https://203.0.113.10/org/repo.git").unwrap())
             .await
             .unwrap();
         assert_eq!(allowed.curlopt_resolve, None);
 
-        assert!(policy
-            .resolve(reqwest::Url::parse("https://127.0.0.1/org/repo.git").unwrap())
-            .await
-            .is_err());
+        for denied in [
+            "127.0.0.1",
+            "10.2.3.4",
+            "169.254.169.254",
+            "[::1]",
+            "[fd00::20]",
+        ] {
+            let url = reqwest::Url::parse(&format!("https://{denied}/org/repo.git")).unwrap();
+            assert!(
+                policy.resolve(url).await.is_err(),
+                "{denied} must stay denied"
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn stale_target_is_rechecked_under_the_write_locks(pool: sqlx::PgPool) {
+        let missing_git = PathBuf::from("/definitely/missing/git");
+        let (worker, db, _repos) = test_worker(pool, missing_git, 1).await;
+        let target = add_inbound_mirror(
+            &worker,
+            &db,
+            "00000000-0000-0000-0000-000000000001",
+            "stale",
+            "https://8.8.8.8/org/stale.git",
+        )
+        .await;
+        sqlx::query(
+            "UPDATE repos
+             SET mirror_status = 'outbound'
+             WHERE id = $1",
+        )
+        .bind(&target.repo_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let outcome = worker.fetch_target(target).await.unwrap();
+        assert_eq!(outcome, FetchOutcome::SkippedStale);
+        assert!(worker.repo_write_leases.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn scan_pages_past_one_failure_and_fetches_the_next_repo(pool: sqlx::PgPool) {
+        let bootstrap = tempfile::tempdir().unwrap();
+        let (git, calls) = fake_git(&bootstrap);
+        let (worker, db, _repos) = test_worker(pool, git, 1).await;
+        add_inbound_mirror(
+            &worker,
+            &db,
+            "00000000-0000-0000-0000-000000000001",
+            "fails",
+            "https://8.8.8.8/org/fail.git",
+        )
+        .await;
+        add_inbound_mirror(
+            &worker,
+            &db,
+            "00000000-0000-0000-0000-000000000002",
+            "succeeds",
+            "https://8.8.8.8/org/ok.git",
+        )
+        .await;
+
+        worker.scan_once().await;
+
+        let calls = std::fs::read_to_string(calls).unwrap();
+        assert_eq!(calls.lines().collect::<Vec<_>>(), ["fail", "ok"]);
+        assert!(worker.repo_write_leases.is_empty());
     }
 }
