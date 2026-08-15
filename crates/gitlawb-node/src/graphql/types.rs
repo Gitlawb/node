@@ -70,6 +70,18 @@ pub struct AgentTaskReadType {
     pub deadline: Option<String>,
 }
 
+/// Wraps a `tasks` page with the same truncation signal the REST list route
+/// exposes (`incomplete`), so a GraphQL caller behind a denied-row scan wall
+/// can tell a short page from an exhaustive one instead of getting an
+/// indistinguishable empty/short list. Carries no cursor, for the same reason
+/// REST's `list_tasks` response does not: the scan wall lands on the last
+/// *examined* candidate, not necessarily one the caller may see.
+#[derive(SimpleObject, Clone)]
+pub struct TaskPageType {
+    pub items: Vec<AgentTaskReadType>,
+    pub incomplete: bool,
+}
+
 impl From<AgentTask> for AgentTaskReadType {
     fn from(t: AgentTask) -> Self {
         Self {
