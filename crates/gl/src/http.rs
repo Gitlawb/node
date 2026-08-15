@@ -19,10 +19,10 @@ const MAX_ICAPTCHA_RETRIES: usize = 2;
 /// response body, so it bounds a slow download and not just a slow handshake.
 const TOTAL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Follow a redirect only when it stays on the origin that issued it, and only for
-/// as long as the chain bound allows.
+/// Follow a redirect only when it stays on the origin that issued it AND re-issues the
+/// identical request-target, and only for as long as the chain bound allows.
 ///
-/// The origin decision itself is [`gitlawb_core::redirect::may_follow`], shared with
+/// The decision itself is [`gitlawb_core::redirect::may_follow`], shared with
 /// `git-remote-gitlawb` so the two signing clients cannot drift apart on it. Refusal
 /// is `stop`, not `error`: the 3xx comes back as an ordinary response and each caller
 /// reports it through the status path it already has.
@@ -917,6 +917,11 @@ mod tests {
     /// cannot import (`git-remote-gitlawb` is a binary crate and this is its test
     /// module). Keep the two textually identical apart from the mockito seam around
     /// them, so an edit to one is visibly an edit to both.
+    ///
+    /// The production verifier both copies mirror is `crate::auth::require_signature` in
+    /// `crates/gitlawb-node/src/auth/mod.rs`. This is a re-implementation, not a call, so
+    /// an edit to that middleware has to land here too: otherwise the copies drift and
+    /// this test keeps passing against a rule the node has stopped applying.
     ///
     /// It asserts internally, which is deliberate but constrains its callers: inside
     /// `with_body_from_request` those assertions fire on the server thread and reach

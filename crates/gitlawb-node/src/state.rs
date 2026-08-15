@@ -445,9 +445,18 @@ impl AppState {
     /// it): the provenance phase spends from the budget the floor reserved for the
     /// search, the fallback 429s short of its configured reach, and the retry re-pays the
     /// same provenance charges. The term is
-    /// `min(MAX_HISTORY_WALKS_PER_REQUEST, ipfs_max_repos_walked)` because that is
-    /// textually the resolver's own `walk_cap` in `gate_and_serve`; the two `min()`s must
-    /// move together, so an edit to either finds the other from here. It reads the
+    /// `min(MAX_HISTORY_WALKS_PER_REQUEST, ipfs_max_repos_walked)` because that is what
+    /// the resolver's own `walk_cap` in `gate_and_serve` evaluates to. The two
+    /// expressions are separate, not one shared value: this one reads the CONSTANT
+    /// `crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST`, while `walk_cap` reads the
+    /// `AppState` seam `state.ipfs_max_history_walks`. They agree only because every
+    /// construction seeds that seam from that constant: the production one in `main.rs`,
+    /// and the two test ones in `auth`'s test module and `test_support`. Nothing
+    /// mechanically ties the two expressions beyond this comment and its counterpart at
+    /// `walk_cap` (no shared helper, no type, no assertion outside the one fixture that
+    /// pins the seam as a precondition), so the two `min()`s have to be moved together
+    /// by hand, and a construction that seeded the seam from anything else would size
+    /// the floor for a cap the resolver does not enforce. It reads the
     /// CONSTANT and the CONFIG knob for the same reason the page term below reads the
     /// constant page size: `ipfs_max_history_walks` is an `AppState` test seam, and
     /// sizing a production floor from a seam would inflate the budget by whatever a test

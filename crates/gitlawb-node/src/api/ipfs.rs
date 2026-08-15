@@ -1516,6 +1516,13 @@ async fn gate_and_serve(
             // independently of what the source set contains. The taint name stays
             // "walk-cap": to an operator the meaning is unchanged (a walk ceiling cut
             // the search), and the knobs still mean what they say, now per phase.
+            //
+            // `AppState::ipfs_work_budget` in `crates/gitlawb-node/src/state.rs`
+            // duplicates this same `min()` as the walk term of the work-bucket floor,
+            // because a floor that does not reserve what this cap can spend 429s the
+            // legacy fallback short of its configured reach (#173 round 15, F2). The two
+            // `min()`s must move together, so an edit starting on this side finds the
+            // floor rather than only the other way round.
             let walk_cap = std::cmp::min(
                 state.ipfs_max_history_walks as usize,
                 state.config.ipfs_max_repos_walked,

@@ -332,8 +332,9 @@ const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 /// private repo signs on the retry. reqwest strips only `Authorization`, `Cookie`,
 /// `Proxy-Authorization` and `WWW-Authenticate` across hosts, so under the default
 /// `Policy::limited(10)` those signature headers rode a 302 to whatever origin the
-/// node named, and on a 307/308 the pack body went with them. Scope the follow to
-/// the origin that issued the redirect, which is the same predicate `gl` uses.
+/// node named, and on a 307/308 the pack body went with them. Scope the follow to the
+/// origin that issued the redirect AND to an identical request-target, which is the
+/// same predicate `gl` uses.
 fn build_http_client() -> Result<reqwest::blocking::Client> {
     Ok(reqwest::blocking::Client::builder()
         .timeout(HTTP_TIMEOUT)
@@ -341,7 +342,8 @@ fn build_http_client() -> Result<reqwest::blocking::Client> {
         .build()?)
 }
 
-/// Refuse any redirect that leaves the issuing origin, and bound the chain.
+/// Refuse any redirect that leaves the issuing origin or rewrites the request-target,
+/// and bound the chain.
 ///
 /// Refusal is `stop`, not `error`: the 3xx comes back as an ordinary response and
 /// the caller reports it through the status path it already has.
@@ -1139,6 +1141,11 @@ mod tests {
     /// module (this is a binary crate's test module). Keep the two textually identical
     /// apart from the mockito seam around them, so an edit to one is visibly an edit to
     /// both.
+    ///
+    /// The production verifier both copies mirror is `crate::auth::require_signature` in
+    /// `crates/gitlawb-node/src/auth/mod.rs`. This is a re-implementation, not a call, so
+    /// an edit to that middleware has to land here too: otherwise the copies drift and
+    /// this test keeps passing against a rule the node has stopped applying.
     ///
     /// It asserts internally, which is deliberate but constrains its callers: inside
     /// `with_body_from_request` those assertions fire on the server thread and reach

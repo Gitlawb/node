@@ -50,6 +50,18 @@ pub const MAX_REDIRECTS: usize = 10;
 /// signed and unsigned callers alike, for the same reason the predicate is shared:
 /// two rules would drift.
 ///
+/// The clause pins `@path`, and only `@path`. A gitlawb signature also covers
+/// `@method` and `content-digest`, and both of those are still open on a followed
+/// hop: on a 301, 302 or 303, reqwest 0.12.28 delegates to tower-http's
+/// `FollowRedirect`, which rewrites a POST to a GET and empties the body
+/// (tower-http-0.6.8 `src/follow_redirect/mod.rs:273-285`), while its
+/// `drop_payload_headers` removes only `Content-Type`, `Content-Length`,
+/// `Content-Encoding` and `Transfer-Encoding`. So `Signature`, `Signature-Input` and
+/// `Content-Digest` ride along on a request that no longer has the method or the body
+/// they were computed over. Only 307 and 308 preserve both. This predicate returning
+/// true therefore makes a GET-shaped hop safe to replay against the node's verifier
+/// and says nothing about a bodied one: a signed write must not rely on it alone.
+///
 /// `Url::query` is `None` for `/a` and `Some("")` for `/a?`, and those are two
 /// different request-targets on the node side too, so the comparison is strict and
 /// needs no special case.
@@ -202,6 +214,20 @@ mod tests {
                 false,
                 "an empty query added where there was none: a missing query and an empty \
                  one are different request-targets",
+            ),
+            (
+                "https://node.example/a?x=1",
+                "https://node.example/a",
+                false,
+                "the query dropped where there was one: the comparison is symmetric, and \
+                 nothing else in the matrix pins that direction",
+            ),
+            (
+                "https://node.example/a#x",
+                "https://node.example/a#y",
+                true,
+                "a fragment-only difference is still followed: a fragment never reaches \
+                 the wire, so it is no part of the request-target the node verifies",
             ),
         ];
         for (previous, next, expected, why) in cases {
