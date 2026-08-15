@@ -683,9 +683,12 @@ mod tests {
         let state = test_state(pool).await;
         state
             .db
-            .create_task(&seed_task("task-1", delegator))
+            .create_repo(&seed_repo(delegator, "task-pub-repo"))
             .await
-            .expect("seed task");
+            .expect("seed repo");
+        let mut t1 = seed_task("task-1", delegator);
+        t1.repo_id = Some("task-pub-repo".to_string());
+        state.db.create_task(&t1).await.expect("seed task");
         // Assignee claims it: pending -> claimed, assignee_did = assignee.
         state
             .db
@@ -704,8 +707,25 @@ mod tests {
         let uri = "/api/v1/tasks/task-1/complete";
         let body = || Body::from("{}");
 
-        // Stranger (not the assignee) is rejected by the authorization gate, even
-        // with the empty body that previously bypassed the binding. Exact 403.
+        // Stranger on an invisible (repo-less) task receives opaque 404 (no existence leak).
+        let inv_task = seed_task("task-inv", delegator);
+        state.db.create_task(&inv_task).await.unwrap();
+        let inv_resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::POST,
+                "/api/v1/tasks/task-inv/complete",
+                body(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            inv_resp.status(),
+            StatusCode::NOT_FOUND,
+            "an invisible task must 404 so existence is not leaked"
+        );
+
+        // Stranger on a visible task is rejected by the authorization gate with exact 403.
         let resp = router()
             .oneshot(signed_request_as(stranger, Method::POST, uri, body()))
             .await
