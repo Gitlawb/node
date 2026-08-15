@@ -65,9 +65,30 @@ pub async fn run(cmd: IdentityCmd) -> Result<()> {
 
 /// Resolve the identity directory, honouring an explicit override.
 /// Public so sibling commands (`gl ucan import`) store alongside the identity.
+///
+/// Falls back to the parent of `GITLAWB_KEY` before `~/.gitlawb`. Without that,
+/// an operator who moved their key — `GITLAWB_KEY=/data/keys/identity.pem`, the
+/// shape `.env.example` documents — has `gl ucan import` write the delegation to
+/// `~/.gitlawb/delegations` while `git-remote-gitlawb`, which resolves its store
+/// from `GITLAWB_KEY`, reads an empty directory. The push then goes out with no
+/// `X-Ucan` and the delegate is refused, with nothing to indicate why.
 pub fn gitlawb_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(d) = override_dir {
         return Ok(d);
+    }
+    if let Ok(key) = std::env::var("GITLAWB_KEY") {
+        if !key.trim().is_empty() {
+            let path = if let Some(rest) = key.strip_prefix("~/") {
+                dirs::home_dir()
+                    .context("could not determine home directory")?
+                    .join(rest)
+            } else {
+                PathBuf::from(key)
+            };
+            if let Some(parent) = path.parent() {
+                return Ok(parent.to_path_buf());
+            }
+        }
     }
     let home = dirs::home_dir().context("could not determine home directory")?;
     Ok(home.join(".gitlawb"))

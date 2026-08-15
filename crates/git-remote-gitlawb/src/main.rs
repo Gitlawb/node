@@ -417,19 +417,44 @@ fn build_invocation(
     // Constraints are copied from the covering capability, not dropped: dropping
     // them is a widening and `verify_chain` refuses it.
     let resource = format!("gitlawb://repos/{owner}/{repo}");
+
+    // The owner segment must be compared on the bare key. `parse_gitlawb_url` yields
+    // the bare form from the push URL, while an owner following the operator guide
+    // issues `--cap gitlawb://repos/<owner-did>/<repo>` — the full DID. Comparing the
+    // whole resource string finds nothing, and because every failure here is
+    // best-effort the push goes out with no header and the delegate is told to obtain
+    // the delegation they already hold.
+    fn bare(d: &str) -> &str {
+        d.strip_prefix("did:key:").unwrap_or(d)
+    }
+    let names_this_repo = |with: &str| {
+        with.strip_prefix("gitlawb://repos/")
+            .and_then(|rest| rest.rsplit_once('/'))
+            .is_some_and(|(o, r)| bare(o) == bare(owner) && r == repo)
+    };
+
     let source = delegation
         .payload
         .att
         .iter()
         .find(|c| {
-            (c.with == resource || c.with == "*")
+            (c.with == "*" || names_this_repo(&c.with))
                 && (c.can == caps::GIT_PUSH || c.can == "*" || c.can == caps::REPO_ADMIN)
         })
         .ok_or_else(|| {
             anyhow::anyhow!("stored delegation carries no git/push capability for {resource}")
         })?;
 
-    let mut narrowed = Capability::new(resource, caps::GIT_PUSH);
+    // Keep the parent's resource verbatim when it already names this repo. The node's
+    // `is_attenuated_by` compares `with` by exact equality, so re-emitting a bare form
+    // under a full-DID parent would fail attenuation and be refused. Only a `*` parent
+    // needs the URL-derived string, and that is the case narrowing exists for.
+    let narrowed_with = if source.with == "*" {
+        resource
+    } else {
+        source.with.clone()
+    };
+    let mut narrowed = Capability::new(narrowed_with, caps::GIT_PUSH);
     narrowed.constraints = source.constraints.clone();
 
     // Carry the delegation's own expiry onto the invocation. The node refuses a
@@ -2446,6 +2471,77 @@ mod delegated_push_tests {
             err.to_string().contains("expired"),
             "the failure must name expiry, got: {err}"
         );
+    }
+
+    /// The shipping combination: the owner issues with the FULL DID (what
+    /// `RUN-A-NODE.md` instructs), while the push URL yields the BARE key
+    /// (`parse_gitlawb_url` takes the last colon-delimited segment). Comparing the
+    /// whole resource string never matches, so the delegation is not found, no
+    /// `X-Ucan` is sent, and the delegate gets a 403 telling them to obtain the
+    /// delegation they are already holding.
+    #[test]
+    fn build_invocation_matches_a_full_did_delegation_against_a_bare_owner() {
+        use gitlawb_core::ucan::{caps, Capability, Ucan};
+
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let full = owner.did().to_string();
+        let bare = full.strip_prefix("did:key:").unwrap().to_string();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        let delegation = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{full}/r"),
+                caps::GIT_PUSH,
+            )],
+            Some(hour),
+        )
+        .expect("issue");
+
+        let invocation = build_invocation(&agent, &node.did(), &delegation, &bare, "r")
+            .expect("a full-DID delegation must match a bare-owner push URL");
+
+        // The narrowed capability must keep the parent's exact `with`: the node's
+        // `is_attenuated_by` compares it by equality, so emitting the bare form under
+        // a full-DID parent would fail attenuation and be refused at the node.
+        assert_eq!(
+            invocation.payload.att[0].with,
+            format!("gitlawb://repos/{full}/r"),
+            "narrowing must not rewrite a resource that already names this repo"
+        );
+        assert!(
+            invocation.payload.att[0].is_attenuated_by(&delegation.payload.att[0]),
+            "the narrowed capability must still attenuate under its parent"
+        );
+    }
+
+    #[test]
+    fn build_invocation_narrows_a_wildcard_to_the_pushed_repo() {
+        use gitlawb_core::ucan::{caps, Capability, Ucan};
+
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        let delegation = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new("*", caps::GIT_PUSH)],
+            Some(hour),
+        )
+        .expect("issue");
+
+        let invocation =
+            build_invocation(&agent, &node.did(), &delegation, "z6MkOwner", "r").expect("wrap");
+        assert_eq!(
+            invocation.payload.att[0].with, "gitlawb://repos/z6MkOwner/r",
+            "a wildcard parent is the one case where the URL-derived resource is used"
+        );
+        assert!(invocation.payload.att[0].is_attenuated_by(&delegation.payload.att[0]));
     }
 
     #[test]
