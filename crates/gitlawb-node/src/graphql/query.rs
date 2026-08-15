@@ -671,7 +671,7 @@ mod tests {
         db.create_repo(&repo("public-repo", OWNER, "public", true))
             .await
             .unwrap();
-        let mut visible_newer = crate::db::AgentTask {
+        let visible_newer = crate::db::AgentTask {
             id: "newer-visible".into(),
             repo_id: Some("public-repo".into()),
             kind: "build".into(),
