@@ -186,8 +186,11 @@ pub(crate) struct VisibleTasks {
     /// that point is the last *examined* candidate, which may be a task the
     /// caller was denied, and handing that back would let a denied read leak
     /// the id/created_at of a row `GET /tasks/{id}` otherwise 404s (the same
-    /// id `claim_task` accepts). A caller can still page with
-    /// `after_created_at`/`after_id` set to the last row *they* received.
+    /// id `claim_task` accepts). A caller can page with `after_created_at`/`after_id`
+    /// set to the last row they actually received; if a window of >= 1,000
+    /// consecutive denied tasks intervenes before the next visible row, pagination
+    /// anchored on that received row stalls at the candidate ceiling and
+    /// repeatedly returns empty results with `incomplete: true`.
     pub incomplete: bool,
 }
 
@@ -216,7 +219,6 @@ pub(crate) async fn collect_visible_tasks(
     let mut cursor: Option<(String, String)> =
         after.map(|(ts, id)| (ts.to_string(), id.to_string()));
     let mut scanned = 0;
-    let mut last_batch_full = false;
 
     while scanned < MAX_TASK_SCAN_CANDIDATES {
         let batch_limit = MAX_VISIBLE_TASKS.min(MAX_TASK_SCAN_CANDIDATES - scanned);
@@ -231,7 +233,6 @@ pub(crate) async fn collect_visible_tasks(
             )
             .await?;
         if tasks.is_empty() {
-            last_batch_full = false;
             break;
         }
         scanned += tasks.len() as i64;
@@ -267,16 +268,12 @@ pub(crate) async fn collect_visible_tasks(
             break;
         }
         if tasks.len() < batch_limit as usize {
-            last_batch_full = false;
             break;
         }
-        last_batch_full = true;
         cursor = next_cursor;
     }
 
-    let incomplete = visible.len() < bounded_limit as usize
-        && scanned >= MAX_TASK_SCAN_CANDIDATES
-        && last_batch_full;
+    let incomplete = visible.len() < bounded_limit as usize && scanned >= MAX_TASK_SCAN_CANDIDATES;
 
     Ok(VisibleTasks {
         tasks: visible,
@@ -356,15 +353,17 @@ pub async fn create_task(
 
 /// Canonicalize an RFC3339 timestamp. If spaces were introduced by URL query decoding
 /// (e.g. `+00:00` decoded as ` 00:00`), convert spaces back to `+` before parsing.
+/// Validates RFC3339 syntax while preserving the original fractional precision
+/// and string representation so comparisons against stored TEXT timestamps remain exact.
 pub(crate) fn canonicalize_timestamp(raw: &str) -> crate::error::Result<String> {
     let normalized = if raw.contains(' ') {
         raw.replace(' ', "+")
     } else {
         raw.to_string()
     };
-    let dt = chrono::DateTime::parse_from_rfc3339(&normalized)
+    chrono::DateTime::parse_from_rfc3339(&normalized)
         .map_err(|e| AppError::BadRequest(format!("invalid timestamp format '{raw}': {e}")))?;
-    Ok(dt.to_rfc3339())
+    Ok(normalized)
 }
 
 /// A cursor is two query fields (`created_at`, `id`) from either the `after_*` or `cursor_*` family.
@@ -986,10 +985,10 @@ mod visible_tasks_tests {
             .create_repo(&repo("public-repo", DELEGATOR, "public", true))
             .await
             .unwrap();
-        let mut visible = task("past-ceiling", Some("public-repo"), DELEGATOR);
-        visible.created_at = "2026-01-01T00:00:00Z".into();
-        visible.updated_at = visible.created_at.clone();
-        state.db.create_task(&visible).await.unwrap();
+        let mut visible_newer = task("newer-visible", Some("public-repo"), DELEGATOR);
+        visible_newer.created_at = "2026-01-03T00:00:00Z".into();
+        visible_newer.updated_at = visible_newer.created_at.clone();
+        state.db.create_task(&visible_newer).await.unwrap();
 
         for i in 0..MAX_TASK_SCAN_CANDIDATES {
             let mut hidden = task(&format!("hidden-{i:04}"), None, DELEGATOR);
@@ -998,8 +997,27 @@ mod visible_tasks_tests {
             state.db.create_task(&hidden).await.unwrap();
         }
 
+        let mut visible_older = task("past-ceiling", Some("public-repo"), DELEGATOR);
+        visible_older.created_at = "2026-01-01T00:00:00Z".into();
+        visible_older.updated_at = visible_older.created_at.clone();
+        state.db.create_task(&visible_older).await.unwrap();
+
+        // Page 1 yields the first visible task.
         let resp = list_router(state.clone())
             .oneshot(anon_get("/api/v1/tasks?limit=1"))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["incomplete"], false);
+        assert_eq!(body["tasks"][0]["id"], "newer-visible");
+
+        // Page 2 anchored on the last received row hits the 1,000 candidate scan ceiling
+        // across the intervening denied rows and signals incomplete without leaking any denied row.
+        let resp = list_router(state.clone())
+            .oneshot(anon_get(
+                "/api/v1/tasks?limit=1&after_created_at=2026-01-03T00:00:00Z&after_id=newer-visible",
+            ))
             .await
             .unwrap();
         let body = body_json(resp).await;
@@ -1015,26 +1033,23 @@ mod visible_tasks_tests {
             "response must not leak any denied row's id: {body}"
         );
 
-        // No cursor is disclosed above, so resuming past the scan wall in one
-        // more request requires `after_created_at`/`after_id` the caller
-        // already legitimately knows. This stands in for that out-of-band
-        // knowledge with the last seeded row's known position.
+        // A subsequent request anchored on the same legitimately-held row stalls at the
+        // scan ceiling rather than bypassing authorization.
         let resp = list_router(state)
-            .oneshot(anon_get(&format!(
-                "/api/v1/tasks?limit=1&after_created_at=2026-01-02T00:00:00Z&after_id=hidden-{:04}",
-                MAX_TASK_SCAN_CANDIDATES - 1
-            )))
+            .oneshot(anon_get(
+                "/api/v1/tasks?limit=1&after_created_at=2026-01-03T00:00:00Z&after_id=newer-visible",
+            ))
             .await
             .unwrap();
         let body = body_json(resp).await;
-        assert_eq!(body["count"], 1);
-        assert_eq!(body["incomplete"], false);
-        assert_eq!(body["tasks"][0]["id"], "past-ceiling");
+        assert_eq!(body["count"], 0);
+        assert_eq!(body["incomplete"], true);
     }
 
     #[sqlx::test]
     async fn list_tasks_rejects_partial_cursor_pair(pool: PgPool) {
         let state = test_state(pool).await;
+
         let resp = list_router(state.clone())
             .oneshot(anon_get(
                 "/api/v1/tasks?after_created_at=2026-01-01T00:00:00Z",
@@ -1042,12 +1057,46 @@ mod visible_tasks_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["message"],
+            "after_created_at and after_id must be supplied together"
+        );
 
-        let resp = list_router(state)
+        let resp = list_router(state.clone())
             .oneshot(anon_get("/api/v1/tasks?after_id=some-id"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["message"],
+            "after_created_at and after_id must be supplied together"
+        );
+
+        let resp = list_router(state.clone())
+            .oneshot(anon_get(
+                "/api/v1/tasks?cursor_created_at=2026-01-01T00:00:00Z",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["message"],
+            "cursor_created_at and cursor_id must be supplied together"
+        );
+
+        let resp = list_router(state)
+            .oneshot(anon_get("/api/v1/tasks?cursor_id=some-id"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["message"],
+            "cursor_created_at and cursor_id must be supplied together"
+        );
     }
 
     #[sqlx::test]
@@ -1091,7 +1140,22 @@ mod visible_tasks_tests {
     #[sqlx::test]
     async fn list_tasks_rejects_mixed_cursor_alias_families(pool: PgPool) {
         let state = test_state(pool).await;
-        let resp = list_router(state)
+
+        let resp = list_router(state.clone())
+            .oneshot(anon_get(
+                "/api/v1/tasks?after_created_at=2026-01-01T00:00:00Z&after_id=a&cursor_created_at=2026-01-01T00:00:00Z&cursor_id=b",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "bad_request");
+        assert_eq!(
+            body["message"],
+            "cannot mix after_* and cursor_* parameter aliases"
+        );
+
+        let resp = list_router(state.clone())
             .oneshot(anon_get(
                 "/api/v1/tasks?after_created_at=2026-01-01T00:00:00Z&cursor_id=some-id",
             ))
@@ -1100,6 +1164,24 @@ mod visible_tasks_tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_json(resp).await;
         assert_eq!(body["error"], "bad_request");
+        assert_eq!(
+            body["message"],
+            "cannot mix after_* and cursor_* parameter aliases"
+        );
+
+        let resp = list_router(state)
+            .oneshot(anon_get(
+                "/api/v1/tasks?cursor_created_at=2026-01-01T00:00:00Z&after_id=some-id",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "bad_request");
+        assert_eq!(
+            body["message"],
+            "cannot mix after_* and cursor_* parameter aliases"
+        );
     }
 
     #[sqlx::test]
@@ -1121,6 +1203,65 @@ mod visible_tasks_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[sqlx::test]
+    async fn list_tasks_keyset_advances_across_trailing_zero_fraction_timestamps(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("public-repo", DELEGATOR, "public", true))
+            .await
+            .unwrap();
+
+        let ts_sibling = "2026-06-01T00:00:00.000000000+00:00";
+        let mut t2 = task("task-2", Some("public-repo"), DELEGATOR);
+        t2.created_at = ts_sibling.into();
+        t2.updated_at = t2.created_at.clone();
+        state.db.create_task(&t2).await.unwrap();
+
+        let mut t1 = task("task-1", Some("public-repo"), DELEGATOR);
+        t1.created_at = ts_sibling.into();
+        t1.updated_at = t1.created_at.clone();
+        state.db.create_task(&t1).await.unwrap();
+
+        let mut t0 = task("task-0", Some("public-repo"), DELEGATOR);
+        t0.created_at = "2026-05-01T00:00:00.000000000+00:00".into();
+        t0.updated_at = t0.created_at.clone();
+        state.db.create_task(&t0).await.unwrap();
+
+        let resp = list_router(state.clone())
+            .oneshot(anon_get("/api/v1/tasks?limit=1"))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["tasks"][0]["id"], "task-2");
+        let served_ts = body["tasks"][0]["created_at"].as_str().unwrap();
+        assert_eq!(served_ts, ts_sibling);
+
+        let resp = list_router(state.clone())
+            .oneshot(anon_get(&format!(
+                "/api/v1/tasks?limit=1&after_created_at={served_ts}&after_id=task-2"
+            )))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["count"], 1);
+        assert_eq!(
+            body["tasks"][0]["id"], "task-1",
+            "keyset pagination must advance to sibling row with equal timestamp"
+        );
+
+        let resp = list_router(state)
+            .oneshot(anon_get(&format!(
+                "/api/v1/tasks?limit=1&after_created_at={served_ts}&after_id=task-1"
+            )))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["tasks"][0]["id"], "task-0");
     }
 
     fn full_task_router(state: crate::state::AppState) -> Router {

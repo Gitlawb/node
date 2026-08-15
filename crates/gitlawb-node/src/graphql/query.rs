@@ -671,8 +671,8 @@ mod tests {
         db.create_repo(&repo("public-repo", OWNER, "public", true))
             .await
             .unwrap();
-        let visible = crate::db::AgentTask {
-            id: "past-ceiling".into(),
+        let mut visible_newer = crate::db::AgentTask {
+            id: "newer-visible".into(),
             repo_id: Some("public-repo".into()),
             kind: "build".into(),
             status: "pending".into(),
@@ -682,13 +682,13 @@ mod tests {
             ucan_token: None,
             payload: None,
             result: None,
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:00Z".into(),
+            created_at: "2026-01-03T00:00:00Z".into(),
+            updated_at: "2026-01-03T00:00:00Z".into(),
             deadline: None,
         };
-        db.create_task(&visible).await.unwrap();
+        db.create_task(&visible_newer).await.unwrap();
         for i in 0..1000 {
-            let mut hidden = visible.clone();
+            let mut hidden = visible_newer.clone();
             hidden.id = format!("hidden-{i:04}");
             hidden.repo_id = None;
             hidden.created_at = "2026-01-02T00:00:00Z".into();
@@ -696,20 +696,38 @@ mod tests {
             db.create_task(&hidden).await.unwrap();
         }
 
+        let mut visible_older = visible_newer.clone();
+        visible_older.id = "past-ceiling".into();
+        visible_older.created_at = "2026-01-01T00:00:00Z".into();
+        visible_older.updated_at = visible_older.created_at.clone();
+        db.create_task(&visible_older).await.unwrap();
+
         let schema = schema(db);
+        // Page 1 returns the first visible task.
         let resp = anon(&schema, "{ tasks(limit: 1) { items { id } incomplete } }").await;
+        assert_eq!(count_tasks(&resp), 1);
+        assert!(!task_incomplete(&resp));
+        assert_eq!(task_items(&resp)[0]["id"], "newer-visible");
+
+        // Page 2 anchored on the visible task hits the candidate ceiling across the denied window.
+        let resp = anon(
+            &schema,
+            r#"{ tasks(limit: 1, afterCreatedAt: "2026-01-03T00:00:00Z", afterId: "newer-visible") { items { id } incomplete } }"#,
+        )
+        .await;
         assert_eq!(count_tasks(&resp), 0);
         assert!(task_incomplete(&resp));
         assert!(!format!("{:?}", resp.data).contains("hidden-"));
+        assert!(!format!("{:?}", resp.data).contains("past-ceiling"));
 
+        // A repeated query on the same legitimately-held cursor stalls at the ceiling.
         let resp = anon(
             &schema,
-            r#"{ tasks(limit: 1, afterCreatedAt: "2026-01-02T00:00:00Z", afterId: "hidden-0999") { items { id } incomplete } }"#,
+            r#"{ tasks(limit: 1, afterCreatedAt: "2026-01-03T00:00:00Z", afterId: "newer-visible") { items { id } incomplete } }"#,
         )
         .await;
-        assert_eq!(count_tasks(&resp), 1);
-        assert!(!task_incomplete(&resp));
-        assert!(format!("{:?}", resp.data).contains("past-ceiling"));
+        assert_eq!(count_tasks(&resp), 0);
+        assert!(task_incomplete(&resp));
     }
 
     #[sqlx::test]
