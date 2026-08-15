@@ -51,7 +51,6 @@ pub(crate) async fn test_state(pool: PgPool) -> AppState {
 /// `config::tests::enforce_owner_push_is_declared_true_independent_of_the_environment`,
 /// which reads the declaration off the parser. Splitting the two keeps a parser
 /// question and an authorization question from sharing one failure mode.
-#[allow(dead_code)]
 pub(crate) async fn test_state_with(
     pool: PgPool,
     configure: impl FnOnce(&mut crate::config::Config),
@@ -2256,8 +2255,8 @@ mod tests {
         assert_eq!(
             resp.status(),
             StatusCode::FORBIDDEN,
-            "with no configuration at all, a signed push from a non-owner must be \
-             refused: a did:key is self-certifying, so authentication alone is not \
+            "with the gate enabled, a signed push from a non-owner must be refused: \
+             a did:key is self-certifying, so authentication alone is not \
              authorization"
         );
     }

@@ -8483,8 +8483,11 @@ mod tests {
     /// the per-source permit above the park, four parked pushes deny every push on the
     /// node for up to 1260s.
     ///
-    /// Same one source IP for all three pushes (the collapsed-key shape), distinct pusher
-    /// DIDs, per-source cap 2 so the holder plus a parked push would exhaust it.
+    /// Same one source IP for all three pushes (the collapsed-key shape), per-source
+    /// cap 2 so the holder plus a parked push would exhaust it. A and B are the owner
+    /// of `n1`; C is a second tenant, `z6u1nat2`, pushing to its own `n2` — owner-only
+    /// push means a tenant is identified by the repo it may write, not by an arbitrary
+    /// DID, and the cap keys on the resolved peer address rather than either.
     #[cfg(unix)]
     #[sqlx::test]
     async fn u1_parked_push_does_not_shed_another_pusher_behind_the_same_ip(pool: sqlx::PgPool) {

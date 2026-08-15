@@ -104,6 +104,13 @@ previous document and will reinstall the previous compose file.
   rendered compose carries it, so the upgrade installs the right version.
 - **`compose.yaml` is Terraform-owned and is overwritten on every upgrade.**
   Per-instance settings belong in `/opt/gitlawb/.env`, which is never touched.
+- **The upgrade reconciles the service set, not just the image.** The rendering is
+  conditional — `postgres` exists only when `db_host` is empty, `caddy` only when
+  `domain_name` is set — and the command runs `--remove-orphans`. So setting
+  `use_rds`, or clearing `domain_name`, and then upgrading will **stop and remove**
+  the local postgres or the TLS terminator. That is the intended outcome of those
+  variables, but it happens on the upgrade rather than on `apply`. Data survives
+  either way: both bind-mount under `/mnt/data`.
 
 ### Why the upgrade rewrites the compose file
 
@@ -124,18 +131,41 @@ Replace the instance itself (OS/AMI/instance-type changes) with
 
 ## Changing configuration
 
-User-data only runs at first boot, and the instance ignores `user_data` drift
-(`ignore_changes`), so editing terraform.tfvars values that feed the bootstrap
-(`bootstrap_peers`, `public_url`, integrations, `image_tag`) does **not**
-affect a running instance on `terraform apply`. To roll out such changes,
-either edit `/opt/gitlawb/.env` on the instance (SSM session, then
-`docker compose up -d`), or replace the instance:
+`terraform apply` alone never changes a running instance: user-data runs once and
+the instance ignores `user_data` drift. How a change rolls out depends on which
+of the two files carries it.
+
+**Rendered into `compose.yaml`** — `image_tag`, `gitlawb_port`, `metrics_port`,
+`domain_name`, `db_host`, the `icaptcha_*` values. `apply`, then run
+`upgrade_command`: it installs the new rendering and restarts.
+
+```sh
+terraform apply
+$(terraform output -raw upgrade_command)
+```
+
+**Written into `/opt/gitlawb/.env` at first boot** — `public_url`,
+`bootstrap_peers`, `auto_sync`, `max_pack_bytes`, and the integration secrets.
+Editing these in `terraform.tfvars` does **not** reach a running instance, because
+nothing rewrites `.env` after the first boot. Either edit `/opt/gitlawb/.env` on
+the instance and `docker compose up -d`, or replace it:
 
 ```sh
 terraform apply -replace=aws_instance.node
 ```
 
 The data volume reattaches; repos, postgres data, and the identity key survive.
+
+**A node setting the installed `compose.yaml` does not already name** —
+`GITLAWB_ENFORCE_OWNER_PUSH` on an instance created before it was added, for
+example. Editing `.env` is **not enough**: compose only passes through the
+variables its `environment:` block lists, so the value is read from `.env` and
+then dropped. Run `apply` plus `upgrade_command` first, which installs a compose
+file that names the key; after that, `.env` governs it like any other.
+
+That last case is the one worth remembering: `.env` reaches the container only for
+keys the *installed* compose interpolates, and the upgrade is what makes a newly
+added key one of them.
 
 ## Remote state (optional)
 
