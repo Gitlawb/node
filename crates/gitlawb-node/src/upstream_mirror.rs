@@ -116,13 +116,47 @@ fn reject_always_local_hostname(host: &str) -> Result<()> {
 }
 
 fn address_is_permitted(ip: IpAddr) -> bool {
-    // Broadcast/multicast/reserved destinations are never forge endpoints.
-    match ip {
-        IpAddr::V4(v4) if v4.octets()[0] >= 224 => return false,
-        IpAddr::V6(v6) if v6.is_multicast() => return false,
-        _ => {}
+    if !crate::api::peers::is_public_ip(ip) {
+        return false;
     }
-    crate::api::peers::is_public_ip(ip)
+    let classified = match ip {
+        IpAddr::V6(v6) => crate::api::peers::embedded_ipv4(v6)
+            .map(IpAddr::V4)
+            .unwrap_or(ip),
+        _ => ip,
+    };
+    match classified {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            // IANA special-purpose ranges that are not globally reachable but
+            // may be routed inside labs, clouds, or operator networks. They are
+            // unsuitable for an owner-controlled outbound fetch even though
+            // `Ipv4Addr::is_private` does not classify them as RFC1918.
+            !(a >= 224
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 0 && c == 2)
+                || (a == 192 && b == 88 && c == 99)
+                || (a == 198 && matches!(b, 18 | 19))
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113))
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            // IANA special-purpose ranges that are non-global, locally
+            // meaningful, or unsafe to treat as ordinary forge endpoints.
+            // Reject the complete IETF protocol-assignment /23 rather than
+            // trying to maintain its narrow globally reachable exceptions;
+            // a public forge has no reason to depend on those anycast ranges.
+            !(v6.is_multicast()
+                || (s[0] & 0xffc0) == 0xfec0
+                || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
+                || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 1)
+                || (s[0] == 0x2001 && (s[1] & 0xfe00) == 0)
+                || (s[0] == 0x2001 && s[1] == 0x0db8)
+                || (s[0] == 0x3fff && (s[1] & 0xf000) == 0)
+                || s[0] == 0x5f00)
+        }
+    }
 }
 
 fn parse_git_version(output: &str) -> Option<(u64, u64)> {
@@ -155,82 +189,62 @@ fn ensure_safe_git_runtime(git_bin: &str) -> Result<()> {
     Ok(())
 }
 
-fn fetch_args(upstream: &PinnedUpstream) -> Vec<String> {
-    let http_scope = |name: &str, value: &str| format!("http.{}.{name}={value}", upstream.url);
-    let credential_scope =
-        |name: &str, value: &str| format!("credential.{}.{name}={value}", upstream.url);
-    let mut args = vec![
-        "-c".to_string(),
-        "http.proxy=".to_string(),
-        "-c".to_string(),
-        "http.followRedirects=false".to_string(),
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FetchCommand {
+    config: Vec<(String, String)>,
+    args: Vec<String>,
+}
+
+fn fetch_command(upstream: &PinnedUpstream) -> FetchCommand {
+    let http_scope = |name: &str| format!("http.{}.{name}", upstream.url);
+    let credential_scope = |name: &str| format!("credential.{}.{name}", upstream.url);
+    let mut config = vec![
+        ("http.proxy".to_string(), "".to_string()),
+        ("http.followRedirects".to_string(), "false".to_string()),
         // Reset any inherited multi-valued resolver entries before adding the
         // address set validated for this exact fetch.
-        "-c".to_string(),
-        "http.curloptResolve=".to_string(),
+        ("http.curloptResolve".to_string(), "".to_string()),
         // Never forward operator or repository-scoped HTTP credentials to an
         // owner-selected forge. Empty values reset Git's multi-valued headers
         // and disable cookie state for this invocation.
-        "-c".to_string(),
-        "http.extraHeader=".to_string(),
-        "-c".to_string(),
-        "http.cookieFile=".to_string(),
-        "-c".to_string(),
-        "http.saveCookies=false".to_string(),
-        "-c".to_string(),
-        "http.sslVerify=true".to_string(),
+        ("http.extraHeader".to_string(), "".to_string()),
+        ("http.cookieFile".to_string(), "".to_string()),
+        ("http.saveCookies".to_string(), "false".to_string()),
+        ("http.sslVerify".to_string(), "true".to_string()),
         // URL-specific configuration outranks generic `http.*` values even
-        // when the generic value came from `-c`. Repeat every security control
-        // at the exact validated URL so a repository-local scoped setting
-        // cannot re-enable redirects/proxies/headers/cookies or disable TLS.
-        "-c".to_string(),
-        http_scope("proxy", ""),
-        "-c".to_string(),
-        http_scope("followRedirects", "false"),
-        "-c".to_string(),
-        http_scope("curloptResolve", ""),
-        "-c".to_string(),
-        http_scope("extraHeader", ""),
-        "-c".to_string(),
-        http_scope("cookieFile", ""),
-        "-c".to_string(),
-        http_scope("saveCookies", "false"),
-        "-c".to_string(),
-        http_scope("sslVerify", "true"),
-        "-c".to_string(),
-        http_scope("sslCert", ""),
-        "-c".to_string(),
-        http_scope("sslKey", ""),
+        // when the generic value is command-scoped. Repeat every security
+        // control at the exact validated URL so a repository-local scoped
+        // setting cannot re-enable redirects/proxies/headers/cookies or disable
+        // TLS. Key/value environment entries avoid `git -c` splitting a valid
+        // URL path that contains `=`.
+        (http_scope("proxy"), "".to_string()),
+        (http_scope("followRedirects"), "false".to_string()),
+        (http_scope("curloptResolve"), "".to_string()),
+        (http_scope("extraHeader"), "".to_string()),
+        (http_scope("cookieFile"), "".to_string()),
+        (http_scope("saveCookies"), "false".to_string()),
+        (http_scope("sslVerify"), "true".to_string()),
     ];
     if let Some(resolve) = &upstream.curlopt_resolve {
-        args.extend([
-            "-c".to_string(),
-            format!("http.curloptResolve={resolve}"),
-            "-c".to_string(),
-            http_scope("curloptResolve", resolve),
+        config.extend([
+            ("http.curloptResolve".to_string(), resolve.clone()),
+            (http_scope("curloptResolve"), resolve.clone()),
         ]);
     }
-    args.extend([
-        "-c".to_string(),
-        "credential.helper=".to_string(),
-        "-c".to_string(),
-        credential_scope("helper", ""),
-        "-c".to_string(),
-        "credential.interactive=false".to_string(),
-        "-c".to_string(),
-        "core.askPass=false".to_string(),
-        "-c".to_string(),
-        "fetch.recurseSubmodules=false".to_string(),
-        "-c".to_string(),
+    config.extend([
+        ("credential.helper".to_string(), "".to_string()),
+        (credential_scope("helper"), "".to_string()),
+        ("credential.interactive".to_string(), "false".to_string()),
+        ("core.askPass".to_string(), "false".to_string()),
+        ("fetch.recurseSubmodules".to_string(), "false".to_string()),
         // Do not let a smart server or repository-local config introduce a
         // second, unvalidated pack/bundle URL outside the pinned upstream.
-        "fetch.uriprotocols=".to_string(),
-        "-c".to_string(),
-        "fetch.bundleURI=".to_string(),
-        "-c".to_string(),
-        "protocol.allow=never".to_string(),
-        "-c".to_string(),
-        "protocol.https.allow=always".to_string(),
+        ("fetch.uriprotocols".to_string(), "".to_string()),
+        ("fetch.bundleURI".to_string(), "".to_string()),
+        ("protocol.allow".to_string(), "never".to_string()),
+        ("protocol.https.allow".to_string(), "always".to_string()),
+    ]);
+    let args = vec![
         "fetch".to_string(),
         "--atomic".to_string(),
         "--force".to_string(),
@@ -242,8 +256,8 @@ fn fetch_args(upstream: &PinnedUpstream) -> Vec<String> {
         upstream.url.clone(),
         "+refs/heads/*:refs/heads/*".to_string(),
         "+refs/tags/*:refs/tags/*".to_string(),
-    ]);
-    args
+    ];
+    FetchCommand { config, args }
 }
 
 fn reject_local_url_rewrite(
@@ -272,21 +286,53 @@ fn reject_local_url_rewrite(
     Ok(())
 }
 
+fn reject_sensitive_local_config(git_bin: &str, repo_path: &Path, deadline: Instant) -> Result<()> {
+    let args = [
+        "config",
+        "--local",
+        "--includes",
+        "--get-regexp",
+        r"^(http|credential|url)\.",
+    ];
+    let (status, stdout, stderr) = crate::git::visibility_pack::run_bounded_git_raw_isolated_https(
+        git_bin, &args, repo_path, b"", deadline,
+    )?;
+    match status.code() {
+        Some(1) if stdout.is_empty() => Ok(()),
+        Some(0) => anyhow::bail!(
+            "repository-local network or credential Git config is not allowed for upstream mirrors"
+        ),
+        _ => {
+            let stderr = String::from_utf8_lossy(&stderr);
+            anyhow::bail!(
+                "checking repository-local Git config failed: {}",
+                stderr.chars().take(4_096).collect::<String>()
+            )
+        }
+    }
+}
+
 fn run_fetch(
     git_bin: &str,
     repo_path: &Path,
     upstream: &PinnedUpstream,
     timeout: Duration,
 ) -> Result<()> {
-    let args = fetch_args(upstream);
-    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    let command = fetch_command(upstream);
+    let args: Vec<&str> = command.args.iter().map(String::as_str).collect();
+    let config: Vec<(&str, &str)> = command
+        .config
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
     let deadline = Instant::now()
         .checked_add(timeout)
         .context("upstream mirror fetch timeout is not representable")?;
     reject_local_url_rewrite(git_bin, repo_path, &upstream.url, deadline)?;
+    reject_sensitive_local_config(git_bin, repo_path, deadline)?;
     let (status, _stdout, stderr) =
-        crate::git::visibility_pack::run_bounded_git_raw_isolated_https(
-            git_bin, &borrowed, repo_path, b"", deadline,
+        crate::git::visibility_pack::run_bounded_git_raw_isolated_https_with_config(
+            git_bin, &args, repo_path, b"", deadline, &config,
         )?;
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr);
@@ -556,6 +602,10 @@ if [ "$1" = "ls-remote" ]; then
   printf '%s\n' "$3"
   exit 0
 fi
+if [ "$1" = "config" ]; then
+  # Match real Git when no sensitive repository-local keys are configured.
+  exit 1
+fi
 case "$*" in
   *fail.git*) printf '%s\n' fail >> '{}'; exit 7 ;;
   *) printf '%s\n' ok >> '{}'; exit 0 ;;
@@ -604,7 +654,27 @@ esac
             .validate_addresses("oversized.example", &too_many)
             .is_err());
 
-        for never in ["127.0.0.1", "169.254.169.254", "::1", "fe80::1"] {
+        for never in [
+            "127.0.0.1",
+            "169.254.169.254",
+            "192.0.2.1",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.10",
+            "::1",
+            "::ffff:198.18.0.1",
+            "2002:c612:1::",
+            "64:ff9b::c612:1",
+            "100::1",
+            "100:0:0:1::1",
+            "2001::1",
+            "2001:2::1",
+            "2001:db8::1",
+            "fec0::1",
+            "fe80::1",
+            "3fff::1",
+            "5f00::1",
+        ] {
             let ip = never.parse().unwrap();
             assert!(!address_is_permitted(ip), "{never} must stay denied");
         }
@@ -631,37 +701,60 @@ esac
     fn fetch_command_pins_dns_and_only_updates_branches_and_tags() {
         let upstream = PinnedUpstream {
             url: "https://github.example/org/repo.git".to_string(),
-            curlopt_resolve: Some("+github.example:443:203.0.113.10,[2001:db8::10]".to_string()),
+            curlopt_resolve: Some("+github.example:443:8.8.8.8,[2606:4700:4700::1111]".to_string()),
         };
-        let args = fetch_args(&upstream);
-        assert!(args.contains(&"http.followRedirects=false".to_string()));
-        assert!(args.contains(&"http.proxy=".to_string()));
-        assert!(args.contains(&"http.extraHeader=".to_string()));
-        assert!(args.contains(&"http.cookieFile=".to_string()));
-        assert!(args.contains(&"http.saveCookies=false".to_string()));
-        assert!(args.contains(&"http.sslVerify=true".to_string()));
-        assert!(args.contains(
-            &"http.curloptResolve=+github.example:443:203.0.113.10,[2001:db8::10]".to_string()
+        let command = fetch_command(&upstream);
+        let has_config = |key: &str, value: &str| {
+            command
+                .config
+                .contains(&(key.to_string(), value.to_string()))
+        };
+        assert!(has_config("http.followRedirects", "false"));
+        assert!(has_config("http.proxy", ""));
+        assert!(has_config("http.extraHeader", ""));
+        assert!(has_config("http.cookieFile", ""));
+        assert!(has_config("http.saveCookies", "false"));
+        assert!(has_config("http.sslVerify", "true"));
+        assert!(has_config(
+            "http.curloptResolve",
+            "+github.example:443:8.8.8.8,[2606:4700:4700::1111]"
         ));
-        assert!(args.contains(
-            &"http.https://github.example/org/repo.git.followRedirects=false".to_string()
+        assert!(has_config(
+            "http.https://github.example/org/repo.git.followRedirects",
+            "false"
         ));
-        assert!(args.contains(&"http.https://github.example/org/repo.git.proxy=".to_string()));
-        assert!(args.contains(&"http.https://github.example/org/repo.git.extraHeader=".to_string()));
-        assert!(args.contains(
-            &"http.https://github.example/org/repo.git.curloptResolve=+github.example:443:203.0.113.10,[2001:db8::10]".to_string()
+        assert!(has_config(
+            "http.https://github.example/org/repo.git.proxy",
+            ""
         ));
-        assert!(
-            args.contains(&"credential.https://github.example/org/repo.git.helper=".to_string())
-        );
-        assert!(args.contains(&"protocol.allow=never".to_string()));
-        assert!(args.contains(&"protocol.https.allow=always".to_string()));
-        assert!(args.contains(&"fetch.uriprotocols=".to_string()));
-        assert!(args.contains(&"fetch.bundleURI=".to_string()));
-        assert!(args.contains(&"--atomic".to_string()));
-        assert!(args.contains(&"+refs/heads/*:refs/heads/*".to_string()));
-        assert!(args.contains(&"+refs/tags/*:refs/tags/*".to_string()));
-        assert!(!args.iter().any(|arg| arg == "+refs/*:refs/*"));
+        assert!(has_config(
+            "http.https://github.example/org/repo.git.extraHeader",
+            ""
+        ));
+        assert!(has_config(
+            "http.https://github.example/org/repo.git.curloptResolve",
+            "+github.example:443:8.8.8.8,[2606:4700:4700::1111]"
+        ));
+        assert!(has_config(
+            "credential.https://github.example/org/repo.git.helper",
+            ""
+        ));
+        assert!(has_config("protocol.allow", "never"));
+        assert!(has_config("protocol.https.allow", "always"));
+        assert!(has_config("fetch.uriprotocols", ""));
+        assert!(has_config("fetch.bundleURI", ""));
+        assert!(!command
+            .config
+            .iter()
+            .any(|(key, _)| key.ends_with("sslCert") || key.ends_with("sslKey")));
+        assert!(command.args.contains(&"--atomic".to_string()));
+        assert!(command
+            .args
+            .contains(&"+refs/heads/*:refs/heads/*".to_string()));
+        assert!(command
+            .args
+            .contains(&"+refs/tags/*:refs/tags/*".to_string()));
+        assert!(!command.args.iter().any(|arg| arg == "+refs/*:refs/*"));
     }
 
     #[test]
@@ -694,11 +787,86 @@ esac
         assert!(error.to_string().contains("attempted to rewrite"));
     }
 
+    #[test]
+    fn repository_local_network_and_credential_config_is_rejected() {
+        let repo = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+
+        reject_sensitive_local_config("git", repo.path(), Instant::now() + Duration::from_secs(5))
+            .unwrap();
+
+        let config = std::process::Command::new("git")
+            .args(["config", "http.sslCert", "/tmp/untrusted-client.pem"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(config.status.success());
+
+        let error = reject_sensitive_local_config(
+            "git",
+            repo.path(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("network or credential"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardened_real_git_reaches_https_transport_for_equals_path() {
+        let repo = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+
+        // This is intentionally a loopback test seam around `run_fetch`, below
+        // the egress-policy layer. Reaching the listener proves the generated
+        // Git config neither dies on an empty client certificate nor splits the
+        // valid `=` path at the command-config boundary. The listener closes
+        // immediately, so the expected final result is a TLS transport error.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let accepted = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((_stream, _address)) => return true,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accepting real-Git transport probe: {error}"),
+                }
+            }
+            false
+        });
+        let upstream = PinnedUpstream {
+            url: format!("https://127.0.0.1:{port}/org/repo=mirror.git"),
+            curlopt_resolve: None,
+        };
+        let error = run_fetch("git", repo.path(), &upstream, Duration::from_secs(5)).unwrap_err();
+        assert!(
+            accepted.join().unwrap(),
+            "real Git must reach the HTTPS transport; got {error:#}"
+        );
+        let error = error.to_string();
+        assert!(!error.contains("credential missing host field"));
+        assert!(!error.contains("invalid key"));
+    }
+
     #[tokio::test]
     async fn literal_addresses_are_checked_without_dns() {
         let policy = EgressPolicy;
         let allowed = policy
-            .resolve(reqwest::Url::parse("https://203.0.113.10/org/repo.git").unwrap())
+            .resolve(reqwest::Url::parse("https://8.8.8.8/org/repo.git").unwrap())
             .await
             .unwrap();
         assert_eq!(allowed.curlopt_resolve, None);
@@ -707,8 +875,18 @@ esac
             "127.0.0.1",
             "10.2.3.4",
             "169.254.169.254",
+            "192.0.2.1",
+            "198.18.0.1",
+            "203.0.113.10",
             "[::1]",
+            "[100::1]",
+            "[100:0:0:1::1]",
+            "[2001::1]",
+            "[2001:db8::1]",
+            "[fec0::1]",
             "[fd00::20]",
+            "[3fff::1]",
+            "[5f00::1]",
         ] {
             let url = reqwest::Url::parse(&format!("https://{denied}/org/repo.git")).unwrap();
             assert!(

@@ -38,6 +38,7 @@ fn git_child_command(
     args: &[&str],
     repo_path: &Path,
     isolated_https: bool,
+    isolated_config: &[(&str, &str)],
 ) -> std::process::Command {
     let mut command = std::process::Command::new(git_bin);
     command
@@ -63,6 +64,14 @@ fn git_child_command(
             .env("SSH_ASKPASS", "false")
             .env("LANG", "C")
             .env("LC_ALL", "C");
+        if !isolated_config.is_empty() {
+            command.env("GIT_CONFIG_COUNT", isolated_config.len().to_string());
+            for (index, (key, value)) in isolated_config.iter().enumerate() {
+                command
+                    .env(format!("GIT_CONFIG_KEY_{index}"), key)
+                    .env(format!("GIT_CONFIG_VALUE_{index}"), value);
+            }
+        }
     }
     command
 }
@@ -112,13 +121,14 @@ fn run_bounded_git_raw_impl(
     stdin_bytes: &[u8],
     deadline: Instant,
     isolated_https: bool,
+    isolated_config: &[(&str, &str)],
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
     use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
     use std::sync::mpsc::RecvTimeoutError;
 
     let label = args.first().copied().unwrap_or("git");
-    let mut command = git_child_command(git_bin, args, repo_path, isolated_https);
+    let mut command = git_child_command(git_bin, args, repo_path, isolated_https, isolated_config);
     let mut child = command
         .process_group(0)
         .spawn()
@@ -236,7 +246,7 @@ pub(crate) fn run_bounded_git_raw(
     stdin_bytes: &[u8],
     deadline: Instant,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
-    run_bounded_git_raw_impl(git_bin, args, repo_path, stdin_bytes, deadline, false)
+    run_bounded_git_raw_impl(git_bin, args, repo_path, stdin_bytes, deadline, false, &[])
 }
 
 /// Run a bounded Git child without inheriting ambient Git/proxy/credential
@@ -249,7 +259,29 @@ pub(crate) fn run_bounded_git_raw_isolated_https(
     stdin_bytes: &[u8],
     deadline: Instant,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
-    run_bounded_git_raw_impl(git_bin, args, repo_path, stdin_bytes, deadline, true)
+    run_bounded_git_raw_impl(git_bin, args, repo_path, stdin_bytes, deadline, true, &[])
+}
+
+/// Isolated HTTPS runner with command-scope Git configuration supplied as
+/// separate key/value environment entries. Unlike `git -c key=value`, this
+/// preserves valid URL subsection keys whose path contains `=`.
+pub(crate) fn run_bounded_git_raw_isolated_https_with_config(
+    git_bin: &str,
+    args: &[&str],
+    repo_path: &Path,
+    stdin_bytes: &[u8],
+    deadline: Instant,
+    config: &[(&str, &str)],
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    run_bounded_git_raw_impl(
+        git_bin,
+        args,
+        repo_path,
+        stdin_bytes,
+        deadline,
+        true,
+        config,
+    )
 }
 
 /// Bounded git returning only stdout, `bail!`ing on any nonzero exit. The thin
@@ -292,12 +324,13 @@ fn run_bounded_git_raw_impl(
     stdin_bytes: &[u8],
     deadline: Instant,
     isolated_https: bool,
+    isolated_config: &[(&str, &str)],
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
     use std::io::{Read, Write};
     use std::sync::mpsc::RecvTimeoutError;
 
     let label = args.first().copied().unwrap_or("git");
-    let mut child = git_child_command(git_bin, args, repo_path, isolated_https)
+    let mut child = git_child_command(git_bin, args, repo_path, isolated_https, isolated_config)
         .spawn()
         .with_context(|| format!("failed to spawn git {label}"))?;
 

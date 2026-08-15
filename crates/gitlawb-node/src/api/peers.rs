@@ -84,7 +84,7 @@ pub(crate) const PUBLIC_HTTP_URL_REQUIREMENT: &str = "must be a public http(s) U
 /// sits at a prefix-length-dependent offset (RFC 6052 §2.2) — so they return
 /// `None`. Any caller that needs them blocked must reject the wider
 /// `64:ff9b::/32` itself; `is_public_http_url` does this in its native-v6 arm.
-fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+pub(crate) fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
     if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
         return Some(v4);
     }
