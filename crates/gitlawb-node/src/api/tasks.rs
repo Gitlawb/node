@@ -216,6 +216,7 @@ pub(crate) async fn collect_visible_tasks(
     let mut cursor: Option<(String, String)> =
         after.map(|(ts, id)| (ts.to_string(), id.to_string()));
     let mut scanned = 0;
+    let mut last_batch_full = false;
 
     while scanned < MAX_TASK_SCAN_CANDIDATES {
         let batch_limit = MAX_VISIBLE_TASKS.min(MAX_TASK_SCAN_CANDIDATES - scanned);
@@ -230,6 +231,7 @@ pub(crate) async fn collect_visible_tasks(
             )
             .await?;
         if tasks.is_empty() {
+            last_batch_full = false;
             break;
         }
         scanned += tasks.len() as i64;
@@ -261,13 +263,20 @@ pub(crate) async fn collect_visible_tasks(
             }
         }
 
-        if visible.len() == bounded_limit as usize || tasks.len() < batch_limit as usize {
+        if visible.len() == bounded_limit as usize {
             break;
         }
+        if tasks.len() < batch_limit as usize {
+            last_batch_full = false;
+            break;
+        }
+        last_batch_full = true;
         cursor = next_cursor;
     }
 
-    let incomplete = visible.len() < bounded_limit as usize && scanned >= MAX_TASK_SCAN_CANDIDATES;
+    let incomplete = visible.len() < bounded_limit as usize
+        && scanned >= MAX_TASK_SCAN_CANDIDATES
+        && last_batch_full;
 
     Ok(VisibleTasks {
         tasks: visible,
@@ -345,6 +354,60 @@ pub async fn create_task(
     Ok((StatusCode::CREATED, Json(task_to_json(&task))))
 }
 
+/// Canonicalize an RFC3339 timestamp. If spaces were introduced by URL query decoding
+/// (e.g. `+00:00` decoded as ` 00:00`), convert spaces back to `+` before parsing.
+pub(crate) fn canonicalize_timestamp(raw: &str) -> crate::error::Result<String> {
+    let normalized = if raw.contains(' ') {
+        raw.replace(' ', "+")
+    } else {
+        raw.to_string()
+    };
+    let dt = chrono::DateTime::parse_from_rfc3339(&normalized)
+        .map_err(|e| AppError::BadRequest(format!("invalid timestamp format '{raw}': {e}")))?;
+    Ok(dt.to_rfc3339())
+}
+
+/// A cursor is two query fields (`created_at`, `id`) from either the `after_*` or `cursor_*` family.
+/// Reject cross-family alias mixing, require both fields within a family, and canonicalize timestamps.
+pub(crate) fn parse_after_cursor(
+    after_created_at: Option<&str>,
+    after_id: Option<&str>,
+    cursor_created_at: Option<&str>,
+    cursor_id: Option<&str>,
+) -> crate::error::Result<Option<(String, String)>> {
+    let has_after = after_created_at.is_some() || after_id.is_some();
+    let has_cursor = cursor_created_at.is_some() || cursor_id.is_some();
+    if has_after && has_cursor {
+        return Err(AppError::BadRequest(
+            "cannot mix after_* and cursor_* parameter aliases".into(),
+        ));
+    }
+    let (raw_ts, raw_id) = if has_after {
+        match (after_created_at, after_id) {
+            (Some(ts), Some(id)) => (ts, id),
+            _ => {
+                return Err(AppError::BadRequest(
+                    "after_created_at and after_id must be supplied together".into(),
+                ))
+            }
+        }
+    } else if has_cursor {
+        match (cursor_created_at, cursor_id) {
+            (Some(ts), Some(id)) => (ts, id),
+            _ => {
+                return Err(AppError::BadRequest(
+                    "cursor_created_at and cursor_id must be supplied together".into(),
+                ))
+            }
+        }
+    } else {
+        return Ok(None);
+    };
+
+    let canonical_ts = canonicalize_timestamp(raw_ts)?;
+    Ok(Some((canonical_ts, raw_id.to_string())))
+}
+
 /// GET /api/v1/tasks
 ///
 /// Open to anonymous callers, but every row is gated by `collect_visible_tasks`
@@ -356,12 +419,15 @@ pub async fn list_tasks(
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> crate::error::Result<Json<Value>> {
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
-    let after = parse_after_cursor(
-        q.after_created_at
-            .as_deref()
-            .or(q.cursor_created_at.as_deref()),
-        q.after_id.as_deref().or(q.cursor_id.as_deref()),
+    let after_parsed = parse_after_cursor(
+        q.after_created_at.as_deref(),
+        q.after_id.as_deref(),
+        q.cursor_created_at.as_deref(),
+        q.cursor_id.as_deref(),
     )?;
+    let after = after_parsed
+        .as_ref()
+        .map(|(ts, id)| (ts.as_str(), id.as_str()));
     let result = collect_visible_tasks(
         &state.db,
         q.status.as_deref(),
@@ -377,22 +443,6 @@ pub async fn list_tasks(
         "count": items.len(),
         "incomplete": result.incomplete,
     })))
-}
-
-/// A cursor is two independently optional query fields (`created_at`, `id`);
-/// treating a half-supplied pair as absent would silently restart the caller
-/// at page one instead of surfacing the lost half. Require both together.
-pub(crate) fn parse_after_cursor<'a>(
-    created_at: Option<&'a str>,
-    id: Option<&'a str>,
-) -> crate::error::Result<Option<(&'a str, &'a str)>> {
-    match (created_at, id) {
-        (Some(ts), Some(id)) => Ok(Some((ts, id))),
-        (None, None) => Ok(None),
-        _ => Err(AppError::BadRequest(
-            "after_created_at and after_id must be supplied together".into(),
-        )),
-    }
 }
 
 /// GET /api/v1/tasks/{id}
@@ -445,13 +495,10 @@ pub async fn complete_task(
     Path(id): Path<String>,
     Json(body): Json<CompleteTaskBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // Authorize the actor, not just bind their identity: the N13 signer-binding
-    // proved the caller was whoever they claimed, but never that they were the
-    // task's assignee. Load the task and require the caller to be its assignee;
-    // finish_task then transitions only a claimed task.
-    let existing = state
-        .db
-        .get_task(&id)
+    // Authorize the actor, not just bind their identity: the task must be visible
+    // to the caller (returning 404 for invisible tasks so existence is not leaked),
+    // and only the task's assignee may complete it.
+    let existing = get_visible_task(&state.db, &id, Some(&auth.0))
         .await
         .map_err(|e| {
             (
@@ -499,12 +546,10 @@ pub async fn fail_task(
     Path(id): Path<String>,
     Json(body): Json<FailTaskBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // Authorize the actor, not just bind their identity (see complete_task): only
-    // the task's assignee may fail it, and finish_task transitions only a claimed
-    // task.
-    let existing = state
-        .db
-        .get_task(&id)
+    // Authorize the actor: the task must be visible to the caller (returning
+    // 404 for invisible tasks so existence is not leaked), and only the task's
+    // assignee may fail it.
+    let existing = get_visible_task(&state.db, &id, Some(&auth.0))
         .await
         .map_err(|e| {
             (
@@ -1041,5 +1086,95 @@ mod visible_tasks_tests {
         );
         let body = body_json(resp).await;
         assert_eq!(body["error"], "db_unavailable");
+    }
+
+    #[sqlx::test]
+    async fn list_tasks_rejects_mixed_cursor_alias_families(pool: PgPool) {
+        let state = test_state(pool).await;
+        let resp = list_router(state)
+            .oneshot(anon_get(
+                "/api/v1/tasks?after_created_at=2026-01-01T00:00:00Z&cursor_id=some-id",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "bad_request");
+    }
+
+    #[sqlx::test]
+    async fn list_tasks_accepts_and_canonicalizes_spaces_in_timestamp(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("public-repo", DELEGATOR, "public", true))
+            .await
+            .unwrap();
+        let mut t1 = task("t1", Some("public-repo"), DELEGATOR);
+        t1.created_at = "2026-01-01T00:00:00+00:00".into();
+        state.db.create_task(&t1).await.unwrap();
+
+        let resp = list_router(state)
+            .oneshot(anon_get(
+                "/api/v1/tasks?after_created_at=2026-01-02T00:00:00+00:00&after_id=dummy",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    fn full_task_router(state: crate::state::AppState) -> Router {
+        Router::new()
+            .route("/api/v1/tasks", axum::routing::get(super::list_tasks))
+            .route("/api/v1/tasks/{id}", axum::routing::get(super::get_task))
+            .route(
+                "/api/v1/tasks/{id}/complete",
+                axum::routing::post(super::complete_task),
+            )
+            .route(
+                "/api/v1/tasks/{id}/fail",
+                axum::routing::post(super::fail_task),
+            )
+            .with_state(state)
+    }
+
+    #[sqlx::test]
+    async fn complete_and_fail_task_on_invisible_task_returns_404_not_403(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_task(&task("t1", None, DELEGATOR))
+            .await
+            .unwrap();
+
+        let complete_resp = full_task_router(state.clone())
+            .oneshot(signed_request_as(
+                STRANGER,
+                Method::POST,
+                "/api/v1/tasks/t1/complete",
+                Body::from(r#"{"result":"done"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            complete_resp.status(),
+            StatusCode::NOT_FOUND,
+            "completing an invisible task must 404, not leak existence via 403"
+        );
+
+        let fail_resp = full_task_router(state)
+            .oneshot(signed_request_as(
+                STRANGER,
+                Method::POST,
+                "/api/v1/tasks/t1/fail",
+                Body::from(r#"{"reason":"error"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            fail_resp.status(),
+            StatusCode::NOT_FOUND,
+            "failing an invisible task must 404, not leak existence via 403"
+        );
     }
 }

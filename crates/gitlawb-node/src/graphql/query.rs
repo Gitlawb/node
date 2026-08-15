@@ -127,9 +127,16 @@ impl QueryRoot {
             .data::<crate::auth::AuthenticatedDid>()
             .ok()
             .map(|d| d.0.as_str());
-        let after =
-            crate::api::tasks::parse_after_cursor(after_created_at.as_deref(), after_id.as_deref())
-                .map_err(crate::graphql::graphql_app_err)?;
+        let after_parsed = crate::api::tasks::parse_after_cursor(
+            after_created_at.as_deref(),
+            after_id.as_deref(),
+            None,
+            None,
+        )
+        .map_err(crate::graphql::graphql_app_err)?;
+        let after = after_parsed
+            .as_ref()
+            .map(|(ts, id)| (ts.as_str(), id.as_str()));
         let result = crate::api::tasks::collect_visible_tasks(
             db,
             status.as_deref(),

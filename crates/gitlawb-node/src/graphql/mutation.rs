@@ -103,12 +103,12 @@ impl MutationRoot {
         let by_did = caller.to_string();
         let db = ctx.data_unchecked::<Arc<Db>>();
         let tx = ctx.data_unchecked::<tokio::sync::broadcast::Sender<TaskEventBroadcast>>();
-        // Authorize the actor: binding by_did to the signer is necessary but not
-        // sufficient — only the task's assignee may finish it.
-        let existing = db
-            .get_task(&id)
+        // Authorize the actor: the task must be visible to the caller (returning
+        // not found for invisible tasks so existence is not leaked), and only
+        // the task's assignee may finish it.
+        let existing = crate::api::tasks::get_visible_task(db, &id, Some(caller))
             .await
-            .map_err(crate::graphql::graphql_db_err)?
+            .map_err(crate::graphql::graphql_app_err)?
             .ok_or_else(|| async_graphql::Error::new("task not found"))?;
         if !crate::api::did_matches(caller, existing.assignee_did.as_deref().unwrap_or_default()) {
             return Err(async_graphql::Error::new(
@@ -145,11 +145,12 @@ impl MutationRoot {
         let by_did = caller.to_string();
         let db = ctx.data_unchecked::<Arc<Db>>();
         let tx = ctx.data_unchecked::<tokio::sync::broadcast::Sender<TaskEventBroadcast>>();
-        // Authorize the actor: only the task's assignee may fail it.
-        let existing = db
-            .get_task(&id)
+        // Authorize the actor: the task must be visible to the caller (returning
+        // not found for invisible tasks so existence is not leaked), and only
+        // the task's assignee may fail it.
+        let existing = crate::api::tasks::get_visible_task(db, &id, Some(caller))
             .await
-            .map_err(crate::graphql::graphql_db_err)?
+            .map_err(crate::graphql::graphql_app_err)?
             .ok_or_else(|| async_graphql::Error::new("task not found"))?;
         if !crate::api::did_matches(caller, existing.assignee_did.as_deref().unwrap_or_default()) {
             return Err(async_graphql::Error::new(
@@ -294,7 +295,7 @@ mod tests {
             payload: None,
             result: None,
             created_at: now.clone(),
-            updated_at: now,
+            updated_at: now.clone(),
             deadline: None,
         };
         state.db.create_task(&task).await.expect("seed task");
@@ -311,14 +312,69 @@ mod tests {
             )
         };
 
-        // Stranger signs as themselves and passes byDid=self (so the signer
-        // binding passes), but is not the assignee → rejected by authorization.
+        // Stranger signs as themselves on a repo-less task they cannot see:
+        // invisible task returns "task not found" so existence is not leaked.
         let resp = schema
             .execute(Request::new(q(stranger)).data(AuthenticatedDid(stranger.into())))
             .await;
         assert!(
+            errors(&resp).contains("task not found"),
+            "an invisible task must return not found, got: {}",
+            errors(&resp)
+        );
+
+        // Seed a task on a public repo that stranger CAN see, but is not assignee of:
+        let pub_repo = crate::db::RepoRecord {
+            id: "pub-r".into(),
+            name: "pub-r".into(),
+            owner_did: "did:key:zGQLDELEGATORCCCCCCCCCCCCCCCCCCCCCCCCCC".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            disk_path: "/tmp/pub-r".into(),
+            forked_from: None,
+            machine_id: None,
+        };
+        state.db.create_repo(&pub_repo).await.expect("create repo");
+        let pub_task = crate::db::AgentTask {
+            id: "task-pub".into(),
+            repo_id: Some("pub-r".into()),
+            kind: "build".into(),
+            status: "pending".into(),
+            delegator_did: "did:key:zGQLDELEGATORCCCCCCCCCCCCCCCCCCCCCCCCCC".into(),
+            assignee_did: None,
+            capability: "repo:write".into(),
+            ucan_token: None,
+            payload: None,
+            result: None,
+            created_at: now.clone(),
+            updated_at: now,
+            deadline: None,
+        };
+        state
+            .db
+            .create_task(&pub_task)
+            .await
+            .expect("seed pub task");
+        state
+            .db
+            .claim_task("task-pub", assignee)
+            .await
+            .expect("claim pub task");
+
+        let q_pub = |actor: &str| {
+            format!(
+                r#"mutation {{ completeTask(id: "task-pub", byDid: "{actor}", input: {{}}) {{ id status }} }}"#
+            )
+        };
+        let resp = schema
+            .execute(Request::new(q_pub(stranger)).data(AuthenticatedDid(stranger.into())))
+            .await;
+        assert!(
             errors(&resp).contains("assignee"),
-            "a non-assignee signer must be rejected: {}",
+            "a non-assignee signer on a visible task must be rejected: {}",
             errors(&resp)
         );
 
