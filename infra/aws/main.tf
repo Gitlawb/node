@@ -350,10 +350,16 @@ resource "aws_instance" "node" {
     # ami: new AL2023 releases shouldn't churn the instance; replace
     # deliberately for OS upgrades.
     # user_data: only runs at first boot, so re-rendering it on a live
-    # instance is a pointless stop/start. Config changes that feed user-data
-    # (bootstrap peers, integrations, image tag) require a deliberate
-    # `terraform apply -replace=aws_instance.node` — see README "Changing
-    # configuration".
+    # instance is a pointless stop/start. How a config change reaches a running
+    # instance depends on which file carries it:
+    #   - rendered into compose.yaml (image_tag, ports, domain_name, db_host,
+    #     icaptcha_*): `terraform apply` then `upgrade_command`, which
+    #     reinstalls the rendering and restarts.
+    #   - written into /opt/gitlawb/.env at first boot (public_url,
+    #     bootstrap_peers, integrations): nothing rewrites .env afterwards, so
+    #     these need an edit on the instance or
+    #     `terraform apply -replace=aws_instance.node`.
+    # See README "Changing configuration".
     ignore_changes = [ami, user_data]
   }
 }
