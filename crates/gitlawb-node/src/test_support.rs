@@ -681,13 +681,10 @@ mod tests {
         let assignee = "did:key:zTASKASSIGNEEBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
         let stranger = "did:key:zTASKSTRANGERCCCCCCCCCCCCCCCCCCCCCCCCCCC";
         let state = test_state(pool).await;
-        state
-            .db
-            .create_repo(&seed_repo(delegator, "task-pub-repo"))
-            .await
-            .expect("seed repo");
+        let repo = seed_repo(delegator, "task-pub-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
         let mut t1 = seed_task("task-1", delegator);
-        t1.repo_id = Some("task-pub-repo".to_string());
+        t1.repo_id = Some(repo.id);
         state.db.create_task(&t1).await.expect("seed task");
         // Assignee claims it: pending -> claimed, assignee_did = assignee.
         state
