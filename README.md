@@ -56,7 +56,7 @@ Good today:
 - Bare git repository storage.
 - Git smart-HTTP clone/fetch/push.
 - RFC 9421-signed writes.
-- Repository and path-scoped read visibility enforcement, including 404-shaped denials.
+- Repository and path-scoped visibility enforcement for repository and Git content reads, with 404-shaped repository denials.
 - DID identities.
 - `gl` CLI workflows.
 - libp2p peer discovery/gossip foundation.
@@ -69,6 +69,7 @@ Known limitations:
 - Repository write authorization is not secure by default: `GITLAWB_ENFORCE_OWNER_PUSH` defaults to `false` for compatibility, so a valid HTTP Signature identifies a pusher but does not enforce owner-only pushes.
 - UCAN proof chains are validated when supplied, but UCAN capabilities are not consulted by write authorization and the root issuer is not independently trust-anchored. UCANs therefore do not yet grant scoped collaborator access.
 - Agent lifecycle revocation is not enforced by HTTP Signature authorization; do not rely on removing or revoking an agent record to block a compromised signer.
+- Read visibility is not a blanket data-classification boundary: task, IPFS-pin, and Arweave-anchor listings are not repository-gated; withheld path names can be visible to a root reader; and later visibility changes cannot retract content already announced or externally anchored.
 - Peer writes are signed by upgraded nodes, but strict signed-peer enforcement is opt-in during rolling upgrades.
 - Current GraphQL mutations require an authenticated signer, but there is no mutation-specific guardrail that prevents a future mutation from omitting that check.
 - Pull-request review comments do not yet have threaded line-level anchors, and merges do not enforce approval requirements.

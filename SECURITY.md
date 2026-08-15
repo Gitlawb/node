@@ -71,8 +71,11 @@ These are documented limitations of the current live release. They should be pri
 - **Fix target:** v0.2
 
 ### Private repository reads
-- Repository and path-scoped visibility checks are enforced for API and Git content reads. A denied read returns the same 404 shape as a missing repository, so the denial does not reveal repository or withheld-path existence.
-- **Impact:** Callers can read only repositories and paths their visibility rules permit.
+- Repository and path-scoped visibility checks are enforced for repository API and Git content reads. A denied whole-repository or root read returns the same 404 shape as a missing repository, so the denial does not reveal private-repository existence.
+- Sparse-clone support exposes withheld path globs to callers who may read the repository root. Do not put sensitive information in withheld path names.
+- `GET /api/v1/tasks`, `/api/v1/ipfs/pins`, and `/api/v1/arweave/anchors` are not repository-gated. Task records include a UCAN token; pin and anchor listings expose object and ref metadata.
+- Changing a repository's visibility controls future serving, but cannot retract ref metadata or configured external pins and anchors already announced while the repository was public. Do not push secrets to an announceable repository.
+- **Impact:** Visibility policies protect the repository and Git content routes they gate, not every metadata endpoint or previously published content.
 - **Remaining boundary:** This read control does not address the independent write-authorization and UCAN-delegation limitations described above.
 
 ### Pull-request review enforcement
@@ -108,7 +111,7 @@ These are documented limitations of the current live release. They should be pri
 | Key storage | PKCS#8 PEM, 0600 permissions |
 | Content hashing | SHA-256 via CIDv1 |
 | HTTP Signatures | RFC 9421 (Ed25519 + SHA-256 Content-Digest) |
-| UCAN tokens | JWT (Ed25519 signatures) |
+| UCAN tokens | Signed JSON object (Ed25519 signature) |
 | On-chain | ECDSA secp256k1 (Base L2 / Ethereum) |
 
 ---
@@ -116,7 +119,7 @@ These are documented limitations of the current live release. They should be pri
 ## Threat Model
 
 gitlawb is designed to be secure against:
-- **Unauthorized writes** — HTTP Signature auth on all write endpoints
+- **Unauthenticated writes** — HTTP Signature auth on protected write endpoints; see Known Limitations for owner and capability authorization gaps
 - **Tampered git objects** — CIDv1 content addressing detects modification
 - **Identity spoofing** — DIDs derived from public keys, unforgeable without the private key
 - **Centralized takedown** — no single point of control; data on IPFS + Arweave
