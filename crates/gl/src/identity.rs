@@ -76,15 +76,33 @@ pub fn gitlawb_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(d) = override_dir {
         return Ok(d);
     }
-    if let Ok(key) = std::env::var("GITLAWB_KEY") {
-        if !key.trim().is_empty() {
-            let path = if let Some(rest) = key.strip_prefix("~/") {
-                dirs::home_dir()
+    // `var_os`, not `var`: a non-UTF-8 value makes `var` return Err, which would be
+    // indistinguishable from unset and would silently select ~/.gitlawb instead of
+    // the operator's actual key directory.
+    if let Some(raw) = std::env::var_os("GITLAWB_KEY") {
+        let key = PathBuf::from(&raw);
+        if !key.as_os_str().is_empty() {
+            let path = match key.strip_prefix("~") {
+                Ok(rest) => dirs::home_dir()
                     .context("could not determine home directory")?
-                    .join(rest)
-            } else {
-                PathBuf::from(key)
+                    .join(rest),
+                Err(_) => key,
             };
+            // A relative GITLAWB_KEY is refused rather than resolved. `gl` and
+            // `git-remote-gitlawb` run with different working directories, so a
+            // relative path makes them derive different delegation stores — the
+            // import lands somewhere the helper never looks, and the push is refused
+            // with nothing to indicate why. A one-component value is worse still:
+            // `parent()` yields "", so the store becomes `./delegations`.
+            if !path.is_absolute() {
+                anyhow::bail!(
+                    "GITLAWB_KEY must be an absolute path (got {}). It determines where \
+                     delegations are stored, and `gl` and `git-remote-gitlawb` do not \
+                     share a working directory, so a relative path sends them to \
+                     different places.",
+                    path.display()
+                );
+            }
             if let Some(parent) = path.parent() {
                 return Ok(parent.to_path_buf());
             }
@@ -530,5 +548,56 @@ mod tests {
 
         let dst_kp = load_keypair_from_dir(Some(dst_dir.path())).unwrap();
         assert_eq!(original_did, dst_kp.did());
+    }
+}
+
+#[cfg(test)]
+mod gitlawb_dir_tests {
+    use super::gitlawb_dir;
+    use std::path::PathBuf;
+
+    /// An explicit --dir always wins and is never validated against GITLAWB_KEY.
+    #[test]
+    fn explicit_override_wins() {
+        let d = PathBuf::from("/tmp/explicit");
+        assert_eq!(gitlawb_dir(Some(d.clone())).unwrap(), d);
+    }
+
+    /// A relative GITLAWB_KEY must fail loudly. `gl` and `git-remote-gitlawb` run
+    /// from different working directories, so resolving one relatively sends the
+    /// import and the lookup to different stores; a one-component value yields an
+    /// empty parent and puts the store in `./delegations`.
+    ///
+    /// Serialised with the other env-touching case: the process environment is
+    /// global and these would otherwise race.
+    #[test]
+    fn relative_and_nonunicode_key_paths() {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let restore = std::env::var_os("GITLAWB_KEY");
+
+        std::env::set_var("GITLAWB_KEY", "identity.pem");
+        let one_component = gitlawb_dir(None);
+        std::env::set_var("GITLAWB_KEY", "keys/identity.pem");
+        let relative = gitlawb_dir(None);
+        std::env::set_var("GITLAWB_KEY", "");
+        let empty = gitlawb_dir(None);
+
+        match restore {
+            Some(v) => std::env::set_var("GITLAWB_KEY", v),
+            None => std::env::remove_var("GITLAWB_KEY"),
+        }
+
+        assert!(
+            one_component.is_err(),
+            "a one-component key path yields an empty parent and must be refused"
+        );
+        assert!(relative.is_err(), "a relative key path must be refused");
+        assert!(
+            empty.is_ok(),
+            "an empty value is treated as unset, not as an error"
+        );
     }
 }
