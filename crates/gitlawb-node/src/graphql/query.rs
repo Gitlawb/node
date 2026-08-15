@@ -707,7 +707,13 @@ mod tests {
         let resp = anon(&schema, "{ tasks(limit: 1) { items { id } incomplete } }").await;
         assert_eq!(count_tasks(&resp), 1);
         assert!(!task_incomplete(&resp));
-        assert_eq!(task_items(&resp)[0]["id"], "newer-visible");
+        let async_graphql::Value::Object(first) = &task_items(&resp)[0] else {
+            panic!("expected task item to be an object");
+        };
+        assert_eq!(
+            first.get("id"),
+            Some(&async_graphql::Value::from("newer-visible"))
+        );
 
         // Page 2 anchored on the visible task hits the candidate ceiling across the denied window.
         let resp = anon(
