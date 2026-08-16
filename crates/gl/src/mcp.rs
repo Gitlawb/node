@@ -1102,6 +1102,7 @@ async fn call_tool(
             let resp: Value = client
                 .post(&format!("/api/v1/tasks/{id}/claim"), &body)
                 .await?
+                .error_for_status()?
                 .json()
                 .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
@@ -1118,6 +1119,7 @@ async fn call_tool(
             let resp: Value = client
                 .post(&format!("/api/v1/tasks/{id}/complete"), &body)
                 .await?
+                .error_for_status()?
                 .json()
                 .await?;
             Ok(serde_json::to_string_pretty(&resp)?)

@@ -264,16 +264,24 @@ pub(crate) async fn collect_visible_tasks(
             }
         }
 
+        let last_batch = tasks.len() < batch_limit as usize;
         if visible.len() == bounded_limit as usize {
-            break;
+            // A full page is incomplete when more candidates remain after this
+            // batch. Stopping here without that flag made a full page look
+            // like the end of the list.
+            let incomplete = !last_batch;
+            return Ok(VisibleTasks {
+                tasks: visible,
+                incomplete,
+            });
         }
-        if tasks.len() < batch_limit as usize {
+        if last_batch {
             break;
         }
         cursor = next_cursor;
     }
 
-    let incomplete = visible.len() < bounded_limit as usize && scanned >= MAX_TASK_SCAN_CANDIDATES;
+    let incomplete = scanned >= MAX_TASK_SCAN_CANDIDATES;
 
     Ok(VisibleTasks {
         tasks: visible,
@@ -312,6 +320,25 @@ pub(crate) async fn get_visible_task(
         None => (HashMap::new(), HashMap::new()),
     };
     Ok(task_visible(&task, caller, &repos_by_id, &rules_by_repo).then_some(task))
+}
+
+/// Broadcast a task event only when the task is publicly visible.
+/// Matches `if announce` on ref updates: private-task status changes stay off
+/// the unauthenticated GraphQL subscription.
+pub(crate) async fn announce_task_event(
+    db: &crate::db::Db,
+    tx: &tokio::sync::broadcast::Sender<TaskEventBroadcast>,
+    event: TaskEventBroadcast,
+) {
+    match get_visible_task(db, &event.task_id, None).await {
+        Ok(Some(_)) => {
+            let _ = tx.send(event);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, task_id = %event.task_id, "skipping task event broadcast");
+        }
+    }
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -471,19 +498,40 @@ pub async fn claim_task(
     if !crate::api::did_matches(&auth.0, &body.assignee_did) {
         return Err(forbidden("assignee_did must be the authenticated signer"));
     }
+    // Same visibility gate as complete/fail: invisible tasks are 404 so
+    // existence is not leaked via a successful claim or a leaking 409.
+    get_visible_task(&state.db, &id, Some(&auth.0))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "task not found" })),
+            )
+        })?;
     let task = state.db.claim_task(&id, &auth.0).await.map_err(|e| {
         (
             StatusCode::CONFLICT,
             Json(json!({ "error": e.to_string() })),
         )
     })?;
-    let _ = state.task_event_tx.send(TaskEventBroadcast {
-        task_id: id,
-        old_status: "pending".to_string(),
-        new_status: "claimed".to_string(),
-        by_did: auth.0,
-        at: Utc::now().to_rfc3339(),
-    });
+    announce_task_event(
+        &state.db,
+        &state.task_event_tx,
+        TaskEventBroadcast {
+            task_id: id,
+            old_status: "pending".to_string(),
+            new_status: "claimed".to_string(),
+            by_did: auth.0,
+            at: Utc::now().to_rfc3339(),
+        },
+    )
+    .await;
     Ok(Json(task_to_json(&task)))
 }
 
@@ -528,13 +576,18 @@ pub async fn complete_task(
                 Json(json!({ "error": e.to_string() })),
             )
         })?;
-    let _ = state.task_event_tx.send(TaskEventBroadcast {
-        task_id: id,
-        old_status: "claimed".to_string(),
-        new_status: "completed".to_string(),
-        by_did,
-        at: Utc::now().to_rfc3339(),
-    });
+    announce_task_event(
+        &state.db,
+        &state.task_event_tx,
+        TaskEventBroadcast {
+            task_id: id,
+            old_status: "claimed".to_string(),
+            new_status: "completed".to_string(),
+            by_did,
+            at: Utc::now().to_rfc3339(),
+        },
+    )
+    .await;
     Ok(Json(task_to_json(&task)))
 }
 
@@ -580,13 +633,18 @@ pub async fn fail_task(
                 Json(json!({ "error": e.to_string() })),
             )
         })?;
-    let _ = state.task_event_tx.send(TaskEventBroadcast {
-        task_id: id,
-        old_status: "claimed".to_string(),
-        new_status: "failed".to_string(),
-        by_did,
-        at: Utc::now().to_rfc3339(),
-    });
+    announce_task_event(
+        &state.db,
+        &state.task_event_tx,
+        TaskEventBroadcast {
+            task_id: id,
+            old_status: "claimed".to_string(),
+            new_status: "failed".to_string(),
+            by_did,
+            at: Utc::now().to_rfc3339(),
+        },
+    )
+    .await;
     Ok(Json(task_to_json(&task)))
 }
 
@@ -1269,6 +1327,10 @@ mod visible_tasks_tests {
             .route("/api/v1/tasks", axum::routing::get(super::list_tasks))
             .route("/api/v1/tasks/{id}", axum::routing::get(super::get_task))
             .route(
+                "/api/v1/tasks/{id}/claim",
+                axum::routing::post(super::claim_task),
+            )
+            .route(
                 "/api/v1/tasks/{id}/complete",
                 axum::routing::post(super::complete_task),
             )
@@ -1316,6 +1378,31 @@ mod visible_tasks_tests {
             fail_resp.status(),
             StatusCode::NOT_FOUND,
             "failing an invisible task must 404, not leak existence via 403"
+        );
+    }
+
+    #[sqlx::test]
+    async fn claim_task_on_invisible_task_returns_404_not_success_or_409(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_task(&task("t1", None, DELEGATOR))
+            .await
+            .unwrap();
+
+        let claim_resp = full_task_router(state)
+            .oneshot(signed_request_as(
+                STRANGER,
+                Method::POST,
+                "/api/v1/tasks/t1/claim",
+                Body::from(format!(r#"{{"assignee_did":"{STRANGER}"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            claim_resp.status(),
+            StatusCode::NOT_FOUND,
+            "claiming an invisible task must 404, not succeed or leak via 409"
         );
     }
 }

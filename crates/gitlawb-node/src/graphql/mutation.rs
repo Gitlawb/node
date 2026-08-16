@@ -73,17 +73,26 @@ impl MutationRoot {
         let assignee_did = caller.to_string();
         let db = ctx.data_unchecked::<Arc<Db>>();
         let tx = ctx.data_unchecked::<tokio::sync::broadcast::Sender<TaskEventBroadcast>>();
+        crate::api::tasks::get_visible_task(db, &id, Some(caller))
+            .await
+            .map_err(crate::graphql::graphql_app_err)?
+            .ok_or_else(|| async_graphql::Error::new("task not found"))?;
         let task = db
             .claim_task(&id, &assignee_did)
             .await
             .map_err(crate::graphql::graphql_db_err)?;
-        let _ = tx.send(TaskEventBroadcast {
-            task_id: id,
-            old_status: "pending".to_string(),
-            new_status: "claimed".to_string(),
-            by_did: assignee_did,
-            at: Utc::now().to_rfc3339(),
-        });
+        crate::api::tasks::announce_task_event(
+            db,
+            tx,
+            TaskEventBroadcast {
+                task_id: id,
+                old_status: "pending".to_string(),
+                new_status: "claimed".to_string(),
+                by_did: assignee_did,
+                at: Utc::now().to_rfc3339(),
+            },
+        )
+        .await;
         Ok(AgentTaskType::from(task))
     }
 
@@ -119,13 +128,18 @@ impl MutationRoot {
             .finish_task(&id, "completed", input.result.as_deref())
             .await
             .map_err(crate::graphql::graphql_db_err)?;
-        let _ = tx.send(TaskEventBroadcast {
-            task_id: id,
-            old_status: "claimed".to_string(),
-            new_status: "completed".to_string(),
-            by_did,
-            at: Utc::now().to_rfc3339(),
-        });
+        crate::api::tasks::announce_task_event(
+            db,
+            tx,
+            TaskEventBroadcast {
+                task_id: id,
+                old_status: "claimed".to_string(),
+                new_status: "completed".to_string(),
+                by_did,
+                at: Utc::now().to_rfc3339(),
+            },
+        )
+        .await;
         Ok(AgentTaskType::from(task))
     }
 
@@ -162,13 +176,18 @@ impl MutationRoot {
             .finish_task(&id, "failed", Some(&reason))
             .await
             .map_err(crate::graphql::graphql_db_err)?;
-        let _ = tx.send(TaskEventBroadcast {
-            task_id: id,
-            old_status: "claimed".to_string(),
-            new_status: "failed".to_string(),
-            by_did,
-            at: Utc::now().to_rfc3339(),
-        });
+        crate::api::tasks::announce_task_event(
+            db,
+            tx,
+            TaskEventBroadcast {
+                task_id: id,
+                old_status: "claimed".to_string(),
+                new_status: "failed".to_string(),
+                by_did,
+                at: Utc::now().to_rfc3339(),
+            },
+        )
+        .await;
         Ok(AgentTaskType::from(task))
     }
 }
