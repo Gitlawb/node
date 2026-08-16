@@ -523,32 +523,60 @@ mod tests {
     }
 }
 
+/// Scoped `GITLAWB_KEY` for tests, shared crate-wide.
+///
+/// The process environment is global and more than one suite in this crate
+/// depends on it — the resolver's own cases here, and `gl register`'s check that
+/// the bootstrap token lands beside the key. They take one lock rather than each
+/// declaring its own, which would not serialise them against each other.
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::ffi::{OsStr, OsString};
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Restores the previous value and releases the lock on drop.
+    pub(crate) struct KeyEnv {
+        _guard: MutexGuard<'static, ()>,
+        restore: Option<OsString>,
+    }
+
+    impl Drop for KeyEnv {
+        fn drop(&mut self) {
+            match self.restore.take() {
+                Some(v) => std::env::set_var("GITLAWB_KEY", v),
+                None => std::env::remove_var("GITLAWB_KEY"),
+            }
+        }
+    }
+
+    /// Set `GITLAWB_KEY` (or remove it, for `None`) until the guard drops.
+    pub(crate) fn set_key<V: AsRef<OsStr>>(value: Option<V>) -> KeyEnv {
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let restore = std::env::var_os("GITLAWB_KEY");
+        match value {
+            Some(v) => std::env::set_var("GITLAWB_KEY", v),
+            None => std::env::remove_var("GITLAWB_KEY"),
+        }
+        KeyEnv {
+            _guard: guard,
+            restore,
+        }
+    }
+}
+
 #[cfg(test)]
 mod gitlawb_dir_tests {
     use super::{gitlawb_dir, load_keypair_from_dir};
     use std::ffi::OsString;
     use std::path::PathBuf;
-    use std::sync::Mutex;
-
-    /// The process environment is global. Every case that touches `GITLAWB_KEY`
-    /// takes this lock so they cannot race each other.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Run `f` with `GITLAWB_KEY` set to `value` (or removed for `None`), restoring
     /// whatever was there before.
     fn with_key_env<T>(value: Option<OsString>, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let restore = std::env::var_os("GITLAWB_KEY");
-        match &value {
-            Some(v) => std::env::set_var("GITLAWB_KEY", v),
-            None => std::env::remove_var("GITLAWB_KEY"),
-        }
-        let out = f();
-        match restore {
-            Some(v) => std::env::set_var("GITLAWB_KEY", v),
-            None => std::env::remove_var("GITLAWB_KEY"),
-        }
-        out
+        let _env = crate::identity::test_env::set_key(value);
+        f()
     }
 
     /// An explicit --dir always wins and is never validated against GITLAWB_KEY.

@@ -328,11 +328,10 @@ pub async fn cmd_unstake(
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn load_did(dir: Option<PathBuf>) -> Result<String> {
-    let base = dir.unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".gitlawb")
-    });
+    // The shared resolver, not a local `~/.gitlawb`: `gl identity new` writes the
+    // key wherever `GITLAWB_KEY` points, and the old fallback to `.` on a missing
+    // home made the answer depend on the working directory.
+    let base = crate::identity::gitlawb_dir(dir)?;
     let path = base.join("identity.pem");
     let pem = std::fs::read_to_string(&path).with_context(|| {
         format!(

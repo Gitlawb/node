@@ -39,11 +39,10 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
     println!("and create your first repository.");
     println!();
 
-    let dir = args.dir.clone().unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".gitlawb")
-    });
+    // The wizard generates the identity AND stores the bootstrap UCAN, so it has to
+    // land where every later command reads from — the parent of `GITLAWB_KEY`, not
+    // an unconditional `~/.gitlawb`.
+    let dir = crate::identity::gitlawb_dir(args.dir.clone())?;
 
     // ── Step 1: Identity ──────────────────────────────────────────────────
     println!("── Step 1: Identity ─────────────────────────────────────────────────");

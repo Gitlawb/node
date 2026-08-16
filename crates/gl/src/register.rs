@@ -1,7 +1,8 @@
 //! `gl register` — register this agent identity with a gitlawb node.
 //!
 //! Sends a signed POST /api/register request and saves the returned bootstrap
-//! UCAN token to `~/.gitlawb/ucan.json` for use by other commands.
+//! UCAN token as `ucan.json` beside the identity key, where the other commands
+//! look for it.
 
 use anyhow::{Context, Result};
 use clap::Args;
@@ -69,17 +70,20 @@ pub async fn run(args: RegisterArgs) -> Result<()> {
     // Save bootstrap UCAN
     let ucan = payload.get("ucan").and_then(|v| v.as_str()).unwrap_or("");
 
-    if !ucan.is_empty() {
-        let ucan_path = ucan_path(args.dir.as_deref())?;
+    let saved_to = if ucan.is_empty() {
+        None
+    } else {
+        let path = ucan_path(args.dir.as_deref())?;
         let record = json!({
             "ucan": ucan,
             "node": args.node,
             "did": did.to_string(),
             "saved_at": chrono::Utc::now().to_rfc3339(),
         });
-        std::fs::write(&ucan_path, serde_json::to_string_pretty(&record)?)?;
-        tracing::debug!("saved UCAN to {}", ucan_path.display());
-    }
+        std::fs::write(&path, serde_json::to_string_pretty(&record)?)?;
+        tracing::debug!("saved UCAN to {}", path.display());
+        Some(path)
+    };
 
     let trust = payload
         .get("trust_score")
@@ -99,21 +103,28 @@ pub async fn run(args: RegisterArgs) -> Result<()> {
     println!("  Trust score:  {trust:.2}");
     println!("  UCAN expires: {expires}");
     println!();
-    println!("  Bootstrap UCAN saved to ~/.gitlawb/ucan.json");
+    // The real path, not the default one: `GITLAWB_KEY` moves it, and an operator
+    // told to look in `~/.gitlawb` would find nothing there.
+    match &saved_to {
+        Some(path) => println!("  Bootstrap UCAN saved to {}", path.display()),
+        None => println!("  The node returned no bootstrap UCAN."),
+    }
     println!("  You are now a verified agent on the gitlawb network.");
 
     Ok(())
 }
 
+/// Where the bootstrap UCAN is stored: beside the identity key, always.
+///
+/// Routed through `gitlawb_dir` rather than resolving `~/.gitlawb` locally. The
+/// key is READ from the parent of `GITLAWB_KEY`, so writing the token anywhere
+/// else splits the two: registration succeeds, and `gl doctor`, `gl ucan show`,
+/// `gl init`, and `gl mcp ucan_show` all read `ucan.json` from the key's
+/// directory and report an unregistered identity.
 fn ucan_path(dir: Option<&std::path::Path>) -> Result<PathBuf> {
-    let base = if let Some(d) = dir {
-        d.to_path_buf()
-    } else {
-        dirs::home_dir()
-            .context("could not determine home directory")?
-            .join(".gitlawb")
-    };
-    std::fs::create_dir_all(&base)?;
+    let base = crate::identity::gitlawb_dir(dir.map(std::path::Path::to_path_buf))?;
+    std::fs::create_dir_all(&base)
+        .with_context(|| format!("failed to create {}", base.display()))?;
     Ok(base.join("ucan.json"))
 }
 
@@ -158,6 +169,48 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(ucan_file).unwrap()).unwrap();
         assert_eq!(content["ucan"].as_str().unwrap(), "eyJhbGci.test.token");
         assert_eq!(content["node"].as_str().unwrap(), server.url());
+    }
+
+    /// `gl register` READS the identity from the parent of `GITLAWB_KEY`, so it has
+    /// to WRITE the bootstrap token there too. Sending it to `~/.gitlawb` instead is
+    /// silent split-brain: registration prints success, and every command that later
+    /// reads `ucan.json` — `gl doctor`, `gl ucan show`, `gl init`, `gl mcp` — looks
+    /// beside the key, finds nothing, and reports an unregistered identity.
+    #[tokio::test]
+    async fn register_saves_the_bootstrap_ucan_beside_the_key() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+        // No --dir: the destination has to come from GITLAWB_KEY alone.
+        let _env = crate::identity::test_env::set_key(Some(dir.path().join("identity.pem")));
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/register")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"message":"Welcome","ucan":"eyJhbGci.test.token","trust_score":0.5,"expires":"2026-12-31"}"#,
+            )
+            .create_async()
+            .await;
+
+        run(RegisterArgs {
+            node: server.url(),
+            capabilities: vec!["git:push".to_string()],
+            model: None,
+            dir: None,
+        })
+        .await
+        .unwrap();
+
+        let beside_the_key = dir.path().join("ucan.json");
+        assert!(
+            beside_the_key.exists(),
+            "the bootstrap UCAN must land beside GITLAWB_KEY, not in ~/.gitlawb"
+        );
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(beside_the_key).unwrap()).unwrap();
+        assert_eq!(content["ucan"].as_str().unwrap(), "eyJhbGci.test.token");
     }
 
     #[tokio::test]
