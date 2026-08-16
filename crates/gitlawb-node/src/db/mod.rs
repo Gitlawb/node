@@ -901,6 +901,16 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE sync_queue ADD COLUMN IF NOT EXISTS attempted_at TEXT",
         ],
     },
+    Migration {
+        version: 18,
+        name: "sync_queue_origin_timestamp",
+        stmts: &[
+            // The source timestamp accompanies a ref update across either
+            // transport. It remains nullable for rows from older peers and
+            // manually-triggered syncs, which must not report a fabricated lag.
+            "ALTER TABLE sync_queue ADD COLUMN IF NOT EXISTS origin_timestamp TEXT",
+        ],
+    },
 ];
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
@@ -1629,6 +1639,7 @@ pub struct SyncQueueItem {
     pub ref_name: String,
     pub new_sha: String,
     pub cid: Option<String>,
+    pub origin_timestamp: Option<String>,
     pub status: String,
     pub enqueued_at: String,
 }
@@ -1641,10 +1652,11 @@ impl Db {
         ref_name: &str,
         new_sha: &str,
         cid: Option<&str>,
+        origin_timestamp: Option<&str>,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO sync_queue (id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at)
-             VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
+            "INSERT INTO sync_queue (id, repo, node_did, ref_name, new_sha, cid, origin_timestamp, status, enqueued_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
              ON CONFLICT DO NOTHING",
         )
         .bind(Uuid::new_v4().to_string())
@@ -1653,6 +1665,7 @@ impl Db {
         .bind(ref_name)
         .bind(new_sha)
         .bind(cid)
+        .bind(origin_timestamp)
         .bind(Utc::now().to_rfc3339())
         .execute(&self.pool)
         .await?;
@@ -1695,7 +1708,7 @@ impl Db {
                  SELECT id FROM sync_queue WHERE status = 'pending'
                  ORDER BY COALESCE(attempted_at, enqueued_at) ASC LIMIT $1
              )
-             RETURNING id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at",
+             RETURNING id, repo, node_did, ref_name, new_sha, cid, origin_timestamp, status, enqueued_at",
         )
         .bind(limit)
         .bind(Utc::now().to_rfc3339())
@@ -1710,6 +1723,7 @@ impl Db {
                 ref_name: r.get("ref_name"),
                 new_sha: r.get("new_sha"),
                 cid: r.get("cid"),
+                origin_timestamp: r.get("origin_timestamp"),
                 status: r.get("status"),
                 enqueued_at: r.get("enqueued_at"),
             })
@@ -3977,7 +3991,7 @@ mod migration_tests {
         db.migrate().await.unwrap();
     }
 
-    // ── sync_queue scheduling (attempted_at, v17) ────────────────────────────
+    // ── sync_queue scheduling and origin timestamps (v17/v18) ───────────────
 
     async fn enqueue_one(db: &super::Db, repo: &str) {
         db.enqueue_sync(
@@ -3985,6 +3999,7 @@ mod migration_tests {
             "did:key:zPEER",
             "refs/heads/main",
             &"0".repeat(40),
+            None,
             None,
         )
         .await
@@ -4053,6 +4068,72 @@ mod migration_tests {
 
         // Idempotent re-run.
         db.migrate().await.unwrap();
+    }
+
+    /// Upgrade-path test for the nullable source timestamp. The worker must
+    /// preserve it when it exists, while rows written before v18 remain valid.
+    #[sqlx::test]
+    async fn migration_v18_adds_sync_queue_origin_timestamp(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        sqlx::query("ALTER TABLE sync_queue DROP COLUMN origin_timestamp")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 18")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "INSERT INTO sync_queue (id, repo, node_did, ref_name, new_sha, status, enqueued_at)
+             VALUES ('legacy-sync', 'z6Mkfoo/legacy', 'did:key:zPEER', 'refs/heads/main', $1, 'pending', $2)",
+        )
+        .bind("0".repeat(40))
+        .bind("2026-08-16T00:00:00Z")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        db.migrate().await.unwrap();
+
+        let col: (String, String) = sqlx::query_as(
+            "SELECT data_type, is_nullable
+             FROM information_schema.columns
+             WHERE table_name = 'sync_queue' AND column_name = 'origin_timestamp'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(col.0, "text");
+        assert_eq!(col.1, "YES", "origin_timestamp must be nullable");
+
+        let items = db.dequeue_pending_syncs(10).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].origin_timestamp, None);
+        db.migrate().await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn dequeue_preserves_sync_origin_timestamp(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        let timestamp = "2026-08-16T00:00:00Z";
+        db.enqueue_sync(
+            "z6Mkfoo/timestamped",
+            "did:key:zPEER",
+            "refs/heads/main",
+            &"0".repeat(40),
+            None,
+            Some(timestamp),
+        )
+        .await
+        .unwrap();
+
+        let items = db.dequeue_pending_syncs(10).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].origin_timestamp.as_deref(), Some(timestamp));
     }
 
     #[sqlx::test]

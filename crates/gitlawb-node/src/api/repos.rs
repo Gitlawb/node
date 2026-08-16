@@ -1298,6 +1298,7 @@ pub async fn git_upload_pack(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    let fetch_started = std::time::Instant::now();
     // #62 cheap load shed. Permit-less snapshot, not admission; see git_info_refs for
     // what it does and does not bound. The authoritative hold is `git_permit` below,
     // after the per-source cap.
@@ -1500,6 +1501,7 @@ pub async fn git_upload_pack(
     // that mislabel predates this change and is tracked as a follow-up.
     if should_count_fetch(finalizes_fetch, served_filtered_pack, served_pack) {
         crate::metrics::record_fetch(&format!("{owner}/{name}"));
+        crate::metrics::observe_fetch_duration(fetch_started.elapsed());
         crate::metrics::observe_pack_size(body_len as f64);
     }
     Ok(resp)
@@ -1661,6 +1663,7 @@ async fn notify_peer_of_ref(
     node_did: &str,
     pusher_did: &str,
     owner_did: &str,
+    origin_timestamp: &str,
 ) {
     let body = serde_json::json!({
         "repo": repo_slug,
@@ -1669,7 +1672,7 @@ async fn notify_peer_of_ref(
         "node_did": node_did,
         "pusher_did": pusher_did,
         "old_sha": old_sha,
-        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "timestamp": origin_timestamp,
         "owner_did": owner_did,
     });
     let body_bytes = match serde_json::to_vec(&body) {
@@ -1719,6 +1722,7 @@ async fn notify_peer_of_refs(
     node_did: &str,
     pusher_did: &str,
     owner_did: &str,
+    origin_timestamp: &str,
 ) {
     for (ref_name, old_sha, new_sha) in ref_updates {
         notify_peer_of_ref(
@@ -1733,6 +1737,7 @@ async fn notify_peer_of_refs(
             node_did,
             pusher_did,
             owner_did,
+            origin_timestamp,
         )
         .await;
     }
@@ -1747,6 +1752,7 @@ pub async fn git_receive_pack(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    let push_started = std::time::Instant::now();
     let name = smart_http_repo_name(&repo)?;
     // Fast-path shed before the DB lookup when the write pool is ALREADY saturated, so a
     // push flood against a full pool does not hit Postgres per request. Best-effort
@@ -2051,6 +2057,7 @@ pub async fn git_receive_pack(
     // Record the successful push for metrics. The body has already been
     // consumed by smart_http::receive_pack so we observe size up front.
     crate::metrics::record_push(&record.id);
+    crate::metrics::observe_push_duration(push_started.elapsed());
     crate::metrics::observe_pack_size(body_len as f64);
 
     // Record push event for trust score and issue a signed ref certificate.
@@ -2149,6 +2156,10 @@ async fn post_receive_replication_tail(
     disk_path: std::path::PathBuf,
     did: String,
 ) {
+    // Capture this before the asynchronous replication work below. The same
+    // origin time travels over gossip and HTTP so receiving peers can measure
+    // push-to-visible lag rather than notification-to-visible lag.
+    let origin_timestamp = Utc::now().to_rfc3339();
     // Replication enforcement (Phase 2): decide once per push whether the public
     // may read this repo at all and, if so, which blob OIDs must not leave the
     // node. `withheld == None` means this push pins nothing (private / mode A /
@@ -2362,6 +2373,7 @@ async fn post_receive_replication_tail(
         let owner_did_for_arweave = record.owner_did.clone();
         let self_public_url = state.config.public_url.clone();
         let node_keypair = Arc::clone(&state.node_keypair);
+        let origin_timestamp_for_announce = origin_timestamp.clone();
         // #174 F2a: gated on the cheap announce predicate, not on `withheld`.
         // `withheld` is None for a push that coalesced (it never walked), and
         // this task's work is per-push and non-idempotent, so keying it on the
@@ -2468,7 +2480,7 @@ async fn post_receive_replication_tail(
                             ref_name: ref_name.clone(),
                             old_sha: old_sha.clone(),
                             new_sha: new_sha.clone(),
-                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            timestamp: origin_timestamp_for_announce.clone(),
                             cert_id: None,
                             cid: cid.map(|s| s.to_string()),
                         })
@@ -2570,6 +2582,7 @@ async fn post_receive_replication_tail(
                             &node_did_str,
                             &pusher_did_clone,
                             &record.owner_did,
+                            &origin_timestamp_for_announce,
                         )
                         .await;
                     }
@@ -4254,6 +4267,9 @@ mod tests {
                 mockito::Matcher::PartialJsonString(
                     r#"{"owner_did":"did:key:zOwner"}"#.to_string(),
                 ),
+                mockito::Matcher::PartialJsonString(
+                    r#"{"timestamp":"2026-08-16T00:00:00Z"}"#.to_string(),
+                ),
             ]))
             .with_status(200)
             .expect(1)
@@ -4290,6 +4306,7 @@ mod tests {
             "did:key:zNode",
             "did:key:zPusher",
             "did:key:zOwner",
+            "2026-08-16T00:00:00Z",
         )
         .await;
 
@@ -4338,6 +4355,7 @@ mod tests {
             "did:key:zNode",
             "did:key:zPusher",
             "did:key:zOwner",
+            "2026-08-16T00:00:00Z",
         )
         .await;
 

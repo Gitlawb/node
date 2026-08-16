@@ -329,6 +329,7 @@ pub async fn start(
                                         &event.ref_name,
                                         &event.new_sha,
                                         event.cid.as_deref(),
+                                        Some(event.timestamp.as_str()),
                                     ).await;
                                 }
                             }

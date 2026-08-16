@@ -15,7 +15,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use gitlawb_core::identity::Keypair;
 use tracing::{error, info, warn};
 
@@ -177,6 +179,20 @@ fn resolve_origin_url(peers: &[crate::db::PeerRecord], node_did: &str) -> Option
         .iter()
         .find(|p| p.did == node_did)
         .map(|p| p.http_url.trim_end_matches('/').to_string())
+}
+
+/// Convert a sender-supplied RFC-3339 ref-update timestamp into an observable
+/// lag. Missing, malformed, and future timestamps are deliberately ignored:
+/// older peers and clock-skewed peers must not create fabricated observations.
+fn sync_lag_from_origin_timestamp(
+    origin_timestamp: Option<&str>,
+    visible_at: DateTime<Utc>,
+) -> Option<Duration> {
+    let origin = DateTime::parse_from_rfc3339(origin_timestamp?).ok()?;
+    visible_at
+        .signed_duration_since(origin.with_timezone(&Utc))
+        .to_std()
+        .ok()
 }
 
 async fn process_batch(
@@ -395,7 +411,7 @@ async fn process_batch(
                     false
                 };
                 // Register in DB so git smart HTTP can serve the mirrored repo
-                let _ = db
+                let mirror_visible = db
                     .upsert_mirror_repo(
                         owner_short,
                         repo_name,
@@ -403,7 +419,8 @@ async fn process_batch(
                         machine_id,
                         quarantined,
                     )
-                    .await;
+                    .await
+                    .is_ok();
                 // Option B2: carry the encrypted withheld-blob envelopes too, so an
                 // authorized reader can recover private content from this mirror if
                 // the origin dies. `item.repo` is the slug "{owner_short}/{name}",
@@ -418,8 +435,15 @@ async fn process_batch(
                     &config.ipfs_api,
                 )
                 .await;
-                let _ = db.mark_sync_done(&item.id).await;
+                let marked_done = db.mark_sync_done(&item.id).await;
                 crate::metrics::record_sync_processed("done");
+                if mirror_visible && marked_done.is_ok() {
+                    if let Some(lag) =
+                        sync_lag_from_origin_timestamp(item.origin_timestamp.as_deref(), Utc::now())
+                    {
+                        crate::metrics::observe_sync_lag(lag);
+                    }
+                }
 
                 // Tell the origin we now host a replica so its replica_count
                 // reflects reality. Best-effort: idempotent on the origin and
@@ -1194,9 +1218,30 @@ mod tests {
     }
 
     async fn enqueue(db: &Db, repo: &str, did: &str) {
-        db.enqueue_sync(repo, did, "refs/heads/main", &"0".repeat(40), None)
+        db.enqueue_sync(repo, did, "refs/heads/main", &"0".repeat(40), None, None)
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn sync_lag_uses_origin_timestamp_only_when_it_is_in_the_past() {
+        let visible_at = chrono::DateTime::parse_from_rfc3339("2026-08-16T00:00:12Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        assert_eq!(
+            sync_lag_from_origin_timestamp(Some("2026-08-16T00:00:00Z"), visible_at),
+            Some(Duration::from_secs(12))
+        );
+        assert_eq!(sync_lag_from_origin_timestamp(None, visible_at), None);
+        assert_eq!(
+            sync_lag_from_origin_timestamp(Some("not-a-timestamp"), visible_at),
+            None
+        );
+        assert_eq!(
+            sync_lag_from_origin_timestamp(Some("2026-08-16T00:00:13Z"), visible_at),
+            None
+        );
     }
 
     fn dir_entries(dir: &Path) -> Vec<String> {
