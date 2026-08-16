@@ -700,6 +700,14 @@ pub async fn get_by_cid(
     // failure class (tampered, a prior boot's key, expired, malformed, minted for a
     // different CID) lands on the same `None` and starts at the front, silently,
     // so no probe distinguishes them (INV-13).
+    //
+    // The position names the CANDIDATE it resumes as well as the row, so opening it is
+    // two steps: locate that candidate in the freshly ordered list, then seed the row.
+    // A sealed hex that is no longer in the list (the object was unpinned under that oid
+    // between rungs) is treated exactly like an absent token, restarting at the front,
+    // rather than resumed against some other candidate or turned into a 404 built from a
+    // table this request never looked at.
+    let mut resumed_at: Option<usize> = None;
     if let Some(token) = scan_query.scan.as_deref() {
         if let Some(pos) = gitlawb_core::scan_token::open_scan_token(
             &state.ipfs_scan_token_key,
@@ -707,16 +715,54 @@ pub async fn get_by_cid(
             token,
             chrono::Utc::now().timestamp(),
         ) {
-            pager.cursor = Some((pos.created_at_key, pos.id));
-            pager.resumed = true;
+            if let Some(at) = oids.iter().position(|oid| *oid == pos.sha256_hex) {
+                resumed_at = Some(at);
+                // The empty row pair is the front-of-table sentinel: "this candidate, no
+                // row cursor yet", which is what the advance to the next candidate seals.
+                // It cannot collide with a real row: `repos.created_at` is NOT NULL and
+                // written from a serialized timestamp, and `repos.id` is `{owner}/{name}`
+                // so it always contains a slash.
+                pager.cursor = (!pos.created_at_key.is_empty() || !pos.id.is_empty())
+                    .then_some((pos.created_at_key, pos.id));
+                // Set even under the sentinel, where the row walk does start at the front:
+                // this request SKIPPED the candidates ordered before the resumed one, so
+                // absence is not proven within it and the tail must keep the retryable
+                // shed rather than fall through to the definitive 404.
+                pager.resumed = true;
+            }
         }
     }
-    // Set when a ceiling truncates the scan, to the position the caller echoes back.
-    // Sealed at the tail rather than here so exactly one site mints a token and the
-    // wrap case can clear it in one place.
+    // The one position the caller echoes back, written at most once per request: by the
+    // ceiling that truncated the request's proposer, or by that proposer's finish handing
+    // the ladder to the next oid candidate. Sealed at the tail rather than here so
+    // exactly one site mints a token and the wrap case can clear it in one place.
     let mut scan_continuation: Option<SealedScanPos> = None;
+    // True while every candidate ahead of the one being walked FINISHED this request.
+    // On a front-started request that is the proposer rule: the first candidate that did
+    // not finish owns the seal, and once it finishes the role passes to the next one.
+    let mut earlier_all_finished = true;
 
-    for sha256_hex in &oids {
+    for (cand_idx, sha256_hex) in oids.iter().enumerate() {
+        // Exactly ONE candidate per request may seal a position or advance the ladder,
+        // and which one depends on where the REQUEST started, not on which candidate is
+        // interesting.
+        //
+        // RESUMED: only the resumed candidate. The pager was seeded from the caller's
+        // cursor, so `pager.rows` holds the suffix `[start_row, end)`; a later candidate
+        // that walks "from index 0" walked that suffix and has never seen
+        // `[front, start_row)`. Letting it seal would record coverage it does not have
+        // and strand every row in front of the caller's cursor.
+        //
+        // FRONT-STARTED: the first candidate that has not finished. Here the suffix
+        // argument does not exist: every candidate's row loop covers the fetched table
+        // from the front, so a later candidate's ceiling stop is honest coverage. This
+        // arm is what mints rung 1 when the first candidate wraps under budget and a
+        // later one stops on a settled row; silencing it would shed a tainted tokenless
+        // 503 and end a ladder that works today.
+        let is_proposer = match resumed_at {
+            Some(at) => cand_idx == at,
+            None => earlier_all_finished,
+        };
         // A pinned object records EVERY repo it was pinned from (#173 round 8, F1).
         // Resolve a PROVENANCED pin by trying each source repo (bounded to
         // MAX_PIN_SOURCES) through the SAME gate; the first that authorizes serves — no
@@ -835,6 +881,7 @@ pub async fn get_by_cid(
                         reason,
                         None,
                         sha256_hex,
+                        is_proposer,
                     );
                     continue;
                 }
@@ -889,8 +936,20 @@ pub async fn get_by_cid(
         {
             if state.ipfs_work_rate_limiter.is_throttled(&key).await {
                 throttled = true;
+                // Skipped for a spent bucket is NOT finished: no scan ran, so nothing was
+                // covered. Leaving it unfinished keeps the proposer role here, so the
+                // caller's existing token resumes this candidate once the bucket refills
+                // instead of the ladder advancing past work that never happened.
+                earlier_all_finished = false;
                 continue;
             }
+        }
+        // Earlier candidates were finished by earlier rungs, so their scans are owed
+        // nothing. The skip sits HERE on purpose: above it the provenance phase can still
+        // serve outright from a recorded source, and below it the two marker queries would
+        // charge a spent-for-nothing lookup pair per skipped candidate.
+        if resumed_at.is_some_and(|at| cand_idx < at) {
+            continue;
         }
         let needs_scan = sources.is_empty()
             || {
@@ -934,6 +993,12 @@ pub async fn get_by_cid(
                         }
                     }
             };
+        // Set when THIS candidate's row loop exits having walked every row the pager
+        // fetched. It is the witness that the candidate covered the table, and it must be
+        // per candidate: the shared `pager.exhausted` is a per-REQUEST flag set the moment
+        // any short page is fetched, so a candidate that a ceiling stopped mid-page would
+        // read as covered and the ladder would advance over the rows it refused.
+        let mut wrapped = false;
         if needs_scan {
             // Walk the candidate repos one bounded page at a time. Pages already
             // fetched by an earlier oid candidate are re-read from `pager.rows` for
@@ -942,6 +1007,7 @@ pub async fn get_by_cid(
             loop {
                 if idx == pager.rows.len() {
                     if pager.exhausted {
+                        wrapped = true;
                         break;
                     }
                     // Buying another page is only worth its query if a row on it could
@@ -978,6 +1044,7 @@ pub async fn get_by_cid(
                             "probe-ceiling",
                             pager.cursor.clone(),
                             sha256_hex,
+                            is_proposer,
                         );
                         break;
                     }
@@ -988,6 +1055,7 @@ pub async fn get_by_cid(
                             "visit-ceiling",
                             pager.cursor.clone(),
                             sha256_hex,
+                            is_proposer,
                         );
                         break;
                     }
@@ -1004,6 +1072,7 @@ pub async fn get_by_cid(
                             "row-ceiling",
                             pager.cursor.clone(),
                             sha256_hex,
+                            is_proposer,
                         );
                         break;
                     }
@@ -1019,6 +1088,7 @@ pub async fn get_by_cid(
                             "rules-ceiling",
                             pager.cursor.clone(),
                             sha256_hex,
+                            is_proposer,
                         );
                         break;
                     }
@@ -1046,6 +1116,14 @@ pub async fn get_by_cid(
                         .fetch_next_page(&state, request_deadline, &cid_str)
                         .await?;
                     if idx == pager.rows.len() {
+                        // The other walked-every-fetched-row exit, and on any inventory
+                        // whose row count is a multiple of the page size it is the NORMAL
+                        // end of the table: `fetch_next_page` only sets `exhausted` on a
+                        // SHORT page, so a full last page leaves the flag clear and the
+                        // empty page after it lands here. Instrumenting only the
+                        // `exhausted` break above leaves `wrapped` false on that path and
+                        // the ladder dies tokenless with later candidates unexamined.
+                        wrapped = true;
                         break;
                     }
                 }
@@ -1084,13 +1162,14 @@ pub async fn get_by_cid(
                     // no token at all.
                     GateOutcome::CeilingStop(reason) => {
                         // Nothing in front of it means nothing was settled, so there is
-                        // no position to seal and this stop contributes none. The first
-                        // oid candidate cannot get here (the ceiling arms above run
-                        // before every fetch, so a spent budget breaks there instead);
-                        // a LATER candidate can, because it re-walks the already-fetched
-                        // rows from the front without passing those arms. Sealing
-                        // `pager.cursor` for it would push the resume position past rows
-                        // that candidate never examined.
+                        // no position to seal and this stop contributes none. Only a
+                        // LATER candidate reaches this with nothing settled: it re-walks
+                        // the already-fetched rows from index 0 without passing the
+                        // ceiling arms above, so it can be refused on its very first row.
+                        // The candidate that fetched those rows cannot, because those
+                        // arms run before every fetch and a spent budget breaks there
+                        // instead. Sealing `pager.cursor` here would push the resume
+                        // position past rows this candidate never examined.
                         let resume = (idx >= 2).then(|| {
                             let prev = &pager.rows[idx - 2];
                             (prev.created_at_key.clone(), prev.repo.id.clone())
@@ -1101,11 +1180,52 @@ pub async fn get_by_cid(
                             reason,
                             resume,
                             sha256_hex,
+                            is_proposer,
                         );
                         break;
                     }
                     GateOutcome::Skip => {}
                 }
+            }
+        }
+
+        // FINISHED: this candidate covered everything it was owed this request, either by
+        // walking every fetched row (`wrapped`) or by owing no scan at all. The
+        // `needs_scan` arm is not a nicety: a properly provenanced candidate runs no row
+        // loop, so without it the resumed candidate can never finish, the advance below
+        // never fires, and the ladder dies tokenless with later candidates unexamined.
+        //
+        // No "and sealed nothing" conjunct: every truncation arm in the row loop breaks
+        // out of it immediately, so one candidate cannot both seal and walk to the end in
+        // a single request.
+        let finished = wrapped || !needs_scan;
+        if !finished {
+            earlier_all_finished = false;
+        }
+        // The advance. On a RESUMED request the proposer's finish is what moves the ladder
+        // to the next candidate, sealed at the front-of-table sentinel because that
+        // candidate has to walk the whole table with a fresh budget. It goes through
+        // `record_scan_truncation` so the walk is TAINTED as well as sealed: the tail
+        // emits a continuation only on a tainted walk, so a bare seal here would be
+        // discarded and the request would fall through to a definitive 404.
+        //
+        // Not on a front-started request: there the proposer role simply passes to the
+        // next unfinished candidate within this same rung, and that candidate seals its
+        // own stop row.
+        //
+        // The final candidate's finish deliberately seals nothing. Absence of a token is
+        // the ladder's end-of-run signal, and the scan-wrapped clause below turns it into
+        // the retryable shed.
+        if is_proposer && finished && resumed_at.is_some() {
+            if let Some(next) = oids.get(cand_idx + 1) {
+                record_scan_truncation(
+                    &mut walk,
+                    &mut scan_continuation,
+                    "candidate-advance",
+                    Some((String::new(), String::new())),
+                    next,
+                    true,
+                );
             }
         }
     }
@@ -1123,12 +1243,16 @@ pub async fn get_by_cid(
     // every other case and turns exactly that incomplete search into a false 404.
     //
     // A wrapped scan emits NO continuation: there is nothing left to resume, and the
-    // absence of the token is what tells the caller their ladder is over.
+    // absence of the token is what tells the caller their ladder is over. With several
+    // oid candidates that is the FINAL candidate's wrap; an earlier one's hands the
+    // ladder on instead, and the seal it leaves in the slot is what keeps this clause off.
     //
-    // Gated on nothing having been sealed: a ceiling can stop a resumed scan PART WAY
-    // through the last page, which leaves `exhausted` set with rows still unwalked in
-    // front of the cursor. Clearing the seal there would strand exactly those rows,
-    // which is the same tokenless dead end this clause exists to describe honestly.
+    // Gated on nothing having been sealed, for two reasons now. A ceiling can stop a
+    // resumed scan PART WAY through the last page, which leaves `exhausted` set with rows
+    // still unwalked in front of the cursor; and on a multi-candidate CID the request may
+    // already carry the advance to the next candidate. Either way the walk is over for
+    // this rung but the search is not, and clearing the seal would strand exactly what
+    // the token was minted to reach.
     if pager.resumed && pager.exhausted && scan_continuation.is_none() {
         walk.taint("scan-wrapped");
     }
@@ -1239,6 +1363,20 @@ enum GateOutcome {
     CeilingStop(&'static str),
 }
 
+/// A sealed resume position together with the candidate whose walk produced it.
+///
+/// The candidate rides along because one CID can map to several git oids, so a bare row
+/// pair names a row without naming whose walk it belongs to. It is carried by IDENTITY
+/// (the oid hex), never by position in the candidate list, which is ordered by hex and
+/// mutates between rungs.
+struct SealedScanPos {
+    /// The keyset row pair to resume that candidate at. The empty pair is the
+    /// front-of-table sentinel: resume this candidate with no cursor.
+    row: (String, String),
+    /// The candidate oid this position resumes.
+    sha256_hex: String,
+}
+
 /// Taint the walk with a truncation reason and seal the position the caller echoes back,
 /// together, at one site.
 ///
@@ -1249,39 +1387,31 @@ enum GateOutcome {
 /// rather than stopping the scan, and the rows behind them are still walked. A ceiling is
 /// what stops the scan, so a ceiling is what owes the caller a position.
 ///
-/// The position only ever moves FORWARD. A later oid candidate re-walks the same fetched
-/// rows from the front with the request's budget already spent, so it stops earlier than
-/// the candidate before it. That earlier position is still ahead of the token the caller
-/// echoed, so letting it win would not move the ladder backwards; it would shrink each
-/// rung toward a single row and turn a bounded ladder into a crawl.
+/// `may_seal` is the caller's proposer verdict, and it is the whole of the multi-candidate
+/// rule. Exactly one candidate per request may seal: on a resumed request the resumed
+/// candidate (every other one walked only the suffix `[start_row, end)` the pager holds,
+/// so its stop is not coverage of the table), and on a front-started request the first
+/// candidate that has not finished (there every candidate walks from the front, so a later
+/// candidate's stop IS honest coverage). A non-proposer's truncation still TAINTS, since
+/// the scan really was cut short, but it contributes no position.
 ///
-/// The comparison is Rust's byte-wise `Ord` on `(created_at_key, id)`, while the pager's
-/// keyset predicate orders the same TEXT columns under the DATABASE's collation. On a
-/// non-`C` collation the two can disagree for ids differing in case or punctuation. The
-/// disagreement is one-directional and costs work rather than correctness: the loser is a
-/// position behind the true maximum, which REPLAYS rows the caller already walked past
-/// instead of skipping rows it never saw.
-/// A sealed resume position together with the candidate whose walk produced it.
-///
-/// The candidate rides along because one CID can map to several git oids, so a bare row
-/// pair names a row without naming whose walk it belongs to. It is carried by IDENTITY
-/// (the oid hex), never by position in the candidate list, which is ordered by hex and
-/// mutates between rungs.
-struct SealedScanPos {
-    /// The keyset row pair, and the only half the forward-only comparison orders on.
-    row: (String, String),
-    /// The candidate oid this position resumes.
-    sha256_hex: String,
-}
-
+/// That scope, not an ordering comparison, is what keeps the ladder moving forward. Every
+/// sealing arm breaks its row loop and only one candidate may seal, so the slot is written
+/// at most once per request; the debug assertion below states that invariant where a future
+/// change would trip it. The forward-only keep-the-maximum comparison this replaced was
+/// the defect: a budget-starved later candidate contributing nothing could not lower a
+/// maximum, so the token resumed past rows that candidate had never examined and the CID
+/// became permanently unretrievable.
 fn record_scan_truncation(
     walk: &mut WalkState,
     slot: &mut Option<SealedScanPos>,
     reason: &'static str,
     pos: Option<(String, String)>,
     sha256_hex: &str,
+    may_seal: bool,
 ) {
     walk.taint(reason);
+    let pos = pos.filter(|_| may_seal);
     // The one log that separates a rung from a dead end. A truncation that seals nothing
     // sheds a tokenless 503, which the client reads as "your ladder is over", so an
     // operator staring at a stranded caller needs to see WHICH ceiling stopped the scan
@@ -1294,12 +1424,15 @@ fn record_scan_truncation(
         "/ipfs legacy scan truncated"
     );
     if let Some(pos) = pos {
-        if slot.as_ref().is_none_or(|sealed| pos > sealed.row) {
-            *slot = Some(SealedScanPos {
-                row: pos,
-                sha256_hex: sha256_hex.to_string(),
-            });
-        }
+        debug_assert!(
+            slot.is_none(),
+            "one candidate per request may seal, and every sealing arm breaks its row \
+             loop, so the slot is written at most once"
+        );
+        *slot = Some(SealedScanPos {
+            row: pos,
+            sha256_hex: sha256_hex.to_string(),
+        });
     }
 }
 
@@ -5381,6 +5514,1066 @@ mod tests {
             served_at.is_some(),
             "a ceiling that stops part way through the last page of a resumed scan must \
              still ladder; the wrap tail is for a walk that reached the end"
+        );
+    }
+
+    /// A CID with several oid candidates must ladder to a holder only a LATER candidate
+    /// can serve.
+    ///
+    /// `pinned_cids` is unique on the oid, not the cid, so one CID resolves to several
+    /// candidates and every one of them shares the request's pager, budgets, and resume
+    /// slot. With a single shared slot the first candidate's truncation seals a row the
+    /// SECOND candidate never examined: the next rung resumes past the holder, the scan
+    /// wraps, and the tokenless shed tells the caller the ladder is over. The holder is
+    /// then unreachable on every retry, because the inventory never changes.
+    ///
+    /// Two rows and a two-probe ceiling, with the holder on the second row. The absent
+    /// candidate sorts first (`oids_for_cid` orders by hex), so it is the one that spends
+    /// the budget and the holder is reachable only through candidate 2.
+    ///
+    /// PRE-FIX (observed RED): rung 1 sheds a token sealing row 1, rung 2 resumes past it,
+    /// wraps, and sheds with NO token; the holder is never served.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_multi_oid_ladder_reaches_a_holder_only_a_later_candidate_serves(
+        pool: sqlx::PgPool,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool.clone());
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 1024;
+        // Two probes: exactly the two rows, so candidate 1 spends the whole budget and
+        // candidate 2 cannot probe anything this rung.
+        state.ipfs_max_legacy_probes = 2;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1024, std::time::Duration::from_secs(3600));
+
+        seed_root_readable_repos(&state, "multioid", 1).await;
+        stamp_scan_order(&pool, "z6readablemultioid/multioid-0000", 0).await;
+        let (holder_id, holder_oid) = seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6multioid",
+            "holder",
+            b"only the later candidate can serve this\n",
+        )
+        .await;
+        stamp_scan_order(&pool, &holder_id, 1).await;
+        let cid = seed_legacy_pin_for_oid(&state, &holder_oid).await;
+
+        // A second, absent candidate under the SAME cid, sorting ahead of the holder's
+        // oid so the ordered candidate list puts it first.
+        let absent_first = "00".repeat(32);
+        state
+            .db
+            .record_pinned_cid(&absent_first, &cid, None)
+            .await
+            .expect("co-locate a second source-less oid under the same cid");
+        let candidates = state.db.oids_for_cid(&cid).await.unwrap();
+        assert_eq!(
+            candidates,
+            vec![absent_first.clone(), holder_oid.clone()],
+            "precondition: the holder's oid must be the SECOND candidate, or the \
+             starvation this test is about never happens"
+        );
+
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.164:5000".parse().unwrap();
+
+        let mut token: Option<String> = None;
+        let mut served_at = None;
+        for step in 1..=8 {
+            let (status, body) = status_and_body(
+                router
+                    .clone()
+                    .oneshot(get_cid_scan(&cid, Some(peer), token.as_deref()))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            if status == StatusCode::OK {
+                served_at = Some(step);
+                break;
+            }
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "an intermediate rung is the retryable 503 (step {step}): {body}"
+            );
+            token = Some(continuation_of(&body).unwrap_or_else(|| {
+                panic!(
+                    "rung {step} shed with no continuation, which tells the caller the \
+                     ladder is over while a later candidate still holds the object: {body}"
+                )
+            }));
+        }
+        assert!(
+            served_at.is_some(),
+            "a holder reachable only through a later oid candidate must be served by \
+             driving the ladder, not stranded behind the first candidate's seal"
+        );
+    }
+
+    /// Seed `n` root-readable filler rows in scan order, at ascending stamps from
+    /// `first`. They pass the root gate and hold nothing, so each costs exactly one probe
+    /// and reaches a clean absent verdict, which is what drives a scan to its probe
+    /// ceiling on a known row.
+    async fn seed_ladder_filler(
+        state: &crate::state::AppState,
+        pool: &sqlx::PgPool,
+        prefix: &str,
+        n: usize,
+        first: usize,
+    ) {
+        seed_root_readable_repos(state, prefix, n).await;
+        for i in 0..n {
+            stamp_scan_order(
+                pool,
+                &format!("z6readable{prefix}/{prefix}-{i:04}"),
+                first + i,
+            )
+            .await;
+        }
+    }
+
+    /// Open a continuation the node just minted, under the node's own key. The ladder
+    /// tests that assert WHICH candidate a rung names need the position itself; the status
+    /// code alone cannot tell "advanced to the next candidate" from "sealed a row of the
+    /// current one that happens to work".
+    fn opened(key: &[u8; 32], cid: &str, token: &str) -> gitlawb_core::scan_token::ScanPosition {
+        gitlawb_core::scan_token::open_scan_token(key, cid, token, chrono::Utc::now().timestamp())
+            .expect("the node's own token must open under the node's own key")
+    }
+
+    /// Mint a continuation the handler will accept, for the fixtures that need to start
+    /// mid-ladder rather than drive every rung to get there.
+    fn minted(key: &[u8; 32], cid: &str, sha256_hex: &str, row: (&str, &str)) -> String {
+        gitlawb_core::scan_token::seal_scan_token(
+            key,
+            cid,
+            &gitlawb_core::scan_token::ScanPosition {
+                created_at_key: row.0.to_string(),
+                id: row.1.to_string(),
+                sha256_hex: sha256_hex.to_string(),
+            },
+            chrono::Utc::now().timestamp() + 300,
+        )
+        .expect("seal a continuation for the fixture")
+    }
+
+    /// The multi-candidate ladder TERMINATES, and the terminating shed lands exactly on
+    /// the rung in which the FINAL candidate reaches the end of the table.
+    ///
+    /// Every rung must make progress of one of two kinds: advance the row within the
+    /// resumed candidate, or advance to the next candidate. Neither an endless ladder nor
+    /// a rung that hands back a token it already issued is acceptable, and a tokenless
+    /// shed before the last candidate has been walked is the starvation bug wearing the
+    /// "ladder over" signal.
+    ///
+    /// Four rows at two per page against a two-probe ceiling, and two candidates neither
+    /// of which can serve. The ladder is then fully determined: candidate A takes rungs
+    /// 1 and 2 on rows (0,1) and (2,3), rung 3 walks A off the end and advances to B,
+    /// rungs 4 and 5 repeat the table for B, and rung 6 walks B off the end. There are no
+    /// provenance sources anywhere, so the visit budget is untouched when the scan starts
+    /// and the settled-no-row shed cannot fire here; the ONLY tokenless rung is the last.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_multi_oid_ladder_ends_when_the_final_candidate_reaches_the_end(
+        pool: sqlx::PgPool,
+    ) {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 1024;
+        state.ipfs_max_legacy_probes = 2;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1024, std::time::Duration::from_secs(3600));
+
+        seed_ladder_filler(&state, &pool, "term", 4, 0).await;
+        let first = "00".repeat(32);
+        let second = "11".repeat(32);
+        let cid = seed_legacy_pin(&state, &first).await;
+        state
+            .db
+            .record_pinned_cid(&second, &cid, None)
+            .await
+            .expect("co-locate a second source-less oid under the same cid");
+        assert_eq!(
+            state.db.oids_for_cid(&cid).await.unwrap(),
+            vec![first, second],
+            "precondition: two candidates in a known order"
+        );
+
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.165:5000".parse().unwrap();
+
+        let mut token: Option<String> = None;
+        let mut seen: Vec<String> = Vec::new();
+        let mut tokenless_at = None;
+        for step in 1..=12 {
+            let (status, body) = status_and_body(
+                router
+                    .clone()
+                    .oneshot(get_cid_scan(&cid, Some(peer), token.as_deref()))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no candidate can serve, so every rung is the truncated-search 503 \
+                 (step {step}): {body}"
+            );
+            assert_eq!(body["error"], "search_incomplete", "{body}");
+            match continuation_of(&body) {
+                Some(t) => {
+                    assert!(
+                        !seen.contains(&t),
+                        "rung {step} handed back a token it already issued, which is the \
+                         ladder spinning in place rather than advancing"
+                    );
+                    seen.push(t.clone());
+                    token = Some(t);
+                }
+                None => {
+                    tokenless_at = Some(step);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            tokenless_at,
+            Some(6),
+            "the ladder must end on the rung where the SECOND candidate walks off the end \
+             of the table: two rungs of rows plus one wrap rung per candidate. An earlier \
+             tokenless rung means a candidate was abandoned unexamined"
+        );
+    }
+
+    /// The tokenless shed did not widen: a single-candidate resumed scan that wraps with
+    /// nothing sealed still ends the ladder exactly as before.
+    ///
+    /// This is the negative control for the advance. The advance mints a token whenever a
+    /// finished candidate has a successor, so an implementation that forgets the successor
+    /// check would keep minting forever and the caller would never learn the search is
+    /// over.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_single_candidate_wrap_still_sheds_tokenless(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 1024;
+        state.ipfs_max_legacy_probes = 2;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1024, std::time::Duration::from_secs(3600));
+
+        seed_ladder_filler(&state, &pool, "solowrap", 2, 0).await;
+        let cid = seed_legacy_pin(&state, &absent_oid()).await;
+        assert_eq!(
+            state.db.oids_for_cid(&cid).await.unwrap().len(),
+            1,
+            "precondition: exactly one candidate, so no advance is ever available"
+        );
+
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.166:5000".parse().unwrap();
+        let (status, body) = status_and_body(
+            router
+                .clone()
+                .oneshot(get_cid_scan(&cid, Some(peer), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let token = continuation_of(&body).expect("the probe ceiling mints rung 1");
+
+        let (status, body) = status_and_body(
+            router
+                .oneshot(get_cid_scan(&cid, Some(peer), Some(&token)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a resumed scan that ran off the end has not covered the rows before the \
+             token, so it is still the retryable shed: {body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("scan-wrapped")),
+            "and the reason must still be the wrap, not an advance: {body}"
+        );
+        assert_eq!(
+            continuation_of(&body),
+            None,
+            "with no later candidate the wrap ends the ladder, and the absent token is \
+             what tells the caller so: {body}"
+        );
+    }
+
+    /// The advance names the NEXT candidate at the front-of-table sentinel.
+    ///
+    /// Asserted on the token's contents rather than on the ladder's outcome, because the
+    /// outcome alone cannot tell "advanced to candidate B" from "sealed some row of
+    /// candidate A that happens to work". The sentinel matters on its own: candidate B has
+    /// walked nothing, so resuming it anywhere but the front skips rows for it.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_finished_candidate_advances_to_the_next_at_the_front_sentinel(
+        pool: sqlx::PgPool,
+    ) {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 1024;
+        state.ipfs_max_legacy_probes = 2;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1024, std::time::Duration::from_secs(3600));
+
+        seed_ladder_filler(&state, &pool, "advance", 2, 0).await;
+        let first = "00".repeat(32);
+        let second = "11".repeat(32);
+        let cid = seed_legacy_pin(&state, &first).await;
+        state
+            .db
+            .record_pinned_cid(&second, &cid, None)
+            .await
+            .unwrap();
+
+        let key = state.ipfs_scan_token_key.clone();
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.167:5000".parse().unwrap();
+
+        let (_, body) = status_and_body(
+            router
+                .clone()
+                .oneshot(get_cid_scan(&cid, Some(peer), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let rung1 = continuation_of(&body).expect("rung 1 mints on the probe ceiling");
+        let pos = gitlawb_core::scan_token::open_scan_token(
+            &key,
+            &cid,
+            &rung1,
+            chrono::Utc::now().timestamp(),
+        )
+        .expect("the node's own token opens under the node's own key");
+        assert_eq!(
+            pos.sha256_hex, first,
+            "rung 1 seals the candidate that was actually walking"
+        );
+        assert!(
+            !pos.created_at_key.is_empty(),
+            "and it seals a real row, not the sentinel"
+        );
+
+        let (_, body) = status_and_body(
+            router
+                .oneshot(get_cid_scan(&cid, Some(peer), Some(&rung1)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let rung2 = continuation_of(&body)
+            .expect("the finished candidate must advance the ladder, not end it");
+        let pos = gitlawb_core::scan_token::open_scan_token(
+            &key,
+            &cid,
+            &rung2,
+            chrono::Utc::now().timestamp(),
+        )
+        .expect("the advance token opens");
+        assert_eq!(
+            pos.sha256_hex, second,
+            "the finished candidate hands the ladder to the NEXT candidate"
+        );
+        assert_eq!(
+            (pos.created_at_key.as_str(), pos.id.as_str()),
+            ("", ""),
+            "at the front-of-table sentinel: the next candidate has walked nothing, so \
+             any row cursor would skip rows for it"
+        );
+    }
+
+    /// On a FRONT-STARTED request a later candidate's stop is honest coverage, and it is
+    /// what mints rung 1 when the first candidate wraps under budget.
+    ///
+    /// The rule that silences later candidates is keyed on where the REQUEST started, not
+    /// on which candidate is walking. On a resumed request the pager holds only the suffix
+    /// from the caller's cursor, so a later candidate's walk covers a suffix and must not
+    /// seal. Front-started, the pager starts at the front and every candidate's row loop
+    /// covers the fetched table from the beginning, so the first candidate that has NOT
+    /// finished owns the seal, later candidates included.
+    ///
+    /// Three rows at three per page against a four-probe ceiling: candidate A walks all
+    /// three, wraps on the empty page after them, and seals nothing; candidate B spends
+    /// the fourth probe on row 0 and stops on row 1, with row 0 settled behind it. The
+    /// holder is row 2, reachable only for B.
+    ///
+    /// Over-applying the resumed-only rule here sheds a tainted TOKENLESS 503 at rung 1
+    /// and the holder is never served.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_front_started_later_candidate_still_seals_its_stop_row(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool.clone());
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 3;
+        state.ipfs_max_legacy_scan_rows = 1024;
+        // One more probe than candidate A spends walking the whole table, so A wraps
+        // UNTRUNCATED and B gets exactly one probe before the ceiling stops it.
+        state.ipfs_max_legacy_probes = 4;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1024, std::time::Duration::from_secs(3600));
+
+        seed_ladder_filler(&state, &pool, "frontprop", 2, 0).await;
+        let (holder_id, holder_oid) = seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6frontprop",
+            "holder",
+            b"reachable only for the later candidate\n",
+        )
+        .await;
+        stamp_scan_order(&pool, &holder_id, 2).await;
+        let cid = seed_legacy_pin_for_oid(&state, &holder_oid).await;
+        let absent_first = "00".repeat(32);
+        state
+            .db
+            .record_pinned_cid(&absent_first, &cid, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.db.oids_for_cid(&cid).await.unwrap(),
+            vec![absent_first, holder_oid.clone()],
+            "precondition: the holder's oid is the SECOND candidate"
+        );
+
+        let key = state.ipfs_scan_token_key.clone();
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.168:5000".parse().unwrap();
+
+        let (status, body) = status_and_body(
+            router
+                .clone()
+                .oneshot(get_cid_scan(&cid, Some(peer), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let rung1 = continuation_of(&body).unwrap_or_else(|| {
+            panic!(
+                "the first candidate wrapped under budget and sealed nothing, so the \
+                 LATER candidate's ceiling stop is the only thing that can mint rung 1; \
+                 a tokenless shed here ends a ladder that works today: {body}"
+            )
+        });
+        let pos = opened(&key, &cid, &rung1);
+        assert_eq!(
+            pos.sha256_hex, holder_oid,
+            "rung 1 belongs to the candidate that actually stopped"
+        );
+        assert!(
+            !pos.created_at_key.is_empty(),
+            "and it seals that candidate's own stop row, not the front sentinel: it \
+             walked from the front, so there is nothing to restart"
+        );
+
+        let (status, body) = status_and_body(
+            router
+                .oneshot(get_cid_scan(&cid, Some(peer), Some(&rung1)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "echoing rung 1 must reach the holder: {body}"
+        );
+    }
+
+    /// A candidate that a ceiling stopped PART WAY through the last page has not wrapped,
+    /// however the shared pager's exhausted flag reads.
+    ///
+    /// `pager.exhausted` is per REQUEST and is set the moment any short page comes back,
+    /// so it is true while rows the ceiling refused are still sitting in front of the
+    /// cursor. Reading it at the tail as the wrap witness marks the truncated candidate
+    /// finished, advances the ladder to the next one, and strands those rows forever. The
+    /// witness has to be the per-candidate exit the row loop actually took.
+    ///
+    /// Four rows at three per page against a one-probe ceiling. Rung 3 resumes into a
+    /// SHORT page (two rows), spends its probe on the first and is stopped on the second,
+    /// so the request ends with `exhausted` set and a row unwalked.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_truncation_on_an_exhausted_page_does_not_advance_the_candidate(
+        pool: sqlx::PgPool,
+    ) {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 3;
+        state.ipfs_max_legacy_scan_rows = 1024;
+        state.ipfs_max_legacy_probes = 1;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1024, std::time::Duration::from_secs(3600));
+
+        seed_ladder_filler(&state, &pool, "wrapwitness", 4, 0).await;
+        let first = "00".repeat(32);
+        let second = "11".repeat(32);
+        let cid = seed_legacy_pin(&state, &first).await;
+        state
+            .db
+            .record_pinned_cid(&second, &cid, None)
+            .await
+            .unwrap();
+
+        let key = state.ipfs_scan_token_key.clone();
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.169:5000".parse().unwrap();
+
+        let mut token: Option<String> = None;
+        for step in 1..=3 {
+            let (status, body) = status_and_body(
+                router
+                    .clone()
+                    .oneshot(get_cid_scan(&cid, Some(peer), token.as_deref()))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            let t = continuation_of(&body)
+                .unwrap_or_else(|| panic!("rung {step} must carry a continuation: {body}"));
+            let pos = opened(&key, &cid, &t);
+            assert_eq!(
+                pos.sha256_hex, first,
+                "rung {step} stopped the FIRST candidate at a ceiling, so it is still \
+                 that candidate's rung. Rung 3 is the one that matters: it resumes into \
+                 a short page, so the shared exhausted flag is set while a row it refused \
+                 is still unwalked, and an implementation reading that flag as the wrap \
+                 witness advances here and strands the row"
+            );
+            assert!(
+                !pos.created_at_key.is_empty(),
+                "rung {step} seals a real row, not the sentinel"
+            );
+            token = Some(t);
+        }
+
+        let (status, body) = status_and_body(
+            router
+                .oneshot(get_cid_scan(&cid, Some(peer), token.as_deref()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let pos = opened(
+            &key,
+            &cid,
+            &continuation_of(&body).expect("rung 4 walks the first candidate off the end"),
+        );
+        assert_eq!(
+            (pos.sha256_hex.as_str(), pos.created_at_key.as_str()),
+            (second.as_str(), ""),
+            "only once the first candidate has actually walked every fetched row does \
+             the ladder advance, and then to the front of the next candidate"
+        );
+    }
+
+    /// A resumed rung does not re-run the scans of candidates earlier rungs already
+    /// finished, and the skip lands after the provenance phase, not before it.
+    ///
+    /// `walk.probes` has no test seam, so the observable is the marker-query pair the
+    /// fallback gate runs per candidate that reaches `needs_scan`. Both candidates carry
+    /// recorded sources marked incomplete, so both would bump the counter if both were
+    /// scanned; resuming at the second must leave it at one.
+    ///
+    /// The counter also pins the skip's exact position. Skipping at the top of the oid
+    /// loop would cut off the provenance phase, which can serve outright; skipping inside
+    /// `needs_scan` would charge the skipped candidate two lookups for nothing and read 2
+    /// here.
+    #[sqlx::test]
+    async fn get_by_cid_resumed_rung_skips_the_scans_of_earlier_candidates(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 1024;
+        state.ipfs_max_legacy_probes = 1024;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1024, std::time::Duration::from_secs(3600));
+
+        // One private repo, used both as the scan inventory and as the recorded pin
+        // source for each candidate: it denies at the root gate either way, so the
+        // provenance phase runs and serves nothing.
+        seed_root_denying_repos(&state, "skipearlier", 2, 0).await;
+        let source = "skipearlier-0000".to_string();
+        let first = "00".repeat(32);
+        let second = "11".repeat(32);
+        let cid = seed_legacy_pin(&state, &first).await;
+        state
+            .db
+            .record_pinned_cid(&second, &cid, None)
+            .await
+            .unwrap();
+        for oid in [&first, &second] {
+            state.db.record_pin_source(oid, &source).await.unwrap();
+            // Incomplete keeps `needs_scan` true past a non-empty source set, which is
+            // what puts the marker pair on the path for every candidate that is NOT
+            // skipped.
+            state.db.mark_pin_sources_incomplete(oid, "").await.unwrap();
+        }
+
+        let key = state.ipfs_scan_token_key.clone();
+        let token = minted(&key, &cid, &second, ("", ""));
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.170:5000".parse().unwrap();
+
+        crate::api::ipfs::reset_marker_queries();
+        let (status, body) = status_and_body(
+            router
+                .oneshot(get_cid_scan(&cid, Some(peer), Some(&token)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            crate::api::ipfs::marker_queries(),
+            1,
+            "only the resumed candidate owes a scan this rung; the one before it was \
+             finished by an earlier rung and must not pay the fallback gate again: {body}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the resumed candidate walked the table from the sentinel but the rows \
+             before the ladder started were skipped, so the honest tail is the retryable \
+             shed: {body}"
+        );
+    }
+
+    /// A resumed request still lets LATER candidates serve off the pages it already
+    /// bought. They are silenced for sealing, not deferred.
+    ///
+    /// Skipping them would waste page fetches the caller has already paid for and would
+    /// turn a rung that could have ended the ladder outright into another 503.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_resumed_rung_still_serves_from_a_later_candidate(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool.clone());
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 1024;
+        state.ipfs_max_legacy_probes = 1024;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1024, std::time::Duration::from_secs(3600));
+
+        seed_ladder_filler(&state, &pool, "opportune", 1, 0).await;
+        let (holder_id, holder_oid) = seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6opportune",
+            "holder",
+            b"served off a page the resumed candidate bought\n",
+        )
+        .await;
+        stamp_scan_order(&pool, &holder_id, 1).await;
+        let cid = seed_legacy_pin_for_oid(&state, &holder_oid).await;
+        let absent_first = "00".repeat(32);
+        state
+            .db
+            .record_pinned_cid(&absent_first, &cid, None)
+            .await
+            .unwrap();
+
+        let key = state.ipfs_scan_token_key.clone();
+        let token = minted(&key, &cid, &absent_first, ("", ""));
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.171:5000".parse().unwrap();
+
+        let (status, body) = status_and_body(
+            router
+                .oneshot(get_cid_scan(&cid, Some(peer), Some(&token)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a later candidate that can serve off the already-fetched rows must serve in \
+             this same rung: {body}"
+        );
+    }
+
+    /// A token naming a candidate that is no longer pinned degrades to a front restart.
+    ///
+    /// The hex is sealed by the node so it cannot be forged, but an unpin between rungs
+    /// can retire it. The open path must then treat the token as absent: never resume
+    /// some other candidate at that row, never fabricate a 404 out of a table this
+    /// request has not looked at, and never panic on a lookup that misses.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_token_naming_an_unpinned_candidate_restarts_at_the_front(
+        pool: sqlx::PgPool,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool.clone());
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 1024;
+        state.ipfs_max_legacy_probes = 1024;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1024, std::time::Duration::from_secs(3600));
+
+        seed_ladder_filler(&state, &pool, "stalehex", 1, 0).await;
+        let (holder_id, holder_oid) = seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6stalehex",
+            "holder",
+            b"still reachable after the sealed candidate went away\n",
+        )
+        .await;
+        stamp_scan_order(&pool, &holder_id, 1).await;
+        let cid = seed_legacy_pin_for_oid(&state, &holder_oid).await;
+
+        let key = state.ipfs_scan_token_key.clone();
+        // A well-formed token under the node's own key, naming an oid the CID no longer
+        // resolves to, sealed at a row PAST the holder. Resuming it against the wrong
+        // candidate would skip the holder; treating it as absent restarts at the front.
+        let token = minted(
+            &key,
+            &cid,
+            &"cc".repeat(32),
+            (&scan_order_stamp(9).to_rfc3339(), "zzz/zzz"),
+        );
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.172:5000".parse().unwrap();
+
+        let (status, body) = status_and_body(
+            router
+                .oneshot(get_cid_scan(&cid, Some(peer), Some(&token)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a stale candidate identity restarts the scan at the front, so the holder is \
+             still found: {body}"
+        );
+    }
+
+    /// The ladder only ever names the resumed candidate, or the one immediately after it.
+    ///
+    /// Three candidates, resumed at the first with ceilings that truncate it. Every rung
+    /// until the first candidate finishes must keep naming it, and the rung that finally
+    /// moves must hand the ladder to candidate 2 at the front, never skip to candidate 3.
+    /// Skipping one would mark it finished over a table it never walked.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_ladder_never_skips_a_candidate(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 1024;
+        state.ipfs_max_legacy_probes = 2;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1024, std::time::Duration::from_secs(3600));
+
+        seed_ladder_filler(&state, &pool, "noskip", 4, 0).await;
+        let first = "00".repeat(32);
+        let second = "11".repeat(32);
+        let third = "22".repeat(32);
+        let cid = seed_legacy_pin(&state, &first).await;
+        for oid in [&second, &third] {
+            state.db.record_pinned_cid(oid, &cid, None).await.unwrap();
+        }
+        assert_eq!(
+            state.db.oids_for_cid(&cid).await.unwrap(),
+            vec![first.clone(), second.clone(), third.clone()],
+            "precondition: three candidates in a known order"
+        );
+
+        let key = state.ipfs_scan_token_key.clone();
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.173:5000".parse().unwrap();
+
+        let mut token = Some(minted(&key, &cid, &first, ("", "")));
+        let mut moved_to = None;
+        for step in 1..=8 {
+            let (status, body) = status_and_body(
+                router
+                    .clone()
+                    .oneshot(get_cid_scan(&cid, Some(peer), token.as_deref()))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            let t = continuation_of(&body)
+                .unwrap_or_else(|| panic!("rung {step} must carry a continuation: {body}"));
+            let pos = opened(&key, &cid, &t);
+            assert_ne!(
+                pos.sha256_hex, third,
+                "rung {step} handed the ladder to the THIRD candidate while the second \
+                 had not been walked; that marks it finished over a table it never saw"
+            );
+            if pos.sha256_hex != first {
+                moved_to = Some((pos.sha256_hex.clone(), pos.created_at_key.clone()));
+                break;
+            }
+            token = Some(t);
+        }
+        assert_eq!(
+            moved_to,
+            Some((second, String::new())),
+            "the ladder moves one candidate at a time, to the front of the next"
+        );
+    }
+
+    /// R11: a four-candidate CID must be served inside the client's resume budget.
+    ///
+    /// `gl ipfs get` stops after `MAX_SCAN_RESUMES` resumes (see
+    /// `crates/gl/src/ipfs_cmd.rs`; it is private to that crate, so the 8 is repeated
+    /// here and a change to the cap should bring you to this fixture). Ladder length
+    /// scales with candidate count, so this is the shape that pins the cost.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_four_candidates_serve_within_the_client_resume_budget(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool.clone());
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 1024;
+        state.ipfs_max_legacy_probes = 2;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1024, std::time::Duration::from_secs(3600));
+
+        seed_ladder_filler(&state, &pool, "fourcand", 1, 0).await;
+        let (holder_id, holder_oid) = seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6fourcand",
+            "holder",
+            b"four candidates deep\n",
+        )
+        .await;
+        stamp_scan_order(&pool, &holder_id, 1).await;
+        let cid = seed_legacy_pin_for_oid(&state, &holder_oid).await;
+        // Three absent candidates, all sorting ahead of the holder's oid, so the holder
+        // is reachable only through the LAST of the four.
+        for oid in ["00", "11", "22"] {
+            state
+                .db
+                .record_pinned_cid(&oid.repeat(32), &cid, None)
+                .await
+                .unwrap();
+        }
+        let candidates = state.db.oids_for_cid(&cid).await.unwrap();
+        assert_eq!(candidates.len(), 4, "precondition: four candidates");
+        assert_eq!(
+            candidates[3], holder_oid,
+            "precondition: the holder's oid sorts last"
+        );
+
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.174:5000".parse().unwrap();
+
+        // One initial request plus at most MAX_SCAN_RESUMES echoes, exactly as the client
+        // drives it.
+        let mut token: Option<String> = None;
+        let mut served_at = None;
+        for step in 1..=9 {
+            let (status, body) = status_and_body(
+                router
+                    .clone()
+                    .oneshot(get_cid_scan(&cid, Some(peer), token.as_deref()))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            if status == StatusCode::OK {
+                served_at = Some(step);
+                break;
+            }
+            token = Some(
+                continuation_of(&body)
+                    .unwrap_or_else(|| panic!("rung {step} must carry a continuation: {body}")),
+            );
+        }
+        assert!(
+            served_at.is_some_and(|s| s <= 9),
+            "a four-candidate CID must be served inside the client's 8-resume budget, \
+             got {served_at:?}"
+        );
+    }
+
+    /// A resumed candidate that owes NO scan still advances the ladder.
+    ///
+    /// Finished means covered, and a candidate whose recorded provenance is complete is
+    /// covered without a single row being walked. Gating the advance on the row loop
+    /// having wrapped leaves that candidate permanently unfinished: the rung sheds with
+    /// no token and every candidate behind it is never examined, which is the starvation
+    /// bug in a third shape.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_resumed_candidate_owing_no_scan_still_advances(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool.clone());
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 1024;
+        state.ipfs_max_legacy_probes = 1;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1024, std::time::Duration::from_secs(3600));
+
+        seed_ladder_filler(&state, &pool, "noscan", 1, 0).await;
+        let (holder_id, holder_oid) = seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6noscan",
+            "holder",
+            b"behind a candidate that owes no scan\n",
+        )
+        .await;
+        stamp_scan_order(&pool, &holder_id, 1).await;
+        let cid = seed_legacy_pin_for_oid(&state, &holder_oid).await;
+
+        // The first candidate has a COMPLETE recorded source that denies, so its
+        // provenance phase answers for it and `needs_scan` is false: no row loop runs and
+        // it can never wrap.
+        let absent_first = "00".repeat(32);
+        state
+            .db
+            .record_pinned_cid(&absent_first, &cid, None)
+            .await
+            .unwrap();
+        seed_root_denying_repos(&state, "noscansrc", 1, 0).await;
+        state
+            .db
+            .record_pin_source(&absent_first, "noscansrc-0000")
+            .await
+            .unwrap();
+
+        let key = state.ipfs_scan_token_key.clone();
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.175:5000".parse().unwrap();
+
+        let mut token = Some(minted(&key, &cid, &absent_first, ("", "")));
+        let mut served_at = None;
+        for step in 1..=6 {
+            let (status, body) = status_and_body(
+                router
+                    .clone()
+                    .oneshot(get_cid_scan(&cid, Some(peer), token.as_deref()))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            if status == StatusCode::OK {
+                served_at = Some(step);
+                break;
+            }
+            token = Some(continuation_of(&body).unwrap_or_else(|| {
+                panic!(
+                    "rung {step} shed with no continuation: a candidate that owes no scan \
+                     is finished, and finished must hand the ladder on: {body}"
+                )
+            }));
+        }
+        assert!(
+            served_at.is_some(),
+            "the ladder must reach the holder behind the no-scan candidate"
+        );
+    }
+
+    /// Resuming the FINAL candidate at the front sentinel keeps the retryable shed.
+    ///
+    /// Under the sentinel the row walk really does start at the front, so it is tempting
+    /// to treat the request as front-started. It is not: this rung SKIPPED every candidate
+    /// before the sealed one, so absence has not been proven within it and the definitive
+    /// 404 is not available.
+    #[sqlx::test]
+    async fn get_by_cid_front_sentinel_resume_keeps_the_retryable_shed(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 1024;
+        state.ipfs_max_legacy_probes = 1024;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1024, std::time::Duration::from_secs(3600));
+
+        seed_root_denying_repos(&state, "sentinelshed", 2, 0).await;
+        let first = "00".repeat(32);
+        let second = "11".repeat(32);
+        let cid = seed_legacy_pin(&state, &first).await;
+        state
+            .db
+            .record_pinned_cid(&second, &cid, None)
+            .await
+            .unwrap();
+
+        let key = state.ipfs_scan_token_key.clone();
+        let token = minted(&key, &cid, &second, ("", ""));
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.176:5000".parse().unwrap();
+
+        let (status, body) = status_and_body(
+            router
+                .oneshot(get_cid_scan(&cid, Some(peer), Some(&token)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the candidates before the sealed one were skipped this request, so their \
+             absence is unproven and the 404 is not available: {body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("scan-wrapped")),
+            "{body}"
+        );
+        assert_eq!(
+            continuation_of(&body),
+            None,
+            "the last candidate reached the end of the table, so the ladder is over: {body}"
         );
     }
 
