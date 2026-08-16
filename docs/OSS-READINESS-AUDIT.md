@@ -3,6 +3,11 @@
 Date: 2026-05-28
 Repo state inspected: `main` tracking `origin/main`, starting at `b12c6bc feat: per-DID rate limiting on creation endpoints (10/hour) (#13)`.
 
+> **Historical snapshot.** This audit describes the repository at the commit above. Its
+> statements about incomplete UCAN chain validation and absent per-repository read
+> enforcement have been superseded; see [`SECURITY.md`](../SECURITY.md) for the current
+> security posture.
+
 ## Commands run
 
 ```sh

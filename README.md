@@ -19,7 +19,7 @@ The mission is simple: once code is pushed to the network, it should not disappe
 
 ## What is in this repository?
 
-This is a Rust workspace with four crates:
+This is a Rust workspace with six crates:
 
 | Crate | Purpose |
 |---|---|
@@ -27,6 +27,8 @@ This is a Rust workspace with four crates:
 | `gl` | The Gitlawb CLI for identity, repos, issues, PRs, bounties, tasks, peers, node status, MCP, and setup flows. |
 | `git-remote-gitlawb` | Git remote helper for `gitlawb://` URLs, so normal `git clone`, `git fetch`, and `git push` can talk to Gitlawb nodes. |
 | `gitlawb-core` | Shared primitives: Ed25519 identities, `did:key`, CIDs, RFC 9421 HTTP signatures, certificates, and UCAN tokens. |
+| `gitlawb-attest` | Pluggable external provenance attestations for ref-update certificates. |
+| `icaptcha-client` | Client for the iCaptcha proof-of-intelligence flow used to protect spam-prone writes. |
 
 ---
 
@@ -54,6 +56,7 @@ Good today:
 - Bare git repository storage.
 - Git smart-HTTP clone/fetch/push.
 - RFC 9421-signed writes.
+- Repository and path-scoped visibility enforcement for repository and Git content reads, with 404-shaped repository denials.
 - DID identities.
 - `gl` CLI workflows.
 - libp2p peer discovery/gossip foundation.
@@ -63,11 +66,13 @@ Good today:
 
 Known limitations:
 
-- Private repository read enforcement is not wired yet. Treat public nodes as public infrastructure unless you restrict access at your proxy/firewall.
-- UCAN chain validation and revocation are not complete.
-- Repository write authorization is not capability-complete yet; HTTP signatures prove identity, not full authorization policy.
+- Repository write authorization is not secure by default: `GITLAWB_ENFORCE_OWNER_PUSH` defaults to `false` for compatibility, so a valid HTTP Signature identifies a pusher but does not enforce owner-only pushes.
+- UCAN proof chains are validated when supplied, but UCAN capabilities are not consulted by write authorization and the root issuer is not independently trust-anchored. UCANs therefore do not yet grant scoped collaborator access.
+- Agent lifecycle revocation is not enforced by HTTP Signature authorization; do not rely on removing or revoking an agent record to block a compromised signer.
+- Read visibility is not a blanket data-classification boundary: task, IPFS-pin, and Arweave-anchor listings are not repository-gated; withheld path names can be visible to a root reader; and later visibility changes cannot retract content already announced or externally anchored.
 - Peer writes are signed by upgraded nodes, but strict signed-peer enforcement is opt-in during rolling upgrades.
-- GraphQL mutations need mutation-aware auth before becoming a public write surface.
+- Current GraphQL mutations require an authenticated signer, but there is no mutation-specific guardrail that prevents a future mutation from omitting that check.
+- Pull-request review comments do not yet have threaded line-level anchors, and merges do not enforce approval requirements.
 
 See:
 
@@ -466,8 +471,8 @@ Short-term priorities:
 2. Add Docker and installer smoke tests.
 3. Improve operator docs and `gl doctor` checks.
 4. Harden peer writes and publish the signed-peer rollout plan.
-5. Implement repo write authorization: owner checks, protected branches, and UCAN capability checks.
-6. Implement private-read enforcement or remove private repo affordances until it exists.
+5. Close default-open write authorization and wire trusted UCAN delegation into repository permissions.
+6. Add threaded, line-level pull-request discussions and enforce approval requirements on merges.
 7. Add metrics for pushes, fetches, pack sizes, peer sync, failed auth, and webhooks.
 
 Product direction:
