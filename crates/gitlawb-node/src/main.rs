@@ -21,6 +21,7 @@ mod state;
 mod sync;
 #[cfg(test)]
 mod test_support;
+mod upstream_mirror;
 mod visibility;
 mod webhooks;
 
@@ -570,6 +571,22 @@ async fn main() -> Result<()> {
             state.subscribe_shutdown(),
         );
         info!("auto-sync worker started");
+    }
+
+    // External-forge mirroring is a separate, default-off worker. Startup
+    // validation already requires owner-only pushes when it is enabled; the
+    // worker additionally verifies the Git runtime can pin DNS answers before
+    // any URL reaches `git fetch`.
+    if config.upstream_mirror_enabled {
+        upstream_mirror::start(
+            Arc::clone(&state.db),
+            Arc::clone(&state.config),
+            state.repo_store.clone(),
+            state.repo_write_leases.clone(),
+            Arc::clone(&state.git_write_semaphore),
+            state.subscribe_shutdown(),
+        )
+        .context("starting upstream mirror worker")?;
     }
 
     // On-chain operator setup: verify stake + spawn heartbeat loop
