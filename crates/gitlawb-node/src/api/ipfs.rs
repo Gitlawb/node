@@ -708,6 +708,10 @@ pub async fn get_by_cid(
     // rather than resumed against some other candidate or turned into a 404 built from a
     // table this request never looked at.
     let mut resumed_at: Option<usize> = None;
+    // Where this REQUEST started, kept for the strictly-ahead filter at the mint site. A
+    // front-started request leaves it `None`, which reads as "before everything", so every
+    // seal it proposes passes.
+    let mut scan_start: Option<(String, (String, String))> = None;
     if let Some(token) = scan_query.scan.as_deref() {
         if let Some(pos) = gitlawb_core::scan_token::open_scan_token(
             &state.ipfs_scan_token_key,
@@ -717,6 +721,10 @@ pub async fn get_by_cid(
         ) {
             if let Some(at) = oids.iter().position(|oid| *oid == pos.sha256_hex) {
                 resumed_at = Some(at);
+                scan_start = Some((
+                    pos.sha256_hex.clone(),
+                    (pos.created_at_key.clone(), pos.id.clone()),
+                ));
                 // The empty row pair is the front-of-table sentinel: "this candidate, no
                 // row cursor yet", which is what the advance to the next candidate seals.
                 // It cannot collide with a real row: `repos.created_at` is NOT NULL and
@@ -1302,7 +1310,53 @@ pub async fn get_by_cid(
         // confidential, not merely tamper-evident (INV-13). A seal failure is not fatal
         // to the shed: drop the continuation and answer the plain 503, which degrades to
         // the pre-token behaviour rather than turning a truncation into a 500.
-        let continuation = scan_continuation.and_then(|sealed| {
+        // A rung owes a token only when it reached somewhere the caller has not already
+        // been. `walk.visits` is charged by the provenance phase as well as the scan, so a
+        // resumed request whose sources spend the ceiling reaches the scan's top-of-loop
+        // visit arm with nothing fetched, and `pager.cursor` is still the caller's own
+        // incoming position: sealing it hands them back the token they just sent. `gl`
+        // echoes a token up to its resume cap, each rung re-running the whole provenance
+        // phase, so the ladder amplifies one anonymous request into nine while advancing
+        // nothing and the token makes it look like progress.
+        //
+        // Strictly ahead has two arms. A proposal naming the SAME candidate must carry a
+        // row past the start row. A proposal naming a DIFFERENT candidate is the advance,
+        // which only a finished candidate can produce, so it is ahead by construction even
+        // though the front sentinel it seals sorts below every real row.
+        //
+        // ONE site, the same argument the single mint site is already built on: a filter
+        // here cannot be bypassed by a future sealing arm. The ceiling arms stay uniform
+        // (all of them seal `pager.cursor`) rather than each carrying a copy of this rule.
+        //
+        // The row comparison is Rust's byte-wise `Ord` on `(created_at_key, id)`, while the
+        // pager's keyset predicate ordered the same TEXT columns under the DATABASE's
+        // collation, so on a non-`C` collation the two can disagree for ids differing in
+        // case or punctuation. It cannot skip rows: a dropped seal claims no coverage, it
+        // only ends the rung, and the caller's recovery is a fresh ladder from the front.
+        // The case this filter exists for is exact equality of a value with itself, which
+        // no collation moves.
+        let advancing = scan_continuation.filter(|sealed| {
+            let advanced = match &scan_start {
+                None => true,
+                Some((start_hex, start_row)) => {
+                    sealed.sha256_hex != *start_hex || sealed.row > *start_row
+                }
+            };
+            if !advanced {
+                // `record_scan_truncation` already logged `sealed_continuation = true` for
+                // this seal, and a 503 carrying no token next to that line is exactly the
+                // confusion that log exists to prevent. This is the correction, and like
+                // the line it corrects it is a boolean fact only: the position and the
+                // candidate it names are withheld data.
+                tracing::debug!(
+                    seal_dropped_not_advancing = true,
+                    "/ipfs dropped a scan continuation that reached no row past the \
+                     request's own start; shedding without one"
+                );
+            }
+            advanced
+        });
+        let continuation = advancing.and_then(|sealed| {
             let SealedScanPos {
                 row: (created_at_key, id),
                 sha256_hex,
@@ -1417,7 +1471,9 @@ fn record_scan_truncation(
     // operator staring at a stranded caller needs to see WHICH ceiling stopped the scan
     // and whether it handed back a way to continue. The position itself is withheld data
     // (its `created_at` and its `id` carry a private repo's owner DID), so log only
-    // whether one exists, never its value.
+    // whether one exists, never its value. A `true` here is the seal being RECORDED, not
+    // the response carrying it: the mint site drops a seal that reached no row past the
+    // request's own start, and logs its own line saying so when it does.
     tracing::debug!(
         reason,
         sealed_continuation = pos.is_some(),
@@ -6574,6 +6630,300 @@ mod tests {
             continuation_of(&body),
             None,
             "the last candidate reached the end of the table, so the ladder is over: {body}"
+        );
+    }
+
+    /// A rung that advanced nothing must not hand the caller back the token they sent.
+    ///
+    /// `walk.visits` is charged by the provenance phase as well as by the scan, so a CID
+    /// whose recorded sources spend the whole visit budget reaches the scan's top-of-loop
+    /// visit arm before a single page has been fetched. On a RESUMED request `pager.cursor`
+    /// is still the caller's own incoming position at that moment, so sealing it emits
+    /// their own token back verbatim. `gl` echoes a token up to `MAX_SCAN_RESUMES` times
+    /// inside its deadline, and every one of those rungs re-runs the whole provenance phase
+    /// (up to `MAX_PIN_SOURCES` acquires and `cat-file` subprocesses) to arrive at the same
+    /// place, so one anonymous request becomes nine and the token makes the spin look like
+    /// progress.
+    ///
+    /// The STATUS is asserted, not just the missing token. The documented precedence is
+    /// truncation 503 over throttle 429 over the definitive 404, and a dropped seal must
+    /// leave the truncation tail standing rather than fall through to either lower one.
+    ///
+    /// MUTATION (RED): drop the strictly-ahead filter at the mint site, and the shed
+    /// carries a continuation that opens to the identical position that was sent.
+    #[sqlx::test]
+    async fn get_by_cid_visit_starved_resume_does_not_echo_the_callers_own_token(
+        pool: sqlx::PgPool,
+    ) {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 1024;
+        // Probes must NOT bind: the visit budget, spent before the scan starts, is what
+        // stops this request.
+        state.ipfs_max_legacy_probes = 1024;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1024, std::time::Duration::from_secs(3600));
+        let mut cfg = (*state.config).clone();
+        cfg.ipfs_max_repo_visits = 2;
+        state.config = std::sync::Arc::new(cfg);
+
+        // Four root-readable rows. The first two double as the candidate's recorded pin
+        // sources: each passes the root gate, so each is charged a visit, and the pair
+        // spends the ceiling before the scan fetches its first page.
+        seed_ladder_filler(&state, &pool, "visitstarve", 4, 0).await;
+        let oid = absent_oid();
+        let cid = seed_legacy_pin(&state, &oid).await;
+        for i in 0..2 {
+            state
+                .db
+                .record_pin_source(&oid, &format!("z6readablevisitstarve/visitstarve-{i:04}"))
+                .await
+                .unwrap();
+        }
+        // A non-empty source set only reaches the scan when it may be INCOMPLETE, and the
+        // scan is what this rung has to be starved out of.
+        state
+            .db
+            .mark_pin_sources_incomplete(&oid, "")
+            .await
+            .unwrap();
+
+        let key = state.ipfs_scan_token_key.clone();
+        let start = (
+            scan_order_stamp(0).to_rfc3339(),
+            "z6readablevisitstarve/visitstarve-0000".to_string(),
+        );
+        let token = minted(&key, &cid, &oid, (start.0.as_str(), start.1.as_str()));
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.177:5000".parse().unwrap();
+
+        let (status, body) = status_and_body(
+            router
+                .oneshot(get_cid_scan(&cid, Some(peer), Some(&token)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the search was cut short, so the truncation 503 stands; dropping the seal \
+             must not let the tail fall through to the throttle or the definitive 404: \
+             {body}"
+        );
+        // Rendered as the position rather than the opaque token so a failure NAMES the
+        // defect: the echoed triple is byte for byte the one the request carried in.
+        let echoed = continuation_of(&body).map(|t| {
+            let pos = opened(&key, &cid, &t);
+            (pos.sha256_hex, pos.created_at_key, pos.id)
+        });
+        assert_eq!(
+            echoed, None,
+            "this rung reached no row the caller had not already been given, so it owes \
+             no continuation; echoing {start:?} back under {oid} spins the ladder for \
+             another eight amplified requests and calls it progress"
+        );
+    }
+
+    /// The filter drops a seal that stood still, never one that moved.
+    ///
+    /// Two properties in one fixture, because they are the two halves of "does not
+    /// over-drop". Rung 1 is FRONT-STARTED, where the request's start is before every row,
+    /// so its seal must pass the filter untouched; rung 2 resumes from it, walks two more
+    /// rows, and its seal must pass because it is strictly ahead.
+    ///
+    /// MUTATION (RED): compare the proposal against the start with `>=` instead of `>`
+    /// and rung 2 keeps its token, so this stays green; compare with `<` and both rungs
+    /// lose theirs. The filter's job is the middle case, and this fixture is what keeps
+    /// it from swallowing the other two.
+    #[sqlx::test]
+    async fn get_by_cid_a_rung_that_advances_a_row_still_mints(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 1024;
+        state.ipfs_max_legacy_probes = 2;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1024, std::time::Duration::from_secs(3600));
+
+        seed_ladder_filler(&state, &pool, "advances", 4, 0).await;
+        let oid = absent_oid();
+        let cid = seed_legacy_pin(&state, &oid).await;
+
+        let key = state.ipfs_scan_token_key.clone();
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.178:5000".parse().unwrap();
+
+        let (status, body) = status_and_body(
+            router
+                .clone()
+                .oneshot(get_cid_scan(&cid, Some(peer), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let rung1 = continuation_of(&body).expect(
+            "a front-started request starts before every row, so its probe-ceiling seal \
+             is strictly ahead by construction and must still mint",
+        );
+        let first = opened(&key, &cid, &rung1);
+
+        let (status, body) = status_and_body(
+            router
+                .oneshot(get_cid_scan(&cid, Some(peer), Some(&rung1)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let rung2 = continuation_of(&body)
+            .expect("the resumed rung walked two more rows, so it has somewhere to seal");
+        let second = opened(&key, &cid, &rung2);
+        assert_eq!(
+            (second.sha256_hex.as_str(), first.sha256_hex.as_str()),
+            (oid.as_str(), oid.as_str()),
+            "one candidate, so both rungs name it"
+        );
+        assert!(
+            (second.created_at_key.clone(), second.id.clone())
+                > (first.created_at_key.clone(), first.id.clone()),
+            "a rung that reached rows the caller had not seen must seal one of them: \
+             {first:?} then {second:?}"
+        );
+    }
+
+    /// The advance to the next candidate is not "backwards", and the filter must know it.
+    ///
+    /// The advance seals the front-of-table sentinel, an empty row pair that sorts BELOW
+    /// every real key. A filter that compared only the row would read the ladder's one real
+    /// forward step as a step back and drop it, ending every multi-candidate ladder at the
+    /// rung that was about to hand over. What makes it forward is the candidate: a
+    /// different hex can only come from the finished-candidate advance, which is ahead by
+    /// construction.
+    ///
+    /// MUTATION (RED): compare rows without first comparing the candidate, and the
+    /// handover token disappears.
+    #[sqlx::test]
+    async fn get_by_cid_the_advance_to_the_next_candidate_survives_the_filter(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.ipfs_legacy_scan_page_rows = 2;
+        state.ipfs_max_legacy_scan_rows = 1024;
+        state.ipfs_max_legacy_probes = 1024;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1024, std::time::Duration::from_secs(3600));
+
+        seed_root_denying_repos(&state, "advfilter", 2, 0).await;
+        let first = "00".repeat(32);
+        let second = "11".repeat(32);
+        let cid = seed_legacy_pin(&state, &first).await;
+        state
+            .db
+            .record_pinned_cid(&second, &cid, None)
+            .await
+            .unwrap();
+
+        let key = state.ipfs_scan_token_key.clone();
+        // Resumed at the LAST row of the table, so the first candidate's keyset fetch comes
+        // back empty, it wraps, and the rung's whole job is the handover.
+        let token = minted(
+            &key,
+            &cid,
+            &first,
+            (&scan_order_stamp(1).to_rfc3339(), "advfilter-0001"),
+        );
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.179:5000".parse().unwrap();
+
+        let (status, body) = status_and_body(
+            router
+                .oneshot(get_cid_scan(&cid, Some(peer), Some(&token)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let handover = continuation_of(&body).expect(
+            "the finished candidate hands the ladder on, and the sentinel it seals is \
+             ahead by candidate even though the row pair sorts below the start",
+        );
+        let pos = opened(&key, &cid, &handover);
+        assert_eq!(
+            (
+                pos.sha256_hex.as_str(),
+                pos.created_at_key.as_str(),
+                pos.id.as_str()
+            ),
+            (second.as_str(), "", ""),
+            "the next candidate, at the front of the table"
+        );
+    }
+
+    /// A ceiling that stops mid-page seals the last row it SETTLED, which is progress.
+    ///
+    /// This is the arm the tokenless shed must not swallow. A resumed scan only ever walks
+    /// rows past its start cursor, so any row it settled is strictly ahead, and the rung
+    /// that settles two rows before a ceiling refuses the third owes the caller the second
+    /// one. Only a rung that settled NOTHING sheds tokenless, because there the spender is
+    /// the provenance phase, which runs identically on every retry.
+    ///
+    /// MUTATION (RED): seal the request's start instead of the settled row, and the filter
+    /// (correctly) drops it, so this ladder loses its token and stalls.
+    #[sqlx::test]
+    async fn get_by_cid_resumed_ceiling_seals_the_last_row_it_settled(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        // A page wide enough that the probe ceiling binds INSIDE the row loop rather than
+        // at the top of it: that is the arm whose position is the last settled row.
+        state.ipfs_legacy_scan_page_rows = 4;
+        state.ipfs_max_legacy_scan_rows = 1024;
+        state.ipfs_max_legacy_probes = 2;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1024, std::time::Duration::from_secs(3600));
+
+        seed_ladder_filler(&state, &pool, "settled", 5, 0).await;
+        let oid = absent_oid();
+        let cid = seed_legacy_pin(&state, &oid).await;
+
+        let key = state.ipfs_scan_token_key.clone();
+        let start = (
+            scan_order_stamp(0).to_rfc3339(),
+            "z6readablesettled/settled-0000".to_string(),
+        );
+        let token = minted(&key, &cid, &oid, (start.0.as_str(), start.1.as_str()));
+        let router = ipfs_router(state);
+        let peer: SocketAddr = "203.0.113.180:5000".parse().unwrap();
+
+        let (status, body) = status_and_body(
+            router
+                .oneshot(get_cid_scan(&cid, Some(peer), Some(&token)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let pos = opened(
+            &key,
+            &cid,
+            &continuation_of(&body).expect(
+                "the rung settled two rows before the ceiling refused the third, so it \
+                 has real progress to seal",
+            ),
+        );
+        assert_eq!(
+            (pos.created_at_key.as_str(), pos.id.as_str()),
+            (
+                scan_order_stamp(2).to_rfc3339().as_str(),
+                "z6readablesettled/settled-0002"
+            ),
+            "the seal is the last row the ceiling let this rung settle, not the row it \
+             refused and not the caller's own start"
+        );
+        assert!(
+            (pos.created_at_key.clone(), pos.id.clone()) > start,
+            "and it is strictly ahead of the position the request came in with"
         );
     }
 
