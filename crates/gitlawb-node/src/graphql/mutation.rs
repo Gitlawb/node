@@ -238,9 +238,10 @@ mod tests {
             errors(&resp)
         );
 
-        // 3. Signed as the claimed assignee → passes the auth gate. The missing
-        //    task is a business error from claim_task, not a sqlx fault, so the
-        //    actionable message must survive (not the opaque DB string) (#250).
+        // 3. Signed as the claimed assignee → passes the auth gate. A missing
+        //    task is gated by get_visible_task as "task not found" (same as a
+        //    denied id) before claim_task runs, and must stay a business
+        //    message rather than the opaque DB string (#250).
         let resp = schema
             .execute(Request::new(&q).data(AuthenticatedDid(assignee.into())))
             .await;
@@ -250,8 +251,8 @@ mod tests {
             "matching signer must pass the auth gate: {errs}"
         );
         assert!(
-            errs.contains("task not claimable"),
-            "claim race / missing task must keep its business message: {errs}"
+            errs.contains("task not found"),
+            "missing task must keep its business message: {errs}"
         );
         assert!(
             !errs.contains(crate::graphql::GRAPHQL_DB_ERROR_MESSAGE),
