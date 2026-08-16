@@ -2784,11 +2784,19 @@ impl Db {
     /// candidate lets the handler try each rather than pick one arbitrarily and
     /// false-404 when the chosen one is withheld or absent while another is
     /// readable (#173). Empty when the CID was never pinned on this node.
+    ///
+    /// ORDERED, for the same reason `pin_sources_for_oid` orders its union: the handler
+    /// walks these candidates under ONE shared probe budget, visit budget and pager, so
+    /// whichever comes back first is the one that spends the request's budget. Left
+    /// unordered this is a bare sequential scan returning heap order, which an unpin and
+    /// re-pin of any one object rewrites, so two nodes holding identical data could
+    /// resolve the same CID differently and one could 503 where the other serves.
     pub async fn oids_for_cid(&self, cid: &str) -> Result<Vec<String>> {
-        let rows = sqlx::query("SELECT sha256_hex FROM pinned_cids WHERE cid = $1")
-            .bind(cid)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows =
+            sqlx::query("SELECT sha256_hex FROM pinned_cids WHERE cid = $1 ORDER BY sha256_hex")
+                .bind(cid)
+                .fetch_all(&self.pool)
+                .await?;
         Ok(rows
             .into_iter()
             .map(|r| r.get::<String, _>("sha256_hex"))
@@ -8480,6 +8488,67 @@ mod peers_table_writer_guard {
             "the peers-table writers no longer match the ledger. A new writer must \
              be dispositioned in the table above (and gated), and a removed one \
              dropped from LEDGER"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cid_candidate_order_tests {
+    use super::Db;
+    use sqlx::PgPool;
+
+    /// The candidate order `oids_for_cid` returns must not depend on the physical
+    /// row order in `pinned_cids`.
+    ///
+    /// `get_by_cid` walks the candidates under ONE shared probe budget, visit budget
+    /// and pager, so whichever candidate comes back first is the one that spends the
+    /// request's budget. Without an `ORDER BY` the query is a bare sequential scan and
+    /// Postgres is free to return heap order, which any UPDATE to any row rewrites: two
+    /// nodes holding identical data, or one node before and after an unrelated write,
+    /// resolve the same CID by trying candidates in a different order, so one serves the
+    /// object and the other sheds a 503.
+    ///
+    /// The sibling `pin_sources_for_oid` already orders its union for exactly this
+    /// reason, and the handler's own comment leans on that determinism.
+    ///
+    /// MUTATION (RED): drop the `ORDER BY` and the post-UPDATE read comes back rotated.
+    #[sqlx::test]
+    async fn oids_for_cid_is_ordered_independently_of_physical_row_order(pool: PgPool) {
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+
+        let cid = "bafkreiorderingfixtureaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let oids = ["aa".repeat(32), "bb".repeat(32), "cc".repeat(32)];
+        for oid in &oids {
+            db.record_pinned_cid(oid, cid, None).await.unwrap();
+        }
+
+        let before = db.oids_for_cid(cid).await.unwrap();
+        assert_eq!(before.len(), 3, "fixture must seed three candidates");
+
+        // Move the first candidate to the end of the heap the way production does it:
+        // an unpin followed by a re-pin of the same object. An in-place UPDATE is not
+        // enough, since a HOT update leaves the row reachable from its original item
+        // pointer and a sequential scan still returns it in its old position.
+        sqlx::query("DELETE FROM pinned_cids WHERE sha256_hex = $1")
+            .bind(&oids[0])
+            .execute(&pool)
+            .await
+            .expect("unpin one candidate");
+        db.record_pinned_cid(&oids[0], cid, None).await.unwrap();
+
+        let after = db.oids_for_cid(cid).await.unwrap();
+        assert_eq!(
+            before, after,
+            "an unrelated write to one candidate must not reorder the candidate list; \
+             the order decides which oid spends the request's shared budget"
+        );
+
+        let mut sorted = after.clone();
+        sorted.sort();
+        assert_eq!(
+            after, sorted,
+            "the order must be a stated one (ascending oid), not whatever the heap holds"
         );
     }
 }
