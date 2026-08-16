@@ -73,11 +73,11 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
     println!("gl doctor — checking your gitlawb setup");
     println!();
 
-    let dir = args.dir.unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".gitlawb")
-    });
+    // The same resolver every other command uses. `doctor` reporting on
+    // `~/.gitlawb` while `gl register` writes to the parent of `GITLAWB_KEY` would
+    // make the one command whose job is to explain a broken setup the one that
+    // misreports it.
+    let dir = crate::identity::gitlawb_dir(args.dir)?;
 
     let mut checks = Vec::new();
     let mut all_ok = true;

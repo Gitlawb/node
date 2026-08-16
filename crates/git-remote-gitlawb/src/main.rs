@@ -124,7 +124,9 @@ fn help_text() -> String {
          \n\
          ENVIRONMENT:\n\
          \x20   GITLAWB_NODE   Node base URL (default: http://127.0.0.1:7545)\n\
-         \x20   GITLAWB_KEY    Identity PEM path for signed fetch/push (default: ~/.gitlawb/identity.pem)\n\
+         \x20   GITLAWB_KEY    Identity PEM path for signed fetch/push, absolute\n\
+         \x20                  (default: ~/.gitlawb/identity.pem). Its parent also\n\
+         \x20                  holds the delegations `gl ucan import` writes.\n\
          \x20   GITLAWB_LOG    Log filter (default: warn)\n\
          \n\
          FLAGS:\n\
@@ -536,7 +538,7 @@ fn delegation_header(
         return None;
     }
 
-    let dir = resolve_key_path().parent()?.to_path_buf();
+    let dir = resolve_identity_dir()?;
     let path = delegation_path(&dir, &owner, &repo);
     let raw = std::fs::read_to_string(&path).ok()?;
 
@@ -969,7 +971,7 @@ fn safe_error_body_excerpt(body: &str) -> String {
 // ── Keypair loading ───────────────────────────────────────────────────────────
 
 fn load_keypair() -> Option<Keypair> {
-    let key_path = resolve_key_path();
+    let key_path = resolve_key_path()?;
     if !key_path.exists() {
         tracing::debug!("no keypair found at {key_path:?}");
         return None;
@@ -992,16 +994,40 @@ fn load_keypair() -> Option<Keypair> {
     }
 }
 
-fn resolve_key_path() -> std::path::PathBuf {
-    let path_str =
-        std::env::var("GITLAWB_KEY").unwrap_or_else(|_| "~/.gitlawb/identity.pem".to_string());
+/// The identity PEM, resolved by the same rules `gl` uses.
+///
+/// Shared through `gitlawb-core` rather than reimplemented here: this helper and
+/// `gl ucan import` have to derive the same delegation store from `GITLAWB_KEY`,
+/// and the two had drifted — the local version read `env::var` (so a non-UTF-8
+/// value silently became the default key), expanded only a literal `"~/"`, fell
+/// back to `"."` when `HOME` was unset, and never required an absolute path.
+///
+/// `None` means the value is unusable, not that the key is missing. Git runs this
+/// helper mid-push, so a misconfiguration is logged and the push continues
+/// unsigned rather than aborting the transfer.
+fn resolve_key_path() -> Option<std::path::PathBuf> {
+    let home = home_dir()?;
+    gitlawb_core::identity_path::identity_key_path(&home)
+        .inspect_err(|e| tracing::warn!("cannot resolve the identity key path: {e}"))
+        .ok()
+}
 
-    if let Some(stripped) = path_str.strip_prefix("~/") {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        std::path::PathBuf::from(home).join(stripped)
-    } else {
-        std::path::PathBuf::from(path_str)
-    }
+/// The directory holding `identity.pem` and `delegations/`.
+fn resolve_identity_dir() -> Option<std::path::PathBuf> {
+    let home = home_dir()?;
+    gitlawb_core::identity_path::identity_dir(&home)
+        .inspect_err(|e| tracing::warn!("cannot resolve the identity directory: {e}"))
+        .ok()
+}
+
+/// `dirs`, not `$HOME`: the old code fell back to `"."` when `HOME` was unset,
+/// which on Windows is always, so the default key resolved against whatever
+/// directory git happened to invoke the helper from.
+fn home_dir() -> Option<std::path::PathBuf> {
+    dirs::home_dir().or_else(|| {
+        tracing::warn!("could not determine the home directory; pushing without a delegation");
+        None
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

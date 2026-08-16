@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 pub enum IdentityCmd {
     /// Generate a new Ed25519 keypair and DID
     New {
-        /// Output directory for key files (default: ~/.gitlawb)
+        /// Output directory for key files
+        /// (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
         #[arg(long)]
         dir: Option<PathBuf>,
         /// Overwrite existing keys if present
@@ -64,56 +65,27 @@ pub async fn run(cmd: IdentityCmd) -> Result<()> {
 }
 
 /// Resolve the identity directory, honouring an explicit override.
-/// Public so sibling commands (`gl ucan import`) store alongside the identity.
+/// Public so sibling commands (`gl ucan import`, `gl doctor`) look in the same
+/// place the identity itself lives.
 ///
-/// Falls back to the parent of `GITLAWB_KEY` before `~/.gitlawb`. Without that,
-/// an operator who moved their key — `GITLAWB_KEY=/data/keys/identity.pem`, the
-/// shape `.env.example` documents — has `gl ucan import` write the delegation to
-/// `~/.gitlawb/delegations` while `git-remote-gitlawb`, which resolves its store
-/// from `GITLAWB_KEY`, reads an empty directory. The push then goes out with no
-/// `X-Ucan` and the delegate is refused, with nothing to indicate why.
+/// Without an override this is [`gitlawb_core::identity_path::identity_dir`] — the
+/// parent of `GITLAWB_KEY`, else `~/.gitlawb`. The rules live in `gitlawb-core`
+/// because `git-remote-gitlawb` needs the identical answer: an operator who moved
+/// their key (`GITLAWB_KEY=/data/keys/identity.pem`, the shape `.env.example`
+/// documents) would otherwise have `gl ucan import` write the delegation to
+/// `~/.gitlawb/delegations` while the helper reads `/data/keys/delegations` and
+/// finds it empty. The push then goes out with no `X-Ucan` and the delegate is
+/// refused, with nothing on either side to indicate why.
 pub fn gitlawb_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(d) = override_dir {
         return Ok(d);
     }
-    // `var_os`, not `var`: a non-UTF-8 value makes `var` return Err, which would be
-    // indistinguishable from unset and would silently select ~/.gitlawb instead of
-    // the operator's actual key directory.
-    if let Some(raw) = std::env::var_os("GITLAWB_KEY") {
-        let key = PathBuf::from(&raw);
-        if !key.as_os_str().is_empty() {
-            let path = match key.strip_prefix("~") {
-                Ok(rest) => dirs::home_dir()
-                    .context("could not determine home directory")?
-                    .join(rest),
-                Err(_) => key,
-            };
-            // A relative GITLAWB_KEY is refused rather than resolved. `gl` and
-            // `git-remote-gitlawb` run with different working directories, so a
-            // relative path makes them derive different delegation stores — the
-            // import lands somewhere the helper never looks, and the push is refused
-            // with nothing to indicate why. A one-component value is worse still:
-            // `parent()` yields "", so the store becomes `./delegations`.
-            if !path.is_absolute() {
-                anyhow::bail!(
-                    "GITLAWB_KEY must be an absolute path (got {}). It determines where \
-                     delegations are stored, and `gl` and `git-remote-gitlawb` do not \
-                     share a working directory, so a relative path sends them to \
-                     different places.",
-                    path.display()
-                );
-            }
-            if let Some(parent) = path.parent() {
-                return Ok(parent.to_path_buf());
-            }
-        }
-    }
-    let home = dirs::home_dir().context("could not determine home directory")?;
-    Ok(home.join(".gitlawb"))
+    let home = dirs::home_dir().context("could not determine the home directory")?;
+    gitlawb_core::identity_path::identity_dir(&home).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn key_path(dir: &Path) -> PathBuf {
-    dir.join("identity.pem")
+    dir.join(gitlawb_core::identity_path::KEY_FILE_NAME)
 }
 
 fn load_keypair(dir: Option<PathBuf>) -> Result<Keypair> {
@@ -122,14 +94,14 @@ fn load_keypair(dir: Option<PathBuf>) -> Result<Keypair> {
 
 /// Load keypair from an optional directory override.
 /// Used by other modules (register, repo, mcp).
+///
+/// Routed through [`gitlawb_dir`] rather than reaching for `~/.gitlawb` directly:
+/// `gl identity new` writes the key wherever `GITLAWB_KEY` points, so a second
+/// resolver here would have every other command read a different file than the one
+/// just created — `gl ucan delegate` would either fail to find an identity or sign
+/// with a stale DID that is not the repo owner.
 pub fn load_keypair_from_dir(dir: Option<&std::path::Path>) -> Result<Keypair> {
-    let base = if let Some(d) = dir {
-        d.to_path_buf()
-    } else {
-        dirs::home_dir()
-            .context("could not determine home directory")?
-            .join(".gitlawb")
-    };
+    let base = gitlawb_dir(dir.map(Path::to_path_buf))?;
     let path = key_path(&base);
     let pem = fs::read_to_string(&path).with_context(|| {
         format!(
@@ -553,8 +525,31 @@ mod tests {
 
 #[cfg(test)]
 mod gitlawb_dir_tests {
-    use super::gitlawb_dir;
+    use super::{gitlawb_dir, load_keypair_from_dir};
+    use std::ffi::OsString;
     use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    /// The process environment is global. Every case that touches `GITLAWB_KEY`
+    /// takes this lock so they cannot race each other.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Run `f` with `GITLAWB_KEY` set to `value` (or removed for `None`), restoring
+    /// whatever was there before.
+    fn with_key_env<T>(value: Option<OsString>, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let restore = std::env::var_os("GITLAWB_KEY");
+        match &value {
+            Some(v) => std::env::set_var("GITLAWB_KEY", v),
+            None => std::env::remove_var("GITLAWB_KEY"),
+        }
+        let out = f();
+        match restore {
+            Some(v) => std::env::set_var("GITLAWB_KEY", v),
+            None => std::env::remove_var("GITLAWB_KEY"),
+        }
+        out
+    }
 
     /// An explicit --dir always wins and is never validated against GITLAWB_KEY.
     #[test]
@@ -567,37 +562,69 @@ mod gitlawb_dir_tests {
     /// from different working directories, so resolving one relatively sends the
     /// import and the lookup to different stores; a one-component value yields an
     /// empty parent and puts the store in `./delegations`.
-    ///
-    /// Serialised with the other env-touching case: the process environment is
-    /// global and these would otherwise race.
     #[test]
-    fn relative_and_nonunicode_key_paths() {
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-        let restore = std::env::var_os("GITLAWB_KEY");
-
-        std::env::set_var("GITLAWB_KEY", "identity.pem");
-        let one_component = gitlawb_dir(None);
-        std::env::set_var("GITLAWB_KEY", "keys/identity.pem");
-        let relative = gitlawb_dir(None);
-        std::env::set_var("GITLAWB_KEY", "");
-        let empty = gitlawb_dir(None);
-
-        match restore {
-            Some(v) => std::env::set_var("GITLAWB_KEY", v),
-            None => std::env::remove_var("GITLAWB_KEY"),
+    fn relative_key_paths_are_refused() {
+        for raw in ["identity.pem", "keys/identity.pem"] {
+            let result = with_key_env(Some(OsString::from(raw)), || gitlawb_dir(None));
+            assert!(result.is_err(), "{raw} is relative and must be refused");
         }
+    }
 
-        assert!(
-            one_component.is_err(),
-            "a one-component key path yields an empty parent and must be refused"
+    /// An empty value is what a shell leaves behind for `FOO=` and for an unset
+    /// variable expanded into a wrapper script. Treated as unset, not as an error.
+    #[test]
+    fn an_empty_key_path_is_treated_as_unset() {
+        let result = with_key_env(Some(OsString::new()), || gitlawb_dir(None));
+        assert_eq!(
+            result.unwrap(),
+            dirs::home_dir().unwrap().join(".gitlawb"),
+            "an empty value selects the default directory"
         );
-        assert!(relative.is_err(), "a relative key path must be refused");
+    }
+
+    /// The reason `gitlawb_dir` reads through `var_os`: `env::var` folds a non-UTF-8
+    /// value into the same `Err` as unset, so a bad path would silently resolve to
+    /// `~/.gitlawb` instead of being reported. Byte 0xFF is not valid UTF-8 in any
+    /// position, so this value is unreachable through `env::var`.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_key_path_is_not_mistaken_for_unset() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw = OsString::from_vec(b"keys/\xFF/identity.pem".to_vec());
+        let result = with_key_env(Some(raw), || gitlawb_dir(None));
+
+        let err = result.expect_err("a non-UTF-8 relative path must be refused");
         assert!(
-            empty.is_ok(),
-            "an empty value is treated as unset, not as an error"
+            err.to_string().contains("absolute"),
+            "the error must name the real problem, not fall back to the default: {err}"
         );
+
+        let mut absolute = OsString::from("/data/");
+        absolute.push(OsString::from_vec(vec![0xFF]));
+        absolute.push("/identity.pem");
+        let resolved = with_key_env(Some(absolute.clone()), || gitlawb_dir(None)).unwrap();
+        assert_eq!(
+            resolved,
+            PathBuf::from(&absolute).parent().unwrap(),
+            "an absolute non-UTF-8 path resolves to its own parent, not to ~/.gitlawb"
+        );
+    }
+
+    /// `gl identity new` writes the key wherever `GITLAWB_KEY` points, so every
+    /// other command has to read it back from there. `load_keypair_from_dir(None)`
+    /// used to hardcode `~/.gitlawb`, which made `gl ucan delegate` sign with a
+    /// stale DID — or fail outright — for exactly the operators who moved the key.
+    #[test]
+    fn load_keypair_from_dir_honours_the_key_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("identity.pem");
+        let expected = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(&key, expected.to_pem().unwrap()).unwrap();
+
+        let loaded = with_key_env(Some(key.into_os_string()), || load_keypair_from_dir(None))
+            .expect("the identity beside GITLAWB_KEY must be found");
+
+        assert_eq!(loaded.did(), expected.did());
     }
 }

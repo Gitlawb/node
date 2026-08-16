@@ -6,7 +6,7 @@ use serde_json::json;
 use std::path::PathBuf;
 
 use gitlawb_core::did::Did;
-use gitlawb_core::ucan::{Capability, Ucan};
+use gitlawb_core::ucan::{caps, Capability, Ucan};
 
 use crate::identity::load_keypair_from_dir;
 
@@ -164,21 +164,32 @@ async fn cmd_import(token: String, dir: Option<PathBuf>) -> Result<()> {
         "not a valid UCAN token — pass the JSON emitted by `gl ucan delegate`, or a path to it",
     )?;
 
+    // Import admits only what the push path can actually use. `build_invocation`
+    // requires a push-class action on a concrete repository resource, so a token
+    // carrying only `pr/open` would import "successfully", print a stored path, and
+    // then be dropped at push time behind a `tracing::warn` the operator never
+    // sees — a denial wearing the shape of an empty success.
     let push_caps: Vec<(String, String)> = ucan
         .payload
         .att
         .iter()
+        .filter(|cap| is_push_class(&cap.can))
         .filter_map(|cap| repo_from_resource(&cap.with))
         .collect();
 
     if push_caps.is_empty() {
         anyhow::bail!(
-            "this delegation names no repository — expected a capability on \
-             gitlawb://repos/<owner>/<repo>, found: {}",
+            "this delegation carries no storable push capability — expected {} or {} \
+             (or \"*\") on gitlawb://repos/<owner>/<repo>, found: {}\n\
+             A delegation whose resource is \"*\" cannot be imported either: the store \
+             is keyed by repository, so re-issue it against the repository you intend \
+             to push to.",
+            caps::GIT_PUSH,
+            caps::REPO_ADMIN,
             ucan.payload
                 .att
                 .iter()
-                .map(|c| c.with.as_str())
+                .map(|c| format!("{} -> {}", c.with, c.can))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -186,41 +197,84 @@ async fn cmd_import(token: String, dir: Option<PathBuf>) -> Result<()> {
 
     // The identity directory is a private-data contract, not a public one: it
     // already holds `identity.pem`, whose disclosure is strictly worse than a
-    // delegation's. On Unix both get explicit modes. On other targets neither does
-    // — `std::fs` has no portable ACL API and `gitlawb_dir` accepts any directory —
-    // so the contract there is that the caller supplies a user-private directory,
-    // which is what the platform's per-user profile gives by default. Diverging for
-    // this one file while the private key beside it relies on the same assumption
-    // would be theatre.
+    // delegation's. `create_private_dir` and `write_private_file` below carry the
+    // per-platform reasoning.
     let base = crate::identity::gitlawb_dir(dir)?;
     let store = base.join("delegations");
-    std::fs::create_dir_all(&store)
-        .with_context(|| format!("could not create {}", store.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("could not set permissions on {}", store.display()))?;
-    }
+    create_private_dir(&store).with_context(|| format!("could not create {}", store.display()))?;
 
     for (owner, repo) in &push_caps {
         let path = delegation_path(&base, owner, repo);
-        std::fs::write(&path, &raw)
-            .with_context(|| format!("could not write {}", path.display()))?;
         // 0600, like the sibling identity key. The token is not itself sufficient to
         // push — the node requires `iss` to equal the request signer, so a reader
         // still needs the delegate's private key — but it does disclose the
         // delegation graph and which identities hold capabilities on which repos.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("could not set permissions on {}", path.display()))?;
-        }
+        write_private_file(&path, raw.as_bytes())
+            .with_context(|| format!("could not write {}", path.display()))?;
         println!("Stored delegation for {owner}/{repo} at {}", path.display());
     }
 
     Ok(())
+}
+
+/// Actions the push path accepts. Kept in step with the filter in
+/// `git-remote-gitlawb`'s `build_invocation`, which is what actually mints an
+/// invocation from a stored delegation.
+fn is_push_class(can: &str) -> bool {
+    can == caps::GIT_PUSH || can == "*" || can == caps::REPO_ADMIN
+}
+
+/// Create the delegation store owner-only, with no window at a wider mode.
+///
+/// `create_dir_all` followed by `set_permissions` leaves the directory at the
+/// process umask — 0755 under the usual 022 — until the second call lands, which
+/// is long enough for another local user to open it. The mode rides on the
+/// creating syscall instead. The follow-up `set_permissions` is not the window
+/// reopening: it only matters when the directory already existed, and repairs a
+/// 0755 store left behind by an older `gl`.
+#[cfg(unix)]
+fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Write `contents`, owner-only from the moment the file exists.
+///
+/// Not `create_new`: re-importing a refreshed delegation has to overwrite the
+/// stored one. `mode` applies only when the file is created, so the trailing
+/// `set_permissions` covers a 0644 file written by an older `gl`.
+#[cfg(unix)]
+fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+// `std::fs` has no portable ACL API, and `gitlawb_dir` accepts any directory, so
+// the contract off Unix is that the caller supplies a user-private directory —
+// which is what the platform's per-user profile gives by default. The private key
+// sits in the same directory under the same assumption, and its disclosure is
+// strictly worse than a delegation's, so hardening this one file alone would be
+// theatre.
+#[cfg(not(unix))]
+fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
+}
+
+#[cfg(not(unix))]
+fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, contents)
 }
 
 async fn cmd_delegate(
@@ -279,10 +333,7 @@ async fn cmd_delegate(
 }
 
 async fn cmd_show(dir: Option<PathBuf>) -> Result<()> {
-    let home = dir
-        .or_else(|| dirs::home_dir().map(|h| h.join(".gitlawb")))
-        .context("cannot find identity directory")?;
-    let ucan_path = home.join("ucan.json");
+    let ucan_path = crate::identity::gitlawb_dir(dir)?.join("ucan.json");
 
     if !ucan_path.exists() {
         println!("No UCAN saved. Run `gl register` first.");
@@ -568,6 +619,115 @@ mod delegation_store_tests {
             delegation_path(base, "z6MkAbc", "myrepo"),
             expected,
             "bare and full owner forms must address the same delegation"
+        );
+    }
+
+    fn token_for(can: &str, with: &str) -> String {
+        let owner = gitlawb_core::identity::Keypair::generate();
+        let agent = gitlawb_core::identity::Keypair::generate();
+        Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new(with, can)],
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        )
+        .unwrap()
+        .encode()
+        .unwrap()
+    }
+
+    /// A delegation the push path cannot use must fail at import, where the
+    /// operator is watching. `build_invocation` requires a push-class action, so a
+    /// `pr/open` token that imported "successfully" would be silently dropped from
+    /// the push behind a `tracing::warn` and surface only as a 403 with no
+    /// connection to the earlier success.
+    #[tokio::test]
+    async fn import_refuses_a_delegation_the_push_path_cannot_use() {
+        for can in ["pr/open", "issue/create", "git/fetch"] {
+            let dir = tempfile::tempdir().unwrap();
+            let token = token_for(can, "gitlawb://repos/z6MkAbc/myrepo");
+
+            let err = cmd_import(token, Some(dir.path().to_path_buf()))
+                .await
+                .expect_err("{can} is not a push capability and must be refused");
+
+            assert!(
+                err.to_string().contains(caps::GIT_PUSH),
+                "the error must name the action the push path needs: {err}"
+            );
+            assert!(
+                !dir.path().join("delegations").exists(),
+                "nothing may be written before the capability is accepted"
+            );
+        }
+    }
+
+    /// The resource is `*`, so the store — which is keyed by repository — has no
+    /// filename to write under. Refused with an explanation rather than reported as
+    /// an import that stored nothing.
+    #[tokio::test]
+    async fn import_refuses_a_wildcard_resource() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = token_for(caps::GIT_PUSH, "*");
+
+        let err = cmd_import(token, Some(dir.path().to_path_buf()))
+            .await
+            .expect_err("a wildcard resource cannot be keyed by repository");
+
+        assert!(
+            err.to_string().contains("re-issue"),
+            "the error must say what to do instead: {err}"
+        );
+        assert!(!dir.path().join("delegations").exists());
+    }
+
+    #[tokio::test]
+    async fn import_accepts_every_push_class_action() {
+        for can in [caps::GIT_PUSH, caps::REPO_ADMIN, "*"] {
+            let dir = tempfile::tempdir().unwrap();
+            let token = token_for(can, "gitlawb://repos/z6MkAbc/myrepo");
+
+            cmd_import(token, Some(dir.path().to_path_buf()))
+                .await
+                .unwrap_or_else(|e| panic!("{can} must import: {e}"));
+
+            let stored = delegation_path(dir.path(), "z6MkAbc", "myrepo");
+            assert!(stored.exists(), "{can} must leave a stored delegation");
+        }
+    }
+
+    /// The store and the token file must never exist at a wider mode, not even
+    /// briefly: `create_dir_all` then chmod leaves 0755 under the usual umask, and
+    /// the token discloses the delegation graph.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn import_creates_the_store_and_token_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let token = token_for(caps::GIT_PUSH, "gitlawb://repos/z6MkAbc/myrepo");
+        cmd_import(token.clone(), Some(dir.path().to_path_buf()))
+            .await
+            .unwrap();
+
+        let store = dir.path().join("delegations");
+        let stored = delegation_path(dir.path(), "z6MkAbc", "myrepo");
+        assert_eq!(
+            std::fs::metadata(&store).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&stored).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // Re-import has to overwrite, which is why this is not `create_new`.
+        cmd_import(token, Some(dir.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&stored).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 }

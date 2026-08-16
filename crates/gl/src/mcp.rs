@@ -759,9 +759,7 @@ async fn call_tool(
         ]))?),
 
         "ucan_show" => {
-            let ucan_path = dirs::home_dir()
-                .context("no home dir")?
-                .join(".gitlawb/ucan.json");
+            let ucan_path = crate::identity::gitlawb_dir(None)?.join("ucan.json");
             if ucan_path.exists() {
                 let content = std::fs::read_to_string(ucan_path)?;
                 Ok(content)
