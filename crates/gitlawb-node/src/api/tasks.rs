@@ -266,13 +266,11 @@ pub(crate) async fn collect_visible_tasks(
 
         let last_batch = tasks.len() < batch_limit as usize;
         if visible.len() == bounded_limit as usize {
-            // A full page is incomplete when more candidates remain after this
-            // batch. Stopping here without that flag made a full page look
-            // like the end of the list.
-            let incomplete = !last_batch;
+            // Page filled before the scan ceiling. The caller pages from the
+            // last visible row; `incomplete` is reserved for the ceiling path.
             return Ok(VisibleTasks {
                 tasks: visible,
-                incomplete,
+                incomplete: false,
             });
         }
         if last_batch {
