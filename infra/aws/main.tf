@@ -448,25 +448,57 @@ resource "aws_ssm_document" "upgrade" {
       action = "aws:runShellScript"
       name   = "upgrade"
       inputs = {
-        runCommand = [
-          "set -euo pipefail",
-          # Reinstall the CURRENT rendering before restarting.
-          #
-          # `aws_instance` ignores user_data drift, so an instance created before a
-          # template change keeps the compose file it was born with. Compose passes
-          # only the variables named in its `environment:` block into the container,
-          # so a node setting added to the template never reaches an existing
-          # instance — the operator writes it to /opt/gitlawb/.env, restarts, and the
-          # node silently keeps the built-in default. `docker compose pull && up -d`
-          # cannot fix that: the authoritative file is the one on disk.
-          #
-          # Idempotent: writing the same bytes and restarting is a no-op. This does
-          # overwrite hand-edits to compose.yaml, which is intended — the file is
-          # Terraform-owned; per-instance settings belong in /opt/gitlawb/.env.
-          "install -d -m 0755 /opt/gitlawb",
-          "cat > /opt/gitlawb/compose.yaml.new <<'COMPOSE_EOF'\n${local.compose_yaml}\nCOMPOSE_EOF",
-          "mv /opt/gitlawb/compose.yaml.new /opt/gitlawb/compose.yaml",
-          "cd /opt/gitlawb && docker compose pull && docker compose up -d --remove-orphans && docker image prune -f"
+        # Reinstall the CURRENT rendering before restarting.
+        #
+        # `aws_instance` ignores user_data drift, so an instance created before a
+        # template change keeps the compose file it was born with. Compose passes
+        # only the variables named in its `environment:` block into the container,
+        # so a node setting added to the template never reaches an existing
+        # instance — the operator writes it to /opt/gitlawb/.env, restarts, and the
+        # node silently keeps the built-in default. `docker compose pull && up -d`
+        # cannot fix that: the authoritative file is the one on disk.
+        #
+        # Idempotent: writing the same bytes and restarting is a no-op. This does
+        # overwrite hand-edits to compose.yaml, which is intended — the file is
+        # Terraform-owned; per-instance settings belong in /opt/gitlawb/.env.
+        #
+        # One shell step, under flock, writing through mktemp. Two overlapping
+        # executions — a double run, a retry while the first is still pulling, two
+        # operators — otherwise share one fixed temp path: the second truncates the
+        # file the first is about to install, and once the first renames, the
+        # second's open descriptor keeps writing into the live compose.yaml inode.
+        # Both outcomes stay valid YAML, so the `up -d --remove-orphans` on the next
+        # line accepts a blended or truncated service set and deletes whatever fell
+        # off — on a live node, the local postgres or the TLS terminator. The lock
+        # also covers pull and up, so a second run cannot restart against a file the
+        # first is mid-install.
+        runCommand = [<<-UPGRADE
+          set -euo pipefail
+          install -d -m 0755 /opt/gitlawb
+
+          exec 9>/opt/gitlawb/.upgrade.lock
+          if ! flock -n 9; then
+            echo "another upgrade is already running on this instance" >&2
+            exit 1
+          fi
+
+          tmp="$(mktemp /opt/gitlawb/compose.yaml.XXXXXX)"
+          trap 'rm -f "$tmp"' EXIT
+          # base64 rather than a nested heredoc: the rendered compose contains
+          # `$${VAR}` passthroughs that must reach the file unexpanded, and a
+          # heredoc inside an indented Terraform heredoc depends on the dedent
+          # landing the delimiter at column 0. Decoding a single line has neither
+          # failure mode, and no delimiter can collide with the content.
+          echo '${base64encode(local.compose_yaml)}' | base64 -d > "$tmp"
+          chmod 0644 "$tmp"
+          mv "$tmp" /opt/gitlawb/compose.yaml
+          trap - EXIT
+
+          cd /opt/gitlawb
+          docker compose pull
+          docker compose up -d --remove-orphans
+          docker image prune -f
+          UPGRADE
         ]
       }
     }]
