@@ -1207,22 +1207,36 @@ enum GateOutcome {
     Throttled,
     /// A per-request CEILING (probes, repo visits) refused this row before it could reach
     /// a verdict, and will refuse every row after it too. Distinct from `Skip` because the
-    /// caller must both taint AND seal a resume position in front of this row: the taint
-    /// alone sheds a 503 whose missing token reads as "ladder over", stranding this row
-    /// and everything behind it on an inventory that never changes.
+    /// caller owes the ladder a resume position in front of this row, not just a taint:
+    /// the taint alone sheds a 503 whose missing token reads as "ladder over", stranding
+    /// this row and everything behind it on an inventory that never changes. The caller is
+    /// the only one that can name that position, which is why this returns rather than
+    /// tainting here.
     CeilingStop(&'static str),
 }
 
-/// The one site that records a scan truncation: taint the walk with the reason and seal
-/// the position the caller echoes back, together.
+/// Taint the walk with a truncation reason and seal the position the caller echoes back,
+/// together, at one site.
 ///
-/// Keeping the two together is the point. Every earlier drip on this path was a ceiling
-/// that tainted somewhere the mint could not see, so the shed carried no token.
+/// Keeping the two together is the point. Every earlier drip on this path was a CEILING
+/// that tainted somewhere the mint could not see, so the shed carried no token. This is
+/// not the only place the walk is tainted: the transient skips (`acquire`, `read`,
+/// `budget`, the walk cap) taint directly and seal nothing, because they refuse one row
+/// rather than stopping the scan, and the rows behind them are still walked. A ceiling is
+/// what stops the scan, so a ceiling is what owes the caller a position.
 ///
 /// The position only ever moves FORWARD. A later oid candidate re-walks the same fetched
 /// rows from the front with the request's budget already spent, so it stops earlier than
-/// the candidate before it; letting that overwrite the seal would hand back a token the
-/// caller already echoed and the ladder would never advance.
+/// the candidate before it. That earlier position is still ahead of the token the caller
+/// echoed, so letting it win would not move the ladder backwards; it would shrink each
+/// rung toward a single row and turn a bounded ladder into a crawl.
+///
+/// The comparison is Rust's byte-wise `Ord` on `(created_at_key, id)`, while the pager's
+/// keyset predicate orders the same TEXT columns under the DATABASE's collation. On a
+/// non-`C` collation the two can disagree for ids differing in case or punctuation. The
+/// disagreement is one-directional and costs work rather than correctness: the loser is a
+/// position behind the true maximum, which REPLAYS rows the caller already walked past
+/// instead of skipping rows it never saw.
 fn record_scan_truncation(
     walk: &mut WalkState,
     slot: &mut Option<(String, String)>,
@@ -1230,6 +1244,17 @@ fn record_scan_truncation(
     pos: Option<(String, String)>,
 ) {
     walk.taint(reason);
+    // The one log that separates a rung from a dead end. A truncation that seals nothing
+    // sheds a tokenless 503, which the client reads as "your ladder is over", so an
+    // operator staring at a stranded caller needs to see WHICH ceiling stopped the scan
+    // and whether it handed back a way to continue. The position itself is withheld data
+    // (its `created_at` and its `id` carry a private repo's owner DID), so log only
+    // whether one exists, never its value.
+    tracing::debug!(
+        reason,
+        sealed_continuation = pos.is_some(),
+        "/ipfs legacy scan truncated"
+    );
     if let Some(pos) = pos {
         if slot.as_ref().is_none_or(|sealed| pos > *sealed) {
             *slot = Some(pos);
