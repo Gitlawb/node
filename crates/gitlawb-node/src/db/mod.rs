@@ -3767,6 +3767,7 @@ impl Db {
         let row = sqlx::query(
             "UPDATE agent_tasks SET status='claimed', assignee_did=$2, updated_at=$3
              WHERE id=$1 AND status='pending'
+               AND (assignee_did IS NULL OR assignee_did = $2)
              RETURNING id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline",
         )
         .bind(id)

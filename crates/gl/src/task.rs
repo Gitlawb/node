@@ -235,6 +235,8 @@ async fn cmd_claim(id: String, node: String, dir: Option<PathBuf>) -> Result<()>
         .post(&format!("/api/v1/tasks/{}/claim", id), &body)
         .await
         .context("failed to claim task")?
+        .error_for_status()
+        .context("claim request rejected")?
         .json()
         .await
         .context("invalid JSON response")?;
@@ -257,6 +259,8 @@ async fn cmd_complete(
         .post(&format!("/api/v1/tasks/{}/complete", id), &body)
         .await
         .context("failed to complete task")?
+        .error_for_status()
+        .context("complete request rejected")?
         .json()
         .await
         .context("invalid JSON response")?;
@@ -279,6 +283,8 @@ async fn cmd_fail(
         .post(&format!("/api/v1/tasks/{}/fail", id), &body)
         .await
         .context("failed to fail task")?
+        .error_for_status()
+        .context("fail request rejected")?
         .json()
         .await
         .context("invalid JSON response")?;
