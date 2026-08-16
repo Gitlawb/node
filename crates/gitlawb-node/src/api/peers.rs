@@ -365,6 +365,7 @@ pub async fn trigger_sync(State(state): State<AppState>) -> Result<Json<serde_js
                     "refs/heads/main",
                     "0000000000000000000000000000000000000000",
                     None,
+                    None,
                 )
                 .await;
             enqueued += 1;
@@ -446,7 +447,14 @@ pub async fn notify_sync(
 
     state
         .db
-        .enqueue_sync(&req.repo, &req.node_did, &req.ref_name, &req.new_sha, None)
+        .enqueue_sync(
+            &req.repo,
+            &req.node_did,
+            &req.ref_name,
+            &req.new_sha,
+            None,
+            req.timestamp.as_deref(),
+        )
         .await?;
 
     // Mirror the gossipsub-receive handler: insert the same record we'd
@@ -1160,6 +1168,37 @@ mod tests {
             count, 1,
             "the valid path must still write the ref-update row"
         );
+    }
+
+    #[sqlx::test]
+    async fn sync_notify_preserves_origin_timestamp_for_sync_lag(pool: PgPool) {
+        let state = test_state(pool).await;
+        let db = state.db.clone();
+        let peer_did = seed_peer(&state).await;
+        let timestamp = "2026-08-16T00:00:00Z";
+        let body = serde_json::json!({
+            "repo": "z6Mkfoo/timestamped",
+            "ref_name": "refs/heads/main",
+            "new_sha": "0000000000000000000000000000000000000000",
+            "node_did": peer_did,
+            "timestamp": timestamp,
+        })
+        .to_string();
+        let router = crate::server::build_router(state);
+
+        let resp = router
+            .oneshot(unsigned_post(
+                "/api/v1/sync/notify",
+                &body,
+                "198.51.100.23:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let queued = db.dequeue_pending_syncs(100).await.unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].origin_timestamp.as_deref(), Some(timestamp));
     }
 
     #[sqlx::test]
