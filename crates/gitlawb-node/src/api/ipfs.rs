@@ -714,7 +714,7 @@ pub async fn get_by_cid(
     // Set when a ceiling truncates the scan, to the position the caller echoes back.
     // Sealed at the tail rather than here so exactly one site mints a token and the
     // wrap case can clear it in one place.
-    let mut scan_continuation: Option<(String, String)> = None;
+    let mut scan_continuation: Option<SealedScanPos> = None;
 
     for sha256_hex in &oids {
         // A pinned object records EVERY repo it was pinned from (#173 round 8, F1).
@@ -829,7 +829,13 @@ pub async fn get_by_cid(
                 // exactly as before. Only the visit ceiling can reach here (the probe
                 // ceiling is `legacy_scan`-only).
                 GateOutcome::CeilingStop(reason) => {
-                    record_scan_truncation(&mut walk, &mut scan_continuation, reason, None);
+                    record_scan_truncation(
+                        &mut walk,
+                        &mut scan_continuation,
+                        reason,
+                        None,
+                        sha256_hex,
+                    );
                     continue;
                 }
                 GateOutcome::Skip => continue,
@@ -971,6 +977,7 @@ pub async fn get_by_cid(
                             &mut scan_continuation,
                             "probe-ceiling",
                             pager.cursor.clone(),
+                            sha256_hex,
                         );
                         break;
                     }
@@ -980,6 +987,7 @@ pub async fn get_by_cid(
                             &mut scan_continuation,
                             "visit-ceiling",
                             pager.cursor.clone(),
+                            sha256_hex,
                         );
                         break;
                     }
@@ -995,6 +1003,7 @@ pub async fn get_by_cid(
                             &mut scan_continuation,
                             "row-ceiling",
                             pager.cursor.clone(),
+                            sha256_hex,
                         );
                         break;
                     }
@@ -1009,6 +1018,7 @@ pub async fn get_by_cid(
                             &mut scan_continuation,
                             "rules-ceiling",
                             pager.cursor.clone(),
+                            sha256_hex,
                         );
                         break;
                     }
@@ -1085,7 +1095,13 @@ pub async fn get_by_cid(
                             let prev = &pager.rows[idx - 2];
                             (prev.created_at_key.clone(), prev.repo.id.clone())
                         });
-                        record_scan_truncation(&mut walk, &mut scan_continuation, reason, resume);
+                        record_scan_truncation(
+                            &mut walk,
+                            &mut scan_continuation,
+                            reason,
+                            resume,
+                            sha256_hex,
+                        );
                         break;
                     }
                     GateOutcome::Skip => {}
@@ -1162,11 +1178,19 @@ pub async fn get_by_cid(
         // confidential, not merely tamper-evident (INV-13). A seal failure is not fatal
         // to the shed: drop the continuation and answer the plain 503, which degrades to
         // the pre-token behaviour rather than turning a truncation into a 500.
-        let continuation = scan_continuation.and_then(|(created_at_key, id)| {
+        let continuation = scan_continuation.and_then(|sealed| {
+            let SealedScanPos {
+                row: (created_at_key, id),
+                sha256_hex,
+            } = sealed;
             match gitlawb_core::scan_token::seal_scan_token(
                 &state.ipfs_scan_token_key,
                 &canonical_cid,
-                &gitlawb_core::scan_token::ScanPosition { created_at_key, id },
+                &gitlawb_core::scan_token::ScanPosition {
+                    created_at_key,
+                    id,
+                    sha256_hex,
+                },
                 chrono::Utc::now().timestamp() + SCAN_TOKEN_TTL_SECS,
             ) {
                 Ok(token) => Some(token),
@@ -1237,11 +1261,25 @@ enum GateOutcome {
 /// disagreement is one-directional and costs work rather than correctness: the loser is a
 /// position behind the true maximum, which REPLAYS rows the caller already walked past
 /// instead of skipping rows it never saw.
+/// A sealed resume position together with the candidate whose walk produced it.
+///
+/// The candidate rides along because one CID can map to several git oids, so a bare row
+/// pair names a row without naming whose walk it belongs to. It is carried by IDENTITY
+/// (the oid hex), never by position in the candidate list, which is ordered by hex and
+/// mutates between rungs.
+struct SealedScanPos {
+    /// The keyset row pair, and the only half the forward-only comparison orders on.
+    row: (String, String),
+    /// The candidate oid this position resumes.
+    sha256_hex: String,
+}
+
 fn record_scan_truncation(
     walk: &mut WalkState,
-    slot: &mut Option<(String, String)>,
+    slot: &mut Option<SealedScanPos>,
     reason: &'static str,
     pos: Option<(String, String)>,
+    sha256_hex: &str,
 ) {
     walk.taint(reason);
     // The one log that separates a rung from a dead end. A truncation that seals nothing
@@ -1256,8 +1294,11 @@ fn record_scan_truncation(
         "/ipfs legacy scan truncated"
     );
     if let Some(pos) = pos {
-        if slot.as_ref().is_none_or(|sealed| pos > *sealed) {
-            *slot = Some(pos);
+        if slot.as_ref().is_none_or(|sealed| pos > sealed.row) {
+            *slot = Some(SealedScanPos {
+                row: pos,
+                sha256_hex: sha256_hex.to_string(),
+            });
         }
     }
 }
@@ -6068,6 +6109,7 @@ mod tests {
             &gitlawb_core::scan_token::ScanPosition {
                 created_at_key: "2020-01-01T00:00:00+00:00".into(),
                 id: "a/b".into(),
+                sha256_hex: absent_oid(),
             },
             now + 60,
         )
@@ -6078,6 +6120,7 @@ mod tests {
             &gitlawb_core::scan_token::ScanPosition {
                 created_at_key: "2020-01-01T00:00:00+00:00".into(),
                 id: format!("did:key:z6MkAVeryLongOwnerKeyIdentifier/{}", "n".repeat(48)),
+                sha256_hex: absent_oid(),
             },
             now + 60,
         )
@@ -6157,6 +6200,7 @@ mod tests {
             &gitlawb_core::scan_token::ScanPosition {
                 created_at_key: scan_order_stamp(3).to_rfc3339(),
                 id: "front-0003".into(),
+                sha256_hex: absent_oid(),
             },
             now + 3600,
         )
@@ -6169,6 +6213,7 @@ mod tests {
             &gitlawb_core::scan_token::ScanPosition {
                 created_at_key: scan_order_stamp(3).to_rfc3339(),
                 id: "front-0003".into(),
+                sha256_hex: absent_oid(),
             },
             now - 1,
         )
@@ -6234,6 +6279,7 @@ mod tests {
         let pos = gitlawb_core::scan_token::ScanPosition {
             created_at_key: "2020-01-01T00:00:07+00:00".into(),
             id: "did:key:z6MkHiddenOwner/withheld-repo".into(),
+            sha256_hex: "f2".repeat(32),
         };
         let expires = chrono::Utc::now().timestamp() + 3600;
         let first =

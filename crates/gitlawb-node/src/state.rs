@@ -1476,6 +1476,8 @@ mod scan_token_key_tests {
         ScanPosition {
             created_at_key: "2020-01-01T12:00:00+00:00".to_string(),
             id: "did:key:z6MkScanTokenOwner/repo".to_string(),
+            // 40 hex: the production shape, since the node's own repos are sha1.
+            sha256_hex: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678".to_string(),
         }
     }
 

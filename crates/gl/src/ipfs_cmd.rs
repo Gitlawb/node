@@ -151,7 +151,7 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(5);
 /// Wait used when a retryable response carries no usable `Retry-After`.
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
 
-/// Generous ceiling on a continuation token. Real tokens are fixed-width (668
+/// Generous ceiling on a continuation token. Real tokens are fixed-width (756
 /// base64url characters today), but the sealed layout has already changed once and
 /// a rejected token is terminal, so a tight bound would silently kill resume on a
 /// future version bump.
@@ -534,10 +534,12 @@ mod tests {
         format!("{}{err:#}", diag_text())
     }
 
-    /// Width of a real continuation today (see the node's scan_token module): 668
+    /// Width of a real continuation today (see the node's scan_token module): 756
     /// base64url-no-pad characters. The tests build tokens of that width so the
-    /// fixtures look like the wire, not like a placeholder.
-    const TOKEN_LEN: usize = 668;
+    /// fixtures look like the wire, not like a placeholder. Nothing in this crate
+    /// seals a real token, so the number is pinned on the other side by
+    /// `token_length_is_invariant_across_oid_widths` in gitlawb-core's scan_token.
+    const TOKEN_LEN: usize = 756;
 
     fn token_of_len(seed: &str, len: usize) -> String {
         let mut t = String::from(seed);
@@ -1199,7 +1201,7 @@ mod tests {
             "node text must be sanitized before it reaches the terminal, got: {told:?}"
         );
         // The length bound is scoped to the error text, not to `told`: R21 requires a
-        // stderr line carrying the still-held 668-character token, so no implementation
+        // stderr line carrying the still-held 756-character token, so no implementation
         // can keep the whole telling under 600 characters. The error text is where an
         // uncapped node body would land on this path, so the property still binds.
         let reported = format!("{err:#}");
