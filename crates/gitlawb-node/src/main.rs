@@ -132,22 +132,14 @@ async fn main() -> Result<()> {
         }
     }
 
-    // When a bundler URL is configured (whether via the modern
-    // GITLAWB_BUNDLER_URL or the legacy GITLAWB_IRYS_URL alias) and the gateway
-    // was not explicitly set — neither via --arweave-gateway nor the
-    // GITLAWB_ARWEAVE_GATEWAY env var — pair the gateway to the same network so
-    // that anchors uploaded to a devnet bundler (whose transactions are not
-    // resolvable via the arweave.net default gateway) are verifiable through
-    // the verify endpoint. An operator-chosen gateway is never overwritten.
-    if !config.bundler_url.is_empty()
-        && !Config::arweave_gateway_explicitly_set(std::env::args_os())
-    {
-        config.arweave_gateway = config.bundler_url.clone();
-        tracing::warn!(
-            "GITLAWB_ARWEAVE_GATEWAY unset — inferred from bundler URL as {}",
-            crate::server::mask_credential_url(&config.arweave_gateway)
-        );
-    }
+    // The bundler gateway pairing is NOT inferred here (#224 review): silently
+    // setting the gateway to the bundler URL paired a devnet bundler with a
+    // devnet gateway behind the operator's back, which is exactly the shape of
+    // config surprise the old default had — and production deployments that
+    // anchor through a mainnet bundler would have resolve broken anchors via
+    // the devnet gateway. `Config::validate()` now fails fast at boot when a
+    // bundler is configured without an explicit GITLAWB_ARWEAVE_GATEWAY,
+    // forcing the operator to name the network on each side.
 
     // Merge the embedded seed list of public network nodes into the runtime
     // bootstrap peers. Operators can opt out via GITLAWB_BOOTSTRAP_DISABLE_SEEDS.

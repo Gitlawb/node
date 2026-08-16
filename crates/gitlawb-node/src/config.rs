@@ -169,12 +169,15 @@ pub struct Config {
     pub bundler_token: String,
 
     /// Arweave gateway URL for resolving arweave_tx_id to data items.
-    /// Used by the verify endpoint. Default: https://arweave.net
-    #[arg(
-        long,
-        env = "GITLAWB_ARWEAVE_GATEWAY",
-        default_value = "https://arweave.net"
-    )]
+    /// Used by the verify endpoint and the anchors listing.
+    /// Required whenever `bundler_url` is set: anchors uploaded to a bundler
+    /// are only resolvable through the gateway of the SAME network, and the
+    /// inference that used to pair the two silently broke production verify
+    /// reads (a devnet bundler's txns are not resolvable via arweave.net, and
+    /// vice versa), so the operator must pick the network consciously.
+    /// No default: an unset gateway keeps the node's /verify and anchor
+    /// resolution inert, which is correct for a node that does not anchor.
+    #[arg(long, env = "GITLAWB_ARWEAVE_GATEWAY", default_value = "")]
     pub arweave_gateway: String,
 
     /// Base L2 DID registry contract address (0x...)
@@ -769,24 +772,6 @@ impl Config {
         PathBuf::from(&self.key_path)
     }
 
-    /// Whether `arweave_gateway` was set explicitly by the operator — via the
-    /// `--arweave-gateway` CLI flag or the `GITLAWB_ARWEAVE_GATEWAY` env var —
-    /// rather than falling back to the clap default. Startup inference (pairing
-    /// the gateway to the bundler URL) must not overwrite an explicitly chosen
-    /// gateway. Pass `std::env::args_os()` at runtime.
-    pub fn arweave_gateway_explicitly_set<I, T>(args: I) -> bool
-    where
-        I: IntoIterator<Item = T>,
-        T: Into<std::ffi::OsString> + Clone,
-    {
-        use clap::parser::ValueSource;
-        use clap::CommandFactory;
-        Config::command()
-            .get_matches_from(args)
-            .value_source("arweave_gateway")
-            .is_some_and(|s| s != ValueSource::DefaultValue)
-    }
-
     /// DB connections reserved for everything other than held write-locks: auth
     /// lookups, visibility-rule reads, the post-receive tail's own DB writes, and
     /// admin tooling. A write pins one pooled connection for its whole duration, so
@@ -840,6 +825,24 @@ impl Config {
                  'matic' on the Irys devnet), or clear GITLAWB_BUNDLER_URL to disable anchoring."
                     .to_string(),
             );
+        }
+        // Anchoring is enabled, so the gateway must be chosen deliberately
+        // (#224 review). Anchors uploaded to a bundler are only resolvable
+        // through the gateway of the SAME network — an Irys devnet bundler's
+        // transactions are not resolvable via arweave.net, and mainnet Irys
+        // transactions are not resolvable via the devnet gateway — and the
+        // node refuses to start here rather than silently pair the two. The
+        // same fail-fast shape as the funded-account/token checks above.
+        if !self.bundler_url.trim().is_empty() && self.arweave_gateway.trim().is_empty() {
+            return Err(format!(
+                "GITLAWB_BUNDLER_URL is set to {} but GITLAWB_ARWEAVE_GATEWAY is not: an anchor \
+                 is only resolvable through the gateway of the network that recorded it. Set \
+                 GITLAWB_ARWEAVE_GATEWAY to the matching gateway for your bundler network \
+                 (devnet bundler https://devnet.irys.xyz pairs with the devnet gateway; \
+                 production bundler https://node2.irys.xyz pairs with https://arweave.net), or \
+                 clear GITLAWB_BUNDLER_URL to disable anchoring.",
+                crate::server::mask_credential_url(&self.bundler_url)
+            ));
         }
         Ok(())
     }
@@ -1604,7 +1607,8 @@ mod tests {
             "error must name the missing token: {err}"
         );
 
-        // URL plus account plus token validates.
+        // URL plus account plus token validates (with an explicit gateway, as
+        // `bundler_url_requires_an_explicit_gateway` now requires).
         Config::parse_from([
             "gitlawb-node",
             "--bundler-url",
@@ -1613,18 +1617,92 @@ mod tests {
             "zBundlerAccount",
             "--bundler-token",
             "matic",
+            "--arweave-gateway",
+            "https://devnet.irys.xyz",
         ])
         .validate()
         .expect("bundler URL with a funded account and token must validate");
     }
 
+    /// #224 review: anchoring is enabled, so the gateway must be chosen
+    /// deliberately — the old behavior silently paired the gateway to the
+    /// bundler URL, which broke /verify for production deployments (devnet
+    /// transactions are not resolvable via arweave.net). A bundler URL without
+    /// an explicit gateway must refuse to start, naming both URLs and which
+    /// network each must be on.
+    #[test]
+    fn bundler_url_requires_an_explicit_gateway() {
+        // Defaults (no bundler) validate with an unset gateway: a node that
+        // does not anchor has no need of gateway resolution.
+        Config::parse_from(["gitlawb-node"])
+            .validate()
+            .expect("default config must validate");
+
+        // Bundler + account + token but no gateway must be rejected.
+        let no_gateway = Config::parse_from([
+            "gitlawb-node",
+            "--bundler-url",
+            "https://devnet.irys.xyz",
+            "--bundler-account",
+            "zBundlerAccount",
+            "--bundler-token",
+            "matic",
+        ]);
+        let err = no_gateway
+            .validate()
+            .expect_err("bundler URL without an explicit gateway must be rejected");
+        assert!(
+            err.contains("GITLAWB_ARWEAVE_GATEWAY"),
+            "error must name the missing gateway: {err}"
+        );
+        assert!(
+            err.contains("https://devnet.irys.xyz"),
+            "error must name the bundler URL: {err}"
+        );
+        assert!(
+            err.contains("https://arweave.net"),
+            "error must name the matching production gateway: {err}"
+        );
+
+        // Bundler + account + token + gateway validates.
+        Config::parse_from([
+            "gitlawb-node",
+            "--bundler-url",
+            "https://devnet.irys.xyz",
+            "--bundler-account",
+            "zBundlerAccount",
+            "--bundler-token",
+            "matic",
+            "--arweave-gateway",
+            "https://devnet.irys.xyz",
+        ])
+        .validate()
+        .expect("bundler URL with a funded account, token, and explicit gateway must validate");
+
+        // Production shape: mainnet bundler + arweave.net gateway validates.
+        Config::parse_from([
+            "gitlawb-node",
+            "--bundler-url",
+            "https://node2.irys.xyz",
+            "--bundler-account",
+            "zBundlerAccount",
+            "--bundler-token",
+            "ethereum",
+            "--arweave-gateway",
+            "https://arweave.net",
+        ])
+        .validate()
+        .expect("production bundler + arweave.net gateway must validate");
+    }
+
     /// The shipped `.env.example` must stay startable. Anchoring is paid, and
-    /// `validate()` refuses a bundler URL without both a funded account and a
-    /// payment token, so the example must never ship a non-empty
-    /// `GITLAWB_BUNDLER_URL` that the file itself does not also back with a
-    /// `GITLAWB_BUNDLER_ACCOUNT` and `GITLAWB_BUNDLER_TOKEN`. The app has no
-    /// dotenv loader, so this test keys on the file's active (non-commented)
-    /// lines the way a user `source`-ing the example would.
+    /// `validate()` refuses a bundler URL without both a funded account, a
+    /// payment token, and an explicit gateway, so the example must never ship a
+    /// non-empty `GITLAWB_BUNDLER_URL` that the file itself does not also back
+    /// with `GITLAWB_BUNDLER_ACCOUNT`, `GITLAWB_BUNDLER_TOKEN`, and
+    /// `GITLAWB_ARWEAVE_GATEWAY`. The app has no dotenv loader, so this test
+    /// keys on the file's active (non-commented) lines the way a user
+    /// `source`-ing the example would.
     #[test]
     fn env_example_bundler_block_is_startable() {
         let example_path =
@@ -1645,6 +1723,7 @@ mod tests {
         let url = active("GITLAWB_BUNDLER_URL=");
         let account = active("GITLAWB_BUNDLER_ACCOUNT=");
         let token = active("GITLAWB_BUNDLER_TOKEN=");
+        let gateway = active("GITLAWB_ARWEAVE_GATEWAY=");
         if !url.is_empty() {
             assert!(
                 !account.is_empty(),
@@ -1653,6 +1732,10 @@ mod tests {
             assert!(
                 !token.is_empty(),
                 ".env.example sets GITLAWB_BUNDLER_URL but no active GITLAWB_BUNDLER_TOKEN"
+            );
+            assert!(
+                !gateway.is_empty(),
+                ".env.example sets GITLAWB_BUNDLER_URL but no active GITLAWB_ARWEAVE_GATEWAY"
             );
         }
 
@@ -1666,19 +1749,20 @@ mod tests {
             &account,
             "--bundler-token",
             &token,
+            "--arweave-gateway",
+            &gateway,
         ];
         Config::parse_from(args)
             .validate()
             .unwrap_or_else(|e| panic!("the shipped .env.example must be startable: {e}"));
     }
 
-    /// #247: an explicit `--arweave-gateway` must not be overwritten by the
-    /// bundler-URL inference. The inference keys on the value source, so only
-    /// the clap default (no CLI flag, no env var) counts as "not explicit".
-    /// (The env-var arm of the detection is exercised indirectly: clap's `env`
-    /// feature routes `GITLAWB_ARWEAVE_GATEWAY` through the same
-    /// `ValueSource::EnvVariable` arm that the CLI-flag tests cover, and mutating
-    /// process env from a parallel test would race other cases.)
+    /// #224 review: the gateway-inference behavior is gone, so there is no
+    /// notion of an "explicit" gateway source to detect — `validate()` instead
+    /// requires a non-empty gateway whenever a bundler is configured (see
+    /// `bundler_url_requires_an_explicit_gateway`). The clap field carries no
+    /// default, so an unset gateway is simply empty and the pairing footgun
+    /// cannot silently select a network for the operator.
     #[test]
     fn enforce_owner_push_is_declared_true_independent_of_the_environment() {
         use clap::CommandFactory;

@@ -188,17 +188,21 @@ pub struct PostReceiveAttestation {
     pub request_path: Option<String>,
 }
 
-/// A durable post-receive job (#224 review): everything a landed push owes
-/// after git accepted the pack — trust-score `record_push`, per-ref signed
-/// certificates, and the replication tail — with its inputs persisted BEFORE
-/// the push is acknowledged. Tokio cancels spawned tasks on restart/shutdown,
-/// so a push whose continuation task died before reaching the bookkeeping left
-/// a durable ref update with no certificate, accounting, anchor, or replication
-/// and no way to recover it. Persisting the job first makes that interval
+/// A durable post-receive job (#224 review): the post-ack work a landed push
+/// owes that the durability contract covers — trust-score `record_push`,
+/// per-ref signed certificates, and the Arweave anchor (upload + its DB row),
+/// each awaited in the job body before the job reaches `done` — with its inputs
+/// persisted BEFORE the push is acknowledged. Tokio cancels spawned tasks on
+/// restart/shutdown, so a push whose continuation task died before reaching the
+/// bookkeeping left a durable ref update with no certificate, accounting, or
+/// anchor and no way to recover it. Persisting the job first makes that interval
 /// recoverable: startup resets stale rows to `pending` and replays them, and
 /// each effect is idempotent (`record_push` keys on the job id, certificates on
 /// a deterministic per-(job, ref) id, the Arweave anchor on an existence
 /// check), so a replay never double-counts, double-issues, or double-anchors.
+/// The rest of the replication tail — Pinata pins, gossip publish, GraphQL
+/// broadcast, peer notify — is explicitly best-effort and OUTSIDE this
+/// contract: those steps are not recovered by a replay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostReceiveJob {
     pub id: String,

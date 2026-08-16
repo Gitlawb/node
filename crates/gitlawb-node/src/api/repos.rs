@@ -2708,15 +2708,220 @@ async fn run_post_receive_job(
         }
     }
 
+    // The replication tail's spawned task re-derives the announce decision and
+    // the pin's sha→CID map; the durable Arweave anchoring unit below needs
+    // both. The tail reports them over a oneshot once the pin has landed, so
+    // the job body only anchors after the pinned objects (and their CIDs)
+    // exist — the anchor embeds the real CID, and that is part of the job's
+    // durability scope. The tail itself stays best-effort: it also does the
+    // lower-priority gossip / GraphQL / peer-notify steps, none of which gate
+    // this job's completion.
+    let (anchor_cid_tx, anchor_cid_rx) = tokio::sync::oneshot::channel();
     post_receive_replication_tail(
         state.clone(),
-        record,
-        ref_updates,
+        record.clone(),
+        ref_updates.clone(),
         disk_path,
         did.to_string(),
-        ref_certs,
+        ref_certs.clone(),
+        anchor_cid_tx,
     )
     .await;
+
+    // Durable Arweave anchoring (#224 review): awaited so the job only reaches
+    // `done` after every anchor's upload AND DB row are on record. A tail that
+    // dies before reporting (panic) drops the sender; that is a job failure,
+    // not a silent skip, so the startup drain retries it.
+    let (announce, cid_map) = anchor_cid_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("replication tail died before reporting announce/CID"))?;
+    anchor_ref_updates(
+        state,
+        &record,
+        &ref_updates,
+        &ref_certs,
+        announce,
+        &cid_map,
+        did,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Durable Arweave anchoring for a post-receive job (#224 review): one awaited
+/// unit of work per ref transition, so the job only reaches `done` after every
+/// anchor's upload AND its DB row are on record. This is the part of the
+/// replication tail that the durability contract covers — Pinata pins, gossip,
+/// GraphQL broadcast, and peer notify are explicitly best-effort and outside it.
+///
+/// Failure semantics, per the review:
+/// - A transition already anchored (existence check) skips the upload entirely,
+///   so a startup replay of an already-anchored job never spends bundler
+///   balance on a duplicate on-chain artifact.
+/// - A DB error during the existence check is NOT treated as "not anchored":
+///   the upload is skipped (fail-closed) so an unknown state never pays for a
+///   duplicate upload, and the check error fails the job so the startup drain
+///   retries, by which time the check can be answered.
+/// - An upload error, or an upload whose row could not be persisted, returns
+///   `Err` and fails the job. The drain retries; the existence check then makes
+///   the retry a no-op for a transition whose row landed meanwhile.
+async fn anchor_ref_updates(
+    state: &AppState,
+    record: &crate::db::RepoRecord,
+    ref_updates: &[RefUpdate],
+    ref_certs: &std::collections::HashMap<String, crate::db::RefCertificate>,
+    announce: bool,
+    cid_map: &std::collections::HashMap<String, String>,
+    node_did: &str,
+) -> anyhow::Result<()> {
+    // Arweave permanent anchoring — suppressed for repos the public cannot read
+    // (public permanent ledger). `announce` is the same fail-closed decision the
+    // replication tail produced (re-derived for coalesced pushes, false when the
+    // walk failed or the repo is not listable at root).
+    let bundler_url = &state.config.bundler_url;
+    if !announce || bundler_url.is_empty() {
+        return Ok(());
+    }
+    let repo_slug = format!(
+        "{}/{}",
+        crate::db::normalize_owner_key(&record.owner_did),
+        record.name
+    );
+    let bundler_account = &state.config.bundler_account;
+    let bundler_token = &state.config.bundler_token;
+    let now_ts = chrono::Utc::now().to_rfc3339();
+    for update in ref_updates {
+        let cid = cid_map.get(&update.new_sha).cloned();
+        // Use the per-update certificate issued above, not a repo-wide latest,
+        // so each anchor embeds the exact certificate for its own ref
+        // transition.
+        let cert = match ref_certs.get(&update.ref_name) {
+            Some(c) => c.clone(),
+            None => {
+                // Certificate issuance failed for this ref update. Anchoring
+                // without a cert would produce a permanent artifact that
+                // verify_anchor must reject — skip instead of publishing an
+                // unverifiable anchor.
+                tracing::warn!(
+                    ref_name = %update.ref_name,
+                    "skipping arweave anchor — no certificate was issued"
+                );
+                continue;
+            }
+        };
+        // #224: a startup replay of this push's job would otherwise re-run the
+        // upload and pay for a SECOND permanent artifact for the same
+        // transition. The anchor existence check makes the upload idempotent:
+        // the exact (repo, ref, old→new) transition already anchored skips the
+        // upload entirely (the recorded anchor, cert, and tx_id from the
+        // original run stand). A transient DB error must not read as "not
+        // anchored" — that would spend bundler balance on a duplicate for a
+        // transition that may already be anchored — and it must not be skipped
+        // silently either (that would drop the anchor forever). It fails the
+        // job: the startup drain retries, by which time the check can be
+        // answered, and whichever way it lands no money has been wasted and no
+        // anchor has been lost.
+        match state
+            .db
+            .arweave_anchor_exists(
+                &repo_slug,
+                &update.ref_name,
+                &update.old_sha,
+                &update.new_sha,
+            )
+            .await
+        {
+            Ok(true) => {
+                tracing::debug!(
+                    repo = %repo_slug,
+                    ref_name = %update.ref_name,
+                    old_sha = %update.old_sha,
+                    new_sha = %update.new_sha,
+                    "skipping arweave anchor — transition already anchored"
+                );
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "cannot check whether {}/{} is already anchored: {e} — \
+                     failing the job so the startup drain retries; the upload is \
+                     skipped until the check can be answered",
+                    repo_slug,
+                    update.ref_name
+                ));
+            }
+        }
+        let anchor = crate::arweave::RefAnchor {
+            repo: repo_slug.clone(),
+            repo_id: record.id.clone(),
+            owner_did: record.owner_did.clone(),
+            ref_name: update.ref_name.clone(),
+            old_sha: update.old_sha.clone(),
+            new_sha: update.new_sha.clone(),
+            cid: cid.clone(),
+            timestamp: now_ts.clone(),
+            node_did: node_did.to_string(),
+            certificate: Some(cert.clone()),
+        };
+        let tx_id = crate::arweave::anchor_ref_update(
+            &state.http_client,
+            bundler_url,
+            bundler_account,
+            bundler_token,
+            &anchor,
+            &state.node_keypair,
+        )
+        .await
+        .map_err(|e| {
+            // A push must never fail over anchoring, but this is a durable job
+            // retried by the startup drain, not the live push. Name the two
+            // common causes (unfunded bundler account, config only checks it
+            // at boot) so operators can tell them apart in the job's error.
+            anyhow::anyhow!(
+                "arweave anchor for {}/{} failed: {e} — if the bundler reports \
+                 'Not enough balance', fund GITLAWB_BUNDLER_ACCOUNT (for the token in \
+                 GITLAWB_BUNDLER_TOKEN); an unfunded node retries and loses anchors forever",
+                repo_slug,
+                update.ref_name
+            )
+        })?;
+        if tx_id.is_empty() {
+            continue;
+        }
+        // Upload succeeded — the DB row is the only durable record of it. A
+        // failed insert is a FAILED UNIT OF WORK, not a warning: returning Err
+        // fails the job, and the startup drain retries. On retry the existence
+        // check skips the upload if the row landed (e.g. another instance
+        // recorded it), and fails closed while it cannot be checked.
+        state
+            .db
+            .record_arweave_anchor(&crate::db::RecordAnchorInputV2 {
+                repo: &repo_slug,
+                owner_did: &record.owner_did,
+                ref_name: &update.ref_name,
+                old_sha: &update.old_sha,
+                new_sha: &update.new_sha,
+                cid: cid.as_deref(),
+                arweave_tx_id: &tx_id,
+                node_did,
+                cert_id: Some(cert.id.clone()),
+            })
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "uploaded arweave anchor {tx_id} for {}/{} but could not persist it: {e}",
+                    repo_slug,
+                    update.ref_name
+                )
+            })?;
+        tracing::info!(
+            tx_id,
+            repo = %repo_slug,
+            ref_name = %update.ref_name,
+            "recorded arweave anchor"
+        );
+    }
     Ok(())
 }
 
@@ -2727,12 +2932,15 @@ async fn run_post_receive_job(
 /// Rows a previous process left `processing` or `failed` are reset to
 /// `pending` — a fresh process has no in-flight jobs, so resetting is safe —
 /// and every pending row is spawned through the same processor the handler
-/// uses. Each effect is idempotent (`record_push_job` keys on the job id,
-/// certificate ids are deterministic per (job, ref), the Arweave anchor is
-/// gated on an existence check), so a replay completes exactly the work the
-/// original run owed without double-counting or double-issuing. A drain that
-/// errors out is logged; the unprocessed rows stay `pending` and are retried on
-/// the next restart (the job table IS the retry policy).
+/// uses. Each durable effect is idempotent (`record_push_job` keys on the job
+/// id, certificate ids are deterministic per (job, ref), the Arweave anchor is
+/// gated on an existence check), so a replay completes exactly the accounting,
+/// certificate, and anchor work the original run owed without double-counting,
+/// double-issuing, or paying for a duplicate on-chain artifact. The rest of the
+/// replication tail (Pinata pins, gossip, GraphQL broadcast, peer notify) is
+/// best-effort and NOT recovered here. A drain that errors out is logged; the
+/// unprocessed rows stay `pending` and are retried on the next restart (the job
+/// table IS the retry policy).
 pub(crate) async fn drain_post_receive_jobs(state: AppState) -> anyhow::Result<usize> {
     state.db.reset_stale_post_receive_jobs().await?;
     let pending = state.db.list_pending_post_receive_jobs().await?;
@@ -2762,6 +2970,8 @@ async fn post_receive_replication_tail(
     ref_updates: Vec<RefUpdate>,
     disk_path: std::path::PathBuf,
     did: String,
+    ref_certs: std::collections::HashMap<String, crate::db::RefCertificate>,
+    anchor_cid_tx: tokio::sync::oneshot::Sender<(bool, std::collections::HashMap<String, String>)>,
 ) {
     // Replication enforcement (Phase 2): decide once per push whether the public
     // may read this repo at all and, if so, which blob OIDs must not leave the
@@ -2942,11 +3152,14 @@ async fn post_receive_replication_tail(
     // #174 P2-2 scope note: this SECOND detached spawn is deliberately NOT brought
     // under the per-repo encryption coalescing above, because unlike the idempotent
     // recovery-copy walk it does PER-PUSH, PER-REF work — branch→CID upserts, gossip
-    // publish, GraphQL subscription broadcast, Arweave anchoring, and peer notify, each
-    // keyed to THIS push's ref_updates. Coalescing (or shedding) it against an in-flight
-    // task for the same repo would DROP a later push's ref-update announcements (a
-    // correctness regression), not merely delay a duplicate. So the task stays one per
-    // push and every push's effects fire exactly once.
+    // publish, GraphQL subscription broadcast, and peer notify, each keyed to THIS
+    // push's ref_updates. Coalescing (or shedding) it against an in-flight task for
+    // the same repo would DROP a later push's ref-update announcements (a correctness
+    // regression), not merely delay a duplicate. So the task stays one per push and
+    // every push's effects fire exactly once. Arweave anchoring is NOT part of this
+    // spawn (#224 review): it is the durable, awaited unit in the job body, which
+    // consumes this task's announce/CID report over a oneshot. Everything this spawn
+    // does is best-effort and outside the post-receive job's durability contract.
     //
     // #174 F2 / KTD-3: {bounded memory, no dropped effects, no handler latency} are
     // jointly unsatisfiable by coalesce/shed/block, so instead of retaining the full
@@ -2976,10 +3189,6 @@ async fn post_receive_replication_tail(
         let pusher_did_clone = did.to_string();
         let db_for_peers = state.db.clone();
         let ref_update_tx = state.ref_update_tx.clone();
-        let bundler_url = state.config.bundler_url.clone();
-        let bundler_account = state.config.bundler_account.clone();
-        let bundler_token = state.config.bundler_token.clone();
-        let owner_did_for_arweave = record.owner_did.clone();
         let self_public_url = state.config.public_url.clone();
         let node_keypair = Arc::clone(&state.node_keypair);
         // #174 F2a: gated on the cheap announce predicate, not on `withheld`.
@@ -3070,6 +3279,15 @@ async fn post_receive_replication_tail(
             // Build sha→cid map from pinned objects
             let cid_map: std::collections::HashMap<String, String> = pinned.into_iter().collect();
 
+            // Report the announce decision and pin CID map to the durable
+            // Arweave anchoring unit in the job body. Sent before the
+            // lower-priority, best-effort steps below (gossip, GraphQL
+            // broadcast, peer notify) so the job does not wait on them; they
+            // are outside the job's durability scope. A panic before this
+            // point drops the sender, and the job body treats that as a
+            // failure to be retried by the next startup drain.
+            let _ = anchor_cid_tx.send((announce, cid_map.clone()));
+
             // Record branch→CID for each ref update and publish gossip
             for (ref_name, old_sha, new_sha) in &ref_updates_clone {
                 let cid = cid_map.get(new_sha).map(|s| s.as_str());
@@ -3123,113 +3341,6 @@ async fn post_receive_replication_tail(
                         timestamp: now_ts.clone(),
                         owner_did: record.owner_did.clone(),
                     });
-                }
-            }
-
-            // Arweave permanent anchoring — fire for each ref update.
-            // Suppressed for repos the public cannot read (public permanent ledger).
-            if announce && !bundler_url.is_empty() {
-                for (ref_name, old_sha, new_sha) in &ref_updates_clone {
-                    let cid = cid_map.get(new_sha).cloned();
-                    // Use the per-update certificate issued above, not a
-                    // repo-wide latest, so each anchor embeds the exact
-                    // certificate for its own ref transition.
-                    let cert = ref_certs_clone.get(ref_name).cloned();
-                    if cert.is_none() {
-                        // Certificate issuance failed for this ref update.
-                        // Anchoring without a cert would produce a permanent
-                        // artifact that verify_anchor must reject — skip
-                        // instead of publishing an unverifiable anchor.
-                        tracing::warn!(
-                            ref_name,
-                            "skipping arweave anchor — no certificate was issued"
-                        );
-                        continue;
-                    }
-                    let cert_id = cert.as_ref().map(|c| c.id.clone());
-                    // #224: a startup replay of this push's job would otherwise
-                    // re-run this loop and upload a SECOND permanent artifact
-                    // for the same transition. The anchor existence check makes
-                    // the upload idempotent: the exact (repo, ref, old→new)
-                    // transition already anchored skips the upload entirely
-                    // (the recorded anchor, cert, and tx_id from the original
-                    // run stand). Narrow TOCTOU window between check and upload
-                    // is accepted: the node's own anchor is single-flight per
-                    // transition in practice, and the duplicate would at worst
-                    // be an extra on-chain artifact, not data corruption.
-                    if db_clone
-                        .arweave_anchor_exists(&repo_slug, ref_name, old_sha, new_sha)
-                        .await
-                        .unwrap_or(false)
-                    {
-                        tracing::debug!(
-                            repo = %repo_slug,
-                            ref_name,
-                            old_sha,
-                            new_sha,
-                            "skipping arweave anchor — transition already anchored"
-                        );
-                        continue;
-                    }
-                    let anchor = crate::arweave::RefAnchor {
-                        repo: repo_slug.clone(),
-                        repo_id: record.id.clone(),
-                        owner_did: owner_did_for_arweave.clone(),
-                        ref_name: ref_name.clone(),
-                        old_sha: old_sha.clone(),
-                        new_sha: new_sha.clone(),
-                        cid: cid.clone(),
-                        timestamp: now_ts.clone(),
-                        node_did: node_did_str.clone(),
-                        certificate: cert,
-                    };
-                    match crate::arweave::anchor_ref_update(
-                        &http_client,
-                        &bundler_url,
-                        &bundler_account,
-                        &bundler_token,
-                        &anchor,
-                        &node_keypair,
-                    )
-                    .await
-                    {
-                        Ok(tx_id) if !tx_id.is_empty() => {
-                            if let Err(e) = db_clone
-                                .record_arweave_anchor(&crate::db::RecordAnchorInputV2 {
-                                    repo: &repo_slug,
-                                    owner_did: &owner_did_for_arweave,
-                                    ref_name,
-                                    old_sha,
-                                    new_sha,
-                                    cid: cid.as_deref(),
-                                    arweave_tx_id: &tx_id,
-                                    node_did: &node_did_str,
-                                    cert_id,
-                                })
-                                .await
-                            {
-                                tracing::warn!(repo=%repo_slug, tx_id=%tx_id, err=%e, "failed to persist arweave anchor");
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            // A push must never fail over anchoring, but a
-                            // failure here is permanent data loss: the anchor
-                            // is never written. Name the two common causes
-                            // (unfunded bundler account, config only checks it
-                            // at boot) so operators can tell them apart.
-                            tracing::warn!(
-                                repo=%repo_slug,
-                                bundler_account=%bundler_account,
-                                bundler_token=%bundler_token,
-                                err=%e,
-                                "Arweave anchor failed — if the bundler reports 'Not enough \
-                                 balance', fund GITLAWB_BUNDLER_ACCOUNT (for the token in \
-                                 GITLAWB_BUNDLER_TOKEN); an unfunded node \
-                                 silently loses every anchor"
-                            )
-                        }
-                    }
                 }
             }
 
@@ -10034,6 +10145,22 @@ mod tests {
         }]
     }
 
+    /// Drive the replication tail with a throwaway announce/CID channel. Tests
+    /// that do not exercise the durable Arweave anchor unit (they never await
+    /// the receiver) discard both ends; the spawned Pinata task's report is a
+    /// no-op either way.
+    async fn f2a_tail(
+        state: AppState,
+        rec: crate::db::RepoRecord,
+        updates: Vec<RefUpdate>,
+        path: std::path::PathBuf,
+        did: String,
+        certs: std::collections::HashMap<String, crate::db::RefCertificate>,
+    ) {
+        let (_tx, _rx) = tokio::sync::oneshot::channel();
+        post_receive_replication_tail(state, rec, updates, path, did, certs, _tx).await;
+    }
+
     const F2A_PUSHER: &str = "did:key:z6MkF2aPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     /// Scenario 1 (the finding). A second rapid push to the same repo coalesces
@@ -10059,7 +10186,7 @@ mod tests {
         state.pin_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
         let _held = state.pin_semaphore.clone().acquire_owned().await.unwrap();
 
-        post_receive_replication_tail(
+        f2a_tail(
             state.clone(),
             rec.clone(),
             f2a_update("refs/heads/main", &c2),
@@ -10079,7 +10206,7 @@ mod tests {
             "the admitted push's task holds the repo key while it is parked on the pin pool"
         );
 
-        post_receive_replication_tail(
+        f2a_tail(
             state.clone(),
             rec.clone(),
             f2a_update("refs/heads/second", &c1),
@@ -10152,7 +10279,7 @@ mod tests {
         let held = state.pin_semaphore.clone().acquire_owned().await.unwrap();
 
         // Push A is admitted; its task then parks on the held pin pool, key retained.
-        post_receive_replication_tail(
+        f2a_tail(
             state.clone(),
             rec.clone(),
             f2a_update("refs/heads/main", &c2),
@@ -10239,6 +10366,8 @@ mod tests {
             f2a_update("refs/heads/main", &c2),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            std::collections::HashMap::new(),
+            tokio::sync::oneshot::channel().0,
         ));
         f2a_wait_for(|| started.exists(), "the admitted push's walk to start").await;
 
@@ -10342,7 +10471,7 @@ mod tests {
             crate::state::BeginOutcome::Coalesced => panic!("the first begin must admit"),
         };
 
-        post_receive_replication_tail(
+        f2a_tail(
             state.clone(),
             rec.clone(),
             vec![RefUpdate {
@@ -10620,7 +10749,7 @@ mod tests {
             crate::state::BeginOutcome::Coalesced => panic!("the first begin must admit"),
         };
 
-        post_receive_replication_tail(
+        f2a_tail(
             state.clone(),
             rec.clone(),
             vec![RefUpdate {
@@ -10679,7 +10808,7 @@ mod tests {
         let (state, mut rec) = f2a_state(pool, &git_bin, "z6f2apriv", "v1", false).await;
         rec.is_public = false;
 
-        post_receive_replication_tail(
+        f2a_tail(
             state.clone(),
             rec.clone(),
             f2a_update("refs/heads/main", &c1),
@@ -10716,7 +10845,7 @@ mod tests {
         let (_server, cid) = f2a_pinata(&mut state).await;
         let mut updates = state.ref_update_tx.subscribe();
 
-        post_receive_replication_tail(
+        f2a_tail(
             state.clone(),
             rec.clone(),
             vec![RefUpdate {
@@ -10813,7 +10942,7 @@ mod tests {
 
         // Nothing pre-takes the coalescing key, so this push is ADMITTED and runs its
         // own walk.
-        post_receive_replication_tail(
+        f2a_tail(
             state.clone(),
             rec.clone(),
             vec![RefUpdate {
@@ -11020,6 +11149,413 @@ mod tests {
                 .len(),
             1,
             "replaying the job must not mint a second certificate"
+        );
+    }
+
+    // ---- #224 review, P4/P5: the Arweave anchor is a durable unit ----
+
+    /// A mock Irys bundler that counts uploads and fails a fixed number of the
+    /// first ones with 500 before succeeding. Returns the base URL and a call
+    /// counter.
+    async fn f2a_bundler(
+        fail_first: usize,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use std::sync::atomic::Ordering;
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let failures_left = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(fail_first));
+        let app = {
+            let calls_srv = calls.clone();
+            let failures_srv = failures_left.clone();
+            axum::Router::new().route(
+                "/tx/{token}",
+                axum::routing::post(move || {
+                    let calls = calls_srv.clone();
+                    let failures = failures_srv.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        if failures
+                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                                if n > 0 {
+                                    Some(n - 1)
+                                } else {
+                                    None
+                                }
+                            })
+                            .is_ok()
+                        {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "simulated bundler outage",
+                            )
+                                .into_response()
+                        } else {
+                            (
+                                StatusCode::OK,
+                                axum::Json(serde_json::json!({"id": "f".repeat(43)})),
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), calls)
+    }
+
+    async fn f2a_job_status(pool: &sqlx::PgPool, job_id: &str) -> String {
+        sqlx::query_scalar::<_, String>("SELECT status FROM post_receive_jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    fn f2a_anchor_record() -> crate::db::RepoRecord {
+        let now = chrono::Utc::now();
+        crate::db::RepoRecord {
+            id: "repo-anchor-1".to_string(),
+            name: "myrepo".to_string(),
+            owner_did: "did:key:zAlice".to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: "/tmp/myrepo".to_string(),
+            forked_from: None,
+            machine_id: None,
+        }
+    }
+
+    fn f2a_anchor_update() -> RefUpdate {
+        RefUpdate {
+            old_sha: "a".repeat(40),
+            new_sha: "b".repeat(40),
+            ref_name: "refs/heads/main".to_string(),
+        }
+    }
+
+    fn f2a_anchor_cert(record: &crate::db::RepoRecord) -> crate::db::RefCertificate {
+        crate::db::RefCertificate {
+            id: "cert-anchor-1".to_string(),
+            repo_id: record.id.clone(),
+            ref_name: "refs/heads/main".to_string(),
+            old_sha: "a".repeat(40),
+            new_sha: "b".repeat(40),
+            pusher_did: "did:key:zAlice".to_string(),
+            node_did: "did:key:zNode".to_string(),
+            signature: "sig".to_string(),
+            issued_at: chrono::Utc::now().to_rfc3339(),
+            seq: 1,
+            prev: "0".repeat(64),
+            pusher_sig: None,
+            signature_input: None,
+            content_digest: None,
+            request_path: None,
+        }
+    }
+
+    /// #224 review, P4: an upload that succeeds but whose DB row cannot be
+    /// written is a FAILED unit of work. The job body must return `Err` — the
+    /// job is then `failed`, not `done`, and the startup drain retries it — and
+    /// the retry must not re-call the bundler once the row exists. The CHECK
+    /// constraint makes the INSERT fail deterministically while the existence
+    /// check (a SELECT) keeps working.
+    #[sqlx::test]
+    async fn anchor_upload_ok_but_db_row_fails_is_retried_without_double_pay(pool: sqlx::PgPool) {
+        use clap::Parser as _;
+
+        let (bundler_url, calls) = f2a_bundler(0).await;
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.config = std::sync::Arc::new(crate::config::Config::parse_from([
+            "gitlawb-node",
+            "--bundler-url",
+            &bundler_url,
+            "--bundler-account",
+            "zBundlerAccount",
+            "--bundler-token",
+            "matic",
+            "--arweave-gateway",
+            "https://arweave.net",
+        ]));
+
+        // Block the row this transition would write (repo slug "zAlice/myrepo")
+        // while leaving the existence check fully functional.
+        sqlx::query(
+            "ALTER TABLE arweave_anchors ADD CONSTRAINT anchor_test_block \
+             CHECK (repo <> 'zAlice/myrepo')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let record = f2a_anchor_record();
+        let update = f2a_anchor_update();
+        let mut certs = std::collections::HashMap::new();
+        certs.insert("refs/heads/main".to_string(), f2a_anchor_cert(&record));
+        let empty_cid = std::collections::HashMap::new();
+
+        // Run 1: the upload lands but the row cannot be written → Err, so the
+        // job body would fail the job and the startup drain would retry.
+        let err = anchor_ref_updates(
+            &state,
+            &record,
+            std::slice::from_ref(&update),
+            &certs,
+            true,
+            &empty_cid,
+            "did:key:zNode",
+        )
+        .await
+        .expect_err("a row-less successful upload must fail the job body");
+        assert!(
+            err.to_string().contains("could not persist"),
+            "the error must name the unpersisted upload: {err}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            !state
+                .db
+                .arweave_anchor_exists(
+                    "zAlice/myrepo",
+                    "refs/heads/main",
+                    &"a".repeat(40),
+                    &"b".repeat(40),
+                )
+                .await
+                .unwrap(),
+            "the failed unit must not leave a row"
+        );
+
+        // Unblock, then the drain-style retry succeeds and records the anchor.
+        sqlx::query("ALTER TABLE arweave_anchors DROP CONSTRAINT anchor_test_block")
+            .execute(&pool)
+            .await
+            .unwrap();
+        anchor_ref_updates(
+            &state,
+            &record,
+            std::slice::from_ref(&update),
+            &certs,
+            true,
+            &empty_cid,
+            "did:key:zNode",
+        )
+        .await
+        .expect("the retried unit must succeed once the row can be written");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            state
+                .db
+                .arweave_anchor_exists(
+                    "zAlice/myrepo",
+                    "refs/heads/main",
+                    &"a".repeat(40),
+                    &"b".repeat(40),
+                )
+                .await
+                .unwrap(),
+            "the retry must record the anchor"
+        );
+
+        // Replay with the row present: the existence check skips the upload, so
+        // the bundler is NOT called again (no second paid on-chain artifact).
+        anchor_ref_updates(
+            &state,
+            &record,
+            std::slice::from_ref(&update),
+            &certs,
+            true,
+            &empty_cid,
+            "did:key:zNode",
+        )
+        .await
+        .expect("an already-anchored transition is a no-op");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "an already-anchored transition must not spend bundler balance again"
+        );
+    }
+
+    /// #224 review, P5: an unknown existence state must never pay for a
+    /// duplicate upload. When the existence check itself cannot be answered
+    /// (closed pool), the upload is skipped (fail-closed) and the job body
+    /// fails so the startup drain retries; the bundler is never called while
+    /// the state is unknown.
+    #[sqlx::test]
+    async fn anchor_existence_check_failure_never_uploads(pool: sqlx::PgPool) {
+        use clap::Parser as _;
+
+        let (bundler_url, calls) = f2a_bundler(0).await;
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.config = std::sync::Arc::new(crate::config::Config::parse_from([
+            "gitlawb-node",
+            "--bundler-url",
+            &bundler_url,
+            "--bundler-account",
+            "zBundlerAccount",
+            "--bundler-token",
+            "matic",
+            "--arweave-gateway",
+            "https://arweave.net",
+        ]));
+
+        let record = f2a_anchor_record();
+        let update = f2a_anchor_update();
+        let mut certs = std::collections::HashMap::new();
+        certs.insert("refs/heads/main".to_string(), f2a_anchor_cert(&record));
+        let empty_cid = std::collections::HashMap::new();
+
+        // Take the DB away: the existence check can no longer be answered.
+        pool.close().await;
+
+        let err = anchor_ref_updates(
+            &state,
+            &record,
+            std::slice::from_ref(&update),
+            &certs,
+            true,
+            &empty_cid,
+            "did:key:zNode",
+        )
+        .await
+        .expect_err("an unanswerable existence check must fail the job body");
+        assert!(
+            err.to_string().contains("already anchored"),
+            "the error must name the unanswerable check: {err}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an unknown existence state must never trigger a paid upload"
+        );
+    }
+
+    /// #224 review, P4 end-to-end: a post-receive job whose Arweave anchor
+    /// upload fails (bundler returns 500) is NOT terminal — the startup drain
+    /// retries it — and once the anchor row exists, replaying the job never
+    /// re-calls the bundler. Drives the same crash fixture as
+    /// `post_receive_job_survives_handler_abort`, with a counting bundler.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn post_receive_job_anchor_failure_retries_and_replay_never_reuploads(
+        pool: sqlx::PgPool,
+    ) {
+        use clap::Parser as _;
+
+        let bin = tempfile::TempDir::new().unwrap();
+        let log = bin.path().join("git.log");
+        let git_bin = f2a_logging_git(bin.path(), &log);
+        let (mut state, rec) = f2a_state(pool.clone(), &git_bin, "z6anchor", "a1", true).await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(
+            repos_dir.path().to_path_buf(),
+            pool.clone(),
+        );
+        state
+            .db
+            .register_agent(F2A_PUSHER, &["agent".to_string()])
+            .await
+            .unwrap();
+
+        // First upload fails (500), then the bundler behaves.
+        let (bundler_url, calls) = f2a_bundler(1).await;
+        state.config = std::sync::Arc::new(crate::config::Config::parse_from([
+            "gitlawb-node",
+            "--bundler-url",
+            &bundler_url,
+            "--bundler-account",
+            "zBundlerAccount",
+            "--bundler-token",
+            "matic",
+            "--arweave-gateway",
+            "https://arweave.net",
+        ]));
+
+        let (_, repo_path) = state
+            .repo_store
+            .local_path(&rec.owner_did, &rec.name)
+            .unwrap();
+        std::fs::create_dir_all(&repo_path).unwrap();
+        u5_init_repo(&repo_path);
+        let c1 = u5_commit_file(&repo_path, "a.txt", "one\n");
+
+        let update = f2a_update("refs/heads/main", &c1);
+        let job = crate::db::PostReceiveJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            pusher_did: F2A_PUSHER.to_string(),
+            owner_did: rec.owner_did.clone(),
+            repo_name: rec.name.clone(),
+            repo_id: rec.id.clone(),
+            ref_updates: update
+                .iter()
+                .map(|u| crate::db::JobRefUpdate {
+                    old_sha: u.old_sha.clone(),
+                    new_sha: u.new_sha.clone(),
+                    ref_name: u.ref_name.clone(),
+                })
+                .collect(),
+            attestation: crate::db::PostReceiveAttestation::default(),
+            status: "pending".to_string(),
+            enqueued_at: chrono::Utc::now().to_rfc3339(),
+            attempts: 0,
+            error: None,
+        };
+        state.db.enqueue_post_receive_job(&job).await.unwrap();
+
+        // Run 1: the bundler fails the upload, so the anchor unit fails and the
+        // job is NOT done — it stays `failed` for the startup drain to retry.
+        process_post_receive_job(state.clone(), job.clone()).await;
+        assert_eq!(
+            f2a_job_status(&pool, &job.id).await,
+            "failed",
+            "a job whose anchor upload failed must not be terminal"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            !state
+                .db
+                .arweave_anchor_exists(&f2a_slug(&rec), "refs/heads/main", ZERO_SHA, &c1)
+                .await
+                .unwrap(),
+            "a failed anchor must not leave a row"
+        );
+
+        // Drain retry: the bundler now succeeds, the anchor row lands, `done`.
+        state.db.reset_stale_post_receive_jobs().await.unwrap();
+        let pending = state.db.list_pending_post_receive_jobs().await.unwrap();
+        assert_eq!(pending.len(), 1, "the failed job must be drained");
+        for job in pending {
+            process_post_receive_job(state.clone(), job).await;
+        }
+        assert_eq!(f2a_job_status(&pool, &job.id).await, "done");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            state
+                .db
+                .arweave_anchor_exists(&f2a_slug(&rec), "refs/heads/main", ZERO_SHA, &c1)
+                .await
+                .unwrap(),
+            "the retried anchor must be recorded"
+        );
+
+        // Replay with the row present: the existence gate skips the upload, so
+        // the bundler is never called again.
+        process_post_receive_job(state.clone(), job.clone()).await;
+        assert_eq!(f2a_job_status(&pool, &job.id).await, "done");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "replaying an anchored job must not pay for a second upload"
         );
     }
 }

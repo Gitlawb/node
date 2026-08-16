@@ -414,10 +414,10 @@ Important node settings:
 | `GITLAWB_IPFS_RATE_LIMIT` | Max `/ipfs/{cid}` requests per client IP per hour (route flood brake). 0 disables. Default 600. |
 | `GITLAWB_TIGRIS_BUCKET` | Optional S3/Tigris shared repo storage bucket. |
 | `GITLAWB_PINATA_JWT` | Optional Pinata/IPFS warm-storage pinning. |
-| `GITLAWB_BUNDLER_URL` | Bundler URL for Arweave permanent anchoring (e.g., https://devnet.irys.xyz). Leave empty to disable. (Legacy name: `GITLAWB_IRYS_URL`). |
-| `GITLAWB_BUNDLER_ACCOUNT` | Irys bundler account (public address) for Arweave permanent anchoring. Must be set together with `GITLAWB_BUNDLER_TOKEN` for anchoring to enable. |
-| `GITLAWB_BUNDLER_TOKEN` | Irys bundler token (API key) for Arweave permanent anchoring. Sent as the `x-irys-paid-by` header with the account. Must be set together with `GITLAWB_BUNDLER_ACCOUNT` for anchoring to enable. |
-| `GITLAWB_ARWEAVE_GATEWAY` | Arweave gateway URL for resolving anchors (defaults to `https://arweave.net`). |
+| `GITLAWB_BUNDLER_URL` | Bundler URL for Arweave permanent anchoring (e.g., https://devnet.irys.xyz for devnet, https://node2.irys.xyz for mainnet Irys). Leave empty to disable. (Legacy name: `GITLAWB_IRYS_URL`). |
+| `GITLAWB_BUNDLER_ACCOUNT` | Funded bundler account (public address/identity) that pays for uploads. The node's ANS-104 signature proves authorship, not payment — Irys only serves items backed by a funded account — so the node refuses to start when a bundler URL is set without this. It is sent as the `x-irys-paid-by` header on every upload. |
+| `GITLAWB_BUNDLER_TOKEN` | Payment-token slug the funded account holds (e.g. `matic` on devnet, `ethereum` on mainnet). Irys bills uploads at `/tx/{token}`, so this names the token, not an API key, and is NOT sent as `x-irys-paid-by` (that header carries the account). The node refuses to start when a bundler URL is set without it. |
+| `GITLAWB_ARWEAVE_GATEWAY` | Arweave gateway used to resolve anchors for `/verify` and the anchors listing. Has no default: the node refuses to start when a bundler is configured without an explicit gateway, because an anchor is only resolvable through the gateway of the network that recorded it (a devnet bundler pairs with the devnet gateway, mainnet Irys with `https://arweave.net`). |
 | `GITLAWB_ARWEAVE_RATE_LIMIT` | Per-client-IP rate limit for the verify endpoint, requests per hour (defaults to 120; `0` disables). |
 
 Production note: change the default Postgres password before exposing a node publicly.

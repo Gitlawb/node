@@ -263,4 +263,65 @@ mod closed_pool_tests {
             "arweave_url should carry the safe origin plus path prefix, got: {body}"
         );
     }
+
+    /// #224 review: `?limit=0` must behave like the parameter being absent
+    /// (the serde default of 50), not like `?limit=1`. The old
+    /// `q.limit.clamp(1, 200)` collapsed 0 to 1, silently narrowing the
+    /// listing; the fix routes sub-1 values through `default_limit()`.
+    #[sqlx::test]
+    async fn list_anchors_limit_zero_uses_default_limit(pool: PgPool) {
+        use clap::Parser as _;
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.config = std::sync::Arc::new(crate::config::Config::parse_from([
+            "gitlawb-node",
+            "--arweave-gateway",
+            "https://arweave.net",
+        ]));
+
+        // Seed three distinct transitions.
+        for (ref_name, old_sha, new_sha) in [
+            ("refs/heads/main", "a".repeat(40), "b".repeat(40)),
+            ("refs/heads/dev", "c".repeat(40), "d".repeat(40)),
+            ("refs/tags/v1", "e".repeat(40), "f".repeat(40)),
+        ] {
+            state
+                .db
+                .record_arweave_anchor(&crate::db::RecordAnchorInputV2 {
+                    repo: "alice/myrepo",
+                    owner_did: "did:key:zAlice",
+                    ref_name,
+                    old_sha: &old_sha,
+                    new_sha: &new_sha,
+                    cid: Some("bafy1test"),
+                    arweave_tx_id: &"f".repeat(43),
+                    node_did: "did:key:zNode",
+                    cert_id: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let resp = Router::new()
+            .route("/api/v1/arweave/anchors", axum::routing::get(list_anchors))
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/arweave/anchors?limit=0")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(
+            v["count"], 3,
+            "limit=0 must fall back to the default limit, not clamp to 1"
+        );
+    }
 }
