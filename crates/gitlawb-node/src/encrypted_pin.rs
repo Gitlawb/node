@@ -69,6 +69,12 @@ fn resolve_all_recipients(dids: &BTreeSet<String>) -> Result<Vec<VerifyingKey>, 
 enum SealPlan {
     /// An existing envelope already covers exactly this recipient set; nothing to do.
     SkipUnchanged,
+    /// The stored tag matches, but the stored reader set contains a DID that
+    /// must not resolve (e.g. a small-order did:key sealed before the choke
+    /// point landed). The old envelope is already public and cannot be
+    /// withdrawn, but it must be surfaced for operator action rather than
+    /// silently skipped as unchanged.
+    SkipUnresolvableStored(Vec<String>),
     /// No recipient DID resolved to a key, so there is nothing to seal to.
     SkipNoRecipients,
     /// At least one recipient DID is unresolvable. Fail closed: never seal to a
@@ -90,15 +96,30 @@ enum SealPlan {
 /// recover the blob; reader removal is not retroactive (the old envelope is
 /// already public). The comparison is on the opaque node-keyed tag, never the
 /// DID list.
+///
+/// A matching stored tag is normally a skip, but the set is still resolved
+/// before skipping: a reader that used to resolve and now must not (a
+/// small-order did:key sealed before the choke point landed) is surfaced as
+/// [`SealPlan::SkipUnresolvableStored`] instead of being silently treated as
+/// unchanged. The old envelope is already public and cannot be withdrawn, but
+/// the operator must be able to see that a persisted envelope was sealed to a
+/// weak recipient.
 fn plan_seal(node_seed: &[u8; 32], dids: &BTreeSet<String>, stored_tag: Option<&str>) -> SealPlan {
     let tag = recipients_tag(node_seed, dids);
     if stored_tag == Some(tag.as_str()) {
-        return SealPlan::SkipUnchanged;
-    }
-    match resolve_all_recipients(dids) {
-        Ok(keys) if keys.is_empty() => SealPlan::SkipNoRecipients,
-        Ok(keys) => SealPlan::Seal { keys, tag },
-        Err(unresolved) => SealPlan::SkipUnresolvable(unresolved),
+        // The stored envelope already covers exactly this set, so there is
+        // nothing to re-seal. Resolve anyway so a now-unresolvable reader in an
+        // unchanged set is surfaced rather than hidden by the tag match.
+        match resolve_all_recipients(dids) {
+            Ok(_) => SealPlan::SkipUnchanged,
+            Err(unresolved) => SealPlan::SkipUnresolvableStored(unresolved),
+        }
+    } else {
+        match resolve_all_recipients(dids) {
+            Ok(keys) if keys.is_empty() => SealPlan::SkipNoRecipients,
+            Ok(keys) => SealPlan::Seal { keys, tag },
+            Err(unresolved) => SealPlan::SkipUnresolvable(unresolved),
+        }
     }
 }
 
@@ -131,6 +152,21 @@ pub async fn encrypt_and_pin(
         // covered (which would permanently lock out the dropped readers, #47).
         let (keys, tag) = match plan_seal(node_seed, dids, stored_tag.as_deref()) {
             SealPlan::SkipUnchanged => continue,
+            SealPlan::SkipUnresolvableStored(unresolved) => {
+                // A stored envelope already covers this exact reader set, and
+                // the set now contains a DID that must not resolve (a
+                // small-order did:key sealed before the choke point landed).
+                // The old envelope is already public and cannot be withdrawn
+                // or re-sealed; surface it so the operator can act.
+                let sample: Vec<&String> = unresolved.iter().take(3).collect();
+                tracing::warn!(
+                    oid = %oid,
+                    unresolved_count = unresolved.len(),
+                    unresolved_sample = ?sample,
+                    "stored envelope was sealed to a recipient that must not resolve; operator action may be required"
+                );
+                continue;
+            }
             SealPlan::SkipNoRecipients => {
                 tracing::warn!(oid = %oid, "no resolvable recipient keys; skipping encrypted pin");
                 continue;
@@ -387,6 +423,43 @@ mod tests {
         let stored = recipients_tag(&SEED, &dids);
         assert!(matches!(
             plan_seal(&SEED, &dids, Some(&stored)),
+            SealPlan::SkipUnchanged
+        ));
+    }
+
+    /// P1 remediation (review): an unchanged reader set is normally a skip, but
+    /// the skip must not hide a recipient that now fails to resolve. A blob
+    /// sealed to a small-order did:key before the choke-point guard landed keeps
+    /// its old CID and stays decryptable-without-a-private-key unless the
+    /// matching-tag path surfaces it. This pins that the stored-tag match still
+    /// resolves the set instead of short-circuiting.
+    #[test]
+    fn plan_seal_surfaces_unresolvable_recipient_in_unchanged_reader_set() {
+        let weak = weak_did_key();
+        let mut dids = BTreeSet::new();
+        dids.insert(did_key(9));
+        dids.insert(weak.clone());
+        let stored = recipients_tag(&SEED, &dids);
+
+        match plan_seal(&SEED, &dids, Some(&stored)) {
+            SealPlan::SkipUnresolvableStored(unresolved) => assert!(
+                unresolved.contains(&weak),
+                "the weak DID must be named in the unresolved set, got {unresolved:?}"
+            ),
+            other => panic!("expected SkipUnresolvableStored, got {other:?}"),
+        }
+    }
+
+    /// Degenerate control: an empty set with a matching stored tag stays a
+    /// silent skip. The state is unreachable in practice (a seal is never
+    /// recorded for an empty reader set), so this pins only that the
+    /// resolve-on-match path must not turn it into a re-seal or a warning.
+    #[test]
+    fn plan_seal_unchanged_empty_set_still_skips() {
+        let empty = BTreeSet::new();
+        let empty_tag = recipients_tag(&SEED, &empty);
+        assert!(matches!(
+            plan_seal(&SEED, &empty, Some(&empty_tag)),
             SealPlan::SkipUnchanged
         ));
     }
