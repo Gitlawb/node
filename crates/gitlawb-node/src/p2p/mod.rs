@@ -427,10 +427,19 @@ fn verify_ref_update(event: &RefUpdateEvent) -> Result<(), String> {
 pub(crate) enum IngestOutcome {
     /// The event was authenticated AND every write it implies landed.
     Accepted,
+    /// The event was admitted WITHOUT authentication, through the rolling-upgrade
+    /// window, and every write it implies landed.
+    ///
+    /// Deliberately a distinct outcome from `Accepted`: a valid signature proves
+    /// who the sender is, an unsigned event proves nothing, and counting the two
+    /// under one label would make the fleet's authenticated-admission rate
+    /// indistinguishable from its reliance on the legacy compatibility path.
+    UnsignedAdmitted,
     /// The event passed every guard, but a durable write failed. The decision
     /// was still "admit it", so this is not a refusal; it exists because
-    /// returning `Accepted` for an event whose row never landed would make the
-    /// outcome an observability lie.
+    /// returning an admission outcome (`Accepted` or `UnsignedAdmitted`) for an
+    /// event whose row never landed would make the outcome an observability
+    /// lie.
     WriteFailed(String),
     /// The event was dropped. Nothing is stored, so the reason exists only to
     /// be logged and counted.
@@ -468,6 +477,7 @@ impl IngestOutcome {
     fn metric_label(&self) -> &'static str {
         match self {
             IngestOutcome::Accepted => "accepted",
+            IngestOutcome::UnsignedAdmitted => "unsigned_admitted",
             IngestOutcome::WriteFailed(_) => "write_failed",
             IngestOutcome::Rejected(_) => "rejected",
             IngestOutcome::SourceRateLimited => "source_rate_limited",
@@ -747,6 +757,7 @@ pub(crate) async fn ingest_ref_update(
     }
     match write_error {
         Some(reason) => IngestOutcome::WriteFailed(reason),
+        None if unsigned => IngestOutcome::UnsignedAdmitted,
         None => IngestOutcome::Accepted,
     }
 }
@@ -1030,6 +1041,7 @@ pub async fn start(
                             crate::metrics::record_gossip_ingest(outcome.metric_label());
                             match outcome {
                                 IngestOutcome::Accepted => {}
+                                IngestOutcome::UnsignedAdmitted => {}
                                 IngestOutcome::WriteFailed(reason) => warn!(
                                     from = %propagation_source,
                                     reason = %reason,
@@ -1803,6 +1815,9 @@ mod tests {
         match outcome {
             IngestOutcome::Rejected(reason) => reason,
             IngestOutcome::Accepted => panic!("{context}: the event must be rejected"),
+            IngestOutcome::UnsignedAdmitted => {
+                panic!("{context}: the event must be rejected, not admitted unsigned")
+            }
             IngestOutcome::WriteFailed(reason) => {
                 panic!("{context}: the event must be rejected by a guard, not admitted and then failed to write: {reason}")
             }
@@ -2094,9 +2109,12 @@ mod tests {
     }
 
     /// R7, the rolling-upgrade window: with enforcement off, an unsigned event
-    /// from a KNOWN peer is still accepted. Turning the flag on is the
+    /// from a KNOWN peer is still admitted. Turning the flag on is the
     /// operator's step, not a code change, so this path has to keep working
     /// until they take it.
+    ///
+    /// It is `UnsignedAdmitted`, not `Accepted`: the event wrote rows without
+    /// authenticating its sender, and the two must not be observably the same.
     ///
     /// The ingest path also emits a `warn!` pointing at the flag on this
     /// branch. Nothing here asserts that, so the log line is uncovered:
@@ -2113,8 +2131,8 @@ mod tests {
         let outcome =
             ingest_with_fresh_limiter(&db, false, true, &bytes_of(&event), &PeerId::random()).await;
         assert!(
-            matches!(outcome, IngestOutcome::Accepted),
-            "an unsigned known-peer event must survive the rolling-upgrade window, got {outcome:?}"
+            matches!(outcome, IngestOutcome::UnsignedAdmitted),
+            "an unsigned known-peer event must be admitted (distinct from Accepted) through the rolling-upgrade window, got {outcome:?}"
         );
         assert_eq!(count(&pool, "received_ref_updates").await, 1);
         assert_eq!(count(&pool, "sync_queue").await, 1);
@@ -2393,6 +2411,7 @@ mod tests {
     fn every_ingest_outcome_carries_a_distinct_metric_label() {
         let labels = [
             IngestOutcome::Accepted.metric_label(),
+            IngestOutcome::UnsignedAdmitted.metric_label(),
             IngestOutcome::WriteFailed("db down".into()).metric_label(),
             IngestOutcome::Rejected("malformed".into()).metric_label(),
             IngestOutcome::SourceRateLimited.metric_label(),
@@ -2403,6 +2422,7 @@ mod tests {
             labels,
             [
                 "accepted",
+                "unsigned_admitted",
                 "write_failed",
                 "rejected",
                 "source_rate_limited",
@@ -2629,7 +2649,7 @@ mod tests {
             let outcome =
                 ingest_ref_update(&db, &limiters, false, true, &claim, &attacker_edge).await;
             assert!(
-                matches!(outcome, IngestOutcome::Accepted),
+                matches!(outcome, IngestOutcome::UnsignedAdmitted),
                 "unsigned event {i} is inside every budget and is admitted in the rolling-upgrade window, got {outcome:?}"
             );
         }
@@ -2671,7 +2691,7 @@ mod tests {
         for i in 0..GOSSIP_UNSIGNED_SOURCE_MAX_EVENTS {
             let outcome = ingest_ref_update(db, limiters, false, true, claim, &source).await;
             assert!(
-                matches!(outcome, IngestOutcome::Accepted),
+                matches!(outcome, IngestOutcome::UnsignedAdmitted),
                 "unsigned event {i} is inside the unsigned budget and must be admitted, got {outcome:?}"
             );
         }
@@ -2766,7 +2786,7 @@ mod tests {
         let fresh_source = PeerId::random();
         let outcome = ingest_ref_update(&db, &limiters, false, true, &claim, &fresh_source).await;
         assert!(
-            matches!(outcome, IngestOutcome::Accepted),
+            matches!(outcome, IngestOutcome::UnsignedAdmitted),
             "the claimed DID must not carry a spent budget between forwarders, got {outcome:?}"
         );
         assert_eq!(
@@ -2899,7 +2919,7 @@ mod tests {
         let outcome =
             ingest_ref_update(&db, &limiters, false, true, &valid_unsigned, &unsigned_edge).await;
         assert!(
-            matches!(outcome, IngestOutcome::Accepted),
+            matches!(outcome, IngestOutcome::UnsignedAdmitted),
             "the forwarder's unsigned budget must be untouched by malformed events, got {outcome:?}"
         );
         assert_eq!(
@@ -3035,7 +3055,7 @@ mod tests {
             let outcome =
                 ingest_with_fresh_limiter(&db, false, true, &claim, &PeerId::random()).await;
             assert!(
-                matches!(outcome, IngestOutcome::Accepted),
+                matches!(outcome, IngestOutcome::UnsignedAdmitted),
                 "B outcome {outcome:?}"
             );
             assert!(logs.saw_warn(), "B must warn, got: {}", logs.text());

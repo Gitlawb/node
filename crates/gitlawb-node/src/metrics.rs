@@ -289,8 +289,14 @@ pub fn record_webhook_delivery(result: &str) {
 }
 
 /// Record what the gossip ingest path decided about one inbound ref-update.
-/// `outcome` ∈ {accepted, write_failed, rejected, source_rate_limited,
-/// author_rate_limited, unsigned_source_rate_limited}.
+/// `outcome` ∈ {accepted, unsigned_admitted, write_failed, rejected,
+/// source_rate_limited, author_rate_limited, unsigned_source_rate_limited}.
+///
+/// `accepted` is reserved for signature-verified events. An unsigned event that
+/// survives the rolling-upgrade window is `unsigned_admitted`, so the
+/// authenticated-admission rate is not silently padded by legacy compatibility
+/// traffic; an operator can tell whether the fleet still relies on the
+/// compatibility allowance.
 ///
 /// The three shed reasons stay separate labels rather than one `rate_limited`
 /// because they answer different operator questions: `source_rate_limited` is a
