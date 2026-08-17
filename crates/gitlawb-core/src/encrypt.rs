@@ -32,21 +32,24 @@ fn x25519_public(vk: &VerifyingKey) -> Result<[u8; 32]> {
     Ok(edwards.to_montgomery().to_bytes())
 }
 
-/// True when a 32-byte Montgomery u-coordinate is a small-order point, i.e. a
-/// point whose X25519 shared secret is the all-zero key for any scalar.
-/// The header-supplied `eph` in an envelope is attacker-controlled, so the
-/// open side must not derive a shared secret from one: an entry built on a
-/// low-order ephemeral unwraps for any reader. u = 0 and u = 1 are the
-/// u-coordinates that decompress to a small-order Edwards point (u = 0 is the
-/// all-zero Montgomery u); the remaining small-order u values fail to
-/// decompress and are already skipped by the decode path in `open_blob`.
-fn is_low_order_montgomery(u: &[u8; 32]) -> bool {
+/// True when the X25519 exchange between an attacker-supplied `u` and this
+/// reader's scalar yields the all-zero shared secret.
+///
+/// Asked of the RESULT, not of the encoding, and that distinction is the whole
+/// guard. The previous version decompressed `u` to an Edwards point and asked
+/// `is_small_order`, which reports "safe" for any low-order encoding that does
+/// not decompress at all. Measured across the seven standard low-order
+/// encodings, six were caught and `u = p - 1` was not: it fails to decompress,
+/// so the check returned false, and the exchange is still the all-zero secret.
+/// An entry built on it unwraps for every reader.
+///
+/// Enumerating encodings cannot be exhaustive, because the attack depends on the
+/// shared secret rather than on the bytes that produced it, and twist and
+/// non-canonical inputs keep arriving. Asking the result needs no list.
+fn yields_all_zero_shared_secret(u: &[u8; 32], scalar: &[u8; 32]) -> bool {
     use curve25519_dalek::montgomery::MontgomeryPoint;
 
-    MontgomeryPoint(*u)
-        .to_edwards(0u8)
-        .map(|p| p.is_small_order())
-        .unwrap_or(false)
+    MontgomeryPoint(*u).mul_clamped(*scalar).to_bytes() == [0u8; 32]
 }
 
 /// X25519 secret scalar for an Ed25519 seed (SHA-512 of seed, lower 32, clamped).
@@ -159,7 +162,10 @@ pub fn open_blob(envelope: &[u8], keypair: &Keypair) -> Result<Vec<u8>> {
             .context("decode header")?;
     let body = &envelope[p + hlen..];
 
-    let my_x = XSecret::from(*x25519_secret_from_seed(&keypair.to_seed()));
+    // The raw scalar is kept alongside the box secret so the exchange can be
+    // tested BEFORE a box is built from an attacker-supplied ephemeral.
+    let my_x_scalar = x25519_secret_from_seed(&keypair.to_seed());
+    let my_x = XSecret::from(*my_x_scalar);
 
     // Identities are blinded: no entry says which recipient it belongs to, so
     // try each one. The ChaChaBox AEAD tag authenticates, so exactly the
@@ -171,11 +177,11 @@ pub fn open_blob(envelope: &[u8], keypair: &Keypair) -> Result<Vec<u8>> {
             .ok()
             .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
         {
-            // A small-order ephemeral public forces the all-zero shared
-            // secret, so the entry would unwrap for anyone. Skip it.
-            // A small-order ephemeral public forces the all-zero shared
-            // secret, so the entry would unwrap for anyone. Skip it.
-            Some(b) if !is_low_order_montgomery(&b) => XPublic::from(b),
+            // An ephemeral whose exchange with this reader is the all-zero
+            // shared secret would unwrap for anyone, so the entry is skipped.
+            // Tested on the exchange itself: an encoding-shaped check misses
+            // every low-order input that does not decompress to Edwards.
+            Some(b) if !yields_all_zero_shared_secret(&b, &my_x_scalar) => XPublic::from(b),
             Some(_) => continue,
             None => continue,
         };
@@ -338,19 +344,58 @@ mod tests {
     /// other small-order u values fail to decompress and are already skipped
     /// by the decode path.
     #[test]
-    fn is_low_order_montgomery_flags_small_order_and_accepts_real() {
-        let zero = [0u8; 32];
-        assert!(is_low_order_montgomery(&zero), "u=0 is the all-zero secret");
+    fn all_zero_shared_secret_is_detected_for_every_standard_low_order_encoding() {
+        // The seven standard X25519 low-order encodings, driven as a set rather
+        // than as the two that happen to decompress. The encoding-shaped check
+        // this replaced reported `p - 1` as safe, and its exchange is all-zero.
         let mut one = [0u8; 32];
         one[0] = 1;
-        assert!(is_low_order_montgomery(&one), "u=1 is small-order");
-
-        // A real X25519 public key is not low-order.
+        let hex = |h: &str| -> [u8; 32] {
+            let mut out = [0u8; 32];
+            for i in 0..32 {
+                out[i] = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap();
+            }
+            out
+        };
+        let vectors = [
+            ("u=0", [0u8; 32]),
+            ("u=1", one),
+            (
+                "order8-a",
+                hex("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"),
+            ),
+            (
+                "order8-b",
+                hex("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157"),
+            ),
+            (
+                "p-1",
+                hex("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+            ),
+            (
+                "p",
+                hex("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+            ),
+            (
+                "p+1",
+                hex("eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+            ),
+        ];
         let kp = Keypair::generate();
+        let scalar = x25519_secret_from_seed(&kp.to_seed());
+        for (name, u) in vectors {
+            assert!(
+                yields_all_zero_shared_secret(&u, &scalar),
+                "{name} is a low-order encoding and must be detected"
+            );
+        }
+
+        // And the other direction, or a guard that returned true always would
+        // pass everything above while making the envelope unopenable.
         let real_u = x25519_public(&kp.verifying_key()).unwrap();
         assert!(
-            !is_low_order_montgomery(&real_u),
-            "a real key must not be flagged low-order"
+            !yields_all_zero_shared_secret(&real_u, &scalar),
+            "a real key must not be treated as low-order"
         );
     }
 
@@ -452,6 +497,77 @@ mod tests {
         assert!(
             err.to_string().contains("not a recipient"),
             "a poisoned-only envelope must not open for anyone, got: {err}"
+        );
+    }
+
+    /// The same must-not, driven with the low-order encoding that does NOT map
+    /// to an Edwards point.
+    ///
+    /// This is the case an encoding-shaped guard cannot see. `u = p - 1` is a
+    /// legal X25519 input whose exchange is the all-zero secret for any scalar,
+    /// and `MontgomeryPoint::to_edwards` returns None for it, so a check written
+    /// as "decompress, then ask is_small_order" reports it as safe. Measured
+    /// across the seven standard low-order encodings: six are caught that way
+    /// and this one is not.
+    ///
+    /// Found by a cross-family review of the head that first added the guard,
+    /// and the comment beside that guard asserted this case was already handled
+    /// by a decode path that does not exist. That is why the fix rejects on the
+    /// RESULT of the exchange rather than on a list of encodings: the result is
+    /// what the attack actually depends on, and it needs no enumeration to be
+    /// exhaustive.
+    #[test]
+    fn open_blob_rejects_a_non_edwards_low_order_ephemeral() {
+        // No blanket `use ...::Aead` here. Two aead versions are reachable, and a
+        // blanket import silently resolved the wrap through the one open_blob does
+        // NOT decrypt with, producing a ciphertext that could never open. The test
+        // then passed with the guard, without it, and with the original pre-fix
+        // guard alike, proving nothing. Every call below names its trait.
+        use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
+        use crypto_box::aead::AeadCore;
+
+        // u = p - 1 = 2^255 - 20, little endian.
+        let mut eph = [0xffu8; 32];
+        eph[0] = 0xec;
+        eph[31] = 0x7f;
+
+        let content_key = [0x42u8; 32];
+        let zero_box = ChaChaBox::new(&XPublic::from([0u8; 32]), &XSecret::from([7u8; 32]));
+        let nonce = ChaChaBox::generate_nonce(&mut OsRng);
+        let wrap = crypto_box::aead::Aead::encrypt(&zero_box, &nonce, &content_key[..]).unwrap();
+
+        let body_nonce = [0x24u8; 24];
+        let body_cipher = XChaCha20Poly1305::new_from_slice(&content_key).unwrap();
+        let body = chacha20poly1305::aead::Aead::encrypt(
+            &body_cipher,
+            XNonce::from_slice(&body_nonce),
+            b"attacker-chosen plaintext".as_slice(),
+        )
+        .unwrap();
+
+        let header = serde_json::json!({
+            "alg": "xchacha20poly1305",
+            "nonce": B64.encode(body_nonce),
+            "recipients": [{
+                "eph": B64.encode(eph),
+                "nonce": B64.encode(nonce),
+                "wrap": B64.encode(wrap),
+            }],
+        });
+        let header_json = serde_json::to_vec(&header).unwrap();
+        let mut env = Vec::new();
+        env.extend_from_slice(MAGIC);
+        env.push(VERSION);
+        env.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
+        env.extend_from_slice(&header_json);
+        env.extend_from_slice(&body);
+
+        let reader = Keypair::generate();
+        let err = open_blob(&env, &reader).unwrap_err();
+        assert!(
+            err.to_string().contains("not a recipient"),
+            "an envelope whose only entry uses a non-Edwards low-order eph must not \
+             open for anyone, got: {err}"
         );
     }
 
