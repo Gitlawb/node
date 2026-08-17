@@ -34,6 +34,27 @@ use gitlawb_core::http_sig::{
 };
 use gitlawb_core::identity::verify;
 
+/// The hint for an unresolvable DID, chosen by method. The hint is only true
+/// for a method we have no resolver for: a did:key that parsed and then failed
+/// on its key material (a small-order key, wrong multicodec, wrong length)
+/// would be sent looking for the wrong problem by the alpha-support wording.
+fn unresolvable_did_hint(key_id: &Did) -> &'static str {
+    if key_id.is_did_key() {
+        "the DID is a did:key whose key material did not resolve"
+    } else {
+        "only did:key is supported in alpha"
+    }
+}
+
+/// Bound the echoed keyid in the unresolvable-DID message. `key_id` is
+/// unauthenticated request input, so reflecting it back at whatever length the
+/// caller chose would amplify attacker input into the response body. The bound
+/// is slack (a did:key method-id is a fixed 48 characters) and only defends
+/// the echo, not the resolution.
+fn bounded_did_echo(key_id: &str) -> String {
+    key_id.chars().take(96).collect()
+}
+
 /// Axum middleware that enforces HTTP Signature authentication (RFC 9421).
 ///
 /// Every write request must carry:
@@ -141,21 +162,15 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
     let verifying_key = match sig.key_id.to_verifying_key() {
         Ok(vk) => vk,
         Err(e) => {
-            // The hint is only true for a method we have no resolver for.
-            // A did:key that parsed and then failed on its key material (a
-            // small-order key, wrong multicodec, wrong length) would be sent
-            // looking for the wrong problem by it.
-            let hint = if sig.key_id.is_did_key() {
-                "the DID is a did:key whose key material did not resolve"
-            } else {
-                "only did:key is supported in alpha"
-            };
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({
                     "error": "unresolvable_did",
-                    "message": format!("cannot resolve DID '{}': {e}", sig.key_id),
-                    "hint": hint,
+                    "message": format!(
+                        "cannot resolve DID '{}': {e}",
+                        bounded_did_echo(&sig.key_id.to_string())
+                    ),
+                    "hint": unresolvable_did_hint(&sig.key_id),
                 })),
             )
                 .into_response();
@@ -430,6 +445,58 @@ mod tests {
         let token = delegation.encode().unwrap();
 
         assert!(validate_ucan_chain(&token, &node_did, &agent_did).is_ok());
+    }
+
+    /// The two-branch hint selection is the point of the unresolvable-DID
+    /// change: a did:key that failed on its key material must be told the key
+    /// material did not resolve, and any other method must be told only did:key
+    /// is supported. A regression that drops the is_did_key() check would send
+    /// a did:key caller after the wrong problem, so both branches are pinned.
+    #[test]
+    fn unresolvable_did_hint_distinguishes_key_material_from_method() {
+        // A real did:key whose key material fails to resolve (small-order):
+        // key-material hint.
+        let mut weak = [0u8; 32];
+        weak[0] = 1; // compressed identity point
+        let weak_vk = ed25519_dalek::VerifyingKey::from_bytes(&weak).unwrap();
+        let weak_did = Did::from_verifying_key(&weak_vk);
+        assert!(
+            weak_did.to_verifying_key().is_err(),
+            "fixture precondition: small-order did:key must not resolve"
+        );
+        assert_eq!(
+            unresolvable_did_hint(&weak_did),
+            "the DID is a did:key whose key material did not resolve"
+        );
+
+        // A method with no resolver: alpha-support hint.
+        let web = Did::web("example.com");
+        assert!(
+            web.to_verifying_key().is_err(),
+            "fixture precondition: did:web must not resolve locally"
+        );
+        assert_eq!(
+            unresolvable_did_hint(&web),
+            "only did:key is supported in alpha"
+        );
+    }
+
+    /// The unresolvable-DID message echoes the keyid, which is unauthenticated
+    /// request input. The echoed value must be bounded so a hostile caller
+    /// cannot amplify arbitrary-length input into the response body.
+    #[test]
+    fn unresolvable_did_message_bounds_the_echoed_keyid() {
+        let long_keyid = format!("did:key:z{}", "A".repeat(2000));
+        let shown = bounded_did_echo(&long_keyid);
+        assert!(
+            shown.len() <= 96,
+            "echoed keyid must be bounded, got {} chars",
+            shown.len()
+        );
+        assert!(
+            !shown.contains(&"A".repeat(1000)),
+            "the full keyid must not survive into the message"
+        );
     }
 
     #[test]
