@@ -1366,15 +1366,21 @@ mod did_resolve_message_tests {
     use std::str::FromStr;
 
     /// A well-formed did:key encoding the compressed identity point, which is
-    /// small-order. Indistinguishable by eye from a real key: same `z6Mk`
-    /// prefix, same fixed 48-character method-id.
-    const WEAK_DID_KEY: &str = "did:key:z6MkeXATEjyXENzBXBxgC5EHk2JE5aqd7qMGGtDpLUH1e2Sj";
+    /// small-order. Derived from the point bytes so the fixture states WHY it
+    /// is weak rather than pinning an opaque string (the literal also trips
+    /// secret scanners, which cannot tell a public DID from an API key).
+    fn weak_did_key() -> String {
+        let mut weak = [0u8; 32];
+        weak[0] = 1; // compressed identity point
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&weak).expect("decompresses");
+        Did::from_verifying_key(&vk).to_string()
+    }
 
     #[test]
     fn test_did_key_failure_does_not_claim_did_key_is_unsupported() {
         // Drive the real parse and the real resolution error rather than
         // hardcoding the discriminator, so flipping it at the call site fails.
-        let did_str = WEAK_DID_KEY;
+        let did_str = &weak_did_key();
         let did = Did::from_str(did_str).expect("well-formed did:key");
         let err = did
             .to_verifying_key()
