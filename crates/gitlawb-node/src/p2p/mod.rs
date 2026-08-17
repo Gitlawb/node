@@ -4032,7 +4032,19 @@ mod tests {
             let limiters = IngestLimiters::new();
             let source = spend_unsigned_budget(&db, &limiters, &claim).await;
             let (logs, _g) = capture_warnings();
-            let outcome = ingest_ref_update(&db, &limiters, false, true, &claim, &source).await;
+            // A fresh guard: this case drives an UNSIGNED event, which the
+            // replay block skips entirely, so the guard is inert here and a
+            // shared one would only couple this case to another's state.
+            let outcome = ingest_ref_update(
+                &db,
+                &limiters,
+                &ReplayGuard::new(),
+                false,
+                true,
+                &claim,
+                &source,
+            )
+            .await;
             assert!(
                 matches!(outcome, IngestOutcome::UnsignedSourceRateLimited(_)),
                 "C outcome {outcome:?}"
@@ -5407,7 +5419,11 @@ mod tests {
                 ingest_ref_update(&db, &limiters, &replay_guard, false, true, &bytes, &source)
                     .await;
             match outcome {
-                IngestOutcome::Accepted => {}
+                // `UnsignedAdmitted`, not `Accepted`: this branch predates the
+                // outcome split and an unsigned admission now reports itself as
+                // one. The property under test is unchanged, that unsigned bytes
+                // are admitted twice rather than deduplicated.
+                IngestOutcome::UnsignedAdmitted => {}
                 IngestOutcome::Replayed => panic!(
                     "delivery {i}: unsigned bytes must never reach the seen-set; deduplicating \
                      them lets an attacker pre-send a victim's predictable event and have the \
@@ -5437,7 +5453,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(outcome, IngestOutcome::Accepted),
+            matches!(outcome, IngestOutcome::UnsignedAdmitted),
             "the freshness window rides on the same verified path as the seen-set, so an unsigned \
              event outside it is admitted rather than refused, got {outcome:?}"
         );
