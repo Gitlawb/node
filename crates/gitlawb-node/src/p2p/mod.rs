@@ -652,6 +652,23 @@ pub(crate) async fn ingest_ref_update(
     // peer cannot be impersonated: claiming a registered DID now requires the
     // key behind it.
     //
+    // Shed an author that is ALREADY over budget before paying for the lookup.
+    // The brake belongs in front of the work it bounds: an over-budget author is
+    // going to be refused whatever the peer table says, so the round trip is work
+    // done for a request that was never going to be admitted, and a signed author
+    // can drive it at the pre-parse source rate.
+    //
+    // Deliberately a READ, not the charge. `check` inserts a window for a key it
+    // has never seen, so probing with it here would let a flood of self-minted
+    // signed DIDs occupy the bounded author map before `peer_exists` had a chance
+    // to refuse them, turning a brake into a memory-fill surface. `is_over_budget`
+    // allocates nothing and an unseen DID reads as within budget, so the only
+    // behaviour that changes is WHEN an already-over-budget author is refused.
+    // The charge itself stays below the lookup, unmoved.
+    if verified && limiters.author.is_over_budget(&event.node_did).await {
+        return IngestOutcome::AuthorRateLimited(event.node_did.clone());
+    }
+
     // Keyed lookup, not `list_peers`: this runs on every event that survives
     // the parse, and scanning the whole table per event makes ingest cost grow
     // with the peer count.
@@ -2681,6 +2698,100 @@ mod tests {
             count(&pool, "sync_queue").await,
             GOSSIP_AUTHOR_MAX_EVENTS as i64 + 1,
             "the victim's signed event must land its own queue entry"
+        );
+    }
+
+    /// The brake must sit in front of the work it bounds, not behind it.
+    ///
+    /// An author already over its budget is going to be shed no matter what the
+    /// peer lookup says, so paying a Postgres round trip first is work done for a
+    /// request that was never going to be admitted. A signed author can drive that
+    /// at the pre-parse source rate, and with peer-id rotation past it.
+    ///
+    /// The counter is what makes this a real assertion rather than a restatement
+    /// of the code: it observes the lookup NOT happening, which reading the
+    /// ordering cannot do.
+    #[sqlx::test]
+    async fn an_over_budget_author_is_shed_without_a_peer_lookup(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        let author = Keypair::generate();
+        seed_peer(&pool, &author.did().to_string()).await;
+
+        // A distinct signed event per iteration: identical bytes are a replay and
+        // would be dropped by that guard instead of reaching the budget.
+        let signed_nth = |n: usize| {
+            let mut e = event_for(&author);
+            e.ref_name = format!("refs/heads/b{n}");
+            sign_ref_update(&author, &mut e).unwrap();
+            e
+        };
+        for i in 0..GOSSIP_AUTHOR_MAX_EVENTS {
+            let outcome = ingest_ref_update(
+                &db,
+                &limiters,
+                true,
+                true,
+                &bytes_of(&signed_nth(i)),
+                &PeerId::random(),
+            )
+            .await;
+            assert!(
+                matches!(outcome, IngestOutcome::Accepted),
+                "event {i} is inside the budget, got {outcome:?}"
+            );
+        }
+
+        reset_peer_exists_calls();
+        let outcome = ingest_ref_update(
+            &db,
+            &limiters,
+            true,
+            true,
+            &bytes_of(&signed_nth(GOSSIP_AUTHOR_MAX_EVENTS)),
+            &PeerId::random(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, IngestOutcome::AuthorRateLimited(_)),
+            "the over-budget author must be shed, got {outcome:?}"
+        );
+        assert_eq!(
+            peer_exists_calls(),
+            0,
+            "an over-budget author must be shed BEFORE the peer lookup; the brake \
+             belongs in front of the work it bounds"
+        );
+    }
+
+    /// The must-not that keeps the early shed from becoming a key-farming axis.
+    ///
+    /// The early check is a READ. An author the limiter has never seen must not
+    /// gain a map entry from it, or a flood of self-minted signed DIDs could fill
+    /// the bounded author map without ever registering a peer, and legitimate new
+    /// authors would then be shed once it was full.
+    #[sqlx::test]
+    async fn the_early_author_check_does_not_track_an_unseen_did(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let limiters = IngestLimiters::new();
+        let stranger = Keypair::generate();
+        // Deliberately NOT seeded: an unregistered DID must be refused by the peer
+        // lookup, and must leave no trace in the author limiter on the way.
+        let mut e = event_for(&stranger);
+        sign_ref_update(&stranger, &mut e).unwrap();
+
+        let before = limiters.author.tracked_keys().await;
+        let outcome =
+            ingest_ref_update(&db, &limiters, true, true, &bytes_of(&e), &PeerId::random()).await;
+        assert!(
+            matches!(outcome, IngestOutcome::Rejected(_)),
+            "an unregistered DID is refused by the peer lookup, got {outcome:?}"
+        );
+        assert_eq!(
+            limiters.author.tracked_keys().await,
+            before,
+            "the early check must not allocate a map entry for a DID it has never \
+             seen, or the shed becomes its own memory-fill surface"
         );
     }
 

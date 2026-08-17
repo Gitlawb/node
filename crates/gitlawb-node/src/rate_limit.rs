@@ -121,6 +121,41 @@ impl RateLimiter {
         true
     }
 
+    /// Is this key ALREADY over its budget, answered without touching the map?
+    ///
+    /// Exists so a caller can shed an over-budget key before doing expensive work
+    /// on its behalf, which is the brake-placement rule: the brake belongs in
+    /// front of the work it bounds, not behind it.
+    ///
+    /// Read-only is the load-bearing part, not an optimisation. `check` inserts a
+    /// window for a key it has never seen, so using it as an early probe would let
+    /// a flood of unseen keys occupy the bounded map before any other gate had a
+    /// chance to refuse them. This allocates nothing and inserts nothing: an
+    /// untracked key is reported as within budget, and the real charge still
+    /// happens at the `check` call site further down.
+    ///
+    /// Expired timestamps are counted out rather than pruned, since pruning would
+    /// need the write lock this is deliberately avoiding. The count is therefore
+    /// exact for the decision it drives.
+    pub(crate) async fn is_over_budget(&self, key: &str) -> bool {
+        if self.max_requests == 0 {
+            return false;
+        }
+        let now = Instant::now();
+        let state = self.state.lock().await;
+        match state.get(key) {
+            None => false,
+            Some(window) => {
+                let live = window
+                    .timestamps
+                    .iter()
+                    .filter(|t| now.duration_since(**t) < self.window)
+                    .count();
+                live >= self.max_requests
+            }
+        }
+    }
+
     /// Number of keys currently tracked. Tests use it to observe what a sweep
     /// reclaimed; there is no production reader.
     #[cfg(test)]
