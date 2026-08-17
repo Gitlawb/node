@@ -195,7 +195,7 @@ fn canonical_signing_bytes(
     Ok(out)
 }
 
-fn did_key_from_verifying_key(key: &VerifyingKey) -> String {
+pub(crate) fn did_key_from_verifying_key(key: &VerifyingKey) -> String {
     let mut buf = Vec::with_capacity(ED25519_MULTICODEC.len() + 32);
     buf.extend_from_slice(&ED25519_MULTICODEC);
     buf.extend_from_slice(&key.to_bytes());

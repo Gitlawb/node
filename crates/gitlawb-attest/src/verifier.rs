@@ -121,7 +121,12 @@ impl Registry {
         attestation: &Attestation,
         expected_cert_hash: [u8; 32],
     ) -> Result<VerifiedAttestation> {
-        attestation.verify_signature(expected_cert_hash)?;
+        // The key that actually verified is the trust anchor for the signer a
+        // consumer sees. `verify_signature` recovers it from the artifact's
+        // `signer` field and rejects a field that does not match the signing
+        // key, so this is the canonical DID of the key that signed — never a
+        // raw artifact string that could disagree with it.
+        let verified_key = attestation.verify_signature(expected_cert_hash)?;
 
         let fully = match self.by_type.get(attestation.type_.as_str()) {
             Some(v) => {
@@ -138,7 +143,7 @@ impl Registry {
 
         Ok(VerifiedAttestation {
             type_: attestation.type_.clone(),
-            signer: attestation.signer.clone(),
+            signer: crate::attestation::did_key_from_verifying_key(&verified_key),
             cert_hash: attestation.cert_hash.clone(),
             fully_verified: fully,
         })
@@ -171,7 +176,7 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attestation::{Attestation, AttestationPayload};
+    use crate::attestation::{did_key_from_verifying_key, Attestation, AttestationPayload};
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
     use serde::{Deserialize, Serialize};
@@ -373,5 +378,53 @@ mod tests {
         let att = signed_demo(&sk, cert_hash, "ok");
         let err = reg.verify(&att, cert_hash).unwrap_err();
         assert!(matches!(err, Error::Payload(_)));
+    }
+
+    /// The signer a consumer sees must be the canonical DID of the key that
+    /// actually verified, never a raw artifact string that could disagree.
+    /// `verify_signature` derives the key from the artifact's `signer` field
+    /// and the parser is canonical (base58btc, exact length, ed25519
+    /// multicodec), so a forged field fails verification outright: the
+    /// must-not here is that no `VerifiedAttestation` ever carries a signer
+    /// that did not verify.
+    #[test]
+    fn verified_signer_is_anchored_to_the_key_that_verified() {
+        let signer = fresh();
+        let other = fresh();
+        assert_ne!(
+            signer.verifying_key().to_bytes(),
+            other.verifying_key().to_bytes(),
+            "fixture precondition: distinct signing keys"
+        );
+
+        let cert_hash = sample_hash();
+        let reg = Registry::new();
+
+        // Control: an honest artifact reports the signer's canonical DID, and
+        // it agrees with the artifact field.
+        let att = signed_demo(&signer, cert_hash, "ok");
+        let v = reg.verify(&att, cert_hash).unwrap();
+        let expected = did_key_from_verifying_key(&signer.verifying_key());
+        assert_eq!(v.signer, expected, "signer must be the verified key's DID");
+        assert_eq!(v.signer, att.signer, "honest artifact: field and key agree");
+
+        // Must-not, both directions: a signer field naming a DIFFERENT key
+        // than the one that signed must fail verification, so the artifact
+        // string can never redirect the reported signer.
+        let mut forged = signed_demo(&signer, cert_hash, "ok");
+        forged.signer = did_key_from_verifying_key(&other.verifying_key());
+        let err = reg.verify(&forged, cert_hash).unwrap_err();
+        assert!(
+            matches!(err, Error::Signature(_)),
+            "a signer field that does not match the signing key must fail, got {err:?}"
+        );
+
+        let mut forged_rev = signed_demo(&other, cert_hash, "ok");
+        forged_rev.signer = did_key_from_verifying_key(&signer.verifying_key());
+        let err_rev = reg.verify(&forged_rev, cert_hash).unwrap_err();
+        assert!(
+            matches!(err_rev, Error::Signature(_)),
+            "mismatched signer field must fail verification, got {err_rev:?}"
+        );
     }
 }
