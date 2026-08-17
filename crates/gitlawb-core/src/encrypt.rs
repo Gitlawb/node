@@ -19,7 +19,8 @@ fn x25519_public(vk: &VerifyingKey) -> Result<[u8; 32]> {
     // rebuilt by anyone. Resolution already refuses such a key (see
     // Did::to_verifying_key); this guard covers the SEAL side on its own terms
     // for a caller that obtained the key some other way. The open side
-    // (open_blob's attacker-supplied `eph`) is NOT covered here.
+    // (open_blob's attacker-supplied `eph`) is covered by
+    // is_low_order_montgomery.
     if vk.is_weak() {
         return Err(anyhow::anyhow!("verifying key is a small-order point"));
     }
@@ -29,6 +30,23 @@ fn x25519_public(vk: &VerifyingKey) -> Result<[u8; 32]> {
         .and_then(|c| c.decompress())
         .context("verifying key is not a valid edwards point")?;
     Ok(edwards.to_montgomery().to_bytes())
+}
+
+/// True when a 32-byte Montgomery u-coordinate is a small-order point, i.e. a
+/// point whose X25519 shared secret is the all-zero key for any scalar.
+/// The header-supplied `eph` in an envelope is attacker-controlled, so the
+/// open side must not derive a shared secret from one: an entry built on a
+/// low-order ephemeral unwraps for any reader. u = 0 and u = 1 are the
+/// u-coordinates that decompress to a small-order Edwards point (u = 0 is the
+/// all-zero Montgomery u); the remaining small-order u values fail to
+/// decompress and are already skipped by the decode path in `open_blob`.
+fn is_low_order_montgomery(u: &[u8; 32]) -> bool {
+    use curve25519_dalek::montgomery::MontgomeryPoint;
+
+    MontgomeryPoint(*u)
+        .to_edwards(0u8)
+        .map(|p| p.is_small_order())
+        .unwrap_or(false)
 }
 
 /// X25519 secret scalar for an Ed25519 seed (SHA-512 of seed, lower 32, clamped).
@@ -153,7 +171,12 @@ pub fn open_blob(envelope: &[u8], keypair: &Keypair) -> Result<Vec<u8>> {
             .ok()
             .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
         {
-            Some(b) => XPublic::from(b),
+            // A small-order ephemeral public forces the all-zero shared
+            // secret, so the entry would unwrap for anyone. Skip it.
+            // A small-order ephemeral public forces the all-zero shared
+            // secret, so the entry would unwrap for anyone. Skip it.
+            Some(b) if !is_low_order_montgomery(&b) => XPublic::from(b),
+            Some(_) => continue,
             None => continue,
         };
         // from_slice panics on a wrong length, and the envelope is attacker
@@ -305,6 +328,131 @@ mod tests {
         let mut header: serde_json::Value = serde_json::from_slice(header_bytes).unwrap();
         header["nonce"] = bad_nonce;
         assert!(open_blob(&reframe(&header), &reader).is_err());
+    }
+
+    /// A low-order ephemeral public forces the all-zero shared secret, so an
+    /// entry built on it would unwrap for anyone. The header's `eph` is
+    /// attacker-controlled, so the open side must skip it. u = 0 and u = 1 are
+    /// the Montgomery u-coordinates that decompress to a small-order Edwards
+    /// point (u = 0 is the one that produces the all-zero shared secret); the
+    /// other small-order u values fail to decompress and are already skipped
+    /// by the decode path.
+    #[test]
+    fn is_low_order_montgomery_flags_small_order_and_accepts_real() {
+        let zero = [0u8; 32];
+        assert!(is_low_order_montgomery(&zero), "u=0 is the all-zero secret");
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        assert!(is_low_order_montgomery(&one), "u=1 is small-order");
+
+        // A real X25519 public key is not low-order.
+        let kp = Keypair::generate();
+        let real_u = x25519_public(&kp.verifying_key()).unwrap();
+        assert!(
+            !is_low_order_montgomery(&real_u),
+            "a real key must not be flagged low-order"
+        );
+    }
+
+    /// The open side must skip an entry whose header-supplied `eph` is a
+    /// low-order point: such an entry forces the all-zero shared secret and
+    /// would unwrap for any reader. A poisoned entry among honest ones must
+    /// not DoS the envelope — the honest entry still opens.
+    #[test]
+    fn open_blob_skips_a_low_order_ephemeral_and_still_opens_honest_entry() {
+        use curve25519_dalek::montgomery::MontgomeryPoint;
+        let reader = Keypair::generate();
+        let env = seal_blob(b"private blob contents", &[reader.verifying_key()]).unwrap();
+
+        // Split the envelope framing into header JSON and body.
+        let mut p = MAGIC.len() + 1;
+        let hlen = u32::from_le_bytes(env[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        let header_bytes = &env[p..p + hlen];
+        let body = &env[p + hlen..];
+
+        // A low-order Montgomery u (u = 0) encoded as the entry's eph.
+        let low_order_u = MontgomeryPoint([0u8; 32]).to_bytes();
+        let poisoned = serde_json::json!({
+            "eph": B64.encode(low_order_u),
+            "nonce": B64.encode([0u8; 24]),
+            "wrap": B64.encode([0u8; 32]),
+        });
+
+        let reframe = |header: &serde_json::Value| -> Vec<u8> {
+            let hj = serde_json::to_vec(header).unwrap();
+            let mut out = Vec::new();
+            out.extend_from_slice(MAGIC);
+            out.push(VERSION);
+            out.extend_from_slice(&(hj.len() as u32).to_le_bytes());
+            out.extend_from_slice(&hj);
+            out.extend_from_slice(body);
+            out
+        };
+
+        let mut header: serde_json::Value = serde_json::from_slice(header_bytes).unwrap();
+        // Prepend the poisoned entry. The reader's honest entry must still
+        // unwrap, so the envelope opens despite the low-order entry.
+        let recipients = header["recipients"].as_array_mut().unwrap();
+        recipients.insert(0, poisoned);
+        assert_eq!(
+            open_blob(&reframe(&header), &reader).unwrap(),
+            b"private blob contents",
+            "the honest entry must still open despite a low-order eph entry"
+        );
+    }
+
+    /// Must-not for the open-side guard: an envelope whose ONLY entry is built
+    /// on a low-order ephemeral must not open for any reader. Without the
+    /// guard the all-zero shared secret unwraps for everyone, so the attacker
+    /// controls the plaintext and the envelope's confidentiality is void.
+    #[test]
+    fn open_blob_rejects_a_poisoned_only_envelope() {
+        use chacha20poly1305::{aead::Aead, KeyInit, XChaCha20Poly1305, XNonce};
+        use crypto_box::aead::AeadCore;
+        use curve25519_dalek::montgomery::MontgomeryPoint;
+
+        // Build a poisoned envelope from scratch: one recipient entry whose
+        // eph is the low-order u = 0. The wrap is the encryption of a content
+        // key under the all-zero shared secret, so without the guard any
+        // reader's ChaChaBox against u = 0 decrypts it.
+        let content_key = [0x42u8; 32];
+        let zero_box = ChaChaBox::new(&XPublic::from([0u8; 32]), &XSecret::from([7u8; 32]));
+        let nonce = ChaChaBox::generate_nonce(&mut OsRng);
+        let wrap = zero_box.encrypt(&nonce, &content_key[..]).unwrap();
+
+        let body_nonce = [0x24u8; 24];
+        let body_cipher = XChaCha20Poly1305::new_from_slice(&content_key).unwrap();
+        let body = body_cipher
+            .encrypt(
+                XNonce::from_slice(&body_nonce),
+                b"attacker-chosen plaintext".as_slice(),
+            )
+            .unwrap();
+
+        let header = serde_json::json!({
+            "alg": "xchacha20poly1305",
+            "nonce": B64.encode(body_nonce),
+            "recipients": [{
+                "eph": B64.encode(MontgomeryPoint([0u8; 32]).to_bytes()),
+                "nonce": B64.encode(nonce),
+                "wrap": B64.encode(wrap),
+            }],
+        });
+        let header_json = serde_json::to_vec(&header).unwrap();
+        let mut env = Vec::new();
+        env.extend_from_slice(MAGIC);
+        env.push(VERSION);
+        env.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
+        env.extend_from_slice(&header_json);
+        env.extend_from_slice(&body);
+
+        let reader = Keypair::generate();
+        let err = open_blob(&env, &reader).unwrap_err();
+        assert!(
+            err.to_string().contains("not a recipient"),
+            "a poisoned-only envelope must not open for anyone, got: {err}"
+        );
     }
 
     /// The compressed identity point: a well-formed Ed25519 encoding that is
