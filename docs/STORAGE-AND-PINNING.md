@@ -43,9 +43,11 @@ slot indefinitely. The Pinata tail re-derives its object list only *after*
 acquiring a slot, which bounds outstanding memory to O(refs) rather than
 O(pushes × objects).
 
-De-duplication is per sink: the `pinned_cids` and `pinata_cids` tables record
-what each sink already holds, so re-pushing unchanged objects does no redundant
-upload.
+De-duplication is per sink and best-effort: the `pinned_cids` and `pinata_cids`
+tables record what each sink already holds, so later pushes normally skip objects
+whose successful pin is already recorded. The check-upload-record sequence is not
+atomic, so concurrent post-push tasks for the same object, or a failure to record
+after a successful upload, can still cause a repeat upload attempt.
 
 ## Durability notes
 
