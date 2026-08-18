@@ -108,9 +108,15 @@ impl RefUpdateCert {
         Ok(())
     }
 
-    /// Verify all signatures on this certificate.
+    /// Verify all signatures on this certificate, failing closed.
     ///
-    /// Returns the list of DIDs whose signatures are valid.
+    /// On success returns the list of DIDs whose signatures are valid. This is
+    /// strict: it returns an error if *any* signature entry is malformed or
+    /// invalid. Because signature entries live outside the signed body (anyone
+    /// can append one without key material), do not use this to make a
+    /// threshold decision on an untrusted certificate — a single appended junk
+    /// entry would reject the whole cert. Use [`Self::satisfies_threshold`],
+    /// which ignores invalid entries and counts only the valid signers.
     pub fn verify_all(&self) -> Result<Vec<Did>> {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
         let signing_bytes = self.body.to_signing_bytes()?;
@@ -135,13 +141,48 @@ impl RefUpdateCert {
         Ok(valid)
     }
 
+    /// The DIDs whose signature entries validate, skipping any that are
+    /// malformed or invalid rather than failing.
+    ///
+    /// Signature entries are appended outside the signed body, so any third
+    /// party can attach a junk entry without key material. Counting only the
+    /// entries that actually verify — instead of short-circuiting on the first
+    /// bad one, as [`Self::verify_all`] does — prevents that from becoming a
+    /// denial-of-service on an otherwise valid certificate (#349). A forged
+    /// entry that names a real maintainer DID but carries a bad signature is
+    /// skipped, so it cannot inflate the count either.
+    fn valid_signers(&self) -> Result<Vec<Did>> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let signing_bytes = self.body.to_signing_bytes()?;
+        let mut valid = Vec::new();
+
+        for cert_sig in &self.signatures {
+            let Ok(vk) = cert_sig.signer.to_verifying_key() else {
+                continue;
+            };
+            let Ok(sig_bytes_vec) = URL_SAFE_NO_PAD.decode(&cert_sig.sig) else {
+                continue;
+            };
+            let Ok(sig_bytes) = <[u8; 64]>::try_from(sig_bytes_vec) else {
+                continue;
+            };
+            if verify(&vk, &signing_bytes, &sig_bytes).is_ok() {
+                valid.push(cert_sig.signer.clone());
+            }
+        }
+
+        Ok(valid)
+    }
+
     /// Check if this certificate satisfies a threshold of valid signatures
     /// from the provided set of authorized maintainer DIDs.
     ///
     /// Counts distinct signer DIDs, not signature entries: a repeated
-    /// signature from the same maintainer counts once.
+    /// signature from the same maintainer counts once. Malformed or invalid
+    /// signature entries are ignored (see [`Self::valid_signers`]), so an
+    /// attacker cannot deny a valid cert by appending junk signatures.
     pub fn satisfies_threshold(&self, maintainers: &[Did], threshold: usize) -> Result<bool> {
-        let valid = self.verify_all()?;
+        let valid = self.valid_signers()?;
         let distinct_signers: HashSet<&Did> =
             valid.iter().filter(|d| maintainers.contains(d)).collect();
         Ok(distinct_signers.len() >= threshold)
@@ -375,6 +416,70 @@ mod tests {
         // Two signature entries but a single distinct signer must not
         // satisfy a 2-of-3 threshold.
         assert!(!cert.satisfies_threshold(&maintainers, 2).unwrap());
+    }
+
+    /// An attacker can append junk signature entries to a cert (they live
+    /// outside the signed body, so no key material is needed). `satisfies_threshold`
+    /// must ignore them and still count the real signers — before the fix,
+    /// `verify_all`'s `?` on the junk made the whole check error out, denying a
+    /// valid 2-of-2 cert.
+    #[test]
+    fn satisfies_threshold_ignores_appended_junk_signatures() {
+        let kp1 = Keypair::generate();
+        let kp2 = Keypair::generate();
+        let mut cert = RefUpdateCert::new(
+            kp1.did(),
+            "refs/heads/main".to_string(),
+            dummy_hash('0'),
+            dummy_hash('a'),
+            1,
+            &kp1,
+        )
+        .unwrap();
+        cert.countersign(&kp2).unwrap();
+
+        // Append entries that are unparseable / invalid in different ways.
+        cert.signatures.push(CertSignature {
+            signer: kp1.did(),
+            sig: "!!!not-base64!!!".to_string(),
+        });
+        // Valid base64 but only 3 bytes — fails the 64-byte length check.
+        cert.signatures.push(CertSignature {
+            signer: kp2.did(),
+            sig: "AAAA".to_string(),
+        });
+
+        let maintainers = vec![kp1.did(), kp2.did()];
+        assert!(cert.satisfies_threshold(&maintainers, 2).unwrap());
+    }
+
+    /// A junk entry that names a real maintainer DID but carries a signature
+    /// that does not verify must not be counted — otherwise appending garbage
+    /// under a maintainer's DID could forge a threshold.
+    #[test]
+    fn satisfies_threshold_does_not_count_a_forged_maintainer_signature() {
+        let kp1 = Keypair::generate();
+        let kp2 = Keypair::generate();
+        let mut cert = RefUpdateCert::new(
+            kp1.did(),
+            "refs/heads/main".to_string(),
+            dummy_hash('0'),
+            dummy_hash('a'),
+            1,
+            &kp1,
+        )
+        .unwrap();
+        // Well-formed 64-byte signature from kp2, but over unrelated bytes, so
+        // it fails verification against the cert body.
+        cert.signatures.push(CertSignature {
+            signer: kp2.did(),
+            sig: kp2.sign_b64(b"unrelated bytes"),
+        });
+
+        let maintainers = vec![kp1.did(), kp2.did()];
+        // Only kp1 actually signed the body: 2-of-2 must fail, 1-of-2 holds.
+        assert!(!cert.satisfies_threshold(&maintainers, 2).unwrap());
+        assert!(cert.satisfies_threshold(&maintainers, 1).unwrap());
     }
 
     #[test]
