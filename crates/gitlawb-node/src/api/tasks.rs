@@ -1484,6 +1484,114 @@ mod visible_tasks_tests {
         );
     }
 
+    /// `create_task` stores the supplied assignee form unchanged. Claim binds
+    /// the authenticated DID (typically `did:key:...`) and list filters pass
+    /// the query string through. Both SQL comparisons must collapse the
+    /// did:key short form, or a designated assignee stored as a bare key
+    /// cannot claim, and a `?assignee_did=` filter in the other form drops
+    /// the row. A `did:web:` assignee sharing the same residual must stay
+    /// unmatched.
+    #[sqlx::test]
+    async fn claim_and_list_match_bare_and_did_key_assignee_forms(pool: PgPool) {
+        let bare_assignee = crate::db::normalize_owner_key(ASSIGNEE);
+        assert_ne!(
+            bare_assignee, ASSIGNEE,
+            "test setup requires ASSIGNEE to be the full did:key form"
+        );
+
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("public-repo", DELEGATOR, "public", true))
+            .await
+            .unwrap();
+
+        let mut bare = task("bare-assignee", Some("public-repo"), DELEGATOR);
+        bare.assignee_did = Some(bare_assignee.into());
+        state.db.create_task(&bare).await.unwrap();
+
+        let mut full = task("full-assignee", Some("public-repo"), DELEGATOR);
+        full.assignee_did = Some(ASSIGNEE.into());
+        state.db.create_task(&full).await.unwrap();
+
+        let mut web = task("web-assignee", Some("public-repo"), DELEGATOR);
+        web.assignee_did = Some(format!("did:web:{bare_assignee}"));
+        state.db.create_task(&web).await.unwrap();
+
+        let listed_ids = |body: &serde_json::Value| -> Vec<String> {
+            body["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|task| task["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let full_filter = list_router(state.clone())
+            .oneshot(anon_get(&format!("/api/v1/tasks?assignee_did={ASSIGNEE}")))
+            .await
+            .unwrap();
+        assert_eq!(full_filter.status(), StatusCode::OK);
+        let full_ids = listed_ids(&body_json(full_filter).await);
+        assert!(
+            full_ids.contains(&"bare-assignee".to_string()),
+            "a did:key: filter must match a bare stored assignee"
+        );
+        assert!(full_ids.contains(&"full-assignee".to_string()));
+        assert!(
+            !full_ids.contains(&"web-assignee".to_string()),
+            "did:key matching must not collapse a did:web assignee"
+        );
+
+        let bare_filter = list_router(state.clone())
+            .oneshot(anon_get(&format!(
+                "/api/v1/tasks?assignee_did={bare_assignee}"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(bare_filter.status(), StatusCode::OK);
+        let bare_ids = listed_ids(&body_json(bare_filter).await);
+        assert!(
+            bare_ids.contains(&"full-assignee".to_string()),
+            "a bare filter must match a did:key stored assignee"
+        );
+        assert!(bare_ids.contains(&"bare-assignee".to_string()));
+        assert!(
+            !bare_ids.contains(&"web-assignee".to_string()),
+            "did:key matching must not collapse a did:web assignee"
+        );
+
+        let claim_full = full_task_router(state.clone())
+            .oneshot(signed_request_as(
+                ASSIGNEE,
+                Method::POST,
+                "/api/v1/tasks/bare-assignee/claim",
+                Body::from(format!(r#"{{"assignee_did":"{ASSIGNEE}"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            claim_full.status(),
+            StatusCode::OK,
+            "claim as did:key: form must match a bare stored assignee"
+        );
+
+        let claim_bare = full_task_router(state)
+            .oneshot(signed_request_as(
+                bare_assignee,
+                Method::POST,
+                "/api/v1/tasks/full-assignee/claim",
+                Body::from(format!(r#"{{"assignee_did":"{bare_assignee}"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            claim_bare.status(),
+            StatusCode::OK,
+            "claim as a bare key must match a did:key stored assignee"
+        );
+    }
+
     /// Goes RED if `announce_task_event` is replaced with a bare `tx.send`:
     /// a repo-less claim would then reach an anonymous subscriber.
     #[sqlx::test]
