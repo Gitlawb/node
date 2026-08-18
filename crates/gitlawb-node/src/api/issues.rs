@@ -256,6 +256,18 @@ pub async fn close_issue(
     // Without this, any signed non-owner could issue parallel close requests for
     // arbitrary issue ids and drive unbounded downloads and blocking extraction
     // (a disposable-identity DoS), because the route has no other pre-authorization.
+    //
+    // mirror-rows-handled: a repo row synced from a peer is stored public and
+    // carries none of the owner's visibility rules, so for such a row this check
+    // can only return allow. That is deliberate rather than overlooked, and it is
+    // the same verdict every other read gate in this API reaches for one. Refusing
+    // instead would deny the repo's real owner and the issue's real author on any
+    // node whose only copy of the repo is a synced one, which is an ordinary state
+    // here, and it would not buy the protection it appears to, because a synced
+    // row's recorded owner comes from the peer that sent it. The expensive work
+    // this check guards is bounded ahead of it by the per-IP limiter above, and the
+    // authoritative owner-or-author decision still runs below and again under the
+    // write lock.
     {
         let rules = state.db.list_visibility_rules(&record.id).await?;
         let caller = auth.0.as_str();
@@ -500,6 +512,90 @@ mod tests {
             matches!(refused, Err(AppError::Forbidden(_))),
             "expected 403 Forbidden for a stranger, got {:?}",
             refused.err().map(|e| format!("{e:?}"))
+        );
+    }
+
+    /// The read-gate's blind spot, pinned rather than left to be rediscovered.
+    ///
+    /// A repo row synced from a peer is stored public and carries none of the
+    /// owner's visibility rules, so the gate's own inputs can only produce allow
+    /// for it. The gate above therefore does not carry this class of row, and the
+    /// test that does cover it (`non_reader_is_refused_before_the_snapshot`) seeds
+    /// a locally created repo, which cannot observe this: a passing test there is
+    /// not coverage here.
+    ///
+    /// Two things are asserted, and the second is why the first is acceptable.
+    /// The gate's verdict for such a row is allow for an arbitrary caller, and the
+    /// handler still refuses that caller afterwards, because the decision that
+    /// matters is the owner-or-author check rather than this one. If a later change
+    /// makes the gate the load-bearing decision for this route, the first assertion
+    /// breaks and this comment is where to start.
+    #[sqlx::test]
+    async fn a_synced_row_is_not_gated_by_its_own_visibility(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+
+        // Only a synced row exists for this repo, with no locally created twin.
+        state
+            .db
+            .upsert_mirror_repo("z6MkSyncOwner", "syncrepo", "/tmp/syncrepo", None, false)
+            .await
+            .expect("seed synced repo"); // false = not quarantined, the ordinary case
+        let record = state
+            .db
+            .get_repo("z6MkSyncOwner", "syncrepo")
+            .await
+            .expect("get_repo")
+            .expect("repo exists")
+            .clone();
+        assert!(
+            record.id.contains('/'),
+            "this test is only meaningful against a synced row; got id {}",
+            record.id
+        );
+
+        // The gate's two inputs, and what they force.
+        let rules = state
+            .db
+            .list_visibility_rules(&record.id)
+            .await
+            .expect("list rules");
+        assert!(rules.is_empty(), "a synced row carries no rules of its own");
+        assert!(record.is_public, "a synced row is stored public");
+        assert_eq!(
+            crate::visibility::visibility_check(
+                &rules,
+                record.is_public,
+                &record.owner_did,
+                Some("did:key:z6MkSyncStranger"),
+                "/",
+            ),
+            crate::visibility::Decision::Allow,
+            "the gate can only allow for a synced row, which is the property the \
+             handler's mirror-rows-handled note records",
+        );
+
+        // So the refusal has to come from the decision that is actually load-bearing.
+        let stranger = crate::auth::AuthenticatedDid("did:key:z6MkSyncStranger".to_string());
+        let outcome = close_issue(
+            axum::extract::State(state.clone()),
+            axum::Extension(stranger),
+            axum::extract::Path((
+                "z6MkSyncOwner".to_string(),
+                "syncrepo".to_string(),
+                "1".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(Some("203.0.113.99:5000".parse().unwrap())),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "a stranger must still be refused on a synced row, gate or no gate",
+        );
+        let body = format!("{:?}", outcome.err().unwrap());
+        assert!(
+            !body.contains("syncrepo/") && !body.to_lowercase().contains("issue body"),
+            "the refusal must not leak repo contents: {body}",
         );
     }
 
