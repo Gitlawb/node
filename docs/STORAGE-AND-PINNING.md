@@ -12,11 +12,14 @@ both configured.
 
 | Tier | Sink | Module | Enabled by | Purpose |
 |------|------|--------|-----------|---------|
-| Hot  | Local Kubo (IPFS) | `ipfs_pin.rs` | `GITLAWB_IPFS_API` set | Node-local availability; the node is itself an IPFS peer |
+| Hot  | Local Kubo (IPFS) | `ipfs_pin.rs` | `GITLAWB_IPFS_API` set | Node-local availability; the node is an HTTP client of a co-located Kubo daemon |
 | Warm | Pinata (Filecoin-backed) | `pinata.rs` | `GITLAWB_PINATA_JWT` set | Off-node durability + public IPFS gateway reachability |
 
-If a sink's config value is empty, every call into that sink is a no-op — so
-leaving `GITLAWB_PINATA_JWT` unset simply disables the warm tier.
+If a sink's config value is empty, its **pin** paths are no-ops — so leaving
+`GITLAWB_PINATA_JWT` unset simply disables warm-tier pinning. Note this applies to
+pinning only, not reads: the hot-tier read path (`ipfs_pin::cat`) returns an error
+rather than a no-op when `GITLAWB_IPFS_API` is unset, so a node that serves the
+encrypted-blob read endpoint needs Kubo configured.
 
 ## Configuration
 
@@ -38,16 +41,19 @@ Pinning happens **after** a push is accepted, not on the push's critical path:
 Both tiers share a single global **pin admission semaphore**
 (`max_concurrent_pin_tasks`). The pool **defers rather than sheds**: when it is
 saturated, a pin loop waits for a slot instead of dropping the pin. Each batch is
-bounded by `PIN_BATCH_BUDGET` (120s) so a single large or slow push cannot hold a
-slot indefinitely. The Pinata tail re-derives its object list only *after*
-acquiring a slot, which bounds outstanding memory to O(refs) rather than
-O(pushes × objects).
+bounded by `PIN_BATCH_BUDGET` (120s) so the pin batch itself cannot hold a slot
+indefinitely. The Pinata tail re-derives its object list only *after* acquiring a
+slot, which bounds outstanding memory to O(refs) rather than O(pushes × objects).
+Note the budget covers the pin batch, not the preceding object-list re-derivation
+walk: that walk holds the slot too, and bounds only each child git process
+individually (no aggregate deadline).
 
-De-duplication is per sink and best-effort: the `pinned_cids` and `pinata_cids`
-tables record what each sink already holds, so later pushes normally skip objects
-whose successful pin is already recorded. The check-upload-record sequence is not
-atomic, so concurrent post-push tasks for the same object, or a failure to record
-after a successful upload, can still cause a repeat upload attempt.
+De-duplication is per sink and best-effort, backed by the single `pinned_cids`
+table: the hot tier keys on its `cid`/`sha256_hex` rows and the warm tier on the
+nullable `pinata_cid` column, so later pushes normally skip objects whose
+successful pin is already recorded. The check-upload-record sequence is not atomic,
+so concurrent post-push tasks for the same object, or a failure to record after a
+successful upload, can still cause a repeat upload attempt.
 
 ## Durability notes
 
