@@ -1179,9 +1179,13 @@ mod tests {
         // deterministically.
         let endpoint = crate::test_support::silent_http_endpoint().await;
         let tigris =
-            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
-                .await;
-        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint);
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir,
+            Some(tigris),
+            pool,
+            std::time::Duration::from_secs(300),
+        );
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
         let mut cfg = (*state.config).clone();
         cfg.git_acquire_timeout_secs = 1;
@@ -1243,9 +1247,13 @@ mod tests {
         // 1s timeout (endpoint-pinned test client, no AWS_* env reads).
         let endpoint = crate::test_support::silent_http_endpoint().await;
         let tigris =
-            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
-                .await;
-        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint);
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir,
+            Some(tigris),
+            pool,
+            std::time::Duration::from_secs(300),
+        );
         state
             .db
             .upsert_mirror_repo("z6f2acqcont", "ghost", "/unused-ghost", None, false)
@@ -1768,9 +1776,13 @@ mod tests {
         // the budget (endpoint-pinned test client, no AWS_* env reads).
         let endpoint = crate::test_support::silent_http_endpoint().await;
         let tigris =
-            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
-                .await;
-        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint);
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir,
+            Some(tigris),
+            pool,
+            std::time::Duration::from_secs(300),
+        );
         state
             .db
             .upsert_mirror_repo("z6f3budget", "ghost", "/unused-ghost", None, false)
