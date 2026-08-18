@@ -145,23 +145,43 @@ impl Registry {
     }
 
     /// Verify a batch, then enforce `RequireAll`.
+    ///
+    /// Under [`Policy::RequireAll`] this never short-circuits: an attestation
+    /// that fails to verify — bad signature, cert-hash mismatch, malformed
+    /// payload, or a type with no verifier — is dropped from the result rather
+    /// than aborting the batch. Any third party can attach an attestation, so a
+    /// hard error here would let an unrelated `attacker/spam/v1` deny-of-service
+    /// the whole cert (the DoS vector the module docstring warns about). The
+    /// `required_types` check below is the real gate, and it only counts
+    /// `fully_verified` entries — so a required type represented solely by a
+    /// malformed attestation still fails with [`Error::RequiredMissing`].
+    ///
+    /// Under `AcceptKnown` and `RejectUnknown` the batch stays strict: the
+    /// first verification error is surfaced to the caller.
     pub fn verify_all(
         &self,
         attestations: &[Attestation],
         expected_cert_hash: [u8; 32],
     ) -> Result<Vec<VerifiedAttestation>> {
-        let mut verified = Vec::with_capacity(attestations.len());
-        for a in attestations {
-            verified.push(self.verify(a, expected_cert_hash)?);
+        if self.policy != Policy::RequireAll {
+            let mut verified = Vec::with_capacity(attestations.len());
+            for a in attestations {
+                verified.push(self.verify(a, expected_cert_hash)?);
+            }
+            return Ok(verified);
         }
-        if self.policy == Policy::RequireAll {
-            for required in &self.required_types {
-                let present = verified
-                    .iter()
-                    .any(|v| &v.type_ == required && v.fully_verified);
-                if !present {
-                    return Err(Error::RequiredMissing(required.clone()));
-                }
+
+        // RequireAll: drop entries that fail to verify instead of aborting.
+        let verified: Vec<VerifiedAttestation> = attestations
+            .iter()
+            .filter_map(|a| self.verify(a, expected_cert_hash).ok())
+            .collect();
+        for required in &self.required_types {
+            let present = verified
+                .iter()
+                .any(|v| &v.type_ == required && v.fully_verified);
+            if !present {
+                return Err(Error::RequiredMissing(required.clone()));
             }
         }
         Ok(verified)
@@ -333,6 +353,65 @@ mod tests {
 
         let att = signed_demo(&sk, cert_hash, "ok");
         let err = reg.verify_all(&[att], cert_hash).unwrap_err();
+        assert!(matches!(err, Error::RequiredMissing(t) if t == "demo/v1"));
+    }
+
+    /// A cert-hash that does not match `sample_hash()`, so an attestation
+    /// signed against it fails `verify_signature` when the batch is checked
+    /// against `sample_hash()`.
+    fn other_hash() -> [u8; 32] {
+        let mut h = sample_hash();
+        h[0] ^= 0xff;
+        h
+    }
+
+    /// Under `RequireAll`, a malformed attestation (here: signed against the
+    /// wrong cert hash, so it fails signature verification) attached alongside a
+    /// valid required one must not abort the batch. The junk is dropped and the
+    /// cert still verifies. Before the fix, `verify_all` propagated the error
+    /// via `?` and the whole batch failed — the DoS vector the docstring warns
+    /// about.
+    #[test]
+    fn require_all_drops_a_malformed_extra_and_still_accepts() {
+        let sk = fresh();
+        let cert_hash = sample_hash();
+        let mut reg = Registry::new()
+            .with_policy(Policy::RequireAll)
+            .require_types(["demo/v1"]);
+        reg.register(DemoVerifier);
+
+        // Signed against `other_hash()`, so it will not verify under `cert_hash`.
+        let malformed = signed_demo(&sk, other_hash(), "boom");
+        let real = signed_demo(&sk, cert_hash, "ok");
+
+        let verified = reg
+            .verify_all(&[malformed, real], cert_hash)
+            .expect("a malformed extra must not abort the batch under RequireAll");
+        assert_eq!(verified.len(), 1, "the malformed entry should be dropped");
+        assert!(verified
+            .iter()
+            .any(|v| v.type_ == "demo/v1" && v.fully_verified));
+    }
+
+    /// Leniency must not open a hole: if the *only* attestation of a required
+    /// type is malformed, dropping it leaves the required type absent and
+    /// `verify_all` must still fail with `RequiredMissing`. Guards against a fix
+    /// that skips errors so eagerly it lets an unverified required type pass.
+    #[test]
+    fn require_all_rejects_when_only_a_malformed_required_type_is_present() {
+        let sk = fresh();
+        let cert_hash = sample_hash();
+        let mut reg = Registry::new()
+            .with_policy(Policy::RequireAll)
+            .require_types(["demo/v1"]);
+        reg.register(DemoVerifier);
+
+        // The sole demo/v1 is bound to the wrong cert hash → fails verification.
+        let malformed_required = signed_demo(&sk, other_hash(), "ok");
+
+        let err = reg
+            .verify_all(&[malformed_required], cert_hash)
+            .unwrap_err();
         assert!(matches!(err, Error::RequiredMissing(t) if t == "demo/v1"));
     }
 
