@@ -759,7 +759,11 @@ async fn call_tool(
         ]))?),
 
         "ucan_show" => {
-            let ucan_path = crate::identity::gitlawb_dir(None)?.join("ucan.json");
+            // The directory the server was started with, like every sibling tool.
+            // Reading the default here while the rest honour `--dir` splits one MCP
+            // session across two identity directories.
+            let ucan_path = crate::identity::gitlawb_dir(dir.map(std::path::Path::to_path_buf))?
+                .join("ucan.json");
             if ucan_path.exists() {
                 let content = std::fs::read_to_string(ucan_path)?;
                 Ok(content)

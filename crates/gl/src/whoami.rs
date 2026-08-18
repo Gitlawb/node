@@ -10,7 +10,7 @@ use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
 pub struct WhoamiArgs {
-    /// Identity directory (default: ~/.gitlawb)
+    /// Identity directory (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
     #[arg(long)]
     dir: Option<PathBuf>,
     /// Node URL to query for registration info

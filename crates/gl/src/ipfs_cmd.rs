@@ -23,7 +23,7 @@ pub enum IpfsCmd {
     List {
         #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
         node: String,
-        /// Identity directory (default: ~/.gitlawb)
+        /// Identity directory (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
         #[arg(long)]
         dir: Option<PathBuf>,
     },

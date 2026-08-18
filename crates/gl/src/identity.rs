@@ -80,8 +80,11 @@ pub fn gitlawb_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(d) = override_dir {
         return Ok(d);
     }
-    let home = dirs::home_dir().context("could not determine the home directory")?;
-    gitlawb_core::identity_path::identity_dir(&home).map_err(|e| anyhow::anyhow!("{e}"))
+    // `home_dir()` is passed as an Option rather than demanded here: an absolute
+    // GITLAWB_KEY resolves without a home directory, and a host that has none is a
+    // normal container shape, not a reason to refuse a correctly-configured key.
+    let home = dirs::home_dir();
+    gitlawb_core::identity_path::identity_dir(home.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn key_path(dir: &Path) -> PathBuf {

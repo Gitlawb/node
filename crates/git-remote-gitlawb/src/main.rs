@@ -1006,16 +1006,14 @@ fn load_keypair() -> Option<Keypair> {
 /// helper mid-push, so a misconfiguration is logged and the push continues
 /// unsigned rather than aborting the transfer.
 fn resolve_key_path() -> Option<std::path::PathBuf> {
-    let home = home_dir()?;
-    gitlawb_core::identity_path::identity_key_path(&home)
+    gitlawb_core::identity_path::identity_key_path(home_dir().as_deref())
         .inspect_err(|e| tracing::warn!("cannot resolve the identity key path: {e}"))
         .ok()
 }
 
 /// The directory holding `identity.pem` and `delegations/`.
 fn resolve_identity_dir() -> Option<std::path::PathBuf> {
-    let home = home_dir()?;
-    gitlawb_core::identity_path::identity_dir(&home)
+    gitlawb_core::identity_path::identity_dir(home_dir().as_deref())
         .inspect_err(|e| tracing::warn!("cannot resolve the identity directory: {e}"))
         .ok()
 }
@@ -1023,11 +1021,11 @@ fn resolve_identity_dir() -> Option<std::path::PathBuf> {
 /// `dirs`, not `$HOME`: the old code fell back to `"."` when `HOME` was unset,
 /// which on Windows is always, so the default key resolved against whatever
 /// directory git happened to invoke the helper from.
+///
+/// `None` is not fatal — an absolute `GITLAWB_KEY` resolves without it, and only
+/// the default and `~/`-prefixed forms need a home at all.
 fn home_dir() -> Option<std::path::PathBuf> {
-    dirs::home_dir().or_else(|| {
-        tracing::warn!("could not determine the home directory; pushing without a delegation");
-        None
-    })
+    dirs::home_dir()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

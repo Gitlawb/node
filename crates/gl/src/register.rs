@@ -30,7 +30,7 @@ pub struct RegisterArgs {
     #[arg(long)]
     pub model: Option<String>,
 
-    /// Identity directory (default: ~/.gitlawb)
+    /// Identity directory (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
     #[arg(long)]
     pub dir: Option<PathBuf>,
 }
@@ -105,11 +105,18 @@ pub async fn run(args: RegisterArgs) -> Result<()> {
     println!();
     // The real path, not the default one: `GITLAWB_KEY` moves it, and an operator
     // told to look in `~/.gitlawb` would find nothing there.
+    // Registration without a stored token means the registration-gated
+    // capabilities never arrived, so the closing line must not claim they did.
     match &saved_to {
-        Some(path) => println!("  Bootstrap UCAN saved to {}", path.display()),
-        None => println!("  The node returned no bootstrap UCAN."),
+        Some(path) => {
+            println!("  Bootstrap UCAN saved to {}", path.display());
+            println!("  You are now a verified agent on the gitlawb network.");
+        }
+        None => {
+            println!("  The node returned no bootstrap UCAN, so this identity is not");
+            println!("  a verified agent yet. Re-run `gl register` once the node issues one.");
+        }
     }
-    println!("  You are now a verified agent on the gitlawb network.");
 
     Ok(())
 }

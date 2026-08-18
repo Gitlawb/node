@@ -24,7 +24,7 @@ pub struct DoctorArgs {
     #[arg(long, default_value = PUBLIC_NODE, env = "GITLAWB_NODE")]
     pub node: String,
 
-    /// Identity directory (default: ~/.gitlawb)
+    /// Identity directory (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
     #[arg(long)]
     pub dir: Option<PathBuf>,
 }

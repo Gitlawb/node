@@ -341,7 +341,8 @@ async fn cmd_show(dir: Option<PathBuf>) -> Result<()> {
     }
 
     let content = std::fs::read_to_string(&ucan_path)?;
-    let ucan = Ucan::decode(&content)?;
+    let ucan = decode_saved_ucan(&content)
+        .with_context(|| format!("could not read the saved UCAN at {}", ucan_path.display()))?;
 
     println!("Issuer:   {}", ucan.payload.iss);
     println!("Audience: {}", ucan.payload.aud);
@@ -729,5 +730,81 @@ mod delegation_store_tests {
             std::fs::metadata(&stored).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+}
+
+/// Decode the token out of a saved `ucan.json`.
+///
+/// `gl register`, `gl init`, and `gl quickstart` all write an envelope —
+/// `{"ucan": "<token>", "node": ..., "did": ..., "saved_at": ...}` — and `doctor`
+/// and `quickstart` read it back as one. `cmd_show` was the only reader calling
+/// `Ucan::decode` on the whole file, and `Ucan` is `{payload, s}`, so it failed
+/// with "missing field `payload`" immediately after a successful `gl register`.
+///
+/// The bare-token form is still accepted: a file written by an older `gl`, or by
+/// hand, should not stop being readable just because the envelope is now canonical.
+fn decode_saved_ucan(content: &str) -> Result<Ucan> {
+    if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(content) {
+        if let Some(token) = envelope.get("ucan").and_then(|v| v.as_str()) {
+            return Ucan::decode(token).map_err(Into::into);
+        }
+    }
+    Ucan::decode(content.trim()).map_err(Into::into)
+}
+
+#[cfg(test)]
+mod saved_ucan_tests {
+    use super::*;
+
+    fn a_token() -> String {
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let aud = gitlawb_core::identity::Keypair::generate();
+        Ucan::issue(
+            &kp,
+            aud.did(),
+            vec![Capability::new("*", caps::GIT_PUSH)],
+            None,
+        )
+        .unwrap()
+        .encode()
+        .unwrap()
+    }
+
+    /// The shape `gl register`, `gl init`, and `gl quickstart` all write, and the
+    /// shape `doctor` and `quickstart` already read back. `cmd_show` used to call
+    /// `Ucan::decode` on the whole file and failed with "missing field `payload`"
+    /// immediately after a successful `gl register`.
+    #[test]
+    fn the_register_envelope_decodes() {
+        let token = a_token();
+        let envelope = serde_json::json!({
+            "ucan": token,
+            "node": "https://node.gitlawb.com",
+            "did": "did:key:z6MkAbc",
+            "saved_at": "2026-08-17T00:00:00Z",
+        })
+        .to_string();
+
+        let decoded = decode_saved_ucan(&envelope).expect("the written envelope must decode");
+        assert_eq!(decoded.encode().unwrap(), token);
+    }
+
+    /// A file written by an older `gl`, or by hand, stays readable.
+    #[test]
+    fn a_bare_token_still_decodes() {
+        let token = a_token();
+        assert_eq!(
+            decode_saved_ucan(&format!("  {token}\n"))
+                .expect("a bare token must still decode")
+                .encode()
+                .unwrap(),
+            token
+        );
+    }
+
+    #[test]
+    fn neither_shape_swallows_garbage() {
+        assert!(decode_saved_ucan("not a ucan").is_err());
+        assert!(decode_saved_ucan(r#"{"node":"x"}"#).is_err());
     }
 }

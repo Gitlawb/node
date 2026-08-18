@@ -34,20 +34,22 @@ pub const DEFAULT_DIR_NAME: &str = ".gitlawb";
 /// An empty `GITLAWB_KEY` counts as unset. That is what a shell leaves behind for
 /// `FOO=` and for an unset variable expanded into a wrapper script, and reading it
 /// as a path would resolve against the process working directory instead.
-pub fn identity_key_path(home: &Path) -> Result<PathBuf> {
+pub fn identity_key_path(home: Option<&Path>) -> Result<PathBuf> {
     // `var_os`, not `var`: `var` folds a non-UTF-8 value into the same `Err` as
     // unset, so an operator whose key path is not valid UTF-8 would silently get
     // the default directory rather than theirs — or an error naming the real
     // problem.
     match std::env::var_os(KEY_ENV) {
         Some(raw) if !raw.is_empty() => resolve_key_value(Path::new(&raw), home),
-        _ => Ok(home.join(DEFAULT_DIR_NAME).join(KEY_FILE_NAME)),
+        _ => Ok(require_home(home)?
+            .join(DEFAULT_DIR_NAME)
+            .join(KEY_FILE_NAME)),
     }
 }
 
 /// The directory holding `identity.pem` and `delegations/` — the parent of
 /// [`identity_key_path`].
-pub fn identity_dir(home: &Path) -> Result<PathBuf> {
+pub fn identity_dir(home: Option<&Path>) -> Result<PathBuf> {
     let key = identity_key_path(home)?;
     key.parent().map(Path::to_path_buf).ok_or_else(|| {
         Error::Key(format!(
@@ -57,11 +59,27 @@ pub fn identity_dir(home: &Path) -> Result<PathBuf> {
     })
 }
 
+/// The home directory, demanded only where the value being resolved needs it.
+///
+/// An absolute `GITLAWB_KEY` never needs home, so requiring it up front would
+/// discard a perfectly good key on a host where `dirs::home_dir()` returns `None`
+/// — no `HOME` and no passwd entry, which is an ordinary container shape. The
+/// helper would then push unsigned, blaming the home directory for a setting the
+/// operator had configured correctly.
+fn require_home(home: Option<&Path>) -> Result<&Path> {
+    home.ok_or_else(|| {
+        Error::Key(format!(
+            "could not determine the home directory, which is needed to resolve this \
+             {KEY_ENV} value. Set {KEY_ENV} to an absolute path to avoid needing it."
+        ))
+    })
+}
+
 /// Apply the `GITLAWB_KEY` rules to a raw value.
 ///
 /// Split out from [`identity_key_path`] so the rules can be tested without setting
 /// a process-global environment variable, which would make the tests race.
-fn resolve_key_value(raw: &Path, home: &Path) -> Result<PathBuf> {
+fn resolve_key_value(raw: &Path, home: Option<&Path>) -> Result<PathBuf> {
     let path = expand_tilde(raw, home)?;
 
     if !path.is_absolute() {
@@ -95,7 +113,7 @@ fn resolve_key_value(raw: &Path, home: &Path) -> Result<PathBuf> {
 /// what lets the value stay an `OsStr` end to end: the helper's old
 /// `str::strip_prefix("~/")` needed a `String` first, which is why it reached for
 /// `env::var` and folded every non-UTF-8 path into "unset".
-fn expand_tilde(path: &Path, home: &Path) -> Result<PathBuf> {
+fn expand_tilde(path: &Path, home: Option<&Path>) -> Result<PathBuf> {
     let mut components = path.components();
     match components.next() {
         Some(Component::Normal(first)) if first == OsStr::new("~") => {
@@ -107,7 +125,7 @@ fn expand_tilde(path: &Path, home: &Path) -> Result<PathBuf> {
                     path.display()
                 )));
             }
-            Ok(home.join(rest))
+            Ok(require_home(home)?.join(rest))
         }
         _ => Ok(path.to_path_buf()),
     }
@@ -131,12 +149,12 @@ mod tests {
     #[test]
     fn absolute_value_is_taken_verbatim() {
         let raw = home().join("data").join("keys").join(KEY_FILE_NAME);
-        assert_eq!(resolve_key_value(&raw, &home()).unwrap(), raw);
+        assert_eq!(resolve_key_value(&raw, Some(&home())).unwrap(), raw);
     }
 
     #[test]
     fn tilde_slash_expands_to_the_home_directory() {
-        let resolved = resolve_key_value(Path::new("~/keys/identity.pem"), &home()).unwrap();
+        let resolved = resolve_key_value(Path::new("~/keys/identity.pem"), Some(&home())).unwrap();
         assert_eq!(resolved, home().join("keys").join(KEY_FILE_NAME));
     }
 
@@ -145,7 +163,8 @@ mod tests {
     /// shell, and the two binaries used to reach it by different routes.
     #[test]
     fn the_tilde_spelling_of_the_default_resolves_to_the_default() {
-        let resolved = resolve_key_value(Path::new("~/.gitlawb/identity.pem"), &home()).unwrap();
+        let resolved =
+            resolve_key_value(Path::new("~/.gitlawb/identity.pem"), Some(&home())).unwrap();
         assert_eq!(resolved, home().join(DEFAULT_DIR_NAME).join(KEY_FILE_NAME));
     }
 
@@ -156,7 +175,7 @@ mod tests {
     fn relative_values_are_refused() {
         for raw in ["identity.pem", "keys/identity.pem", "./keys/identity.pem"] {
             assert!(
-                resolve_key_value(Path::new(raw), &home()).is_err(),
+                resolve_key_value(Path::new(raw), Some(&home())).is_err(),
                 "{raw} is relative and must be refused"
             );
         }
@@ -168,7 +187,7 @@ mod tests {
     fn unsupported_tilde_forms_are_refused() {
         for raw in ["~", "~/", "~someone/keys/identity.pem"] {
             assert!(
-                resolve_key_value(Path::new(raw), &home()).is_err(),
+                resolve_key_value(Path::new(raw), Some(&home())).is_err(),
                 "{raw} must be refused rather than resolved"
             );
         }
@@ -177,7 +196,7 @@ mod tests {
     /// The root has no parent, so the delegation store would have nowhere to go.
     #[test]
     fn the_filesystem_root_is_refused() {
-        assert!(resolve_key_value(Path::new("/"), &home()).is_err());
+        assert!(resolve_key_value(Path::new("/"), Some(&home())).is_err());
     }
 
     /// The whole point of `var_os`: a non-UTF-8 value must reach the rules rather
@@ -191,14 +210,14 @@ mod tests {
 
         let relative = OsString::from_vec(b"keys/\xFF/identity.pem".to_vec());
         assert!(
-            resolve_key_value(Path::new(&relative), &home()).is_err(),
+            resolve_key_value(Path::new(&relative), Some(&home())).is_err(),
             "a non-UTF-8 relative path must be refused, not silently defaulted"
         );
 
         let mut absolute = OsString::from("/data/");
         absolute.push(OsString::from_vec(vec![0xFF]));
         absolute.push("/identity.pem");
-        let resolved = resolve_key_value(Path::new(&absolute), &home()).unwrap();
+        let resolved = resolve_key_value(Path::new(&absolute), Some(&home())).unwrap();
         assert_eq!(resolved.as_os_str(), absolute.as_os_str());
     }
 
@@ -215,9 +234,15 @@ mod tests {
         let restore = std::env::var_os(KEY_ENV);
 
         std::env::remove_var(KEY_ENV);
-        let unset = (identity_key_path(&home()), identity_dir(&home()));
+        let unset = (
+            identity_key_path(Some(&home())),
+            identity_dir(Some(&home())),
+        );
         std::env::set_var(KEY_ENV, "");
-        let empty = (identity_key_path(&home()), identity_dir(&home()));
+        let empty = (
+            identity_key_path(Some(&home())),
+            identity_dir(Some(&home())),
+        );
 
         match restore {
             Some(v) => std::env::set_var(KEY_ENV, v),
@@ -236,5 +261,39 @@ mod tests {
                 "{label} directory"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod no_home_tests {
+    use super::*;
+
+    /// An absolute key needs no home directory. Demanding one up front discarded a
+    /// correctly-configured `GITLAWB_KEY` on any host where `dirs::home_dir()`
+    /// returns `None` — no `HOME` and no passwd entry, an ordinary container shape —
+    /// and the helper then pushed unsigned while blaming the home directory.
+    #[test]
+    fn an_absolute_key_resolves_without_a_home_directory() {
+        let raw = if cfg!(windows) {
+            r"C:\data\keys\identity.pem"
+        } else {
+            "/data/keys/identity.pem"
+        };
+        let resolved = resolve_key_value(Path::new(raw), None)
+            .expect("an absolute key must not need a home directory");
+        assert_eq!(resolved, PathBuf::from(raw));
+        assert_eq!(resolved.parent().unwrap(), Path::new(raw).parent().unwrap());
+    }
+
+    /// The forms that genuinely need a home still say so, rather than resolving
+    /// somewhere arbitrary.
+    #[test]
+    fn the_forms_that_need_a_home_report_its_absence() {
+        let err = resolve_key_value(Path::new("~/keys/identity.pem"), None)
+            .expect_err("a ~/ path cannot resolve without a home directory");
+        assert!(
+            err.to_string().contains("home directory"),
+            "the error must name the missing home directory, got: {err}"
+        );
     }
 }
