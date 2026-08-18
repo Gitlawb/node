@@ -1149,6 +1149,10 @@ const OWNER_KEY_CASE_SQL: &str = "CASE WHEN owner_did LIKE 'did:key:%' AND posit
 /// named `did` (like in agent_profiles) instead of `owner_did`.
 const PROFILE_DID_CASE_SQL: &str = "CASE WHEN did LIKE 'did:key:%' AND position(':' in substr(did, 9)) = 0 THEN substr(did, 9) ELSE did END";
 
+/// SQL CASE expression byte-identical to `normalize_owner_key`, but for the
+/// `assignee_did` column on `agent_tasks`.
+const ASSIGNEE_DID_CASE_SQL: &str = "CASE WHEN assignee_did LIKE 'did:key:%' AND position(':' in substr(assignee_did, 9)) = 0 THEN substr(assignee_did, 9) ELSE assignee_did END";
+
 #[cfg(test)]
 mod normalize_owner_key_tests {
     use super::normalize_owner_key;
@@ -3743,38 +3747,51 @@ impl Db {
         limit: i64,
         after: Option<(&str, &str)>,
     ) -> Result<Vec<AgentTask>> {
-        let rows = sqlx::query(
+        // create_task stores the supplied assignee form unchanged. Compare the
+        // did:key short form so a `did:key:z...` filter matches a bare `z...`
+        // row (and the reverse), matching `did_matches` on the read path.
+        let assignee_key = assignee_did.map(normalize_owner_key);
+        let sql = format!(
             "SELECT id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline
              FROM agent_tasks
              WHERE ($1::text IS NULL OR status = $1)
-               AND ($2::text IS NULL OR assignee_did = $2)
+               AND ($2::text IS NULL OR ({key}) = $2)
                AND ($3::text IS NULL OR (created_at, id) < ($3, $4))
              ORDER BY created_at DESC, id DESC
              LIMIT $5",
-        )
-        .bind(status)
-        .bind(assignee_did)
-        .bind(after.map(|cursor| cursor.0))
-        .bind(after.map(|cursor| cursor.1))
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+            key = ASSIGNEE_DID_CASE_SQL
+        );
+        let rows = sqlx::query(&sql)
+            .bind(status)
+            .bind(assignee_key)
+            .bind(after.map(|cursor| cursor.0))
+            .bind(after.map(|cursor| cursor.1))
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows.into_iter().map(row_to_task).collect())
     }
 
     pub async fn claim_task(&self, id: &str, assignee_did: &str) -> Result<AgentTask> {
         let now = Utc::now().to_rfc3339();
-        let row = sqlx::query(
+        // Bind the presented DID for the write, and the normalized key for the
+        // pre-assignment guard. A designated assignee stored as a bare key
+        // must still be able to claim when the signer presents `did:key:...`.
+        let assignee_key = normalize_owner_key(assignee_did);
+        let sql = format!(
             "UPDATE agent_tasks SET status='claimed', assignee_did=$2, updated_at=$3
              WHERE id=$1 AND status='pending'
-               AND (assignee_did IS NULL OR assignee_did = $2)
+               AND (assignee_did IS NULL OR ({key}) = $4)
              RETURNING id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline",
-        )
-        .bind(id)
-        .bind(assignee_did)
-        .bind(&now)
-        .fetch_optional(&self.pool)
-        .await?;
+            key = ASSIGNEE_DID_CASE_SQL
+        );
+        let row = sqlx::query(&sql)
+            .bind(id)
+            .bind(assignee_did)
+            .bind(&now)
+            .bind(assignee_key)
+            .fetch_optional(&self.pool)
+            .await?;
         row.map(row_to_task)
             .ok_or_else(|| anyhow::anyhow!("task not claimable: not found or already claimed"))
     }
@@ -6083,6 +6100,49 @@ mod dedup_db_tests {
             assert_eq!(
                 sql_result, rust_result,
                 "PROFILE_DID_CASE_SQL(\"{val}\") mismatch: Rust = \"{rust_result}\", SQL CASE = \"{sql_result}\""
+            );
+        }
+    }
+
+    /// Verify that `ASSIGNEE_DID_CASE_SQL` (which aliases `assignee_did`) also
+    /// agrees with Rust `normalize_owner_key` across the full boundary matrix.
+    #[sqlx::test]
+    async fn assignee_did_case_sql_matches_normalize_owner_key(pool: PgPool) {
+        let boundary_values = [
+            "did:key:z6Mkfoo",
+            "z6Mkfoo",
+            "did:gitlawb:z6Mkfoo",
+            "did:web:example.com:alice",
+            "did:key:did:gitlawb:z6Mkfoo",
+            "",
+            "did:key:",
+            "DID:KEY:z6Mkfoo",
+        ];
+
+        let values_sql: String = boundary_values
+            .iter()
+            .map(|v| format!("('{}'::text)", v))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "WITH data(assignee_did) AS (VALUES {values_sql})
+             SELECT assignee_did, ({key}) AS normalized FROM data ORDER BY assignee_did",
+            key = super::ASSIGNEE_DID_CASE_SQL
+        );
+
+        let rows: Vec<(String, String)> = sqlx::query_as(&sql).fetch_all(&pool).await.unwrap();
+
+        assert_eq!(
+            rows.len(),
+            boundary_values.len(),
+            "every boundary value must produce a row"
+        );
+
+        for (val, sql_result) in &rows {
+            let rust_result = super::normalize_owner_key(val);
+            assert_eq!(
+                sql_result, rust_result,
+                "ASSIGNEE_DID_CASE_SQL(\"{val}\") mismatch: Rust = \"{rust_result}\", SQL CASE = \"{sql_result}\""
             );
         }
     }
