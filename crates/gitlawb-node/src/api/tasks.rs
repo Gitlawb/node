@@ -33,6 +33,16 @@ fn forbidden(msg: &str) -> (StatusCode, Json<Value>) {
     )
 }
 
+/// Map a db-layer `anyhow` from claim/finish: connection-class sqlx failures
+/// stay retryable 503, business "not claimable / not claimed" stays 409 with
+/// a fixed message (not the anyhow text).
+fn task_write_conflict(err: anyhow::Error, message: &str) -> AppError {
+    match AppError::from(err) {
+        db @ AppError::Db(_) => db,
+        _ => AppError::Conflict(message.into()),
+    }
+}
+
 // ── Request / response types ──────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -180,17 +190,21 @@ pub(crate) fn task_visible(
 #[derive(Debug, Clone)]
 pub(crate) struct VisibleTasks {
     pub tasks: Vec<AgentTask>,
-    /// True when the candidate scan hit `MAX_TASK_SCAN_CANDIDATES` before
-    /// filling `limit`, so the caller cannot tell an empty/short page from an
-    /// exhaustive one. Deliberately carries no cursor: the scan position at
-    /// that point is the last *examined* candidate, which may be a task the
-    /// caller was denied, and handing that back would let a denied read leak
-    /// the id/created_at of a row `GET /tasks/{id}` otherwise 404s (the same
-    /// id `claim_task` accepts). A caller can page with `after_created_at`/`after_id`
-    /// set to the last row they actually received; if a window of >= 1,000
-    /// consecutive denied tasks intervenes before the next visible row, pagination
-    /// anchored on that received row stalls at the candidate ceiling and
-    /// repeatedly returns empty results with `incomplete: true`.
+    /// True when the candidate scan hit `MAX_TASK_SCAN_CANDIDATES` and more
+    /// rows remain, so the caller cannot tell an empty/short page from an
+    /// exhaustive one. False when the last fetched batch was short or a
+    /// one-row probe past the ceiling is empty: exactly
+    /// `MAX_TASK_SCAN_CANDIDATES` rows with nothing beyond is a finished
+    /// stream, not a wall. Deliberately carries no cursor: the scan position
+    /// at that point is the last *examined* candidate, which may be a task
+    /// the caller was denied, and handing that back would let a denied read
+    /// leak the id/created_at of a row `GET /tasks/{id}` otherwise 404s (the
+    /// same id `claim_task` accepts). A caller can page with
+    /// `after_created_at`/`after_id` set to the last row they actually
+    /// received; if a window of >= 1,000 consecutive denied tasks
+    /// intervenes before the next visible row, pagination anchored on that
+    /// received row stalls at the candidate ceiling and repeatedly returns
+    /// empty results with `incomplete: true`.
     pub incomplete: bool,
 }
 
@@ -219,6 +233,7 @@ pub(crate) async fn collect_visible_tasks(
     let mut cursor: Option<(String, String)> =
         after.map(|(ts, id)| (ts.to_string(), id.to_string()));
     let mut scanned = 0;
+    let mut last_batch_full = false;
 
     while scanned < MAX_TASK_SCAN_CANDIDATES {
         let batch_limit = MAX_VISIBLE_TASKS.min(MAX_TASK_SCAN_CANDIDATES - scanned);
@@ -233,6 +248,7 @@ pub(crate) async fn collect_visible_tasks(
             )
             .await?;
         if tasks.is_empty() {
+            last_batch_full = false;
             break;
         }
         scanned += tasks.len() as i64;
@@ -264,7 +280,7 @@ pub(crate) async fn collect_visible_tasks(
             }
         }
 
-        let last_batch = tasks.len() < batch_limit as usize;
+        last_batch_full = tasks.len() >= batch_limit as usize;
         if visible.len() == bounded_limit as usize {
             // Page filled before the scan ceiling. The caller pages from the
             // last visible row; `incomplete` is reserved for the ceiling path.
@@ -273,13 +289,30 @@ pub(crate) async fn collect_visible_tasks(
                 incomplete: false,
             });
         }
-        if last_batch {
+        if !last_batch_full {
             break;
         }
         cursor = next_cursor;
     }
 
-    let incomplete = scanned >= MAX_TASK_SCAN_CANDIDATES;
+    // A full last batch at the ceiling is ambiguous: either more rows exist,
+    // or the table ended on an exact multiple of the batch size. Probe one
+    // more row so `incomplete` is false when the stream is exhausted.
+    let incomplete = if scanned >= MAX_TASK_SCAN_CANDIDATES && last_batch_full {
+        let more = db
+            .list_tasks_keyset(
+                status,
+                assignee_did,
+                1,
+                cursor
+                    .as_ref()
+                    .map(|(created_at, id)| (created_at.as_str(), id.as_str())),
+            )
+            .await?;
+        !more.is_empty()
+    } else {
+        false
+    };
 
     Ok(VisibleTasks {
         tasks: visible,
@@ -491,33 +524,22 @@ pub async fn claim_task(
     Extension(auth): Extension<AuthenticatedDid>,
     Path(id): Path<String>,
     Json(body): Json<ClaimTaskBody>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> crate::error::Result<Json<Value>> {
     // Bind the assignee to the authenticated signer (N13).
     if !crate::api::did_matches(&auth.0, &body.assignee_did) {
-        return Err(forbidden("assignee_did must be the authenticated signer"));
+        return Err(AppError::Forbidden(
+            "assignee_did must be the authenticated signer".into(),
+        ));
     }
     // Same visibility gate as complete/fail: invisible tasks are 404 so
     // existence is not leaked via a successful claim or a leaking 409.
     get_visible_task(&state.db, &id, Some(&auth.0))
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e.to_string() })),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "task not found" })),
-            )
+        .await?
+        .ok_or_else(|| AppError::NotFound("task not found".into()))?;
+    let task =
+        state.db.claim_task(&id, &auth.0).await.map_err(|e| {
+            task_write_conflict(e, "task not claimable: not found or already claimed")
         })?;
-    let task = state.db.claim_task(&id, &auth.0).await.map_err(|e| {
-        (
-            StatusCode::CONFLICT,
-            Json(json!({ "error": e.to_string() })),
-        )
-    })?;
     announce_task_event(
         &state.db,
         &state.task_event_tx,
@@ -539,41 +561,27 @@ pub async fn complete_task(
     Extension(auth): Extension<AuthenticatedDid>,
     Path(id): Path<String>,
     Json(body): Json<CompleteTaskBody>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> crate::error::Result<Json<Value>> {
     // Authorize the actor, not just bind their identity: the task must be visible
     // to the caller (returning 404 for invisible tasks so existence is not leaked),
     // and only the task's assignee may complete it.
     let existing = get_visible_task(&state.db, &id, Some(&auth.0))
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e.to_string() })),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "task not found" })),
-            )
-        })?;
+        .await?
+        .ok_or_else(|| AppError::NotFound("task not found".into()))?;
     if !crate::api::did_matches(
         &auth.0,
         existing.assignee_did.as_deref().unwrap_or_default(),
     ) {
-        return Err(forbidden("only the task assignee can complete it"));
+        return Err(AppError::Forbidden(
+            "only the task assignee can complete it".into(),
+        ));
     }
     let by_did = auth.0;
     let task = state
         .db
         .finish_task(&id, "completed", body.result.as_deref())
         .await
-        .map_err(|e| {
-            (
-                StatusCode::CONFLICT,
-                Json(json!({ "error": e.to_string() })),
-            )
-        })?;
+        .map_err(|e| task_write_conflict(e, "task not found or not in claimed state"))?;
     announce_task_event(
         &state.db,
         &state.task_event_tx,
@@ -595,29 +603,20 @@ pub async fn fail_task(
     Extension(auth): Extension<AuthenticatedDid>,
     Path(id): Path<String>,
     Json(body): Json<FailTaskBody>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> crate::error::Result<Json<Value>> {
     // Authorize the actor: the task must be visible to the caller (returning
     // 404 for invisible tasks so existence is not leaked), and only the task's
     // assignee may fail it.
     let existing = get_visible_task(&state.db, &id, Some(&auth.0))
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e.to_string() })),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "task not found" })),
-            )
-        })?;
+        .await?
+        .ok_or_else(|| AppError::NotFound("task not found".into()))?;
     if !crate::api::did_matches(
         &auth.0,
         existing.assignee_did.as_deref().unwrap_or_default(),
     ) {
-        return Err(forbidden("only the task assignee can fail it"));
+        return Err(AppError::Forbidden(
+            "only the task assignee can fail it".into(),
+        ));
     }
     let by_did = auth.0;
     let reason = body.reason.unwrap_or_default();
@@ -625,12 +624,7 @@ pub async fn fail_task(
         .db
         .finish_task(&id, "failed", Some(&reason))
         .await
-        .map_err(|e| {
-            (
-                StatusCode::CONFLICT,
-                Json(json!({ "error": e.to_string() })),
-            )
-        })?;
+        .map_err(|e| task_write_conflict(e, "task not found or not in claimed state"))?;
     announce_task_event(
         &state.db,
         &state.task_event_tx,
@@ -1339,6 +1333,14 @@ mod visible_tasks_tests {
             .with_state(state)
     }
 
+    fn assert_not_found_envelope(body: &serde_json::Value) {
+        assert_eq!(body["error"], "not_found");
+        assert_eq!(body["message"], "task not found");
+        let serialized = body.to_string();
+        assert!(!serialized.contains(SECRET_UCAN));
+        assert!(!serialized.contains("payload-data"));
+    }
+
     #[sqlx::test]
     async fn complete_and_fail_task_on_invisible_task_returns_404_not_403(pool: PgPool) {
         let state = test_state(pool).await;
@@ -1362,6 +1364,7 @@ mod visible_tasks_tests {
             StatusCode::NOT_FOUND,
             "completing an invisible task must 404, not leak existence via 403"
         );
+        assert_not_found_envelope(&body_json(complete_resp).await);
 
         let fail_resp = full_task_router(state)
             .oneshot(signed_request_as(
@@ -1377,6 +1380,7 @@ mod visible_tasks_tests {
             StatusCode::NOT_FOUND,
             "failing an invisible task must 404, not leak existence via 403"
         );
+        assert_not_found_envelope(&body_json(fail_resp).await);
     }
 
     #[sqlx::test]
@@ -1402,5 +1406,190 @@ mod visible_tasks_tests {
             StatusCode::NOT_FOUND,
             "claiming an invisible task must 404, not succeed or leak via 409"
         );
+        assert_not_found_envelope(&body_json(claim_resp).await);
+    }
+
+    /// Goes RED if `claim_task`'s `assignee_did IS NULL OR assignee_did = $2`
+    /// predicate is deleted: a public-repo pre-assigned task is visible to a
+    /// stranger, so only the SQL guard stops them from overwriting the
+    /// designated assignee.
+    #[sqlx::test]
+    async fn claim_task_does_not_steal_preassigned_assignee(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("public-repo", DELEGATOR, "public", true))
+            .await
+            .unwrap();
+        let mut assigned = task("preassigned", Some("public-repo"), DELEGATOR);
+        assigned.assignee_did = Some(ASSIGNEE.into());
+        state.db.create_task(&assigned).await.unwrap();
+
+        let stranger_resp = full_task_router(state.clone())
+            .oneshot(signed_request_as(
+                STRANGER,
+                Method::POST,
+                "/api/v1/tasks/preassigned/claim",
+                Body::from(format!(r#"{{"assignee_did":"{STRANGER}"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            stranger_resp.status(),
+            StatusCode::CONFLICT,
+            "a stranger must not claim a task pre-assigned to someone else"
+        );
+        let stranger_body = body_json(stranger_resp).await;
+        assert!(!stranger_body.to_string().contains(SECRET_UCAN));
+        assert_eq!(
+            state
+                .db
+                .get_task("preassigned")
+                .await
+                .unwrap()
+                .unwrap()
+                .assignee_did
+                .as_deref(),
+            Some(ASSIGNEE),
+            "hostile claim must leave the designated assignee in place"
+        );
+
+        let assignee_resp = full_task_router(state.clone())
+            .oneshot(signed_request_as(
+                ASSIGNEE,
+                Method::POST,
+                "/api/v1/tasks/preassigned/claim",
+                Body::from(format!(r#"{{"assignee_did":"{ASSIGNEE}"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(assignee_resp.status(), StatusCode::OK);
+        let claimed = body_json(assignee_resp).await;
+        assert_eq!(claimed["status"], "claimed");
+        assert_eq!(claimed["assignee_did"], ASSIGNEE);
+
+        let second_resp = full_task_router(state)
+            .oneshot(signed_request_as(
+                STRANGER,
+                Method::POST,
+                "/api/v1/tasks/preassigned/claim",
+                Body::from(format!(r#"{{"assignee_did":"{STRANGER}"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            second_resp.status(),
+            StatusCode::CONFLICT,
+            "a second claim after the assignee took the task must be refused"
+        );
+    }
+
+    /// Goes RED if `announce_task_event` is replaced with a bare `tx.send`:
+    /// a repo-less claim would then reach an anonymous subscriber.
+    #[sqlx::test]
+    async fn announce_task_event_skips_tasks_invisible_to_anonymous(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("public-repo", DELEGATOR, "public", true))
+            .await
+            .unwrap();
+        state
+            .db
+            .create_task(&task("pub-t", Some("public-repo"), DELEGATOR))
+            .await
+            .unwrap();
+        state
+            .db
+            .create_task(&task("priv-t", None, DELEGATOR))
+            .await
+            .unwrap();
+
+        let mut events = state.task_event_tx.subscribe();
+
+        let pub_resp = full_task_router(state.clone())
+            .oneshot(signed_request_as(
+                ASSIGNEE,
+                Method::POST,
+                "/api/v1/tasks/pub-t/claim",
+                Body::from(format!(r#"{{"assignee_did":"{ASSIGNEE}"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pub_resp.status(), StatusCode::OK);
+        let broadcast = events
+            .try_recv()
+            .expect("a publicly visible claim must broadcast");
+        assert_eq!(broadcast.task_id, "pub-t");
+        assert_eq!(broadcast.new_status, "claimed");
+
+        let priv_resp = full_task_router(state)
+            .oneshot(signed_request_as(
+                DELEGATOR,
+                Method::POST,
+                "/api/v1/tasks/priv-t/claim",
+                Body::from(format!(r#"{{"assignee_did":"{DELEGATOR}"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(priv_resp.status(), StatusCode::OK);
+        assert!(
+            events.try_recv().is_err(),
+            "a repo-less claim must not reach an anonymous subscriber"
+        );
+    }
+
+    #[sqlx::test]
+    async fn exhausted_scan_of_exactly_ceiling_candidates_is_not_incomplete(pool: PgPool) {
+        let state = test_state(pool).await;
+        for i in 0..MAX_TASK_SCAN_CANDIDATES {
+            let mut hidden = task(&format!("hidden-{i:04}"), None, DELEGATOR);
+            hidden.created_at = "2026-01-02T00:00:00Z".into();
+            hidden.updated_at = hidden.created_at.clone();
+            state.db.create_task(&hidden).await.unwrap();
+        }
+
+        let resp = list_router(state)
+            .oneshot(anon_get("/api/v1/tasks?limit=1"))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["count"], 0);
+        assert_eq!(
+            body["incomplete"], false,
+            "exactly {MAX_TASK_SCAN_CANDIDATES} denied rows with nothing beyond is a finished stream"
+        );
+    }
+
+    #[sqlx::test]
+    async fn task_mutations_closed_pool_returns_503_db_unavailable(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        pool.close().await;
+
+        for (uri, body) in [
+            (
+                "/api/v1/tasks/t1/claim",
+                format!(r#"{{"assignee_did":"{ASSIGNEE}"}}"#),
+            ),
+            ("/api/v1/tasks/t1/complete", r#"{"result":"done"}"#.into()),
+            ("/api/v1/tasks/t1/fail", r#"{"reason":"error"}"#.into()),
+        ] {
+            let resp = full_task_router(state.clone())
+                .oneshot(signed_request_as(
+                    ASSIGNEE,
+                    Method::POST,
+                    uri,
+                    Body::from(body),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{uri}: closed-pool outage during visibility pre-check must be retryable 503"
+            );
+            let json = body_json(resp).await;
+            assert_eq!(json["error"], "db_unavailable", "{uri}");
+        }
     }
 }

@@ -60,6 +60,7 @@ pub(crate) fn graphql_app_err(e: crate::error::AppError) -> async_graphql::Error
         // Curated client-safe variants — `Display` is intentional API text.
         safe @ (crate::error::AppError::RepoNotFound(_)
         | crate::error::AppError::RepoExists(_)
+        | crate::error::AppError::Conflict(_)
         | crate::error::AppError::NotFound(_)
         | crate::error::AppError::Unauthorized(_)
         | crate::error::AppError::Forbidden(_)
