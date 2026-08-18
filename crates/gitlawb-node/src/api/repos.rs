@@ -692,8 +692,17 @@ pub async fn git_info_refs(
         git_permit(&state.git_read_semaphore)?
     };
 
-    // For receive-pack (push), download the latest from Tigris so the client
-    // sees the same refs that acquire_write() will operate on.
+    // For receive-pack (push), read the latest from Tigris so the client sees
+    // the same refs that acquire_write() will operate on. A NON-MUTATING
+    // snapshot, not `acquire_fresh`: the advertisement runs WITHOUT the advisory
+    // lock, and acquire_fresh downloads and publishes into the live repo path
+    // (removing the existing directory and renaming the extract into place), so
+    // an unlocked advertisement could delete or swap the directory under a
+    // concurrent guarded write. In the worst ordering the guarded write has
+    // finished but `release` has not compressed the tree, and the guarded
+    // release uploads the replaced old tree with its still-valid ETag and
+    // reports success, losing the accepted write. The snapshot unpacks into a
+    // throwaway temp dir that is served from and then removed.
     //
     // Bound the acquire under `git_acquire_timeout_secs`: the concurrency permit is
     // already held above, and `git_service_timeout_secs` only starts once git spawns,
@@ -706,13 +715,15 @@ pub async fn git_info_refs(
         let res = if service == "git-receive-pack" {
             state
                 .repo_store
-                .acquire_fresh(&record.owner_did, &record.name)
+                .read_snapshot(&record.owner_did, &record.name)
                 .await
+                .map(|s| (s.path().to_path_buf(), Some(s)))
         } else {
             state
                 .repo_store
                 .acquire(&record.owner_did, &record.name)
                 .await
+                .map(|p| (p, None))
         };
         res.map_err(|e| {
             if is_expected_transient_acquire_failure(&e) {
@@ -732,7 +743,10 @@ pub async fn git_info_refs(
             }
         })
     };
-    let disk_path = tokio::time::timeout(acquire_deadline, acquire_fut)
+    // The snapshot (if any) is kept alive for the whole handler scope below: its
+    // Drop removes the temp dir it was unpacked into, so dropping it here would
+    // delete the directory `info_refs` is about to serve from.
+    let (disk_path, _snapshot_keepalive) = tokio::time::timeout(acquire_deadline, acquire_fut)
         .await
         .map_err(|_elapsed| {
             tracing::warn!(repo = %name, service = %service, "repo acquire timed out; shedding with 503");
@@ -2826,11 +2840,28 @@ pub async fn fork_repo(
         )));
     }
 
-    // Upload fork to Tigris
+    // Upload fork to Tigris. Create-only: a refused precondition means an orphan
+    // archive already sits under this key (a failed create_repo or another
+    // writer), and proceeding would create a DB record whose archive is shadowed
+    // by bytes that are not this fork. Refuse rather than accept a fork other
+    // nodes would fetch as unrelated content. The local clone is cleaned up on
+    // this path by the caller's error return dropping the handler state.
     state
         .repo_store
         .release_after_write(&forker_did, &fork_name)
-        .await;
+        .await
+        .map_err(|e| match e {
+            crate::git::tigris::UploadError::PreconditionLost { status } => {
+                tracing::warn!(
+                    forker = %forker_did,
+                    fork = %fork_name,
+                    status,
+                    "fork refused: an archive already exists under the fork's key"
+                );
+                AppError::RepoExists(fork_name.clone())
+            }
+            other => AppError::Git(format!("fork upload failed: {other}")),
+        })?;
 
     let now = Utc::now();
     let record = crate::db::RepoRecord {

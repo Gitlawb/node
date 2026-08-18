@@ -225,12 +225,51 @@ pub async fn close_issue(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, repo, issue_id)): Path<(String, String, String)>,
+    headers: axum::http::HeaderMap,
+    crate::rate_limit::PeerAddr(peer): crate::rate_limit::PeerAddr,
 ) -> Result<Json<serde_json::Value>> {
     let record = state
         .db
         .get_repo(&owner, &repo)
         .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+
+    // Per-IP flood brake, layered on the same shared limiter and trusted-proxy
+    // policy as the push advertisement. The pre-lock snapshot downloads the
+    // whole archive and runs a blocking extraction, so an unlimited route would
+    // let disposable identities drive unbounded transfer/CPU/disk with parallel
+    // close requests for arbitrary issue ids. Applied before the snapshot work
+    // so a rejected request does none of it.
+    if let Some(key) = crate::rate_limit::client_key(&headers, peer, state.push_limiter_trust) {
+        if !state.push_rate_limiter.check(&key).await {
+            tracing::warn!(repo = %repo, key = %key, "close_issue rate limited");
+            return Err(AppError::TooManyRequests(
+                "rate limit exceeded — try again later".into(),
+            ));
+        }
+    }
+
+    // READ-GATE before any snapshot work. The author fallback below needs the
+    // issue blob, which needs the repo tree, so authorship cannot be established
+    // without a download; but a caller who cannot even READ the repo must be
+    // stopped here, cheaply, before any Tigris transfer or extraction happens.
+    // Without this, any signed non-owner could issue parallel close requests for
+    // arbitrary issue ids and drive unbounded downloads and blocking extraction
+    // (a disposable-identity DoS), because the route has no other pre-authorization.
+    {
+        let rules = state.db.list_visibility_rules(&record.id).await?;
+        let caller = auth.0.as_str();
+        if crate::visibility::visibility_check(
+            &rules,
+            record.is_public,
+            &record.owner_did,
+            Some(caller),
+            "/",
+        ) == crate::visibility::Decision::Deny
+        {
+            return Err(AppError::RepoNotFound(format!("{owner}/{repo}")));
+        }
+    }
 
     // AUTHORIZE BEFORE ACQUIRING. The per-repo advisory lock genuinely excludes
     // now, so taking it first would hand any caller with read access a way to hold
@@ -263,11 +302,23 @@ pub async fn close_issue(
         // dir instead of publishing into the live repo path — an unlocked
         // pre-check must not delete or swap the directory under a concurrent
         // guarded write on the same path.
-        let snapshot = state
-            .repo_store
-            .read_snapshot(&record.owner_did, &record.name)
-            .await?;
+        let snapshot = tokio::time::timeout(
+            std::time::Duration::from_secs(state.config.lock_held_transfer_timeout_secs),
+            state
+                .repo_store
+                .read_snapshot(&record.owner_did, &record.name),
+        )
+        .await
+        .map_err(|_elapsed| {
+            tracing::warn!(
+                repo = %repo,
+                bound_secs = state.config.lock_held_transfer_timeout_secs,
+                "close_issue snapshot exceeded the transfer bound — shedding as a retryable refusal"
+            );
+            AppError::RepoUnavailable
+        })??;
         let snapshot_path = snapshot.path().to_path_buf();
+
         let author_did: Option<String> = match git_issues::get_issue(&snapshot_path, &issue_id) {
             Ok(Some(raw)) => serde_json::from_str::<IssueRecord>(&raw)
                 .ok()
@@ -434,6 +485,8 @@ mod tests {
                     "u7repo".to_string(),
                     "1".to_string(),
                 )),
+                axum::http::HeaderMap::new(),
+                crate::rate_limit::PeerAddr(Some("203.0.113.64:5000".parse().unwrap())),
             ),
         )
         .await;
@@ -450,8 +503,53 @@ mod tests {
         );
     }
 
-    /// Seed a real bare repo with one issue blob whose author is `author_did`, at
-    /// the on-disk path the store will resolve for (owner_did, repo).
+    /// The read-gate added for the pre-lock snapshot: a caller who cannot READ
+    /// the repo (private repo, no rule granting them access) must be refused with
+    /// a not-found BEFORE any snapshot download or extraction happens. The
+    /// observable is the refusal itself; the cheaper part (no Tigris work) is
+    /// structural (the gate precedes the snapshot call in the handler).
+    #[sqlx::test]
+    async fn non_reader_is_refused_before_the_snapshot(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let now = chrono::Utc::now();
+        state
+            .db
+            .create_repo(&crate::db::RepoRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "priv-close".to_string(),
+                owner_did: "z6MkT3Owner".to_string(),
+                description: None,
+                is_public: false,
+                default_branch: "main".to_string(),
+                created_at: now,
+                updated_at: now,
+                disk_path: "/tmp/priv-close".to_string(),
+                forked_from: None,
+                machine_id: None,
+            })
+            .await
+            .expect("seed private repo");
+
+        let stranger = crate::auth::AuthenticatedDid("did:key:z6MkT3Stranger".to_string());
+        let res = close_issue(
+            axum::extract::State(state.clone()),
+            axum::Extension(stranger),
+            axum::extract::Path((
+                "z6MkT3Owner".to_string(),
+                "priv-close".to_string(),
+                "1".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(Some("203.0.113.67:5000".parse().unwrap())),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(AppError::RepoNotFound(_))),
+            "a non-reader must be refused as not-found, got {:?}",
+            res.err().map(|e| format!("{e:?}"))
+        );
+    }
+
     async fn seed_repo_with_issue(
         state: &crate::state::AppState,
         owner_slug: &str,
@@ -530,6 +628,8 @@ mod tests {
                 "t1repo".to_string(),
                 "1".to_string(),
             )),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(Some("203.0.113.65:5000".parse().unwrap())),
         )
         .await;
         assert!(
@@ -563,6 +663,8 @@ mod tests {
                 "t2repo".to_string(),
                 "1".to_string(),
             )),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(Some("203.0.113.66:5000".parse().unwrap())),
         )
         .await;
         assert!(

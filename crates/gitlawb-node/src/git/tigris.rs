@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
-use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::Client as S3Client;
 use tracing::{debug, info};
 
@@ -187,12 +186,18 @@ impl TigrisClient {
             // EncryptionTypeMismatch, InvalidRequest, InvalidWriteOffset,
             // TooManyParts, Unhandled), so a refused precondition arrives as
             // `Unhandled` and matching the enum would classify it as a generic
-            // failure. The raw HTTP status off the service-error response is the
-            // only place the answer actually lives.
-            let status = match &e {
-                SdkError::ServiceError(ctx) => Some(ctx.raw().status().as_u16()),
-                _ => None,
-            };
+            // failure. The raw HTTP status off the response is the only place the
+            // answer actually lives.
+            //
+            // Read it via `raw_response()`, not a `ServiceError`-only match: the
+            // SDK exposes the raw response for BOTH `ServiceError` and
+            // `ResponseError`, and a refused conditional PUT whose error body the
+            // SDK cannot parse (malformed XML, premature close) surfaces as
+            // `ResponseError`. Matching only `ServiceError` would classify that
+            // unparsable 409/412 as a generic failure, and `RepoWriteGuard::release`
+            // would log-and-succeed instead of taking the supersede retry,
+            // acknowledging a write that was definitively not published.
+            let status = e.raw_response().map(|raw| raw.status().as_u16());
             // 412 is always a lost precondition. 409 is one only when we asked
             // for create-only, which is how S3-compatible stores report "the key
             // already exists". Everything else, 404 included, is a real failure:
@@ -265,26 +270,44 @@ impl TigrisClient {
             .context("reading tigris response body")?
             .into_bytes();
 
+        // The snapshot temp dir is decided HERE, in the async layer, before the
+        // extraction runs. The extraction itself is uncancellable spawn_blocking,
+        // so the dir is created no matter what happens to this future; an
+        // async-layer guard that owns the path removes it when this future is
+        // dropped mid-await (client disconnect, a bounded-transfer timeout).
+        let snapshot_tmp = if publish {
+            None
+        } else {
+            let parent = target.parent().context("snapshot path has no parent")?;
+            std::fs::create_dir_all(parent).context("creating parent dir")?;
+            let file_name = target
+                .file_name()
+                .context("snapshot path has no file name")?
+                .to_string_lossy();
+            Some(parent.join(format!(
+                ".{file_name}.tmp-snapshot.{}",
+                uuid::Uuid::new_v4()
+            )))
+        };
+        // Armed before the extraction await; disarmed on the success return via
+        // `mem::forget`, leaving the dir to the caller (RepoSnapshot::drop). On
+        // any other exit, including a cancelled future, the guard removes the
+        // dir. This is what closes the leak where a dropped read_snapshot future
+        // abandons a completed extraction.
+        let _cleanup = snapshot_tmp.as_ref().map(|p| SnapshotCleanup(p.clone()));
+
         // Extract tar.zst to a directory.
         let extracted = tokio::task::spawn_blocking({
             let target = target.to_path_buf();
+            let snapshot_tmp = snapshot_tmp.clone();
             move || -> Result<PathBuf> {
                 if publish {
                     decompress_repo(&data, &target)?;
                     return Ok(target);
                 }
-                // Non-mutating snapshot: unpack into a fresh temp dir under the
-                // target's parent. The live repo path is never touched.
-                let parent = target.parent().context("snapshot path has no parent")?;
-                std::fs::create_dir_all(parent).context("creating parent dir")?;
-                let file_name = target
-                    .file_name()
-                    .context("snapshot path has no file name")?
-                    .to_string_lossy();
-                let tmp_dir = parent.join(format!(
-                    ".{file_name}.tmp-snapshot.{}",
-                    uuid::Uuid::new_v4()
-                ));
+                // Non-mutating snapshot: unpack into the temp dir decided above.
+                // The live repo path is never touched.
+                let tmp_dir = snapshot_tmp.expect("snapshot path was decided above");
                 std::fs::create_dir_all(&tmp_dir).context("creating temp extract dir")?;
                 let unpack = (|| -> Result<()> {
                     let decoder = zstd::stream::Decoder::new(&data[..])?;
@@ -302,6 +325,11 @@ impl TigrisClient {
         .await
         .context("extract task panicked")?
         .context("extracting repo")?;
+
+        // The dir is now the caller's to own: drop the cleanup guard without
+        // removing anything. On a future drop before this point, `_cleanup` runs
+        // and removes the dir even though the extraction completed.
+        std::mem::forget(_cleanup);
 
         info!(key = %key, path = %target.display(), "downloaded repo from tigris");
         Ok(extracted)
@@ -352,6 +380,20 @@ fn publish_lock(local_path: &Path) -> Arc<Mutex<()>> {
     map.entry(local_path.to_path_buf())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
+}
+
+/// Async-layer cleanup for a snapshot temp dir that the extraction's
+/// `spawn_blocking` created and that would otherwise outlive a cancelled
+/// `download_to` future. Armed before the extraction await, disarmed (via
+/// `mem::forget`) on success so `RepoSnapshot::drop` stays the single owner; on
+/// any other exit the dir is removed even though the extraction ran to
+/// completion.
+struct SnapshotCleanup(PathBuf);
+
+impl Drop for SnapshotCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Decompress a tar.zst byte vector into a local directory.
@@ -467,9 +509,14 @@ mod tests {
         }
         match req.send().await {
             Ok(_) => Ok(None),
-            Err(e) => match &e {
-                SdkError::ServiceError(ctx) => Ok(Some(ctx.raw().status().as_u16())),
-                _ => Err(format!("conditional PUT {key}: no HTTP response: {e}")),
+            Err(e) => match e.raw_response() {
+                // Same raw-response rule as `upload`: a refused conditional PUT
+                // whose body the SDK cannot parse surfaces as `ResponseError`, and
+                // the status has to come off the raw response for both variants.
+                // Without it, an unparsable 409/412 would report "no HTTP
+                // response" here and skip the supersede retry.
+                Some(raw) => Ok(Some(raw.status().as_u16())),
+                None => Err(format!("conditional PUT {key}: no HTTP response: {e}")),
             },
         }
     }

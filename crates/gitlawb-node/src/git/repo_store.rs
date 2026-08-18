@@ -199,88 +199,20 @@ impl RepoStore {
         Ok(local_path)
     }
 
-    /// Ensure a repo is available on local disk with the **latest** Tigris state.
-    /// Use this for operations that precede a write (e.g. `info/refs` for
-    /// `git-receive-pack`) so the client sees the same refs that `acquire_write()`
-    /// will operate on.
-    ///
-    /// A failed existence check refuses the acquire rather than guessing the
-    /// archive is absent, matching the under-lock path in `acquire_write()`.
-    pub async fn acquire_fresh(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
-        let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
-
-        if let Some(ref tigris) = self.tigris {
-            // The HEAD and the download fail for epistemically DIFFERENT reasons,
-            // so they are kept apart rather than collapsed into one `Result`. The
-            // `unwrap_or(false)` this replaced read a HEAD error as "no archive"
-            // and silently advertised a possibly-stale local copy to a client that
-            // is about to push against it.
-            match tigris.exists(&owner_slug, repo_name).await {
-                Ok(true) => {
-                    debug!(repo = %repo_name, "acquire_fresh: downloading latest from tigris");
-                    if let Err(e) = tigris.download(&owner_slug, repo_name, &local_path).await {
-                        // The Tigris archive is present (HEAD ok) but unreadable — a
-                        // corrupt/partial upload, or a transient GET failure. If we have a
-                        // valid local copy, proceed with it rather than blocking the write;
-                        // the post-write upload re-syncs (self-heals) Tigris. Only hard-fail
-                        // when there is no local copy to fall back to.
-                        if local_path.exists() {
-                            warn!(repo = %repo_name, err = %e,
-                                "acquire_fresh: tigris download failed — falling back to local copy");
-                            return Ok(local_path);
-                        }
-                        // No local copy, so the write cannot proceed and the archive's
-                        // readability is unknowable. Same epistemic class as the HEAD arm
-                        // and the under-lock refresh: a transient storage blip must be a
-                        // retryable refusal, not a 500 that tells the client the failure
-                        // is permanent. Wrap so the handler layer's `RepoUnavailable`
-                        // downcast maps this to a retryable 503 with a fixed body; the
-                        // detail (which repo, why) stays in this warn and the context.
-                        warn!(repo = %repo_name, err = %e,
-                            "acquire_fresh: tigris download failed and no local copy exists — refusing");
-                        return Err(anyhow::Error::new(RepoUnavailable).context(format!(
-                            "tigris download failed during acquire_fresh for {owner_slug}/{repo_name}: {e:#}"
-                        )));
-                    }
-                    return Ok(local_path);
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    // We do not know whether a newer archive exists, so we cannot
-                    // tell whether the local copy is current. Advertising stale refs
-                    // here sends the client into a push computed against the wrong
-                    // base, so refuse for the same reason `acquire_write` refuses on
-                    // this condition. A transient storage blip costs a retryable
-                    // refusal, which is the cheaper failure.
-                    warn!(repo = %repo_name, err = %e,
-                        "acquire_fresh: tigris HEAD failed — refusing rather than \
-                         guessing the archive is absent");
-                    return Err(anyhow::Error::new(RepoUnavailable).context(format!(
-                        "tigris HEAD failed during acquire_fresh for {owner_slug}/{repo_name}"
-                    )));
-                }
-            }
-        }
-
-        // Tigris disabled or repo not in Tigris — fall back to local
-        Ok(local_path)
-    }
-
     /// Non-mutating snapshot of a repo's **latest** Tigris state, for reads that
     /// must see fresh data but must NOT write into the live repo path.
     ///
-    /// Unlike `acquire_fresh`, which downloads and PUBLISHES into the live
-    /// directory (removing the existing dir and renaming the extract into
-    /// place), this unpacks into a throwaway temp dir and returns it. The live
-    /// path is never touched, so an unlocked caller cannot delete or swap the
-    /// directory under a concurrent guarded write.
+    /// The fresh-acquire form this replaced (`acquire_fresh`) downloaded and
+    /// PUBLISHED into the live directory (removing the existing dir and renaming
+    /// the extract into place); this unpacks into a throwaway temp dir and
+    /// returns it. The live path is never touched, so an unlocked caller cannot
+    /// delete or swap the directory under a concurrent guarded write.
     ///
     /// The returned snapshot owns its temp dir and removes it on drop; when
     /// there is no Tigris backend (or no archive), the snapshot borrows the live
     /// local path and owns nothing. A HEAD failure refuses rather than guessing,
-    /// matching `acquire_fresh` and the under-lock refresh path: a transient
-    /// storage blip must be a retryable refusal (`RepoUnavailable`), not a 500
-    /// or a silently stale read.
+    /// matching the under-lock refresh path: a transient storage blip must be a
+    /// retryable refusal (`RepoUnavailable`), not a 500 or a silently stale read.
     pub async fn read_snapshot(&self, owner_did: &str, repo_name: &str) -> Result<RepoSnapshot> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
 
@@ -288,6 +220,13 @@ impl RepoStore {
             match tigris.exists(&owner_slug, repo_name).await {
                 Ok(true) => {
                     // Snapshot form: unpack into a temp dir, never the live path.
+                    //
+                    // Cancellation cleanup: the extraction runs in a
+                    // `spawn_blocking` that cannot be aborted, so a dropped
+                    // future (client disconnect, a bounded-transfer timeout)
+                    // still leaves the temp dir on disk. The cleanup has to live
+                    // in the ASYNC layer, armed for the whole download await and
+                    // disarmed only when `RepoSnapshot` takes ownership.
                     let snapshot = tigris
                         .download_to(&owner_slug, repo_name, &local_path, false)
                         .await
@@ -573,7 +512,17 @@ impl RepoStore {
                         // overwrite this carries the ETag to prevent.
                         guard.publish_fence = fence;
                     } else {
-                        return Err(err).context("downloading repo from tigris for write");
+                        // No local copy, so the write cannot proceed and the
+                        // archive's readability is unknowable. Same epistemic
+                        // class as the HEAD arm: a transient storage blip must be
+                        // a retryable refusal, not a 500 that tells the client the
+                        // failure is permanent. Wrap so the handler layer's
+                        // `RepoUnavailable` downcast maps this to a retryable 503
+                        // with a fixed body; the detail (which repo, why) stays in
+                        // this error chain for the log.
+                        return Err(anyhow::Error::new(RepoUnavailable).context(format!(
+                            "tigris download failed during acquire_write for {owner_slug}/{repo_name}: {err:#}"
+                        )));
                     }
                 }
                 Some(Err(RefreshFailure::Unknown(e))) => {
@@ -667,20 +616,32 @@ impl RepoStore {
 
     /// Upload a repo to Tigris after a write operation (push, merge, fork, etc.).
     /// Call this after any operation that modifies the git repo on disk.
-    pub async fn release_after_write(&self, owner_did: &str, repo_name: &str) {
+    ///
+    /// Returns `Err(UploadError::PreconditionLost)` when the create-only upload was
+    /// refused because the key already exists. That is a DISTINCT outcome from a
+    /// plain upload failure: the sole caller (fork creation) uses it to refuse the
+    /// fork rather than create a DB record whose archive is shadowed by an orphan
+    /// other nodes would fetch. Plain upload failures are logged and return `Ok`
+    /// for the same reason the guard's release logs-and-succeeds: the local write
+    /// is done and the storage retry is the operator's.
+    pub async fn release_after_write(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+    ) -> Result<(), UploadError> {
         if let Some(ref tigris) = self.tigris {
             let (owner_slug, local_path) = match self.local_path(owner_did, repo_name) {
                 Ok(p) => p,
                 Err(e) => {
                     warn!(repo = %repo_name, err = %e, "rejected unsafe path in release_after_write");
-                    return;
+                    return Err(UploadError::Other(e));
                 }
             };
             // Create-only. The sole caller is fork creation, which rejects a
             // name conflict in the database before it clones anything, so the
             // key is expected absent here (and archive keys are never deleted:
             // `delete` has no callers). A refusal therefore means someone else
-            // already published this key, and dropping our bytes is correct.
+            // already published this key.
             match tigris
                 .upload(
                     &owner_slug,
@@ -691,16 +652,15 @@ impl RepoStore {
                 .await
             {
                 Ok(()) => {}
-                // Kept apart from the warn arm so the fence working does not
-                // read as a storage failure.
-                Err(UploadError::PreconditionLost { status }) => {
-                    info!(repo = %repo_name, status, "dropped the post-write upload: another writer already published this repo");
-                }
+                // Propagated, not logged as success: an orphan archive under
+                // this key shadows the fork for every other node.
+                Err(e @ UploadError::PreconditionLost { .. }) => return Err(e),
                 Err(e) => {
                     warn!(repo = %repo_name, err = %e, "failed to upload repo to tigris after write");
                 }
             }
         }
+        Ok(())
     }
 
     /// Compute the local disk path and owner slug for a repo.
@@ -3221,80 +3181,6 @@ mod tests {
         TigrisClient::for_testing_with_endpoint("test-bucket", "http://127.0.0.1:1")
     }
 
-    /// A failed HEAD tells us nothing about whether a newer archive exists, so
-    /// the pre-write refresh must refuse rather than read the failure as "no
-    /// archive" and serve a possibly-stale local copy to the pushing client.
-    ///
-    /// Asserts on the downcast, not the message, so a context rewrite cannot
-    /// quietly make this vacuous.
-    #[sqlx::test]
-    async fn acquire_fresh_refuses_when_the_head_check_fails(pool: PgPool) {
-        let opts = (*pool.connect_options()).clone();
-        let lock_pool = no_reap_pool(&opts, 2).await;
-        let store = RepoStore::for_testing_with_tigris(
-            PathBuf::from("/tmp/gitlawb-headfail-fresh"),
-            lock_pool,
-            unreachable_tigris(),
-        );
-
-        let err = store
-            .acquire_fresh("did:key:z6MkHeadFail", "freshrepo")
-            .await
-            .expect_err("a failed HEAD must refuse rather than serve the local copy");
-        assert!(
-            err.downcast_ref::<RepoUnavailable>().is_some(),
-            "the refusal must be typed so the handler layer maps it to a retryable 503, got {err:#}"
-        );
-    }
-
-    /// A download that fails when the HEAD succeeded tells us the archive is
-    /// present but unreadable, and with no local copy to fall back on the
-    /// pre-write refresh must refuse as `RepoUnavailable` — not leak a bare
-    /// Tigris error that the handler layer would map to a non-retryable 500.
-    ///
-    /// The server answers HEAD 200 and GET 500, so `exists()` returns
-    /// `Ok(true)` while `download()` fails at the transport layer, exactly the
-    /// "archive present per HEAD, GET failed, no local fallback" state.
-    #[sqlx::test]
-    async fn acquire_fresh_refuses_when_the_download_fails_and_no_local_copy_exists(pool: PgPool) {
-        use axum::response::IntoResponse;
-
-        let app = axum::Router::new().route(
-            "/{*key}",
-            axum::routing::any(|method: axum::http::Method| async move {
-                if method == axum::http::Method::HEAD {
-                    axum::http::StatusCode::OK.into_response()
-                } else {
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let opts = (*pool.connect_options()).clone();
-        let lock_pool = no_reap_pool(&opts, 2).await;
-        let store = RepoStore::for_testing_with_tigris(
-            PathBuf::from("/tmp/gitlawb-getfail-fresh"),
-            lock_pool,
-            TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint),
-        );
-
-        let err = store
-            .acquire_fresh("did:key:z6MkGetFail", "freshrepo")
-            .await
-            .expect_err("a failed download with no local copy must refuse");
-        assert!(
-            err.downcast_ref::<RepoUnavailable>().is_some(),
-            "the refusal must be typed so the handler layer maps it to a retryable 503, got {err:#}"
-        );
-
-        server.abort();
-    }
-
     /// The under-lock sibling of the above. `acquire_write` already refuses on
     /// this condition; this proves the `RefreshFailure::Unknown` arm end to end
     /// against a real failing HEAD rather than by reading the code.
@@ -3324,6 +3210,63 @@ mod tests {
             err.downcast_ref::<RepoUnavailable>().is_some(),
             "the refusal must be typed so the handler layer maps it to a retryable 503, got {err:#}"
         );
+    }
+
+    /// P2 (cold-cache): the under-lock refresh's HEAD succeeds but the GET fails
+    /// on a node with no local copy. The download arm must refuse as
+    /// `RepoUnavailable` (retryable 503), matching the HEAD arm and the
+    /// `acquire_fresh` sibling, not a bare anyhow error that the handler layer
+    /// maps to a permanent 500.
+    #[sqlx::test]
+    async fn acquire_write_refuses_when_the_download_fails_and_no_local_copy_exists(pool: PgPool) {
+        use axum::response::IntoResponse;
+
+        let app = axum::Router::new().route(
+            "/{*key}",
+            axum::routing::any(|method: axum::http::Method| async move {
+                if method == axum::http::Method::HEAD {
+                    // A real Tigris HEAD 200 carries the generation ETag. Without
+                    // it `head_etag` errors and the test would exercise the HEAD
+                    // arm, not the download arm this test exists for.
+                    let mut resp = axum::http::StatusCode::OK.into_response();
+                    resp.headers_mut()
+                        .insert("etag", axum::http::HeaderValue::from_static("\"gen-1\""));
+                    resp
+                } else {
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let opts = (*pool.connect_options()).clone();
+        let lock_pool = no_reap_pool(&opts, 2).await;
+        let store = RepoStore::for_testing_with_tigris(
+            PathBuf::from("/tmp/gitlawb-getfail-write"),
+            lock_pool,
+            TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint),
+        );
+
+        let err = match store
+            .acquire_write("did:key:z6MkGetFailWrite", "writerepo")
+            .await
+        {
+            Err(e) => e,
+            Ok(guard) => {
+                let _ = guard.release(false).await;
+                panic!("a failed download with no local copy must refuse the write");
+            }
+        };
+        assert!(
+            err.downcast_ref::<RepoUnavailable>().is_some(),
+            "the refusal must be typed so the handler layer maps it to a retryable 503, got {err:#}"
+        );
+
+        server.abort();
     }
 
     /// The transfer bound is a knob, so it gets the same parse/default/reject-zero
@@ -4393,6 +4336,129 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    /// The P1 raw-response case: a conditional PUT refused with an UNPARSABLE
+    /// 409/412 body (malformed XML, premature close). The SDK cannot map that to
+    /// a modeled service error, so it surfaces as `SdkError::ResponseError`, and
+    /// the status has to be read off the raw response, not off a
+    /// `ServiceError`-only match. A lost precondition reported as `Other` here
+    /// would make `RepoWriteGuard::release` log-and-succeed instead of taking the
+    /// supersede retry, acknowledging a write that was definitively not
+    /// published.
+    #[tokio::test]
+    async fn upload_classifies_an_unparsable_409_as_precondition_lost() {
+        let app = axum::Router::new().route(
+            "/{*key}",
+            axum::routing::any(|| async {
+                (
+                    axum::http::StatusCode::CONFLICT,
+                    "this is not xml, so the sdk cannot model an error from it",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint);
+        let dir = payload_dir("unparsable-conflict");
+
+        let err = client
+            .upload("owner", "repo", dir.path(), UploadPrecondition::IfAbsent)
+            .await
+            .expect_err("409 must be an error");
+        assert!(
+            matches!(err, UploadError::PreconditionLost { status: 409 }),
+            "an unparsable 409 under IfAbsent is still a lost precondition, got {err:?}"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn upload_classifies_an_unparsable_412_as_precondition_lost() {
+        let app = axum::Router::new().route(
+            "/{*key}",
+            axum::routing::any(|| async {
+                (axum::http::StatusCode::PRECONDITION_FAILED, "also not xml")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint);
+        let dir = payload_dir("unparsable-stale");
+
+        let err = client
+            .upload(
+                "owner",
+                "repo",
+                dir.path(),
+                UploadPrecondition::IfMatch("\"stale\"".to_string()),
+            )
+            .await
+            .expect_err("412 must be an error");
+        assert!(
+            matches!(err, UploadError::PreconditionLost { status: 412 }),
+            "an unparsable 412 is a lost precondition, got {err:?}"
+        );
+
+        server.abort();
+    }
+
+    /// P2 (fork orphan): `release_after_write` must surface a refused create-only
+    /// upload as `PreconditionLost`, not swallow it as success. The fork handler
+    /// relies on that to refuse creating a DB record whose archive is shadowed by
+    /// an orphan (a failed `create_repo` left bytes under the key, or another
+    /// writer got there first). Without the propagation, the fork reports success
+    /// and every other node fetches the unrelated archive.
+    #[tokio::test]
+    async fn release_after_write_refuses_when_the_key_already_exists() {
+        let mock = S3Mock::start().await;
+        let client = TigrisClient::for_testing_with_endpoint("test-bucket", mock.endpoint());
+        // Seed an orphan under the fork's would-be key.
+        mock_put(&mock_s3_client(mock.endpoint()), b"orphan", None, None)
+            .await
+            .expect("seeding the orphan archive");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repos_dir = tmp.path().join("repos");
+        // release_after_write("owner", "repo") uploads from local_path =
+        // <repos_dir>/owner/repo.git, so the bare repo must exist there for the
+        // compress to have anything to read.
+        let local = repos_dir.join("owner").join("repo.git");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        store::init_bare(&local).expect("a bare repo to upload");
+
+        let store = RepoStore::new(
+            repos_dir,
+            Some(client),
+            sqlx::PgPool::connect_lazy(&std::env::var("DATABASE_URL").unwrap()).unwrap(),
+            Duration::from_secs(300),
+        );
+        // The upload key is owner-slug/repo: mock_put seeded
+        // "repos/v1/owner/repo.tar.zst", and an owner_did of "owner" has no
+        // colons so its slug is exactly "owner" and the IfAbsent upload is
+        // refused against the seeded key.
+        let err = store
+            .release_after_write("owner", "repo")
+            .await
+            .expect_err("a create-only upload over an existing key must be refused");
+        assert!(
+            matches!(err, UploadError::PreconditionLost { .. }),
+            "the fork upload must surface the lost precondition, got {err:?}"
+        );
+        assert_eq!(
+            mock.object().as_deref(),
+            Some(b"orphan".as_slice()),
+            "the refused upload must not have replaced the orphan"
+        );
+
+        mock.shutdown();
     }
 
     /// MUST-NOT. A 404 is permanent (no such bucket, a misrouted endpoint), so
