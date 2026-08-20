@@ -9,16 +9,6 @@ use serde::Deserialize;
 use crate::error::{AppError, Result};
 use crate::state::AppState;
 
-/// Validate an Arweave transaction ID: 43-character base64url string.
-fn is_valid_tx_id(tx_id: &str) -> bool {
-    if tx_id.len() != 43 {
-        return false;
-    }
-    tx_id
-        .bytes()
-        .all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_'))
-}
-
 /// GET /api/v1/arweave/verify/:tx_id
 ///
 /// Fetch the anchor from Arweave via the configured gateway, extract the embedded
@@ -36,7 +26,7 @@ pub async fn verify_anchor_endpoint(
     State(state): State<AppState>,
     Path(tx_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    if !is_valid_tx_id(&tx_id) {
+    if !crate::arweave::is_valid_tx_id(&tx_id) {
         return Err(AppError::BadRequest(
             "invalid transaction ID: expected 43-character base64url".to_string(),
         ));
@@ -81,14 +71,19 @@ pub async fn list_anchors(
 
     // The gateway config may carry credentials (e.g. an Irys user:pass). Those
     // must never leak into a public listing, so only the credential-free origin
-    // is embedded in each anchor's URL.
+    // is embedded in each anchor's URL. A node with NO gateway configured emits
+    // no presentation URL at all: the recorded tx id stays durable and listable
+    // (it is the anchor's identity), but a `/tx_id`-shaped relative string would
+    // resolve against the node's own origin and mislead clients (#224 review).
     let gateway =
         crate::server::mask_credential_url(state.config.arweave_gateway.trim_end_matches('/'));
     let anchors: Vec<crate::db::ArweaveAnchor> = anchors
         .into_iter()
         .map(|mut a| {
             a.irys_tx_id = Some(a.arweave_tx_id.clone());
-            a.arweave_url = Some(format!("{}/{}", gateway, a.arweave_tx_id));
+            if !gateway.is_empty() {
+                a.arweave_url = Some(format!("{}/{}", gateway, a.arweave_tx_id));
+            }
             a
         })
         .collect();
@@ -261,6 +256,62 @@ mod closed_pool_tests {
         assert!(
             body.contains(&format!("https://gateway.example/data/{tx_id}")),
             "arweave_url should carry the safe origin plus path prefix, got: {body}"
+        );
+    }
+
+    /// #224 review, P2: a node with recorded anchors but NO gateway configured
+    /// must not emit a relative `/tx_id` string as `arweave_url` — it would
+    /// resolve against the node's own origin and mislead clients. The recorded
+    /// tx id stays durable and listable (it is the anchor's identity); the
+    /// presentation URL is simply omitted.
+    #[sqlx::test]
+    async fn list_anchors_without_gateway_omits_arweave_url(pool: PgPool) {
+        // test_state's default config has no gateway configured.
+        let state = crate::test_support::test_state(pool.clone()).await;
+
+        state
+            .db
+            .record_arweave_anchor(&crate::db::RecordAnchorInputV2 {
+                repo: "alice/myrepo",
+                owner_did: "did:key:zAlice",
+                ref_name: "refs/heads/main",
+                old_sha: &"a".repeat(40),
+                new_sha: &"b".repeat(40),
+                cid: Some("bafy1test"),
+                arweave_tx_id: &"f".repeat(43),
+                node_did: "did:key:zNode",
+                cert_id: None,
+            })
+            .await
+            .unwrap();
+
+        let resp = Router::new()
+            .route("/api/v1/arweave/anchors", axum::routing::get(list_anchors))
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/arweave/anchors")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: Value = serde_json::from_slice(&bytes).expect("json body");
+        let anchor = v["anchors"][0].clone();
+        assert_eq!(
+            anchor["arweave_tx_id"],
+            "f".repeat(43),
+            "the durable tx id must still be listable"
+        );
+        assert!(
+            anchor["arweave_url"].is_null(),
+            "with no gateway the arweave_url must be omitted, got: {}",
+            anchor["arweave_url"]
         );
     }
 

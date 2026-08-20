@@ -38,7 +38,8 @@
 use anyhow::Result;
 #[cfg(test)]
 use anyhow::{anyhow, bail};
-use sha2::{Digest, Sha384};
+use base64::Engine as _;
+use sha2::{Digest, Sha256, Sha384};
 
 /// SignatureConfig value for Ed25519 data items (ANS-104).
 pub const SIGNATURE_TYPE_ED25519: u16 = 2;
@@ -94,6 +95,17 @@ pub fn build_signed_data_item(
     let signature = keypair.sign(&signature_data).to_bytes();
     item[2..2 + SIGNATURE_LEN].copy_from_slice(&signature);
     Ok(item)
+}
+
+/// The ANS-104 data-item id: `base64url(sha256(item bytes))`. This is the id
+/// the bundler returns for a data item and the id gateways resolve
+/// `{gateway}/{id}` under, so it is a stable, content-derived remote identity:
+/// the durable job persists it BEFORE the upload request is sent, and a
+/// recovery probes that id to decide whether a crashed upload actually landed
+/// before ever issuing a second paid request (#224 review).
+pub fn data_item_id(item: &[u8]) -> String {
+    let digest = Sha256::digest(item);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 
 /// Parse a data item and verify its Ed25519 signature against `verifying_key`

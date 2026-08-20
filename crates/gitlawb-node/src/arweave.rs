@@ -25,11 +25,18 @@
 //!   - devnet (faucet-funded):  https://devnet.irys.xyz
 //!   - mainnet:                 https://node2.irys.xyz
 //!
-//! Configure `GITLAWB_ARWEAVE_GATEWAY` to override the gateway used for resolving anchors
-//! (defaults to https://arweave.net).
+//! `GITLAWB_ARWEAVE_GATEWAY` has NO default. An anchoring node MUST set it to a
+//! gateway on the SAME network as the bundler (devnet → the devnet gateway,
+//! mainnet → https://arweave.net): the old implicit arweave.net default paired
+//! the gateway to the bundler URL and made /verify fail for devnet
+//! transactions, which arweave.net cannot resolve. `Config::validate()` refuses
+//! to start with a bundler configured but no explicit gateway; a node that
+//! does not anchor may leave the gateway unset (existing recorded anchors stay
+//! durable and listable, but carry no presentation URL).
 //!
-//! Each anchor returns a transaction ID (43-char base58 string).
-//! The permanent Arweave URL is: <gateway>/<tx_id>
+//! Each anchor returns a transaction ID (43-char base64url) that is the
+//! content-derived id of the signed data item. The permanent Arweave URL is:
+//! <gateway>/<tx_id>
 //!
 //! Anchors are stored in the `arweave_anchors` table for auditability.
 use anyhow::Result;
@@ -57,24 +64,46 @@ pub struct RefAnchor {
     /// serialized and embedded so a verifier can validate the chain.
     pub certificate: Option<crate::db::RefCertificate>,
 }
-/// Anchor a ref-update to Arweave via Irys.
+/// Validate an Arweave transaction / data-item ID: 43-character base64url.
+/// This is the expected wire format for both a bundler's `{"id": ...}` response
+/// and the id under which a gateway resolves a data item. The durable job and
+/// the public `/verify` endpoint share this boundary so a malformed id is
+/// rejected the same way everywhere.
+pub(crate) fn is_valid_tx_id(tx_id: &str) -> bool {
+    if tx_id.len() != 43 {
+        return false;
+    }
+    tx_id
+        .bytes()
+        .all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_'))
+}
+
+/// Classified outcome of a bundler upload, so the durable job can decide
+/// whether a retry may safely pay for another upload (#224 review):
 ///
-/// The payload is uploaded as a signed ANS-104 data item: `node_keypair` signs
-/// the item and the indexing metadata (App-Name, Schema, Repo, Ref, SHA,
-/// Node-DID) is embedded as data-item tags inside the signed item — never in a
-/// request header. Returns the Irys/Arweave transaction ID on success.
-/// Returns `Ok("")` if `bundler_url` is empty (anchoring disabled).
-pub async fn anchor_ref_update(
-    client: &reqwest::Client,
-    bundler_url: &str,
-    bundler_account: &str,
-    bundler_token: &str,
+/// - [`UploadOutcome::Accepted`] — the provider returned a well-formed
+///   transaction id; the item is permanently accepted.
+/// - [`UploadOutcome::Rejected`] — the provider returned a definitive
+///   non-acceptance (HTTP error body). The item was NOT accepted, so a retry
+///   may re-upload safely.
+/// - [`UploadOutcome::Uncertain`] — the request failed before a verdict
+///   (connection drop, or a success response that did not carry a valid id).
+///   The item MAY have been accepted; a retry must reconcile via the gateway
+///   probe before issuing another paid request, never re-upload blindly.
+#[derive(Debug)]
+pub enum UploadOutcome {
+    Accepted { tx_id: String },
+    Rejected { message: String },
+    Uncertain { message: String },
+}
+
+/// Build the signed ANS-104 data item for a ref-update anchor. The metadata is
+/// embedded as tags inside the item (where the bundler verifies them against
+/// the signature); nothing is passed out-of-band.
+pub(crate) fn build_ref_anchor_item(
     anchor: &RefAnchor,
     node_keypair: &gitlawb_core::identity::Keypair,
-) -> Result<String> {
-    if bundler_url.is_empty() {
-        return Ok(String::new());
-    }
+) -> Result<Vec<u8>> {
     let mut payload = json!({
         "schema": "gitlawb/ref-update/v1",
         "repo": anchor.repo,
@@ -107,55 +136,127 @@ pub async fn anchor_ref_update(
         (name.to_string(), value.to_string())
     })
     .collect();
-    let data_item = crate::ans104::build_signed_data_item(node_keypair, &tag_refs(&tags), &body)?;
+    crate::ans104::build_signed_data_item(node_keypair, &tag_refs(&tags), &body)
+}
+
+/// Upload a signed ANS-104 data item to the bundler and classify the outcome.
+/// The caller supplies the already-signed item so it can persist the item's
+/// deterministic id ([`crate::ans104::data_item_id`]) BEFORE the request is
+/// sent — that is the durable request identity a crash-recovery probes.
+pub async fn upload_ref_anchor_item(
+    client: &reqwest::Client,
+    bundler_url: &str,
+    bundler_account: &str,
+    bundler_token: &str,
+    item: &[u8],
+) -> Result<UploadOutcome> {
     // Irys upload target: {bundler_url}/tx/{token}. Built structurally so a
     // query on the base URL is preserved and a fragment is rejected outright.
     let url = bundler_upload_url(bundler_url, bundler_token)?;
     let display_url = crate::server::mask_credential_url(&url);
-    let resp = client
+    let resp = match client
         .post(&url)
         .header("Content-Type", "application/octet-stream")
         .header("x-irys-paid-by", bundler_account)
-        .body(data_item)
+        .body(item.to_vec())
         .send()
         .await
-        .map_err(|e| remote_send_error("Bundler upload failed", &e, &url, &display_url))?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // The request did not reach a verdict: the item MAY have been
+            // accepted. The message is already redacted/masked.
+            return Ok(UploadOutcome::Uncertain {
+                message: remote_send_error("Bundler upload failed", &e, &url, &display_url)
+                    .to_string(),
+            });
+        }
+    };
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(remote_response_error(
+        let message = remote_response_error(
             "Bundler upload",
             &status,
             &body,
             &url,
             &display_url,
             &[bundler_account, bundler_token],
-        ));
-    }
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to parse Bundler response: {e}"))?;
-    // Bundler response: {"id": "<data_item_id>", "timestamp": ..., "version": ...}
-    let tx_id = json["id"]
-        .as_str()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no 'id' in Bundler response: {}",
-                truncate_for_error(&json.to_string(), 512)
-            )
-        })?
+        )
         .to_string();
-    tracing::info!(
-        repo = %anchor.repo,
-        ref_name = %anchor.ref_name,
-        new_sha = %anchor.new_sha,
-        tx_id = %tx_id,
-        bundler_account = %bundler_account,
-        bundler_token = %bundler_token,
-        "anchored ref update to Arweave via bundler"
-    );
-    Ok(tx_id)
+        return Ok(UploadOutcome::Rejected { message });
+    }
+    let json: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            // Success status but no parseable body: outcome unknown. Treating a
+            // malformed success as `Accepted` would let a misbehaving bundler
+            // turn a required anchor into a silent no-op; treating it as
+            // `Rejected` would risk a second paid artifact if the item landed.
+            return Ok(UploadOutcome::Uncertain {
+                message: format!("failed to parse Bundler response: {e}"),
+            });
+        }
+    };
+    // Bundler response: {"id": "<data_item_id>", "timestamp": ..., "version": ...}
+    // The id must be a well-formed non-empty Arweave id; an empty/malformed
+    // success response is an Uncertain outcome, not success (#224 review).
+    let tx_id = match json["id"].as_str() {
+        Some(id) if is_valid_tx_id(id) => id.to_string(),
+        _ => {
+            return Ok(UploadOutcome::Uncertain {
+                message: format!(
+                    "Bundler returned a malformed transaction id in its success response: {}",
+                    truncate_for_error(&json.to_string(), 512)
+                ),
+            });
+        }
+    };
+    Ok(UploadOutcome::Accepted { tx_id })
+}
+
+/// Anchor a ref-update to Arweave via Irys.
+///
+/// The payload is uploaded as a signed ANS-104 data item: `node_keypair` signs
+/// the item and the indexing metadata (App-Name, Schema, Repo, Ref, SHA,
+/// Node-DID) is embedded as data-item tags inside the signed item — never in a
+/// request header. Returns the Irys/Arweave transaction ID on success.
+/// Returns `Ok("")` if `bundler_url` is empty (anchoring disabled).
+///
+/// The durable post-receive job does not call this directly: it drives
+/// [`build_ref_anchor_item`] + [`upload_ref_anchor_item`] so it can persist the
+/// item id before the request and classify the outcome. This thin wrapper keeps
+/// the manifest/tail call sites and tests on a `Result<String>` contract.
+#[cfg(test)]
+pub async fn anchor_ref_update(
+    client: &reqwest::Client,
+    bundler_url: &str,
+    bundler_account: &str,
+    bundler_token: &str,
+    anchor: &RefAnchor,
+    node_keypair: &gitlawb_core::identity::Keypair,
+) -> Result<String> {
+    if bundler_url.is_empty() {
+        return Ok(String::new());
+    }
+    let item = build_ref_anchor_item(anchor, node_keypair)?;
+    match upload_ref_anchor_item(client, bundler_url, bundler_account, bundler_token, &item).await?
+    {
+        UploadOutcome::Accepted { tx_id } => {
+            tracing::info!(
+                repo = %anchor.repo,
+                ref_name = %anchor.ref_name,
+                new_sha = %anchor.new_sha,
+                tx_id = %tx_id,
+                bundler_account = %bundler_account,
+                bundler_token = %bundler_token,
+                "anchored ref update to Arweave via bundler"
+            );
+            Ok(tx_id)
+        }
+        UploadOutcome::Rejected { message } => Err(anyhow::anyhow!(message)),
+        UploadOutcome::Uncertain { message } => Err(anyhow::anyhow!(message)),
+    }
 }
 /// A per-push manifest of the blobs encrypted this push (Option B3). The
 /// `blobs` slice is `(oid, cid)` tuples. Anchored directly to Arweave as its JSON
@@ -175,7 +276,7 @@ pub struct EncryptedManifest<'a> {
 /// recipients, so the reader set must not be written to Arweave either.
 ///
 /// The manifest is uploaded as a signed ANS-104 data item (same scheme as
-/// [`anchor_ref_update`]); the discovery tags are embedded inside the item.
+/// `anchor_ref_update`); the discovery tags are embedded inside the item.
 ///
 /// Returns the Arweave transaction ID, or `Ok("")` when `bundler_url` is empty
 /// (anchoring disabled) or there are no blobs to anchor.
@@ -246,15 +347,18 @@ pub async fn anchor_encrypted_manifest(
         .json()
         .await
         .map_err(|e| anyhow::anyhow!("failed to parse Bundler response: {e}"))?;
-    let tx_id = json["id"]
-        .as_str()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no 'id' in Bundler response: {}",
+    // Bundler response: {"id": "<data_item_id>", "timestamp": ..., "version": ...}
+    // A success without a well-formed, non-empty id must be an error (never a
+    // silent no-op), so a malformed success cannot fake an anchor (#224 review).
+    let tx_id = match json["id"].as_str() {
+        Some(id) if is_valid_tx_id(id) => id.to_string(),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "Bundler returned a malformed transaction id in its success response: {}",
                 truncate_for_error(&json.to_string(), 512)
-            )
-        })?
-        .to_string();
+            ));
+        }
+    };
     tracing::info!(
         repo = %manifest.repo,
         tx_id = %tx_id,
@@ -324,6 +428,42 @@ fn bundler_upload_url(bundler_url: &str, token: &str) -> Result<String> {
 /// Gateway request target for a transaction ID: `{gateway_url}/{tx_id}`.
 fn gateway_tx_url(gateway_url: &str, tx_id: &str) -> Result<String> {
     join_url_path(gateway_url, &[tx_id], "gateway URL")
+}
+/// Whether a data item with the given id is resolvable at the configured
+/// gateway (`GET {gateway}/{id}`). This is the reconciliation probe a durable
+/// job uses to decide whether a crashed upload actually landed before issuing
+/// a second paid request (#224 review): present → record the item id and skip
+/// the upload; absent → the earlier upload did not land, re-upload is safe;
+/// any other failure to reach a verdict → the caller must fail closed (no
+/// upload). A 404/400/410 means the item is absent; a missing gateway means
+/// the probe cannot run at all and is an error, never a silent "absent".
+pub(crate) async fn anchor_item_present(
+    client: &reqwest::Client,
+    gateway_url: &str,
+    item_id: &str,
+) -> Result<bool> {
+    if gateway_url.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "no GITLAWB_ARWEAVE_GATEWAY configured to reconcile a possibly-uploaded anchor"
+        ));
+    }
+    let url = gateway_tx_url(gateway_url, item_id)?;
+    let display_url = crate::server::mask_credential_url(&url);
+    let resp =
+        client.get(&url).send().await.map_err(|e| {
+            remote_send_error("Arweave gateway probe failed", &e, &url, &display_url)
+        })?;
+    if resp.status().is_success() {
+        return Ok(true);
+    }
+    match resp.status() {
+        reqwest::StatusCode::NOT_FOUND
+        | reqwest::StatusCode::BAD_REQUEST
+        | reqwest::StatusCode::GONE => Ok(false),
+        other => Err(anyhow::anyhow!(
+            "Arweave gateway probe returned {other} for {display_url}"
+        )),
+    }
 }
 /// Cap a value for error messages/logs so a hostile or misbehaving endpoint
 /// cannot drive unbounded allocations or output through an error string.
@@ -1130,6 +1270,73 @@ mod tests {
             "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuOk"
         );
     }
+    /// #224 review, P2: the client validates the bundler's success id at the
+    /// boundary. An empty, missing, or malformed transaction id in a 200
+    /// response must NOT read as success — it is Uncertain (the item may or may
+    /// not have been accepted), so the durable job probes the gateway instead of
+    /// recording a fabricated anchor. Only a well-formed 43-char base64url id is
+    /// Accepted.
+    #[tokio::test]
+    async fn test_upload_rejects_empty_missing_and_malformed_success_ids() {
+        use axum::response::IntoResponse;
+        use std::sync::atomic::Ordering;
+
+        async fn mock_bundler(
+            body: &'static str,
+        ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let app = {
+                let calls_srv = calls.clone();
+                axum::Router::new().route(
+                    "/tx/matic",
+                    axum::routing::post(move || {
+                        let calls = calls_srv.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            (axum::http::StatusCode::OK, body).into_response()
+                        }
+                    }),
+                )
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            (format!("http://{addr}"), calls)
+        }
+
+        let client = reqwest::Client::new();
+        let item = b"signed-data-item-bytes".to_vec();
+
+        for (label, body) in [
+            ("empty id", r#"{"id":""}"#),
+            ("missing id", r#"{"foo":"bar"}"#),
+            ("malformed id", r#"{"id":"WAY_TOO_SHORT"}"#),
+        ] {
+            let (server, calls) = mock_bundler(body).await;
+            let outcome =
+                upload_ref_anchor_item(&client, &server, "zBundlerAccount", "matic", &item)
+                    .await
+                    .unwrap();
+            assert!(
+                matches!(outcome, UploadOutcome::Uncertain { .. }),
+                "{label} must classify as Uncertain: {outcome:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+
+        // The well-formed case still lands as Accepted.
+        let (server, _calls) =
+            mock_bundler(r#"{"id":"7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuOk"}"#).await;
+        let outcome = upload_ref_anchor_item(&client, &server, "zBundlerAccount", "matic", &item)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&outcome, UploadOutcome::Accepted { tx_id } if tx_id == "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuOk"),
+            "a well-formed id must be Accepted: {outcome:?}"
+        );
+    }
     /// The funded bundler account must ride on the upload request: the item
     /// signature is authorship, not payment, so an upload that omits the
     /// account must be refused — it would otherwise be billed to nobody.
@@ -1181,7 +1388,7 @@ mod tests {
             "/tx/matic",
             &[("App-Name", "gitlawb")],
             move |j| j["old_sha"] == real_old && j["new_sha"] == real_new,
-            "TX_REAL_OLD_SHA",
+            "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuO1",
         )
         .await;
         let client = reqwest::Client::new();
@@ -1199,7 +1406,10 @@ mod tests {
         };
         let result =
             anchor_ref_update(&client, &server, "zBundlerAccount", "matic", &anchor, &kp).await;
-        assert_eq!(result.unwrap(), "TX_REAL_OLD_SHA");
+        assert_eq!(
+            result.unwrap(),
+            "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuO1"
+        );
     }
     #[tokio::test]
     async fn test_anchor_rejected_when_signed_by_other_key() {
@@ -1308,7 +1518,7 @@ mod tests {
                 ("Node-DID", "did:key:zN"),
             ],
             |j| j["repo"] == "alice/r" && j["blobs"].as_array().is_some_and(|b| b.len() == 1),
-            "MANIFESTTX123",
+            "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuO2",
         )
         .await;
         let client = reqwest::Client::new();
@@ -1322,7 +1532,7 @@ mod tests {
         };
         let r =
             anchor_encrypted_manifest(&client, &server, "zBundlerAccount", "matic", &m, &kp).await;
-        assert_eq!(r.unwrap(), "MANIFESTTX123");
+        assert_eq!(r.unwrap(), "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuO2");
     }
     /// A minimal ref-update anchor for the URL-join tests.
     fn test_anchor(repo: &str, new_sha: &str) -> RefAnchor {
@@ -1350,7 +1560,7 @@ mod tests {
             "/prefix/tx/matic",
             &[("App-Name", "gitlawb")],
             |_| true,
-            "PREFIXED_TX",
+            "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuO3",
         )
         .await;
         let client = reqwest::Client::new();
@@ -1367,7 +1577,10 @@ mod tests {
             &kp,
         )
         .await;
-        assert_eq!(result.unwrap(), "PREFIXED_TX");
+        assert_eq!(
+            result.unwrap(),
+            "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuO3"
+        );
     }
     /// A query on the bundler base must ride along on the upload request target
     /// (`/tx/matic?token=secret`) rather than being dropped by string concat.
@@ -1380,7 +1593,7 @@ mod tests {
             "/tx/matic?token=secret",
             &[("App-Name", "gitlawb")],
             |_| true,
-            "QUERY_TX",
+            "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuO4",
         )
         .await;
         let client = reqwest::Client::new();
@@ -1397,7 +1610,10 @@ mod tests {
             &kp,
         )
         .await;
-        assert_eq!(result.unwrap(), "QUERY_TX");
+        assert_eq!(
+            result.unwrap(),
+            "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuO4"
+        );
     }
     /// A fragment in the bundler URL must be rejected outright for both upload
     /// paths: it is never sent to the bundler, so sending it silently would

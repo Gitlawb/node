@@ -33,6 +33,16 @@ We will acknowledge receipt within 48 hours and aim to release a fix within 14 d
 - A supplied token's signature, audience, expiry, and proof-chain attenuation are validated.
 - Tokens use a signed JSON wire format with expiry.
 - Capability grants are not yet consulted by repository write authorization; see the limitations below.
+**UCAN capability tokens**
+- Issued at registration as a signed JSON envelope `{ "payload": {...}, "s": "<base64url Ed25519 signature over the payload JSON>" }` — not a JWT (#224 review: the policy must describe the actual wire format)
+- Capability-scoped: `git/push`, `git/fetch`, `issue/create`, `pr/open`
+- Expiry enforced on every verification
+- The auth middleware (`require_ucan_chain`) verifies the full delegation chain when the `X-Ucan` header is present: the UCAN issuer must match the HTTP Signature identity, the audience must be this node's DID, and every proof in the chain must be cryptographically sound with no capability escalation
+
+**Authorization**
+- Every repo-scoped read and mutation binds the caller to an authorization decision before serving or mutating anything
+- Per-repository read enforcement is wired: `authorize_repo_read` denies with the same 404 a missing repo returns, and content endpoints pass the specific path so a withheld subtree is denied even on an otherwise-public repo
+- Owner-only mutations (visibility, webhooks, protected branches, merges) are gated to the repo owner; star/unstar, replica registration, and bounty actions have their own intended gates
 
 **Smart contracts (Base Sepolia testnet)**
 - `GitlawbDIDRegistry` — on-chain DID → document registry
@@ -57,6 +67,16 @@ These are documented limitations of the current live release. They should be pri
 - `git-receive-pack` verifies HTTP Signatures, but `GITLAWB_ENFORCE_OWNER_PUSH` defaults to `false` for compatibility during rollout.
 - **Impact:** With the default setting, a valid signature authenticates the pusher but does not require that DID to be the repository owner.
 - **Mitigation:** Set `GITLAWB_ENFORCE_OWNER_PUSH=true` on nodes where owner-only pushes are required. Confirm that every legitimate pusher uses the owner DID before enabling it.
+### UCAN chain validation is optional per request
+- The middleware verifies the full UCAN delegation chain only when the client presents an `X-Ucan` header. Requests without the header pass through unchanged, so agents that predate UCAN delegation are not forced off.
+- **Impact:** A client can still authenticate with a bare RFC 9421 HTTP Signature and skip delegation-chain enforcement entirely; capability delegation is enforced only for clients that opt into presenting a UCAN.
+- **Mitigation:** Keep write endpoints signed, treat public nodes as public infrastructure, and treat trust scores as soft rate-limiting signals rather than authorization.
+- **Fix target:** make UCAN presentation mandatory for pushes (planned together with owner-push enforcement).
+
+### Owner-push enforcement defaults off
+- `GITLAWB_ENFORCE_OWNER_PUSH` defaults to `false`: a valid did:key HTTP Signature is authentication, not authorization, so any registered agent can push to a repo until the operator enables owner-only writes.
+- **Impact:** Anyone who can register an agent can push to any repo while the flag is off.
+- **Mitigation:** Enable `GITLAWB_ENFORCE_OWNER_PUSH=true` in production; keep write endpoints signed in the meantime.
 
 ### UCAN delegation and revocation
 - The middleware validates a supplied UCAN's complete proof chain, but a root token is accepted without an independently trusted issuer anchor. `Ucan::can` is not yet used by write handlers, so a UCAN does not grant scoped repository access.
@@ -85,6 +105,9 @@ These are documented limitations of the current live release. They should be pri
 ### GraphQL mutation coverage
 - Existing GraphQL mutations require an authenticated signer, but a mutation-specific source-level guardrail has not yet been added for future mutations.
 - **Impact:** A new mutation could accidentally omit its signer check without an explicit test fence.
+- Per-repository private-read enforcement IS wired: `authorize_repo_read` and per-path visibility rules deny non-readers with an opaque 404, on reads and writes alike.
+- **Impact:** The remaining risk is operational, not structural: a public node should still not be handed secrets, because read access is granted by the repo owner's visibility rules and any node operator can see everything stored on their own node.
+- **Mitigation:** Keep secrets on isolated nodes and restrict network access at the reverse proxy or firewall layer.
 
 ### Peer route hardening rollout
 - Peer announce and sync notification routes accept signed requests and verify DID matches when a signature is present.
@@ -112,6 +135,7 @@ These are documented limitations of the current live release. They should be pri
 | Content hashing | SHA-256 via CIDv1 |
 | HTTP Signatures | RFC 9421 (Ed25519 + SHA-256 Content-Digest) |
 | UCAN tokens | Signed JSON object (Ed25519 signature) |
+| UCAN tokens | Signed JSON envelope (Ed25519 over the payload JSON), not JWT |
 | On-chain | ECDSA secp256k1 (Base L2 / Ethereum) |
 
 ---

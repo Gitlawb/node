@@ -2588,12 +2588,23 @@ fn deterministic_cert_id(job_id: &str, ref_name: &str) -> String {
 /// elsewhere. This task is spawned by the handler on success and by the startup
 /// drain for every row a previous process left pending.
 pub(crate) async fn process_post_receive_job(state: AppState, job: crate::db::PostReceiveJob) {
-    if let Err(e) = state
-        .db
-        .update_post_receive_job(&job.id, "processing", None)
-        .await
-    {
-        tracing::error!(job_id = %job.id, err = %e, "failed to mark post-receive job processing");
+    // Conditional claim: exactly one worker may run a job. A concurrent drainer
+    // (or a handler + drainer racing on the same row) loses the UPDATE and must
+    // not run the body — otherwise two workers would each attempt the paid
+    // anchor for the same transition (#224 review).
+    match state.db.claim_post_receive_job(&job.id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(
+                job_id = %job.id,
+                "post-receive job already claimed by another worker; skipping"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::error!(job_id = %job.id, err = %e, "failed to claim post-receive job");
+            return;
+        }
     }
 
     match run_post_receive_job(&state, &job).await {
@@ -2679,11 +2690,18 @@ async fn run_post_receive_job(
     // Issue a signed certificate for every ref this push advanced, each
     // carrying that ref's real old→new transition. A multi-ref push must
     // not collapse to a single cert covering only the first ref.
+    //
+    // A certificate is a REQUIRED durable output of a landed push: issuance
+    // failure (a transient insert/sequence/DB error) must fail the job so the
+    // startup drain retries it, never a warning followed by `done` that would
+    // lose the cert and its anchor permanently (#224 review). Retries re-issue
+    // the same deterministic cert id, which `insert_ref_certificate_tx`'s
+    // `ON CONFLICT (id) DO NOTHING` turns into a no-op.
     let mut ref_certs: std::collections::HashMap<String, crate::db::RefCertificate> =
         std::collections::HashMap::new();
     for update in &ref_updates {
         let cert_id = deterministic_cert_id(&job.id, &update.ref_name);
-        match cert::issue_ref_certificate(
+        let cert = cert::issue_ref_certificate(
             state,
             &record.id,
             &update.ref_name,
@@ -2697,15 +2715,16 @@ async fn run_post_receive_job(
             job.attestation.request_path.clone(),
         )
         .await
-        {
-            Ok(c) => {
-                tracing::info!(cert_id = %c.id, repo = %record.name, ref_name = %update.ref_name, pusher = %did, "issued ref certificate");
-                ref_certs.insert(update.ref_name.clone(), c);
-            }
-            Err(e) => {
-                tracing::warn!(err = %e, ref_name = %update.ref_name, "failed to issue ref certificate")
-            }
-        }
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to issue ref certificate for {}/{}: {e} — the job stays retryable \
+                 so the startup drain re-issues it",
+                record.name,
+                update.ref_name
+            )
+        })?;
+        tracing::info!(cert_id = %cert.id, repo = %record.name, ref_name = %update.ref_name, pusher = %did, "issued ref certificate");
+        ref_certs.insert(update.ref_name.clone(), cert);
     }
 
     // The replication tail's spawned task re-derives the announce decision and
@@ -2735,6 +2754,10 @@ async fn run_post_receive_job(
     let (announce, cid_map) = anchor_cid_rx
         .await
         .map_err(|_| anyhow::anyhow!("replication tail died before reporting announce/CID"))?;
+    // The anchor's issuer is the NODE, not the pusher: `verify_anchor` compares
+    // the anchor's outer node_did against the embedded certificate's issuer and
+    // rejects a mismatch, and the certificate is signed with `state.node_keypair`.
+    // `job.pusher_did` belongs only in the pusher/provenance fields (#224 review).
     anchor_ref_updates(
         state,
         &record,
@@ -2742,7 +2765,7 @@ async fn run_post_receive_job(
         &ref_certs,
         announce,
         &cid_map,
-        did,
+        &state.node_did.to_string(),
     )
     .await?;
     Ok(())
@@ -2754,17 +2777,31 @@ async fn run_post_receive_job(
 /// replication tail that the durability contract covers — Pinata pins, gossip,
 /// GraphQL broadcast, and peer notify are explicitly best-effort and outside it.
 ///
-/// Failure semantics, per the review:
-/// - A transition already anchored (existence check) skips the upload entirely,
-///   so a startup replay of an already-anchored job never spends bundler
-///   balance on a duplicate on-chain artifact.
-/// - A DB error during the existence check is NOT treated as "not anchored":
-///   the upload is skipped (fail-closed) so an unknown state never pays for a
-///   duplicate upload, and the check error fails the job so the startup drain
-///   retries, by which time the check can be answered.
-/// - An upload error, or an upload whose row could not be persisted, returns
-///   `Err` and fails the job. The drain retries; the existence check then makes
-///   the retry a no-op for a transition whose row landed meanwhile.
+/// The anchor row is a per-transition outbox/state machine, not a retry wrapper
+/// around an HTTP call:
+///
+/// - `claim` — an atomic `INSERT ... ON CONFLICT DO NOTHING` against the unique
+///   (repo, ref_name, old_sha, new_sha) transition index creates the durable
+///   claim BEFORE any paid upload is attempted. Competing workers converge:
+///   exactly one INSERT wins, so exactly one worker can ever pay for a given
+///   transition. A `recorded` claim is a replay of an already-anchored job and
+///   skips the upload entirely.
+/// - `prepare` — the signed item is built and its deterministic ANS-104 id
+///   (`base64url(sha256(item))`) is persisted on the row BEFORE the request is
+///   sent. That id is the durable request identity a crash-recovery probes.
+/// - `upload` — the outcome is classified. A definitive provider rejection
+///   marks the row `failed` (safe to re-upload later); a connection drop or a
+///   malformed success marks nothing and leaves the row `uploading` because the
+///   item MAY have been accepted.
+/// - `record` — the accepted transaction id is persisted (`recorded`, the
+///   terminal state) and `item_id` becomes the id the gateway resolves.
+///
+/// Recovery of a non-terminal claim (`pending`/`uploading`/`failed`): if the row
+/// carries an `item_id`, the gateway is probed for it BEFORE any re-upload.
+/// Present → the earlier upload landed and is recorded as-is (no second paid
+/// request); absent → it did not land, re-upload is safe; a probe that cannot
+/// reach a verdict fails the job without uploading (fail-closed, no double-pay).
+/// A row with no `item_id` was never prepared/sent, so a fresh upload is safe.
 async fn anchor_ref_updates(
     state: &AppState,
     record: &crate::db::RepoRecord,
@@ -2789,69 +2826,126 @@ async fn anchor_ref_updates(
     );
     let bundler_account = &state.config.bundler_account;
     let bundler_token = &state.config.bundler_token;
-    let now_ts = chrono::Utc::now().to_rfc3339();
     for update in ref_updates {
         let cid = cid_map.get(&update.new_sha).cloned();
         // Use the per-update certificate issued above, not a repo-wide latest,
         // so each anchor embeds the exact certificate for its own ref
-        // transition.
+        // transition. Issuance failure already fails the job before this point;
+        // a missing cert here is a hard error, never a silent skip — anchoring
+        // without a cert would publish an artifact verify_anchor must reject.
         let cert = match ref_certs.get(&update.ref_name) {
             Some(c) => c.clone(),
             None => {
-                // Certificate issuance failed for this ref update. Anchoring
-                // without a cert would produce a permanent artifact that
-                // verify_anchor must reject — skip instead of publishing an
-                // unverifiable anchor.
-                tracing::warn!(
-                    ref_name = %update.ref_name,
-                    "skipping arweave anchor — no certificate was issued"
-                );
-                continue;
-            }
-        };
-        // #224: a startup replay of this push's job would otherwise re-run the
-        // upload and pay for a SECOND permanent artifact for the same
-        // transition. The anchor existence check makes the upload idempotent:
-        // the exact (repo, ref, old→new) transition already anchored skips the
-        // upload entirely (the recorded anchor, cert, and tx_id from the
-        // original run stand). A transient DB error must not read as "not
-        // anchored" — that would spend bundler balance on a duplicate for a
-        // transition that may already be anchored — and it must not be skipped
-        // silently either (that would drop the anchor forever). It fails the
-        // job: the startup drain retries, by which time the check can be
-        // answered, and whichever way it lands no money has been wasted and no
-        // anchor has been lost.
-        match state
-            .db
-            .arweave_anchor_exists(
-                &repo_slug,
-                &update.ref_name,
-                &update.old_sha,
-                &update.new_sha,
-            )
-            .await
-        {
-            Ok(true) => {
-                tracing::debug!(
-                    repo = %repo_slug,
-                    ref_name = %update.ref_name,
-                    old_sha = %update.old_sha,
-                    new_sha = %update.new_sha,
-                    "skipping arweave anchor — transition already anchored"
-                );
-                continue;
-            }
-            Ok(false) => {}
-            Err(e) => {
                 return Err(anyhow::anyhow!(
-                    "cannot check whether {}/{} is already anchored: {e} — \
-                     failing the job so the startup drain retries; the upload is \
-                     skipped until the check can be answered",
+                    "no certificate was issued for {}/{} — refusing to anchor an \
+                     unverifiable transition",
                     repo_slug,
                     update.ref_name
                 ));
             }
-        }
+        };
+        let claim_token = uuid::Uuid::new_v4().to_string();
+        let claimed_at = chrono::Utc::now().to_rfc3339();
+        // Atomic claim BEFORE any paid upload. This is the durable per-transition
+        // outbox state; the unique transition index makes concurrent workers
+        // converge on a single owner for the upload obligation.
+        let claim = state
+            .db
+            .claim_anchor_claim(&crate::db::ClaimAnchorInput {
+                repo: &repo_slug,
+                owner_did: &record.owner_did,
+                ref_name: &update.ref_name,
+                old_sha: &update.old_sha,
+                new_sha: &update.new_sha,
+                cid: cid.as_deref(),
+                node_did,
+                cert_id: Some(&cert.id),
+                claim_token: &claim_token,
+                claimed_at: &claimed_at,
+            })
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "cannot claim arweave anchor for {}/{}: {e}",
+                    repo_slug,
+                    update.ref_name
+                )
+            })?;
+        let claim_id = match claim {
+            crate::db::AnchorClaim::AlreadyRecorded => {
+                tracing::debug!(
+                    repo = %repo_slug,
+                    ref_name = %update.ref_name,
+                    "skipping arweave anchor — transition already recorded"
+                );
+                continue;
+            }
+            crate::db::AnchorClaim::Claimed { id } => id,
+            crate::db::AnchorClaim::Recover {
+                id,
+                state: recovered_state,
+                item_id,
+            } => {
+                tracing::debug!(
+                    repo = %repo_slug,
+                    ref_name = %update.ref_name,
+                    state = %recovered_state,
+                    "recovering non-terminal arweave anchor claim"
+                );
+                // A previous attempt of this same transition did not reach
+                // `recorded`. Reconcile BEFORE any re-upload: an `item_id` that
+                // is already on the gateway means the earlier upload landed and
+                // we must not pay for a second artifact.
+                match item_id {
+                    None => id,
+                    Some(persisted_item) => {
+                        match crate::arweave::anchor_item_present(
+                            &state.http_client,
+                            &state.config.arweave_gateway,
+                            &persisted_item,
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                state
+                                    .db
+                                    .record_claimed_anchor(&id, &persisted_item)
+                                    .await
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "recovered arweave anchor {persisted_item} for \
+                                             {}/{} but could not persist it: {e}",
+                                            repo_slug,
+                                            update.ref_name
+                                        )
+                                    })?;
+                                tracing::info!(
+                                    tx_id = %persisted_item,
+                                    repo = %repo_slug,
+                                    ref_name = %update.ref_name,
+                                    "recovered already-uploaded arweave anchor without re-uploading"
+                                );
+                                continue;
+                            }
+                            Ok(false) => id,
+                            Err(e) => {
+                                // Fail closed: the gateway could not be queried,
+                                // so we cannot know whether an upload happened.
+                                // Failing the job (no upload) keeps the drain
+                                // retrying until the probe can be answered.
+                                return Err(anyhow::anyhow!(
+                                    "cannot reconcile possibly-uploaded arweave anchor for \
+                                     {}/{} (item {persisted_item}): {e} — failing the job \
+                                     without uploading so no second paid artifact is created",
+                                    repo_slug,
+                                    update.ref_name
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        };
         let anchor = crate::arweave::RefAnchor {
             repo: repo_slug.clone(),
             repo_id: record.id.clone(),
@@ -2860,53 +2954,82 @@ async fn anchor_ref_updates(
             old_sha: update.old_sha.clone(),
             new_sha: update.new_sha.clone(),
             cid: cid.clone(),
-            timestamp: now_ts.clone(),
+            timestamp: claimed_at.clone(),
             node_did: node_did.to_string(),
             certificate: Some(cert.clone()),
         };
-        let tx_id = crate::arweave::anchor_ref_update(
+        // Build the signed item, persist its deterministic id, then send.
+        let item =
+            crate::arweave::build_ref_anchor_item(&anchor, &state.node_keypair).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to build arweave anchor for {}/{}: {e}",
+                    repo_slug,
+                    update.ref_name
+                )
+            })?;
+        let item_id = crate::ans104::data_item_id(&item);
+        state
+            .db
+            .set_anchor_uploading(&claim_id, &item_id)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "cannot mark arweave anchor uploading for {}/{}: {e}",
+                    repo_slug,
+                    update.ref_name
+                )
+            })?;
+        let outcome = crate::arweave::upload_ref_anchor_item(
             &state.http_client,
             bundler_url,
             bundler_account,
             bundler_token,
-            &anchor,
-            &state.node_keypair,
+            &item,
         )
         .await
         .map_err(|e| {
-            // A push must never fail over anchoring, but this is a durable job
-            // retried by the startup drain, not the live push. Name the two
-            // common causes (unfunded bundler account, config only checks it
-            // at boot) so operators can tell them apart in the job's error.
             anyhow::anyhow!(
-                "arweave anchor for {}/{} failed: {e} — if the bundler reports \
-                 'Not enough balance', fund GITLAWB_BUNDLER_ACCOUNT (for the token in \
-                 GITLAWB_BUNDLER_TOKEN); an unfunded node retries and loses anchors forever",
+                "arweave anchor upload for {}/{} could not be classified: {e}",
                 repo_slug,
                 update.ref_name
             )
         })?;
-        if tx_id.is_empty() {
-            continue;
-        }
-        // Upload succeeded — the DB row is the only durable record of it. A
-        // failed insert is a FAILED UNIT OF WORK, not a warning: returning Err
-        // fails the job, and the startup drain retries. On retry the existence
-        // check skips the upload if the row landed (e.g. another instance
-        // recorded it), and fails closed while it cannot be checked.
+        let tx_id = match outcome {
+            crate::arweave::UploadOutcome::Accepted { tx_id } => tx_id,
+            crate::arweave::UploadOutcome::Rejected { message } => {
+                // The provider definitively did not accept the item; a later
+                // drain re-uploads. The row stays reserved for that drain.
+                let _ = state.db.set_anchor_failed(&claim_id).await;
+                return Err(anyhow::anyhow!(
+                    "arweave anchor for {}/{} rejected by the bundler: {message} — if the \
+                     bundler reports 'Not enough balance', fund GITLAWB_BUNDLER_ACCOUNT \
+                     (for the token in GITLAWB_BUNDLER_TOKEN); an unfunded node retries \
+                     and loses anchors forever",
+                    repo_slug,
+                    update.ref_name
+                ));
+            }
+            crate::arweave::UploadOutcome::Uncertain { message } => {
+                // The outcome is unknown (connection drop or malformed success):
+                // the item MAY have been accepted. Leave the row `uploading` and
+                // fail the job; the drain's recovery probes the gateway and
+                // records without re-uploading if the item landed.
+                return Err(anyhow::anyhow!(
+                    "arweave anchor for {}/{} has an unknown upload outcome: {message} — \
+                     the startup drain will probe the gateway before deciding whether \
+                     to re-upload",
+                    repo_slug,
+                    update.ref_name
+                ));
+            }
+        };
+        // Upload accepted — persist the durable terminal state. A failed UPDATE
+        // is a FAILED UNIT OF WORK: the row stays `uploading` with its item_id,
+        // so the drain's recovery probes the gateway and records the already-
+        // landed item without paying for a second artifact.
         state
             .db
-            .record_arweave_anchor(&crate::db::RecordAnchorInputV2 {
-                repo: &repo_slug,
-                owner_did: &record.owner_did,
-                ref_name: &update.ref_name,
-                old_sha: &update.old_sha,
-                new_sha: &update.new_sha,
-                cid: cid.as_deref(),
-                arweave_tx_id: &tx_id,
-                node_did,
-                cert_id: Some(cert.id.clone()),
-            })
+            .record_claimed_anchor(&claim_id, &tx_id)
             .await
             .map_err(|e| {
                 anyhow::anyhow!(
@@ -11210,6 +11333,50 @@ mod tests {
         (format!("http://{addr}"), calls)
     }
 
+    /// A mock Arweave gateway that answers item-presence probes (`GET
+    /// /{item_id}`). Modes: `present` (200 — the earlier upload landed),
+    /// `absent` (404 — it did not), `error` (500 — no verdict). Returns the base
+    /// URL and a probe counter.
+    async fn f2a_gateway(
+        mode: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::response::IntoResponse;
+        use std::sync::atomic::Ordering;
+
+        let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = {
+            let probes_srv = probes.clone();
+            axum::Router::new().route(
+                "/{item_id}",
+                axum::routing::get(move |path: axum::extract::Path<String>| {
+                    let probes = probes_srv.clone();
+                    async move {
+                        probes.fetch_add(1, Ordering::SeqCst);
+                        match mode {
+                            "present" => (
+                                axum::http::StatusCode::OK,
+                                axum::Json(serde_json::json!({ "id": path.0 })),
+                            )
+                                .into_response(),
+                            "absent" => (axum::http::StatusCode::NOT_FOUND, "{}").into_response(),
+                            _ => (
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                "simulated gateway outage",
+                            )
+                                .into_response(),
+                        }
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), probes)
+    }
+
     async fn f2a_job_status(pool: &sqlx::PgPool, job_id: &str) -> String {
         sqlx::query_scalar::<_, String>("SELECT status FROM post_receive_jobs WHERE id = $1")
             .bind(job_id)
@@ -11263,17 +11430,20 @@ mod tests {
         }
     }
 
-    /// #224 review, P4: an upload that succeeds but whose DB row cannot be
-    /// written is a FAILED unit of work. The job body must return `Err` — the
-    /// job is then `failed`, not `done`, and the startup drain retries it — and
-    /// the retry must not re-call the bundler once the row exists. The CHECK
-    /// constraint makes the INSERT fail deterministically while the existence
-    /// check (a SELECT) keeps working.
+    /// #224 review, P1-4: an accepted upload whose `recorded` transition cannot
+    /// be persisted is a FAILED unit of work — the job body returns `Err`, the
+    /// row is left `uploading` with its item id — and the drain's recovery
+    /// probes the gateway, finds the item present, and records it WITHOUT paying
+    /// for a second upload. The CHECK constraint blocks only the
+    /// `UPDATE ... SET state = 'recorded'` (the claim INSERT and the `uploading`
+    /// transition both stay allowed), so the failure lands exactly where the
+    /// real crash does.
     #[sqlx::test]
-    async fn anchor_upload_ok_but_db_row_fails_is_retried_without_double_pay(pool: sqlx::PgPool) {
+    async fn anchor_record_failure_is_reconciled_without_double_pay(pool: sqlx::PgPool) {
         use clap::Parser as _;
 
         let (bundler_url, calls) = f2a_bundler(0).await;
+        let (gateway_url, probes) = f2a_gateway("present").await;
         let mut state = crate::test_support::test_state(pool.clone()).await;
         state.config = std::sync::Arc::new(crate::config::Config::parse_from([
             "gitlawb-node",
@@ -11284,14 +11454,15 @@ mod tests {
             "--bundler-token",
             "matic",
             "--arweave-gateway",
-            "https://arweave.net",
+            &gateway_url,
         ]));
 
-        // Block the row this transition would write (repo slug "zAlice/myrepo")
-        // while leaving the existence check fully functional.
+        // Block only the transition to `recorded` for this repo's slug: the
+        // claim INSERT (`state='pending'`) and the `uploading` UPDATE must both
+        // succeed so the failure lands exactly where the real crash does.
         sqlx::query(
             "ALTER TABLE arweave_anchors ADD CONSTRAINT anchor_test_block \
-             CHECK (repo <> 'zAlice/myrepo')",
+             CHECK (NOT (state = 'recorded' AND repo = 'zAlice/myrepo'))",
         )
         .execute(&pool)
         .await
@@ -11303,8 +11474,9 @@ mod tests {
         certs.insert("refs/heads/main".to_string(), f2a_anchor_cert(&record));
         let empty_cid = std::collections::HashMap::new();
 
-        // Run 1: the upload lands but the row cannot be written → Err, so the
-        // job body would fail the job and the startup drain would retry.
+        // Run 1: the upload is accepted but the row cannot be recorded → Err, so
+        // the job body fails the job and the startup drain retries. The row is
+        // left `uploading` with its item id — the durable trace of the request.
         let err = anchor_ref_updates(
             &state,
             &record,
@@ -11315,27 +11487,33 @@ mod tests {
             "did:key:zNode",
         )
         .await
-        .expect_err("a row-less successful upload must fail the job body");
+        .expect_err("an unrecordable accepted upload must fail the job body");
         assert!(
             err.to_string().contains("could not persist"),
             "the error must name the unpersisted upload: {err}"
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(
-            !state
-                .db
-                .arweave_anchor_exists(
-                    "zAlice/myrepo",
-                    "refs/heads/main",
-                    &"a".repeat(40),
-                    &"b".repeat(40),
-                )
+        let row_state: String =
+            sqlx::query_scalar("SELECT state FROM arweave_anchors WHERE repo = 'zAlice/myrepo'")
+                .fetch_one(&pool)
                 .await
-                .unwrap(),
-            "the failed unit must not leave a row"
+                .unwrap();
+        assert_eq!(
+            row_state, "uploading",
+            "the accepted-but-unrecorded upload must leave the row uploading"
+        );
+        let item_id: String =
+            sqlx::query_scalar("SELECT item_id FROM arweave_anchors WHERE repo = 'zAlice/myrepo'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            !item_id.is_empty(),
+            "the unrecorded upload must still carry its persisted item id"
         );
 
-        // Unblock, then the drain-style retry succeeds and records the anchor.
+        // Unblock; the drain-style retry finds a non-terminal claim, probes the
+        // gateway, sees the item, and records it without uploading again.
         sqlx::query("ALTER TABLE arweave_anchors DROP CONSTRAINT anchor_test_block")
             .execute(&pool)
             .await
@@ -11350,8 +11528,17 @@ mod tests {
             "did:key:zNode",
         )
         .await
-        .expect("the retried unit must succeed once the row can be written");
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        .expect("the reconciled retry must succeed once the row can be recorded");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an item the gateway already has must not be uploaded a second time"
+        );
+        assert_eq!(
+            probes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the recovery must probe the gateway exactly once"
+        );
         assert!(
             state
                 .db
@@ -11363,10 +11550,10 @@ mod tests {
                 )
                 .await
                 .unwrap(),
-            "the retry must record the anchor"
+            "the reconciled retry must record the anchor"
         );
 
-        // Replay with the row present: the existence check skips the upload, so
+        // Replay with the row recorded: the claim itself says AlreadyRecorded, so
         // the bundler is NOT called again (no second paid on-chain artifact).
         anchor_ref_updates(
             &state,
@@ -11378,24 +11565,24 @@ mod tests {
             "did:key:zNode",
         )
         .await
-        .expect("an already-anchored transition is a no-op");
+        .expect("an already-recorded transition is a no-op");
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "an already-anchored transition must not spend bundler balance again"
+            1,
+            "an already-recorded transition must not spend bundler balance again"
         );
     }
 
-    /// #224 review, P5: an unknown existence state must never pay for a
-    /// duplicate upload. When the existence check itself cannot be answered
-    /// (closed pool), the upload is skipped (fail-closed) and the job body
-    /// fails so the startup drain retries; the bundler is never called while
-    /// the state is unknown.
+    /// #224 review, P1-4: a worker that cannot even make its atomic claim (DB
+    /// down) must fail closed — the job body returns `Err`, the bundler is never
+    /// called, and nothing is uploaded while the durable state cannot be
+    /// consulted.
     #[sqlx::test]
-    async fn anchor_existence_check_failure_never_uploads(pool: sqlx::PgPool) {
+    async fn anchor_claim_db_failure_never_uploads(pool: sqlx::PgPool) {
         use clap::Parser as _;
 
         let (bundler_url, calls) = f2a_bundler(0).await;
+        let (gateway_url, _probes) = f2a_gateway("absent").await;
         let mut state = crate::test_support::test_state(pool.clone()).await;
         state.config = std::sync::Arc::new(crate::config::Config::parse_from([
             "gitlawb-node",
@@ -11406,7 +11593,7 @@ mod tests {
             "--bundler-token",
             "matic",
             "--arweave-gateway",
-            "https://arweave.net",
+            &gateway_url,
         ]));
 
         let record = f2a_anchor_record();
@@ -11415,7 +11602,7 @@ mod tests {
         certs.insert("refs/heads/main".to_string(), f2a_anchor_cert(&record));
         let empty_cid = std::collections::HashMap::new();
 
-        // Take the DB away: the existence check can no longer be answered.
+        // Take the DB away: the claim can no longer be answered.
         pool.close().await;
 
         let err = anchor_ref_updates(
@@ -11428,23 +11615,119 @@ mod tests {
             "did:key:zNode",
         )
         .await
-        .expect_err("an unanswerable existence check must fail the job body");
+        .expect_err("an unclaimable anchor must fail the job body");
         assert!(
-            err.to_string().contains("already anchored"),
-            "the error must name the unanswerable check: {err}"
+            err.to_string().contains("cannot claim"),
+            "the error must name the unclaimable anchor: {err}"
         );
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "an unknown existence state must never trigger a paid upload"
+            "an unknown durable state must never trigger a paid upload"
         );
     }
 
-    /// #224 review, P4 end-to-end: a post-receive job whose Arweave anchor
+    /// #224 review, P1-4: a recovery probe that cannot reach a verdict (gateway
+    /// 500) fails closed — the job body returns `Err`, the row stays
+    /// non-terminal, and the bundler is NOT called, because an upload MAY have
+    /// landed and a second one would be a duplicate paid artifact.
+    #[sqlx::test]
+    async fn anchor_probe_failure_never_uploads(pool: sqlx::PgPool) {
+        use clap::Parser as _;
+
+        let (bundler_url, calls) = f2a_bundler(0).await;
+        let (gateway_url, probes) = f2a_gateway("error").await;
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.config = std::sync::Arc::new(crate::config::Config::parse_from([
+            "gitlawb-node",
+            "--bundler-url",
+            &bundler_url,
+            "--bundler-account",
+            "zBundlerAccount",
+            "--bundler-token",
+            "matic",
+            "--arweave-gateway",
+            &gateway_url,
+        ]));
+
+        let record = f2a_anchor_record();
+        let update = f2a_anchor_update();
+        let mut certs = std::collections::HashMap::new();
+        certs.insert("refs/heads/main".to_string(), f2a_anchor_cert(&record));
+        let empty_cid = std::collections::HashMap::new();
+
+        // Simulate a prior crash between "upload accepted" and "recorded": a
+        // non-terminal claim with a persisted item id.
+        let claim = state
+            .db
+            .claim_anchor_claim(&crate::db::ClaimAnchorInput {
+                repo: "zAlice/myrepo",
+                owner_did: "did:key:zAlice",
+                ref_name: "refs/heads/main",
+                old_sha: &"a".repeat(40),
+                new_sha: &"b".repeat(40),
+                cid: None,
+                node_did: "did:key:zNode",
+                cert_id: Some("cert-anchor-1"),
+                claim_token: "claim-token",
+                claimed_at: &chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .unwrap();
+        let claim_id = match claim {
+            crate::db::AnchorClaim::Claimed { id } => id,
+            other => panic!("expected a fresh claim, got {other:?}"),
+        };
+        state
+            .db
+            .set_anchor_uploading(&claim_id, "item-probe-123")
+            .await
+            .unwrap();
+
+        let err = anchor_ref_updates(
+            &state,
+            &record,
+            std::slice::from_ref(&update),
+            &certs,
+            true,
+            &empty_cid,
+            "did:key:zNode",
+        )
+        .await
+        .expect_err("a probe that cannot reach a verdict must fail the job body");
+        assert!(
+            err.to_string().contains("cannot reconcile"),
+            "the error must name the unresolved reconciliation: {err}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an unknown upload outcome must never pay for a second artifact"
+        );
+        assert_eq!(
+            probes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the failed job must still have probed the gateway once"
+        );
+        let row_state: String =
+            sqlx::query_scalar("SELECT state FROM arweave_anchors WHERE repo = 'zAlice/myrepo'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            row_state, "uploading",
+            "an unresolved reconciliation must leave the row non-terminal, not recorded"
+        );
+    }
+
+    /// #224 review, P1-4 end-to-end: a post-receive job whose Arweave anchor
     /// upload fails (bundler returns 500) is NOT terminal — the startup drain
-    /// retries it — and once the anchor row exists, replaying the job never
-    /// re-calls the bundler. Drives the same crash fixture as
-    /// `post_receive_job_survives_handler_abort`, with a counting bundler.
+    /// retries it. The retry's recovery probes the gateway, sees the rejected
+    /// item was never indexed, re-uploads, and records the anchor; once the row
+    /// is recorded, replaying the job never re-calls the bundler. Also asserts
+    /// the stored anchor names the NODE as issuer (state.node_did), not the
+    /// pusher (#224 review, P1-2). Drives the same crash fixture as
+    /// `post_receive_job_survives_handler_abort`, with counting mocks.
     #[cfg(unix)]
     #[sqlx::test]
     async fn post_receive_job_anchor_failure_retries_and_replay_never_reuploads(
@@ -11467,8 +11750,10 @@ mod tests {
             .await
             .unwrap();
 
-        // First upload fails (500), then the bundler behaves.
+        // First upload fails (500), then the bundler behaves; the gateway says
+        // the rejected item was never indexed.
         let (bundler_url, calls) = f2a_bundler(1).await;
+        let (gateway_url, probes) = f2a_gateway("absent").await;
         state.config = std::sync::Arc::new(crate::config::Config::parse_from([
             "gitlawb-node",
             "--bundler-url",
@@ -11478,7 +11763,7 @@ mod tests {
             "--bundler-token",
             "matic",
             "--arweave-gateway",
-            "https://arweave.net",
+            &gateway_url,
         ]));
 
         let (_, repo_path) = state
@@ -11512,25 +11797,29 @@ mod tests {
         };
         state.db.enqueue_post_receive_job(&job).await.unwrap();
 
-        // Run 1: the bundler fails the upload, so the anchor unit fails and the
+        // Run 1: the bundler rejects the upload, so the anchor unit fails and the
         // job is NOT done — it stays `failed` for the startup drain to retry.
         process_post_receive_job(state.clone(), job.clone()).await;
         assert_eq!(
             f2a_job_status(&pool, &job.id).await,
             "failed",
-            "a job whose anchor upload failed must not be terminal"
+            "a job whose anchor upload was rejected must not be terminal"
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(
-            !state
-                .db
-                .arweave_anchor_exists(&f2a_slug(&rec), "refs/heads/main", ZERO_SHA, &c1)
-                .await
-                .unwrap(),
-            "a failed anchor must not leave a row"
+        let row_state: String = sqlx::query_scalar(
+            "SELECT state FROM arweave_anchors WHERE repo = $1 AND ref_name = 'refs/heads/main'",
+        )
+        .bind(f2a_slug(&rec))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row_state, "failed",
+            "a definitively rejected upload must leave the row failed"
         );
 
-        // Drain retry: the bundler now succeeds, the anchor row lands, `done`.
+        // Drain retry: recovery probes the gateway, sees the item absent,
+        // re-uploads (the bundler now behaves), records the anchor, `done`.
         state.db.reset_stale_post_receive_jobs().await.unwrap();
         let pending = state.db.list_pending_post_receive_jobs().await.unwrap();
         assert_eq!(pending.len(), 1, "the failed job must be drained");
@@ -11540,6 +11829,10 @@ mod tests {
         assert_eq!(f2a_job_status(&pool, &job.id).await, "done");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert!(
+            probes.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the recovery must probe the gateway before deciding to re-upload"
+        );
+        assert!(
             state
                 .db
                 .arweave_anchor_exists(&f2a_slug(&rec), "refs/heads/main", ZERO_SHA, &c1)
@@ -11548,14 +11841,127 @@ mod tests {
             "the retried anchor must be recorded"
         );
 
-        // Replay with the row present: the existence gate skips the upload, so
-        // the bundler is never called again.
+        // The stored anchor names the NODE as issuer (state.node_did), not the
+        // pusher whose push triggered the job (#224 review, P1-2).
+        let stored_node: String = sqlx::query_scalar(
+            "SELECT node_did FROM arweave_anchors
+             WHERE repo = $1 AND ref_name = 'refs/heads/main' AND old_sha = $2 AND new_sha = $3",
+        )
+        .bind(f2a_slug(&rec))
+        .bind(ZERO_SHA)
+        .bind(&c1)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stored_node,
+            state.node_did.to_string(),
+            "the anchor must be issued by the node's own DID"
+        );
+        assert_ne!(
+            stored_node, F2A_PUSHER,
+            "the pusher must not be recorded as the anchor issuer"
+        );
+
+        // Replay with the row recorded: the claim says AlreadyRecorded, so the
+        // bundler is never called again.
         process_post_receive_job(state.clone(), job.clone()).await;
         assert_eq!(f2a_job_status(&pool, &job.id).await, "done");
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "replaying an anchored job must not pay for a second upload"
+        );
+    }
+
+    /// #224 review, P1-4: two workers processing the SAME job concurrently must
+    /// converge on a single executor. The atomic conditional claim lets exactly
+    /// one win; the loser's claim updates zero rows and it skips the body. The
+    /// bundler is called exactly once and the anchor is recorded exactly once.
+    #[sqlx::test]
+    async fn two_concurrent_workers_claim_the_job_once(pool: sqlx::PgPool) {
+        use clap::Parser as _;
+
+        let bin = tempfile::TempDir::new().unwrap();
+        let log = bin.path().join("git.log");
+        let git_bin = f2a_logging_git(bin.path(), &log);
+        let (mut state, rec) = f2a_state(pool.clone(), &git_bin, "z6anchor", "a2", false).await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(
+            repos_dir.path().to_path_buf(),
+            pool.clone(),
+        );
+        state
+            .db
+            .register_agent(F2A_PUSHER, &["agent".to_string()])
+            .await
+            .unwrap();
+
+        let (bundler_url, calls) = f2a_bundler(0).await;
+        let (gateway_url, _probes) = f2a_gateway("absent").await;
+        state.config = std::sync::Arc::new(crate::config::Config::parse_from([
+            "gitlawb-node",
+            "--bundler-url",
+            &bundler_url,
+            "--bundler-account",
+            "zBundlerAccount",
+            "--bundler-token",
+            "matic",
+            "--arweave-gateway",
+            &gateway_url,
+        ]));
+
+        let (_, repo_path) = state
+            .repo_store
+            .local_path(&rec.owner_did, &rec.name)
+            .unwrap();
+        std::fs::create_dir_all(&repo_path).unwrap();
+        u5_init_repo(&repo_path);
+        let c1 = u5_commit_file(&repo_path, "a.txt", "one\n");
+
+        let update = f2a_update("refs/heads/main", &c1);
+        let job = crate::db::PostReceiveJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            pusher_did: F2A_PUSHER.to_string(),
+            owner_did: rec.owner_did.clone(),
+            repo_name: rec.name.clone(),
+            repo_id: rec.id.clone(),
+            ref_updates: update
+                .iter()
+                .map(|u| crate::db::JobRefUpdate {
+                    old_sha: u.old_sha.clone(),
+                    new_sha: u.new_sha.clone(),
+                    ref_name: u.ref_name.clone(),
+                })
+                .collect(),
+            attestation: crate::db::PostReceiveAttestation::default(),
+            status: "pending".to_string(),
+            enqueued_at: chrono::Utc::now().to_rfc3339(),
+            attempts: 0,
+            error: None,
+        };
+        state.db.enqueue_post_receive_job(&job).await.unwrap();
+
+        // Two drainers race on the same job; the conditional claim lets only one
+        // run the body.
+        let ((), ()) = tokio::join!(
+            process_post_receive_job(state.clone(), job.clone()),
+            process_post_receive_job(state.clone(), job.clone()),
+        );
+
+        assert_eq!(f2a_job_status(&pool, &job.id).await, "done");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the claiming worker may run the job body"
+        );
+        assert!(
+            state
+                .db
+                .arweave_anchor_exists(&f2a_slug(&rec), "refs/heads/main", ZERO_SHA, &c1)
+                .await
+                .unwrap(),
+            "the anchor must be recorded exactly once"
         );
     }
 }

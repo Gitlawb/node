@@ -545,9 +545,11 @@ impl Db {
 // signature_input, content_digest, and request_path are added by v19.
 // New installs reach v18/v19 via sequential migration; existing installs with
 // the columns already present are no-ops via IF NOT EXISTS. v20 drops the
-// superseded (repo_id, ref_name) unique index that v1 bundled; that drop is
+// superseded (repo_id, ref_name) unique index that v10 created; that drop is
 // one-way and rollback-unsupported (see the migration's own comment).
-// v21 adds the durable post-receive job table.
+// v21 adds the durable post-receive job table, and v22 turns the
+// `arweave_anchors` row into a per-transition durable claim/outbox
+// (state, item_id, claim_token) with a unique transition index.
 //
 // Each migration runs in a single transaction, so statements that Postgres
 // forbids inside a transaction (notably `CREATE INDEX CONCURRENTLY`) cannot be
@@ -1199,16 +1201,16 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 20,
         name: "drop_ref_certs_repo_ref_unique",
-        // ONE-WAY, ROLLBACK-UNSUPPORTED: this drops the unique index that v1
-        // bundled. Rolling back to v19 would require re-creating
-        // `idx_ref_certs_repo_ref`, which a release built at v20+ cannot do
-        // (the migration that created it has been superseded). Operators must
-        // treat v20 as terminal: there is no supported downgrade past it. The
-        // drop itself is the point of the migration — the old index would
-        // reject the second cert insert for a ref, which the append-only cert
-        // chain (v19) requires.
+        // ONE-WAY, ROLLBACK-UNSUPPORTED: this drops the unique index that v10
+        // (ref_cert_unique_per_ref) created. Rolling back to v19 would require
+        // re-creating `idx_ref_certs_repo_ref`, which a release built at v20+
+        // cannot do (the migration that created it has been superseded).
+        // Operators must treat v20 as terminal: there is no supported downgrade
+        // past it. The drop itself is the point of the migration — the old
+        // index would reject the second cert insert for a ref, which the
+        // append-only cert chain (v19) requires.
         stmts: &[
-            // Remove the superseded (repo_id, ref_name) unique index.  v19 makes
+            // Remove the superseded (repo_id, ref_name) unique index (v10).  v19 makes
             // the cert chain append-only, which requires multiple rows per
             // (repo_id, ref_name); the unique index would reject the second
             // insert for a ref.  Deferring the drop is impossible for the same
@@ -1243,6 +1245,44 @@ const MIGRATIONS: &[Migration] = &[
                 error          TEXT
             )"#,
             "CREATE INDEX IF NOT EXISTS idx_post_receive_jobs_status ON post_receive_jobs(status, enqueued_at)",
+        ],
+    },
+    // Per-transition Arweave anchor outbox (#224 review): the anchor row IS the
+    // durable claim. `anchor_ref_updates` atomically INSERTs the transition row
+    // in `pending` BEFORE any paid upload is attempted, then moves it through
+    // `uploading` → `recorded` (or `failed`). The unique (repo, ref_name,
+    // old_sha, new_sha) index makes competing workers converge: only one INSERT
+    // wins, so only one worker can ever pay for a given transition. `item_id`
+    // is the ANS-104 data-item id computed from the signed item BEFORE the
+    // upload request is sent; a recovery that finds the row in `pending`/
+    // `uploading` with an `item_id` probes the gateway for that id to decide
+    // whether the crashed upload actually landed before ever issuing a second
+    // paid request. `claim_token`/`claimed_at` record who holds the lease.
+    Migration {
+        version: 22,
+        name: "arweave_anchor_outbox",
+        stmts: &[
+            // Existing rows were all uploaded and recorded by earlier code, so
+            // backfill them as `recorded` (the durable terminal state).
+            "ALTER TABLE arweave_anchors ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'recorded'",
+            "ALTER TABLE arweave_anchors ADD COLUMN IF NOT EXISTS item_id TEXT",
+            "ALTER TABLE arweave_anchors ADD COLUMN IF NOT EXISTS claim_token TEXT",
+            "ALTER TABLE arweave_anchors ADD COLUMN IF NOT EXISTS claimed_at TEXT",
+            // A claimed (pending/uploading) outbox row has no transaction id yet;
+            // only the recorded row carries one.
+            "ALTER TABLE arweave_anchors ALTER COLUMN arweave_tx_id DROP NOT NULL",
+            // Dedup before the unique index: earlier releases had no uniqueness
+            // on a transition, so an existing database could carry two anchors
+            // for one (repo, ref, old→new). Keep the earliest recorded row (the
+            // original artifact) and drop the stragglers' LISTING rows — the
+            // permanent on-chain artifacts themselves cannot be un-published,
+            // but the audit table must not block the claim index.
+            r#"DELETE FROM arweave_anchors a
+               USING arweave_anchors b
+               WHERE a.repo = b.repo AND a.ref_name = b.ref_name
+                 AND a.old_sha = b.old_sha AND a.new_sha = b.new_sha
+                 AND (a.anchored_at, a.id) > (b.anchored_at, b.id)"#,
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_arweave_anchors_transition ON arweave_anchors(repo, ref_name, old_sha, new_sha)",
         ],
     },
 ];
@@ -2180,6 +2220,26 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Atomically claim a post-receive job for processing. The conditional
+    /// `WHERE status IN ('pending','failed')` means only one worker wins the
+    /// claim; a concurrent drainer's claim updates zero rows and it must not
+    /// run the job body (#224 review: two simultaneous drainers must converge
+    /// on one executor per job). `done`/`failed` transitions are unconditional
+    /// because only the claiming worker runs the body.
+    pub async fn claim_post_receive_job(&self, id: &str) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE post_receive_jobs
+             SET status = 'processing', attempted_at = $1, attempts = attempts + 1, error = NULL
+             WHERE id = $2 AND status IN ('pending', 'failed')",
+        )
+        .bind(&now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// Advance a job's status. `done` stamps `processed_at`; `processing`
@@ -4204,6 +4264,7 @@ pub struct ArweaveAnchor {
 }
 
 /// Input parameters for recording an Arweave anchor.
+#[cfg(test)]
 pub struct RecordAnchorInputV2<'a> {
     pub repo: &'a str,
     pub owner_did: &'a str,
@@ -4217,7 +4278,51 @@ pub struct RecordAnchorInputV2<'a> {
     pub cert_id: Option<String>,
 }
 
+/// Outcome of atomically claiming a per-transition Arweave anchor outbox row
+/// (#224 review). The claim row IS the durable per-transition state: it is
+/// created BEFORE any paid upload is attempted, so a worker that wins the claim
+/// is the only one that can pay for that transition.
+#[derive(Debug)]
+pub enum AnchorClaim {
+    /// This worker INSERTed the row (state `pending`); it owns the upload
+    /// obligation and must drive the row to `recorded`.
+    Claimed { id: String },
+    /// A `recorded` row already exists for this exact transition — a replay of
+    /// an already-anchored job; nothing to do.
+    AlreadyRecorded,
+    /// A row exists in a non-terminal state (`pending`/`uploading`/`failed`).
+    /// `item_id` is the ANS-104 data-item id persisted before the last upload
+    /// attempt (`None` when no request was ever prepared/sent). The worker must
+    /// reconcile it (probe the gateway) before deciding whether another paid
+    /// upload is safe.
+    Recover {
+        id: String,
+        state: String,
+        item_id: Option<String>,
+    },
+}
+
+/// Everything the claim of a per-transition anchor outbox row needs. Bundled
+/// into a struct so the atomic-claim contract stays a single unit rather than
+/// a ten-argument call.
+pub struct ClaimAnchorInput<'a> {
+    pub repo: &'a str,
+    pub owner_did: &'a str,
+    pub ref_name: &'a str,
+    pub old_sha: &'a str,
+    pub new_sha: &'a str,
+    pub cid: Option<&'a str>,
+    /// The NODE's DID — the anchor issuer (never the pusher, #224 review).
+    pub node_did: &'a str,
+    pub cert_id: Option<&'a str>,
+    /// Opaque per-claim lease token (for operator forensics on mid-flight rows).
+    pub claim_token: &'a str,
+    /// RFC 3339 timestamp of this claim.
+    pub claimed_at: &'a str,
+}
+
 impl Db {
+    #[cfg(test)]
     pub async fn record_arweave_anchor(&self, input: &RecordAnchorInputV2<'_>) -> Result<()> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
@@ -4241,11 +4346,107 @@ impl Db {
         Ok(())
     }
 
+    /// Atomically claim the per-transition anchor outbox row for
+    /// (repo, ref_name, old_sha, new_sha). The unique transition index makes
+    /// competing workers converge: exactly one INSERT wins, so exactly one
+    /// worker can pay for a given transition. A won claim leaves the row in
+    /// `pending` with a NULL item id — no upload has been attempted.
+    pub async fn claim_anchor_claim(&self, input: &ClaimAnchorInput<'_>) -> Result<AnchorClaim> {
+        let id = Uuid::new_v4().to_string();
+        let result = sqlx::query(
+            "INSERT INTO arweave_anchors
+             (id, repo, owner_did, ref_name, old_sha, new_sha, cid, arweave_tx_id, node_did, anchored_at, cert_id, state, item_id, claim_token, claimed_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,NULL,$8,$9,$10,'pending',NULL,$11,$12)
+             ON CONFLICT (repo, ref_name, old_sha, new_sha) DO NOTHING",
+        )
+        .bind(&id)
+        .bind(input.repo)
+        .bind(input.owner_did)
+        .bind(input.ref_name)
+        .bind(input.old_sha)
+        .bind(input.new_sha)
+        .bind(input.cid)
+        .bind(input.node_did)
+        .bind(input.claimed_at)
+        .bind(input.cert_id)
+        .bind(input.claim_token)
+        .bind(input.claimed_at)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 1 {
+            return Ok(AnchorClaim::Claimed { id });
+        }
+        let row = sqlx::query(
+            "SELECT id, state, item_id FROM arweave_anchors
+             WHERE repo = $1 AND ref_name = $2 AND old_sha = $3 AND new_sha = $4",
+        )
+        .bind(input.repo)
+        .bind(input.ref_name)
+        .bind(input.old_sha)
+        .bind(input.new_sha)
+        .fetch_one(&self.pool)
+        .await?;
+        let state: String = row.get("state");
+        if state == "recorded" {
+            return Ok(AnchorClaim::AlreadyRecorded);
+        }
+        Ok(AnchorClaim::Recover {
+            id: row.get("id"),
+            state,
+            item_id: row.get("item_id"),
+        })
+    }
+
+    /// Move a claimed outbox row to `uploading` and persist the ANS-104
+    /// data-item id that the upload request is about to send. Persisting the id
+    /// BEFORE the request is what lets a crash-recovery probe that id to decide
+    /// whether the upload landed (#224 review).
+    pub async fn set_anchor_uploading(&self, id: &str, item_id: &str) -> Result<()> {
+        sqlx::query("UPDATE arweave_anchors SET state = 'uploading', item_id = $1 WHERE id = $2")
+            .bind(item_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Mark a claimed outbox row `failed` (the provider definitively rejected
+    /// the upload). The job row carries the error detail; the transition stays
+    /// reserved so a later drain owns it and re-uploads.
+    pub async fn set_anchor_failed(&self, id: &str) -> Result<()> {
+        sqlx::query("UPDATE arweave_anchors SET state = 'failed' WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Persist the accepted upload on a claimed outbox row: `recorded` state,
+    /// the transaction id the provider returned (also the id the gateway
+    /// resolves the item under, so it becomes the probe id for later replays),
+    /// and the anchor timestamp. This is the durable terminal state; a retry
+    /// that finds it skips the upload entirely.
+    pub async fn record_claimed_anchor(&self, id: &str, tx_id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE arweave_anchors
+             SET state = 'recorded', arweave_tx_id = $1, item_id = $1, anchored_at = $2
+             WHERE id = $3",
+        )
+        .bind(tx_id)
+        .bind(&now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Whether this exact ref transition (same repo slug, ref, old→new SHAs)
     /// already has a recorded Arweave anchor. The durable post-receive job
     /// checks this BEFORE uploading, so a startup replay of an already-anchored
     /// job skips the upload instead of writing a second permanent on-chain
     /// artifact for the same transition (#224).
+    #[cfg(test)]
     pub async fn arweave_anchor_exists(
         &self,
         repo: &str,
@@ -4276,7 +4477,7 @@ impl Db {
         let rows = if let Some(repo) = repo {
             sqlx::query(
                 "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, arweave_tx_id, node_did, anchored_at, cert_id
-                 FROM arweave_anchors WHERE repo=$1 ORDER BY anchored_at DESC LIMIT $2",
+                 FROM arweave_anchors WHERE repo=$1 AND state = 'recorded' ORDER BY anchored_at DESC LIMIT $2",
             )
             .bind(repo)
             .bind(limit)
@@ -4285,7 +4486,7 @@ impl Db {
         } else {
             sqlx::query(
                 "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, arweave_tx_id, node_did, anchored_at, cert_id
-                 FROM arweave_anchors ORDER BY anchored_at DESC LIMIT $1",
+                 FROM arweave_anchors WHERE state = 'recorded' ORDER BY anchored_at DESC LIMIT $1",
             )
             .bind(limit)
             .fetch_all(&self.pool)
