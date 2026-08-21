@@ -112,12 +112,16 @@ impl QueryRoot {
         assignee_did: Option<String>,
         #[graphql(
             default = 50,
-            desc = "Max 200; larger requests are clamped to 200 (no error). Negative values clamp to 0."
+            desc = "Max 200; larger requests are clamped to 200 (no error). Negative values clamp to 0. Use `nextCursor` to read past the clamp."
         )]
         limit: i64,
-        after_created_at: Option<String>,
-        after_id: Option<String>,
+        #[graphql(
+            desc = "Opaque continuation token from a previous page's `nextCursor`. Must be presented with the same `status`/`assigneeDid` filter that issued it."
+        )]
+        cursor: Option<String>,
     ) -> Result<TaskPageType> {
+        use crate::api::task_cursor::{self, TaskCursorKey, TaskFilter};
+
         let db = ctx.data_unchecked::<Arc<Db>>();
         // #268: gate rows via the same collector the REST list route uses (like
         // `ref_updates` shares `collect_visible_ref_updates` with its REST feed),
@@ -127,32 +131,37 @@ impl QueryRoot {
             .data::<crate::auth::AuthenticatedDid>()
             .ok()
             .map(|d| d.0.as_str());
-        let after_parsed = crate::api::tasks::parse_after_cursor(
-            after_created_at.as_deref(),
-            after_id.as_deref(),
-            None,
-            None,
-        )
-        .map_err(crate::graphql::graphql_app_err)?;
-        let after = after_parsed
-            .as_ref()
-            .map(|(ts, id)| (ts.as_str(), id.as_str()));
+        let key = ctx.data_unchecked::<TaskCursorKey>();
+        let filter = TaskFilter {
+            status: status.as_deref(),
+            assignee_did: assignee_did.as_deref(),
+        };
+        let resume = cursor
+            .as_deref()
+            .map(|token| task_cursor::decode(key, filter, token))
+            .transpose()
+            .map_err(crate::graphql::graphql_app_err)?;
         let result = crate::api::tasks::collect_visible_tasks(
             db,
             status.as_deref(),
             assignee_did.as_deref(),
             limit,
-            after,
+            resume.as_ref(),
             caller,
         )
         .await
         .map_err(crate::graphql::graphql_app_err)?;
         Ok(TaskPageType {
+            next_cursor: result
+                .next_position
+                .as_ref()
+                .map(|pos| task_cursor::encode(key, filter, pos)),
             items: result
                 .tasks
                 .into_iter()
                 .map(AgentTaskReadType::from)
                 .collect(),
+            has_more: result.has_more,
             incomplete: result.incomplete,
         })
     }
@@ -186,10 +195,14 @@ mod tests {
         Arc::new(db)
     }
 
+    fn cursor_key() -> crate::api::task_cursor::TaskCursorKey {
+        crate::api::task_cursor::TaskCursorKey::derive(&[42u8; 32])
+    }
+
     fn schema(db: Arc<Db>) -> super::super::GitlawbSchema {
         let (ref_tx, _) = tokio::sync::broadcast::channel(16);
         let (task_tx, _) = tokio::sync::broadcast::channel(16);
-        super::super::build_schema(db, ref_tx, task_tx)
+        super::super::build_schema(db, ref_tx, task_tx, cursor_key())
     }
 
     fn repo(id: &str, owner_did: &str, name: &str, is_public: bool) -> RepoRecord {
@@ -659,14 +672,13 @@ mod tests {
         assert!(format!("{:?}", resp.data).contains("visible"));
     }
 
-    /// The candidate scan wall reports `incomplete: true` with no cursor
-    /// (#268 follow-up review): the server never discloses the id/created_at
-    /// of a denied row it stopped scanning on. A caller that wants to push
-    /// past the wall in one more request must supply `after`/`id` it already
-    /// legitimately knows, which this test stands in for directly rather than
-    /// reading it from a prior response, since none is offered.
+    /// The GraphQL surface must page past a denied window on server-issued
+    /// cursors alone, exactly as REST does (#327 review). Before this, the
+    /// only cursor a caller could hold named the last row they saw, so the
+    /// query stalled at `incomplete: true` forever and never reached
+    /// `past-ceiling`.
     #[sqlx::test]
-    async fn tasks_continuation_past_candidate_ceiling(pool: PgPool) {
+    async fn tasks_page_past_candidate_ceiling_on_server_cursors(pool: PgPool) {
         let db = db(pool).await;
         db.create_repo(&repo("public-repo", OWNER, "public", true))
             .await
@@ -687,7 +699,7 @@ mod tests {
             deadline: None,
         };
         db.create_task(&visible_newer).await.unwrap();
-        for i in 0..1000 {
+        for i in 0..1500 {
             let mut hidden = visible_newer.clone();
             hidden.id = format!("hidden-{i:04}");
             hidden.repo_id = None;
@@ -703,52 +715,145 @@ mod tests {
         db.create_task(&visible_older).await.unwrap();
 
         let schema = schema(db);
-        // Page 1 returns the first visible task.
-        let resp = anon(&schema, "{ tasks(limit: 1) { items { id } incomplete } }").await;
-        assert_eq!(count_tasks(&resp), 1);
-        assert!(!task_incomplete(&resp));
-        let async_graphql::Value::Object(first) = &task_items(&resp)[0] else {
-            panic!("expected task item to be an object");
-        };
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for request in 0..10 {
+            let query = match &cursor {
+                Some(c) => format!(
+                    r#"{{ tasks(limit: 1, cursor: "{c}") {{ items {{ id }} hasMore incomplete nextCursor }} }}"#
+                ),
+                None => {
+                    "{ tasks(limit: 1) { items { id } hasMore incomplete nextCursor } }".to_string()
+                }
+            };
+            let resp = anon(&schema, &query).await;
+            let rendered = format!("{:?}", resp.data);
+            assert!(
+                !rendered.contains("hidden-"),
+                "request {request} disclosed a denied row: {rendered}"
+            );
+            for item in task_items(&resp) {
+                let async_graphql::Value::Object(row) = item else {
+                    panic!("task item not an object");
+                };
+                seen.push(row.get("id").unwrap().to_string().replace('"', ""));
+            }
+            // Short page with more behind it is the scan wall, and says so.
+            if task_page_bool(&resp, "hasMore") && task_items(&resp).is_empty() {
+                assert!(
+                    task_incomplete(&resp),
+                    "request {request}: an empty page with rows behind it is a paused scan"
+                );
+            }
+            match task_page_cursor(&resp) {
+                Some(c) => cursor = Some(c),
+                None => {
+                    assert!(!task_page_bool(&resp, "hasMore"));
+                    assert!(!task_incomplete(&resp));
+                    break;
+                }
+            }
+        }
+
         assert_eq!(
-            first.get("id"),
-            Some(&async_graphql::Value::from("newer-visible"))
+            seen,
+            vec!["newer-visible".to_string(), "past-ceiling".to_string()],
+            "both visible rows must be reachable using only server-issued cursors"
         );
-
-        // Page 2 anchored on the visible task hits the candidate ceiling across the denied window.
-        let resp = anon(
-            &schema,
-            r#"{ tasks(limit: 1, afterCreatedAt: "2026-01-03T00:00:00Z", afterId: "newer-visible") { items { id } incomplete } }"#,
-        )
-        .await;
-        assert_eq!(count_tasks(&resp), 0);
-        assert!(task_incomplete(&resp));
-        assert!(!format!("{:?}", resp.data).contains("hidden-"));
-        assert!(!format!("{:?}", resp.data).contains("past-ceiling"));
-
-        // A repeated query on the same legitimately-held cursor stalls at the ceiling.
-        let resp = anon(
-            &schema,
-            r#"{ tasks(limit: 1, afterCreatedAt: "2026-01-03T00:00:00Z", afterId: "newer-visible") { items { id } incomplete } }"#,
-        )
-        .await;
-        assert_eq!(count_tasks(&resp), 0);
-        assert!(task_incomplete(&resp));
     }
 
+    /// REST and GraphQL mint the same tokens from the same node key, so a
+    /// cursor must not be usable against a filter it was not issued for, and
+    /// must render the same single rejection every other bad cursor renders.
     #[sqlx::test]
-    async fn tasks_rejects_partial_cursor_pair(pool: PgPool) {
+    async fn tasks_rejects_unusable_cursor(pool: PgPool) {
+        use crate::api::task_cursor::{self, TaskFilter, TaskPosition};
+
         let db = db(pool).await;
         let schema = schema(db);
+
+        let wrong_filter = task_cursor::encode(
+            &cursor_key(),
+            TaskFilter {
+                status: Some("pending"),
+                assignee_did: None,
+            },
+            &TaskPosition::new("2026-01-01T00:00:00Z", "t1"),
+        );
+        let foreign = task_cursor::encode(
+            &crate::api::task_cursor::TaskCursorKey::derive(&[9u8; 32]),
+            TaskFilter {
+                status: None,
+                assignee_did: None,
+            },
+            &TaskPosition::new("2026-01-01T00:00:00Z", "t1"),
+        );
+
+        for (label, query) in [
+            (
+                "garbage",
+                r#"{ tasks(cursor: "not-a-cursor") { items { id } } }"#.to_string(),
+            ),
+            (
+                "another node's key",
+                format!(r#"{{ tasks(cursor: "{foreign}") {{ items {{ id }} }} }}"#),
+            ),
+            (
+                "different filter",
+                format!(r#"{{ tasks(cursor: "{wrong_filter}") {{ items {{ id }} }} }}"#),
+            ),
+        ] {
+            let resp = anon(&schema, &query).await;
+            assert_eq!(
+                resp.errors.len(),
+                1,
+                "{label}: must be rejected, not treated as page one"
+            );
+            assert!(
+                resp.errors[0].message.contains("invalid or expired cursor"),
+                "{label}: unexpected message {:?}",
+                resp.errors[0].message
+            );
+        }
+
+        // Presented with the filter that issued it, the same token is accepted.
         let resp = anon(
             &schema,
-            r#"{ tasks(afterCreatedAt: "2026-01-01T00:00:00Z") { items { id } } }"#,
+            &format!(
+                r#"{{ tasks(status: "pending", cursor: "{wrong_filter}") {{ items {{ id }} }} }}"#
+            ),
         )
         .await;
-        assert!(
-            !resp.errors.is_empty(),
-            "a half-supplied cursor must be rejected, not treated as page one"
-        );
+        assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
+    }
+
+    fn task_page_bool(resp: &async_graphql::Response, field: &str) -> bool {
+        assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
+        let async_graphql::Value::Object(obj) = &resp.data else {
+            panic!("data not an object: {:?}", resp.data);
+        };
+        let async_graphql::Value::Object(page) = obj.get("tasks").expect("tasks key") else {
+            panic!("tasks not an object");
+        };
+        let async_graphql::Value::Boolean(value) = page.get(field).expect("field present") else {
+            panic!("{field} not a bool");
+        };
+        *value
+    }
+
+    fn task_page_cursor(resp: &async_graphql::Response) -> Option<String> {
+        assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
+        let async_graphql::Value::Object(obj) = &resp.data else {
+            panic!("data not an object: {:?}", resp.data);
+        };
+        let async_graphql::Value::Object(page) = obj.get("tasks").expect("tasks key") else {
+            panic!("tasks not an object");
+        };
+        match page.get("nextCursor").expect("nextCursor key") {
+            async_graphql::Value::Null => None,
+            async_graphql::Value::String(c) => Some(c.clone()),
+            other => panic!("nextCursor not a string: {other:?}"),
+        }
     }
 
     fn task_items(resp: &async_graphql::Response) -> &Vec<async_graphql::Value> {

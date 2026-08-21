@@ -59,6 +59,10 @@ pub struct AppState {
     pub task_event_tx: tokio::sync::broadcast::Sender<TaskEventBroadcast>,
     /// GraphQL schema (queries + mutations + subscriptions)
     pub graphql_schema: Arc<crate::graphql::GitlawbSchema>,
+    /// MAC key for task-list continuation tokens, derived from the node
+    /// keypair seed. Held here (and handed to the GraphQL schema) so REST and
+    /// GraphQL mint and accept the same tokens.
+    pub task_cursor_key: crate::api::task_cursor::TaskCursorKey,
     /// Fly.io machine ID — used for fly-replay routing in multi-machine deployments
     pub machine_id: Option<String>,
     /// Centralized repo storage: local disk cache + optional Tigris backend

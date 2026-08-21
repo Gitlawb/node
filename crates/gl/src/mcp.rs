@@ -512,7 +512,8 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "status": { "type": "string", "description": "Filter by status: pending, claimed, completed, failed" },
                     "assignee_did": { "type": "string", "description": "Filter by assignee DID" },
-                    "limit": { "type": "integer", "description": "Max results (default: 50)", "default": 50 }
+                    "limit": { "type": "integer", "description": "Total results to return (default: 50). Values above the node's 200-row page cap are gathered by following continuation tokens.", "default": 50 },
+                    "cursor": { "type": "string", "description": "Resume from a previous call's next_cursor. Must be paired with the same status/assignee_did filter that produced it." }
                 }
             }
         },
@@ -1060,21 +1061,23 @@ async fn call_tool(
 
         // ── Task tools ────────────────────────────────────────────────────
         "task_list" => {
-            let limit = args["limit"].as_i64().unwrap_or(50);
-            let mut path = format!("/api/v1/tasks?limit={limit}");
-            if let Some(s) = args.get("status").and_then(|v| v.as_str()) {
-                path.push_str(&format!("&status={}", urlencoding::encode(s)));
+            // Follows the node's opaque `next_cursor` so a limit above the
+            // 200-row server page cap returns what was asked for instead of a
+            // silently truncated page, and reports an explicit incomplete
+            // result when a guard or the node's scan ceiling stops it (#327).
+            let result = crate::task::fetch_tasks(
+                &client,
+                args.get("status").and_then(|v| v.as_str()),
+                args.get("assignee_did").and_then(|v| v.as_str()),
+                args["limit"].as_i64().unwrap_or(50),
+                args.get("cursor").and_then(|v| v.as_str()),
+            )
+            .await?;
+            let mut out = result.to_json();
+            if let Some(warning) = result.truncation_warning() {
+                out["warning"] = Value::String(warning);
             }
-            if let Some(a) = args.get("assignee_did").and_then(|v| v.as_str()) {
-                path.push_str(&format!("&assignee_did={}", urlencoding::encode(a)));
-            }
-            let resp: Value = client
-                .get_maybe_signed(&path)
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            Ok(serde_json::to_string_pretty(&resp)?)
+            Ok(serde_json::to_string_pretty(&out)?)
         }
 
         "task_create" => {
@@ -1646,6 +1649,103 @@ mod tests {
             .unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["tasks"][0]["id"], "t1");
+    }
+
+    /// #327 review: MCP `task_list` issued one request and exposed no
+    /// continuation, so a limit above the node's 200-row page cap returned a
+    /// silently truncated result the model had no way to detect. It now
+    /// follows cursors and, when a guard stops it, says so in the payload.
+    #[tokio::test]
+    async fn test_task_list_via_mcp_follows_cursors() {
+        let mut server = mockito::Server::new_async().await;
+        let first = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/tasks\?limit=200$".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"tasks":[{"id":"t1"}],"has_more":true,"incomplete":false,"next_cursor":"c1"}"#,
+            )
+            .create_async()
+            .await;
+        let second = server
+            .mock("GET", mockito::Matcher::Regex(r"cursor=c1".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[{"id":"t2"}],"has_more":false,"next_cursor":null}"#)
+            .create_async()
+            .await;
+
+        let result = call_tool("task_list", json!({"limit": 500}), &server.url(), None)
+            .await
+            .unwrap();
+        first.assert_async().await;
+        second.assert_async().await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["count"], 2);
+        assert_eq!(parsed["tasks"][1]["id"], "t2");
+        assert_eq!(parsed["complete"], json!(true));
+        assert!(parsed.get("warning").is_none());
+    }
+
+    /// A truncated MCP result must carry an explicit warning and a resume
+    /// cursor, so the model cannot read it as the whole answer.
+    #[tokio::test]
+    async fn test_task_list_via_mcp_flags_incomplete_results() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"tasks":[],"has_more":true,"incomplete":true,"next_cursor":"resume-me"}"#,
+            )
+            .create_async()
+            .await;
+
+        let result = call_tool("task_list", json!({"limit": 50}), &server.url(), None)
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["complete"], json!(false));
+        assert_eq!(parsed["incomplete"], json!(true));
+        assert_eq!(parsed["next_cursor"], "resume-me");
+        assert!(
+            parsed["warning"]
+                .as_str()
+                .unwrap()
+                .contains("result incomplete"),
+            "{parsed}"
+        );
+    }
+
+    /// A cursor the model passes back must reach the node.
+    #[tokio::test]
+    async fn test_task_list_via_mcp_forwards_cursor_argument() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"cursor=given-cursor".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[],"has_more":false}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        call_tool(
+            "task_list",
+            json!({"cursor": "given-cursor"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .unwrap();
+        m.assert_async().await;
     }
 
     #[tokio::test]

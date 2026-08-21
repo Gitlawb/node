@@ -70,16 +70,22 @@ pub struct AgentTaskReadType {
     pub deadline: Option<String>,
 }
 
-/// Wraps a `tasks` page with the same truncation signal the REST list route
-/// exposes (`incomplete`), so a GraphQL caller behind a denied-row scan wall
-/// can tell a short page from an exhaustive one instead of getting an
-/// indistinguishable empty/short list. Carries no cursor, for the same reason
-/// REST's `list_tasks` response does not: the scan wall lands on the last
-/// *examined* candidate, not necessarily one the caller may see.
+/// Wraps a `tasks` page with the same completion signals the REST list route
+/// exposes, so the two surfaces answer pagination identically.
+///
+/// `hasMore` and `incomplete` are separate because they are separate facts
+/// (#327 review): `hasMore` says more candidates remain, `incomplete` says
+/// this page is short *only* because the authorization scan hit its safety
+/// wall. `nextCursor` is present exactly when `hasMore` is true and is an
+/// opaque MAC'd token — it can name the last examined candidate, denied or
+/// not, without disclosing it, which is what lets a caller page past a denied
+/// window instead of stalling on it.
 #[derive(SimpleObject, Clone)]
 pub struct TaskPageType {
     pub items: Vec<AgentTaskReadType>,
+    pub has_more: bool,
     pub incomplete: bool,
+    pub next_cursor: Option<String>,
 }
 
 impl From<AgentTask> for AgentTaskReadType {

@@ -77,10 +77,15 @@ impl MutationRoot {
             .await
             .map_err(crate::graphql::graphql_app_err)?
             .ok_or_else(|| async_graphql::Error::new("task not found"))?;
+        // Same classification REST's claim handler applies: a claim race is a
+        // client-safe conflict, a genuine sqlx failure stays opaque. Routing
+        // both transports through `task_write_conflict` is what stops a normal
+        // race from reaching a GraphQL caller as a generic database error
+        // (#327 review).
         let task = db
             .claim_task(&id, &assignee_did)
             .await
-            .map_err(crate::graphql::graphql_db_err)?;
+            .map_err(crate::graphql::graphql_claim_conflict)?;
         crate::api::tasks::announce_task_event(
             db,
             tx,
@@ -127,7 +132,7 @@ impl MutationRoot {
         let task = db
             .finish_task(&id, "completed", input.result.as_deref())
             .await
-            .map_err(crate::graphql::graphql_db_err)?;
+            .map_err(crate::graphql::graphql_finish_conflict)?;
         crate::api::tasks::announce_task_event(
             db,
             tx,
@@ -175,7 +180,7 @@ impl MutationRoot {
         let task = db
             .finish_task(&id, "failed", Some(&reason))
             .await
-            .map_err(crate::graphql::graphql_db_err)?;
+            .map_err(crate::graphql::graphql_finish_conflict)?;
         crate::api::tasks::announce_task_event(
             db,
             tx,
@@ -290,6 +295,179 @@ mod tests {
         assert!(
             !errs.contains("column") && !errs.contains("status"),
             "schema text leaked: {errs}"
+        );
+    }
+
+    /// #327 review: `claimTask`/`completeTask`/`failTask` called
+    /// `graphql_db_err` directly on db-layer business failures, so an ordinary
+    /// claim race or stale finish reached GraphQL clients as a generic
+    /// database error while REST clients got an actionable conflict. All three
+    /// now route through the shared `task_write_conflict` classifier.
+    ///
+    /// Deleting either `map_err` from a mutation turns this red: the message
+    /// becomes the raw anyhow text instead of the fixed conflict form.
+    #[sqlx::test]
+    async fn task_write_races_surface_as_conflicts_not_db_errors(pool: PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let schema = state.graphql_schema.as_ref();
+        let assignee = "did:key:zGQLRACEASSIGNEEAAAAAAAAAAAAAAAAAAAAAAA";
+        let rival = "did:key:zGQLRACERIVALBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let delegator = "did:key:zGQLRACEDELEGATORCCCCCCCCCCCCCCCCCCCCC";
+        let now = chrono::Utc::now().to_rfc3339();
+
+        state
+            .db
+            .create_repo(&crate::db::RepoRecord {
+                id: "race-repo".into(),
+                name: "race".into(),
+                owner_did: delegator.into(),
+                description: None,
+                is_public: true,
+                default_branch: "main".into(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                disk_path: "/tmp/race-repo".into(),
+                forked_from: None,
+                machine_id: None,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .create_task(&crate::db::AgentTask {
+                id: "race-task".into(),
+                repo_id: Some("race-repo".into()),
+                kind: "build".into(),
+                status: "pending".into(),
+                delegator_did: delegator.into(),
+                assignee_did: None,
+                capability: "repo:write".into(),
+                ucan_token: None,
+                payload: None,
+                result: None,
+                created_at: now.clone(),
+                updated_at: now,
+                deadline: None,
+            })
+            .await
+            .unwrap();
+
+        // The assignee wins the claim.
+        let claim = |did: &str| {
+            format!(r#"mutation {{ claimTask(id: "race-task", assigneeDid: "{did}") {{ id }} }}"#)
+        };
+        let resp = schema
+            .execute(Request::new(claim(assignee)).data(AuthenticatedDid(assignee.into())))
+            .await;
+        assert!(resp.errors.is_empty(), "first claim: {}", errors(&resp));
+
+        // The rival loses the race: an expected conflict, not an outage.
+        let resp = schema
+            .execute(Request::new(claim(rival)).data(AuthenticatedDid(rival.into())))
+            .await;
+        let errs = errors(&resp);
+        assert!(
+            errs.contains("task not claimable: not found or already claimed"),
+            "a lost claim race must render the fixed conflict message: {errs}"
+        );
+        assert!(
+            !errs.contains(crate::graphql::GRAPHQL_DB_ERROR_MESSAGE),
+            "a claim race is not a database failure: {errs}"
+        );
+
+        // A stale finish on an already-completed task is the same class.
+        let complete = format!(
+            r#"mutation {{ completeTask(id: "race-task", byDid: "{assignee}", input: {{ result: "ok" }}) {{ id }} }}"#
+        );
+        let resp = schema
+            .execute(Request::new(&complete).data(AuthenticatedDid(assignee.into())))
+            .await;
+        assert!(resp.errors.is_empty(), "first complete: {}", errors(&resp));
+
+        let resp = schema
+            .execute(Request::new(&complete).data(AuthenticatedDid(assignee.into())))
+            .await;
+        let errs = errors(&resp);
+        assert!(
+            errs.contains("task not found or not in claimed state"),
+            "a stale complete must render the fixed conflict message: {errs}"
+        );
+        assert!(
+            !errs.contains(crate::graphql::GRAPHQL_DB_ERROR_MESSAGE),
+            "a stale complete is not a database failure: {errs}"
+        );
+
+        let fail = format!(
+            r#"mutation {{ failTask(id: "race-task", byDid: "{assignee}", input: {{ reason: "nope" }}) {{ id }} }}"#
+        );
+        let resp = schema
+            .execute(Request::new(&fail).data(AuthenticatedDid(assignee.into())))
+            .await;
+        let errs = errors(&resp);
+        assert!(
+            errs.contains("task not found or not in claimed state"),
+            "a stale fail must render the fixed conflict message: {errs}"
+        );
+        assert!(
+            !errs.contains(crate::graphql::GRAPHQL_DB_ERROR_MESSAGE),
+            "a stale fail is not a database failure: {errs}"
+        );
+    }
+
+    /// The other half of the same classification: a genuine SQL fault on the
+    /// write itself must stay opaque. Without this, routing conflicts through
+    /// `task_write_conflict` could be "fixed" by making every db failure a
+    /// client-visible conflict message.
+    #[sqlx::test]
+    async fn task_write_sql_faults_stay_opaque(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let assignee = "did:key:zGQLOPAQUEASSIGNEEAAAAAAAAAAAAAAAAAAAAA";
+        let delegator = "did:key:zGQLOPAQUEDELEGATORBBBBBBBBBBBBBBBBBBB";
+        let now = chrono::Utc::now().to_rfc3339();
+        state
+            .db
+            .create_task(&crate::db::AgentTask {
+                id: "opaque-task".into(),
+                repo_id: None,
+                kind: "build".into(),
+                status: "pending".into(),
+                delegator_did: delegator.into(),
+                assignee_did: Some(assignee.into()),
+                capability: "repo:write".into(),
+                ucan_token: None,
+                payload: None,
+                result: None,
+                created_at: now.clone(),
+                updated_at: now,
+                deadline: None,
+            })
+            .await
+            .unwrap();
+
+        // Break the column the claim UPDATE writes, after the visibility
+        // pre-check's SELECT still succeeds.
+        sqlx::query("ALTER TABLE agent_tasks DROP COLUMN updated_at")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let resp = state
+            .graphql_schema
+            .execute(
+                Request::new(format!(
+                    r#"mutation {{ claimTask(id: "opaque-task", assigneeDid: "{assignee}") {{ id }} }}"#
+                ))
+                .data(AuthenticatedDid(assignee.into())),
+            )
+            .await;
+        let errs = errors(&resp);
+        assert!(
+            errs.contains(crate::graphql::GRAPHQL_DB_ERROR_MESSAGE),
+            "a real sqlx fault on the write must stay opaque: {errs}"
+        );
+        assert!(
+            !errs.contains("updated_at") && !errs.contains("column"),
+            "schema text leaked through the conflict mapper: {errs}"
         );
     }
 

@@ -288,10 +288,15 @@ async fn main() -> Result<()> {
     let (ref_update_tx, _) = tokio::sync::broadcast::channel::<state::RefUpdateBroadcast>(256);
     let (task_event_tx, _) = tokio::sync::broadcast::channel::<state::TaskEventBroadcast>(256);
 
+    // Node-keyed, so continuation tokens this node mints are only accepted by
+    // this node and survive its restarts without any configured secret.
+    let task_cursor_key = api::task_cursor::TaskCursorKey::derive(&keypair.to_seed());
+
     let graphql_schema = Arc::new(graphql::build_schema(
         Arc::clone(&db),
         ref_update_tx.clone(),
         task_event_tx.clone(),
+        task_cursor_key.clone(),
     ));
 
     let machine_id = std::env::var("FLY_MACHINE_ID").ok();
@@ -413,6 +418,7 @@ async fn main() -> Result<()> {
         db,
         node_did: node_did.clone(),
         node_keypair: Arc::new(keypair),
+        task_cursor_key,
         p2p: p2p_handle,
         http_client,
         ref_update_tx,
