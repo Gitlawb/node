@@ -279,11 +279,13 @@ pub(crate) async fn collect_visible_tasks(
         let repo_ids: Vec<String> = repos_by_id.keys().cloned().collect();
         let rules_by_repo = db.list_visibility_rules_for_repos(&repo_ids).await?;
 
+        let mut consumed = 0usize;
         for task in &batch {
             // Advance the examined position per row, not per batch: when the
             // page fills mid-batch the resume point is that row, so the next
             // request neither repeats nor skips its successors.
             scanned += 1;
+            consumed += 1;
             examined = Some(TaskPosition::new(task.created_at.clone(), task.id.clone()));
             if task_visible(task, caller, &repos_by_id, &rules_by_repo) {
                 visible.push(task.clone());
@@ -293,7 +295,11 @@ pub(crate) async fn collect_visible_tasks(
             }
         }
 
-        if batch_len < batch_limit {
+        // A short batch only ends the stream once every row in it has been
+        // examined. Filling the page mid-batch leaves rows behind that the
+        // next request must still see, so the position advances and `has_more`
+        // is settled by the probe below rather than assumed false.
+        if consumed == batch.len() && batch_len < batch_limit {
             stream_ended = true;
             break;
         }
@@ -1259,6 +1265,55 @@ mod visible_tasks_tests {
             unique.len(),
             total,
             "paging must enumerate every visible row exactly once, no skips or repeats"
+        );
+    }
+
+    /// The minimal shape of a mid-batch page fill: fewer rows than one SQL
+    /// batch, and a limit smaller than that. A short batch means no rows exist
+    /// *past* it, not that every row *in* it was examined, so treating the two
+    /// as the same drops every row after the one that filled the page.
+    #[sqlx::test]
+    async fn short_batch_that_fills_the_page_still_offers_a_continuation(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("public-repo", DELEGATOR, "public", true))
+            .await
+            .unwrap();
+        for (id, ts) in [
+            ("t-3", "2026-01-03T00:00:00Z"),
+            ("t-2", "2026-01-02T00:00:00Z"),
+            ("t-1", "2026-01-01T00:00:00Z"),
+        ] {
+            let mut t = task(id, Some("public-repo"), DELEGATOR);
+            t.created_at = ts.into();
+            t.updated_at = t.created_at.clone();
+            state.db.create_task(&t).await.unwrap();
+        }
+
+        let resp = list_router(state.clone())
+            .oneshot(anon_get("/api/v1/tasks?limit=1"))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["tasks"][0]["id"], "t-3");
+        assert_eq!(
+            body["has_more"], true,
+            "two rows remain in the same batch, so this is not the end of the stream: {body}"
+        );
+        let cursor = body["next_cursor"]
+            .as_str()
+            .expect("a continuation must be offered")
+            .to_string();
+
+        let resp = list_router(state)
+            .oneshot(anon_get(&format!("/api/v1/tasks?limit=1&cursor={cursor}")))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["tasks"][0]["id"], "t-2",
+            "the continuation must resume inside the batch, not past it: {body}"
         );
     }
 
