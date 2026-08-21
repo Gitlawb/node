@@ -444,12 +444,24 @@ mod tests {
             .await
             .unwrap();
 
-        // Break the column the claim UPDATE writes, after the visibility
-        // pre-check's SELECT still succeeds.
-        sqlx::query("ALTER TABLE agent_tasks DROP COLUMN updated_at")
-            .execute(&pool)
-            .await
-            .unwrap();
+        // Fault the write itself, not the schema. Dropping a column the
+        // visibility pre-check also SELECTs would fail in `get_visible_task`
+        // and never reach `graphql_claim_conflict`, so this test would pass
+        // against a claim mapper that leaks (#327 review). A BEFORE UPDATE
+        // trigger keeps every read valid and faults only inside
+        // `Db::claim_task`.
+        sqlx::raw_sql(
+            "CREATE FUNCTION gl_test_fault_task_update() RETURNS trigger
+             LANGUAGE plpgsql AS $fn$
+             BEGIN RAISE EXCEPTION 'gl_test_forced_update_fault'; END;
+             $fn$;
+             CREATE TRIGGER gl_test_fault_task_update
+             BEFORE UPDATE ON agent_tasks
+             FOR EACH ROW EXECUTE FUNCTION gl_test_fault_task_update();",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let resp = state
             .graphql_schema
@@ -466,8 +478,12 @@ mod tests {
             "a real sqlx fault on the write must stay opaque: {errs}"
         );
         assert!(
-            !errs.contains("updated_at") && !errs.contains("column"),
-            "schema text leaked through the conflict mapper: {errs}"
+            !errs.contains("task not claimable"),
+            "a write-time sqlx fault must not be reclassified as a claim race: {errs}"
+        );
+        assert!(
+            !errs.contains("gl_test_forced_update_fault") && !errs.contains("trigger"),
+            "database text leaked through the conflict mapper: {errs}"
         );
     }
 
