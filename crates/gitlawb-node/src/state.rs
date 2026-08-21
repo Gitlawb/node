@@ -323,6 +323,14 @@ pub struct AppState {
     /// (`with_default_max_keys`, reject-before-insert) so a source-key farm cannot grow
     /// it (INV-15).
     pub git_ipfs_walk_per_caller: crate::rate_limit::PerCallerConcurrency,
+    /// Per-client-IP rate limiter for the task read routes. `GET /api/v1/tasks`
+    /// and `GET /api/v1/tasks/{id}` are anonymously reachable and run the #268
+    /// visibility gate (a task lookup plus deduped-repo and visibility-rule
+    /// queries) before returning the opaque 404, so an unauthenticated prober
+    /// costs the node real work per request whether or not anything is visible.
+    /// Keyed on the resolved client IP via `push_limiter_trust`. Layered on
+    /// `task_read_routes` via `rate_limit_by_ip`.
+    pub task_read_rate_limiter: RateLimiter,
     /// The `git` executable the served-git withheld-blob walk spawns. Production is
     /// `"git"` (resolved via PATH); injectable so a fake `git` can drive the walk's
     /// process-group teardown in handler tests without mutating the process-global
@@ -350,6 +358,7 @@ impl AppState {
         self.ipfs_work_rate_limiter.cleanup().await;
         self.sync_trigger_rate_limiter.cleanup().await;
         self.peer_write_rate_limiter.cleanup().await;
+        self.task_read_rate_limiter.cleanup().await;
     }
 
     /// Trigger graceful shutdown. Idempotent — calling more than once
