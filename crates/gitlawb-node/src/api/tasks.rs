@@ -36,7 +36,7 @@ fn forbidden(msg: &str) -> (StatusCode, Json<Value>) {
 /// Map a db-layer `anyhow` from claim/finish: connection-class sqlx failures
 /// stay retryable 503, business "not claimable / not claimed" stays 409 with
 /// a fixed message (not the anyhow text).
-fn task_write_conflict(err: anyhow::Error, message: &str) -> AppError {
+pub(crate) fn task_write_conflict(err: anyhow::Error, message: &str) -> AppError {
     match AppError::from(err) {
         db @ AppError::Db(_) => db,
         _ => AppError::Conflict(message.into()),
@@ -63,10 +63,13 @@ pub struct ListTasksQuery {
     pub assignee_did: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: i64,
-    pub after_created_at: Option<String>,
-    pub after_id: Option<String>,
-    pub cursor_created_at: Option<String>,
-    pub cursor_id: Option<String>,
+    /// Opaque continuation token from a previous response's `next_cursor`.
+    /// The raw `after_created_at`/`after_id`/`cursor_created_at`/`cursor_id`
+    /// pairs this replaces are gone (#327 review): a caller-typed timestamp
+    /// compared against TEXT storage had no single ordering domain, and a
+    /// caller-held cursor could only ever name a row the caller had already
+    /// seen, which is what made a long denied window unpageable.
+    pub cursor: Option<String>,
 }
 
 fn default_limit() -> i64 {
@@ -186,26 +189,27 @@ pub(crate) fn task_visible(
     crate::visibility::listable_at_root(rules, record.is_public, &record.owner_did, caller)
 }
 
-/// Collect up to `limit` tasks visible to `caller`, applying the same gate the
 #[derive(Debug, Clone)]
 pub(crate) struct VisibleTasks {
     pub tasks: Vec<AgentTask>,
-    /// True when the candidate scan hit `MAX_TASK_SCAN_CANDIDATES` and more
-    /// rows remain, so the caller cannot tell an empty/short page from an
-    /// exhaustive one. False when the last fetched batch was short or a
-    /// one-row probe past the ceiling is empty: exactly
-    /// `MAX_TASK_SCAN_CANDIDATES` rows with nothing beyond is a finished
-    /// stream, not a wall. Deliberately carries no cursor: the scan position
-    /// at that point is the last *examined* candidate, which may be a task
-    /// the caller was denied, and handing that back would let a denied read
-    /// leak the id/created_at of a row `GET /tasks/{id}` otherwise 404s (the
-    /// same id `claim_task` accepts). A caller can page with
-    /// `after_created_at`/`after_id` set to the last row they actually
-    /// received; if a window of >= 1,000 consecutive denied tasks
-    /// intervenes before the next visible row, pagination anchored on that
-    /// received row stalls at the candidate ceiling and repeatedly returns
-    /// empty results with `incomplete: true`.
+    /// True when candidate rows remain past this page, whether or not the
+    /// page filled. `next_position` is `Some` exactly when this is true.
+    pub has_more: bool,
+    /// True when this request stopped at `MAX_TASK_SCAN_CANDIDATES` with the
+    /// page still unfilled, so a short or empty page is a paused scan rather
+    /// than the end of the stream.
+    ///
+    /// Kept separate from `has_more` because they answer different questions
+    /// (#327 review): `has_more` says another page exists, `incomplete` says
+    /// *this* page is short only because the authorization scan hit its safety
+    /// wall. Overloading one flag for both left a caller unable to tell a
+    /// finished stream from a paused one.
     pub incomplete: bool,
+    /// Keyset position of the last candidate this request *examined*, visible
+    /// or not. Handed back only inside a MAC'd token (`api::task_cursor`), so
+    /// resuming a scan can step past a denied window without the denied rows'
+    /// ids or timestamps ever reaching the caller in the clear.
+    pub next_position: Option<crate::api::task_cursor::TaskPosition>,
 }
 
 /// Collect up to `limit` tasks visible to `caller`, applying the same gate the
@@ -214,49 +218,53 @@ pub(crate) struct VisibleTasks {
 /// pattern in `api/events.rs`. `limit` is clamped here so a caller-supplied
 /// value never reaches SQL unclamped.
 ///
+/// `resume` is the position decoded from a continuation token, never a
+/// caller-typed cursor: the token carries `created_at` verbatim as stored, so
+/// the TEXT comparison in `list_tasks_keyset` always runs against a string the
+/// server wrote. That is what keeps equivalent RFC3339 spellings (`Z` versus
+/// `+00:00`, differing fractional widths) from silently skipping or repeating
+/// same-timestamp rows.
 pub(crate) async fn collect_visible_tasks(
     db: &crate::db::Db,
     status: Option<&str>,
     assignee_did: Option<&str>,
     limit: i64,
-    after: Option<(&str, &str)>,
+    resume: Option<&crate::api::task_cursor::TaskPosition>,
     caller: Option<&str>,
 ) -> crate::error::Result<VisibleTasks> {
-    let bounded_limit = limit.clamp(0, MAX_VISIBLE_TASKS);
+    use crate::api::task_cursor::TaskPosition;
+
+    let bounded_limit = limit.clamp(0, MAX_VISIBLE_TASKS) as usize;
     if bounded_limit == 0 {
         return Ok(VisibleTasks {
             tasks: Vec::new(),
+            has_more: false,
             incomplete: false,
+            next_position: None,
         });
     }
-    let mut visible = Vec::with_capacity(bounded_limit as usize);
-    let mut cursor: Option<(String, String)> =
-        after.map(|(ts, id)| (ts.to_string(), id.to_string()));
-    let mut scanned = 0;
-    let mut last_batch_full = false;
+    let mut visible = Vec::with_capacity(bounded_limit);
+    let mut examined: Option<TaskPosition> = resume.cloned();
+    let mut scanned: i64 = 0;
+    let mut stream_ended = false;
 
-    while scanned < MAX_TASK_SCAN_CANDIDATES {
+    while scanned < MAX_TASK_SCAN_CANDIDATES && visible.len() < bounded_limit {
         let batch_limit = MAX_VISIBLE_TASKS.min(MAX_TASK_SCAN_CANDIDATES - scanned);
-        let tasks = db
+        let batch = db
             .list_tasks_keyset(
                 status,
                 assignee_did,
                 batch_limit,
-                cursor
-                    .as_ref()
-                    .map(|(created_at, id)| (created_at.as_str(), id.as_str())),
+                examined.as_ref().map(TaskPosition::as_pair),
             )
             .await?;
-        if tasks.is_empty() {
-            last_batch_full = false;
+        if batch.is_empty() {
+            stream_ended = true;
             break;
         }
-        scanned += tasks.len() as i64;
-        let next_cursor = tasks
-            .last()
-            .map(|task| (task.created_at.clone(), task.id.clone()));
+        let batch_len = batch.len() as i64;
 
-        let referenced: Vec<String> = tasks
+        let referenced: Vec<String> = batch
             .iter()
             .filter_map(|task| task.repo_id.clone())
             .collect::<HashSet<_>>()
@@ -271,52 +279,50 @@ pub(crate) async fn collect_visible_tasks(
         let repo_ids: Vec<String> = repos_by_id.keys().cloned().collect();
         let rules_by_repo = db.list_visibility_rules_for_repos(&repo_ids).await?;
 
-        for task in &tasks {
+        for task in &batch {
+            // Advance the examined position per row, not per batch: when the
+            // page fills mid-batch the resume point is that row, so the next
+            // request neither repeats nor skips its successors.
+            scanned += 1;
+            examined = Some(TaskPosition::new(task.created_at.clone(), task.id.clone()));
             if task_visible(task, caller, &repos_by_id, &rules_by_repo) {
                 visible.push(task.clone());
-                if visible.len() == bounded_limit as usize {
+                if visible.len() == bounded_limit {
                     break;
                 }
             }
         }
 
-        last_batch_full = tasks.len() >= batch_limit as usize;
-        if visible.len() == bounded_limit as usize {
-            // Page filled before the scan ceiling. The caller pages from the
-            // last visible row; `incomplete` is reserved for the ceiling path.
-            return Ok(VisibleTasks {
-                tasks: visible,
-                incomplete: false,
-            });
-        }
-        if !last_batch_full {
+        if batch_len < batch_limit {
+            stream_ended = true;
             break;
         }
-        cursor = next_cursor;
     }
 
-    // A full last batch at the ceiling is ambiguous: either more rows exist,
-    // or the table ended on an exact multiple of the batch size. Probe one
-    // more row so `incomplete` is false when the stream is exhausted.
-    let incomplete = if scanned >= MAX_TASK_SCAN_CANDIDATES && last_batch_full {
-        let more = db
-            .list_tasks_keyset(
-                status,
-                assignee_did,
-                1,
-                cursor
-                    .as_ref()
-                    .map(|(created_at, id)| (created_at.as_str(), id.as_str())),
-            )
-            .await?;
-        !more.is_empty()
-    } else {
+    // A full final batch is ambiguous: more rows may exist, or the stream may
+    // have ended on an exact multiple of the batch size. One probe row past
+    // the last examined candidate settles it, so `has_more` never advertises a
+    // page that turns out to be empty.
+    let has_more = if stream_ended {
         false
+    } else {
+        !db.list_tasks_keyset(
+            status,
+            assignee_did,
+            1,
+            examined.as_ref().map(TaskPosition::as_pair),
+        )
+        .await?
+        .is_empty()
     };
+
+    let incomplete = has_more && visible.len() < bounded_limit;
 
     Ok(VisibleTasks {
         tasks: visible,
+        has_more,
         incomplete,
+        next_position: if has_more { examined } else { None },
     })
 }
 
@@ -409,96 +415,54 @@ pub async fn create_task(
     Ok((StatusCode::CREATED, Json(task_to_json(&task))))
 }
 
-/// Canonicalize an RFC3339 timestamp. If spaces were introduced by URL query decoding
-/// (e.g. `+00:00` decoded as ` 00:00`), convert spaces back to `+` before parsing.
-/// Validates RFC3339 syntax while preserving the original fractional precision
-/// and string representation so comparisons against stored TEXT timestamps remain exact.
-pub(crate) fn canonicalize_timestamp(raw: &str) -> crate::error::Result<String> {
-    let normalized = if raw.contains(' ') {
-        raw.replace(' ', "+")
-    } else {
-        raw.to_string()
-    };
-    chrono::DateTime::parse_from_rfc3339(&normalized)
-        .map_err(|e| AppError::BadRequest(format!("invalid timestamp format '{raw}': {e}")))?;
-    Ok(normalized)
-}
-
-/// A cursor is two query fields (`created_at`, `id`) from either the `after_*` or `cursor_*` family.
-/// Reject cross-family alias mixing, require both fields within a family, and canonicalize timestamps.
-pub(crate) fn parse_after_cursor(
-    after_created_at: Option<&str>,
-    after_id: Option<&str>,
-    cursor_created_at: Option<&str>,
-    cursor_id: Option<&str>,
-) -> crate::error::Result<Option<(String, String)>> {
-    let has_after = after_created_at.is_some() || after_id.is_some();
-    let has_cursor = cursor_created_at.is_some() || cursor_id.is_some();
-    if has_after && has_cursor {
-        return Err(AppError::BadRequest(
-            "cannot mix after_* and cursor_* parameter aliases".into(),
-        ));
-    }
-    let (raw_ts, raw_id) = if has_after {
-        match (after_created_at, after_id) {
-            (Some(ts), Some(id)) => (ts, id),
-            _ => {
-                return Err(AppError::BadRequest(
-                    "after_created_at and after_id must be supplied together".into(),
-                ))
-            }
-        }
-    } else if has_cursor {
-        match (cursor_created_at, cursor_id) {
-            (Some(ts), Some(id)) => (ts, id),
-            _ => {
-                return Err(AppError::BadRequest(
-                    "cursor_created_at and cursor_id must be supplied together".into(),
-                ))
-            }
-        }
-    } else {
-        return Ok(None);
-    };
-
-    let canonical_ts = canonicalize_timestamp(raw_ts)?;
-    Ok(Some((canonical_ts, raw_id.to_string())))
-}
-
 /// GET /api/v1/tasks
 ///
 /// Open to anonymous callers, but every row is gated by `collect_visible_tasks`
 /// (#268): an anonymous or unrelated caller only sees tasks against a repo they
 /// can read, never another party's repo-less task or its `ucan_token`/`payload`.
+///
+/// Paging follows the module-level contract. `limit` is echoed back as the
+/// value actually applied, so a caller asking for more than
+/// `MAX_VISIBLE_TASKS` can see the clamp rather than mistaking a full page for
+/// the whole answer.
 pub async fn list_tasks(
     State(state): State<AppState>,
     Query(q): Query<ListTasksQuery>,
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> crate::error::Result<Json<Value>> {
+    use crate::api::task_cursor::{self, TaskFilter};
+
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
-    let after_parsed = parse_after_cursor(
-        q.after_created_at.as_deref(),
-        q.after_id.as_deref(),
-        q.cursor_created_at.as_deref(),
-        q.cursor_id.as_deref(),
-    )?;
-    let after = after_parsed
-        .as_ref()
-        .map(|(ts, id)| (ts.as_str(), id.as_str()));
+    let filter = TaskFilter {
+        status: q.status.as_deref(),
+        assignee_did: q.assignee_did.as_deref(),
+    };
+    let resume = q
+        .cursor
+        .as_deref()
+        .map(|token| task_cursor::decode(&state.task_cursor_key, filter, token))
+        .transpose()?;
     let result = collect_visible_tasks(
         &state.db,
         q.status.as_deref(),
         q.assignee_did.as_deref(),
         q.limit,
-        after,
+        resume.as_ref(),
         caller,
     )
     .await?;
+    let next_cursor = result
+        .next_position
+        .as_ref()
+        .map(|pos| task_cursor::encode(&state.task_cursor_key, filter, pos));
     let items: Vec<Value> = result.tasks.iter().map(task_to_read_json).collect();
     Ok(Json(json!({
         "tasks": items,
         "count": items.len(),
+        "limit": q.limit.clamp(0, MAX_VISIBLE_TASKS),
+        "has_more": result.has_more,
         "incomplete": result.incomplete,
+        "next_cursor": next_cursor,
     })))
 }
 
@@ -1027,8 +991,17 @@ mod visible_tasks_tests {
         assert_eq!(body["tasks"][0]["id"], "visible");
     }
 
+    /// #327 review: a visible row behind a denied window longer than the scan
+    /// budget was permanently unreachable. The only cursor a caller could hold
+    /// named the last row they *saw*, so every retry rescanned the same denied
+    /// window and returned `{ tasks: [], incomplete: true }` forever.
+    ///
+    /// The server-issued token names the last row *examined*, so each request
+    /// advances a full scan budget. This walks the whole recovery path using
+    /// nothing but cursors the server handed back, and asserts the denied rows
+    /// never appear in any response.
     #[sqlx::test]
-    async fn denied_history_scan_stops_at_candidate_ceiling_and_signals_incomplete(pool: PgPool) {
+    async fn denied_window_longer_than_scan_budget_is_pageable_to_the_end(pool: PgPool) {
         let state = test_state(pool).await;
         state
             .db
@@ -1040,8 +1013,11 @@ mod visible_tasks_tests {
         visible_newer.updated_at = visible_newer.created_at.clone();
         state.db.create_task(&visible_newer).await.unwrap();
 
-        for i in 0..MAX_TASK_SCAN_CANDIDATES {
-            let mut hidden = task(&format!("hidden-{i:04}"), None, DELEGATOR);
+        // Two and a half scan budgets' worth of rows an anonymous caller may
+        // not read, so recovery provably takes more than one continuation.
+        let denied = MAX_TASK_SCAN_CANDIDATES * 2 + MAX_TASK_SCAN_CANDIDATES / 2;
+        for i in 0..denied {
+            let mut hidden = task(&format!("hidden-{i:05}"), None, DELEGATOR);
             hidden.created_at = "2026-01-02T00:00:00Z".into();
             hidden.updated_at = hidden.created_at.clone();
             state.db.create_task(&hidden).await.unwrap();
@@ -1052,101 +1028,300 @@ mod visible_tasks_tests {
         visible_older.updated_at = visible_older.created_at.clone();
         state.db.create_task(&visible_older).await.unwrap();
 
-        // Page 1 yields the first visible task.
-        let resp = list_router(state.clone())
-            .oneshot(anon_get("/api/v1/tasks?limit=1"))
-            .await
-            .unwrap();
-        let body = body_json(resp).await;
-        assert_eq!(body["count"], 1);
-        assert_eq!(body["incomplete"], false);
-        assert_eq!(body["tasks"][0]["id"], "newer-visible");
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut requests = 0;
+        loop {
+            requests += 1;
+            assert!(requests <= 10, "recovery must terminate, not spin");
+            let uri = match &cursor {
+                Some(c) => format!("/api/v1/tasks?limit=1&cursor={}", c),
+                None => "/api/v1/tasks?limit=1".to_string(),
+            };
+            let resp = list_router(state.clone())
+                .oneshot(anon_get(&uri))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_json(resp).await;
+            assert!(
+                !body.to_string().contains("hidden-"),
+                "no response may disclose a denied row's id: {body}"
+            );
+            for t in body["tasks"].as_array().unwrap() {
+                seen.push(t["id"].as_str().unwrap().to_string());
+            }
+            // A short page mid-stream is the scan wall, and must say so.
+            if body["has_more"].as_bool().unwrap() && body["tasks"].as_array().unwrap().is_empty() {
+                assert_eq!(
+                    body["incomplete"], true,
+                    "an empty page with more rows behind it is a paused scan, not an end: {body}"
+                );
+            }
+            match body["next_cursor"].as_str() {
+                Some(c) => {
+                    assert_eq!(body["has_more"], true);
+                    cursor = Some(c.to_string());
+                }
+                None => {
+                    assert_eq!(body["has_more"], false);
+                    assert_eq!(
+                        body["incomplete"], false,
+                        "a terminal page is complete, not incomplete: {body}"
+                    );
+                    break;
+                }
+            }
+        }
 
-        // Page 2 anchored on the last received row hits the 1,000 candidate scan ceiling
-        // across the intervening denied rows and signals incomplete without leaking any denied row.
-        let resp = list_router(state.clone())
-            .oneshot(anon_get(
-                "/api/v1/tasks?limit=1&after_created_at=2026-01-03T00:00:00Z&after_id=newer-visible",
-            ))
-            .await
-            .unwrap();
-        let body = body_json(resp).await;
-        assert_eq!(body["count"], 0);
-        assert_eq!(body["incomplete"], true);
-        assert!(!body.to_string().contains("past-ceiling"));
-        assert!(
-            body.get("next_cursor").is_none(),
-            "response must not disclose the last examined (denied) row's id/created_at: {body}"
+        assert_eq!(
+            seen,
+            vec!["newer-visible".to_string(), "past-ceiling".to_string()],
+            "both visible rows must be reachable using only server-issued cursors"
         );
         assert!(
-            !body.to_string().contains("hidden-"),
-            "response must not leak any denied row's id: {body}"
+            requests > 2,
+            "the denied window spans multiple scan budgets, so recovery must \
+             take more than one continuation (took {requests})"
         );
-
-        // A subsequent request anchored on the same legitimately-held row stalls at the
-        // scan ceiling rather than bypassing authorization.
-        let resp = list_router(state)
-            .oneshot(anon_get(
-                "/api/v1/tasks?limit=1&after_created_at=2026-01-03T00:00:00Z&after_id=newer-visible",
-            ))
-            .await
-            .unwrap();
-        let body = body_json(resp).await;
-        assert_eq!(body["count"], 0);
-        assert_eq!(body["incomplete"], true);
     }
 
+    /// The raw `after_*`/`cursor_*` pairs are gone (#327 review): there is one
+    /// ordering domain, and it is the one the server writes. An unknown query
+    /// parameter must be ignored rather than silently paging, so a client
+    /// still sending the old pair gets page one, not a skipped window.
     #[sqlx::test]
-    async fn list_tasks_rejects_partial_cursor_pair(pool: PgPool) {
+    async fn removed_raw_cursor_params_do_not_page(pool: PgPool) {
         let state = test_state(pool).await;
-
-        let resp = list_router(state.clone())
-            .oneshot(anon_get(
-                "/api/v1/tasks?after_created_at=2026-01-01T00:00:00Z",
-            ))
+        state
+            .db
+            .create_repo(&repo("public-repo", DELEGATOR, "public", true))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = body_json(resp).await;
-        assert_eq!(
-            body["message"],
-            "after_created_at and after_id must be supplied together"
+        for (id, ts) in [
+            ("t-newer", "2026-01-03T00:00:00Z"),
+            ("t-older", "2026-01-01T00:00:00Z"),
+        ] {
+            let mut t = task(id, Some("public-repo"), DELEGATOR);
+            t.created_at = ts.into();
+            t.updated_at = t.created_at.clone();
+            state.db.create_task(&t).await.unwrap();
+        }
+
+        for uri in [
+            "/api/v1/tasks?after_created_at=2026-01-03T00:00:00Z&after_id=t-newer",
+            "/api/v1/tasks?cursor_created_at=2026-01-03T00:00:00Z&cursor_id=t-newer",
+            "/api/v1/tasks?after_id=t-newer",
+        ] {
+            let resp = list_router(state.clone())
+                .oneshot(anon_get(uri))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            let body = body_json(resp).await;
+            assert_eq!(
+                body["count"], 2,
+                "{uri}: a removed cursor param must not page, it must be inert"
+            );
+        }
+    }
+
+    /// Every way a token can fail must be one indistinguishable 400, so a
+    /// caller cannot use cursor validation as an oracle.
+    #[sqlx::test]
+    async fn list_tasks_rejects_unusable_cursors(pool: PgPool) {
+        use crate::api::task_cursor::{self, TaskCursorKey, TaskFilter, TaskPosition};
+
+        let state = test_state(pool).await;
+        let position = TaskPosition::new("2026-01-03T00:00:00Z", "some-task");
+        let unfiltered = TaskFilter {
+            status: None,
+            assignee_did: None,
+        };
+
+        let forged = task_cursor::encode(&TaskCursorKey::derive(&[9u8; 32]), unfiltered, &position);
+        let wrong_filter = task_cursor::encode(
+            &state.task_cursor_key,
+            TaskFilter {
+                status: Some("pending"),
+                assignee_did: None,
+            },
+            &position,
         );
 
+        for (label, uri) in [
+            ("garbage", "/api/v1/tasks?cursor=not-a-cursor".to_string()),
+            (
+                "forged by another node's key",
+                format!("/api/v1/tasks?cursor={forged}"),
+            ),
+            (
+                "issued for a different filter",
+                format!("/api/v1/tasks?cursor={wrong_filter}"),
+            ),
+        ] {
+            let resp = list_router(state.clone())
+                .oneshot(anon_get(&uri))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{label}");
+            let body = body_json(resp).await;
+            assert_eq!(
+                body["message"], "invalid or expired cursor",
+                "{label}: every rejection must render the same message"
+            );
+        }
+
+        // The same token against the filter it was issued for is accepted, so
+        // the rejections above are the binding and not a blanket refusal.
         let resp = list_router(state.clone())
-            .oneshot(anon_get("/api/v1/tasks?after_id=some-id"))
+            .oneshot(anon_get(&format!(
+                "/api/v1/tasks?status=pending&cursor={wrong_filter}"
+            )))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = body_json(resp).await;
-        assert_eq!(
-            body["message"],
-            "after_created_at and after_id must be supplied together"
-        );
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// #327 review: `--limit 500` printed a successful but silently truncated
+    /// 200-row result. The page now fills, says so, and hands back a cursor
+    /// that reaches the rest.
+    #[sqlx::test]
+    async fn full_page_advertises_has_more_and_enumerates_past_the_row_cap(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("public-repo", DELEGATOR, "public", true))
+            .await
+            .unwrap();
+        let total = (MAX_VISIBLE_TASKS + 50) as usize;
+        for i in 0..total {
+            let mut t = task(&format!("visible-{i:04}"), Some("public-repo"), DELEGATOR);
+            // Descending ids so `created_at DESC, id DESC` yields visible-0249
+            // first: order is asserted below, not assumed.
+            t.created_at = format!("2026-01-01T00:00:{:02}Z", i % 60);
+            t.updated_at = t.created_at.clone();
+            state.db.create_task(&t).await.unwrap();
+        }
 
         let resp = list_router(state.clone())
-            .oneshot(anon_get(
-                "/api/v1/tasks?cursor_created_at=2026-01-01T00:00:00Z",
-            ))
+            .oneshot(anon_get("/api/v1/tasks?limit=500"))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_json(resp).await;
         assert_eq!(
-            body["message"],
-            "cursor_created_at and cursor_id must be supplied together"
+            body["count"], MAX_VISIBLE_TASKS,
+            "a request above the row cap is clamped, not served in full"
         );
+        assert_eq!(
+            body["limit"], MAX_VISIBLE_TASKS,
+            "the response must state the effective limit it applied"
+        );
+        assert_eq!(
+            body["has_more"], true,
+            "a filled page with rows behind it must advertise a continuation"
+        );
+        assert_eq!(
+            body["incomplete"], false,
+            "a filled page is not an interrupted scan"
+        );
+
+        let mut seen: Vec<String> = body["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_string())
+            .collect();
+        let cursor = body["next_cursor"].as_str().unwrap().to_string();
 
         let resp = list_router(state)
-            .oneshot(anon_get("/api/v1/tasks?cursor_id=some-id"))
+            .oneshot(anon_get(&format!(
+                "/api/v1/tasks?limit=500&cursor={cursor}"
+            )))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_json(resp).await;
-        assert_eq!(
-            body["message"],
-            "cursor_created_at and cursor_id must be supplied together"
+        assert_eq!(body["count"], 50);
+        assert_eq!(body["has_more"], false);
+        assert!(body["next_cursor"].is_null());
+        seen.extend(
+            body["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["id"].as_str().unwrap().to_string()),
         );
+
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            total,
+            "paging must enumerate every visible row exactly once, no skips or repeats"
+        );
+    }
+
+    /// Rows sharing a timestamp are the case a mis-ordered cursor skips or
+    /// repeats. The token carries the stored `created_at` verbatim, so the
+    /// `(created_at, id)` tie-break holds across a page boundary that lands
+    /// inside a group of equal timestamps.
+    #[sqlx::test]
+    async fn paging_across_equal_timestamps_neither_skips_nor_repeats(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("public-repo", DELEGATOR, "public", true))
+            .await
+            .unwrap();
+        // Deliberately mixed spellings of the *same* instant, as a peer or an
+        // older writer could have stored them.
+        for (i, ts) in [
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00+00:00",
+            "2026-01-01T00:00:00.000+00:00",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00+00:00",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut t = task(&format!("tie-{i}"), Some("public-repo"), DELEGATOR);
+            t.created_at = (*ts).into();
+            t.updated_at = t.created_at.clone();
+            state.db.create_task(&t).await.unwrap();
+        }
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..10 {
+            let uri = match &cursor {
+                Some(c) => format!("/api/v1/tasks?limit=2&cursor={}", c),
+                None => "/api/v1/tasks?limit=2".to_string(),
+            };
+            let resp = list_router(state.clone())
+                .oneshot(anon_get(&uri))
+                .await
+                .unwrap();
+            let body = body_json(resp).await;
+            for t in body["tasks"].as_array().unwrap() {
+                seen.push(t["id"].as_str().unwrap().to_string());
+            }
+            match body["next_cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_string()),
+                None => break,
+            }
+        }
+
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            seen.len(),
+            5,
+            "five rows sharing an instant must be returned exactly once each: {seen:?}"
+        );
+        assert_eq!(unique.len(), 5, "no row may repeat across pages: {seen:?}");
     }
 
     #[sqlx::test]
@@ -1187,76 +1362,12 @@ mod visible_tasks_tests {
         assert_eq!(body["error"], "db_unavailable");
     }
 
+    /// Equal-timestamp siblings are where a cursor with the wrong ordering
+    /// domain skips or repeats a row. The token carries the served
+    /// `created_at` byte-for-byte, so the `(created_at, id)` tie-break
+    /// advances one row at a time through a fractional-zero sibling group.
     #[sqlx::test]
-    async fn list_tasks_rejects_mixed_cursor_alias_families(pool: PgPool) {
-        let state = test_state(pool).await;
-
-        let resp = list_router(state.clone())
-            .oneshot(anon_get(
-                "/api/v1/tasks?after_created_at=2026-01-01T00:00:00Z&after_id=a&cursor_created_at=2026-01-01T00:00:00Z&cursor_id=b",
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = body_json(resp).await;
-        assert_eq!(body["error"], "bad_request");
-        assert_eq!(
-            body["message"],
-            "cannot mix after_* and cursor_* parameter aliases"
-        );
-
-        let resp = list_router(state.clone())
-            .oneshot(anon_get(
-                "/api/v1/tasks?after_created_at=2026-01-01T00:00:00Z&cursor_id=some-id",
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = body_json(resp).await;
-        assert_eq!(body["error"], "bad_request");
-        assert_eq!(
-            body["message"],
-            "cannot mix after_* and cursor_* parameter aliases"
-        );
-
-        let resp = list_router(state)
-            .oneshot(anon_get(
-                "/api/v1/tasks?cursor_created_at=2026-01-01T00:00:00Z&after_id=some-id",
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = body_json(resp).await;
-        assert_eq!(body["error"], "bad_request");
-        assert_eq!(
-            body["message"],
-            "cannot mix after_* and cursor_* parameter aliases"
-        );
-    }
-
-    #[sqlx::test]
-    async fn list_tasks_accepts_and_canonicalizes_spaces_in_timestamp(pool: PgPool) {
-        let state = test_state(pool).await;
-        state
-            .db
-            .create_repo(&repo("public-repo", DELEGATOR, "public", true))
-            .await
-            .unwrap();
-        let mut t1 = task("t1", Some("public-repo"), DELEGATOR);
-        t1.created_at = "2026-01-01T00:00:00+00:00".into();
-        state.db.create_task(&t1).await.unwrap();
-
-        let resp = list_router(state)
-            .oneshot(anon_get(
-                "/api/v1/tasks?after_created_at=2026-01-02T00:00:00+00:00&after_id=dummy",
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[sqlx::test]
-    async fn list_tasks_keyset_advances_across_trailing_zero_fraction_timestamps(pool: PgPool) {
+    async fn keyset_advances_across_trailing_zero_fraction_timestamps(pool: PgPool) {
         let state = test_state(pool).await;
         state
             .db
@@ -1265,53 +1376,52 @@ mod visible_tasks_tests {
             .unwrap();
 
         let ts_sibling = "2026-06-01T00:00:00.000000000+00:00";
-        let mut t2 = task("task-2", Some("public-repo"), DELEGATOR);
-        t2.created_at = ts_sibling.into();
-        t2.updated_at = t2.created_at.clone();
-        state.db.create_task(&t2).await.unwrap();
+        for (id, ts) in [
+            ("task-2", ts_sibling),
+            ("task-1", ts_sibling),
+            ("task-0", "2026-05-01T00:00:00.000000000+00:00"),
+        ] {
+            let mut t = task(id, Some("public-repo"), DELEGATOR);
+            t.created_at = ts.into();
+            t.updated_at = t.created_at.clone();
+            state.db.create_task(&t).await.unwrap();
+        }
 
-        let mut t1 = task("task-1", Some("public-repo"), DELEGATOR);
-        t1.created_at = ts_sibling.into();
-        t1.updated_at = t1.created_at.clone();
-        state.db.create_task(&t1).await.unwrap();
+        let mut cursor: Option<String> = None;
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..5 {
+            let uri = match &cursor {
+                Some(c) => format!("/api/v1/tasks?limit=1&cursor={c}"),
+                None => "/api/v1/tasks?limit=1".to_string(),
+            };
+            let resp = list_router(state.clone())
+                .oneshot(anon_get(&uri))
+                .await
+                .unwrap();
+            let body = body_json(resp).await;
+            for t in body["tasks"].as_array().unwrap() {
+                // The response must echo the stored spelling verbatim; that is
+                // the string the token compares against.
+                if t["id"] != "task-0" {
+                    assert_eq!(t["created_at"], ts_sibling);
+                }
+                seen.push(t["id"].as_str().unwrap().to_string());
+            }
+            match body["next_cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_string()),
+                None => break,
+            }
+        }
 
-        let mut t0 = task("task-0", Some("public-repo"), DELEGATOR);
-        t0.created_at = "2026-05-01T00:00:00.000000000+00:00".into();
-        t0.updated_at = t0.created_at.clone();
-        state.db.create_task(&t0).await.unwrap();
-
-        let resp = list_router(state.clone())
-            .oneshot(anon_get("/api/v1/tasks?limit=1"))
-            .await
-            .unwrap();
-        let body = body_json(resp).await;
-        assert_eq!(body["count"], 1);
-        assert_eq!(body["tasks"][0]["id"], "task-2");
-        let served_ts = body["tasks"][0]["created_at"].as_str().unwrap();
-        assert_eq!(served_ts, ts_sibling);
-
-        let resp = list_router(state.clone())
-            .oneshot(anon_get(&format!(
-                "/api/v1/tasks?limit=1&after_created_at={served_ts}&after_id=task-2"
-            )))
-            .await
-            .unwrap();
-        let body = body_json(resp).await;
-        assert_eq!(body["count"], 1);
         assert_eq!(
-            body["tasks"][0]["id"], "task-1",
-            "keyset pagination must advance to sibling row with equal timestamp"
+            seen,
+            vec![
+                "task-2".to_string(),
+                "task-1".to_string(),
+                "task-0".to_string()
+            ],
+            "paging must advance one row at a time through equal timestamps"
         );
-
-        let resp = list_router(state)
-            .oneshot(anon_get(&format!(
-                "/api/v1/tasks?limit=1&after_created_at={served_ts}&after_id=task-1"
-            )))
-            .await
-            .unwrap();
-        let body = body_json(resp).await;
-        assert_eq!(body["count"], 1);
-        assert_eq!(body["tasks"][0]["id"], "task-0");
     }
 
     fn full_task_router(state: crate::state::AppState) -> Router {

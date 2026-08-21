@@ -49,8 +49,14 @@ pub enum TaskCmd {
         status: Option<String>,
         #[arg(long)]
         assignee_did: Option<String>,
+        /// Total tasks to return. Values above the node's 200-row page cap are
+        /// gathered by following continuation tokens.
         #[arg(long, default_value = "50")]
         limit: i64,
+        /// Resume from a previous run's `next_cursor`. Must be used with the
+        /// same --status/--assignee-did filter that produced it.
+        #[arg(long)]
+        cursor: Option<String>,
         #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
         node: String,
         #[arg(long)]
@@ -124,9 +130,10 @@ pub async fn run(args: TaskArgs) -> Result<()> {
             status,
             assignee_did,
             limit,
+            cursor,
             node,
             dir,
-        } => cmd_list(status, assignee_did, limit, node, dir).await,
+        } => cmd_list(status, assignee_did, limit, cursor, node, dir).await,
         TaskCmd::View { id, node, dir } => cmd_view(id, node, dir).await,
         TaskCmd::Claim { id, node, dir } => cmd_claim(id, node, dir).await,
         TaskCmd::Complete {
@@ -184,31 +191,182 @@ async fn cmd_create(
     Ok(())
 }
 
+/// Server-side ceiling on rows per response (`MAX_VISIBLE_TASKS` on the node).
+/// A `--limit` above this needs more than one request, which is why the
+/// clients follow `next_cursor` rather than printing a silently truncated page
+/// (#327 review).
+const SERVER_PAGE_CAP: i64 = 200;
+
+/// Requests one `gl`/MCP list call may issue while following continuations.
+/// The node examines at most 1,000 candidate rows per request, so a long
+/// window of tasks the caller cannot read returns empty pages that still carry
+/// a cursor. Without this cap a single `task list` against such a window would
+/// walk the whole table one request at a time.
+const MAX_TASK_PAGES: usize = 25;
+
+/// Why page-following stopped before the requested limit was met.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TaskListStop {
+    /// The stream ended: every visible task was returned.
+    Exhausted,
+    /// The caller's limit was reached; more results remain.
+    LimitReached,
+    /// `MAX_TASK_PAGES` requests were issued and more results remain.
+    PageCap,
+    /// The node reported more results but returned no cursor to reach them, so
+    /// another request would repeat this one. Never expected against a healthy
+    /// node; this is the guard that keeps a contract break from spinning.
+    NoProgress,
+}
+
+#[derive(Debug)]
+pub(crate) struct TaskList {
+    pub tasks: Vec<Value>,
+    /// True when the last response was short because the node's authorization
+    /// scan hit its ceiling, not because the stream ended.
+    pub incomplete: bool,
+    pub next_cursor: Option<String>,
+    pub pages: usize,
+    pub stop: TaskListStop,
+}
+
+impl TaskList {
+    /// Human-readable warning when the result is not the complete answer to
+    /// the request, so a truncated list can never read as an exhaustive one.
+    pub fn truncation_warning(&self) -> Option<String> {
+        let reason = match self.stop {
+            TaskListStop::Exhausted | TaskListStop::LimitReached if !self.incomplete => {
+                return None
+            }
+            TaskListStop::PageCap => "page limit reached",
+            TaskListStop::NoProgress => "node reported more results but returned no cursor",
+            _ => "node's authorization scan ceiling reached",
+        };
+        let resume = match &self.next_cursor {
+            Some(c) => format!("; continue with --cursor {c}"),
+            None => String::new(),
+        };
+        Some(format!(
+            "result incomplete: {reason} after {} page(s), {} task(s) returned{resume}",
+            self.pages,
+            self.tasks.len()
+        ))
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "tasks": self.tasks,
+            "count": self.tasks.len(),
+            "incomplete": self.incomplete,
+            "has_more": self.next_cursor.is_some(),
+            "next_cursor": self.next_cursor,
+            "pages_fetched": self.pages,
+            "complete": self.truncation_warning().is_none(),
+        })
+    }
+}
+
+/// Fetch up to `limit` visible tasks, following the node's opaque
+/// `next_cursor` across requests.
+///
+/// Bounded on both axes so this cannot become an unbounded crawl: at most
+/// `MAX_TASK_PAGES` requests, and it stops the moment a response reports more
+/// results without a cursor to reach them.
+pub(crate) async fn fetch_tasks(
+    client: &NodeClient,
+    status: Option<&str>,
+    assignee_did: Option<&str>,
+    limit: i64,
+    cursor: Option<&str>,
+) -> Result<TaskList> {
+    let mut tasks: Vec<Value> = Vec::new();
+    let mut cursor = cursor.map(str::to_string);
+    let mut incomplete = false;
+    let mut pages = 0usize;
+
+    let stop = loop {
+        if limit > 0 && tasks.len() as i64 >= limit {
+            break TaskListStop::LimitReached;
+        }
+        let want = if limit > 0 {
+            (limit - tasks.len() as i64).min(SERVER_PAGE_CAP)
+        } else {
+            limit
+        };
+        let mut path = format!("/api/v1/tasks?limit={want}");
+        if let Some(s) = status {
+            path.push_str(&format!("&status={}", urlencoding::encode(s)));
+        }
+        if let Some(a) = assignee_did {
+            path.push_str(&format!("&assignee_did={}", urlencoding::encode(a)));
+        }
+        if let Some(c) = &cursor {
+            path.push_str(&format!("&cursor={}", urlencoding::encode(c)));
+        }
+        let resp: Value = client
+            .get_maybe_signed(&path)
+            .await
+            .context("failed to list tasks")?
+            // No `context` here: the reqwest error already names the status,
+            // and MCP surfaces this message verbatim to the model.
+            .error_for_status()?
+            .json()
+            .await
+            .context("invalid JSON response")?;
+        pages += 1;
+
+        if let Some(page) = resp["tasks"].as_array() {
+            tasks.extend(page.iter().cloned());
+        }
+        incomplete = resp["incomplete"].as_bool().unwrap_or(false);
+        let next = resp["next_cursor"].as_str().map(str::to_string);
+
+        if !resp["has_more"].as_bool().unwrap_or(false) {
+            cursor = None;
+            break TaskListStop::Exhausted;
+        }
+        // `has_more` without a cursor, or a cursor the node did not advance,
+        // means the next request would repeat this one.
+        if next.is_none() || next == cursor {
+            break TaskListStop::NoProgress;
+        }
+        cursor = next;
+        if pages >= MAX_TASK_PAGES {
+            break TaskListStop::PageCap;
+        }
+    };
+
+    Ok(TaskList {
+        tasks,
+        incomplete,
+        next_cursor: cursor,
+        pages,
+        stop,
+    })
+}
+
 async fn cmd_list(
     status: Option<String>,
     assignee_did: Option<String>,
     limit: i64,
+    cursor: Option<String>,
     node: String,
     dir: Option<PathBuf>,
 ) -> Result<()> {
     let client = NodeClient::new(&node, load_keypair_from_dir(dir.as_deref()).ok());
-    let mut path = format!("/api/v1/tasks?limit={}", limit);
-    if let Some(s) = &status {
-        path.push_str(&format!("&status={}", urlencoding::encode(s)));
+    let result = fetch_tasks(
+        &client,
+        status.as_deref(),
+        assignee_did.as_deref(),
+        limit,
+        cursor.as_deref(),
+    )
+    .await?;
+    print_json(&result.to_json());
+    // stderr so stdout stays a single parseable JSON document.
+    if let Some(warning) = result.truncation_warning() {
+        eprintln!("warning: {warning}");
     }
-    if let Some(a) = &assignee_did {
-        path.push_str(&format!("&assignee_did={}", urlencoding::encode(a)));
-    }
-    let resp: Value = client
-        .get_maybe_signed(&path)
-        .await
-        .context("failed to list tasks")?
-        .error_for_status()
-        .context("failed to list tasks")?
-        .json()
-        .await
-        .context("invalid JSON response")?;
-    print_json(&resp);
     Ok(())
 }
 
@@ -410,9 +568,16 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_list(None, None, 50, server.url(), Some(dir.path().to_path_buf()))
-            .await
-            .unwrap();
+        cmd_list(
+            None,
+            None,
+            50,
+            None,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -443,11 +608,225 @@ mod tests {
             Some("pending".to_string()),
             Some("did:key:z6Mk_test".to_string()),
             10,
+            None,
             server.url(),
             Some(dir.path().to_path_buf()),
         )
         .await
         .unwrap();
+    }
+
+    // ── list paging ──────────────────────────────────────────────────
+
+    fn page(ids: &[&str], has_more: bool, incomplete: bool, next: Option<&str>) -> String {
+        let tasks: Vec<Value> = ids
+            .iter()
+            .map(|id| json!({ "id": id, "kind": "test", "status": "pending" }))
+            .collect();
+        json!({
+            "tasks": tasks,
+            "count": tasks.len(),
+            "has_more": has_more,
+            "incomplete": incomplete,
+            "next_cursor": next,
+        })
+        .to_string()
+    }
+
+    fn client_for(server: &mockito::Server) -> NodeClient {
+        NodeClient::new(server.url(), None)
+    }
+
+    /// #327 review: `--limit 500` used to print a successful but silently
+    /// truncated 200-row page, because the client issued exactly one request
+    /// and the server clamps to 200. It now follows `next_cursor`.
+    #[tokio::test]
+    async fn list_follows_cursors_until_the_limit_is_met() {
+        let mut server = mockito::Server::new_async().await;
+        let first = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/tasks\?limit=200$".into()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(page(&["a", "b"], true, false, Some("cursor-1")))
+            .create_async()
+            .await;
+        let second = server
+            .mock("GET", mockito::Matcher::Regex(r"cursor=cursor-1".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(page(&["c"], false, false, None))
+            .create_async()
+            .await;
+
+        let result = fetch_tasks(&client_for(&server), None, None, 300, None)
+            .await
+            .unwrap();
+        first.assert_async().await;
+        second.assert_async().await;
+        assert_eq!(result.tasks.len(), 3);
+        assert_eq!(result.pages, 2);
+        assert_eq!(result.stop, TaskListStop::Exhausted);
+        assert!(result.next_cursor.is_none());
+        assert!(
+            result.truncation_warning().is_none(),
+            "an exhausted stream is a complete result"
+        );
+        assert_eq!(result.to_json()["complete"], json!(true));
+    }
+
+    /// The node's authorization scan ceiling can end a run early. That must
+    /// reach the user as an explicit incomplete result with a way to resume,
+    /// never as a plain short list.
+    #[tokio::test]
+    async fn list_reports_incomplete_and_offers_a_resume_cursor() {
+        let mut server = mockito::Server::new_async().await;
+        // Distinct cursor per page, so the page cap is what stops this and not
+        // the no-progress guard.
+        let mut mocks = Vec::new();
+        for step in 0..=MAX_TASK_PAGES {
+            let matcher = if step == 0 {
+                mockito::Matcher::Regex(r"^/api/v1/tasks\?limit=200$".into())
+            } else {
+                mockito::Matcher::Regex(format!(r"cursor=step-{step}$"))
+            };
+            mocks.push(
+                server
+                    .mock("GET", matcher)
+                    .with_status(200)
+                    .with_header("content-type", "application/json")
+                    .with_body(page(
+                        &["a"],
+                        true,
+                        true,
+                        Some(&format!("step-{}", step + 1)),
+                    ))
+                    .create_async()
+                    .await,
+            );
+        }
+
+        let result = fetch_tasks(&client_for(&server), None, None, 10_000, None)
+            .await
+            .unwrap();
+        assert_eq!(result.stop, TaskListStop::PageCap);
+        assert_eq!(result.pages, MAX_TASK_PAGES);
+        assert_eq!(result.tasks.len(), MAX_TASK_PAGES);
+        assert!(result.incomplete);
+        assert_eq!(
+            result.next_cursor.as_deref(),
+            Some(format!("step-{MAX_TASK_PAGES}").as_str())
+        );
+        let warning = result.truncation_warning().expect("must warn");
+        assert!(warning.contains("page limit reached"), "{warning}");
+        assert!(
+            warning.contains(&format!("--cursor step-{MAX_TASK_PAGES}")),
+            "{warning}"
+        );
+        assert_eq!(result.to_json()["complete"], json!(false));
+    }
+
+    /// A node that claims more results but hands back no cursor would spin the
+    /// loop forever on the same request. The progress guard stops it.
+    #[tokio::test]
+    async fn list_stops_when_the_node_offers_no_way_forward() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(page(&["a"], true, false, None))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = fetch_tasks(&client_for(&server), None, None, 500, None)
+            .await
+            .unwrap();
+        m.assert_async().await;
+        assert_eq!(result.stop, TaskListStop::NoProgress);
+        assert_eq!(result.pages, 1);
+        let warning = result.truncation_warning().expect("must warn");
+        assert!(warning.contains("no cursor"), "{warning}");
+    }
+
+    /// A node that keeps returning the same cursor is the other shape of the
+    /// same fault, and must not loop either.
+    #[tokio::test]
+    async fn list_stops_when_the_cursor_does_not_advance() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(page(&["a"], true, false, Some("stuck")))
+            .create_async()
+            .await;
+
+        let result = fetch_tasks(&client_for(&server), None, None, 500, Some("stuck"))
+            .await
+            .unwrap();
+        assert_eq!(result.stop, TaskListStop::NoProgress);
+        assert_eq!(result.pages, 1);
+    }
+
+    /// A caller-supplied resume cursor must reach the node, and each request
+    /// must ask only for the rows still outstanding.
+    #[tokio::test]
+    async fn list_resumes_from_a_supplied_cursor_and_narrows_each_request() {
+        let mut server = mockito::Server::new_async().await;
+        let first = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/tasks\?limit=3&cursor=given$".into()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(page(&["a"], true, false, Some("next")))
+            .create_async()
+            .await;
+        let second = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/tasks\?limit=2&cursor=next$".into()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(page(&["b"], false, false, None))
+            .create_async()
+            .await;
+
+        let result = fetch_tasks(&client_for(&server), None, None, 3, Some("given"))
+            .await
+            .unwrap();
+        first.assert_async().await;
+        second.assert_async().await;
+        assert_eq!(result.tasks.len(), 2);
+    }
+
+    /// A per-request ask must never exceed the node's page cap, so the client
+    /// cannot rely on a server that forgets to clamp.
+    #[tokio::test]
+    async fn list_never_asks_for_more_than_the_server_page_cap() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(format!(r"^/api/v1/tasks\?limit={SERVER_PAGE_CAP}$")),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(page(&["a"], false, false, None))
+            .expect(1)
+            .create_async()
+            .await;
+
+        fetch_tasks(&client_for(&server), None, None, 5_000, None)
+            .await
+            .unwrap();
+        m.assert_async().await;
     }
 
     // ── view ─────────────────────────────────────────────────────────

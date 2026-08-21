@@ -83,10 +83,12 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
     let node_did = keypair.did();
     let (ref_tx, _) = tokio::sync::broadcast::channel(1);
     let (task_tx, _) = tokio::sync::broadcast::channel(1);
+    let task_cursor_key = crate::api::task_cursor::TaskCursorKey::derive(&keypair.to_seed());
     let schema = Arc::new(graphql::build_schema(
         db.clone(),
         ref_tx.clone(),
         task_tx.clone(),
+        task_cursor_key.clone(),
     ));
     AppState {
         config: Arc::new(Config::parse_from(["gitlawb-node"])),
@@ -98,6 +100,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         ref_update_tx: ref_tx,
         task_event_tx: task_tx,
         graphql_schema: schema,
+        task_cursor_key,
         machine_id: None,
         repo_store: crate::git::repo_store::RepoStore::for_testing(PathBuf::from("/tmp"), pool),
         rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
