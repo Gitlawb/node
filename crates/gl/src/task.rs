@@ -49,8 +49,8 @@ pub enum TaskCmd {
         status: Option<String>,
         #[arg(long)]
         assignee_did: Option<String>,
-        /// Total tasks to return. Values above the node's 200-row page cap are
-        /// gathered by following continuation tokens.
+        /// Total tasks to return. Must be positive. Values above the node's
+        /// 200-row page cap are gathered by following continuation tokens.
         #[arg(long, default_value = "50")]
         limit: i64,
         /// Resume from a previous run's `next_cursor`. Must be used with the
@@ -272,6 +272,11 @@ impl TaskList {
 /// Bounded on both axes so this cannot become an unbounded crawl: at most
 /// `MAX_TASK_PAGES` requests, and it stops the moment a response reports more
 /// results without a cursor to reach them.
+///
+/// `limit` must be positive. The node clamps a non-positive limit to zero and
+/// answers with an empty page marked complete, which reads as "no tasks exist"
+/// rather than "your request was invalid", so both clients reject it here
+/// instead of sending it (#327 review).
 pub(crate) async fn fetch_tasks(
     client: &NodeClient,
     status: Option<&str>,
@@ -279,20 +284,19 @@ pub(crate) async fn fetch_tasks(
     limit: i64,
     cursor: Option<&str>,
 ) -> Result<TaskList> {
+    if limit < 1 {
+        anyhow::bail!("limit must be a positive number of tasks (got {limit})");
+    }
     let mut tasks: Vec<Value> = Vec::new();
     let mut cursor = cursor.map(str::to_string);
     let mut incomplete = false;
     let mut pages = 0usize;
 
     let stop = loop {
-        if limit > 0 && tasks.len() as i64 >= limit {
+        if tasks.len() as i64 >= limit {
             break TaskListStop::LimitReached;
         }
-        let want = if limit > 0 {
-            (limit - tasks.len() as i64).min(SERVER_PAGE_CAP)
-        } else {
-            limit
-        };
+        let want = (limit - tasks.len() as i64).min(SERVER_PAGE_CAP);
         let mut path = format!("/api/v1/tasks?limit={want}");
         if let Some(s) = status {
             path.push_str(&format!("&status={}", urlencoding::encode(s)));
@@ -826,6 +830,34 @@ mod tests {
         fetch_tasks(&client_for(&server), None, None, 5_000, None)
             .await
             .unwrap();
+        m.assert_async().await;
+    }
+
+    /// #327 review: `--limit 0` (or a negative one) reached the node, which
+    /// clamped it to zero and answered with an empty page marked complete. A
+    /// caller could read an invalid request as proof that no tasks exist, so
+    /// the shared helper both clients use rejects it before the first request.
+    #[tokio::test]
+    async fn non_positive_limit_is_rejected_without_a_request() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(page(&[], false, false, None))
+            .expect(0)
+            .create_async()
+            .await;
+
+        for limit in [0, -1] {
+            let err = fetch_tasks(&client_for(&server), None, None, limit, None)
+                .await
+                .expect_err("a non-positive limit must not be answered with an empty list");
+            assert!(
+                err.to_string().contains("limit must be a positive"),
+                "{err}"
+            );
+        }
         m.assert_async().await;
     }
 

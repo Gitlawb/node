@@ -512,7 +512,7 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "status": { "type": "string", "description": "Filter by status: pending, claimed, completed, failed" },
                     "assignee_did": { "type": "string", "description": "Filter by assignee DID" },
-                    "limit": { "type": "integer", "description": "Total results to return (default: 50). Values above the node's 200-row page cap are gathered by following continuation tokens.", "default": 50 },
+                    "limit": { "type": "integer", "minimum": 1, "description": "Total results to return (default: 50). Must be positive; a non-positive limit is rejected rather than answered with an empty list. Values above the node's 200-row page cap are gathered by following continuation tokens.", "default": 50 },
                     "cursor": { "type": "string", "description": "Resume from a previous call's next_cursor. Must be paired with the same status/assignee_did filter that produced it." }
                 }
             }
@@ -1766,6 +1766,34 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("500"));
+    }
+
+    /// #327 review: a model that sends `limit: 0` used to get an empty list
+    /// marked complete, which reads as "this node has no tasks". The shared
+    /// helper rejects it, so the model sees an invalid argument instead.
+    #[tokio::test]
+    async fn test_task_list_via_mcp_rejects_non_positive_limit() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[],"has_more":false,"incomplete":false,"next_cursor":null}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let err = call_tool("task_list", json!({"limit": 0}), &server.url(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("limit must be a positive"),
+            "{err}"
+        );
+        m.assert_async().await;
     }
 
     #[tokio::test]
