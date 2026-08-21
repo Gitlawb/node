@@ -82,10 +82,22 @@ pub fn build_router(state: AppState) -> Router {
     // but each task/row is gated to its delegator, its assignee, or (for a
     // repo-scoped task) whoever can read that repo (#268 — these routes previously
     // carried no gate and no identity at all).
+    // Both routes also carry a per-IP flood brake, mirroring `/ipfs/{cid}`: they are
+    // anon-reachable and the gate above costs a task lookup plus deduped-repo and
+    // visibility-rule queries *before* the opaque 404, so a prober pays nothing and
+    // the node pays per request. The limiter is the outermost layer so a flood is
+    // rejected before signature verification and the visibility queries run. The
+    // extension MUST be attached or `rate_limit_by_ip` is a silent no-op.
+    let task_read_limiter = rate_limit::IpRateLimiter {
+        limiter: state.task_read_rate_limiter.clone(),
+        trust: state.push_limiter_trust,
+    };
     let task_read_routes = Router::new()
         .route("/api/v1/tasks", get(tasks::list_tasks))
         .route("/api/v1/tasks/{id}", get(tasks::get_task))
-        .layer(middleware::from_fn(auth::optional_signature));
+        .layer(middleware::from_fn(auth::optional_signature))
+        .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+        .layer(axum::Extension(task_read_limiter));
 
     // ── Rate-limited creation routes — require HTTP Signature, plus a per-DID
     // throttle AND a per-IP flood brake. The per-DID limiter (inner) caps a

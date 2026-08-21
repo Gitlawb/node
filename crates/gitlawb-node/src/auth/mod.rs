@@ -548,6 +548,7 @@ mod tests {
             git_ipfs_walk_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             git_ipfs_walk_per_caller:
                 crate::rate_limit::PerCallerConcurrency::with_default_max_keys(16),
+            task_read_rate_limiter: RateLimiter::new(1200, Duration::from_secs(3600)),
             git_bin: "git".to_string(),
         }
     }

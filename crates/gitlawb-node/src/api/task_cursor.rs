@@ -31,6 +31,15 @@
 //! token instead carries the stored string verbatim, so the value compared is
 //! always a value the server wrote.
 //!
+//! A token is bound to the *caller* as well as the filter. The position it
+//! names is the last examined candidate, not the last visible one, so it
+//! encodes how far a scan got under one caller's visibility. Resuming it as a
+//! different caller would start the scan past rows that caller is entitled to
+//! read, silently dropping them from the answer (#327 review). The presenting
+//! caller's normalized DID (empty and flagged absent when anonymous) is
+//! therefore part of the MAC input, so a token presented by anyone else fails
+//! to verify rather than under-reporting.
+//!
 //! Wire form: `v1.<payload>.<tag>`, both parts base64url unpadded.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -125,23 +134,41 @@ pub struct TaskFilter<'a> {
     pub assignee_did: Option<&'a str>,
 }
 
-fn cursor_mac(key: &TaskCursorKey, filter: TaskFilter<'_>, plaintext: &[u8]) -> HmacSha256 {
+/// The visibility identity a token was issued to. Normalized through
+/// `normalize_owner_key` so the two spellings of one `did:key` identity
+/// (`did:key:X` and bare `X`) bind identically, matching `did_matches` on the
+/// read path: a caller who authenticates with the other spelling of their own
+/// DID must be able to resume their own page.
+fn caller_binding(caller: Option<&str>) -> &str {
+    caller.map(crate::db::normalize_owner_key).unwrap_or("")
+}
+
+fn cursor_mac(
+    key: &TaskCursorKey,
+    filter: TaskFilter<'_>,
+    caller: Option<&str>,
+    plaintext: &[u8],
+) -> HmacSha256 {
     let mut mac = HmacSha256::new_from_slice(&key.0).expect("HMAC accepts any key length");
     mac.update(TAG_DOMAIN);
-    // Length-prefix every field so no two distinct filter/plaintext triples can
-    // produce the same MAC input.
+    // Length-prefix every field so no two distinct filter/caller/plaintext
+    // tuples can produce the same MAC input.
     for field in [
         filter.status.unwrap_or("").as_bytes(),
         filter.assignee_did.unwrap_or("").as_bytes(),
+        caller_binding(caller).as_bytes(),
         plaintext,
     ] {
         mac.update(&(field.len() as u64).to_be_bytes());
         mac.update(field);
     }
-    // Presence is distinct from emptiness for the two optional fields.
+    // Presence is distinct from emptiness for all three optional fields, so an
+    // anonymous token cannot collide with one issued to a caller whose
+    // normalized DID is the empty string.
     mac.update(&[
         u8::from(filter.status.is_some()),
         u8::from(filter.assignee_did.is_some()),
+        u8::from(caller.is_some()),
     ]);
     mac
 }
@@ -149,9 +176,18 @@ fn cursor_mac(key: &TaskCursorKey, filter: TaskFilter<'_>, plaintext: &[u8]) -> 
 /// Synthetic IV: the authentication tag over the filter and plaintext, which
 /// also seeds the keystream. Deterministic by construction, so no randomness
 /// source is needed and two tokens for the same page are byte-identical.
-fn siv(key: &TaskCursorKey, filter: TaskFilter<'_>, plaintext: &[u8]) -> [u8; TAG_LEN] {
+fn siv(
+    key: &TaskCursorKey,
+    filter: TaskFilter<'_>,
+    caller: Option<&str>,
+    plaintext: &[u8],
+) -> [u8; TAG_LEN] {
     let mut out = [0u8; TAG_LEN];
-    out.copy_from_slice(&cursor_mac(key, filter, plaintext).finalize().into_bytes()[..TAG_LEN]);
+    out.copy_from_slice(
+        &cursor_mac(key, filter, caller, plaintext)
+            .finalize()
+            .into_bytes()[..TAG_LEN],
+    );
     out
 }
 
@@ -170,15 +206,20 @@ fn apply_keystream(key: &TaskCursorKey, iv: &[u8; TAG_LEN], buf: &mut [u8]) {
     }
 }
 
-/// Mint a token resuming at `position` for `filter`.
-pub fn encode(key: &TaskCursorKey, filter: TaskFilter<'_>, position: &TaskPosition) -> String {
+/// Mint a token resuming at `position` for `filter`, usable only by `caller`.
+pub fn encode(
+    key: &TaskCursorKey,
+    filter: TaskFilter<'_>,
+    caller: Option<&str>,
+    position: &TaskPosition,
+) -> String {
     let mut payload = serde_json::to_vec(&CursorPayload {
         t: &position.created_at,
         i: &position.id,
         e: chrono::Utc::now().timestamp() + CURSOR_TTL_SECS,
     })
     .expect("cursor payload is plain strings and an integer");
-    let iv = siv(key, filter, &payload);
+    let iv = siv(key, filter, caller, &payload);
     apply_keystream(key, &iv, &mut payload);
     format!(
         "{CURSOR_PREFIX}.{}.{}",
@@ -189,18 +230,21 @@ pub fn encode(key: &TaskCursorKey, filter: TaskFilter<'_>, position: &TaskPositi
 
 /// One rejection message for every way a token can fail to verify. A caller
 /// who mangled a token, replayed an expired one, or tried to move one to a
-/// different filter learns only that the cursor is not usable — never which
-/// of those it was, and never anything about the row it named.
+/// different filter or a different presenting identity learns only that the
+/// cursor is not usable — never which of those it was, and never anything
+/// about the row it named.
 const INVALID_CURSOR: &str = "invalid or expired cursor";
 
 fn reject() -> AppError {
     AppError::BadRequest(INVALID_CURSOR.into())
 }
 
-/// Verify a token against `filter` and return the position it carries.
+/// Verify a token against `filter` and the presenting `caller`, and return the
+/// position it carries.
 pub fn decode(
     key: &TaskCursorKey,
     filter: TaskFilter<'_>,
+    caller: Option<&str>,
     token: &str,
 ) -> crate::error::Result<TaskPosition> {
     let mut parts = token.split('.');
@@ -221,7 +265,7 @@ pub fn decode(
     // attacker-chosen bytes run through a keystream. `verify_truncated_left`
     // is the constant-time compare, so a forgery attempt cannot be steered by
     // timing the first differing byte.
-    cursor_mac(key, filter, &plaintext)
+    cursor_mac(key, filter, caller, &plaintext)
         .verify_truncated_left(&iv)
         .map_err(|_| reject())?;
 
@@ -252,8 +296,8 @@ mod tests {
         let k = key();
         // A stored timestamp the server wrote, fractional digits and all.
         let pos = TaskPosition::new("2026-01-03T00:00:00.123456789+00:00", "task-a");
-        let token = encode(&k, unfiltered(), &pos);
-        assert_eq!(decode(&k, unfiltered(), &token).unwrap(), pos);
+        let token = encode(&k, unfiltered(), None, &pos);
+        assert_eq!(decode(&k, unfiltered(), None, &token).unwrap(), pos);
     }
 
     /// The whole point of the token is that the caller may hold it without
@@ -265,6 +309,7 @@ mod tests {
         let token = encode(
             &k,
             unfiltered(),
+            None,
             &TaskPosition::new("2026-01-03T00:00:00+00:00", "denied-task-id"),
         );
         let body = token.split('.').nth(2).expect("token has a body part");
@@ -293,6 +338,7 @@ mod tests {
                 status: Some("pending"),
                 assignee_did: Some("did:key:z6MkAssignee"),
             },
+            None,
             &TaskPosition::new("2026-01-03T00:00:00.123456789+00:00", "task-a"),
         );
         assert!(
@@ -312,6 +358,7 @@ mod tests {
         let token = encode(
             &k,
             unfiltered(),
+            None,
             &TaskPosition::new("2026-01-03T00:00:00+00:00", "task-a"),
         );
         let parts: Vec<&str> = token.split('.').collect();
@@ -322,21 +369,27 @@ mod tests {
                 let mut mangled: Vec<String> = parts.iter().map(|p| p.to_string()).collect();
                 mangled[part] = String::from_utf8(bytes).unwrap();
                 assert!(
-                    decode(&k, unfiltered(), &mangled.join(".")).is_err(),
+                    decode(&k, unfiltered(), None, &mangled.join(".")).is_err(),
                     "byte {position} of part {part} must not be malleable"
                 );
             }
         }
         // Sanity: the untouched token still decodes, so the loop above is not
         // passing because every token is rejected.
-        assert!(decode(&k, unfiltered(), &token).is_ok());
+        assert!(decode(&k, unfiltered(), None, &token).is_ok());
     }
 
     #[test]
     fn rejects_token_from_another_node() {
         let pos = TaskPosition::new("2026-01-03T00:00:00+00:00", "task-a");
-        let token = encode(&TaskCursorKey::derive(&[1u8; 32]), unfiltered(), &pos);
-        assert!(decode(&TaskCursorKey::derive(&[2u8; 32]), unfiltered(), &token).is_err());
+        let token = encode(&TaskCursorKey::derive(&[1u8; 32]), unfiltered(), None, &pos);
+        assert!(decode(
+            &TaskCursorKey::derive(&[2u8; 32]),
+            unfiltered(),
+            None,
+            &token
+        )
+        .is_err());
     }
 
     #[test]
@@ -349,15 +402,17 @@ mod tests {
                 status: Some("pending"),
                 assignee_did: None,
             },
+            None,
             &pos,
         );
-        assert!(decode(&k, unfiltered(), &token).is_err());
+        assert!(decode(&k, unfiltered(), None, &token).is_err());
         assert!(decode(
             &k,
             TaskFilter {
                 status: Some("claimed"),
                 assignee_did: None
             },
+            None,
             &token
         )
         .is_err());
@@ -367,6 +422,7 @@ mod tests {
                 status: Some("pending"),
                 assignee_did: None
             },
+            None,
             &token
         )
         .is_ok());
@@ -377,16 +433,74 @@ mod tests {
     fn distinguishes_absent_filter_from_empty_filter() {
         let k = key();
         let pos = TaskPosition::new("2026-01-03T00:00:00+00:00", "task-a");
-        let token = encode(&k, unfiltered(), &pos);
+        let token = encode(&k, unfiltered(), None, &pos);
         assert!(decode(
             &k,
             TaskFilter {
                 status: Some(""),
                 assignee_did: None
             },
+            None,
             &token
         )
         .is_err());
+    }
+
+    /// A cursor names how far a scan got under one caller's visibility. Moved
+    /// to a different presenting identity it would start that caller's scan
+    /// past rows they are entitled to read, so it must fail to verify rather
+    /// than silently under-report (#327 review).
+    #[test]
+    fn rejects_cursor_moved_to_a_different_caller() {
+        let k = key();
+        let pos = TaskPosition::new("2026-01-03T00:00:00+00:00", "task-a");
+        let alice = Some("did:key:z6MkAlice");
+        let bob = Some("did:key:z6MkBob");
+
+        let anon_token = encode(&k, unfiltered(), None, &pos);
+        assert!(
+            decode(&k, unfiltered(), alice, &anon_token).is_err(),
+            "an anonymously minted cursor must not resume an authenticated scan"
+        );
+        assert!(decode(&k, unfiltered(), None, &anon_token).is_ok());
+
+        let alice_token = encode(&k, unfiltered(), alice, &pos);
+        assert!(
+            decode(&k, unfiltered(), bob, &alice_token).is_err(),
+            "one caller's cursor must not resume another caller's scan"
+        );
+        assert!(
+            decode(&k, unfiltered(), None, &alice_token).is_err(),
+            "an authenticated cursor must not resume an anonymous scan"
+        );
+        assert!(decode(&k, unfiltered(), alice, &alice_token).is_ok());
+    }
+
+    /// The binding is on identity, not spelling: `did:key:X` and bare `X` are
+    /// one caller everywhere else on the read path (`did_matches`), so a caller
+    /// who presents the other form of their own DID must keep their own page.
+    #[test]
+    fn caller_binding_is_normalized_across_did_key_spellings() {
+        let k = key();
+        let pos = TaskPosition::new("2026-01-03T00:00:00+00:00", "task-a");
+        let token = encode(&k, unfiltered(), Some("did:key:z6MkAlice"), &pos);
+        assert_eq!(
+            decode(&k, unfiltered(), Some("z6MkAlice"), &token).unwrap(),
+            pos
+        );
+        // A different method sharing the base58 tail is a different principal.
+        assert!(decode(&k, unfiltered(), Some("did:web:z6MkAlice"), &token).is_err());
+    }
+
+    /// Anonymous is a distinct binding from a caller whose normalized DID is
+    /// the empty string, the same way `Some("")` is distinct from `None` for
+    /// the filter fields.
+    #[test]
+    fn distinguishes_anonymous_from_empty_caller() {
+        let k = key();
+        let pos = TaskPosition::new("2026-01-03T00:00:00+00:00", "task-a");
+        let token = encode(&k, unfiltered(), None, &pos);
+        assert!(decode(&k, unfiltered(), Some(""), &token).is_err());
     }
 
     /// Length-prefixing must stop a status/assignee pair from being re-split.
@@ -400,6 +514,7 @@ mod tests {
                 status: Some("pend"),
                 assignee_did: Some("ing"),
             },
+            None,
             &pos,
         );
         assert!(decode(
@@ -408,6 +523,7 @@ mod tests {
                 status: Some("pending"),
                 assignee_did: Some("")
             },
+            None,
             &token
         )
         .is_err());
@@ -423,14 +539,14 @@ mod tests {
             e: chrono::Utc::now().timestamp() - 1,
         })
         .unwrap();
-        let iv = siv(&k, unfiltered(), &payload);
+        let iv = siv(&k, unfiltered(), None, &payload);
         apply_keystream(&k, &iv, &mut payload);
         let expired = format!(
             "v1.{}.{}",
             URL_SAFE_NO_PAD.encode(iv),
             URL_SAFE_NO_PAD.encode(&payload)
         );
-        let err = decode(&k, unfiltered(), &expired).unwrap_err();
+        let err = decode(&k, unfiltered(), None, &expired).unwrap_err();
         assert!(err.to_string().contains(INVALID_CURSOR));
     }
 
@@ -447,7 +563,7 @@ mod tests {
             "v1.!!!.def",
         ] {
             assert!(
-                decode(&k, unfiltered(), bad).is_err(),
+                decode(&k, unfiltered(), None, bad).is_err(),
                 "must reject {bad:?}"
             );
         }
@@ -460,7 +576,7 @@ mod tests {
         let k = key();
         for bad in ["v1.abc.def", "not-a-cursor", "v1..", "v9.a.b"] {
             assert_eq!(
-                decode(&k, unfiltered(), bad).unwrap_err().to_string(),
+                decode(&k, unfiltered(), None, bad).unwrap_err().to_string(),
                 format!("invalid request: {INVALID_CURSOR}")
             );
         }

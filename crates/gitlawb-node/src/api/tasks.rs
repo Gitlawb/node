@@ -446,7 +446,7 @@ pub async fn list_tasks(
     let resume = q
         .cursor
         .as_deref()
-        .map(|token| task_cursor::decode(&state.task_cursor_key, filter, token))
+        .map(|token| task_cursor::decode(&state.task_cursor_key, filter, caller, token))
         .transpose()?;
     let result = collect_visible_tasks(
         &state.db,
@@ -460,7 +460,7 @@ pub async fn list_tasks(
     let next_cursor = result
         .next_position
         .as_ref()
-        .map(|pos| task_cursor::encode(&state.task_cursor_key, filter, pos));
+        .map(|pos| task_cursor::encode(&state.task_cursor_key, filter, caller, pos));
     let items: Vec<Value> = result.tasks.iter().map(task_to_read_json).collect();
     Ok(Json(json!({
         "tasks": items,
@@ -1145,13 +1145,19 @@ mod visible_tasks_tests {
             assignee_did: None,
         };
 
-        let forged = task_cursor::encode(&TaskCursorKey::derive(&[9u8; 32]), unfiltered, &position);
+        let forged = task_cursor::encode(
+            &TaskCursorKey::derive(&[9u8; 32]),
+            unfiltered,
+            None,
+            &position,
+        );
         let wrong_filter = task_cursor::encode(
             &state.task_cursor_key,
             TaskFilter {
                 status: Some("pending"),
                 assignee_did: None,
             },
+            None,
             &position,
         );
 
@@ -1187,6 +1193,159 @@ mod visible_tasks_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// The per-IP brake on the task read routes is WIRED, not a silent no-op:
+    /// `rate_limit_by_ip` without its `IpRateLimiter` extension does nothing,
+    /// so this drives the production router with a tight bucket and asserts a
+    /// 429. Both routes are anon-reachable and run the #268 visibility gate (a
+    /// task lookup plus deduped-repo and visibility-rule queries) before the
+    /// opaque 404, so an unauthenticated prober costs the node work per request
+    /// whether the id exists or not (#327 review).
+    /// MUTATION (RED): drop the `axum::Extension(task_read_limiter)` layer in
+    /// `server.rs` and the probes below reach the handler (200/404) instead.
+    #[sqlx::test]
+    async fn task_read_routes_ip_rate_limit_is_attached(pool: PgPool) {
+        use std::net::SocketAddr;
+
+        let mut state = test_state(pool).await;
+        // Two slots: one known-id probe and one random-id probe pass, the third
+        // request from that IP is braked whichever route it targets.
+        state.task_read_rate_limiter =
+            crate::rate_limit::RateLimiter::new(2, std::time::Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .create_task(&task("t1", None, DELEGATOR))
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let probe = |peer: SocketAddr, uri: &str| {
+            let mut req = anon_get(uri);
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(peer));
+            req
+        };
+        let peer: SocketAddr = "203.0.113.42:5000".parse().unwrap();
+
+        // A known id and a random one cost the same work and debit the same
+        // bucket: the gate runs before the response can distinguish them.
+        for uri in ["/api/v1/tasks/t1", "/api/v1/tasks/does-not-exist"] {
+            let resp = router.clone().oneshot(probe(peer, uri)).await.unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "{uri}: the first probes from an IP must pass the brake"
+            );
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "{uri}: an anonymous probe is an opaque 404 either way"
+            );
+        }
+
+        let resp = router
+            .clone()
+            .oneshot(probe(peer, "/api/v1/tasks"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "an exhausted per-IP bucket must brake the list route too — the \
+             IpRateLimiter extension must be attached to task_read_routes"
+        );
+
+        let other: SocketAddr = "203.0.113.43:5000".parse().unwrap();
+        let resp = router
+            .oneshot(probe(other, "/api/v1/tasks/t1"))
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a different IP must not be braked by another IP's exhausted bucket"
+        );
+    }
+
+    /// #327 review: a cursor records how far a scan got under *one* caller's
+    /// visibility, so presenting it as a different caller must fail rather
+    /// than resume. Here an anonymous page stops at a public task, having
+    /// already examined and denied the delegator's private one that sorts
+    /// ahead of it. Resuming that token as the delegator would start their
+    /// scan past their own task and drop it from the answer with nothing to
+    /// signal the loss.
+    #[sqlx::test]
+    async fn a_cursor_minted_anonymously_cannot_resume_an_authenticated_scan(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("public-repo", DELEGATOR, "public", true))
+            .await
+            .unwrap();
+        // `created_at DESC, id DESC`: the delegator-only task sorts first, so
+        // it sits *before* the position the anonymous page stops at.
+        for (id, repo_id, ts) in [
+            ("priv-1", None, "2026-01-03T00:00:00Z"),
+            ("pub-2", Some("public-repo"), "2026-01-02T00:00:00Z"),
+            ("pub-1", Some("public-repo"), "2026-01-01T00:00:00Z"),
+        ] {
+            let mut t = task(id, repo_id, DELEGATOR);
+            t.created_at = ts.to_string();
+            t.updated_at = ts.to_string();
+            state.db.create_task(&t).await.unwrap();
+        }
+
+        let resp = list_router(state.clone())
+            .oneshot(anon_get("/api/v1/tasks?limit=1"))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["tasks"][0]["id"], "pub-2");
+        assert_eq!(body["has_more"], true);
+        let anon_cursor = body["next_cursor"]
+            .as_str()
+            .expect("a filled page hands back a continuation")
+            .to_string();
+
+        let resp = list_router(state.clone())
+            .oneshot(signed_request_as(
+                DELEGATOR,
+                Method::GET,
+                &format!("/api/v1/tasks?limit=50&cursor={anon_cursor}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a cursor bound to anonymous must not resume the delegator's scan"
+        );
+        let body = body_json(resp).await;
+        assert_eq!(body["message"], "invalid or expired cursor");
+
+        // Load-bearing: the delegator really can read `priv-1`, so accepting
+        // that cursor would have silently dropped a row they are entitled to
+        // see rather than merely re-ordering their page.
+        let resp = list_router(state)
+            .oneshot(signed_request_as(
+                DELEGATOR,
+                Method::GET,
+                "/api/v1/tasks?limit=50",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        let ids: Vec<&str> = body["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["priv-1", "pub-2", "pub-1"]);
     }
 
     /// #327 review: `--limit 500` printed a successful but silently truncated

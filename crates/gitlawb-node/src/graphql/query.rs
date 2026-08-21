@@ -138,7 +138,7 @@ impl QueryRoot {
         };
         let resume = cursor
             .as_deref()
-            .map(|token| task_cursor::decode(key, filter, token))
+            .map(|token| task_cursor::decode(key, filter, caller, token))
             .transpose()
             .map_err(crate::graphql::graphql_app_err)?;
         let result = crate::api::tasks::collect_visible_tasks(
@@ -155,7 +155,7 @@ impl QueryRoot {
             next_cursor: result
                 .next_position
                 .as_ref()
-                .map(|pos| task_cursor::encode(key, filter, pos)),
+                .map(|pos| task_cursor::encode(key, filter, caller, pos)),
             items: result
                 .tasks
                 .into_iter()
@@ -778,6 +778,7 @@ mod tests {
                 status: Some("pending"),
                 assignee_did: None,
             },
+            None,
             &TaskPosition::new("2026-01-01T00:00:00Z", "t1"),
         );
         let foreign = task_cursor::encode(
@@ -786,6 +787,7 @@ mod tests {
                 status: None,
                 assignee_did: None,
             },
+            None,
             &TaskPosition::new("2026-01-01T00:00:00Z", "t1"),
         );
 
