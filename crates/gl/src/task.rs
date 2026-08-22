@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::http::NodeClient;
@@ -213,10 +214,10 @@ pub(crate) enum TaskListStop {
     LimitReached,
     /// `MAX_TASK_PAGES` requests were issued and more results remain.
     PageCap,
-    /// The node reported more results but returned no cursor to reach them, so
-    /// another request would repeat this one. Never expected against a healthy
-    /// node; this is the guard that keeps a contract break from spinning.
+    /// The node made no progress, returned an invalid/cyclic cursor, or repeated task rows.
     NoProgress,
+    /// The node returned a legacy response without pagination metadata (`has_more`).
+    LegacyProtocol,
 }
 
 #[derive(Debug)]
@@ -236,10 +237,13 @@ impl TaskList {
     pub fn truncation_warning(&self) -> Option<String> {
         let reason = match self.stop {
             TaskListStop::Exhausted | TaskListStop::LimitReached if !self.incomplete => {
-                return None
+                return None;
             }
             TaskListStop::PageCap => "page limit reached",
-            TaskListStop::NoProgress => "node reported more results but returned no cursor",
+            TaskListStop::NoProgress => {
+                "node made no progress or returned an invalid/cyclic cursor"
+            }
+            TaskListStop::LegacyProtocol => "node does not support pagination metadata",
             _ => "node's authorization scan ceiling reached",
         };
         let resume = match &self.next_cursor {
@@ -266,6 +270,82 @@ impl TaskList {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum TaskPage {
+    Paginated {
+        tasks: Vec<Value>,
+        has_more: bool,
+        incomplete: bool,
+        next_cursor: Option<String>,
+    },
+    Legacy {
+        tasks: Vec<Value>,
+    },
+}
+
+pub(crate) fn parse_task_page(val: Value) -> Result<TaskPage> {
+    let obj = match val {
+        Value::Object(map) => map,
+        _ => anyhow::bail!("malformed task response: expected JSON object"),
+    };
+
+    let tasks_val = obj
+        .get("tasks")
+        .ok_or_else(|| anyhow::anyhow!("malformed task response: missing 'tasks' field"))?;
+    let tasks_arr = match tasks_val {
+        Value::Array(arr) => arr.clone(),
+        _ => anyhow::bail!("malformed task response: 'tasks' must be an array"),
+    };
+
+    let has_more_val = obj.get("has_more");
+    let incomplete_val = obj.get("incomplete");
+    let next_cursor_val = obj.get("next_cursor");
+
+    if let Some(hm) = has_more_val {
+        let has_more = match hm {
+            Value::Bool(b) => *b,
+            _ => anyhow::bail!("malformed task response: 'has_more' must be a boolean"),
+        };
+
+        let incomplete = match incomplete_val {
+            Some(Value::Bool(b)) => *b,
+            Some(_) => anyhow::bail!("malformed task response: 'incomplete' must be a boolean"),
+            None => false,
+        };
+
+        let next_cursor = match next_cursor_val {
+            Some(Value::String(s)) => {
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.clone())
+                }
+            }
+            Some(Value::Null) | None => None,
+            Some(_) => {
+                anyhow::bail!("malformed task response: 'next_cursor' must be a string or null")
+            }
+        };
+
+        Ok(TaskPage::Paginated {
+            tasks: tasks_arr,
+            has_more,
+            incomplete,
+            next_cursor,
+        })
+    } else {
+        if incomplete_val.is_some() || next_cursor_val.is_some() {
+            anyhow::bail!("malformed task response: pagination fields present without 'has_more'");
+        }
+        if let Some(count_val) = obj.get("count") {
+            if !count_val.is_number() {
+                anyhow::bail!("malformed task response: 'count' must be a number");
+            }
+        }
+        Ok(TaskPage::Legacy { tasks: tasks_arr })
+    }
+}
+
 /// Fetch up to `limit` visible tasks, following the node's opaque
 /// `next_cursor` across requests.
 ///
@@ -288,7 +368,13 @@ pub(crate) async fn fetch_tasks(
         anyhow::bail!("limit must be a positive number of tasks (got {limit})");
     }
     let mut tasks: Vec<Value> = Vec::new();
-    let mut cursor = cursor.map(str::to_string);
+    let mut seen_task_ids: HashSet<String> = HashSet::new();
+    let mut seen_cursors: HashSet<String> = HashSet::new();
+    let mut current_request_cursor: Option<String> = cursor.map(str::to_string);
+    if let Some(ref c) = current_request_cursor {
+        seen_cursors.insert(c.clone());
+    }
+    let mut safe_resume_cursor: Option<String> = None;
     let mut incomplete = false;
     let mut pages = 0usize;
 
@@ -304,10 +390,10 @@ pub(crate) async fn fetch_tasks(
         if let Some(a) = assignee_did {
             path.push_str(&format!("&assignee_did={}", urlencoding::encode(a)));
         }
-        if let Some(c) = &cursor {
+        if let Some(c) = &current_request_cursor {
             path.push_str(&format!("&cursor={}", urlencoding::encode(c)));
         }
-        let resp: Value = client
+        let raw_val: Value = client
             .get_maybe_signed(&path)
             .await
             .context("failed to list tasks")?
@@ -319,31 +405,85 @@ pub(crate) async fn fetch_tasks(
             .context("invalid JSON response")?;
         pages += 1;
 
-        if let Some(page) = resp["tasks"].as_array() {
-            tasks.extend(page.iter().cloned());
-        }
-        incomplete = resp["incomplete"].as_bool().unwrap_or(false);
-        let next = resp["next_cursor"].as_str().map(str::to_string);
+        let page = parse_task_page(raw_val)?;
+        match page {
+            TaskPage::Paginated {
+                tasks: page_tasks,
+                has_more,
+                incomplete: page_incomplete,
+                next_cursor,
+            } => {
+                let mut has_duplicate_row = false;
+                for t in &page_tasks {
+                    if let Some(id) = t.get("id").and_then(|v| v.as_str()) {
+                        if seen_task_ids.contains(id) {
+                            has_duplicate_row = true;
+                            break;
+                        }
+                    }
+                }
+                if has_duplicate_row {
+                    incomplete = true;
+                    safe_resume_cursor = None;
+                    break TaskListStop::NoProgress;
+                }
 
-        if !resp["has_more"].as_bool().unwrap_or(false) {
-            cursor = None;
-            break TaskListStop::Exhausted;
-        }
-        // `has_more` without a cursor, or a cursor the node did not advance,
-        // means the next request would repeat this one.
-        if next.is_none() || next == cursor {
-            break TaskListStop::NoProgress;
-        }
-        cursor = next;
-        if pages >= MAX_TASK_PAGES {
-            break TaskListStop::PageCap;
+                for t in page_tasks {
+                    if let Some(id) = t.get("id").and_then(|v| v.as_str()) {
+                        seen_task_ids.insert(id.to_string());
+                    }
+                    tasks.push(t);
+                }
+                incomplete = page_incomplete;
+
+                if tasks.len() as i64 >= limit {
+                    safe_resume_cursor = if has_more { next_cursor } else { None };
+                    break TaskListStop::LimitReached;
+                }
+
+                if !has_more {
+                    safe_resume_cursor = None;
+                    break TaskListStop::Exhausted;
+                }
+
+                let Some(next) = next_cursor else {
+                    incomplete = true;
+                    safe_resume_cursor = None;
+                    break TaskListStop::NoProgress;
+                };
+
+                if seen_cursors.contains(&next) {
+                    incomplete = true;
+                    safe_resume_cursor = None;
+                    break TaskListStop::NoProgress;
+                }
+
+                seen_cursors.insert(next.clone());
+                current_request_cursor = Some(next.clone());
+                safe_resume_cursor = Some(next);
+
+                if pages >= MAX_TASK_PAGES {
+                    break TaskListStop::PageCap;
+                }
+            }
+            TaskPage::Legacy { tasks: page_tasks } => {
+                for t in page_tasks {
+                    if let Some(id) = t.get("id").and_then(|v| v.as_str()) {
+                        seen_task_ids.insert(id.to_string());
+                    }
+                    tasks.push(t);
+                }
+                incomplete = true;
+                safe_resume_cursor = None;
+                break TaskListStop::LegacyProtocol;
+            }
         }
     };
 
     Ok(TaskList {
         tasks,
         incomplete,
-        next_cursor: cursor,
+        next_cursor: safe_resume_cursor,
         pages,
         stop,
     })
@@ -568,7 +708,7 @@ mod tests {
             )
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"tasks":[]}"#)
+            .with_body(r#"{"tasks":[],"has_more":false,"incomplete":false,"next_cursor":null}"#)
             .create_async()
             .await;
 
@@ -604,7 +744,7 @@ mod tests {
             .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"tasks":[{"id":"t1","kind":"test","status":"pending"}]}"#)
+            .with_body(r#"{"tasks":[{"id":"t1","kind":"test","status":"pending"}],"has_more":false,"incomplete":false,"next_cursor":null}"#)
             .create_async()
             .await;
 
@@ -696,13 +836,14 @@ mod tests {
             } else {
                 mockito::Matcher::Regex(format!(r"cursor=step-{step}$"))
             };
+            let task_id = format!("task-{step}");
             mocks.push(
                 server
                     .mock("GET", matcher)
                     .with_status(200)
                     .with_header("content-type", "application/json")
                     .with_body(page(
-                        &["a"],
+                        &[&task_id],
                         true,
                         true,
                         Some(&format!("step-{}", step + 1)),
@@ -752,8 +893,11 @@ mod tests {
         m.assert_async().await;
         assert_eq!(result.stop, TaskListStop::NoProgress);
         assert_eq!(result.pages, 1);
+        assert!(result.incomplete);
+        assert!(result.next_cursor.is_none());
+        assert_eq!(result.to_json()["complete"], json!(false));
         let warning = result.truncation_warning().expect("must warn");
-        assert!(warning.contains("no cursor"), "{warning}");
+        assert!(warning.contains("result incomplete"), "{warning}");
     }
 
     /// A node that keeps returning the same cursor is the other shape of the
@@ -774,6 +918,305 @@ mod tests {
             .unwrap();
         assert_eq!(result.stop, TaskListStop::NoProgress);
         assert_eq!(result.pages, 1);
+        assert!(result.incomplete);
+        assert!(result.next_cursor.is_none());
+        assert_eq!(result.to_json()["complete"], json!(false));
+    }
+
+    /// A legacy node returns `{tasks, count}` without pagination metadata.
+    /// The client must NOT interpret this as complete/exhausted, but instead
+    /// return an explicit incomplete result with `complete: false`.
+    #[tokio::test]
+    async fn list_legacy_response_is_incomplete_and_does_not_claim_exhaustion() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/tasks\?limit=50$".into()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[{"id":"t1","kind":"test","status":"pending"}],"count":1}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = fetch_tasks(&client_for(&server), None, None, 50, None)
+            .await
+            .unwrap();
+        m.assert_async().await;
+        assert_eq!(result.stop, TaskListStop::LegacyProtocol);
+        assert_eq!(result.pages, 1);
+        assert_eq!(result.tasks.len(), 1);
+        assert!(result.incomplete);
+        assert!(result.next_cursor.is_none());
+        assert_eq!(result.to_json()["complete"], json!(false));
+        let warning = result
+            .truncation_warning()
+            .expect("legacy response must warn");
+        assert!(
+            warning.contains("node does not support pagination metadata"),
+            "{warning}"
+        );
+    }
+
+    /// When querying a legacy node with a limit above the 200-row page cap,
+    /// the client stops after the first page (since no cursor is returned)
+    /// and reports `complete: false` rather than claiming the 200 rows are the whole dataset.
+    #[tokio::test]
+    async fn list_legacy_response_with_limit_above_page_cap_stops_after_one_page() {
+        let mut server = mockito::Server::new_async().await;
+        let ids: Vec<String> = (0..200).map(|i| format!("t{i}")).collect();
+        let tasks_json: Vec<Value> = ids
+            .iter()
+            .map(|id| json!({ "id": id, "kind": "test" }))
+            .collect();
+        let body = json!({ "tasks": tasks_json, "count": 200 }).to_string();
+
+        let m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/tasks\?limit=200$".into()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = fetch_tasks(&client_for(&server), None, None, 500, None)
+            .await
+            .unwrap();
+        m.assert_async().await;
+        assert_eq!(result.stop, TaskListStop::LegacyProtocol);
+        assert_eq!(result.pages, 1);
+        assert_eq!(result.tasks.len(), 200);
+        assert!(result.incomplete);
+        assert!(result.next_cursor.is_none());
+        assert_eq!(result.to_json()["complete"], json!(false));
+        let warning = result
+            .truncation_warning()
+            .expect("legacy response must warn");
+        assert!(
+            warning.contains("node does not support pagination metadata"),
+            "{warning}"
+        );
+    }
+
+    /// Malformed responses (missing fields, wrong types) must fail with an error
+    /// rather than silently succeeding.
+    #[tokio::test]
+    async fn list_malformed_responses_fail_visibly() {
+        let mut server = mockito::Server::new_async().await;
+        let bad_responses = [
+            r#"{"tasks":"not-an-array"}"#,
+            r#"{"count":0}"#,
+            r#"{"tasks":[],"has_more":"true"}"#,
+            r#"{"tasks":[],"has_more":true,"incomplete":"no"}"#,
+            r#"{"tasks":[],"has_more":true,"next_cursor":123}"#,
+            r#"{"tasks":[],"next_cursor":"c1"}"#,
+            r#"[]"#,
+        ];
+
+        for bad in bad_responses {
+            let m = server
+                .mock("GET", mockito::Matcher::Any)
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(bad)
+                .expect(1)
+                .create_async()
+                .await;
+
+            let err = fetch_tasks(&client_for(&server), None, None, 50, None)
+                .await
+                .expect_err(&format!("expected error for malformed body: {bad}"));
+            assert!(
+                err.to_string().contains("malformed") || err.to_string().contains("invalid JSON"),
+                "{err}"
+            );
+            m.assert_async().await;
+        }
+    }
+
+    /// A node that loops cursors (c1 -> c2 -> c1) must be detected as a cycle,
+    /// terminating the loop without reaching the limit or page cap, and never
+    /// reporting duplicate rows as complete or recommending a stale cursor.
+    #[tokio::test]
+    async fn list_stops_on_cursor_cycle_c1_c2_c1() {
+        let mut server = mockito::Server::new_async().await;
+        let p1 = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/tasks\?limit=200$".into()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(page(&["t1"], true, false, Some("c1")))
+            .create_async()
+            .await;
+        let p2 = server
+            .mock("GET", mockito::Matcher::Regex(r"cursor=c1".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(page(&["t2"], true, false, Some("c2")))
+            .create_async()
+            .await;
+        let p3 = server
+            .mock("GET", mockito::Matcher::Regex(r"cursor=c2".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(page(&["t3"], true, false, Some("c1")))
+            .create_async()
+            .await;
+
+        let result = fetch_tasks(&client_for(&server), None, None, 500, None)
+            .await
+            .unwrap();
+        p1.assert_async().await;
+        p2.assert_async().await;
+        p3.assert_async().await;
+        assert_eq!(result.stop, TaskListStop::NoProgress);
+        assert_eq!(result.pages, 3);
+        assert_eq!(result.tasks.len(), 3);
+        assert!(result.incomplete);
+        assert!(result.next_cursor.is_none());
+        assert_eq!(result.to_json()["complete"], json!(false));
+        let warning = result.truncation_warning().expect("must warn on cycle");
+        assert!(
+            !warning.contains("--cursor c1"),
+            "must not recommend stale cursor c1: {warning}"
+        );
+        assert!(
+            !warning.contains("--cursor c2"),
+            "must not recommend stale cursor c2: {warning}"
+        );
+    }
+
+    /// A longer cursor cycle (c1 -> c2 -> c3 -> c1) must terminate boundedly.
+    #[tokio::test]
+    async fn list_stops_on_longer_cursor_cycle() {
+        let mut server = mockito::Server::new_async().await;
+        let p1 = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/tasks\?limit=200$".into()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(page(&["t1"], true, false, Some("c1")))
+            .create_async()
+            .await;
+        let p2 = server
+            .mock("GET", mockito::Matcher::Regex(r"cursor=c1".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(page(&["t2"], true, false, Some("c2")))
+            .create_async()
+            .await;
+        let p3 = server
+            .mock("GET", mockito::Matcher::Regex(r"cursor=c2".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(page(&["t3"], true, false, Some("c3")))
+            .create_async()
+            .await;
+        let p4 = server
+            .mock("GET", mockito::Matcher::Regex(r"cursor=c3".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(page(&["t4"], true, false, Some("c1")))
+            .create_async()
+            .await;
+
+        let result = fetch_tasks(&client_for(&server), None, None, 500, None)
+            .await
+            .unwrap();
+        p1.assert_async().await;
+        p2.assert_async().await;
+        p3.assert_async().await;
+        p4.assert_async().await;
+        assert_eq!(result.stop, TaskListStop::NoProgress);
+        assert_eq!(result.pages, 4);
+        assert!(result.incomplete);
+        assert!(result.next_cursor.is_none());
+        assert_eq!(result.to_json()["complete"], json!(false));
+    }
+
+    /// A node that issues fresh cursors (c1 -> c2) but returns repeated task rows
+    /// must be caught by row progress validation, preventing duplicate rows and stopping boundedly.
+    #[tokio::test]
+    async fn list_stops_on_fresh_cursors_with_repeated_task_rows() {
+        let mut server = mockito::Server::new_async().await;
+        let p1 = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/tasks\?limit=200$".into()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(page(&["t1"], true, false, Some("c1")))
+            .create_async()
+            .await;
+        let p2 = server
+            .mock("GET", mockito::Matcher::Regex(r"cursor=c1".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(page(&["t1"], true, false, Some("c2")))
+            .create_async()
+            .await;
+
+        let result = fetch_tasks(&client_for(&server), None, None, 500, None)
+            .await
+            .unwrap();
+        p1.assert_async().await;
+        p2.assert_async().await;
+        assert_eq!(result.stop, TaskListStop::NoProgress);
+        assert_eq!(result.pages, 2);
+        assert_eq!(result.tasks.len(), 1, "duplicate row must not be appended");
+        assert!(result.incomplete);
+        assert!(result.next_cursor.is_none());
+        assert_eq!(result.to_json()["complete"], json!(false));
+        let warning = result.truncation_warning().expect("must warn");
+        assert!(
+            !warning.contains("--cursor c2"),
+            "must not recommend c2: {warning}"
+        );
+    }
+
+    /// If the caller supplies cursor `c1` and the node returns `next_cursor: c1` on the first request,
+    /// the client stops immediately as NoProgress and does NOT recommend `--cursor c1`.
+    #[tokio::test]
+    async fn list_stops_on_immediate_repeat_from_caller_supplied_cursor() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("GET", mockito::Matcher::Regex(r"cursor=c1".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(page(&["t1"], true, false, Some("c1")))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = fetch_tasks(&client_for(&server), None, None, 500, Some("c1"))
+            .await
+            .unwrap();
+        m.assert_async().await;
+        assert_eq!(result.stop, TaskListStop::NoProgress);
+        assert_eq!(result.pages, 1);
+        assert_eq!(result.tasks.len(), 1);
+        assert!(result.incomplete);
+        assert!(
+            result.next_cursor.is_none(),
+            "must not return stale input cursor c1"
+        );
+        assert_eq!(result.to_json()["complete"], json!(false));
+        let warning = result.truncation_warning().expect("must warn");
+        assert!(
+            !warning.contains("--cursor c1"),
+            "must not recommend stale cursor c1: {warning}"
+        );
     }
 
     /// A caller-supplied resume cursor must reach the node, and each request
