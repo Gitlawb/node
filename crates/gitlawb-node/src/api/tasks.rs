@@ -1269,6 +1269,107 @@ mod visible_tasks_tests {
         );
     }
 
+    /// The GraphQL task resolvers reach the SAME `collect_visible_tasks` /
+    /// `get_visible_task` gate as the REST read routes, so they must carry the
+    /// same per-IP brake — otherwise `task_read_routes` is a fence with an open
+    /// gate beside it and a prober just asks over /graphql instead (#327
+    /// review). The brake rides as request data rather than a router layer
+    /// because /graphql is one endpoint for every operation; see
+    /// `rate_limit::TaskReadBrake`.
+    /// MUTATION (RED): drop the `TaskReadBrake` data from `graphql_handler`, or
+    /// the `task_read_brake` call from either resolver, and the exhausted-bucket
+    /// probes below answer normally instead of with the brake message.
+    #[sqlx::test]
+    async fn graphql_task_queries_share_the_task_read_ip_brake(pool: PgPool) {
+        use std::net::SocketAddr;
+
+        let mut state = test_state(pool).await;
+        // Two slots, so the third task field from this IP is braked.
+        state.task_read_rate_limiter =
+            crate::rate_limit::RateLimiter::new(2, std::time::Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .create_task(&task("t1", None, DELEGATOR))
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let peer: SocketAddr = "198.51.100.7:5000".parse().unwrap();
+        let query = |peer: SocketAddr, q: &str| {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri("/graphql")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({ "query": q }).to_string()))
+                .unwrap();
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(peer));
+            req
+        };
+        let run = |router: Router, peer: SocketAddr, q: &'static str| async move {
+            let resp = router.oneshot(query(peer, q)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "GraphQL answers 200: {q}");
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let braked = |body: &serde_json::Value| {
+            body["errors"].as_array().is_some_and(|errs| {
+                errs.iter()
+                    .any(|e| e["message"].as_str() == Some(crate::rate_limit::RATE_LIMIT_MESSAGE))
+            })
+        };
+
+        // Anonymous list, then anonymous single-id lookup: both run the gate,
+        // both spend a slot.
+        for q in ["{ tasks { items { id } } }", "{ task(id: \"t1\") { id } }"] {
+            let body = run(router.clone(), peer, q).await;
+            // Asserting the whole `errors` key is absent, not merely that the
+            // brake message is missing: a query that failed for some other
+            // reason would still spend its slot and leave this test vacuous.
+            assert!(
+                body.get("errors").is_none(),
+                "{q}: the first probes must pass the brake and resolve, got {body}"
+            );
+        }
+
+        let body = run(router.clone(), peer, "{ tasks { items { id } } }").await;
+        assert!(
+            braked(&body),
+            "an exhausted per-IP bucket must brake the GraphQL task query too, \
+             got {body}"
+        );
+        assert!(
+            body["data"]["tasks"].is_null(),
+            "a braked field must resolve to null, not answer with rows: {body}"
+        );
+
+        // The bucket is the one `task_read_routes` debits, not a second budget:
+        // the REST route is already exhausted by the GraphQL traffic above.
+        let mut rest = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/tasks")
+            .body(Body::empty())
+            .unwrap();
+        rest.extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        let resp = router.clone().oneshot(rest).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "GraphQL and REST task reads must share one per-IP bucket"
+        );
+
+        let other: SocketAddr = "198.51.100.8:5000".parse().unwrap();
+        let body = run(router, other, "{ tasks { items { id } } }").await;
+        assert!(
+            !braked(&body),
+            "a different IP must not be braked by another IP's exhausted bucket"
+        );
+    }
+
     /// #327 review: a cursor records how far a scan got under *one* caller's
     /// visibility, so presenting it as a different caller must fail rather
     /// than resume. Here an anonymous page stops at a public task, having

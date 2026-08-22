@@ -279,7 +279,7 @@ pub async fn rate_limit_by_did(request: Request, next: Next) -> Response {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 [("retry-after", "60")],
-                "rate limit exceeded — try again later",
+                RATE_LIMIT_MESSAGE,
             )
                 .into_response();
         }
@@ -384,6 +384,11 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
     }
 }
 
+/// The message every per-IP brake answers with, shared so the GraphQL surface
+/// (which cannot return a 429 status inside a 200 GraphQL envelope) says the
+/// same thing as the REST routes.
+pub const RATE_LIMIT_MESSAGE: &str = "rate limit exceeded — try again later";
+
 /// The shared 429 response for the per-IP flood brakes. Route-agnostic: this
 /// middleware now serves the push path AND the peer-sync routes, so the message
 /// stays generic (the offending path is recorded in the warn log below).
@@ -391,9 +396,41 @@ pub fn too_many_requests() -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
         [("retry-after", "60")],
-        "rate limit exceeded — try again later",
+        RATE_LIMIT_MESSAGE,
     )
         .into_response()
+}
+
+/// The per-IP task-read brake carried as GraphQL request data: the limiter plus
+/// the client key the transport already resolved.
+///
+/// `/graphql` is a single POST endpoint, so this brake cannot sit in middleware
+/// the way `task_read_routes` mounts `rate_limit_by_ip`: that would charge every
+/// unrelated query and every mutation against the task-read bucket. The two task
+/// resolvers debit it instead, which also prices an aliased query honestly — ten
+/// aliased `tasks` fields run the visibility gate ten times and pay ten slots,
+/// where one request-scoped debit would pay one (#327 review).
+#[derive(Clone)]
+pub struct TaskReadBrake {
+    pub limiter: RateLimiter,
+    /// `None` when no key could be resolved at all (no trusted header and no
+    /// `ConnectInfo`, e.g. a synthetic test request). Never braked, matching
+    /// [`rate_limit_by_ip`].
+    pub key: Option<String>,
+}
+
+impl TaskReadBrake {
+    /// Debit one slot for one task-read field. `true` = proceed.
+    pub async fn check(&self, field: &str) -> bool {
+        let Some(key) = self.key.as_deref() else {
+            return true;
+        };
+        if self.limiter.check(key).await {
+            return true;
+        }
+        tracing::warn!(key = %key, field = %field, "per-IP rate limit exceeded");
+        false
+    }
 }
 
 /// Throttle the git push path by resolved client IP. The socket peer address is
