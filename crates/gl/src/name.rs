@@ -168,15 +168,8 @@ pub async fn run(args: NameArgs) -> Result<()> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn identity_dir(dir: Option<PathBuf>) -> Result<PathBuf> {
-    // The shared resolver, not a local `~/.gitlawb`: `gl identity new` writes the
-    // key wherever `GITLAWB_KEY` points, and the old fallback to `.` on a missing
-    // home made the answer depend on the working directory.
-    crate::identity::gitlawb_dir(dir)
-}
-
 fn load_did(dir: Option<PathBuf>) -> Result<String> {
-    let path = identity_dir(dir)?.join("identity.pem");
+    let path = crate::identity::key_path_for(dir.as_deref())?;
     let pem = std::fs::read_to_string(&path).with_context(|| {
         format!(
             "No identity at {} — run `gl identity new` first",
@@ -189,7 +182,7 @@ fn load_did(dir: Option<PathBuf>) -> Result<String> {
 }
 
 fn load_did_and_document(dir: Option<PathBuf>) -> Result<(String, String)> {
-    let path = identity_dir(dir)?.join("identity.pem");
+    let path = crate::identity::key_path_for(dir.as_deref())?;
     let pem = std::fs::read_to_string(&path).with_context(|| {
         format!(
             "No identity at {} — run `gl identity new` first",

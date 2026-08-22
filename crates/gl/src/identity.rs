@@ -87,8 +87,28 @@ pub fn gitlawb_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
     gitlawb_core::identity_path::identity_dir(home.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-fn key_path(dir: &Path) -> PathBuf {
-    dir.join(gitlawb_core::identity_path::KEY_FILE_NAME)
+/// The identity PEM to read or write.
+///
+/// With an explicit `--dir` this is `<dir>/identity.pem`, the conventional layout.
+/// Without one it is [`gitlawb_core::identity_path::identity_key_path`] — the whole
+/// of `GITLAWB_KEY`, basename included.
+///
+/// Taking only the parent and re-appending `identity.pem` was a real divergence,
+/// not a tidy-up: `GITLAWB_KEY` is documented as a path to a PEM, and
+/// `git-remote-gitlawb` opens exactly that path. With
+/// `GITLAWB_KEY=/data/keys/ci-agent.pem`, `gl identity new` wrote
+/// `/data/keys/identity.pem` while every push loaded `/data/keys/ci-agent.pem`, so
+/// the two either disagreed on identity or the helper found no key at all — and
+/// owner enforcement and the delegation proof both key off that identity.
+pub(crate) fn key_path_for(dir: Option<&Path>) -> Result<PathBuf> {
+    match dir {
+        Some(d) => Ok(d.join(gitlawb_core::identity_path::KEY_FILE_NAME)),
+        None => {
+            let home = dirs::home_dir();
+            gitlawb_core::identity_path::identity_key_path(home.as_deref())
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        }
+    }
 }
 
 fn load_keypair(dir: Option<PathBuf>) -> Result<Keypair> {
@@ -104,8 +124,7 @@ fn load_keypair(dir: Option<PathBuf>) -> Result<Keypair> {
 /// just created — `gl ucan delegate` would either fail to find an identity or sign
 /// with a stale DID that is not the repo owner.
 pub fn load_keypair_from_dir(dir: Option<&std::path::Path>) -> Result<Keypair> {
-    let base = gitlawb_dir(dir.map(Path::to_path_buf))?;
-    let path = key_path(&base);
+    let path = key_path_for(dir)?;
     let pem = fs::read_to_string(&path).with_context(|| {
         format!(
             "no identity found at {}\nRun `gl identity new` to create one",
@@ -124,8 +143,11 @@ async fn cmd_new_with_reader(
     force: bool,
     reader: &mut impl std::io::BufRead,
 ) -> Result<()> {
-    let dir = gitlawb_dir(dir)?;
-    let path = key_path(&dir);
+    let path = key_path_for(dir.as_deref())?;
+    let dir = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
 
     if path.exists() {
         if force {
@@ -199,8 +221,7 @@ async fn cmd_sign(message: String, dir: Option<PathBuf>) -> Result<()> {
 }
 
 async fn cmd_backup(out: Option<PathBuf>, dir: Option<PathBuf>) -> Result<()> {
-    let base = gitlawb_dir(dir)?;
-    let src = key_path(&base);
+    let src = key_path_for(dir.as_deref())?;
 
     let pem = fs::read_to_string(&src).with_context(|| {
         format!(
@@ -255,8 +276,11 @@ async fn cmd_restore_with_reader(
     // Verify it's a valid keypair before writing anything
     let keypair = Keypair::from_pem(&pem).context("backup file is not a valid identity PEM")?;
 
-    let base = gitlawb_dir(dir)?;
-    let dest = key_path(&base);
+    let dest = key_path_for(dir.as_deref())?;
+    let base = dest
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
 
     if dest.exists() {
         if force {
@@ -554,6 +578,12 @@ pub(crate) mod test_env {
         }
     }
 
+    /// Run `f` with `GITLAWB_KEY` set, restoring it afterwards.
+    pub(crate) fn with_key<T, V: AsRef<OsStr>>(value: Option<V>, f: impl FnOnce() -> T) -> T {
+        let _guard = set_key(value);
+        f()
+    }
+
     /// Set `GITLAWB_KEY` (or remove it, for `None`) until the guard drops.
     pub(crate) fn set_key<V: AsRef<OsStr>>(value: Option<V>) -> KeyEnv {
         let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -657,5 +687,44 @@ mod gitlawb_dir_tests {
             .expect("the identity beside GITLAWB_KEY must be found");
 
         assert_eq!(loaded.did(), expected.did());
+    }
+}
+
+#[cfg(test)]
+mod key_basename_tests {
+    use super::*;
+
+    /// `GITLAWB_KEY` names a FILE. `gl` used to keep only its parent and re-append
+    /// `identity.pem`, while `git-remote-gitlawb` opened the configured path — so
+    /// with `GITLAWB_KEY=/data/keys/ci-agent.pem` the CLI and the push path loaded
+    /// different files, and owner enforcement and the delegation proof both key off
+    /// whichever identity that was.
+    #[test]
+    fn a_non_default_key_basename_is_honoured() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("ci-agent.pem");
+        let expected = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(&key, expected.to_pem().unwrap()).unwrap();
+
+        let (resolved, loaded) = crate::identity::test_env::with_key(Some(key.clone()), || {
+            (key_path_for(None).unwrap(), load_keypair_from_dir(None))
+        });
+
+        assert_eq!(resolved, key, "the configured basename must survive");
+        assert_eq!(
+            loaded.expect("the key at GITLAWB_KEY must load").did(),
+            expected.did(),
+            "gl must load the same file the helper opens"
+        );
+    }
+
+    /// An explicit --dir keeps the conventional layout.
+    #[test]
+    fn an_explicit_dir_still_uses_identity_pem() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            key_path_for(Some(dir.path())).unwrap(),
+            dir.path().join("identity.pem")
+        );
     }
 }

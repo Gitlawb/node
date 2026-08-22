@@ -184,7 +184,7 @@ What the node requires, and why:
 | Requirement | Reason |
 |---|---|
 | The chain's **root issuer** is the repo owner | A `did:key` is self-certifying, so anyone can mint a chain. The owner is the only anchor the node holds independently of the token. |
-| The capability names **this** repository | A `*` capability would otherwise grow to cover every repo the owner creates later. The helper narrows to the concrete repo when it builds the invocation. |
+| The capability names **this** repository | Enforced by the node: a `*` resource is refused outright, so one delegation can never grow to cover repos the owner creates later. `git-remote-gitlawb` also narrows a `*` delegation to the concrete repo when it builds the invocation, but that is convenience — the node does not rely on it. |
 | **Every link carries an expiry** | There is no revocation path yet. An unbounded delegation could never be withdrawn once leaked, so the node refuses one outright. `gl ucan delegate` defaults to 30 days. |
 | No `nb` constraints | Constraints are reserved but not yet interpreted, so a capability carrying them authorizes nothing rather than silently granting more than the owner intended. |
 

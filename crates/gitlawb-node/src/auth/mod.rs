@@ -53,12 +53,20 @@ pub fn caller_authorized_to_push(
 ///
 /// Structural, not a string compare: `owner_did` is stored as a full
 /// `did:key:z6Mk…` on canonical rows and as a bare `z6Mk…` on mirror rows, so a
-/// literal match would deny a valid delegation for every mirror. `"*"` keeps the
-/// wildcard meaning [`gitlawb_core::ucan::Capability::is_attenuated_by`] gives it.
+/// literal match would deny a valid delegation for every mirror.
+///
+/// A resource wildcard is REFUSED here, deliberately, even though
+/// [`gitlawb_core::ucan::Capability::is_attenuated_by`] accepts `"*"` as a parent.
+/// `git-remote-gitlawb` narrows a wildcard delegation to the concrete repo before
+/// signing an invocation, but that is one client's courtesy, not a protocol
+/// boundary: a delegate can sign an otherwise valid `agent -> node` invocation that
+/// keeps `with: "*"`, and it passes attenuation because its proof is `"*"` too.
+/// Accepting it would let a single delegation push to every repository the root DID
+/// owns, including repositories created AFTER the delegation was issued — exactly
+/// the growth `docs/RUN-A-NODE.md` promises cannot happen. An authorization
+/// boundary cannot enforce that by trusting a client-side representation change,
+/// so the node requires a concrete resource of its own.
 fn repo_capability_matches(with: &str, record: &crate::db::RepoRecord) -> bool {
-    if with == "*" {
-        return true;
-    }
     let Some(rest) = with.strip_prefix("gitlawb://repos/") else {
         return false;
     };
@@ -882,11 +890,30 @@ mod ucan_push_tests {
         assert!(!ucan_grants_push(&rec, &v));
     }
 
+    /// A resource wildcard must NOT authorize a push, even though attenuation
+    /// accepts it. The helper narrows a `*` delegation before signing, but the node
+    /// cannot rely on that: a delegate can sign an invocation that keeps the
+    /// wildcard, and it would otherwise reach every repository the owner has — or
+    /// will later create. This test previously asserted the opposite.
     #[test]
-    fn honours_the_resource_wildcard_and_repo_admin() {
+    fn refuses_a_resource_wildcard_and_honours_repo_admin() {
         let rec = repo(&owner_full(), "myrepo");
         let wildcard = verified(&owner_full(), vec![Capability::new("*", caps::GIT_PUSH)]);
-        assert!(ucan_grants_push(&rec, &wildcard));
+        assert!(
+            !ucan_grants_push(&rec, &wildcard),
+            "a wildcard resource must not authorize a push at the node"
+        );
+
+        // The ACTION wildcard is a different axis and stays: attenuation bounds it,
+        // and it still has to name a concrete repository.
+        let action_wildcard = verified(
+            &owner_full(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{}/myrepo", owner_full()),
+                "*",
+            )],
+        );
+        assert!(ucan_grants_push(&rec, &action_wildcard));
 
         let admin = verified(
             &owner_full(),
@@ -896,6 +923,15 @@ mod ucan_push_tests {
             )],
         );
         assert!(ucan_grants_push(&rec, &admin));
+    }
+
+    /// The attack the wildcard refusal exists to stop: one `*` delegation reaching a
+    /// repository it was never issued against, including one created afterwards.
+    #[test]
+    fn a_wildcard_delegation_cannot_reach_a_second_repository() {
+        let other = repo(&owner_full(), "a-repo-created-later");
+        let wildcard = verified(&owner_full(), vec![Capability::new("*", caps::GIT_PUSH)]);
+        assert!(!ucan_grants_push(&other, &wildcard));
     }
 
     #[test]

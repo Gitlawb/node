@@ -218,12 +218,15 @@ pub async fn run(args: InitArgs) -> Result<()> {
 }
 
 fn generate_identity(dir: Option<&std::path::Path>) -> Result<gitlawb_core::identity::Keypair> {
-    let base = crate::identity::gitlawb_dir(dir.map(std::path::Path::to_path_buf))?;
+    let path = crate::identity::key_path_for(dir)?;
+    let base = path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
     std::fs::create_dir_all(&base)?;
 
     let keypair = gitlawb_core::identity::Keypair::generate();
     let pem = keypair.to_pem()?;
-    let path = base.join("identity.pem");
 
     #[cfg(unix)]
     {

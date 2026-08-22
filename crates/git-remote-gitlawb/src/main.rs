@@ -440,7 +440,13 @@ fn build_invocation(
         .att
         .iter()
         .find(|c| {
-            (c.with == "*" || names_this_repo(&c.with))
+            // `constraints.is_none()` mirrors the node: `ucan_grants_push` treats any
+            // capability carrying `nb` as granting nothing, so selecting one here
+            // would mint an invocation guaranteed to be refused — and a delegation
+            // holding BOTH a constrained and an unconstrained grant would fail or
+            // succeed purely on their order in `att`.
+            c.constraints.is_none()
+                && (c.with == "*" || names_this_repo(&c.with))
                 && (c.can == caps::GIT_PUSH || c.can == "*" || c.can == caps::REPO_ADMIN)
         })
         .ok_or_else(|| {
@@ -2566,6 +2572,48 @@ mod delegated_push_tests {
             "a wildcard parent is the one case where the URL-derived resource is used"
         );
         assert!(invocation.payload.att[0].is_attenuated_by(&delegation.payload.att[0]));
+    }
+
+    /// A delegation holding both a constrained and an unconstrained grant must work
+    /// regardless of their order. The node refuses a constrained leaf outright, so
+    /// picking merely the FIRST push-class capability made a valid delegation
+    /// succeed or fail purely on how the owner happened to order `att`.
+    #[test]
+    fn build_invocation_skips_a_constrained_capability_in_either_order() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+        let resource = "gitlawb://repos/z6MkOwner/r";
+
+        let mut constrained = Capability::new(resource, caps::GIT_PUSH);
+        constrained.constraints = Some(serde_json::json!({"max_bytes": 1}));
+        let usable = Capability::new(resource, caps::GIT_PUSH);
+
+        for (label, att) in [
+            (
+                "constrained first",
+                vec![constrained.clone(), usable.clone()],
+            ),
+            ("usable first", vec![usable.clone(), constrained.clone()]),
+        ] {
+            let delegation = Ucan::issue(&owner, agent.did(), att, Some(hour)).expect("issue");
+            let invocation = build_invocation(&agent, &node.did(), &delegation, "z6MkOwner", "r")
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert!(
+                invocation.payload.att[0].constraints.is_none(),
+                "{label}: the invocation must carry the capability the node can authorize"
+            );
+        }
+
+        // With ONLY a constrained grant there is nothing the node would accept, so
+        // failing here beats minting an invocation guaranteed to be refused.
+        let only_constrained =
+            Ucan::issue(&owner, agent.did(), vec![constrained], Some(hour)).expect("issue");
+        assert!(
+            build_invocation(&agent, &node.did(), &only_constrained, "z6MkOwner", "r").is_err(),
+            "a delegation with no unconstrained grant must not produce an invocation"
+        );
     }
 
     #[test]

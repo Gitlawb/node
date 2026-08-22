@@ -164,6 +164,37 @@ async fn cmd_import(token: String, dir: Option<PathBuf>) -> Result<()> {
         "not a valid UCAN token — pass the JSON emitted by `gl ucan delegate`, or a path to it",
     )?;
 
+    // The audience has to be THIS identity. The node requires `proof.aud` to equal
+    // the invocation issuer, so a token addressed to someone else is unusable here
+    // however well-formed it is: the helper would sign as us, the proof would name
+    // them, and the node would refuse the linkage — a 403 with nothing locally to
+    // explain it. Import is the last cheap place to say so.
+    let me = crate::identity::load_keypair_from_dir(dir.as_deref())
+        .context("cannot tell who this delegation is for without a local identity")?;
+    let my_did = me.did().to_string();
+    if !did_eq(&ucan.payload.aud.to_string(), &my_did) {
+        anyhow::bail!(
+            "this delegation is addressed to {}, but the local identity is {my_did}. \
+             Ask the owner to re-issue it with `--to {my_did}`.",
+            ucan.payload.aud
+        );
+    }
+
+    // Verify before it can displace a working delegation: a token the node would
+    // refuse is not worth overwriting a good one for.
+    let root = ucan
+        .verify_chain()
+        .map_err(|e| anyhow::anyhow!("this delegation does not verify: {e}"))?;
+    if ucan.is_expired() {
+        anyhow::bail!("this delegation has already expired");
+    }
+    if !ucan.chain_lifetime_is_bounded() {
+        anyhow::bail!(
+            "this delegation has an unbounded link, and a node refuses an unbounded push chain"
+        );
+    }
+    tracing::debug!("delegation verified, rooted at {root}");
+
     // Import admits only what the push path can actually use. `build_invocation`
     // requires a push-class action on a concrete repository resource, so a token
     // carrying only `pr/open` would import "successfully", print a stored path, and
@@ -251,14 +282,42 @@ fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
 fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(contents)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+
+    // Written to a sibling temp first, then renamed. Opening the real path with
+    // `truncate(true)` empties a working delegation before the replacement is
+    // written, so an interruption, ENOSPC, or a short write between the two leaves
+    // the operator with an unreadable token and pushes that silently drop `X-Ucan`.
+    // `rename` within a directory is atomic: either the old token or the new one is
+    // there, never a half of either.
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp = dir.join(format!(
+        ".{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+
+    let write = || -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(contents)?;
+        // Durable before it becomes the live token: a rename that beats the data to
+        // disk can surface an empty file after a crash.
+        file.sync_all()?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+    };
+
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 // `std::fs` has no portable ACL API, and `gitlawb_dir` accepts any directory, so
@@ -623,9 +682,23 @@ mod delegation_store_tests {
         );
     }
 
-    fn token_for(can: &str, with: &str) -> String {
+    /// Seed `dir` with a local identity and issue a delegation addressed to it.
+    ///
+    /// Import now binds the token's audience to the local key, so a fixture that
+    /// issues to an unrelated DID is testing the audience check rather than
+    /// whatever it meant to test.
+    pub(super) fn seed_identity(dir: &std::path::Path) -> gitlawb_core::identity::Keypair {
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(dir.join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        kp
+    }
+
+    pub(super) fn token_for_agent(
+        agent: &gitlawb_core::identity::Keypair,
+        can: &str,
+        with: &str,
+    ) -> String {
         let owner = gitlawb_core::identity::Keypair::generate();
-        let agent = gitlawb_core::identity::Keypair::generate();
         Ucan::issue(
             &owner,
             agent.did(),
@@ -646,7 +719,8 @@ mod delegation_store_tests {
     async fn import_refuses_a_delegation_the_push_path_cannot_use() {
         for can in ["pr/open", "issue/create", "git/fetch"] {
             let dir = tempfile::tempdir().unwrap();
-            let token = token_for(can, "gitlawb://repos/z6MkAbc/myrepo");
+            let agent = seed_identity(dir.path());
+            let token = token_for_agent(&agent, can, "gitlawb://repos/z6MkAbc/myrepo");
 
             let err = cmd_import(token, Some(dir.path().to_path_buf()))
                 .await
@@ -669,7 +743,8 @@ mod delegation_store_tests {
     #[tokio::test]
     async fn import_refuses_a_wildcard_resource() {
         let dir = tempfile::tempdir().unwrap();
-        let token = token_for(caps::GIT_PUSH, "*");
+        let agent = seed_identity(dir.path());
+        let token = token_for_agent(&agent, caps::GIT_PUSH, "*");
 
         let err = cmd_import(token, Some(dir.path().to_path_buf()))
             .await
@@ -686,7 +761,8 @@ mod delegation_store_tests {
     async fn import_accepts_every_push_class_action() {
         for can in [caps::GIT_PUSH, caps::REPO_ADMIN, "*"] {
             let dir = tempfile::tempdir().unwrap();
-            let token = token_for(can, "gitlawb://repos/z6MkAbc/myrepo");
+            let agent = seed_identity(dir.path());
+            let token = token_for_agent(&agent, can, "gitlawb://repos/z6MkAbc/myrepo");
 
             cmd_import(token, Some(dir.path().to_path_buf()))
                 .await
@@ -706,7 +782,8 @@ mod delegation_store_tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let token = token_for(caps::GIT_PUSH, "gitlawb://repos/z6MkAbc/myrepo");
+        let agent = seed_identity(dir.path());
+        let token = token_for_agent(&agent, caps::GIT_PUSH, "gitlawb://repos/z6MkAbc/myrepo");
         cmd_import(token.clone(), Some(dir.path().to_path_buf()))
             .await
             .unwrap();
@@ -806,5 +883,107 @@ mod saved_ucan_tests {
     fn neither_shape_swallows_garbage() {
         assert!(decode_saved_ucan("not a ucan").is_err());
         assert!(decode_saved_ucan(r#"{"node":"x"}"#).is_err());
+    }
+}
+
+/// Compare two DIDs ignoring the `did:key:` prefix.
+///
+/// The same identity appears in both forms across this codebase — the node stores
+/// canonical rows full and mirror rows bare, and `delegation_path` keys on the bare
+/// form for filename safety — so a literal string compare would reject a match that
+/// every other layer accepts.
+fn did_eq(a: &str, b: &str) -> bool {
+    let bare = |d: &str| d.strip_prefix("did:key:").unwrap_or(d).to_string();
+    bare(a) == bare(b)
+}
+
+#[cfg(test)]
+mod import_binding_tests {
+    use super::delegation_store_tests::{seed_identity, token_for_agent};
+    use super::*;
+
+    /// A valid delegation addressed to somebody else must fail at import, not at
+    /// push. The node requires `proof.aud == invocation.iss`, so storing it only
+    /// buys a 403 later with nothing pointing back to the import that caused it.
+    #[tokio::test]
+    async fn import_refuses_a_delegation_addressed_to_another_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let _me = seed_identity(dir.path());
+        let someone_else = gitlawb_core::identity::Keypair::generate();
+        let token = token_for_agent(
+            &someone_else,
+            caps::GIT_PUSH,
+            "gitlawb://repos/z6MkAbc/myrepo",
+        );
+
+        let err = cmd_import(token, Some(dir.path().to_path_buf()))
+            .await
+            .expect_err("a delegation for another DID is unusable here");
+
+        assert!(
+            err.to_string().contains("addressed to"),
+            "the error must name the mismatch: {err}"
+        );
+        assert!(
+            !dir.path().join("delegations").exists(),
+            "nothing may be stored for a delegation this identity cannot invoke"
+        );
+    }
+
+    /// A failed re-import must not destroy the delegation already in place.
+    /// `truncate(true)` on the live path emptied it before the replacement landed.
+    #[tokio::test]
+    async fn a_refused_reimport_leaves_the_stored_delegation_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = seed_identity(dir.path());
+        let good = token_for_agent(&me, caps::GIT_PUSH, "gitlawb://repos/z6MkAbc/myrepo");
+        cmd_import(good.clone(), Some(dir.path().to_path_buf()))
+            .await
+            .unwrap();
+        let stored = delegation_path(dir.path(), "z6MkAbc", "myrepo");
+        let before = std::fs::read_to_string(&stored).unwrap();
+
+        // A token for the same repo that import must refuse.
+        let someone_else = gitlawb_core::identity::Keypair::generate();
+        let bad = token_for_agent(
+            &someone_else,
+            caps::GIT_PUSH,
+            "gitlawb://repos/z6MkAbc/myrepo",
+        );
+        let _ = cmd_import(bad, Some(dir.path().to_path_buf())).await;
+
+        assert_eq!(
+            std::fs::read_to_string(&stored).unwrap(),
+            before,
+            "a refused import must leave the working delegation exactly as it was"
+        );
+    }
+
+    /// An expired delegation cannot displace a live one either.
+    #[tokio::test]
+    async fn import_refuses_an_expired_delegation() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = seed_identity(dir.path());
+        let owner = gitlawb_core::identity::Keypair::generate();
+        let expired = Ucan::issue(
+            &owner,
+            me.did(),
+            vec![Capability::new(
+                "gitlawb://repos/z6MkAbc/myrepo",
+                caps::GIT_PUSH,
+            )],
+            Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+
+        let err = cmd_import(expired, Some(dir.path().to_path_buf()))
+            .await
+            .expect_err("an expired delegation is not importable");
+        assert!(
+            err.to_string().contains("expired"),
+            "the error must name expiry: {err}"
+        );
     }
 }
