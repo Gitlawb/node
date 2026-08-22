@@ -254,7 +254,7 @@ fn generate_identity(
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::write(path, pem.as_bytes())?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     #[cfg(not(unix))]
     {
