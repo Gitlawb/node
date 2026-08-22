@@ -820,7 +820,7 @@ mod delegation_store_tests {
 ///
 /// The bare-token form is still accepted: a file written by an older `gl`, or by
 /// hand, should not stop being readable just because the envelope is now canonical.
-fn decode_saved_ucan(content: &str) -> Result<Ucan> {
+pub(crate) fn decode_saved_ucan(content: &str) -> Result<Ucan> {
     if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(content) {
         if let Some(token) = envelope.get("ucan").and_then(|v| v.as_str()) {
             return Ucan::decode(token).map_err(Into::into);
