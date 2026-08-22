@@ -23,6 +23,8 @@ use crate::state::AppState;
 async fn graphql_handler(
     State(state): State<AppState>,
     auth: Option<axum::Extension<crate::auth::AuthenticatedDid>>,
+    headers: axum::http::HeaderMap,
+    rate_limit::PeerAddr(peer): rate_limit::PeerAddr,
     req: GraphQLRequest,
 ) -> GraphQLResponse {
     // `optional_signature` attaches the verified DID when a signature is present.
@@ -32,6 +34,17 @@ async fn graphql_handler(
     if let Some(axum::Extension(did)) = auth {
         inner = inner.data(did);
     }
+    // The anonymous `tasks`/`task` resolvers run the same #268 visibility gate
+    // as the REST read routes and cost the node the same queries, so they carry
+    // the same per-IP brake. It rides as request data rather than a router layer
+    // because /graphql is one endpoint for every operation — see `TaskReadBrake`
+    // (#327 review). It debits before the gate runs, but unlike the REST layer
+    // it sits inside `optional_signature`, so it brakes the gate's query cost
+    // and not signature verification.
+    inner = inner.data(rate_limit::TaskReadBrake {
+        limiter: state.task_read_rate_limiter.clone(),
+        key: rate_limit::client_key(&headers, peer, state.push_limiter_trust),
+    });
     state.graphql_schema.execute(inner).await.into()
 }
 

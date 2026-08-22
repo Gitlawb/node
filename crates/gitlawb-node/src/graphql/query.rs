@@ -7,6 +7,23 @@ use super::types::{AgentTaskReadType, RefUpdateType, RepoType, TaskPageType};
 
 pub struct QueryRoot;
 
+/// Debit the per-IP task-read brake for one task field, mirroring the
+/// `rate_limit_by_ip` layer on `task_read_routes`. Both surfaces run the same
+/// #268 visibility gate and pay the same queries before answering, so an
+/// anonymous prober must not get an unbraked lane by asking over GraphQL
+/// (#327 review).
+///
+/// A schema built without the brake (unit tests, subscriptions) is not braked,
+/// exactly as `rate_limit_by_ip` is a no-op without its extension.
+async fn task_read_brake(ctx: &Context<'_>, field: &str) -> Result<()> {
+    match ctx.data::<crate::rate_limit::TaskReadBrake>() {
+        Ok(brake) if !brake.check(field).await => Err(async_graphql::Error::new(
+            crate::rate_limit::RATE_LIMIT_MESSAGE,
+        )),
+        _ => Ok(()),
+    }
+}
+
 #[Object]
 impl QueryRoot {
     async fn repos(&self, ctx: &Context<'_>) -> Result<Vec<RepoType>> {
@@ -122,6 +139,7 @@ impl QueryRoot {
     ) -> Result<TaskPageType> {
         use crate::api::task_cursor::{self, TaskCursorKey, TaskFilter};
 
+        task_read_brake(ctx, "tasks").await?;
         let db = ctx.data_unchecked::<Arc<Db>>();
         // #268: gate rows via the same collector the REST list route uses (like
         // `ref_updates` shares `collect_visible_ref_updates` with its REST feed),
@@ -167,6 +185,7 @@ impl QueryRoot {
     }
 
     async fn task(&self, ctx: &Context<'_>, id: String) -> Result<Option<AgentTaskReadType>> {
+        task_read_brake(ctx, "task").await?;
         let db = ctx.data_unchecked::<Arc<Db>>();
         // #268: same gate as the REST get route, via the shared helper.
         let caller = ctx
