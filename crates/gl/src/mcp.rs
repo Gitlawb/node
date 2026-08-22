@@ -1605,7 +1605,7 @@ mod tests {
             )
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"tasks":[{"id":"t1","kind":"test","status":"pending"}]}"#)
+            .with_body(r#"{"tasks":[{"id":"t1","kind":"test","status":"pending"}],"has_more":false,"incomplete":false,"next_cursor":null}"#)
             .create_async()
             .await;
 
@@ -1619,6 +1619,7 @@ mod tests {
         .unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["tasks"][0]["id"], "t1");
+        assert_eq!(parsed["complete"], json!(true));
     }
 
     #[tokio::test]
@@ -1640,7 +1641,9 @@ mod tests {
             .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"tasks":[{"id":"t1"}]}"#)
+            .with_body(
+                r#"{"tasks":[{"id":"t1"}],"has_more":false,"incomplete":false,"next_cursor":null}"#,
+            )
             .create_async()
             .await;
 
@@ -1649,6 +1652,7 @@ mod tests {
             .unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["tasks"][0]["id"], "t1");
+        assert_eq!(parsed["complete"], json!(true));
     }
 
     /// #327 review: MCP `task_list` issued one request and exposed no
@@ -1700,12 +1704,12 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                r#"{"tasks":[],"has_more":true,"incomplete":true,"next_cursor":"resume-me"}"#,
+                r#"{"tasks":[{"id":"t1"}],"has_more":true,"incomplete":true,"next_cursor":"resume-me"}"#,
             )
             .create_async()
             .await;
 
-        let result = call_tool("task_list", json!({"limit": 50}), &server.url(), None)
+        let result = call_tool("task_list", json!({"limit": 1}), &server.url(), None)
             .await
             .unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
@@ -1721,6 +1725,72 @@ mod tests {
         );
     }
 
+    /// A legacy response without pagination metadata is reported as incomplete via MCP.
+    #[tokio::test]
+    async fn test_task_list_via_mcp_legacy_response_is_incomplete() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[{"id":"t1"}],"count":1}"#)
+            .create_async()
+            .await;
+
+        let result = call_tool("task_list", json!({"limit": 50}), &server.url(), None)
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["complete"], json!(false));
+        assert_eq!(parsed["incomplete"], json!(true));
+        assert!(parsed["next_cursor"].is_null());
+        assert!(
+            parsed["warning"]
+                .as_str()
+                .unwrap()
+                .contains("node does not support pagination metadata"),
+            "{parsed}"
+        );
+    }
+
+    /// A legacy response with limit > 200 stops after 1 page and does not claim completeness via MCP.
+    #[tokio::test]
+    async fn test_task_list_via_mcp_legacy_limit_above_page_cap() {
+        let mut server = mockito::Server::new_async().await;
+        let ids: Vec<String> = (0..200).map(|i| format!("t{i}")).collect();
+        let tasks_json: Vec<Value> = ids.iter().map(|id| json!({ "id": id })).collect();
+        let body = json!({ "tasks": tasks_json, "count": 200 }).to_string();
+
+        let m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/tasks\?limit=200$".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = call_tool("task_list", json!({"limit": 500}), &server.url(), None)
+            .await
+            .unwrap();
+        m.assert_async().await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["count"], 200);
+        assert_eq!(parsed["complete"], json!(false));
+        assert_eq!(parsed["incomplete"], json!(true));
+        assert!(parsed["next_cursor"].is_null());
+        assert!(
+            parsed["warning"]
+                .as_str()
+                .unwrap()
+                .contains("node does not support pagination metadata"),
+            "{parsed}"
+        );
+    }
+
     /// A cursor the model passes back must reach the node.
     #[tokio::test]
     async fn test_task_list_via_mcp_forwards_cursor_argument() {
@@ -1732,7 +1802,7 @@ mod tests {
             )
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"tasks":[],"has_more":false}"#)
+            .with_body(r#"{"tasks":[],"has_more":false,"incomplete":false,"next_cursor":null}"#)
             .expect(1)
             .create_async()
             .await;
@@ -1766,6 +1836,30 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("500"));
+    }
+
+    /// Malformed server responses fail visibly in MCP.
+    #[tokio::test]
+    async fn test_task_list_via_mcp_malformed_response_errors() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":"not-an-array"}"#)
+            .create_async()
+            .await;
+
+        let err = call_tool("task_list", json!({}), &server.url(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("malformed") || err.to_string().contains("invalid JSON"),
+            "{err}"
+        );
     }
 
     /// #327 review: a model that sends `limit: 0` used to get an empty list

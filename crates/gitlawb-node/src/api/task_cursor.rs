@@ -143,6 +143,15 @@ fn caller_binding(caller: Option<&str>) -> &str {
     caller.map(crate::db::normalize_owner_key).unwrap_or("")
 }
 
+/// The assignee filter a token was issued under. Normalized through
+/// `normalize_owner_key` so the two spellings of one `did:key` identity
+/// (`did:key:X` and bare `X`) bind identically, matching `list_tasks_keyset`
+/// in SQL: minting under `did:key:X` and resuming with bare `X` (or the reverse)
+/// hits the same rows and must verify under the MAC.
+fn assignee_binding(assignee: Option<&str>) -> &str {
+    assignee.map(crate::db::normalize_owner_key).unwrap_or("")
+}
+
 fn cursor_mac(
     key: &TaskCursorKey,
     filter: TaskFilter<'_>,
@@ -155,7 +164,7 @@ fn cursor_mac(
     // tuples can produce the same MAC input.
     for field in [
         filter.status.unwrap_or("").as_bytes(),
-        filter.assignee_did.unwrap_or("").as_bytes(),
+        assignee_binding(filter.assignee_did).as_bytes(),
         caller_binding(caller).as_bytes(),
         plaintext,
     ] {
@@ -490,6 +499,42 @@ mod tests {
         );
         // A different method sharing the base58 tail is a different principal.
         assert!(decode(&k, unfiltered(), Some("did:web:z6MkAlice"), &token).is_err());
+    }
+
+    /// The filter binding is on identity, not spelling: `assignee_did` matches
+    /// normalized keys in SQL (`normalize_owner_key`), so minting under
+    /// `did:key:X` and resuming under bare `X` (or vice versa) must succeed,
+    /// while `did:web:X` remains distinct.
+    #[test]
+    fn assignee_filter_binding_is_normalized_across_did_key_spellings() {
+        let k = key();
+        let pos = TaskPosition::new("2026-01-03T00:00:00+00:00", "task-a");
+        let filter_did_key = TaskFilter {
+            status: Some("pending"),
+            assignee_did: Some("did:key:z6MkAssignee"),
+        };
+        let filter_bare = TaskFilter {
+            status: Some("pending"),
+            assignee_did: Some("z6MkAssignee"),
+        };
+        let filter_web = TaskFilter {
+            status: Some("pending"),
+            assignee_did: Some("did:web:z6MkAssignee"),
+        };
+
+        let token_from_did_key = encode(&k, filter_did_key, None, &pos);
+        assert_eq!(
+            decode(&k, filter_bare, None, &token_from_did_key).unwrap(),
+            pos
+        );
+        assert!(decode(&k, filter_web, None, &token_from_did_key).is_err());
+
+        let token_from_bare = encode(&k, filter_bare, None, &pos);
+        assert_eq!(
+            decode(&k, filter_did_key, None, &token_from_bare).unwrap(),
+            pos
+        );
+        assert!(decode(&k, filter_web, None, &token_from_bare).is_err());
     }
 
     /// Anonymous is a distinct binding from a caller whose normalized DID is
