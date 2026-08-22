@@ -2114,9 +2114,26 @@ mod ucan_show_tests {
         assert_eq!(v["expired"], false);
         assert_eq!(v["signature_valid"], true);
 
+        // NOT `!out.contains(&token)`: the token is itself JSON, so embedding it in
+        // a pretty-printed response escapes every quote and that assertion passes
+        // whether or not the token leaked. The signature is a bare base64 string that
+        // survives escaping unchanged, so it is the substring that actually proves
+        // absence.
+        let sig = serde_json::from_str::<serde_json::Value>(&token).unwrap()["s"]
+            .as_str()
+            .expect("a UCAN carries its signature in `s`")
+            .to_string();
+        assert!(!sig.is_empty());
         assert!(
-            !out.contains(&token),
+            !out.contains(&sig),
             "the bootstrap token must not be returned to an MCP caller"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&out)
+                .unwrap()
+                .get("ucan")
+                .is_none(),
+            "no field may carry the token itself"
         );
     }
 

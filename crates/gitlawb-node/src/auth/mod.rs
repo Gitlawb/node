@@ -108,13 +108,64 @@ pub fn ucan_grants_push(record: &crate::db::RepoRecord, verified: &VerifiedUcan)
     if !verified.ucan.chain_lifetime_is_bounded() {
         return false;
     }
-    verified.ucan.payload.att.iter().any(|cap| {
-        cap.constraints.is_none()
-            && (cap.can == gitlawb_core::ucan::caps::GIT_PUSH
-                || cap.can == "*"
-                || cap.can == gitlawb_core::ucan::caps::REPO_ADMIN)
-            && repo_capability_matches(&cap.with, record)
-    })
+    if !verified
+        .ucan
+        .payload
+        .att
+        .iter()
+        .any(|cap| push_class_names_repo(cap, record))
+    {
+        return false;
+    }
+    // EVERY link must name this repository, not just the leaf.
+    //
+    // Refusing a wildcard leaf alone did nothing: `is_attenuated_by` accepts a
+    // concrete child under a `*` parent, and that narrowing is exactly what
+    // `build_invocation` performs. So one owner-issued `with: "*"` proof let the
+    // delegate mint a concrete leaf for ANY repository the owner has — or creates
+    // later — and both the chain check and the owner-root check passed. The scope
+    // of a delegation is fixed when it is issued, so a proof that does not name
+    // this repository cannot authorize a push to it.
+    proofs_name_repo(&verified.ucan, record)
+}
+
+/// A capability that is push-class, unconstrained, and names this repository.
+fn push_class_names_repo(
+    cap: &gitlawb_core::ucan::Capability,
+    record: &crate::db::RepoRecord,
+) -> bool {
+    cap.constraints.is_none()
+        && (cap.can == gitlawb_core::ucan::caps::GIT_PUSH
+            || cap.can == "*"
+            || cap.can == gitlawb_core::ucan::caps::REPO_ADMIN)
+        && repo_capability_matches(&cap.with, record)
+}
+
+/// Every proof in the chain carries a capability naming this repository.
+///
+/// `verify_chain` has already established that the chain is internally consistent
+/// and that each link attenuates its parent — but attenuation permits narrowing a
+/// `*` parent to a concrete child, which is the growth this refuses. Called after
+/// `verify_chain`, so `prf` is at most one entry per link and the depth is bounded
+/// by a chain that already walked successfully.
+fn proofs_name_repo(ucan: &gitlawb_core::ucan::Ucan, record: &crate::db::RepoRecord) -> bool {
+    for proof_token in &ucan.payload.prf {
+        let Ok(proof) = gitlawb_core::ucan::Ucan::decode(proof_token) else {
+            return false;
+        };
+        if !proof
+            .payload
+            .att
+            .iter()
+            .any(|cap| push_class_names_repo(cap, record))
+        {
+            return false;
+        }
+        if !proofs_name_repo(&proof, record) {
+            return false;
+        }
+    }
+    true
 }
 
 use gitlawb_core::http_sig::{
@@ -932,6 +983,87 @@ mod ucan_push_tests {
         let other = repo(&owner_full(), "a-repo-created-later");
         let wildcard = verified(&owner_full(), vec![Capability::new("*", caps::GIT_PUSH)]);
         assert!(!ucan_grants_push(&other, &wildcard));
+    }
+
+    /// The round-8 P1, executed rather than reasoned: an owner-issued `*` PROOF with
+    /// a concrete leaf for a repository that did not exist at issuance. Refusing a
+    /// wildcard *leaf* did nothing here — `is_attenuated_by` accepts a concrete child
+    /// under a `*` parent, and that narrowing is exactly what `build_invocation` did,
+    /// so the first-party helper was the working mint path.
+    #[test]
+    fn a_wildcard_proof_cannot_reach_a_repo_created_later() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        let parent = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new("*", caps::GIT_PUSH)],
+            Some(hour),
+        )
+        .unwrap();
+        let later = format!("gitlawb://repos/{}/a-repo-created-later", owner.did());
+        let invocation = Ucan::delegate(
+            &agent,
+            node.did(),
+            vec![Capability::new(&later, caps::GIT_PUSH)],
+            Some(hour),
+            &parent,
+        )
+        .unwrap();
+
+        let root = invocation.verify_chain().expect("the chain still verifies");
+        let rec = repo(&owner.did().to_string(), "a-repo-created-later");
+        assert!(
+            !ucan_grants_push(
+                &rec,
+                &VerifiedUcan {
+                    ucan: invocation,
+                    root
+                }
+            ),
+            "a wildcard proof must not authorize a repo it never named"
+        );
+    }
+
+    /// The shipping flow must keep working: a proof that names the repository
+    /// authorizes a push to it. Guards against fixing the wildcard by refusing
+    /// everything with a `prf`.
+    #[test]
+    fn a_concrete_proof_still_authorizes_the_repo_it_names() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+        let resource = format!("gitlawb://repos/{}/myrepo", owner.did());
+
+        let parent = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new(&resource, caps::GIT_PUSH)],
+            Some(hour),
+        )
+        .unwrap();
+        let invocation = Ucan::delegate(
+            &agent,
+            node.did(),
+            vec![Capability::new(&resource, caps::GIT_PUSH)],
+            Some(hour),
+            &parent,
+        )
+        .unwrap();
+
+        let root = invocation.verify_chain().expect("chain verifies");
+        let rec = repo(&owner.did().to_string(), "myrepo");
+        assert!(ucan_grants_push(
+            &rec,
+            &VerifiedUcan {
+                ucan: invocation,
+                root
+            }
+        ));
     }
 
     #[test]

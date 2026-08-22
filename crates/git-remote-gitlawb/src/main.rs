@@ -445,24 +445,23 @@ fn build_invocation(
             // would mint an invocation guaranteed to be refused — and a delegation
             // holding BOTH a constrained and an unconstrained grant would fail or
             // succeed purely on their order in `att`.
+            // No `c.with == "*"` arm any more. Narrowing a wildcard to the pushed
+            // repo is what let one delegation reach every repo the owner has or
+            // later creates; the node now refuses a chain whose proof does not name
+            // this repository, so minting from a wildcard could only produce a push
+            // that fails remotely with a less obvious message.
             c.constraints.is_none()
-                && (c.with == "*" || names_this_repo(&c.with))
+                && names_this_repo(&c.with)
                 && (c.can == caps::GIT_PUSH || c.can == "*" || c.can == caps::REPO_ADMIN)
         })
         .ok_or_else(|| {
             anyhow::anyhow!("stored delegation carries no git/push capability for {resource}")
         })?;
 
-    // Keep the parent's resource verbatim when it already names this repo. The node's
-    // `is_attenuated_by` compares `with` by exact equality, so re-emitting a bare form
-    // under a full-DID parent would fail attenuation and be refused. Only a `*` parent
-    // needs the URL-derived string, and that is the case narrowing exists for.
-    let narrowed_with = if source.with == "*" {
-        resource
-    } else {
-        source.with.clone()
-    };
-    let mut narrowed = Capability::new(narrowed_with, caps::GIT_PUSH);
+    // The parent's own resource, verbatim: the node compares `with` by equality via
+    // `is_attenuated_by`, and every capability reaching here already names this repo,
+    // so there is nothing left to narrow.
+    let mut narrowed = Capability::new(source.with.clone(), caps::GIT_PUSH);
     narrowed.constraints = source.constraints.clone();
 
     // Carry the delegation's own expiry onto the invocation. The node refuses a
@@ -2548,8 +2547,15 @@ mod delegated_push_tests {
         );
     }
 
+    /// A wildcard delegation is refused locally now, rather than narrowed.
+    ///
+    /// Narrowing `*` to the pushed repo is what let one delegation reach every
+    /// repository the owner had or later created: the node saw a concrete leaf and
+    /// the `*` proof behind it satisfied attenuation. The node now requires every
+    /// link to name the repository, so minting from a wildcard could only produce a
+    /// push refused remotely with a vaguer message. Failing here says why.
     #[test]
-    fn build_invocation_narrows_a_wildcard_to_the_pushed_repo() {
+    fn build_invocation_refuses_a_wildcard_delegation() {
         use gitlawb_core::ucan::{caps, Capability, Ucan};
 
         let owner = Keypair::generate();
@@ -2565,13 +2571,10 @@ mod delegated_push_tests {
         )
         .expect("issue");
 
-        let invocation =
-            build_invocation(&agent, &node.did(), &delegation, "z6MkOwner", "r").expect("wrap");
-        assert_eq!(
-            invocation.payload.att[0].with, "gitlawb://repos/z6MkOwner/r",
-            "a wildcard parent is the one case where the URL-derived resource is used"
+        assert!(
+            build_invocation(&agent, &node.did(), &delegation, "z6MkOwner", "r").is_err(),
+            "a bare wildcard cannot be narrowed into a usable invocation any more"
         );
-        assert!(invocation.payload.att[0].is_attenuated_by(&delegation.payload.att[0]));
     }
 
     /// A delegation holding both a constrained and an unconstrained grant must work

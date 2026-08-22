@@ -50,7 +50,15 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
 
     let pem_path = crate::identity::key_path_for(args.dir.as_deref())?;
     let keypair = if pem_path.exists() {
-        match load_keypair_from_dir(Some(&dir)) {
+        // `args.dir.as_deref()`, not `Some(&dir)`. Passing the DIRECTORY made the
+        // loader re-derive the basename as `identity.pem`, so with
+        // `GITLAWB_KEY=/data/keys/ci-agent.pem` the check above found `ci-agent.pem`
+        // while the load looked for a sibling that need not exist — and the Err arm
+        // below then regenerated ONTO `ci-agent.pem`, destroying a working key and
+        // changing the DID that repository ownership, registrations, and delegations
+        // are all tied to. Regeneration must follow a failure to read the file that
+        // was actually selected, never the absence of a conventional sibling.
+        match load_keypair_from_dir(args.dir.as_deref()) {
             Ok(kp) => {
                 let did = kp.did();
                 println!("  ✓  Identity already exists");
@@ -58,8 +66,9 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
                 println!();
                 kp
             }
-            Err(_) => {
-                println!("  Identity file exists but is unreadable. Regenerating...");
+            Err(e) => {
+                println!("  Identity at {} is unreadable: {e}", pem_path.display());
+                println!("  Regenerating — the previous key cannot be recovered.");
                 generate_identity(&dir, &pem_path)?
             }
         }
