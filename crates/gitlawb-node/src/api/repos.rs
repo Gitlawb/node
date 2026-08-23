@@ -3071,6 +3071,7 @@ pub async fn fork_repo(
         .args([
             "clone",
             "--mirror",
+            "--",
             source_path.to_str().unwrap_or(""),
             disk_path.to_str().unwrap_or(""),
         ])

@@ -701,6 +701,7 @@ async fn clone_repo(remote_url: &str, local_path: &Path, mode: MirrorMode) -> an
     if mode == MirrorMode::Promisor {
         args.push("--filter=blob:limit=10g");
     }
+    args.push("--");
     args.push(remote_url);
     args.push(local_str);
 
