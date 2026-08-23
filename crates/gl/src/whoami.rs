@@ -1,6 +1,6 @@
 //! `gl whoami` — print current identity and optional node registration info.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use clap::Args;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -78,8 +78,12 @@ pub(crate) async fn run_to_writer(args: WhoamiArgs, w: &mut impl std::io::Write)
                 );
             }
             Err(e) => {
-                let msg = sanitize_node_msg(&e.to_string());
-                return Err(e).context(format!("agent lookup failed: {msg}"));
+                let detail: String = e
+                    .chain()
+                    .map(|e| sanitize_node_msg(&e.to_string()))
+                    .collect::<Vec<_>>()
+                    .join(": ");
+                bail!("agent lookup failed: {detail}");
             }
         }
     }
@@ -349,6 +353,34 @@ mod tests {
             msg.contains("agent lookup failed"),
             "expected transport error, got: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_whoami_transport_sanitizes_control_chars_in_node_url() {
+        let dir = TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let pem = kp.to_pem().unwrap();
+        std::fs::write(dir.path().join("identity.pem"), pem.as_bytes()).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let node = format!("http://127.0.0.1:{port}/\u{1b}]0;PWNED\u{7} \u{202e}gnitirw");
+        let args = WhoamiArgs {
+            dir: Some(dir.path().to_path_buf()),
+            node: Some(node),
+            json: false,
+        };
+        let err = run(args).await.unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("agent lookup failed"),
+            "expected transport error, got: {msg}"
+        );
+        assert!(!msg.contains('\u{1b}'), "ESC leaked into output: {msg:?}");
+        assert!(!msg.contains('\u{7}'), "BEL leaked into output: {msg:?}");
+        assert!(!msg.contains('\u{202e}'), "RLO leaked into output: {msg:?}");
     }
 
     #[tokio::test]
