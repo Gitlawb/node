@@ -369,7 +369,7 @@ pub async fn list_repos(
         .collect();
     let mut response = Json(body).into_response();
     response.headers_mut().insert(
-        "X-Total-Count",
+        "x-total-count",
         HeaderValue::from_str(&total.to_string()).unwrap_or(HeaderValue::from_static("0")),
     );
     Ok(response)
