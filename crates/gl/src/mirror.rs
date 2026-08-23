@@ -81,7 +81,13 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
 
     println!("Cloning source (this may take a while for large repos)...");
     let clone_status = Command::new("git")
-        .args(["clone", "--mirror", "--", &source, mirror_path.to_str().unwrap()])
+        .args([
+            "clone",
+            "--mirror",
+            "--",
+            &source,
+            mirror_path.to_str().unwrap(),
+        ])
         .status()
         .context("failed to run git clone — is git installed?")?;
 
