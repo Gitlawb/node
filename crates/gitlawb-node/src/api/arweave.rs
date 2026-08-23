@@ -26,14 +26,61 @@ pub async fn list_anchors(
     Query(q): Query<ListAnchorsQuery>,
 ) -> Result<Json<serde_json::Value>> {
     let limit = q.limit.min(200);
+    // Bare `?` so connection-class sqlx failures downcast to `AppError::Db` and
+    // map to 503 `db_unavailable` (not 500 via `.map_err(AppError::Internal)`) (#251).
     let anchors = state
         .db
         .list_arweave_anchors(q.repo.as_deref(), limit)
-        .await
-        .map_err(crate::error::AppError::Internal)?;
+        .await?;
 
     Ok(Json(serde_json::json!({
         "anchors": anchors,
         "count": anchors.len(),
     })))
+}
+
+#[cfg(test)]
+mod closed_pool_tests {
+    use super::*;
+    use axum::http::{Request, StatusCode};
+    use axum::Router;
+    use serde_json::Value;
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+
+    /// #251: a closed pool on /api/v1/arweave/anchors must be 503 db_unavailable.
+    #[sqlx::test]
+    async fn list_anchors_closed_pool_returns_503_db_unavailable(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        pool.close().await;
+
+        let resp = Router::new()
+            .route("/api/v1/arweave/anchors", axum::routing::get(list_anchors))
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/arweave/anchors")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "closed-pool outage must be retryable 503, not 500"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "error": crate::error::DB_UNAVAILABLE_CODE,
+                "message": crate::error::DB_UNAVAILABLE_MESSAGE,
+            })
+        );
+    }
 }

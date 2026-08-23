@@ -177,7 +177,8 @@ GITLAWB_ENFORCE_OWNER_PUSH=true
 | Missed heartbeats | After 3 days without one, you're excluded from rewards until you beat again |
 | Operator key | Dedicated wallet, small ETH balance, not your main treasury |
 | Monitoring | Watch `lastHeartbeat` on-chain; alert if > 22h since last beat |
-| Public URL | Must resolve and serve `/health` — peers will ping it |
+| Public URL | Must resolve and serve `/health` for liveness and DB-aware `/ready` for peer readiness |
+| Rolling upgrade (advisory-lock algorithm) | The SHA-256 advisory-lock key swap (replacing `DefaultHasher`) re-keys every repo in the first release that carries it. During a shared-Postgres rolling upgrade, old nodes compute a different `i64` key than new nodes for the same repo, so PostgreSQL treats them as independent locks and cross-machine write-exclusion is lost. **Drain in-flight writes** or cut over through a **single node** before bringing new-binary nodes online. |
 
 ---
 

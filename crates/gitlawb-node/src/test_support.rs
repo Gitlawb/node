@@ -82,6 +82,26 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
         peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         shutdown_tx: tokio::sync::watch::channel(false).0,
+        // Generous — no test drives the handler-level shed (git_permit is unit-tested).
+        git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        git_push_advert_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        git_encrypt_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        pin_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        encrypt_inflight: crate::state::EncryptInflight::new(),
+        repo_write_leases: crate::state::RepoWriteLeases::new(8),
+        git_read_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(16),
+        git_push_advert_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(
+            8,
+        ),
+        git_write_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(8),
+        // Generous — a test that drives the /ipfs walk shed overrides these directly.
+        git_ipfs_walk_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        git_ipfs_walk_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(
+            16,
+        ),
+        ipfs_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+        git_bin: "git".to_string(),
     }
 }
 
@@ -107,6 +127,25 @@ pub(crate) fn signed_request_as(did: &str, method: Method, uri: &str, body: Body
         .extension(AuthenticatedDid(did.to_string()))
         .body(body)
         .expect("request builder")
+}
+
+/// A local endpoint whose TCP accept succeeds instantly but that never writes an
+/// HTTP response, so any request against it stalls deterministically until the
+/// caller's own timeout. (A non-routable address hangs only if the network
+/// blackholes the SYN — a fast RST would end the stall early and make a timeout
+/// test pass for the wrong reason.) The accepted sockets are parked in the
+/// spawned task, which dies with the test's runtime, so the peer never sees a
+/// close mid-test.
+pub(crate) async fn silent_http_endpoint() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            held.push(sock);
+        }
+    });
+    endpoint
 }
 
 #[cfg(test)]
@@ -184,6 +223,207 @@ mod tests {
             resp.status().is_success(),
             "owner should be allowed to set visibility, got {}",
             resp.status()
+        );
+    }
+
+    /// PR3 (#62): the served-git concurrency cap sheds at the HTTP layer before the
+    /// DB. The held `git_permit` acquire now sits after the per-source cap, so the
+    /// cheap early shed is carried by an explicit `available_permits() == 0` check at
+    /// the top of the handler (the held permit remains the authoritative bound further
+    /// down). That check is a permit-less snapshot: it spares a request's DB work once
+    /// the pool is ALREADY saturated, which is the case this test drives, and it does
+    /// not bound the DB window in general. DB-free here because an exhausted semaphore
+    /// sheds before any DB/disk access, so a lazy state works. Remove the early-shed block
+    /// from git_info_refs and this goes red (the request falls through to the DB and
+    /// returns something other than 503).
+    #[tokio::test]
+    async fn git_info_refs_sheds_with_503_when_semaphore_exhausted() {
+        let mut state = test_state_lazy();
+        state.git_read_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let router = Router::new()
+            .route(
+                "/{owner}/{repo}/info/refs",
+                axum::routing::get(crate::api::repos::git_info_refs),
+            )
+            .with_state(state);
+        let resp = router
+            .oneshot(anon_get(
+                "/alice/repo.git/info/refs?service=git-upload-pack",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an exhausted git semaphore must shed info/refs with 503 before touching the DB"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()),
+            Some("1"),
+            "the 503 shed must carry Retry-After"
+        );
+    }
+
+    /// PR3 (#62) sibling of the info/refs shed test: git-upload-pack carries the same
+    /// explicit `available_permits() == 0` early check at the top, so an ALREADY
+    /// exhausted semaphore must shed the request with a 503 before its DB/disk work.
+    /// That is the case the permit-less snapshot does deliver; it is not an admission
+    /// bound on the DB window. Anonymous-reachable, so no auth injection is needed.
+    /// Remove the early-shed block from git_upload_pack and this goes red.
+    #[tokio::test]
+    async fn git_upload_pack_sheds_with_503_when_semaphore_exhausted() {
+        let mut state = test_state_lazy();
+        state.git_read_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let router = Router::new()
+            .route(
+                "/{owner}/{repo}/git-upload-pack",
+                axum::routing::post(crate::api::repos::git_upload_pack),
+            )
+            .with_state(state);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/alice/repo.git/git-upload-pack")
+            .body(Body::from(&b"0000"[..]))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an exhausted git semaphore must shed git-upload-pack with 503 before touching the DB"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()),
+            Some("1"),
+            "the 503 shed must carry Retry-After"
+        );
+    }
+
+    /// PR3 (#62) receive-pack sibling of the info/refs shed test: the early shed
+    /// selects the dedicated ADVERT pool for a git-receive-pack advertisement (#174),
+    /// so an ALREADY exhausted advert pool sheds the advert with 503 before its DB/disk
+    /// work (the case the permit-less snapshot delivers, not an admission bound on the
+    /// DB window), while the write pool (reserved for authenticated POSTs) is left
+    /// free here.
+    /// Flip the pool selection back to the write pool, or remove the early-shed
+    /// block, and this goes red.
+    #[tokio::test]
+    async fn git_info_refs_receive_pack_sheds_with_503_when_advert_pool_exhausted() {
+        let mut state = test_state_lazy();
+        state.git_push_advert_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let router = Router::new()
+            .route(
+                "/{owner}/{repo}/info/refs",
+                axum::routing::get(crate::api::repos::git_info_refs),
+            )
+            .with_state(state);
+        let resp = router
+            .oneshot(anon_get(
+                "/alice/repo.git/info/refs?service=git-receive-pack",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an exhausted ADVERT pool must shed the receive-pack advertisement with 503 before touching the DB"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()),
+            Some("1"),
+            "the 503 shed must carry Retry-After"
+        );
+    }
+
+    /// PR3 (#62) sibling for the push path: git-receive-pack requires an
+    /// AuthenticatedDid extension (production: require_signature injects it), so the
+    /// request carries one via signed_request_as — without it the Extension
+    /// extractor 500s before the handler body reaches the shed. What sits at the top of
+    /// the handler is a permit-less `available_permits() == 0` peek, NOT the permit
+    /// itself: the authoritative held acquire is taken after the per-repo lease, so a
+    /// lease-blocked waiter pins no write slot. An ALREADY exhausted pool is the case
+    /// the peek delivers, so the request sheds 503 before its DB work here. Remove the
+    /// early-shed block from git_receive_pack and this goes red.
+    #[tokio::test]
+    async fn git_receive_pack_sheds_with_503_when_semaphore_exhausted() {
+        let mut state = test_state_lazy();
+        state.git_write_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let router = Router::new()
+            .route(
+                "/{owner}/{repo}/git-receive-pack",
+                axum::routing::post(crate::api::repos::git_receive_pack),
+            )
+            .with_state(state);
+        let owner = "did:key:zRECVSHEDOWNERAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let resp = router
+            .oneshot(signed_request_as(
+                owner,
+                Method::POST,
+                "/alice/repo.git/git-receive-pack",
+                Body::from(&b"0000"[..]),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an exhausted write pool must shed git-receive-pack with 503 before touching the DB"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()),
+            Some("1"),
+            "the 503 shed must carry Retry-After"
+        );
+    }
+
+    /// #174 (SC1, load-bearing): a saturated READ pool must NOT shed an
+    /// authenticated push — the write pool is a separate budget. Read pool at zero,
+    /// write pool with capacity: the push proceeds PAST admission (it then errors on
+    /// the placeholder DB, but crucially it is not a 503). Route git-receive-pack
+    /// back to the read pool and this goes red — that is the isolation proof.
+    #[tokio::test]
+    async fn git_receive_pack_not_shed_by_exhausted_read_pool() {
+        let mut state = test_state_lazy();
+        // Read pool exhausted as if a flood of anonymous clones held every slot.
+        state.git_read_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        // Write pool keeps its default capacity from test_state_lazy.
+
+        let router = Router::new()
+            .route(
+                "/{owner}/{repo}/git-receive-pack",
+                axum::routing::post(crate::api::repos::git_receive_pack),
+            )
+            .with_state(state);
+        let owner = "did:key:zRECVCROSSBOUNDARYAAAAAAAAAAAAAAAAAAAAA";
+        let resp = router
+            .oneshot(signed_request_as(
+                owner,
+                Method::POST,
+                "/alice/repo.git/git-receive-pack",
+                Body::from(&b"0000"[..]),
+            ))
+            .await
+            .unwrap();
+
+        assert_ne!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an exhausted READ pool must not shed a push — the write pool is a separate budget (#174)"
         );
     }
 
@@ -3285,7 +3525,10 @@ mod tests {
     /// the handler skips the whole repo rather than serving. Asserts no leak of the
     /// withheld blob AND that even the *public* blob in that repo is withheld — the
     /// latter distinguishes fail-closed-skip from normal per-blob withholding and
-    /// would serve 200 if the error arm wrongly proceeded.
+    /// would serve 200 if the error arm wrongly proceeded. The skip carries no
+    /// VERDICT (F2), so the response is the retryable truncation 503, not a 404
+    /// claiming the object is absent — never-serve-unproven and never-404-unproven
+    /// hold together.
     #[sqlx::test]
     async fn ipfs_cid_walk_error_fails_closed(pool: PgPool) {
         use crate::db::VisibilityMode;
@@ -3330,7 +3573,8 @@ mod tests {
             .await
             .expect("deny rule");
 
-        // Withheld secret CID under a walk error → 404, no leak.
+        // Withheld secret CID under a walk error → the repo is skipped without a
+        // verdict, so the scan is truncated (503), and nothing leaks.
         let (st, body) = cid_parts(
             cid_router(&state)
                 .oneshot(cid_anon(&secret_cid))
@@ -3340,17 +3584,17 @@ mod tests {
         .await;
         assert_eq!(
             st,
-            StatusCode::NOT_FOUND,
-            "walk error must not serve the withheld blob"
+            StatusCode::SERVICE_UNAVAILABLE,
+            "walk error must not serve the withheld blob — the unproven skip sheds 503"
         );
         assert!(
             !body.contains("TOP SECRET"),
-            "walk-error 404 must not leak the secret"
+            "walk-error 503 must not leak the secret"
         );
 
-        // The PUBLIC blob in the same repo is also 404: the walk error fails closed
-        // by skipping the whole repo, not by serving. Without the fail-closed arm
-        // this would serve 200, so this assertion is the load-bearing discriminator.
+        // The PUBLIC blob in the same repo is also not served: the walk error fails
+        // closed by skipping the whole repo. Without the fail-closed arm this would
+        // serve 200, so this assertion is the load-bearing discriminator.
         let (st, _) = cid_parts(
             cid_router(&state)
                 .oneshot(cid_anon(&public_cid))
@@ -3360,8 +3604,9 @@ mod tests {
         .await;
         assert_eq!(
             st,
-            StatusCode::NOT_FOUND,
-            "walk error fails closed: repo skipped, even the public blob is not served"
+            StatusCode::SERVICE_UNAVAILABLE,
+            "walk error fails closed: repo skipped without a verdict, even the public \
+             blob is not served and the scan sheds 503"
         );
     }
 

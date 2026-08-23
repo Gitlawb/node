@@ -5,9 +5,8 @@ use clap::Args;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{read_body_capped, sanitize_node_msg, NodeClient};
 use crate::identity::load_keypair_from_dir;
-use crate::sync::{read_body_capped, sanitize_node_msg};
 
 #[derive(Args)]
 pub struct WhoamiArgs {

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{read_body_capped, sanitize_node_msg, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
@@ -102,39 +102,6 @@ fn trigger_counts(resp: &serde_json::Value) -> (u64, u64) {
         resp["peers_reached"].as_u64().unwrap_or(0),
         resp["repos_enqueued"].as_u64().unwrap_or(0),
     )
-}
-
-/// Read at most `cap` bytes of a response body. Bounds the allocation from a
-/// hostile or broken node returning a huge error body — the display is capped
-/// separately, but the read itself must not be unbounded (INV-6, read half).
-pub(crate) async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> String {
-    let mut buf: Vec<u8> = Vec::new();
-    while buf.len() < cap {
-        match resp.chunk().await {
-            Ok(Some(chunk)) => {
-                let take = (cap - buf.len()).min(chunk.len());
-                buf.extend_from_slice(&chunk[..take]);
-                if take < chunk.len() {
-                    break; // hit the cap mid-chunk
-                }
-            }
-            _ => break, // end of body or read error — return what we have
-        }
-    }
-    String::from_utf8_lossy(&buf).into_owned()
-}
-
-/// Strip terminal-dangerous characters from (and cap the length of) a
-/// node-supplied error string before surfacing it. The node a caller talks to
-/// could be hostile and embed escape sequences in its error body; those must not
-/// reach the terminal verbatim (INV-6). We drop the C0/C1 control bytes (which
-/// defangs ANSI/OSC escapes) AND the Unicode bidi/format controls (which
-/// `char::is_control` does not cover — they can reorder the displayed line).
-pub(crate) fn sanitize_node_msg(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control() && !gitlawb_core::sanitize::is_bidi_format(*c))
-        .take(200)
-        .collect()
 }
 
 #[cfg(test)]
@@ -258,37 +225,6 @@ mod tests {
             .await;
         let (args, _dir) = trigger_args(server.url());
         run(args).await.unwrap();
-    }
-
-    #[test]
-    fn sanitize_strips_controls_bidi_and_caps_length() {
-        // C0 (ESC/BEL) and the Cf bidi override (U+202E) are both removed; the
-        // printable text survives. (Note: a stripped ESC leaves any following
-        // "[31m" as inert literal text — that is the point, so the input here
-        // avoids that residue to keep the expectation unambiguous.)
-        let out = sanitize_node_msg("a\u{1b}\u{07}b\u{202e}c");
-        assert!(
-            !out.chars().any(|c| c.is_control()),
-            "control char leaked: {out:?}"
-        );
-        assert!(
-            !out.contains('\u{202e}'),
-            "RLO bidi override leaked: {out:?}"
-        );
-        assert_eq!(out, "abc");
-        // Length is capped at 200 chars regardless of input size.
-        let long = "x".repeat(250);
-        assert_eq!(sanitize_node_msg(&long).chars().count(), 200);
-    }
-
-    #[test]
-    fn sanitize_preserves_legitimate_and_rtl_text() {
-        // Must not over-strip: a plain word, a genuine RTL SCRIPT letter (Arabic
-        // U+0627, category Lo — NOT a format char), and ZWJ (U+200D, a legitimate
-        // Cf char, e.g. emoji sequences) all survive. Guards the shared predicate
-        // against being widened into a blanket Cf stripper.
-        let out = sanitize_node_msg("ok \u{0627}\u{200D}b");
-        assert_eq!(out, "ok \u{0627}\u{200D}b");
     }
 
     #[tokio::test]
