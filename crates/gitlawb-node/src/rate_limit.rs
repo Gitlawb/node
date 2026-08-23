@@ -410,6 +410,10 @@ pub fn too_many_requests() -> Response {
 /// resolvers debit it instead, which also prices an aliased query honestly — ten
 /// aliased `tasks` fields run the visibility gate ten times and pay ten slots,
 /// where one request-scoped debit would pay one (#327 review).
+/// Default cap on the number of task read fields (across all aliases) permitted
+/// in a single GraphQL request before rejecting further field executions (#327 review).
+pub const MAX_GRAPHQL_TASK_READS_PER_REQUEST: usize = 5;
+
 #[derive(Clone)]
 pub struct TaskReadBrake {
     pub limiter: RateLimiter,
@@ -417,6 +421,7 @@ pub struct TaskReadBrake {
     /// `ConnectInfo`, e.g. a synthetic test request). Never braked, matching
     /// [`rate_limit_by_ip`].
     pub key: Option<String>,
+    pub request_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl TaskReadBrake {
@@ -425,6 +430,18 @@ impl TaskReadBrake {
         let Some(key) = self.key.as_deref() else {
             return true;
         };
+        let count = self
+            .request_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count >= MAX_GRAPHQL_TASK_READS_PER_REQUEST {
+            tracing::warn!(
+                key = %key,
+                field = %field,
+                count = count + 1,
+                "per-request GraphQL task field limit exceeded"
+            );
+            return false;
+        }
         if self.limiter.check(key).await {
             return true;
         }
