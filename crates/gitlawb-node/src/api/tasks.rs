@@ -243,12 +243,15 @@ pub(crate) async fn collect_visible_tasks(
             next_position: None,
         });
     }
-    let mut visible = Vec::with_capacity(bounded_limit);
+    // Probe for bounded_limit + 1 visible tasks to prove has_more from visible rows only (#327 review).
+    let target_visible = bounded_limit + 1;
+    let mut visible = Vec::with_capacity(target_visible);
     let mut examined: Option<TaskPosition> = resume.cloned();
+    let mut resume_position_for_page: Option<TaskPosition> = None;
     let mut scanned: i64 = 0;
     let mut stream_ended = false;
 
-    while scanned < MAX_TASK_SCAN_CANDIDATES && visible.len() < bounded_limit {
+    while scanned < MAX_TASK_SCAN_CANDIDATES && visible.len() < target_visible {
         let batch_limit = MAX_VISIBLE_TASKS.min(MAX_TASK_SCAN_CANDIDATES - scanned);
         let batch = db
             .list_tasks_keyset(
@@ -286,40 +289,36 @@ pub(crate) async fn collect_visible_tasks(
             // request neither repeats nor skips its successors.
             scanned += 1;
             consumed += 1;
-            examined = Some(TaskPosition::new(task.created_at.clone(), task.id.clone()));
+            let current_pos = TaskPosition::new(task.created_at.clone(), task.id.clone());
+            examined = Some(current_pos.clone());
             if task_visible(task, caller, &repos_by_id, &rules_by_repo) {
                 visible.push(task.clone());
                 if visible.len() == bounded_limit {
+                    resume_position_for_page = Some(current_pos);
+                } else if visible.len() == target_visible {
                     break;
                 }
             }
         }
 
         // A short batch only ends the stream once every row in it has been
-        // examined. Filling the page mid-batch leaves rows behind that the
-        // next request must still see, so the position advances and `has_more`
-        // is settled by the probe below rather than assumed false.
+        // examined.
         if consumed == batch.len() && batch_len < batch_limit {
             stream_ended = true;
             break;
         }
     }
 
-    // A full final batch is ambiguous: more rows may exist, or the stream may
-    // have ended on an exact multiple of the batch size. One probe row past
-    // the last examined candidate settles it, so `has_more` never advertises a
-    // page that turns out to be empty.
-    let has_more = if stream_ended {
-        false
+    // Derive has_more from visible rows or scan-budget exhaustion, never from
+    // an un-gated candidate probe that would leak the existence of trailing
+    // denied rows (#327 review).
+    let (has_more, next_position) = if visible.len() > bounded_limit {
+        visible.truncate(bounded_limit);
+        (true, resume_position_for_page)
+    } else if stream_ended {
+        (false, None)
     } else {
-        !db.list_tasks_keyset(
-            status,
-            assignee_did,
-            1,
-            examined.as_ref().map(TaskPosition::as_pair),
-        )
-        .await?
-        .is_empty()
+        (true, examined)
     };
 
     let incomplete = has_more && visible.len() < bounded_limit;
@@ -328,7 +327,7 @@ pub(crate) async fn collect_visible_tasks(
         tasks: visible,
         has_more,
         incomplete,
-        next_position: if has_more { examined } else { None },
+        next_position,
     })
 }
 
@@ -1367,6 +1366,115 @@ mod visible_tasks_tests {
         assert!(
             !braked(&body),
             "a different IP must not be braked by another IP's exhausted bucket"
+        );
+    }
+
+    /// #327 review: aliased GraphQL task queries execute within a single request,
+    /// so a request-scoped cap prevents an anonymous prober from exhausting the
+    /// rate limit or running excessive visibility scans in one POST.
+    #[sqlx::test]
+    async fn graphql_aliased_task_queries_are_capped_per_request(pool: PgPool) {
+        use std::net::SocketAddr;
+
+        let mut state = test_state(pool).await;
+        // Large per-IP budget so per-request cap is what triggers first.
+        state.task_read_rate_limiter =
+            crate::rate_limit::RateLimiter::new(100, std::time::Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .create_task(&task("t1", None, DELEGATOR))
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let peer: SocketAddr = "198.51.100.9:5000".parse().unwrap();
+        let query = |peer: SocketAddr, q: &str| {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri("/graphql")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({ "query": q }).to_string()))
+                .unwrap();
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(peer));
+            req
+        };
+
+        let aliased_query = "{ \
+            a1: tasks { items { id } } \
+            a2: tasks { items { id } } \
+            a3: tasks { items { id } } \
+            a4: tasks { items { id } } \
+            a5: tasks { items { id } } \
+            a6: tasks { items { id } } \
+        }";
+        let resp = router.oneshot(query(peer, aliased_query)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+        assert!(
+            body["errors"].as_array().is_some_and(|errs| {
+                errs.iter()
+                    .any(|e| e["message"].as_str() == Some(crate::rate_limit::RATE_LIMIT_MESSAGE))
+            }),
+            "excess aliased fields beyond per-request limit must be rejected, got {body}"
+        );
+    }
+
+    /// #327 review: trailing denied tasks must not advertise `has_more = true`
+    /// or leak the existence of private rows through pagination metadata.
+    #[sqlx::test]
+    async fn trailing_denied_tasks_do_not_set_has_more_or_leak_existence(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("public-repo", DELEGATOR, "public", true))
+            .await
+            .unwrap();
+        state
+            .db
+            .create_repo(&repo("private-repo", DELEGATOR, "private", false))
+            .await
+            .unwrap();
+
+        // 2 public tasks, followed by 3 private tasks
+        for (id, repo_id, ts) in [
+            ("pub-2", "public-repo", "2026-01-05T00:00:00Z"),
+            ("pub-1", "public-repo", "2026-01-04T00:00:00Z"),
+            ("priv-3", "private-repo", "2026-01-03T00:00:00Z"),
+            ("priv-2", "private-repo", "2026-01-02T00:00:00Z"),
+            ("priv-1", "private-repo", "2026-01-01T00:00:00Z"),
+        ] {
+            let mut t = task(id, Some(repo_id), DELEGATOR);
+            t.created_at = ts.to_string();
+            t.updated_at = ts.to_string();
+            state.db.create_task(&t).await.unwrap();
+        }
+
+        let resp = list_router(state)
+            .oneshot(anon_get("/api/v1/tasks?limit=2"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let tasks = body["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0]["id"], "pub-2");
+        assert_eq!(tasks[1]["id"], "pub-1");
+        assert_eq!(
+            body["has_more"], false,
+            "has_more must be false when only denied tasks trail the page, got {body}"
+        );
+        assert_eq!(
+            body["incomplete"], false,
+            "incomplete must be false when all visible tasks have been delivered, got {body}"
+        );
+        assert!(
+            body["next_cursor"].is_null(),
+            "next_cursor must be null when no more visible tasks exist, got {body}"
         );
     }
 

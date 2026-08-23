@@ -44,6 +44,7 @@ async fn graphql_handler(
     inner = inner.data(rate_limit::TaskReadBrake {
         limiter: state.task_read_rate_limiter.clone(),
         key: rate_limit::client_key(&headers, peer, state.push_limiter_trust),
+        request_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
     state.graphql_schema.execute(inner).await.into()
 }
