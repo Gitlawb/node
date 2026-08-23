@@ -263,10 +263,11 @@ async fn cmd_show(
 /// gitlawb-node/src/cert.rs::issue_ref_certificate exactly) and verify the
 /// certificate's Ed25519 signature against the key embedded in `node_did`.
 ///
-/// Certificates after this PR use a 13-field payload.  Pre-PR certificates
-/// were signed over 7 fields (repo_id, ref, old, new, pusher, node, ts) with
-/// NULL proof columns.  Try 13-field first; if it fails and all proof fields
-/// are None, retry with the 7-field payload.
+/// Version 2 certificates include an explicit `version` field (14 fields).
+/// Post-PR but pre-version-2 certificates used a 13-field payload (no version).
+/// Pre-PR certificates used a 7-field payload (repo_id, ref, old, new, pusher,
+/// node, ts) with NULL proof columns.  Try each in order; the version field is
+/// the authoritative discriminator — nullable-field inference is not.
 #[allow(clippy::too_many_arguments)]
 fn verify_signature(
     repo_id: &str,
@@ -305,7 +306,34 @@ fn verify_signature(
         .try_into()
         .map_err(|_| "signature is not 64 bytes".to_string())?;
 
-    // Try 13-field payload first.
+    // Try 14-field payload first (version 2 — includes `version` field).
+    let payload_14 = serde_json::json!({
+        "repo_id": repo_id,
+        "ref":     ref_name,
+        "old":     old_sha,
+        "new":     new_sha,
+        "pusher":  pusher,
+        "node":    node_did,
+        "ts":      issued_at,
+        "version": 2_u64,
+        "seq":     seq,
+        "prev":    prev,
+        "pusher_sig": pusher_sig,
+        "signature_input": signature_input,
+        "content_digest": content_digest,
+        "request_path": request_path,
+    });
+    let payload_bytes_14 =
+        serde_json::to_vec(&payload_14).map_err(|e| format!("could not serialize payload: {e}"))?;
+
+    let sig_valid_14 =
+        gitlawb_core::identity::verify(&verifying_key, &payload_bytes_14, &sig_bytes);
+
+    if sig_valid_14.is_ok() {
+        return Ok(());
+    }
+
+    // Fall back to 13-field payload (post-PR, pre-version-2).
     let payload_13 = serde_json::json!({
         "repo_id": repo_id,
         "ref":     ref_name,
@@ -327,7 +355,11 @@ fn verify_signature(
     let sig_valid_13 =
         gitlawb_core::identity::verify(&verifying_key, &payload_bytes_13, &sig_bytes);
 
-    if proof_fields_null && sig_valid_13.is_err() {
+    if sig_valid_13.is_ok() {
+        return Ok(());
+    }
+
+    if proof_fields_null {
         // Fall back to 7-field payload for pre-PR certificates.
         let payload_7 = serde_json::json!({
             "repo_id": repo_id,
@@ -344,7 +376,10 @@ fn verify_signature(
             "Ed25519 signature does not match the signed payload (7-field)".to_string()
         })
     } else {
-        sig_valid_13.map_err(|_| "Ed25519 signature does not match the signed payload".to_string())
+        Err(
+            "Ed25519 signature does not match any recognized payload version (14/13/7-field)"
+                .to_string(),
+        )
     }
 }
 
@@ -397,6 +432,7 @@ mod tests {
             "pusher":  "did:key:z6MkPusher",
             "node":    "did:key:z6MkNode",
             "ts":      "2026-07-22T00:00:00+00:00",
+            "version": 2,
             "seq":     1,
             "prev":   "0000000000000000000000000000000000000000000000000000000000000000",
             "pusher_sig": serde_json::Value::Null,
@@ -409,7 +445,7 @@ mod tests {
             r#""prev":"0000000000000000000000000000000000000000000000000000000000000000","#,
             r#""pusher":"did:key:z6MkPusher","pusher_sig":null,"ref":"refs/heads/main","#,
             r#""repo_id":"repo-1","request_path":null,"seq":1,"signature_input":null,"#,
-            r#""ts":"2026-07-22T00:00:00+00:00"}"#,
+            r#""ts":"2026-07-22T00:00:00+00:00","version":2}"#,
         );
         assert_eq!(serde_json::to_string(&payload).unwrap(), frozen);
     }
@@ -601,6 +637,102 @@ mod tests {
         assert!(
             tampered.is_err(),
             "tampered 7-field payload must not verify"
+        );
+    }
+
+    /// Version 2 (14-field) certificate: the `version` field is part of the
+    /// signed bytes.  Verification must succeed on the first try.
+    #[test]
+    fn verify_signature_version2_14_field() {
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did().as_str().to_string();
+        let prev = "0000000000000000000000000000000000000000000000000000000000000000";
+
+        let payload = serde_json::json!({
+            "repo_id": "repo-1",
+            "ref":     "refs/heads/main",
+            "old":     "0".repeat(40),
+            "new":     "a".repeat(40),
+            "pusher":  "did:key:z6MkPusher",
+            "node":    node_did,
+            "ts":      "2026-07-22T00:00:00+00:00",
+            "version": 2,
+            "seq":     1,
+            "prev":    prev,
+            "pusher_sig": "sig-123",
+            "signature_input": "sig-input-123",
+            "content_digest": "sha256-123",
+            "request_path": "/repo.git/git-receive-pack",
+        });
+        let sig = kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
+
+        let ok = verify_signature(
+            "repo-1",
+            "refs/heads/main",
+            &"0".repeat(40),
+            &"a".repeat(40),
+            "did:key:z6MkPusher",
+            &node_did,
+            "2026-07-22T00:00:00+00:00",
+            1,
+            prev,
+            Some("sig-123"),
+            Some("sig-input-123"),
+            Some("sha256-123"),
+            Some("/repo.git/git-receive-pack"),
+            &sig,
+        );
+        assert!(
+            ok.is_ok(),
+            "version-2 (14-field) certificate must verify, got: {ok:?}"
+        );
+    }
+
+    /// A 13-field certificate (no `version` field) signed before the version
+    /// bump must still verify via the13-field fallback path.
+    #[test]
+    fn verify_signature_legacy_13_field_fallback() {
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did().as_str().to_string();
+        let prev = "0000000000000000000000000000000000000000000000000000000000000000";
+
+        // 13-field payload: no `version` key.
+        let payload = serde_json::json!({
+            "repo_id": "repo-1",
+            "ref":     "refs/heads/main",
+            "old":     "0".repeat(40),
+            "new":     "a".repeat(40),
+            "pusher":  "did:key:z6MkPusher",
+            "node":    node_did,
+            "ts":      "2026-07-22T00:00:00+00:00",
+            "seq":     1,
+            "prev":    prev,
+            "pusher_sig": "sig-123",
+            "signature_input": "sig-input-123",
+            "content_digest": "sha256-123",
+            "request_path": "/repo.git/git-receive-pack",
+        });
+        let sig = kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
+
+        let ok = verify_signature(
+            "repo-1",
+            "refs/heads/main",
+            &"0".repeat(40),
+            &"a".repeat(40),
+            "did:key:z6MkPusher",
+            &node_did,
+            "2026-07-22T00:00:00+00:00",
+            1,
+            prev,
+            Some("sig-123"),
+            Some("sig-input-123"),
+            Some("sha256-123"),
+            Some("/repo.git/git-receive-pack"),
+            &sig,
+        );
+        assert!(
+            ok.is_ok(),
+            "legacy 13-field certificate must verify via fallback, got: {ok:?}"
         );
     }
 }

@@ -143,12 +143,20 @@ pub(crate) fn build_ref_anchor_item(
 /// The caller supplies the already-signed item so it can persist the item's
 /// deterministic id ([`crate::ans104::data_item_id`]) BEFORE the request is
 /// sent — that is the durable request identity a crash-recovery probes.
+///
+/// `expected_id` binds the provider acknowledgement to the exact request
+/// identity: a success response whose `id` differs from the id the node
+/// derived locally (a misrouted, faulty, or compromised bundler substituting
+/// a different well-formed item) is classified `Uncertain`, never `Accepted`.
+/// The recorded identity must be the item the node signed and would re-upload
+/// and recover by identity (R2 #224 review).
 pub async fn upload_ref_anchor_item(
     client: &reqwest::Client,
     bundler_url: &str,
     bundler_account: &str,
     bundler_token: &str,
     item: &[u8],
+    expected_id: &str,
 ) -> Result<UploadOutcome> {
     // Irys upload target: {bundler_url}/tx/{token}. Built structurally so a
     // query on the base URL is preserved and a fragment is rejected outright.
@@ -212,6 +220,23 @@ pub async fn upload_ref_anchor_item(
             });
         }
     };
+    // Bind the provider acknowledgement to the exact request identity. A
+    // well-formed id that is NOT the id the node signed and persisted means
+    // the bundler returned a different item than the one sent (misrouted,
+    // faulty, or compromised): accepting it would record an anchor whose
+    // signature/identity the node cannot reproduce, verify, or recover.
+    // Classify as Uncertain (nonterminal) so recovery probes the item the node
+    // actually sent and re-uploads it if absent, rather than recording a
+    // foreign id as the durable anchor (R2 #224 review).
+    if tx_id != expected_id {
+        return Ok(UploadOutcome::Uncertain {
+            message: format!(
+                "Bundler reported success for a transaction id that does not match the \
+                 item sent: expected {expected_id}, got {tx_id} — treating as unknown \
+                 outcome so the durable identity of the anchor is not replaced"
+            ),
+        });
+    }
     Ok(UploadOutcome::Accepted { tx_id })
 }
 
@@ -240,7 +265,16 @@ pub async fn anchor_ref_update(
         return Ok(String::new());
     }
     let item = build_ref_anchor_item(anchor, node_keypair)?;
-    match upload_ref_anchor_item(client, bundler_url, bundler_account, bundler_token, &item).await?
+    let expected_id = crate::ans104::data_item_id(&item);
+    match upload_ref_anchor_item(
+        client,
+        bundler_url,
+        bundler_account,
+        bundler_token,
+        &item,
+        &expected_id,
+    )
+    .await?
     {
         UploadOutcome::Accepted { tx_id } => {
             tracing::info!(
@@ -454,7 +488,30 @@ pub(crate) async fn anchor_item_present(
             remote_send_error("Arweave gateway probe failed", &e, &url, &display_url)
         })?;
     if resp.status().is_success() {
-        return Ok(true);
+        // A 2xx means the gateway found *something*, but it might be an error
+        // page or a different item. Verify the returned item's id matches what
+        // we asked for — a misconfigured gateway/proxy returning 200 for any
+        // id would cause us to record a phantom anchor. Fail closed by treating
+        // a non-matching 2xx as "cannot determine" rather than "present".
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read gateway probe response: {e}"))?;
+        // The response is an ANS-104 data item. Verify its id by deriving it
+        // from the signature region (bytes 2..66) per ANS-104 spec.
+        let body_id = crate::ans104::data_item_id(&body);
+        if body_id == item_id {
+            return Ok(true);
+        }
+        // 2xx but id mismatch: the gateway resolved a DIFFERENT item (or an
+        // error page). We cannot conclude the requested item landed, and the
+        // caller must fail closed rather than record a phantom anchor — the
+        // durable recovery path re-probes / fails the job instead.
+        return Err(anyhow::anyhow!(
+            "gateway probe returned 2xx but item id mismatch: expected {}, got {}",
+            item_id,
+            body_id
+        ));
     }
     match resp.status() {
         reqwest::StatusCode::NOT_FOUND
@@ -766,11 +823,12 @@ pub async fn verify_anchor(
             }
         }
         // 1. Verify node signature on the certificate payload.
-        //    Certificates produced after this PR use a 13-field payload
-        //    that includes seq, prev, and proof fields.  Pre-PR certificates
-        //    used a 7-field payload (repo_id, ref, old, new, pusher, node, ts)
-        //    with NULL proof fields.  Try the 13-field check first; if it
-        //    fails and all proof fields are NULL, fall back to 7-field.
+        //    Version 2 certificates use a 14-field payload that includes an
+        //    explicit `version` field.  Post-PR but pre-version-2 certificates
+        //    use a 13-field payload (no version).  Pre-PR certificates used a
+        //    7-field payload (repo_id, ref, old, new, pusher, node, ts) with
+        //    NULL proof fields.  Try each in order; the version field is the
+        //    authoritative discriminator — nullable-field inference is not.
         let proof_fields_null = c.pusher_sig.is_none()
             && c.signature_input.is_none()
             && c.content_digest.is_none()
@@ -824,8 +882,8 @@ pub async fn verify_anchor(
                     });
                 }
             };
-        // Try 13-field payload first.
-        let payload_13 = serde_json::json!({
+        // Try 14-field payload first (version 2 — includes `version` field).
+        let payload_14 = serde_json::json!({
             "repo_id":    c.repo_id,
             "ref":        c.ref_name,
             "old":        c.old_sha,
@@ -833,6 +891,7 @@ pub async fn verify_anchor(
             "pusher":     c.pusher_did,
             "node":       c.node_did,
             "ts":         c.issued_at,
+            "version":    crate::cert::CERT_PAYLOAD_VERSION,
             "seq":              c.seq,
             "prev":             c.prev,
             "pusher_sig":       c.pusher_sig,
@@ -840,13 +899,15 @@ pub async fn verify_anchor(
             "content_digest":   c.content_digest,
             "request_path":     c.request_path,
         });
-        let payload_bytes_13 = serde_json::to_vec(&payload_13)?;
-        let sig_valid_13 =
-            gitlawb_core::identity::verify(&verifying_key, &payload_bytes_13, &sig_array);
+        let payload_bytes_14 = serde_json::to_vec(&payload_14)?;
+        let sig_valid_14 =
+            gitlawb_core::identity::verify(&verifying_key, &payload_bytes_14, &sig_array);
         let mut legacy_7_field_verified = false;
-        if proof_fields_null && sig_valid_13.is_err() {
-            // Fall back to 7-field payload for pre-PR certificates.
-            let payload_7 = serde_json::json!({
+        if sig_valid_14.is_ok() {
+            // Version-2 signature verified — nothing more to try.
+        } else {
+            // Fall back to 13-field payload (post-PR, pre-version-2).
+            let payload_13 = serde_json::json!({
                 "repo_id":    c.repo_id,
                 "ref":        c.ref_name,
                 "old":        c.old_sha,
@@ -854,16 +915,43 @@ pub async fn verify_anchor(
                 "pusher":     c.pusher_did,
                 "node":       c.node_did,
                 "ts":         c.issued_at,
+                "seq":              c.seq,
+                "prev":             c.prev,
+                "pusher_sig":       c.pusher_sig,
+                "signature_input":  c.signature_input,
+                "content_digest":   c.content_digest,
+                "request_path":     c.request_path,
             });
-            let payload_bytes_7 = serde_json::to_vec(&payload_7)?;
-            if gitlawb_core::identity::verify(&verifying_key, &payload_bytes_7, &sig_array).is_ok()
-            {
-                legacy_7_field_verified = true;
+            let payload_bytes_13 = serde_json::to_vec(&payload_13)?;
+            let sig_valid_13 =
+                gitlawb_core::identity::verify(&verifying_key, &payload_bytes_13, &sig_array);
+            if sig_valid_13.is_ok() {
+                // 13-field signature verified.
+            } else if proof_fields_null {
+                // Fall back to 7-field payload for pre-PR certificates.
+                let payload_7 = serde_json::json!({
+                    "repo_id":    c.repo_id,
+                    "ref":        c.ref_name,
+                    "old":        c.old_sha,
+                    "new":        c.new_sha,
+                    "pusher":     c.pusher_did,
+                    "node":       c.node_did,
+                    "ts":         c.issued_at,
+                });
+                let payload_bytes_7 = serde_json::to_vec(&payload_7)?;
+                if gitlawb_core::identity::verify(&verifying_key, &payload_bytes_7, &sig_array)
+                    .is_ok()
+                {
+                    legacy_7_field_verified = true;
+                } else {
+                    errors.push("certificate signature verification failed (7-field)".to_string());
+                }
             } else {
-                errors.push("certificate signature verification failed (7-field)".to_string());
+                errors.push(
+                    "certificate signature verification failed: no recognized payload version matched"
+                        .to_string(),
+                );
             }
-        } else if let Err(e) = sig_valid_13 {
-            errors.push(format!("certificate signature verification failed: {e}"));
         }
         // 1b. Corroborate chain position for legacy certificates.
         //    The 7-field fallback covers only repo_id, ref, old, new, pusher,
@@ -1109,14 +1197,15 @@ mod tests {
     /// target must equal `expected_request_target` (i.e. `/tx/{token}`, possibly
     /// with a path prefix or query) and the `x-irys-paid-by` header must carry
     /// `expected_bundler_account`. Any failure returns 400 (surfacing as `Err`
-    /// from the anchor functions); success returns `{"id": <tx_id>}`.
+    /// from the anchor functions); success returns `{"id": <item_id>}` where
+    /// `item_id` is the ANS-104 id derived from the received item's signature
+    /// region — exactly what a real bundler echoes back (#224).
     async fn spawn_enforcing_bundler(
         kp: &Keypair,
         expected_bundler_account: &'static str,
         expected_request_target: &'static str,
         expected_tags: &[(&str, &str)],
         validate: impl Fn(&serde_json::Value) -> bool + Send + Sync + Clone + 'static,
-        tx_id: &'static str,
     ) -> String {
         let vk = kp.verifying_key();
         let expected: Vec<(String, String)> = expected_tags
@@ -1203,7 +1292,13 @@ mod tests {
                                 "payload validation failed".to_string(),
                             );
                         }
-                        (StatusCode::OK, format!(r#"{{"id":"{tx_id}"}}"#))
+                        // A real bundler echoes the ANS-104 data-item id of the
+                        // exact item it received (base64url(sha256(signature))),
+                        // not an arbitrary constant. Derive it from the request
+                        // body so the response-binding contract in
+                        // upload_ref_anchor_item is exercised end to end (#224).
+                        let item_id = crate::ans104::data_item_id(&body);
+                        (StatusCode::OK, format!(r#"{{"id":"{item_id}"}}"#))
                     }
                 },
             ),
@@ -1246,7 +1341,6 @@ mod tests {
                 ("Repo", "alice/myrepo"),
             ],
             |j| j["repo"] == "alice/myrepo",
-            "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuOk",
         )
         .await;
         let client = reqwest::Client::new();
@@ -1265,24 +1359,27 @@ mod tests {
         let result =
             anchor_ref_update(&client, &server, "zBundlerAccount", "matic", &anchor, &kp).await;
         assert!(result.is_ok(), "anchor should succeed: {result:?}");
-        assert_eq!(
-            result.unwrap(),
-            "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuOk"
+        assert!(
+            is_valid_tx_id(&result.unwrap()),
+            "anchor must return the well-formed data-item id the bundler echoed"
         );
     }
-    /// #224 review, P2: the client validates the bundler's success id at the
-    /// boundary. An empty, missing, or malformed transaction id in a 200
-    /// response must NOT read as success — it is Uncertain (the item may or may
-    /// not have been accepted), so the durable job probes the gateway instead of
-    /// recording a fabricated anchor. Only a well-formed 43-char base64url id is
-    /// Accepted.
+    /// #224 review, P2 + R2 BIND: the client validates the bundler's success id
+    /// at the boundary AND binds it to the item actually sent. An empty,
+    /// missing, or malformed transaction id in a 200 response must NOT read as
+    /// success — it is Uncertain (the item may or may not have been accepted),
+    /// so the durable job probes the gateway instead of recording a fabricated
+    /// anchor. And a well-formed id that does NOT match the id of the item the
+    /// node sent (a misrouted/faulty/compromised bundler substituting a
+    /// different item) must also be Uncertain, never Accepted — recording a
+    /// foreign id would destroy the durable identity the node can recover.
     #[tokio::test]
     async fn test_upload_rejects_empty_missing_and_malformed_success_ids() {
         use axum::response::IntoResponse;
         use std::sync::atomic::Ordering;
 
         async fn mock_bundler(
-            body: &'static str,
+            body: String,
         ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
             let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let app = {
@@ -1291,6 +1388,7 @@ mod tests {
                     "/tx/matic",
                     axum::routing::post(move || {
                         let calls = calls_srv.clone();
+                        let body = body.clone();
                         async move {
                             calls.fetch_add(1, Ordering::SeqCst);
                             (axum::http::StatusCode::OK, body).into_response()
@@ -1307,18 +1405,31 @@ mod tests {
         }
 
         let client = reqwest::Client::new();
-        let item = b"signed-data-item-bytes".to_vec();
+        // Must be long enough (>= 2 + 64 bytes) for data_item_id to derive a
+        // real id from the signature region rather than the short-item sentinel.
+        let mut item = vec![0u8; 70];
+        item[0] = 0x02;
+        item[1] = 0x00;
+        item[2..66].copy_from_slice(&[0xAA; 64]);
+        let expected_id = crate::ans104::data_item_id(&item);
+        assert_eq!(expected_id.len(), 43, "derived id must be a valid tx id");
 
         for (label, body) in [
             ("empty id", r#"{"id":""}"#),
             ("missing id", r#"{"foo":"bar"}"#),
             ("malformed id", r#"{"id":"WAY_TOO_SHORT"}"#),
         ] {
-            let (server, calls) = mock_bundler(body).await;
-            let outcome =
-                upload_ref_anchor_item(&client, &server, "zBundlerAccount", "matic", &item)
-                    .await
-                    .unwrap();
+            let (server, calls) = mock_bundler(body.to_string()).await;
+            let outcome = upload_ref_anchor_item(
+                &client,
+                &server,
+                "zBundlerAccount",
+                "matic",
+                &item,
+                &expected_id,
+            )
+            .await
+            .unwrap();
             assert!(
                 matches!(outcome, UploadOutcome::Uncertain { .. }),
                 "{label} must classify as Uncertain: {outcome:?}"
@@ -1326,15 +1437,42 @@ mod tests {
             assert_eq!(calls.load(Ordering::SeqCst), 1);
         }
 
-        // The well-formed case still lands as Accepted.
-        let (server, _calls) =
-            mock_bundler(r#"{"id":"7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuOk"}"#).await;
-        let outcome = upload_ref_anchor_item(&client, &server, "zBundlerAccount", "matic", &item)
-            .await
-            .unwrap();
+        // A well-formed id that MATCHES the item the node sent is Accepted.
+        let (server, _calls) = mock_bundler(format!(r#"{{"id":"{expected_id}"}}"#)).await;
+        let outcome = upload_ref_anchor_item(
+            &client,
+            &server,
+            "zBundlerAccount",
+            "matic",
+            &item,
+            &expected_id,
+        )
+        .await
+        .unwrap();
         assert!(
-            matches!(&outcome, UploadOutcome::Accepted { tx_id } if tx_id == "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuOk"),
-            "a well-formed id must be Accepted: {outcome:?}"
+            matches!(&outcome, UploadOutcome::Accepted { tx_id } if tx_id == &expected_id),
+            "a matching well-formed id must be Accepted: {outcome:?}"
+        );
+
+        // A well-formed id that does NOT match the item sent is Uncertain, never
+        // Accepted (R2 #224): a bundler that returns a different well-formed id
+        // must not be able to replace the durable anchor identity.
+        let (server, _calls) =
+            mock_bundler(r#"{"id":"7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuO9"}"#.to_string())
+                .await;
+        let outcome = upload_ref_anchor_item(
+            &client,
+            &server,
+            "zBundlerAccount",
+            "matic",
+            &item,
+            &expected_id,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, UploadOutcome::Uncertain { .. }),
+            "a mismatched well-formed id must classify as Uncertain: {outcome:?}"
         );
     }
     /// The funded bundler account must ride on the upload request: the item
@@ -1362,7 +1500,6 @@ mod tests {
             "/tx/matic",
             &[("App-Name", "gitlawb"), ("Schema", "gitlawb/ref-update/v1")],
             |_| true,
-            "NEVER_RETURNED",
         )
         .await;
         let result = anchor_ref_update(&client, &server, "", "matic", &anchor, &kp).await;
@@ -1388,7 +1525,6 @@ mod tests {
             "/tx/matic",
             &[("App-Name", "gitlawb")],
             move |j| j["old_sha"] == real_old && j["new_sha"] == real_new,
-            "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuO1",
         )
         .await;
         let client = reqwest::Client::new();
@@ -1406,10 +1542,10 @@ mod tests {
         };
         let result =
             anchor_ref_update(&client, &server, "zBundlerAccount", "matic", &anchor, &kp).await;
-        assert_eq!(
-            result.unwrap(),
-            "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuO1"
-        );
+        // The bundler now echoes the item's own ANS-104 id; compare it against
+        // the id derived from the very item this call would sign.
+        let item = build_ref_anchor_item(&anchor, &kp).unwrap();
+        assert_eq!(result.unwrap(), crate::ans104::data_item_id(&item));
     }
     #[tokio::test]
     async fn test_anchor_rejected_when_signed_by_other_key() {
@@ -1423,7 +1559,6 @@ mod tests {
             "/tx/matic",
             &[("App-Name", "gitlawb")],
             |_| true,
-            "NEVER_RETURNED",
         )
         .await;
         let client = reqwest::Client::new();
@@ -1518,7 +1653,6 @@ mod tests {
                 ("Node-DID", "did:key:zN"),
             ],
             |j| j["repo"] == "alice/r" && j["blobs"].as_array().is_some_and(|b| b.len() == 1),
-            "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuO2",
         )
         .await;
         let client = reqwest::Client::new();
@@ -1532,7 +1666,10 @@ mod tests {
         };
         let r =
             anchor_encrypted_manifest(&client, &server, "zBundlerAccount", "matic", &m, &kp).await;
-        assert_eq!(r.unwrap(), "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuO2");
+        assert!(
+            is_valid_tx_id(&r.unwrap()),
+            "manifest anchor must return the well-formed data-item id the bundler echoed"
+        );
     }
     /// A minimal ref-update anchor for the URL-join tests.
     fn test_anchor(repo: &str, new_sha: &str) -> RefAnchor {
@@ -1560,7 +1697,6 @@ mod tests {
             "/prefix/tx/matic",
             &[("App-Name", "gitlawb")],
             |_| true,
-            "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuO3",
         )
         .await;
         let client = reqwest::Client::new();
@@ -1577,10 +1713,17 @@ mod tests {
             &kp,
         )
         .await;
-        assert_eq!(
-            result.unwrap(),
-            "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuO3"
-        );
+        // The bundler echoes the item's own ANS-104 id; compare against the id
+        // derived from the item this exact anchor + keypair signs.
+        let item = build_ref_anchor_item(
+            &test_anchor(
+                "alice/myrepo",
+                "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4",
+            ),
+            &kp,
+        )
+        .unwrap();
+        assert_eq!(result.unwrap(), crate::ans104::data_item_id(&item));
     }
     /// A query on the bundler base must ride along on the upload request target
     /// (`/tx/matic?token=secret`) rather than being dropped by string concat.
@@ -1593,7 +1736,6 @@ mod tests {
             "/tx/matic?token=secret",
             &[("App-Name", "gitlawb")],
             |_| true,
-            "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuO4",
         )
         .await;
         let client = reqwest::Client::new();
@@ -1610,10 +1752,15 @@ mod tests {
             &kp,
         )
         .await;
-        assert_eq!(
-            result.unwrap(),
-            "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuO4"
-        );
+        let item = build_ref_anchor_item(
+            &test_anchor(
+                "alice/myrepo",
+                "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4",
+            ),
+            &kp,
+        )
+        .unwrap();
+        assert_eq!(result.unwrap(), crate::ans104::data_item_id(&item));
     }
     /// A fragment in the bundler URL must be rejected outright for both upload
     /// paths: it is never sent to the bundler, so sending it silently would
@@ -2254,6 +2401,116 @@ mod tests {
         assert!(
             r.valid,
             "authentic 13-field cert must verify, errors: {:?}",
+            r.errors
+        );
+        assert!(
+            r.errors.is_empty(),
+            "expected no errors, got: {:?}",
+            r.errors
+        );
+        _mock.assert_async().await;
+    }
+    /// Version 2 certificate: the `version` field is included in the signed
+    /// payload.  Verification must succeed on the 14-field first pass.
+    #[sqlx::test]
+    async fn test_verify_anchor_accepts_authentic_14_field_version2_certificate(
+        pool: sqlx::PgPool,
+    ) {
+        let node_kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = node_kp.did().as_str().to_string();
+        let pusher_kp = gitlawb_core::identity::Keypair::generate();
+        let owner_did = "did:key:z6MkOwner";
+        let repo_id = "repo-uuid";
+        let ref_name = "refs/heads/main";
+        let old_sha = "0".repeat(40);
+        let new_sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let issued_at = "2026-07-22T00:00:00+00:00";
+        let seq = 1i64;
+        let prev = "0".repeat(64);
+        let db = migrated_db(pool).await;
+        db.create_repo(&crate::db::RepoRecord {
+            id: repo_id.to_string(),
+            name: "myrepo".into(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            disk_path: "/tmp/anchor-test".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+        // Build a version-2 (14-field) certificate.
+        let request_path = "/repo-uuid.git/git-receive-pack";
+        let signed =
+            gitlawb_core::http_sig::sign_request(&pusher_kp, "POST", request_path, b"push-body");
+        let pusher_sig = signed
+            .signature
+            .strip_prefix("sig1=:")
+            .and_then(|s| s.strip_suffix(':'))
+            .unwrap()
+            .to_string();
+        let payload = serde_json::json!({
+            "repo_id": repo_id,
+            "ref": ref_name,
+            "old": old_sha,
+            "new": new_sha,
+            "pusher": pusher_kp.did().as_str().to_string(),
+            "node": node_did,
+            "ts": issued_at,
+            "version": crate::cert::CERT_PAYLOAD_VERSION,
+            "seq": seq,
+            "prev": prev,
+            "pusher_sig": pusher_sig,
+            "signature_input": signed.signature_input,
+            "content_digest": signed.content_digest,
+            "request_path": request_path,
+        });
+        let signature = node_kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
+        let cert = crate::db::RefCertificate {
+            id: "cert-accept-v2-1".to_string(),
+            repo_id: repo_id.to_string(),
+            ref_name: ref_name.to_string(),
+            old_sha: old_sha.to_string(),
+            new_sha: new_sha.to_string(),
+            pusher_did: pusher_kp.did().as_str().to_string(),
+            node_did: node_did.to_string(),
+            signature,
+            issued_at: issued_at.to_string(),
+            seq,
+            prev: prev.to_string(),
+            pusher_sig: Some(pusher_sig),
+            signature_input: Some(signed.signature_input),
+            content_digest: Some(signed.content_digest),
+            request_path: Some(request_path.to_string()),
+        };
+        let anchor_json = serde_json::json!({
+            "repo": format!("{}/myrepo", crate::db::normalize_owner_key(owner_did)),
+            "owner_did": owner_did,
+            "repo_id": repo_id,
+            "ref_name": ref_name,
+            "old_sha": old_sha,
+            "new_sha": new_sha,
+            "node_did": node_did,
+            "certificate": cert,
+        });
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/accept-v2-tx")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&anchor_json).unwrap())
+            .create_async()
+            .await;
+        let client = reqwest::Client::new();
+        let result = verify_anchor(&client, &server.url(), "accept-v2-tx", &db, &node_did).await;
+        let r = result.expect("verify_anchor should return Ok for a served anchor");
+        assert!(
+            r.valid,
+            "authentic version-2 (14-field) cert must verify, errors: {:?}",
             r.errors
         );
         assert!(

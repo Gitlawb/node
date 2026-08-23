@@ -32,6 +32,14 @@ pub async fn verify_anchor_endpoint(
         ));
     }
     let gateway = &state.config.arweave_gateway;
+    // Return a clear error when no gateway is configured, rather than letting
+    // the downstream URL parse fail surface as a 500.
+    if gateway.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "no Arweave gateway configured: set GITLAWB_ARWEAVE_GATEWAY to verify anchors"
+                .to_string(),
+        ));
+    }
     let node_did = state.node_did.to_string();
     let result =
         crate::arweave::verify_anchor(&state.http_client, gateway, &tx_id, &state.db, &node_did)
@@ -64,6 +72,22 @@ pub async fn list_anchors(
     let limit = q.limit.min(200);
     // Bare `?` so connection-class sqlx failures downcast to `AppError::Db` and
     // map to 503 `db_unavailable` (not 500 via `.map_err(AppError::Internal)`) (#251).
+    // Clamp to a sane bound; a negative value would become LIMIT -1 in SQL,
+    // which Postgres rejects. A value below 1 means "unset" and uses the serde
+    // default, NOT the clamp floor: `?limit=0` must behave like the parameter
+    // being absent (default 50), not like `?limit=1`.
+    let limit = if q.limit < 1 {
+        default_limit()
+    } else {
+        q.limit.min(200)
+    };
+
+    // Visibility is enforced in the query itself (#136 follow-up from the #215
+    // review): the SQL joins anchors to their repo group and only keeps groups
+    // that currently contain a non-quarantined public row, then applies LIMIT
+    // after the gate. An anchor for a repo that later became private (or
+    // disappeared) never reaches this layer — no post-read filter, no pre-gate
+    // limit.
     let anchors = state
         .db
         .list_arweave_anchors(q.repo.as_deref(), limit)
@@ -102,6 +126,32 @@ mod closed_pool_tests {
     use serde_json::Value;
     use sqlx::PgPool;
     use tower::ServiceExt;
+
+    /// Seed a public repo row for `zAlice/{name}`: the SQL visibility gate
+    /// joins each anchor to its repo group, so an anchor without a matching
+    /// public repo row is fail-closed out of the listing (and a test asserting
+    /// URLs/counts would then fail for the wrong reason). Pairing every seeded
+    /// `alice/myrepo`-slugged anchor with this row is the #136 follow-up test
+    /// contract.
+    async fn seed_public_repo(state: &crate::state::AppState, name: &str) {
+        state
+            .db
+            .create_repo(&crate::db::RepoRecord {
+                id: format!("repo-{name}"),
+                name: name.to_string(),
+                owner_did: "did:key:zAlice".to_string(),
+                description: None,
+                is_public: true,
+                default_branch: "main".to_string(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                disk_path: format!("/tmp/{name}"),
+                forked_from: None,
+                machine_id: None,
+            })
+            .await
+            .unwrap();
+    }
 
     /// #251: a closed pool on /api/v1/arweave/anchors must be 503 db_unavailable.
     #[sqlx::test]
@@ -153,6 +203,7 @@ mod closed_pool_tests {
             "https://user:supersecret@arweave.net",
         ]));
 
+        seed_public_repo(&state, "myrepo").await;
         state
             .db
             .record_arweave_anchor(&crate::db::RecordAnchorInputV2 {
@@ -212,6 +263,7 @@ mod closed_pool_tests {
             "https://user:supersecret@gateway.example/data?token=SECRET#frag",
         ]));
 
+        seed_public_repo(&state, "myrepo").await;
         let tx_id = "f".repeat(43);
         state
             .db
@@ -269,6 +321,7 @@ mod closed_pool_tests {
         // test_state's default config has no gateway configured.
         let state = crate::test_support::test_state(pool.clone()).await;
 
+        seed_public_repo(&state, "myrepo").await;
         state
             .db
             .record_arweave_anchor(&crate::db::RecordAnchorInputV2 {
@@ -331,6 +384,7 @@ mod closed_pool_tests {
         ]));
 
         // Seed three distinct transitions.
+        seed_public_repo(&state, "myrepo").await;
         for (ref_name, old_sha, new_sha) in [
             ("refs/heads/main", "a".repeat(40), "b".repeat(40)),
             ("refs/heads/dev", "c".repeat(40), "d".repeat(40)),

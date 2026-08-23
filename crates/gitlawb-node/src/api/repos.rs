@@ -2296,9 +2296,9 @@ pub async fn git_receive_pack(
     // durable push with no certificates and no tail. Certificate issuance runs at
     // the START of the continuation, so the tail always has the per-ref signed
     // certificates in hand: the gossip event carries the real `cert_id`, and the
-    // Arweave anchor embeds the certificate itself. Issuance fails open (errors are
-    // logged and skipped), so a cert outage degrades to a cert-less announce rather
-    // than a dropped push. Each push owns its own tail, including its own
+    // Arweave anchor embeds the certificate itself. Issuance now fails the job
+    // (returns an error), so a cert outage causes the push to fail rather than
+    // silently dropping certificates. Each push owns its own tail, including its own
     // always-spawned announce, so per-push announcements are never coalesced away.
     //
     // ACCEPTED RESIDUAL, and it is the cost of this ordering: the tail also runs
@@ -2844,6 +2844,10 @@ async fn anchor_ref_updates(
                 ));
             }
         };
+        // This worker's lease token (per-attempt). It is written into the row by
+        // the INSERT (fresh claim) or the lease hand-off CAS (recovery), and every
+        // later state-write is conditioned on it — so a worker that loses the
+        // hand-off cannot corrupt the winner's row.
         let claim_token = uuid::Uuid::new_v4().to_string();
         let claimed_at = chrono::Utc::now().to_rfc3339();
         // Atomic claim BEFORE any paid upload. This is the durable per-transition
@@ -2871,7 +2875,14 @@ async fn anchor_ref_updates(
                     update.ref_name
                 )
             })?;
-        let claim_id = match claim {
+        // (claim_id, expected lease token for the hand-off CAS, anchor timestamp).
+        //
+        // The anchor's CONTENT timestamp must be the one already on the row: a
+        // rebuilt item on a retry must serialize identically so its ANS-104 id
+        // is the same id that the gateway probe reconciles (#224 deterministic
+        // retry). Fresh claims use `claimed_at` (= the value the row was
+        // inserted with); recoveries use the row's persisted `claimed_at`.
+        let (claim_id, expected_token, timestamp_for_anchor) = match claim {
             crate::db::AnchorClaim::AlreadyRecorded => {
                 tracing::debug!(
                     repo = %repo_slug,
@@ -2880,11 +2891,19 @@ async fn anchor_ref_updates(
                 );
                 continue;
             }
-            crate::db::AnchorClaim::Claimed { id } => id,
+            crate::db::AnchorClaim::Claimed { id } => {
+                // Fresh claim: the row's claim_token IS ours (the INSERT set it),
+                // so the hand-off CAS with expected token = ours is an atomic
+                // guard against a concurrent worker that could only ever observe
+                // a row we already own.
+                (id, claim_token.clone(), claimed_at.clone())
+            }
             crate::db::AnchorClaim::Recover {
                 id,
                 state: recovered_state,
                 item_id,
+                claim_token: current_token,
+                claimed_at: claimed_at_row,
             } => {
                 tracing::debug!(
                     repo = %repo_slug,
@@ -2892,12 +2911,18 @@ async fn anchor_ref_updates(
                     state = %recovered_state,
                     "recovering non-terminal arweave anchor claim"
                 );
+                // The expected value of the hand-off CAS is the CURRENT holder's
+                // token; a token-less (pre-lease) row is matched by the CAS's
+                // `claim_token IS NULL` clause, so the empty string is a safe
+                // sentinel — it can never equal a real UUID token.
+                let expected = current_token.unwrap_or_default();
                 // A previous attempt of this same transition did not reach
                 // `recorded`. Reconcile BEFORE any re-upload: an `item_id` that
                 // is already on the gateway means the earlier upload landed and
                 // we must not pay for a second artifact.
+                let ts = claimed_at_row.unwrap_or_else(|| claimed_at.clone());
                 match item_id {
-                    None => id,
+                    None => (id, expected, ts),
                     Some(persisted_item) => {
                         match crate::arweave::anchor_item_present(
                             &state.http_client,
@@ -2907,27 +2932,35 @@ async fn anchor_ref_updates(
                         .await
                         {
                             Ok(true) => {
-                                state
-                                    .db
-                                    .record_claimed_anchor(&id, &persisted_item)
-                                    .await
-                                    .map_err(|e| {
-                                        anyhow::anyhow!(
+                                // The earlier upload landed: record it directly.
+                                // This is the idempotent terminal write — it does
+                                // not pay, so no lease hand-off is required; the
+                                // guard uses the current holder's token if one
+                                // exists, so a raced loser cannot corrupt a
+                                // winner's recorded row; a 0-rows_here means the
+                                // row is already recorded, which is correctness
+                                // (progress), not corruption.
+                                match state.db.recover_claimed_anchor(&id, &persisted_item).await {
+                                    Ok(_) => {
+                                        tracing::info!(
+                                            tx_id = %persisted_item,
+                                            repo = %repo_slug,
+                                            ref_name = %update.ref_name,
+                                            "recovered already-uploaded arweave anchor without re-uploading"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        return Err(anyhow::anyhow!(
                                             "recovered arweave anchor {persisted_item} for \
                                              {}/{} but could not persist it: {e}",
                                             repo_slug,
                                             update.ref_name
-                                        )
-                                    })?;
-                                tracing::info!(
-                                    tx_id = %persisted_item,
-                                    repo = %repo_slug,
-                                    ref_name = %update.ref_name,
-                                    "recovered already-uploaded arweave anchor without re-uploading"
-                                );
+                                        ));
+                                    }
+                                }
                                 continue;
                             }
-                            Ok(false) => id,
+                            Ok(false) => (id, expected, ts),
                             Err(e) => {
                                 // Fail closed: the gateway could not be queried,
                                 // so we cannot know whether an upload happened.
@@ -2954,7 +2987,7 @@ async fn anchor_ref_updates(
             old_sha: update.old_sha.clone(),
             new_sha: update.new_sha.clone(),
             cid: cid.clone(),
-            timestamp: claimed_at.clone(),
+            timestamp: timestamp_for_anchor.clone(),
             node_did: node_did.to_string(),
             certificate: Some(cert.clone()),
         };
@@ -2968,9 +3001,20 @@ async fn anchor_ref_updates(
                 )
             })?;
         let item_id = crate::ans104::data_item_id(&item);
-        state
+        // Acquire exclusive ownership before paying. `expected_token` is the
+        // current lease holder (or a sentinel for the pre-lease row), so this
+        // CAS is a token-conditioned pending→uploading transition: of N
+        // concurrent workers covering this same transition, exactly one wins,
+        // hijacks the lease to our `claim_token`, and proceeds; every loser
+        // gets `rows_affected == 0` and must not call the bundler.
+        let rows_affected = state
             .db
-            .set_anchor_uploading(&claim_id, &item_id)
+            .set_anchor_uploading(
+                &claim_id,
+                &item_id,
+                expected_token.as_str(),
+                Some(claim_token.as_str()),
+            )
             .await
             .map_err(|e| {
                 anyhow::anyhow!(
@@ -2979,12 +3023,32 @@ async fn anchor_ref_updates(
                     update.ref_name
                 )
             })?;
+        let claim_id_for_upload = claim_id;
+        if rows_affected == 0 {
+            // We did not win the lease hand-off. Two causes, one safe action:
+            // either a concurrent worker just took the lease and is moving the
+            // row itself, or the row is an `uploading` lease younger than the
+            // quiescence window and no takeover is allowed yet. In NEITHER case
+            // may this worker call the bundler, and neither case justifies
+            // marking the job `done` (that would orphan the anchor if the
+            // winning/holding worker crashes before recording). Fail the job
+            // with no upload — the startup drain retry policy re-attempts it,
+            // converging on the recorded row or eventually winning the lease.
+            return Err(anyhow::anyhow!(
+                "cannot acquire the arweave anchor lease for {}/{} — another worker holds \
+                 or recently claimed the transition; failing without uploading so the \
+                 drain retries",
+                repo_slug,
+                update.ref_name
+            ));
+        }
         let outcome = crate::arweave::upload_ref_anchor_item(
             &state.http_client,
             bundler_url,
             bundler_account,
             bundler_token,
             &item,
+            &item_id,
         )
         .await
         .map_err(|e| {
@@ -2997,39 +3061,49 @@ async fn anchor_ref_updates(
         let tx_id = match outcome {
             crate::arweave::UploadOutcome::Accepted { tx_id } => tx_id,
             crate::arweave::UploadOutcome::Rejected { message } => {
-                // The provider definitively did not accept the item; a later
-                // drain re-uploads. The row stays reserved for that drain.
-                let _ = state.db.set_anchor_failed(&claim_id).await;
+                // The bundler definitively did not accept the item; an upstream
+                // drain will re-upload. The row remains reserved for that drain.
+                // Failure is conditioned on the lease token, so that a batched
+                // worker can't flip the row over to the winner (#224 review).
+                let _ = state
+                    .db
+                    .set_anchor_failed(&claim_id_for_upload, claim_token.as_str())
+                    .await;
                 return Err(anyhow::anyhow!(
-                    "arweave anchor for {}/{} rejected by the bundler: {message} — if the \
-                     bundler reports 'Not enough balance', fund GITLAWB_BUNDLER_ACCOUNT \
-                     (for the token in GITLAWB_BUNDLER_TOKEN); an unfunded node retries \
-                     and loses anchors forever",
+                    "arweave anchor for {}/{} was rejected by the bundler: {message} — if the \
+                     bundler reports 'Not enough balance', charge to \
+                     GITLAWB_BUNDLER_ACCOUNT (the token of GITLAWB_BUNDLER_TOKEN); an \
+                     uncharged node will retry and lose its anchor forever",
                     repo_slug,
                     update.ref_name
                 ));
             }
             crate::arweave::UploadOutcome::Uncertain { message } => {
-                // The outcome is unknown (connection drop or malformed success):
-                // the item MAY have been accepted. Leave the row `uploading` and
-                // fail the job; the drain's recovery probes the gateway and
-                // records without re-uploading if the item landed.
+                // The result is unknown (connection dropped, or a
+                // success-shaped response that doesn't match the expected
+                // identity): the item is possibly accepted. Leave the row as
+                // `uploading` (with our lease token + persisted item_id) and
+                // fail the job; upstream drain recovery probes the gateway and,
+                // if the item has landed, records it instead of re-uploading.
                 return Err(anyhow::anyhow!(
-                    "arweave anchor for {}/{} has an unknown upload outcome: {message} — \
-                     the startup drain will probe the gateway before deciding whether \
-                     to re-upload",
+                    "arweave anchor for {}/{} has unknown upload result: {message} — \
+                     upfront drain will probe the gateway before deciding whether to re-upload",
                     repo_slug,
                     update.ref_name
                 ));
             }
         };
-        // Upload accepted — persist the durable terminal state. A failed UPDATE
-        // is a FAILED UNIT OF WORK: the row stays `uploading` with its item_id,
-        // so the drain's recovery probes the gateway and records the already-
-        // landed item without paying for a second artifact.
-        state
+        // Upload accepted — persist the persistent terminal state. A failed
+        // UPDATE is a failure in the work unit: the row remains `uploading`
+        // with its item_id, and upstream drain recovery probes the gateway and
+        // records the landing item without paying for a second artifact. The
+        // record write is guarded by our lease token, so that no delayed
+        // loser can overwrite the winner's terminal state. If 0 rows are
+        // affected, we've already been replaced mid-approval — the job fails
+        // closed and upstream drain settles the already-landed item.
+        let recorded = state
             .db
-            .record_claimed_anchor(&claim_id, &tx_id)
+            .record_claimed_anchor(&claim_id_for_upload, &tx_id, claim_token.as_str())
             .await
             .map_err(|e| {
                 anyhow::anyhow!(
@@ -3038,6 +3112,15 @@ async fn anchor_ref_updates(
                     update.ref_name
                 )
             })?;
+        if recorded == 0 {
+            return Err(anyhow::anyhow!(
+                "uploaded arweave anchor {tx_id} for {}/{} but the lease is already over — \
+                 the row no longer matches our claim token. Leaving the job unmarked so the \
+                 upfront drain settles it from gateway state",
+                repo_slug,
+                update.ref_name
+            ));
+        }
         tracing::info!(
             tx_id,
             repo = %repo_slug,
@@ -11279,9 +11362,11 @@ mod tests {
 
     /// A mock Irys bundler that counts uploads and fails a fixed number of the
     /// first ones with 500 before succeeding. Returns the base URL and a call
-    /// counter.
+    /// counter. Accepted item bytes are stashed into `uploaded` so a paired
+    /// gateway mock can serve them verbatim for id-verified presence probes.
     async fn f2a_bundler(
         fail_first: usize,
+        uploaded: std::sync::Arc<std::sync::RwLock<Option<Vec<u8>>>>,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use axum::http::StatusCode;
         use axum::response::IntoResponse;
@@ -11292,12 +11377,23 @@ mod tests {
         let app = {
             let calls_srv = calls.clone();
             let failures_srv = failures_left.clone();
+            let uploaded_srv = uploaded.clone();
             axum::Router::new().route(
                 "/tx/{token}",
-                axum::routing::post(move || {
+                // The mock returns the uploaded item's OWN ANS-104 id: the node
+                // binds the provider acknowledgement to the exact request
+                // identity (a different id is classified Uncertain), and a real
+                // bundler echoes the item's id back — this mock must do the
+                // same or every job-level anchor test sees a forged identity.
+                axum::routing::post(move |body: axum::body::Bytes| {
                     let calls = calls_srv.clone();
                     let failures = failures_srv.clone();
+                    let uploaded = uploaded_srv.clone();
                     async move {
+                        // Derive the id from the received bytes BEFORE counting
+                        // the call so that a simulated outage also does not
+                        // consume the response path.
+                        let item_id = crate::ans104::data_item_id(&body);
                         calls.fetch_add(1, Ordering::SeqCst);
                         if failures
                             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
@@ -11315,9 +11411,12 @@ mod tests {
                             )
                                 .into_response()
                         } else {
+                            // Keep the exact bytes the node sent: a gateway
+                            // probe must derive the same id from the body.
+                            *uploaded.write().unwrap() = Some(body.to_vec());
                             (
                                 StatusCode::OK,
-                                axum::Json(serde_json::json!({"id": "f".repeat(43)})),
+                                axum::Json(serde_json::json!({"id": item_id})),
                             )
                                 .into_response()
                         }
@@ -11339,6 +11438,13 @@ mod tests {
     /// URL and a probe counter.
     async fn f2a_gateway(
         mode: &'static str,
+        // The item store shared with the paired `f2a_bundler` — a "present"
+        // probe serves the uploaded bytes verbatim. This is because
+        // `anchor_item_present` derives the body's ANS-104 id and compares it
+        // against the id that was probed (a 2xx with a non-matching body is
+        // treated as "no verdict" and fails closed). A JSON placeholder body
+        // can never satisfy that check.
+        uploaded: std::sync::Arc<std::sync::RwLock<Option<Vec<u8>>>>,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use axum::response::IntoResponse;
         use std::sync::atomic::Ordering;
@@ -11346,18 +11452,31 @@ mod tests {
         let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let app = {
             let probes_srv = probes.clone();
+            let uploaded_srv = uploaded.clone();
             axum::Router::new().route(
                 "/{item_id}",
-                axum::routing::get(move |path: axum::extract::Path<String>| {
+                axum::routing::get(move |_path: axum::extract::Path<String>| {
                     let probes = probes_srv.clone();
+                    let uploaded = uploaded_srv.clone();
                     async move {
                         probes.fetch_add(1, Ordering::SeqCst);
                         match mode {
-                            "present" => (
-                                axum::http::StatusCode::OK,
-                                axum::Json(serde_json::json!({ "id": path.0 })),
-                            )
-                                .into_response(),
+                            "present" => {
+                                // Serve the exact item the node uploaded; if
+                                // nothing has been uploaded there is no item to
+                                // be "present", so 404.
+                                match uploaded.read().unwrap().clone() {
+                                    Some(bytes) => (
+                                        axum::http::StatusCode::OK,
+                                        [("content-type", "application/octet-stream")],
+                                        bytes,
+                                    )
+                                        .into_response(),
+                                    None => {
+                                        (axum::http::StatusCode::NOT_FOUND, "{}").into_response()
+                                    }
+                                }
+                            }
                             "absent" => (axum::http::StatusCode::NOT_FOUND, "{}").into_response(),
                             _ => (
                                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -11442,8 +11561,9 @@ mod tests {
     async fn anchor_record_failure_is_reconciled_without_double_pay(pool: sqlx::PgPool) {
         use clap::Parser as _;
 
-        let (bundler_url, calls) = f2a_bundler(0).await;
-        let (gateway_url, probes) = f2a_gateway("present").await;
+        let uploaded = std::sync::Arc::new(std::sync::RwLock::new(None::<Vec<u8>>));
+        let (bundler_url, calls) = f2a_bundler(0, uploaded.clone()).await;
+        let (gateway_url, probes) = f2a_gateway("present", uploaded).await;
         let mut state = crate::test_support::test_state(pool.clone()).await;
         state.config = std::sync::Arc::new(crate::config::Config::parse_from([
             "gitlawb-node",
@@ -11581,8 +11701,9 @@ mod tests {
     async fn anchor_claim_db_failure_never_uploads(pool: sqlx::PgPool) {
         use clap::Parser as _;
 
-        let (bundler_url, calls) = f2a_bundler(0).await;
-        let (gateway_url, _probes) = f2a_gateway("absent").await;
+        let uploaded = std::sync::Arc::new(std::sync::RwLock::new(None::<Vec<u8>>));
+        let (bundler_url, calls) = f2a_bundler(0, uploaded.clone()).await;
+        let (gateway_url, _probes) = f2a_gateway("absent", uploaded).await;
         let mut state = crate::test_support::test_state(pool.clone()).await;
         state.config = std::sync::Arc::new(crate::config::Config::parse_from([
             "gitlawb-node",
@@ -11635,8 +11756,9 @@ mod tests {
     async fn anchor_probe_failure_never_uploads(pool: sqlx::PgPool) {
         use clap::Parser as _;
 
-        let (bundler_url, calls) = f2a_bundler(0).await;
-        let (gateway_url, probes) = f2a_gateway("error").await;
+        let uploaded = std::sync::Arc::new(std::sync::RwLock::new(None::<Vec<u8>>));
+        let (bundler_url, calls) = f2a_bundler(0, uploaded.clone()).await;
+        let (gateway_url, probes) = f2a_gateway("error", uploaded).await;
         let mut state = crate::test_support::test_state(pool.clone()).await;
         state.config = std::sync::Arc::new(crate::config::Config::parse_from([
             "gitlawb-node",
@@ -11680,7 +11802,7 @@ mod tests {
         };
         state
             .db
-            .set_anchor_uploading(&claim_id, "item-probe-123")
+            .set_anchor_uploading(&claim_id, "item-probe-123", "claim-token", None)
             .await
             .unwrap();
 
@@ -11752,8 +11874,9 @@ mod tests {
 
         // First upload fails (500), then the bundler behaves; the gateway says
         // the rejected item was never indexed.
-        let (bundler_url, calls) = f2a_bundler(1).await;
-        let (gateway_url, probes) = f2a_gateway("absent").await;
+        let uploaded = std::sync::Arc::new(std::sync::RwLock::new(None::<Vec<u8>>));
+        let (bundler_url, calls) = f2a_bundler(1, uploaded.clone()).await;
+        let (gateway_url, probes) = f2a_gateway("absent", uploaded).await;
         state.config = std::sync::Arc::new(crate::config::Config::parse_from([
             "gitlawb-node",
             "--bundler-url",
@@ -11897,8 +12020,9 @@ mod tests {
             .await
             .unwrap();
 
-        let (bundler_url, calls) = f2a_bundler(0).await;
-        let (gateway_url, _probes) = f2a_gateway("absent").await;
+        let uploaded = std::sync::Arc::new(std::sync::RwLock::new(None::<Vec<u8>>));
+        let (bundler_url, calls) = f2a_bundler(0, uploaded.clone()).await;
+        let (gateway_url, _probes) = f2a_gateway("absent", uploaded).await;
         state.config = std::sync::Arc::new(crate::config::Config::parse_from([
             "gitlawb-node",
             "--bundler-url",

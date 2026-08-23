@@ -97,14 +97,24 @@ pub fn build_signed_data_item(
     Ok(item)
 }
 
-/// The ANS-104 data-item id: `base64url(sha256(item bytes))`. This is the id
-/// the bundler returns for a data item and the id gateways resolve
-/// `{gateway}/{id}` under, so it is a stable, content-derived remote identity:
-/// the durable job persists it BEFORE the upload request is sent, and a
-/// recovery probes that id to decide whether a crashed upload actually landed
-/// before ever issuing a second paid request (#224 review).
+/// The ANS-104 data-item id: `base64url(sha256(signature))` where signature
+/// is bytes 2..66 (the 64-byte Ed25519 signature) of the serialized item.
+/// This is the id the bundler returns for a data item and the id gateways
+/// resolve `{gateway}/{id}` under, so it is a stable, content-derived remote
+/// identity: the durable job persists it BEFORE the upload request is sent,
+/// and a recovery probes that id to decide whether a crashed upload actually
+/// landed before ever issuing a second paid request (#224 review).
+///
+/// Note: this differs from hashing the complete serialized item — the id is
+/// derived solely from the signature bytes, per the ANS-104 specification.
 pub fn data_item_id(item: &[u8]) -> String {
-    let digest = Sha256::digest(item);
+    if item.len() < 2 + SIGNATURE_LEN {
+        // Invalid item: return an impossible ID so callers fail safe
+        return base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(b"invalid data item"));
+    }
+    let signature_region = &item[2..2 + SIGNATURE_LEN];
+    let digest = Sha256::digest(signature_region);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 

@@ -7,7 +7,17 @@ use sha2::{Digest, Sha256};
 use crate::db::RefCertificate;
 use crate::state::AppState;
 
+/// The current signed certificate payload version. The version is included in
+/// the JSON bytes the node signs so that verifiers select the correct field set
+/// rather than inferring it from nullable columns.
+pub const CERT_PAYLOAD_VERSION: u64 = 2;
+
 /// Build the canonical signing payload for a certificate.
+///
+/// Version 2 adds an explicit `version` field to the signed bytes. Verifiers
+/// use it to select the field set: version 2 =14 fields (this function),
+/// absent version =13-field post-PR format, absent version + absent proof
+/// fields = 7-field pre-PR format.
 #[allow(clippy::too_many_arguments)]
 fn cert_payload(
     repo_id: &str,
@@ -32,6 +42,7 @@ fn cert_payload(
         "pusher": pusher_did,
         "node": node_did,
         "ts": issued_at,
+        "version": CERT_PAYLOAD_VERSION,
         "seq": seq,
         "prev": prev,
         "pusher_sig": pusher_sig,

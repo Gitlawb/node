@@ -1285,6 +1285,22 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_arweave_anchors_transition ON arweave_anchors(repo, ref_name, old_sha, new_sha)",
         ],
     },
+    // Lease clock for the anchor outbox (#224 review, R2): a dedicated timestamptz
+    // column carrying WHEN the current lease started. `set_anchor_uploading`'s
+    // lease-hand-off CAS refreshes it to `now()` on every successful takeover and
+    // refuses to reclaim an `uploading` lease younger than
+    // ANCHOR_UPLOADING_LEASE_SECONDS. `claimed_at` cannot serve this purpose — it
+    // is the anchor's content timestamp and must stay stable for deterministic
+    // retries (same timestamp → same ANS-104 id). Rows backfilled as `recorded`
+    // and rows later set to `recorded` keep their anchored-at value; 'pre-lease'
+    // rows (claim_token IS NULL) are matched by the CAS's NULL branch regardless.
+    Migration {
+        version: 23,
+        name: "arweave_anchor_lease_since",
+        stmts: &[
+            "ALTER TABLE arweave_anchors ADD COLUMN IF NOT EXISTS lease_since TIMESTAMPTZ",
+        ],
+    },
 ];
 
 /// Max distinct source repos recorded per pinned object (F1, #173 jatmn round 8).
@@ -4292,13 +4308,29 @@ pub enum AnchorClaim {
     AlreadyRecorded,
     /// A row exists in a non-terminal state (`pending`/`uploading`/`failed`).
     /// `item_id` is the ANS-104 data-item id persisted before the last upload
-    /// attempt (`None` when no request was ever prepared/sent). The worker must
-    /// reconcile it (probe the gateway) before deciding whether another paid
-    /// upload is safe.
+    /// attempt (`None` when no request was never prepared/sent). `claim_token`
+    /// is the lease token of the worker that last won the row (may be NULL for
+    /// pre-lease rows); the recoverer passes it as the expected value of the
+    /// atomic CAS in [`Db::set_anchor_uploading`] that hands the lease over, so
+    /// of N concurrent recoverers exactly one can win and pay.
+    /// `claimed_at` is the timestamp from the ORIGINAL claim row — kept stable
+    /// across lease rotations (rotations bump their own copy) so a rebuilt
+    /// anchor item keeps the same content-derived id (deterministic retry,
+    /// #224 review).
+    ///
+    /// Recovery workers must reconcile (probe the gateway) and then win the
+    /// lease CAS BEFORE paying for an upload. There is no time-based expiry:
+    /// the CAS requires the CURRENT holder's token, which every recoverer reads
+    /// from the row, so a dead holder is replaced as soon as anyone retries;
+    /// a live-but-slow holder is protected from a double pay by the same CAS
+    /// because a loser's expected token stops matching the instant the winner
+    /// rotates it.
     Recover {
         id: String,
         state: String,
         item_id: Option<String>,
+        claim_token: Option<String>,
+        claimed_at: Option<String>,
     },
 }
 
@@ -4315,11 +4347,25 @@ pub struct ClaimAnchorInput<'a> {
     /// The NODE's DID — the anchor issuer (never the pusher, #224 review).
     pub node_did: &'a str,
     pub cert_id: Option<&'a str>,
-    /// Opaque per-claim lease token (for operator forensics on mid-flight rows).
+    /// Opaque per-claim lease token. On the fresh-claim path it is the new
+    /// worker's own token; on the recover path it supplies the CURRENT holder's
+    /// token (read from the row) so the per-row CAS can hand the lease over.
     pub claim_token: &'a str,
     /// RFC 3339 timestamp of this claim.
     pub claimed_at: &'a str,
 }
+
+/// Quiescence window for reclaiming an `uploading` anchor outbox row. A
+/// recoverer seeing an `uploading` row cannot tell a dead holder (crashed
+/// between the paid request and the terminal write) from a live one (still in
+/// flight — the item MAY yet be accepted). Re-uploading against a live holder
+/// is a double payment for the same transition, so the lease hand-off CAS in
+/// [`Db::set_anchor_uploading`] only reclaims an `uploading` row once the
+/// row's `claimed_at` is older than this window; `pending`/`failed` rows
+/// (where nothing is in flight) are reclaimable immediately. A worker whose
+/// CAS gets blocked by the window fails its job and lets the job-level retry
+/// policy (restart drain) come back after the window passes.
+pub const ANCHOR_UPLOADING_LEASE_SECONDS: i64 = 300;
 
 impl Db {
     #[cfg(test)]
@@ -4377,7 +4423,7 @@ impl Db {
             return Ok(AnchorClaim::Claimed { id });
         }
         let row = sqlx::query(
-            "SELECT id, state, item_id FROM arweave_anchors
+            "SELECT id, state, item_id, claim_token, claimed_at FROM arweave_anchors
              WHERE repo = $1 AND ref_name = $2 AND old_sha = $3 AND new_sha = $4",
         )
         .bind(input.repo)
@@ -4390,10 +4436,17 @@ impl Db {
         if state == "recorded" {
             return Ok(AnchorClaim::AlreadyRecorded);
         }
+        // Surface the CURRENT lease holder so the recoverer's CAS in
+        // set_anchor_uploading can be conditioned on the actual token: the CAS
+        // guarantees exclusive ownership of the upload obligation.
+        let claim_token: Option<String> = row.get("claim_token");
+        let claimed_at: Option<String> = row.get("claimed_at");
         Ok(AnchorClaim::Recover {
             id: row.get("id"),
             state,
             item_id: row.get("item_id"),
+            claim_token,
+            claimed_at,
         })
     }
 
@@ -4401,24 +4454,96 @@ impl Db {
     /// data-item id that the upload request is about to send. Persisting the id
     /// BEFORE the request is what lets a crash-recovery probe that id to decide
     /// whether the upload landed (#224 review).
-    pub async fn set_anchor_uploading(&self, id: &str, item_id: &str) -> Result<()> {
-        sqlx::query("UPDATE arweave_anchors SET state = 'uploading', item_id = $1 WHERE id = $2")
-            .bind(item_id)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+    ///
+    /// This IS the per-row LEASE HAND-OFF — the concurrency boundary for paid
+    /// uploads (the atomic INSERT only resolves the fresh-claim race; it grants
+    /// no ownership of an existing non-terminal row, so recovering workers must
+    /// win this CAS before paying). The update applies only when the row is
+    /// non-terminal AND its `claim_token` still equals `expected_claim_token`
+    /// (or is NULL, for pre-lease rows) AND, for an `uploading` row, the lease
+    /// is older than [`ANCHOR_UPLOADING_LEASE_SECONDS`] (see below):
+    ///
+    /// Hand the lease from the worker holding `expected_claim_token` to the
+    /// caller, whose `new_claim_token` replaces it in the SAME row write. Of
+    /// N concurrent recoverers that all read the same current token, exactly
+    /// ONE wins this write; every loser gets `rows_affected == 0` and its
+    /// expected token no longer matches the row, so its subsequent terminal
+    /// writes are no-ops. Passing the holder's OWN token (fresh-claim path)
+    /// is the same guard.
+    ///
+    /// - `Some(t)` ONLY: the hand-off never applies without an expected token —
+    ///   there is no unconditional path. Pre-lease rows (claim_token IS NULL)
+    ///   are captured by passing the empty string as `t`: it can never equal a
+    ///   real UUID token, and the CAS's NULL clause accepts it.
+    ///
+    /// Quiescence for `uploading` rows: a recoverer seeing `uploading` cannot
+    /// tell a dead holder from a live one mid-request (the item may still be
+    /// accepted). The CAS therefore reclaims an `uploading` row only once its
+    /// `lease_since` is older than [`ANCHOR_UPLOADING_LEASE_SECONDS`] (a NULL
+    /// `lease_since` means the lease clock predates the column; those rows are
+    /// reclaimable immediately). Before the window passes the row is presumed
+    /// live and the takeover is suppressed. `pending` and `failed` rows are
+    /// reclaimed immediately — no holder can be in flight there. A worker
+    /// blocked by the window sees `rows_affected == 0` and must fail
+    /// closed, never upload.
+    ///
+    /// On success the row's `lease_since` is refreshed to `now()` — the lease
+    /// clock for the NEXT takeover. `claimed_at` is deliberately NOT touched:
+    /// it is the anchor timestamp the item embeds, and every probe/retry must
+    /// reconcile the same id the row carries (#224 deterministic retry).
+    ///
+    /// Returns the number of rows affected; the caller MUST check `> 0` before
+    /// the paid upload, and MUST NOT touch the row afterward if it is 0.
+    pub async fn set_anchor_uploading(
+        &self,
+        id: &str,
+        item_id: &str,
+        expected_claim_token: &str,
+        new_claim_token: Option<&str>,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE arweave_anchors
+             SET state = 'uploading', item_id = $1,
+                 lease_since = now(),
+                 claim_token = COALESCE($4, claim_token)
+             WHERE id = $2
+             AND state != 'recorded'
+             AND (claim_token = $3 OR claim_token IS NULL)
+             AND (state != 'uploading'
+                  OR lease_since IS NULL
+                  OR lease_since < now() - make_interval(secs => $5))",
+        )
+        .bind(item_id)
+        .bind(id)
+        .bind(expected_claim_token)
+        .bind(new_claim_token)
+        .bind(ANCHOR_UPLOADING_LEASE_SECONDS)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// Mark a claimed outbox row `failed` (the provider definitively rejected
     /// the upload). The job row carries the error detail; the transition stays
     /// reserved so a later drain owns it and re-uploads.
-    pub async fn set_anchor_failed(&self, id: &str) -> Result<()> {
-        sqlx::query("UPDATE arweave_anchors SET state = 'failed' WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+    ///
+    /// Lease-conditioned on `expected_claim_token` (same rules as
+    /// [`Db::set_anchor_uploading`], minus the quiescence clause — a row whose
+    /// holder was rejected is not in flight): a worker whose lease was already
+    /// handed off, or a row that reached `recorded`, must NOT be able to flip
+    /// the winner's state. Returns the number of rows affected so the caller
+    /// can log a superseded write; a 0 here is not an error for the loser.
+    pub async fn set_anchor_failed(&self, id: &str, expected_claim_token: &str) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE arweave_anchors SET state = 'failed'
+             WHERE id = $1 AND state != 'recorded'
+             AND (claim_token = $2 OR claim_token IS NULL)",
+        )
+        .bind(id)
+        .bind(expected_claim_token)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// Persist the accepted upload on a claimed outbox row: `recorded` state,
@@ -4426,19 +4551,58 @@ impl Db {
     /// resolves the item under, so it becomes the probe id for later replays),
     /// and the anchor timestamp. This is the durable terminal state; a retry
     /// that finds it skips the upload entirely.
-    pub async fn record_claimed_anchor(&self, id: &str, tx_id: &str) -> Result<()> {
+    ///
+    /// This is the post-PAID-upload terminal write and MUST be
+    /// lease-conditioned on `expected_claim_token` (same rules as
+    /// [`Db::set_anchor_uploading`]): a superseded worker (whose lease was
+    /// handed off mid-flight while an upload may or may not have landed) must
+    /// not overwrite the current holder's terminal state with its own
+    /// transaction id. Returns rows affected; 0 means the caller was
+    /// superseded and its write was suppressed.
+    pub async fn record_claimed_anchor(
+        &self,
+        id: &str,
+        tx_id: &str,
+        expected_claim_token: &str,
+    ) -> Result<u64> {
         let now = Utc::now().to_rfc3339();
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE arweave_anchors
              SET state = 'recorded', arweave_tx_id = $1, item_id = $1, anchored_at = $2
-             WHERE id = $3",
+             WHERE id = $3 AND state != 'recorded'
+             AND (claim_token = $4 OR claim_token IS NULL)",
+        )
+        .bind(tx_id)
+        .bind(&now)
+        .bind(id)
+        .bind(expected_claim_token)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Record an anchor the gateway PROBE confirmed already landed, without any
+    /// paid upload. Unlike [`Db::record_claimed_anchor`] this write is NOT
+    /// lease-conditioned: the transaction id being recorded is the row's own
+    /// Probed `item_id` — the exact request identity an upload attempt sent —
+    /// so no caller fabricates the identity; every worker converges on the
+    /// same value, and the `state != 'recorded'` guard keeps the write
+    /// idempotent. The recovery path uses this so a worker that did not (and
+    /// must not, without paying) hijack the lease can still persist the
+    /// verified landing. Returns rows affected.
+    pub async fn recover_claimed_anchor(&self, id: &str, tx_id: &str) -> Result<u64> {
+        let now = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE arweave_anchors
+             SET state = 'recorded', arweave_tx_id = $1, item_id = $1, anchored_at = $2
+             WHERE id = $3 AND state != 'recorded'",
         )
         .bind(tx_id)
         .bind(&now)
         .bind(id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected())
     }
 
     /// Whether this exact ref transition (same repo slug, ref, old→new SHAs)
@@ -4469,29 +4633,77 @@ impl Db {
         Ok(row.get::<bool, _>("present"))
     }
 
+    /// List anchors gated by current repo visibility, enforced in SQL. This is
+    /// the #136 listing gate lifted out of the handler's post-read loop: the
+    /// old filter ran one `authorize_repo_read` per anchor row (O(N) DB round-
+    /// trips per request), applied LIMIT before filtering (a page silently
+    /// shrank to whatever survived), and its raw slug-equality parse bypassed
+    /// the `did_matches` owner normalization the canonical gate applies.
+    ///
+    /// `arweave_anchors` is joined to its repo GROUP — the same (owner-key,
+    /// name) pair `dedup_cte` groups on — so a canonical `did:key:zX/name`
+    /// slug and a bare `zX/name` mirror sibling are one repo, and the gate
+    /// implements `visibility::listable_at_root`'s anonymous decision: a group
+    /// is visible iff it contains at least one non-quarantined `is_public`
+    /// row. Path-scoped rules never widen read access for anonymous callers,
+    /// so the `is_public` gate is complete for this unauthenticated surface.
+    ///
+    /// Fail-closed edges:
+    /// - Anchors whose repo resolves to no repo group (repo deleted, never
+    ///   mirrored, or unparseable slug) match nothing and are filtered. The
+    ///   old "include unparseable slugs for safety" fallback leaked past the
+    ///   gate and is deliberately gone.
+    /// - A quarantined canonical row hides the whole group even when a mirror
+    ///   sibling is public (the 404-as-404 paradigm), and quarantined rows
+    ///   never contribute `is_public` to a group.
+    /// - `LIMIT` applies AFTER the join, so filtered anchors cannot silently
+    ///   shorten a page.
+    ///
+    /// `repo`, when given as `owner/name`, filters on the normalized owner
+    /// key and the name — the same normalization the group key uses, so a
+    /// full `did:key:` filter matches bare-owner groups and vice versa.
     pub async fn list_arweave_anchors(
         &self,
         repo: Option<&str>,
         limit: i64,
     ) -> Result<Vec<ArweaveAnchor>> {
-        let rows = if let Some(repo) = repo {
-            sqlx::query(
-                "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, arweave_tx_id, node_did, anchored_at, cert_id
-                 FROM arweave_anchors WHERE repo=$1 AND state = 'recorded' ORDER BY anchored_at DESC LIMIT $2",
-            )
-            .bind(repo)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query(
-                "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, arweave_tx_id, node_did, anchored_at, cert_id
-                 FROM arweave_anchors WHERE state = 'recorded' ORDER BY anchored_at DESC LIMIT $1",
-            )
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
+        let (owner_key, name) = match repo.and_then(|r| r.split_once('/')) {
+            Some((owner, name)) if !owner.is_empty() && !name.is_empty() => {
+                (Some(normalize_owner_key(owner)), Some(name))
+            }
+            _ => (None, None),
         };
+        let sql = format!(
+            "WITH repo_groups AS (
+                 SELECT {rkey} AS okey, name AS repo_name,
+                        bool_or(is_public AND NOT quarantined) AS any_public,
+                        bool_or(quarantined AND position('/' in id) = 0)
+                            AS any_quarantined_canonical
+                 FROM repos
+                 GROUP BY {rkey}, name
+             )
+             SELECT a.id, a.repo, a.owner_did, a.ref_name, a.old_sha, a.new_sha,
+                    a.cid, a.arweave_tx_id, a.node_did, a.anchored_at, a.cert_id
+             FROM arweave_anchors a
+             JOIN repo_groups g
+               ON ({akey}) = g.okey
+              AND substr(a.repo, strpos(a.repo, '/') + 1) = g.repo_name
+             WHERE a.state = 'recorded'
+               AND g.any_public
+               AND NOT g.any_quarantined_canonical
+               AND ($1::text IS NULL OR g.okey = $1)
+               AND ($2::text IS NULL OR g.repo_name = $2)
+             ORDER BY a.anchored_at DESC
+             LIMIT $3",
+            rkey = OWNER_KEY_CASE_SQL,
+            akey = OWNER_KEY_CASE_SQL.replace("owner_did", "a.owner_did")
+        );
+        let rows = sqlx::query(&sql)
+            .bind(owner_key)
+            .bind(name)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok(rows
             .into_iter()
@@ -8258,9 +8470,27 @@ mod arweave_anchor_tests {
     async fn record_and_list_arweave_anchors(pool: PgPool) {
         let db = db(pool).await;
 
+        // The listing gate joins anchors to their repo group: only anchors for a
+        // repo with a current non-quarantined public row are visible.
+        db.create_repo(&crate::db::RepoRecord {
+            id: "repo-mine".into(),
+            name: "myrepo".into(),
+            owner_did: "did:key:zAlice".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            disk_path: "/tmp/myrepo".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+
         let input = RecordAnchorInputV2 {
-            repo: "alice/myrepo",
-            owner_did: "did:key:zOWNER",
+            repo: "did:key:zAlice/myrepo",
+            owner_did: "did:key:zAlice",
             ref_name: "refs/heads/main",
             old_sha: "0000000000000000000000000000000000000000",
             new_sha: "1111111111111111111111111111111111111111",
@@ -8272,12 +8502,208 @@ mod arweave_anchor_tests {
 
         db.record_arweave_anchor(&input).await.unwrap();
 
+        // Filter: full did:key owner form matches the bare-owner group key.
         let anchors = db
-            .list_arweave_anchors(Some("alice/myrepo"), 10)
+            .list_arweave_anchors(Some("did:key:zAlice/myrepo"), 10)
             .await
             .unwrap();
         assert_eq!(anchors.len(), 1, "one anchor recorded");
         assert_eq!(anchors[0].arweave_tx_id, "test-tx-id-123");
+
+        // Unfiltered list also sees it.
+        let all = db.list_arweave_anchors(None, 10).await.unwrap();
+        assert_eq!(all.len(), 1);
+
+        // A different group key must not match.
+        let other = db
+            .list_arweave_anchors(Some("zBob/myrepo"), 10)
+            .await
+            .unwrap();
+        assert!(other.is_empty(), "other owner must not see the anchor");
+    }
+
+    /// Private repos never surface in the anchor listing — neither the
+    /// canonical private row nor a quarantined row may make the repo public.
+    #[sqlx::test]
+    async fn list_anchors_hides_private_and_quarantined_repos(pool: PgPool) {
+        let db = db(pool.clone()).await;
+
+        // Private canonical repo with an anchor: logged but never listed.
+        db.create_repo(&crate::db::RepoRecord {
+            id: "repo-private".into(),
+            name: "secret".into(),
+            owner_did: "did:key:zAlice".into(),
+            description: None,
+            is_public: false,
+            default_branch: "main".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            disk_path: "/tmp/secret".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+        db.record_arweave_anchor(&RecordAnchorInputV2 {
+            repo: "did:key:zAlice/secret",
+            owner_did: "did:key:zAlice",
+            ref_name: "refs/heads/main",
+            old_sha: &"0".repeat(40),
+            new_sha: &"1".repeat(40),
+            cid: None,
+            arweave_tx_id: "tx-private",
+            node_did: "did:key:zNODE",
+            cert_id: None,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            db.list_arweave_anchors(None, 50).await.unwrap().is_empty(),
+            "private repo anchors must not be listed"
+        );
+
+        // Repo becomes public: the existing anchor surfaces.
+        sqlx::query("UPDATE repos SET is_public = TRUE WHERE id = 'repo-private'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let anchors = db.list_arweave_anchors(None, 50).await.unwrap();
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].arweave_tx_id, "tx-private");
+
+        // Back to private: hidden again.
+        sqlx::query("UPDATE repos SET is_public = FALSE WHERE id = 'repo-private'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(db.list_arweave_anchors(None, 50).await.unwrap().is_empty());
+
+        // Quarantined canonical row in the group hides the anchor even though
+        // is_public was flipped back on above (404-as-404).
+        sqlx::query(
+            "UPDATE repos SET is_public = TRUE, quarantined = TRUE WHERE id = 'repo-private'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            db.list_arweave_anchors(None, 50).await.unwrap().is_empty(),
+            "quarantined canonical repo must not list anchors"
+        );
+    }
+
+    /// An anchor whose repo rows are gone (repo deleted, or the slug never
+    /// matched a repo group, e.g. an unparseable slug) fails closed: the join
+    /// finds no group and the row is filtered — matching the handler's old
+    /// "skip unknown repo" contract without the O(N) per-repo read.
+    #[sqlx::test]
+    async fn list_anchors_without_repo_group_fails_closed(pool: PgPool) {
+        let db = db(pool).await;
+
+        // No repo rows at all for this slug.
+        db.record_arweave_anchor(&RecordAnchorInputV2 {
+            repo: "ghost/repo",
+            owner_did: "did:key:zGhost",
+            ref_name: "refs/heads/main",
+            old_sha: &"0".repeat(40),
+            new_sha: &"1".repeat(40),
+            cid: None,
+            arweave_tx_id: "tx-orphan",
+            node_did: "did:key:zNODE",
+            cert_id: None,
+        })
+        .await
+        .unwrap();
+        // Unparseable slug (no '/'): the substr join can never match a group.
+        db.record_arweave_anchor(&RecordAnchorInputV2 {
+            repo: "unparseable-slug",
+            owner_did: "did:key:zGhost2",
+            ref_name: "refs/heads/main",
+            old_sha: &"0".repeat(40),
+            new_sha: &"1".repeat(40),
+            cid: None,
+            arweave_tx_id: "tx-unparseable",
+            node_did: "did:key:zNODE",
+            cert_id: None,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            db.list_arweave_anchors(None, 50).await.unwrap().is_empty(),
+            "anchors with no current repo group must not be listed"
+        );
+    }
+
+    /// Group semantics across canonical + bare mirror siblings (#97-style):
+    /// the anchor is visible only when at least one non-quarantined public row
+    /// exists in the group, and the bare slug is reachable through the
+    /// `did:key:` filter key just like the full one.
+    #[sqlx::test]
+    async fn list_anchors_canonical_and_mirror_slug_share_one_group(pool: PgPool) {
+        use chrono::Utc;
+        let db = db(pool.clone()).await;
+
+        // Canonical private row + bare public mirror row, same (key, name).
+        db.create_repo(&crate::db::RepoRecord {
+            id: "repo-canonical".into(),
+            name: "dup".into(),
+            owner_did: "did:key:zAlice".into(),
+            description: None,
+            is_public: false,
+            default_branch: "main".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: "/tmp/dup".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+        db.upsert_mirror_repo("zAlice", "dup", "/tmp/dup-mirror", None, false)
+            .await
+            .unwrap();
+
+        // Anchor recorded under the canonical (full did) slug.
+        db.record_arweave_anchor(&RecordAnchorInputV2 {
+            repo: "did:key:zAlice/dup",
+            owner_did: "did:key:zAlice",
+            ref_name: "refs/heads/main",
+            old_sha: &"0".repeat(40),
+            new_sha: &"1".repeat(40),
+            cid: None,
+            arweave_tx_id: "tx-dup",
+            node_did: "did:key:zNODE",
+            cert_id: None,
+        })
+        .await
+        .unwrap();
+
+        // Mirror row is public -> group is visible && the anchor is listed
+        // even though the canonical row it was recorded under is private.
+        let anchors = db.list_arweave_anchors(None, 50).await.unwrap();
+        assert_eq!(anchors.len(), 1, "group visibility sees the anchored repo");
+        assert_eq!(anchors[0].repo, "did:key:zAlice/dup");
+
+        // Filter forms: full, bare, and bare-owner-of-the-same-key all match.
+        for filter in ["did:key:zAlice/dup", "zAlice/dup"] {
+            assert_eq!(
+                db.list_arweave_anchors(Some(filter), 50)
+                    .await
+                    .unwrap()
+                    .len(),
+                1,
+                "filter {filter} must resolve the group"
+            );
+        }
+
+        // Hide the mirror too: group loses visibility.
+        sqlx::query("UPDATE repos SET is_public = FALSE WHERE id = 'zAlice/dup'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(db.list_arweave_anchors(None, 50).await.unwrap().is_empty());
     }
 }
 #[cfg(test)]
@@ -9480,9 +9906,27 @@ mod upgrade_path_tests {
             .expect("cert readable");
         assert_eq!(got.pusher_sig.as_deref(), Some("sig1=:abc:"));
 
+        // A repo row for the anchor's group: the listing gate joins anchors to
+        // their repo group, so the slug must resolve to a public, non-quarantined
+        // repo or the anchor would not be listable (fail closed).
+        db.create_repo(&crate::db::RepoRecord {
+            id: "repo-anchor-alice".into(),
+            name: "myrepo".into(),
+            owner_did: "did:key:zAlice".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            disk_path: "/tmp/myrepo".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
         db.record_arweave_anchor(&RecordAnchorInputV2 {
-            repo: "alice/myrepo",
-            owner_did: "did:key:zOWNER",
+            repo: "did:key:zAlice/myrepo",
+            owner_did: "did:key:zAlice",
             ref_name: "refs/heads/main",
             old_sha: &"0".repeat(40),
             new_sha: &"1".repeat(40),
@@ -9494,7 +9938,7 @@ mod upgrade_path_tests {
         .await
         .unwrap();
         let anchors = db
-            .list_arweave_anchors(Some("alice/myrepo"), 10)
+            .list_arweave_anchors(Some("did:key:zAlice/myrepo"), 10)
             .await
             .unwrap();
         assert_eq!(anchors.len(), 1);
