@@ -318,7 +318,22 @@ pub(crate) async fn collect_visible_tasks(
     } else if stream_ended {
         (false, None)
     } else {
-        (true, examined)
+        // When scan budget was reached on an exact batch multiple, probe if any row
+        // exists beyond the scan budget in the database.
+        let more_in_db = !db
+            .list_tasks_keyset(
+                status,
+                assignee_did,
+                1,
+                examined.as_ref().map(TaskPosition::as_pair),
+            )
+            .await?
+            .is_empty();
+        if more_in_db {
+            (true, examined)
+        } else {
+            (false, None)
+        }
     };
 
     let incomplete = has_more && visible.len() < bounded_limit;
