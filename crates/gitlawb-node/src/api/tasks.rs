@@ -309,17 +309,45 @@ pub(crate) async fn collect_visible_tasks(
         }
     }
 
-    // Derive has_more from visible rows or scan-budget exhaustion, never from
-    // an un-gated candidate probe that would leak the existence of trailing
-    // denied rows (#327 review).
+    // While the scan is running, `has_more` is derived from visible rows only:
+    // finding a (bounded_limit + 1)-th visible row is what proves another page
+    // exists, so trailing denied rows inside one scan can never set it (#327
+    // review, `trailing_denied_tasks_do_not_set_has_more_or_leak_existence`).
+    //
+    // The scan ceiling is the one case that cannot be answered from visible
+    // rows, and the `else` branch below settles it with an un-gated
+    // `LIMIT 1` probe at the last examined position. That is deliberate, and
+    // the disclosure it carries is bounded as follows (#327 review):
+    //
+    // * What it can tell a caller: whether *any* candidate row — readable or
+    //   not — trails the position this request stopped at. One bit.
+    // * Where it can be asked: only at positions the server chose, which
+    //   advance a full `MAX_TASK_SCAN_CANDIDATES` per request, and only via a
+    //   MAC'd continuation token bound to the caller and filter
+    //   (`api::task_cursor`). A caller cannot aim the probe at a row of their
+    //   choosing, so the coarsest thing it yields is the candidate count to
+    //   `MAX_TASK_SCAN_CANDIDATES` granularity.
+    // * What it never carries: no denied row's id, timestamp, payload or
+    //   `ucan_token` reaches the caller, and `get_task` stays opaquely 404.
+    //
+    // Withholding the probe does not remove that bit, it only defers it:
+    // enumeration past a denied window longer than one scan budget is a hard
+    // requirement (`denied_window_longer_than_scan_budget_is_pageable_to_the_end`),
+    // so the ceiling has to hand back a continuation, and following that
+    // continuation returns the same terminal page the probe predicted — one
+    // round trip later. Paying an extra request per scan window to relocate
+    // the same bit is not a gate. `scan_ceiling_continuation_discloses_only_a_terminal_page`
+    // pins the bound end to end.
     let (has_more, next_position) = if visible.len() > bounded_limit {
         visible.truncate(bounded_limit);
         (true, resume_position_for_page)
     } else if stream_ended {
         (false, None)
     } else {
-        // When scan budget was reached on an exact batch multiple, probe if any row
-        // exists beyond the scan budget in the database.
+        // Scan budget exhausted with the page unproven: ask whether the
+        // candidate stream itself is finished, so an exhausted scan that
+        // happens to land on the last row is reported as the end rather than
+        // as a paused scan the caller would re-request forever.
         let more_in_db = !db
             .list_tasks_keyset(
                 status,
@@ -2192,6 +2220,114 @@ mod visible_tasks_tests {
         assert!(
             events.try_recv().is_err(),
             "a repo-less claim must not reach an anonymous subscriber"
+        );
+    }
+
+    /// #327 review: the scan-ceiling probe in `collect_visible_tasks` is
+    /// un-gated, so a filled page that stops at the ceiling reports
+    /// `has_more = true` when *any* candidate row trails the scan position,
+    /// including rows the caller may not read. That bit is intentional and
+    /// bounded — this pins the bound end to end.
+    ///
+    /// One newest public task, then more than a full scan budget of denied
+    /// rows and nothing visible beyond them. The anonymous caller gets its
+    /// visible row plus a continuation, and following that continuation
+    /// returns the terminal page the probe predicted. What the caller learns
+    /// is therefore exactly what one more request would have told it anyway:
+    /// no denied row's id, payload or `ucan_token` is disclosed at any point,
+    /// and the walk ends instead of spinning.
+    #[sqlx::test]
+    async fn scan_ceiling_continuation_discloses_only_a_terminal_page(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("public-repo", DELEGATOR, "public", true))
+            .await
+            .unwrap();
+        let mut visible_newest = task("newest-visible", Some("public-repo"), DELEGATOR);
+        visible_newest.created_at = "2026-01-03T00:00:00Z".into();
+        visible_newest.updated_at = visible_newest.created_at.clone();
+        state.db.create_task(&visible_newest).await.unwrap();
+
+        // More than one scan budget of unreadable rows, with no visible row
+        // behind them, so the first request stops at the ceiling with rows
+        // still trailing it.
+        for i in 0..(MAX_TASK_SCAN_CANDIDATES + 5) {
+            let mut hidden = task(&format!("hidden-{i:05}"), None, DELEGATOR);
+            hidden.created_at = "2026-01-02T00:00:00Z".into();
+            hidden.updated_at = hidden.created_at.clone();
+            state.db.create_task(&hidden).await.unwrap();
+        }
+
+        let first = list_router(state.clone())
+            .oneshot(anon_get("/api/v1/tasks?limit=1"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let body = body_json(first).await;
+        assert_eq!(
+            body["tasks"][0]["id"], "newest-visible",
+            "the visible row must still be served: {body}"
+        );
+        assert_eq!(body["count"], 1);
+        assert_eq!(
+            body["incomplete"], false,
+            "a page that filled is not a paused scan: {body}"
+        );
+        assert_eq!(
+            body["has_more"], true,
+            "the ceiling hands back a continuation so a longer denied window stays pageable: {body}"
+        );
+        let mut cursor = body["next_cursor"]
+            .as_str()
+            .expect("a continuation must accompany has_more")
+            .to_string();
+        assert!(
+            !body.to_string().contains("hidden-"),
+            "no response may disclose a denied row's id: {body}"
+        );
+        assert!(
+            !body.to_string().contains(SECRET_UCAN),
+            "no response may disclose a ucan token: {body}"
+        );
+
+        // Following the server's own continuation reaches the end of the
+        // stream without ever surfacing a denied row.
+        let mut requests = 1;
+        let terminal = loop {
+            requests += 1;
+            assert!(requests <= 4, "the continuation must terminate, not spin");
+            let resp = list_router(state.clone())
+                .oneshot(anon_get(&format!("/api/v1/tasks?limit=1&cursor={cursor}")))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let page = body_json(resp).await;
+            assert_eq!(
+                page["count"], 0,
+                "nothing visible trails the denied window: {page}"
+            );
+            assert!(
+                !page.to_string().contains("hidden-"),
+                "no response may disclose a denied row's id: {page}"
+            );
+            assert!(
+                !page.to_string().contains(SECRET_UCAN),
+                "no response may disclose a ucan token: {page}"
+            );
+            match page["next_cursor"].as_str() {
+                Some(next) => cursor = next.to_string(),
+                None => break page,
+            }
+        };
+
+        assert_eq!(
+            terminal["has_more"], false,
+            "the walk must end at a terminal page: {terminal}"
+        );
+        assert_eq!(
+            terminal["incomplete"], false,
+            "a terminal page is complete, not incomplete: {terminal}"
         );
     }
 
