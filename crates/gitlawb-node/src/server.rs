@@ -531,7 +531,7 @@ async fn ready(State(state): State<AppState>) -> axum::response::Response {
 
 async fn node_info(State(state): State<AppState>) -> Json<serde_json::Value> {
     let p2p_peer_id = state.p2p.as_ref().map(|h| h.local_peer_id.to_string());
-    Json(json!({
+    let mut body = json!({
         "name": "gitlawb-node",
         "version": env!("CARGO_PKG_VERSION"),
         "did": state.node_did.to_string(),
@@ -540,7 +540,11 @@ async fn node_info(State(state): State<AppState>) -> Json<serde_json::Value> {
         "auth": "http-signature-rfc9421",
         "identity": "ed25519",
         "p2p_peer_id": p2p_peer_id,
-    }))
+    });
+    if let Some(web_url) = &state.config.web_url {
+        body["web_url"] = json!(web_url);
+    }
+    Json(body)
 }
 
 pub(crate) async fn stats(State(state): State<AppState>) -> Json<serde_json::Value> {

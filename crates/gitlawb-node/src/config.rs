@@ -63,6 +63,12 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_PUBLIC_URL")]
     pub public_url: Option<String>,
 
+    /// Base URL for the web view of repos on this node (e.g. https://gitlawb.com).
+    /// When set, `GET /` advertises it as `web_url` so the CLI can print a
+    /// working `View:` link.  Omit for nodes that have no web front-end.
+    #[arg(long, env = "GITLAWB_WEB_URL")]
+    pub web_url: Option<String>,
+
     /// Comma-separated list of bootstrap peer URLs to announce to on startup
     #[arg(long, env = "GITLAWB_BOOTSTRAP_PEERS", value_delimiter = ',')]
     pub bootstrap_peers: Vec<String>,

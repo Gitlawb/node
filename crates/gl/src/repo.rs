@@ -265,7 +265,16 @@ async fn cmd_create(
     println!("✓ Created repository: {name}");
     println!("  Clone: git clone {gitlawb_url}");
     println!("  HTTP:  {clone_url}");
-    println!("  View:  https://gitlawb.com/{owner_short}/{name}");
+    // Only print View: when the node advertises a web_url — self-hosted nodes
+    // without a web front-end would otherwise produce a 404 link (#370).
+    let info_client = NodeClient::new(&node, None);
+    if let Ok(info_resp) = info_client.get("/").await {
+        if let Ok(info) = info_resp.json::<Value>().await {
+            if let Some(web_url) = info["web_url"].as_str() {
+                println!("  View:  {web_url}/{owner_short}/{name}");
+            }
+        }
+    }
     if let Some(desc) = payload["description"].as_str().filter(|s| !s.is_empty()) {
         println!("  Desc:  {desc}");
     }
