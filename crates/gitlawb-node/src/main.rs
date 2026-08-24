@@ -1286,6 +1286,7 @@ mod rate_limiter_sweep_tests {
         state.peer_write_rate_limiter = RateLimiter::new(10, window);
         state.ipfs_rate_limiter = RateLimiter::new(10, window);
         state.ipfs_work_rate_limiter = RateLimiter::new(10, window);
+        state.arweave_rate_limiter = RateLimiter::new(10, window);
 
         let limiters = |s: &crate::state::AppState| {
             [
@@ -1296,6 +1297,7 @@ mod rate_limiter_sweep_tests {
                 s.peer_write_rate_limiter.clone(),
                 s.ipfs_rate_limiter.clone(),
                 s.ipfs_work_rate_limiter.clone(),
+                s.arweave_rate_limiter.clone(),
             ]
         };
         for l in limiters(&state) {
@@ -1310,6 +1312,22 @@ mod rate_limiter_sweep_tests {
             assert_eq!(l.tracked_keys().await, 0, "limiter {i} was not swept");
         }
     }
+}
+
+/// Evict expired entries from every per-key rate limiter on the state.
+///
+/// Named and driven off `AppState` so the periodic sweeper stays in step with
+/// the limiters the router actually mounts: adding a limiter field and
+/// forgetting it here leaves its keys pinned until the map hits `max_keys` and
+/// the inline capacity sweep runs (the `/ipfs` limiter was missed this way).
+async fn sweep_rate_limiters(state: &AppState) {
+    state.rate_limiter.cleanup().await;
+    state.create_ip_rate_limiter.cleanup().await;
+    state.push_rate_limiter.cleanup().await;
+    state.sync_trigger_rate_limiter.cleanup().await;
+    state.peer_write_rate_limiter.cleanup().await;
+    state.ipfs_rate_limiter.cleanup().await;
+    state.arweave_rate_limiter.cleanup().await;
 }
 
 async fn gossip_ping_round(

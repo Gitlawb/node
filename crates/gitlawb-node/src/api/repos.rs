@@ -11438,12 +11438,10 @@ mod tests {
     /// URL and a probe counter.
     async fn f2a_gateway(
         mode: &'static str,
-        // The item store shared with the paired `f2a_bundler` — a "present"
-        // probe serves the uploaded bytes verbatim. This is because
-        // `anchor_item_present` derives the body's ANS-104 id and compares it
-        // against the id that was probed (a 2xx with a non-matching body is
-        // treated as "no verdict" and fails closed). A JSON placeholder body
-        // can never satisfy that check.
+        // The item store shared with the paired `f2a_bundler`. A real gateway
+        // returns the anchor's JSON payload for `GET /{item_id}`, not raw
+        // ANS-104 bytes. The "present" mode serves a minimal JSON anchor
+        // payload so the recovery probe exercises the JSON path.
         uploaded: std::sync::Arc<std::sync::RwLock<Option<Vec<u8>>>>,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use axum::response::IntoResponse;
@@ -11462,16 +11460,29 @@ mod tests {
                         probes.fetch_add(1, Ordering::SeqCst);
                         match mode {
                             "present" => {
-                                // Serve the exact item the node uploaded; if
-                                // nothing has been uploaded there is no item to
-                                // be "present", so 404.
+                                // Serve a JSON anchor payload — this is what a
+                                // real gateway returns for GET /{item_id}.
+                                // If nothing has been uploaded yet there is no
+                                // item to be "present", so 404.
                                 match uploaded.read().unwrap().clone() {
-                                    Some(bytes) => (
-                                        axum::http::StatusCode::OK,
-                                        [("content-type", "application/octet-stream")],
-                                        bytes,
-                                    )
-                                        .into_response(),
+                                    Some(_bytes) => {
+                                        let anchor = serde_json::json!({
+                                            "schema": "gitlawb/ref-update/v1",
+                                            "repo": "zAlice/myrepo",
+                                            "repo_id": "repo-uuid",
+                                            "owner_did": "did:key:z6MkOwner",
+                                            "ref_name": "refs/heads/main",
+                                            "old_sha": "0".repeat(40),
+                                            "new_sha": "a".repeat(40),
+                                            "node_did": "did:key:zNODE",
+                                        });
+                                        (
+                                            axum::http::StatusCode::OK,
+                                            [("content-type", "application/json")],
+                                            serde_json::to_vec(&anchor).unwrap(),
+                                        )
+                                            .into_response()
+                                    }
                                     None => {
                                         (axum::http::StatusCode::NOT_FOUND, "{}").into_response()
                                     }

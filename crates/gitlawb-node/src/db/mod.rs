@@ -1196,16 +1196,48 @@ const MIGRATIONS: &[Migration] = &[
             // the head of the list", which is the same thing a never-swept node reads.
             "ALTER TABLE pin_repair_sweep ADD COLUMN IF NOT EXISTS discovery_cursor_created_at TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE pin_repair_sweep ADD COLUMN IF NOT EXISTS discovery_cursor_id TEXT NOT NULL DEFAULT ''",
+            // Backfill: assign sequential seq values to existing certificates
+            // before creating the unique index. Migrations v10/v11 may have left
+            // multiple rows per repo (from different refs) all at seq = 1.
+            // The prev column is intentionally NOT backfilled here: chain
+            // verification in verify_anchor computes expected_prev dynamically
+            // from the predecessor's 7 canonical fields (repo_id, ref, old,
+            // new, pusher, node, ts), never reading the DB's prev column.
+            // Existing prev values already match what was computed at issuance.
+            r#"UPDATE ref_certificates
+               SET seq = subq.new_seq
+               FROM (
+                   SELECT id, ROW_NUMBER() OVER (
+                       PARTITION BY repo_id ORDER BY issued_at ASC, id ASC
+                   ) AS new_seq
+                   FROM ref_certificates
+               ) subq
+               WHERE ref_certificates.id = subq.id"#,
+            // Make cert chain append-only: add a unique constraint on
+            // (repo_id, seq) so concurrent pushes cannot collide on the same
+            // sequence number.  The superseded (repo_id, ref_name) unique index
+            // is dropped in v27 of this same release — it cannot be deferred
+            // any longer because append-only REQUIRES multiple rows per
+            // (repo_id, ref_name), which a unique index forbids; the two are
+            // mutually exclusive.  Nodes share no database (each runs its own
+            // local Postgres), so the drop cannot strand a mixed-version
+            // writer mid-rollout.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ref_certs_repo_seq ON ref_certificates(repo_id, seq)",
+            // Store the full HTTP Signature context so a third party can verify
+            // the pusher authorization proof (RFC 9421).
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS signature_input TEXT",
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS content_digest TEXT",
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS request_path TEXT",
         ],
     },
     Migration {
-        version: 20,
+        version: 27,
         name: "drop_ref_certs_repo_ref_unique",
         // ONE-WAY, ROLLBACK-UNSUPPORTED: this drops the unique index that v10
         // (ref_cert_unique_per_ref) created. Rolling back to v19 would require
-        // re-creating `idx_ref_certs_repo_ref`, which a release built at v20+
+        // re-creating `idx_ref_certs_repo_ref`, which a release built at v27+
         // cannot do (the migration that created it has been superseded).
-        // Operators must treat v20 as terminal: there is no supported downgrade
+        // Operators must treat v27 as terminal: there is no supported downgrade
         // past it. The drop itself is the point of the migration — the old
         // index would reject the second cert insert for a ref, which the
         // append-only cert chain (v19) requires.
@@ -1220,13 +1252,11 @@ const MIGRATIONS: &[Migration] = &[
             "DROP INDEX IF EXISTS idx_ref_certs_repo_ref",
         ],
     },
-    // Durable post-receive jobs (#224 review). Numbered 21: versions 12–16 are
-    // claimed by other in-flight branches, and 17 is main's prior max (18–20
-    // are this same branch's earlier migrations; #173 renumbers before merge).
-    // The runner keys the applied set on the integer alone, so gaps are
-    // harmless.
+    // Durable post-receive jobs (#224 review). Numbered 28: versions 12–16 are
+    // claimed by other in-flight branches, 17–19 are main's prior migrations,
+    // and 20–26 are claimed by #173.
     Migration {
-        version: 21,
+        version: 28,
         name: "durable_post_receive_jobs",
         stmts: &[
             r#"CREATE TABLE IF NOT EXISTS post_receive_jobs (
@@ -1259,7 +1289,7 @@ const MIGRATIONS: &[Migration] = &[
     // whether the crashed upload actually landed before ever issuing a second
     // paid request. `claim_token`/`claimed_at` record who holds the lease.
     Migration {
-        version: 22,
+        version: 29,
         name: "arweave_anchor_outbox",
         stmts: &[
             // Existing rows were all uploaded and recorded by earlier code, so
@@ -1295,7 +1325,7 @@ const MIGRATIONS: &[Migration] = &[
     // and rows later set to `recorded` keep their anchored-at value; 'pre-lease'
     // rows (claim_token IS NULL) are matched by the CAS's NULL branch regardless.
     Migration {
-        version: 23,
+        version: 30,
         name: "arweave_anchor_lease_since",
         stmts: &[
             "ALTER TABLE arweave_anchors ADD COLUMN IF NOT EXISTS lease_since TIMESTAMPTZ",

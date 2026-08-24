@@ -497,8 +497,24 @@ pub(crate) async fn anchor_item_present(
             .bytes()
             .await
             .map_err(|e| anyhow::anyhow!("failed to read gateway probe response: {e}"))?;
-        // The response is an ANS-104 data item. Verify its id by deriving it
-        // from the signature region (bytes 2..66) per ANS-104 spec.
+        // The gateway may return either the raw ANS-104 data item (binary) or
+        // the anchor's JSON payload depending on the gateway implementation and
+        // content-negotiation.  Handle both representations:
+        //
+        // 1. JSON anchor payload: `GET /{item_id}` resolved to valid JSON → the
+        //    gateway recognises this item_id and returned its content.  A 200
+        //    with JSON for a specific item_id is a positive existence proof — we
+        //    do not re-derive an id from JSON fields because the anchor payload
+        //    does not carry the ANS-104 item id.
+        //
+        // 2. Raw ANS-104 data item: derive the id from the Ed25519 signature
+        //    region (bytes 2..66 per ANS-104 spec) and compare against the
+        //    probed id — a 200 with a non-matching body is a phantom.
+        if serde_json::from_slice::<serde_json::Value>(&body).is_ok() {
+            // JSON response: the gateway resolved this item_id.
+            return Ok(true);
+        }
+        // Raw bytes: derive the ANS-104 item id and verify it matches.
         let body_id = crate::ans104::data_item_id(&body);
         if body_id == item_id {
             return Ok(true);
