@@ -1007,6 +1007,39 @@ mod tests {
         assert_eq!(probe, PromisorProbe::NotPromisor);
     }
 
+    /// #374: `clone_repo` interpolates the peer's origin URL into a `git
+    /// clone --mirror` argument list. Without a `--` delimiter git parses a
+    /// remote beginning with `-` as an option instead of a repository, and
+    /// `--upload-pack=<cmd>` is an option git hands to a shell — arbitrary
+    /// execution on the node driven by a value this process did not author.
+    ///
+    /// The delimiter is what forces the same string to be a repository, and
+    /// git says so in its own words: it reports the whole argument as a
+    /// repository it cannot find. Undelimited, git consumes it as an option
+    /// and fails against the *destination* instead ("Could not read from
+    /// remote repository"), never naming the injected string — which is why
+    /// this assertion is RED before the fix and GREEN after.
+    ///
+    /// The payload is deliberately free of `:` and spaces: a colon would make
+    /// git read the argument as an ssh-style `host:path` URL and report a
+    /// hostname rather than a repository, which is a different code path.
+    #[tokio::test]
+    async fn clone_never_parses_a_remote_as_a_git_option() {
+        let td = TempDir::new().unwrap();
+        let dest = td.path().join("mirror.git");
+        let injected = "--upload-pack=false";
+
+        let err = clone_repo(injected, &dest, MirrorMode::Plain)
+            .await
+            .expect_err("a remote that is not a repository must fail the clone")
+            .to_string();
+
+        assert!(
+            err.contains(injected),
+            "git must report the argument as a repository, not consume it as an option: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn probe_reports_unknown_on_git_error() {
         // A path git cannot resolve as a repo at all (exit 128) is an indeterminate
