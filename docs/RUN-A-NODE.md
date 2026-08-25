@@ -141,31 +141,43 @@ During the cooldown your node still earns rewards if it keeps heartbeating.
 
 ---
 
-## Hardening: owner-only push
+## Owner-only push
 
-By default the node authenticates every `git-receive-pack` push (a valid RFC 9421
-`did:key` signature) but does **not** check that the pusher owns the repo, except
-on branches that are explicitly protected. Because `did:key` is self-certifying,
-any party can generate a key, derive its DID, sign, and push to an unprotected
-branch — authentication is not authorization.
+The node requires the authenticated pusher to be the repo owner on **every**
+branch. A push whose authenticated DID is not the repo owner is rejected with
+HTTP 403 before any ref update is applied. The owner is matched in both the full
+`did:key:z6Mk…` form and its bare `z6Mk…` suffix.
 
-To require the authenticated pusher to be the repo owner on **every** branch, set:
+This is on by default, and the default is the point. The node authenticates every
+`git-receive-pack` push with a valid RFC 9421 `did:key` signature, but `did:key`
+is self-certifying: any party can generate a key, derive its DID and sign.
+Authentication is not authorization, so without this gate every signed caller can
+push to every repository — private ones included — on any branch that is not
+explicitly protected.
+
+### Turning it off
 
 ```bash
-GITLAWB_ENFORCE_OWNER_PUSH=true
+GITLAWB_ENFORCE_OWNER_PUSH=false
 ```
 
-- **Default `false`** — preserves current behavior so live nodes are unaffected by
-  an upgrade. Turn it on once you're ready for owner-only writes.
-- **When `true`** — a push whose authenticated DID is not the repo owner is
-  rejected (HTTP 403) before any ref update is applied. The owner is matched in
-  both the full `did:key:z6Mk…` form and its bare `z6Mk…` suffix.
-- **Caution: this blocks every non-owner pusher, including your own delegated and
-  CI agents.** Push authorization is owner-only today — a UCAN `git/push`
-  capability is verified but not yet honored for authorization, so delegated keys
-  cannot push while this is on. Don't enable it until every identity that pushes
-  to your repos is the owner, or you'll lock out your own automation. Scoped
-  collaborator / UCAN-delegated push rights are a planned follow-up.
+Both the environment variable and `--enforce-owner-push false` disable it; the
+bare `--enforce-owner-push` flag still means `true`.
+
+Do this only for a rolling upgrade whose pushers are not yet the repo owner, and
+treat it as temporary: while it is off, your node accepts a push to any repository
+from anyone who can generate a keypair.
+
+### Caution: delegated and CI keys are non-owners
+
+Push authorization is owner-only today. A UCAN `git/push` capability is verified
+but **not yet honored for authorization**, so a delegated key cannot push while
+this gate is on, even when it holds a valid capability for the repo.
+
+If your automation pushes under its own DID rather than the owner's, it will start
+getting 403s. Either have it push as the owner, or set
+`GITLAWB_ENFORCE_OWNER_PUSH=false` until scoped collaborator / UCAN-delegated push
+rights land — that work is what removes this trade-off.
 
 ---
 

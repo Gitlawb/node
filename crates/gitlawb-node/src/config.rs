@@ -78,10 +78,26 @@ pub struct Config {
 
     /// Require the authenticated pusher to be the repo owner on `git-receive-pack`.
     /// Authentication (a valid did:key signature) is not authorization on its own:
-    /// any party can sign as their own DID. When true, pushes whose authenticated
-    /// DID is not the repo owner are rejected. Keep false during rolling upgrades;
-    /// flip it on once owners are ready for owner-only writes.
-    #[arg(long, env = "GITLAWB_ENFORCE_OWNER_PUSH", default_value_t = false)]
+    /// any party can mint a did:key and sign as it, so with this off every signed
+    /// caller may push to every repository, private ones included. On by default.
+    ///
+    /// Turn it off only for a rolling upgrade whose pushers are not yet the repo
+    /// owner. Both `GITLAWB_ENFORCE_OWNER_PUSH=false` and `--enforce-owner-push
+    /// false` disable it, and the bare `--enforce-owner-push` form still means
+    /// `true`.
+    ///
+    /// The value-taking action is what makes the CLI form parse at all: as a
+    /// presence-only flag, `--enforce-owner-push false` is an "unexpected argument"
+    /// error. The env form resolved correctly either way, so it is the CLI escape
+    /// hatch this buys, not the environment one.
+    #[arg(
+        long,
+        env = "GITLAWB_ENFORCE_OWNER_PUSH",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_value_t = true,
+        default_missing_value = "true"
+    )]
     pub enforce_owner_push: bool,
 
     /// URL of local IPFS/Kubo node HTTP API (e.g. http://127.0.0.1:5001)
@@ -1382,6 +1398,53 @@ mod tests {
         assert!(
             at_floor.validate().is_ok(),
             "db_max_connections at the floor (pushes + headroom) must validate"
+        );
+    }
+
+    /// The DECLARED default, read off the parser rather than out of a parse.
+    ///
+    /// `Config::parse_from` consults the process environment, so on a host that
+    /// exports `GITLAWB_ENFORCE_OWNER_PUSH=false` a parse-based assertion says
+    /// nothing about what this crate declares — it reports the operator's setting.
+    /// Asserting the declaration is the env-independent form, and it is the one that
+    /// actually fails if someone flips `default_value_t` back.
+    #[test]
+    fn enforce_owner_push_is_declared_true_independent_of_the_environment() {
+        use clap::CommandFactory;
+        let cmd = Config::command();
+        let arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "enforce_owner_push")
+            .expect("the argument must exist");
+        assert_eq!(
+            arg.get_default_values(),
+            ["true"],
+            "owner-only push must be the declared default; a node started with no \
+             configuration cannot accept a push from a self-minted key"
+        );
+    }
+
+    /// The flip must not strand an operator mid-upgrade.
+    ///
+    /// Turning the gate on is a breaking change for any deployment whose pushers are
+    /// not yet the repo owner, so the escape hatch has to keep working. As a
+    /// presence-only flag `--enforce-owner-push false` is not "false", it is an
+    /// "unexpected argument" error; the value-taking action is what makes that form
+    /// parse.
+    ///
+    /// This pins the CLI form only. The environment form resolved to `false` under
+    /// the presence-only declaration too, so it is not what this change fixed, and it
+    /// is not exercised here because the process environment is global and these
+    /// tests run in parallel.
+    #[test]
+    fn enforce_owner_push_stays_disableable_for_rolling_upgrades() {
+        assert!(
+            !Config::parse_from(["gitlawb-node", "--enforce-owner-push", "false"])
+                .enforce_owner_push,
+            "operators must still be able to opt out during a rolling upgrade"
+        );
+        assert!(
+            Config::parse_from(["gitlawb-node", "--enforce-owner-push", "true"]).enforce_owner_push
         );
     }
 }
