@@ -589,6 +589,16 @@ impl Config {
                 floor
             ));
         }
+        // GITLAWB_WEB_URL is advertised in GET / so the CLI can print a working
+        // View: link. Clap maps "" to Some("") which would produce a broken URL;
+        // reject early instead of serving a malformed link.
+        if let Some(url) = &self.web_url {
+            if url.trim().is_empty() {
+                return Err("GITLAWB_WEB_URL must not be empty or whitespace-only — \
+                     set it to a full URL like https://gitlawb.com or leave it unset."
+                    .into());
+            }
+        }
         Ok(())
     }
 }
@@ -977,6 +987,32 @@ mod tests {
         assert!(
             at_floor.validate().is_ok(),
             "db_max_connections at the floor (pushes + headroom) must validate"
+        );
+    }
+
+    #[test]
+    fn web_url_rejects_empty_and_whitespace() {
+        // Unset is fine.
+        Config::parse_from(["gitlawb-node"])
+            .validate()
+            .expect("no web_url must validate");
+
+        // A real URL validates.
+        let mut cfg = Config::parse_from(["gitlawb-node"]);
+        cfg.web_url = Some("https://gitlawb.com".into());
+        assert!(cfg.validate().is_ok());
+
+        // Empty string is rejected.
+        let mut cfg = Config::parse_from(["gitlawb-node"]);
+        cfg.web_url = Some("".into());
+        assert!(cfg.validate().is_err(), "empty web_url must be rejected");
+
+        // Whitespace-only is rejected.
+        let mut cfg = Config::parse_from(["gitlawb-node"]);
+        cfg.web_url = Some("   ".into());
+        assert!(
+            cfg.validate().is_err(),
+            "whitespace-only web_url must be rejected"
         );
     }
 }

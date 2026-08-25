@@ -136,18 +136,8 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
     println!("  Clone:  git clone {gitlawb_url}");
     // Only print View: when the node advertises a web_url — self-hosted nodes
     // without a web front-end would otherwise produce a 404 link (#370).
-    let info_client = NodeClient::new(&args.node, None);
-    if let Ok(info_resp) = info_client.get("/").await {
-        if info_resp.status().is_success() {
-            if let Ok(info) = info_resp.json::<Value>().await {
-                if let Some(web_url) = info["web_url"].as_str() {
-                    let web_url = web_url.trim_end_matches('/');
-                    if !web_url.is_empty() {
-                        println!("  View:   {web_url}/{owner_short}/{name}");
-                    }
-                }
-            }
-        }
+    if let Some(web_url) = crate::repo::fetch_node_web_url(&args.node).await {
+        println!("  View:   {web_url}/{owner_short}/{name}");
     }
 
     Ok(())

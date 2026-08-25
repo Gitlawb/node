@@ -222,6 +222,24 @@ async fn resolve_owner_did(_node: &str, dir: Option<&std::path::Path>) -> Result
     Ok(did.split(':').next_back().unwrap_or(&did).to_string())
 }
 
+/// Fetch `GET /` from the node and return the `web_url` if the node advertises one.
+/// Returns `None` on any failure (network error, non-success status, missing field).
+pub(crate) async fn fetch_node_web_url(node: &str) -> Option<String> {
+    let info_client = NodeClient::new(node, None);
+    let info_resp = info_client.get("/").await.ok()?;
+    if !info_resp.status().is_success() {
+        return None;
+    }
+    let info: Value = info_resp.json().await.ok()?;
+    let raw = info["web_url"].as_str()?;
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 async fn cmd_create(
     name: String,
     description: Option<String>,
@@ -267,18 +285,8 @@ async fn cmd_create(
     println!("  HTTP:  {clone_url}");
     // Only print View: when the node advertises a web_url — self-hosted nodes
     // without a web front-end would otherwise produce a 404 link (#370).
-    let info_client = NodeClient::new(&node, None);
-    if let Ok(info_resp) = info_client.get("/").await {
-        if info_resp.status().is_success() {
-            if let Ok(info) = info_resp.json::<Value>().await {
-                if let Some(web_url) = info["web_url"].as_str() {
-                    let web_url = web_url.trim_end_matches('/');
-                    if !web_url.is_empty() {
-                        println!("  View:  {web_url}/{owner_short}/{name}");
-                    }
-                }
-            }
-        }
+    if let Some(web_url) = fetch_node_web_url(&node).await {
+        println!("  View:  {web_url}/{owner_short}/{name}");
     }
     if let Some(desc) = payload["description"].as_str().filter(|s| !s.is_empty()) {
         println!("  Desc:  {desc}");
@@ -858,6 +866,94 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_with_web_url() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"web_url":"https://example.com","did":"did:key:z6Mk"}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url.as_deref(), Some("https://example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_trims_trailing_slash() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"web_url":"https://example.com/"}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url.as_deref(), Some("https://example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_without_web_url() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"did":"did:key:z6Mk"}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url, None);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_empty_string() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"web_url":""}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url, None);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_whitespace_only() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"web_url":"   "}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url, None);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_server_error() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(500)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url, None);
     }
 
     #[tokio::test]
