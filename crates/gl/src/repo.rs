@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{sanitize_node_msg, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
@@ -232,6 +232,10 @@ async fn resolve_owner_did(_node: &str, dir: Option<&std::path::Path>) -> Result
 /// A successful response that lacks a usable `web_url` (field missing or
 /// blank) omits the link silently: self-hosted nodes without a web front-end
 /// are expected to not advertise one (#370).
+///
+/// The body is treated like every other caller-chosen node reply (INV-6): the
+/// read is capped and an accepted `web_url` must be free of control/bidi bytes
+/// — it reaches the terminal verbatim through the View: line.
 pub(crate) async fn fetch_node_web_url(node: &str) -> Option<String> {
     let info_client = NodeClient::new(node, None);
     let info_resp = match info_client.get("/").await {
@@ -246,7 +250,10 @@ pub(crate) async fn fetch_node_web_url(node: &str) -> Option<String> {
         eprintln!("warning: node info request returned {status}; skipping View link");
         return None;
     }
-    let info: Value = match info_resp.json().await {
+    // An info reply is a DID, a few URLs and counts — 8 KiB is well past what
+    // the shape needs; anything longer is hostile or broken (peer.rs precedent).
+    let raw_body = crate::http::read_body_capped(info_resp, 8 * 1024).await;
+    let info: Value = match serde_json::from_str(&raw_body) {
         Ok(json) => json,
         Err(_) => return None,
     };
@@ -260,18 +267,31 @@ pub(crate) async fn fetch_node_web_url(node: &str) -> Option<String> {
     // A present-but-malformed value means the node is misconfigured; say so
     // instead of quietly dropping the link. Mirrors the node-side boot
     // validation: must be an absolute http(s) URL with no query or fragment —
-    // the link is built by string-appending `/{owner}/{repo}` to it.
-    let malformed_reason: Option<&str> = match trimmed.parse::<url::Url>() {
-        Err(_) => Some("not an absolute URL"),
-        Ok(parsed) if !matches!(parsed.scheme(), "http" | "https") => Some("not http(s)"),
-        Ok(parsed) if parsed.query().is_some() || parsed.fragment().is_some() => {
-            Some("contains a query or fragment")
+    // the link is built by string-appending `/{owner}/{repo}` to it. Control
+    // and bidi-format bytes are rejected outright (not stripped): they have no
+    // legitimate place in a base URL and would reach the terminal through the
+    // View: line.
+    let malformed_reason: Option<&str> = if trimmed
+        .chars()
+        .any(|c| c.is_control() || gitlawb_core::sanitize::is_bidi_format(c))
+    {
+        Some("contains control or bidi characters")
+    } else {
+        match trimmed.parse::<url::Url>() {
+            Err(_) => Some("not an absolute URL"),
+            Ok(parsed) if !matches!(parsed.scheme(), "http" | "https") => Some("not http(s)"),
+            Ok(parsed) if parsed.query().is_some() || parsed.fragment().is_some() => {
+                Some("contains a query or fragment")
+            }
+            Ok(_) => None,
         }
-        Ok(_) => None,
     };
     if let Some(reason) = malformed_reason {
+        // The reason string is ours; the advertised value is not — defang it
+        // exactly as it would have been defanged had it been accepted.
+        let shown = sanitize_node_msg(trimmed);
         eprintln!(
-            "warning: node advertised a malformed web_url ({trimmed:?}, {reason}); skipping View link"
+            "warning: node advertised a malformed web_url ({shown:?}, {reason}); skipping View link"
         );
         return None;
     }
@@ -1032,6 +1052,36 @@ mod tests {
         // Port 1 on localhost is reserved (tcpmux) and refuses connections.
         let web_url = fetch_node_web_url("http://127.0.0.1:1").await;
         assert_eq!(web_url, None);
+    }
+
+    /// A hostile node can smuggle ANSI/bell/bidi controls inside a web_url that
+    /// still passes http(s) URL parsing — those bytes would reach the terminal
+    /// verbatim through the View: line. The advertised value must be rejected
+    /// outright: no control byte may survive into the returned string.
+    #[tokio::test]
+    async fn test_fetch_node_web_url_rejects_control_bytes() {
+        for bad in [
+            "https://example.com/\x1b[31mred",      // ANSI CSI escape in path
+            "https://example.com\x07",              // bell
+            "https://ex\u{202e}ample.com",          // bidi override (RLO)
+            "https://example.com/\u{200f}",         // RLM format char
+            "\x1b]0;title\x07https://evil.example", // OSC title-set prefix
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _m = server
+                .mock("GET", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(r#"{{"web_url":"{}"}}"#, bad.replace('"', "\\\"")))
+                .create_async()
+                .await;
+
+            let web_url = fetch_node_web_url(&server.url()).await;
+            assert_eq!(
+                web_url, None,
+                "web_url with control bytes {bad:?} must be rejected"
+            );
+        }
     }
 
     #[tokio::test]
