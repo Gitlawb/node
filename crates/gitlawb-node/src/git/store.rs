@@ -746,8 +746,69 @@ pub fn read_object(repo_path: &Path, sha256_hex: &str) -> Result<Option<(String,
     Ok(Some((obj_type, content)))
 }
 
+/// Validate a git branch ref before it is interpolated into a git argv element.
+/// Rules mirror `git check-ref-format`. The security-critical rule is the
+/// leading-`-` rejection: without it a name like `--output=/tmp/x` is parsed by
+/// git as an option rather than a revision, turning `branch_diff` / `merge_branch`
+/// into an arbitrary file write. A `--` delimiter is not the fix: these arguments
+/// are revisions, and `--` there reinterprets them as pathspecs.
+///
+/// This is the sink-level guard. Storage boundaries (`create_pr`, `create_repo`)
+/// call it too via the `crate::api` re-export to fail fast with a 400, but the
+/// guard here is what makes the property hold for every caller and every row,
+/// including legacy rows and any writer that skipped the boundary check.
+pub fn validate_git_ref(name: &str) -> std::result::Result<(), String> {
+    if name.is_empty() {
+        return Err("branch ref must not be empty".into());
+    }
+    // Option-injection core: a leading '-' makes git read the value as a flag.
+    if name.starts_with('-') {
+        return Err("branch ref must not begin with '-'".into());
+    }
+    if name.len() > 255 {
+        return Err("branch ref must be at most 255 bytes".into());
+    }
+    if name.chars().any(|c| c.is_ascii_control() || c == ' ') {
+        return Err("branch ref must not contain control characters or spaces".into());
+    }
+    if name.contains(['~', '^', ':', '?', '*', '[', '\\']) {
+        return Err("branch ref must not contain any of ~ ^ : ? * [ \\".into());
+    }
+    if name.contains("..") || name.contains("@{") {
+        return Err("branch ref must not contain '..' or '@{'".into());
+    }
+    if name == "@" {
+        return Err("branch ref must not be '@'".into());
+    }
+    if name.starts_with('/') || name.ends_with('/') || name.contains("//") {
+        return Err("branch ref must not have empty path components".into());
+    }
+    if name.ends_with(".lock") {
+        return Err("branch ref must not end with '.lock'".into());
+    }
+    for component in name.split('/') {
+        if component.starts_with('.') || component.ends_with(".lock") {
+            return Err(
+                "no branch ref path component may start with '.' or end with '.lock'".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reject both refs at the sink, so an option-shaped ref can never reach a git
+/// argv element regardless of how it was stored.
+fn guard_refs(target_branch: &str, source_branch: &str) -> Result<()> {
+    validate_git_ref(target_branch)
+        .map_err(|e| anyhow::anyhow!("invalid target branch ref: {e}"))?;
+    validate_git_ref(source_branch)
+        .map_err(|e| anyhow::anyhow!("invalid source branch ref: {e}"))?;
+    Ok(())
+}
+
 /// Get the diff between two branches: changes on source_branch not in target_branch.
 pub fn branch_diff(repo_path: &Path, target_branch: &str, source_branch: &str) -> Result<String> {
+    guard_refs(target_branch, source_branch)?;
     let output = Command::new("git")
         .args(["diff", &format!("{target_branch}...{source_branch}")])
         .current_dir(repo_path)
@@ -765,6 +826,7 @@ pub fn branch_diff_names(
     target_branch: &str,
     source_branch: &str,
 ) -> Result<Vec<String>> {
+    guard_refs(target_branch, source_branch)?;
     let output = Command::new("git")
         .args([
             "diff",
@@ -799,6 +861,7 @@ pub fn merge_branch(
     author_did: &str,
     pr_title: &str,
 ) -> Result<String> {
+    guard_refs(target_branch, source_branch)?;
     let worktree_path = repo_path.join("_merge_worktree");
 
     // Clean up any leftover worktree
@@ -878,6 +941,45 @@ pub fn repo_disk_path(repos_dir: &Path, owner_did: &str, repo_name: &str) -> Pat
 
 #[cfg(test)]
 mod tests {
+    use super::validate_git_ref;
+
+    #[test]
+    fn validate_git_ref_accepts_normal_branch_names() {
+        for good in [
+            "main",
+            "feature/foo",
+            "release-1.2",
+            "v1.0.0",
+            "user/fix-bug",
+        ] {
+            assert!(
+                validate_git_ref(good).is_ok(),
+                "{good:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_git_ref_rejects_option_injection_and_malformed_refs() {
+        let long = "a".repeat(256);
+        for bad in [
+            "",
+            "--output=/tmp/x",
+            "-rf",
+            "a b",
+            "a..b",
+            "a~b",
+            "refs/heads/@{x}",
+            "foo.lock",
+            "/leading",
+            "trailing/",
+            "a//b",
+            long.as_str(),
+        ] {
+            assert!(validate_git_ref(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
     use super::branch_diff_names;
     use std::path::Path;
     use std::process::Command;

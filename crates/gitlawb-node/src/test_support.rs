@@ -786,6 +786,235 @@ mod tests {
         );
     }
 
+    /// SINK GUARD (defense in depth): a poisoned PR row that bypassed the create_pr
+    /// (a pre-fix row, or any writer create_pr does not gate) still reach the git
+    /// sink? Inserts the row directly via db.create_pr and drives get_pr_diff
+    /// anonymously. If the attacker-named file appears, the storage-boundary fix
+    /// does not cover legacy/other-writer rows and the sink itself needs a guard.
+    #[sqlx::test]
+    async fn poisoned_pr_row_cannot_write_a_file_through_the_diff_sink(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let src = std::env::temp_dir().join(format!("gl-probe-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("f.txt"), b"hi").unwrap();
+        run(&["add", "f.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("probe.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+
+        let mut repo = seed_repo(&owner_did, "probe");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pwn = std::env::temp_dir().join(format!("gl-PROBE-{short}"));
+        let _ = std::fs::remove_file(&pwn);
+        let pwn_glued: std::path::PathBuf = format!("{}...main", pwn.to_str().unwrap()).into();
+        let _pg1 = DirGuard(pwn.clone());
+        let _pg2 = DirGuard(pwn_glued.clone());
+
+        // Insert the poisoned row DIRECTLY, as a pre-fix row or an ungated writer would.
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "x".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: "main".into(),
+            target_branch: format!("--output={}", pwn.to_str().unwrap()),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert poisoned row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/diff",
+                axum::routing::get(crate::api::pulls::get_pr_diff),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/probe/pulls/1/diff");
+        let resp = router.oneshot(anon_get(&uri)).await.unwrap();
+        let st = resp.status();
+
+        let written = pwn.exists() || pwn_glued.exists();
+        assert!(
+            !written,
+            "the sink must not write a file even for a poisoned row that bypassed the \
+             create_pr boundary (get_pr_diff status {st})"
+        );
+    }
+
+    /// SECURITY (option injection, source arm): create_pr must reject an
+    /// option-shaped source_branch too. merge_branch interpolates source as its
+    /// own argv element (git merge {source}), so this is the merge-shaped twin of
+    /// the target test above.
+    #[sqlx::test]
+    async fn create_pr_rejects_option_injecting_source_branch(pool: PgPool) {
+        let owner = "did:key:zPRSRCINJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        let repo = seed_repo(owner, "pub-src-inj-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls",
+                axum::routing::post(crate::api::pulls::create_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner}/pub-src-inj-repo/pulls");
+        let body = Body::from(
+            r#"{"title":"x","source_branch":"--output=/tmp/gl-should-not-exist-src","target_branch":"main"}"#,
+        );
+        let resp = router
+            .oneshot(signed_request_as(owner, Method::POST, &uri, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an option-shaped source_branch must be rejected, got {}",
+            resp.status()
+        );
+        let prs = state.db.list_prs(&repo.id).await.expect("list_prs");
+        assert!(prs.is_empty(), "no PR row when source_branch is rejected");
+    }
+
+    /// SECURITY (option injection, second entry point): create_repo must reject a
+    /// default_branch that git would parse as an option. Otherwise an owner sets
+    /// default_branch = "--output=...", opens a PR omitting target_branch so the
+    /// stored target falls back to that default, and the diff/merge sink injects.
+    #[sqlx::test]
+    async fn create_repo_rejects_option_injecting_default_branch(pool: PgPool) {
+        let owner = "did:key:zRepoDEFINJAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos",
+                axum::routing::post(crate::api::repos::create_repo),
+            )
+            .with_state(state.clone());
+        let body = Body::from(
+            r#"{"name":"inj-default","default_branch":"--output=/tmp/gl-should-not-exist-def"}"#,
+        );
+        let resp = router
+            .oneshot(signed_request_as(
+                owner,
+                Method::POST,
+                "/api/v1/repos",
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an option-shaped default_branch must be rejected, got {}",
+            resp.status()
+        );
+
+        // Nothing stored: the boundary rejects before init/create_repo.
+        assert!(
+            state
+                .db
+                .get_repo(owner, "inj-default")
+                .await
+                .unwrap()
+                .is_none(),
+            "no repo row must be created when default_branch is rejected"
+        );
+    }
+
+    /// SECURITY (option injection): create_pr must reject a branch ref that git
+    /// would parse as an option, so a stored `--output=...` target cannot later
+    /// turn get_pr_diff / merge into an arbitrary file write. The caller here is
+    /// the owner (a reader) of a PUBLIC repo, i.e. the minimum access needed to
+    /// plant a PR, and the request must be refused before any row is written.
+    #[sqlx::test]
+    async fn create_pr_rejects_option_injecting_branch_ref(pool: PgPool) {
+        let owner = "did:key:zPRINJOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        let repo = seed_repo(owner, "pub-inj-repo"); // is_public = true
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls",
+                axum::routing::post(crate::api::pulls::create_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner}/pub-inj-repo/pulls");
+        let body = Body::from(
+            r#"{"title":"x","source_branch":"main","target_branch":"--output=/tmp/gl-should-not-exist-inj"}"#,
+        );
+
+        let resp = router
+            .oneshot(signed_request_as(owner, Method::POST, &uri, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an option-shaped branch ref must be rejected, got {}",
+            resp.status()
+        );
+
+        // And nothing was stored: the boundary rejects before the write.
+        let prs = state.db.list_prs(&repo.id).await.expect("list_prs");
+        assert!(
+            prs.is_empty(),
+            "no PR row must be created when the branch ref is rejected"
+        );
+    }
+
     /// Adversarial-review GATE-2 (create_issue): filing an issue requires read
     /// access. A non-reader is denied on a private repo before any git work.
     #[sqlx::test]

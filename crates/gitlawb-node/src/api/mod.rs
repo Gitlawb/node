@@ -92,6 +92,12 @@ pub(crate) fn require_repo_owner(record: &RepoRecord, caller: &str) -> Result<()
     }
 }
 
+/// Re-export of the sink-level git ref validator (canonical home:
+/// `crate::git::store::validate_git_ref`). Storage boundaries call it here to
+/// fail fast with a 400; the sink guards enforce the same property for every
+/// caller. Its unit tests live beside the definition in `git/store.rs`.
+pub(crate) use crate::git::store::validate_git_ref;
+
 #[cfg(test)]
 mod did_tests {
     use super::did_matches;
