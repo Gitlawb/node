@@ -229,6 +229,53 @@ Notes:
   sends the bearer token **only** to your configured origin, never to a URL a
   node advertises, so a hostile node can't capture the key or redirect the solve.
 
+### Fetching an object by CID
+
+```bash
+gl ipfs list                                  # CIDs this node has pinned
+gl ipfs get bafkrei... > object.bin           # object bytes on stdout
+```
+
+Objects that were pinned before the node started recording which repo they came
+from are found by scanning its repo inventory, and that scan stops at the
+per-request ceilings in the [Configuration](#configuration) table. A stopped scan
+answers 503 with a resume token instead of a false "not found", and `gl ipfs get`
+follows the token automatically: up to 8 resumes after the first request, so at
+most 9 calls to the node, waiting between attempts for as long as the node's
+`Retry-After` asks and never longer than 5 seconds.
+
+The whole ladder runs under a 60 second wall-clock deadline. The deadline bounds
+the search, not the download: each attempt gets the time left on it to produce
+response headers, and once an object is found its bytes stream outside that
+deadline. They are not unbounded, though. The client's own 30 second HTTP timeout
+is a total request timeout, running from the start of a request until its body
+has finished, so a transfer still going 30 seconds after its request began is cut
+off. Waits between attempts never run past the deadline either, so a single run
+spends at most around 90 seconds on the network: the deadline plus the 30 second
+timeout covering the last attempt. Writing the object out sits outside both
+bounds, so piping into a reader that stops reading can hold the command open
+longer than that.
+
+Two node-side brakes end a ladder early and are reported rather than retried
+around. A 429 is terminal, because the node's rate-limit window is an hour and
+that wait cannot be honored inside one invocation; a transient overload (a 503
+carrying no incomplete-scan code) is retried on the token already held, under the
+same cap, clamp and deadline. The per-IP fanout brake can also stop a ladder well
+short of the 9 calls, so automatic resumption is not a guarantee of reaching the
+object.
+
+When a bound stops the ladder with a usable token in hand, the command prints the
+token and the invocation that continues from it before exiting nonzero:
+
+```txt
+resume from where this stopped: gl ipfs get bafkrei... --scan <token>
+```
+
+Run that to carry on from where the scan stopped. Re-running without `--scan`
+restarts at the first row, reproduces the same truncation and spends the node's
+per-IP budget again, so the token is the only thing that makes progress. Tokens
+are valid for an hour.
+
 ---
 
 ## Architecture
@@ -357,15 +404,20 @@ Important node settings:
 | `GITLAWB_REPO_LEASE_MAX_WAITERS` | Max pushes parked at once waiting for the same repo's write lease. Each waiter pins its buffered pack body, so this bounds that memory for a hot repo; past the cap the newest push sheds a 503 + Retry-After instead of queueing. Pushes to other repos are unaffected, and the lease holder is not counted. Default 8. |
 | `GITLAWB_MAX_CONCURRENT_IPFS_WALKS` | Max concurrent `GET /ipfs/{cid}` visibility walks across all callers (own pool, disjoint from the served-git pools); over-cap sheds 503. Default 32. |
 | `GITLAWB_IPFS_WALK_PER_SOURCE` | Max concurrent `/ipfs` walks a single source IP may hold. Default 4. |
-| `GITLAWB_IPFS_MAX_REPOS_WALKED` | Max expensive path-scope visibility walks per `/ipfs/{cid}` request; over-cap repos are skipped and the scan continues, shedding a retryable 503 (not a false 404) if the object is then found nowhere. Default 64. |
+| `GITLAWB_IPFS_MAX_LEGACY_PROBES` | Max legacy (NULL-provenance) repos probed per `/ipfs/{cid}` request, bounding the scan-fallback fan-out. A truncated scan returns a retryable 503, not a false 404. Default 256. |
+| `GITLAWB_IPFS_MAX_LEGACY_SCAN_ROWS` | Max repo rows one `/ipfs/{cid}` request's legacy scan may read from the database. The probe ceiling above only starts counting once a probe runs, and quarantined or private repos are denied before that, so this is what bounds a scan over an inventory that denies the caller everywhere. A truncated scan sheds a retryable 503 carrying an opaque `continuation` token; echoing it as `?scan=` resumes the scan where it stopped. Every per-request ceiling on this path (rows, probes, visits, retained rule bytes) mints one, so each request advances the ladder by at least the rows it read and a holder buried past a ceiling is reached in a bounded number of requests, `ceil(repos / ceiling) + 1` when this row ceiling is the one that binds. No ceiling ever produces a 404. Every page is charged to the caller's `/ipfs` work allowance, so raising this raises that allowance too. Lowering it sharpens an oracle: because a truncation emits a token and a completed wrap does not, laddering to the end reveals the node's total repo count (private and quarantined included) to within one ceiling. Default 2048. |
+| `GITLAWB_IPFS_MAX_REPOS_WALKED` | Max expensive path-scope visibility walks a `/ipfs/{cid}` request may run per phase; over-cap repos are skipped and the scan continues, shedding a retryable 503 (not a false 404) if the object is then found nowhere. The effective cap is the tighter of this knob and the node's internal history-walk ceiling of 17 (`MAX_PIN_SOURCES + 1`), so a value above 17 has no effect while a value below it does tighten the cap. It is charged per phase: the provenance lookup and the legacy-scan fallback get separate equal budgets, so one request can run up to twice the cap in total. Default 64. |
 | `GITLAWB_IPFS_MAX_REPO_VISITS` | Ceiling on repos one `/ipfs/{cid}` request may visit (acquire + probe) past the visibility gate. Also the worst-case per-request Tigris fetch count. On exhaustion the scan stops with a retryable 503. Default 1024. |
 | `GITLAWB_IPFS_REQUEST_BUDGET_SECS` | Absolute wall-clock budget for one admitted `/ipfs/{cid}` request's acquire+walk lifetime. Per-stage clamps bound the acquire and walk stages to the remaining budget, and no stage starts once it is exhausted; the scan then stops with a retryable 503. The object-type probe and content-read `cat-file` subprocesses are budget-checked before starting and each also run under their own deadline (the lesser of `GITLAWB_GIT_SERVICE_TIMEOUT_SECS` and the remaining budget), reaped via process-group teardown, so a hung `cat-file` cannot hold the request's walk slot past it. One hang path is still unbounded: the probe's object-store readability check is a plain filesystem sweep with nothing to reap, so a wedged filesystem can hold the slot past the deadline. Default 600. Accepted range is 1 to 3153600000 (100 years), since the node derives a deadline from this value and a larger one cannot be represented. |
+| `GITLAWB_IPFS_RESOLVE_BUDGET_SECS` | Shorter budget for the pre-walk CID resolve inside an admitted `/ipfs/{cid}` request: the lookup that maps the requested CID to its git oid(s), which runs while the scarce walk admission is already held. A well-formed CID with no pin row does no probe and no walk work, so without this it could hold a walk slot for the whole request budget while nothing walked, and enough such requests shed every real retrieval at admission. The effective deadline is the lesser of this and the remaining request budget, so a value above `GITLAWB_IPFS_REQUEST_BUDGET_SECS` degrades to the request budget. Only the resolve is on this clock; walk and probe work stay on the request budget, so a slow but progressing scan is never shed by it. Default 10. Accepted range is 1 to 3153600000 (100 years). |
 | `GITLAWB_IPFS_RATE_LIMIT` | Max `/ipfs/{cid}` requests per client IP per hour (route flood brake). 0 disables. Default 600. |
 | `GITLAWB_TIGRIS_BUCKET` | Optional S3/Tigris shared repo storage bucket. |
 | `GITLAWB_PINATA_JWT` | Optional Pinata/IPFS warm-storage pinning. |
 | `GITLAWB_IRYS_URL` | Optional Irys/Arweave permanent anchoring. |
 
 Production note: change the default Postgres password before exposing a node publicly.
+
+Legacy-pin window: releases before the CID-resolver work stored the provider CID (Kubo dag-pb / Pinata) as a pinned object's resolver key. The `/ipfs/{cid}` resolver now recomputes the raw-content CID from the object bytes and refuses to serve a key that does not match, so `GET /api/v1/ipfs/pins` can still advertise an unrepaired legacy CID that 404s. Such a row is repaired opportunistically the next time a push carries the object again (its key is rewritten to the raw CID, the old value kept in `legacy_provider_cid`), but git negotiation omits objects the node already has, so most legacy rows never re-enter a push delta. A deferred one-shot startup sweep, not this opportunistic path, is what fully retires the advertise-then-404 window. Rows whose object bytes are gone stay withheld.
 
 ---
 
