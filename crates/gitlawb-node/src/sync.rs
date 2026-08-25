@@ -730,7 +730,10 @@ async fn clone_repo(remote_url: &str, local_path: &Path, mode: MirrorMode) -> an
 async fn fetch_repo(local_path: &Path, remote_url: &str, mode: MirrorMode) -> anyhow::Result<()> {
     let local_str = local_path.to_str().unwrap_or(".");
 
-    git_run(&["-C", local_str, "remote", "set-url", "origin", remote_url]).await?;
+    git_run(&[
+        "-C", local_str, "remote", "set-url", "origin", "--", remote_url,
+    ])
+    .await?;
 
     match mode {
         MirrorMode::Promisor => {
@@ -1009,16 +1012,14 @@ mod tests {
 
     /// #374: `clone_repo` interpolates the peer's origin URL into a `git
     /// clone --mirror` argument list. Without a `--` delimiter git parses a
-    /// remote beginning with `-` as an option instead of a repository, and
-    /// `--upload-pack=<cmd>` is an option git hands to a shell — arbitrary
-    /// execution on the node driven by a value this process did not author.
+    /// remote beginning with `-` as an option instead of a repository.
     ///
     /// The delimiter is what forces the same string to be a repository, and
     /// git says so in its own words: it reports the whole argument as a
     /// repository it cannot find. Undelimited, git consumes it as an option
-    /// and fails against the *destination* instead ("Could not read from
-    /// remote repository"), never naming the injected string — which is why
-    /// this assertion is RED before the fix and GREEN after.
+    /// and fails against the *destination* instead (`fatal: repository '<dest>' does not exist`),
+    /// never naming the injected string — which is why this assertion is RED
+    /// before the fix and GREEN after.
     ///
     /// The payload is deliberately free of `:` and spaces: a colon would make
     /// git read the argument as an ssh-style `host:path` URL and report a

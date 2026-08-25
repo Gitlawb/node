@@ -159,8 +159,8 @@ pub fn setup_partial_clone(
 
     if withheld_globs.is_empty() {
         match branch {
-            Some(b) => git_global(&["clone", "-q", "--branch", b, remote_url, dest_str])?,
-            None => git_global(&["clone", "-q", remote_url, dest_str])?,
+            Some(b) => git_global(&["clone", "-q", "--branch", b, "--", remote_url, dest_str])?,
+            None => git_global(&["clone", "-q", "--", remote_url, dest_str])?,
         }
         return Ok(());
     }
@@ -170,6 +170,7 @@ pub fn setup_partial_clone(
         "-q",
         "--filter=blob:none",
         "--no-checkout",
+        "--",
         remote_url,
         dest_str,
     ])?;
@@ -1084,6 +1085,35 @@ mod tests {
             !dest.join("docs/private").exists(),
             "exact-path withheld file must be excluded"
         );
+    }
+
+    #[test]
+    fn setup_partial_clone_plain_without_withheld_paths() {
+        let (td, url) = bare_remote(&[("file.txt", b"hello\n")]);
+        let dest = td.path().join("dest");
+        setup_partial_clone(&dest, &url, &[], &[], None).unwrap();
+        assert!(dest.join("file.txt").exists());
+    }
+
+    #[test]
+    fn setup_partial_clone_with_branch_without_withheld_paths() {
+        let (td, url) = bare_remote(&[("file.txt", b"hello\n")]);
+        let branch_out = Command::new("git")
+            .args([
+                "-C",
+                td.path().join("origin").to_str().unwrap(),
+                "branch",
+                "--show-current",
+            ])
+            .output()
+            .unwrap();
+        let branch = String::from_utf8(branch_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let dest = td.path().join("dest");
+        setup_partial_clone(&dest, &url, &[], &[], Some(&branch)).unwrap();
+        assert!(dest.join("file.txt").exists());
     }
 
     #[test]
