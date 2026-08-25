@@ -350,10 +350,16 @@ resource "aws_instance" "node" {
     # ami: new AL2023 releases shouldn't churn the instance; replace
     # deliberately for OS upgrades.
     # user_data: only runs at first boot, so re-rendering it on a live
-    # instance is a pointless stop/start. Config changes that feed user-data
-    # (bootstrap peers, integrations, image tag) require a deliberate
-    # `terraform apply -replace=aws_instance.node` — see README "Changing
-    # configuration".
+    # instance is a pointless stop/start. How a config change reaches a running
+    # instance depends on which file carries it:
+    #   - rendered into compose.yaml (image_tag, ports, domain_name, db_host,
+    #     icaptcha_*): `terraform apply` then `upgrade_command`, which
+    #     reinstalls the rendering and restarts.
+    #   - written into /opt/gitlawb/.env at first boot (public_url,
+    #     bootstrap_peers, integrations): nothing rewrites .env afterwards, so
+    #     these need an edit on the instance or
+    #     `terraform apply -replace=aws_instance.node`.
+    # See README "Changing configuration".
     ignore_changes = [ami, user_data]
   }
 }
@@ -437,13 +443,62 @@ resource "aws_ssm_document" "upgrade" {
 
   content = jsonencode({
     schemaVersion = "2.2"
-    description   = "Pull the latest gitlawb node image and restart the compose stack"
+    description   = "Reinstall the rendered compose file, pull the latest image, and restart"
     mainSteps = [{
       action = "aws:runShellScript"
       name   = "upgrade"
       inputs = {
-        runCommand = [
-          "cd /opt/gitlawb && docker compose pull && docker compose up -d --remove-orphans && docker image prune -f"
+        # Reinstall the CURRENT rendering before restarting.
+        #
+        # `aws_instance` ignores user_data drift, so an instance created before a
+        # template change keeps the compose file it was born with. Compose passes
+        # only the variables named in its `environment:` block into the container,
+        # so a node setting added to the template never reaches an existing
+        # instance — the operator writes it to /opt/gitlawb/.env, restarts, and the
+        # node silently keeps the built-in default. `docker compose pull && up -d`
+        # cannot fix that: the authoritative file is the one on disk.
+        #
+        # Idempotent: writing the same bytes and restarting is a no-op. This does
+        # overwrite hand-edits to compose.yaml, which is intended — the file is
+        # Terraform-owned; per-instance settings belong in /opt/gitlawb/.env.
+        #
+        # One shell step, under flock, writing through mktemp. Two overlapping
+        # executions — a double run, a retry while the first is still pulling, two
+        # operators — otherwise share one fixed temp path: the second truncates the
+        # file the first is about to install, and once the first renames, the
+        # second's open descriptor keeps writing into the live compose.yaml inode.
+        # Both outcomes stay valid YAML, so the `up -d --remove-orphans` on the next
+        # line accepts a blended or truncated service set and deletes whatever fell
+        # off — on a live node, the local postgres or the TLS terminator. The lock
+        # also covers pull and up, so a second run cannot restart against a file the
+        # first is mid-install.
+        runCommand = [<<-UPGRADE
+          set -euo pipefail
+          install -d -m 0755 /opt/gitlawb
+
+          exec 9>/opt/gitlawb/.upgrade.lock
+          if ! flock -n 9; then
+            echo "another upgrade is already running on this instance" >&2
+            exit 1
+          fi
+
+          tmp="$(mktemp /opt/gitlawb/compose.yaml.XXXXXX)"
+          trap 'rm -f "$tmp"' EXIT
+          # base64 rather than a nested heredoc: the rendered compose contains
+          # `$${VAR}` passthroughs that must reach the file unexpanded, and a
+          # heredoc inside an indented Terraform heredoc depends on the dedent
+          # landing the delimiter at column 0. Decoding a single line has neither
+          # failure mode, and no delimiter can collide with the content.
+          echo '${base64encode(local.compose_yaml)}' | base64 -d > "$tmp"
+          chmod 0644 "$tmp"
+          mv "$tmp" /opt/gitlawb/compose.yaml
+          trap - EXIT
+
+          cd /opt/gitlawb
+          docker compose pull
+          docker compose up -d --remove-orphans
+          docker image prune -f
+          UPGRADE
         ]
       }
     }]
