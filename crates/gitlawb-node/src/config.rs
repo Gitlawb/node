@@ -612,9 +612,10 @@ impl Config {
 
 /// Validate a `web_url` value for use as a browser-reachable base URL.
 /// Blank values are rejected (clap maps `--web-url ""` to `Some("")`), and
-/// non-blank values must parse as absolute `http`/`https` URLs — the CLI
-/// treats this as a string prefix to append paths to, so anything else
-/// produces links no browser can follow.
+/// non-blank values must parse as absolute `http`/`https` URLs with no query
+/// or fragment — the CLI treats this as a string prefix to append paths to,
+/// so anything else produces links no browser can follow (`?a=1/owner/repo`
+/// puts the repo path inside the query string).
 pub(crate) fn validate_web_url(raw: &str) -> Result<(), String> {
     if raw.trim().is_empty() {
         return Err("must not be empty or whitespace-only".into());
@@ -629,6 +630,16 @@ pub(crate) fn validate_web_url(raw: &str) -> Result<(), String> {
     }
     // url::Url cannot represent a URL without a host for http/https schemes, so
     // reaching here guarantees an absolute browser-usable base.
+    if parsed.query().is_some() {
+        return Err(
+            "must not contain a query string — it is used as a path prefix for View links".into(),
+        );
+    }
+    if parsed.fragment().is_some() {
+        return Err(
+            "must not contain a fragment — it is used as a path prefix for View links".into(),
+        );
+    }
     Ok(())
 }
 
@@ -1058,6 +1069,23 @@ mod tests {
             let mut cfg = Config::parse_from(["gitlawb-node"]);
             cfg.web_url = Some(bad.into());
             assert!(cfg.validate().is_err(), "web_url {bad:?} must be rejected");
+        }
+
+        // Query strings and fragments corrupt the appended repo path, since
+        // web_url is used as a raw string prefix (`?a=1` would swallow
+        // `/{owner}/{repo}` into the query).
+        for bad in [
+            "https://gitlawb.com?a=1",
+            "https://gitlawb.com/?utm_source=docs",
+            "https://gitlawb.com#section",
+            "https://gitlawb.com/#faq",
+        ] {
+            let mut cfg = Config::parse_from(["gitlawb-node"]);
+            cfg.web_url = Some(bad.into());
+            assert!(
+                cfg.validate().is_err(),
+                "web_url {bad:?} (query or fragment) must be rejected"
+            );
         }
 
         // Surrounding whitespace around a valid URL is tolerated.

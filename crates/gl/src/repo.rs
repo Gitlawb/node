@@ -225,18 +225,21 @@ async fn resolve_owner_did(_node: &str, dir: Option<&std::path::Path>) -> Result
 /// Fetch `GET /` from the node and return the `web_url` if the node advertises one.
 ///
 /// The View: link is a nice-to-have, so every failure mode degrades to `None`
-/// rather than failing the enclosing command — but failures are not all silent:
-/// a non-success HTTP status is surfaced as a stderr warning (with the status)
-/// since that means the node itself is misbehaving or unreachable at the app
-/// level, which the user would otherwise never learn. A successful response
-/// that lacks a usable `web_url` (field missing, blank, malformed, or not an
-/// absolute http(s) URL) omits the link silently: self-hosted nodes without a
-/// web front-end are expected to not advertise one (#370).
+/// rather than failing the enclosing command — but failures are surfaced as
+/// stderr warnings (request error, non-success HTTP status with the status,
+/// malformed advertised value), since they all mean the node itself is
+/// misbehaving or misconfigured, which the user would otherwise never learn.
+/// A successful response that lacks a usable `web_url` (field missing or
+/// blank) omits the link silently: self-hosted nodes without a web front-end
+/// are expected to not advertise one (#370).
 pub(crate) async fn fetch_node_web_url(node: &str) -> Option<String> {
     let info_client = NodeClient::new(node, None);
     let info_resp = match info_client.get("/").await {
         Ok(resp) => resp,
-        Err(_) => return None,
+        Err(err) => {
+            eprintln!("warning: node info request failed ({err}); skipping View link");
+            return None;
+        }
     };
     let status = info_resp.status();
     if !status.is_success() {
@@ -248,7 +251,7 @@ pub(crate) async fn fetch_node_web_url(node: &str) -> Option<String> {
         Err(_) => return None,
     };
     // Missing field / non-string degrade to None without warning — same contract
-    // as before; only the HTTP-status path warns there.
+    // as before; only transport- and advertisement-level failures warn there.
     let raw = info["web_url"].as_str()?;
     let trimmed = raw.trim().trim_end_matches('/');
     if trimmed.is_empty() {
@@ -256,13 +259,20 @@ pub(crate) async fn fetch_node_web_url(node: &str) -> Option<String> {
     }
     // A present-but-malformed value means the node is misconfigured; say so
     // instead of quietly dropping the link. Mirrors the node-side boot
-    // validation: must parse as an absolute http(s) URL.
-    let malformed = match trimmed.parse::<url::Url>() {
-        Ok(parsed) => !matches!(parsed.scheme(), "http" | "https"),
-        Err(_) => true,
+    // validation: must be an absolute http(s) URL with no query or fragment —
+    // the link is built by string-appending `/{owner}/{repo}` to it.
+    let malformed_reason: Option<&str> = match trimmed.parse::<url::Url>() {
+        Err(_) => Some("not an absolute URL"),
+        Ok(parsed) if !matches!(parsed.scheme(), "http" | "https") => Some("not http(s)"),
+        Ok(parsed) if parsed.query().is_some() || parsed.fragment().is_some() => {
+            Some("contains a query or fragment")
+        }
+        Ok(_) => None,
     };
-    if malformed {
-        eprintln!("warning: node advertised a malformed web_url ({trimmed:?}); skipping View link");
+    if let Some(reason) = malformed_reason {
+        eprintln!(
+            "warning: node advertised a malformed web_url ({trimmed:?}, {reason}); skipping View link"
+        );
         return None;
     }
     Some(trimmed.to_string())
@@ -989,7 +999,14 @@ mod tests {
     /// malformed advertisement means the node is misconfigured (#370).
     #[tokio::test]
     async fn test_fetch_node_web_url_malformed_value_is_rejected() {
-        for bad in ["gitlawb.com", "not a url", "ftp://files.example.com"] {
+        for bad in [
+            "gitlawb.com",
+            "not a url",
+            "ftp://files.example.com",
+            // Query/fragment corrupt the appended /{owner}/{repo} path.
+            "https://example.com?a=1",
+            "https://example.com/#faq",
+        ] {
             let mut server = mockito::Server::new_async().await;
             let _m = server
                 .mock("GET", "/")
@@ -1005,6 +1022,16 @@ mod tests {
                 "malformed web_url {bad:?} must not render a View link"
             );
         }
+    }
+
+    /// A transport-level failure (connection refused) degrades to None but is
+    /// no longer silent: the request error is surfaced on stderr so an
+    /// unreachable node isn't indistinguishable from one without a web_url.
+    #[tokio::test]
+    async fn test_fetch_node_web_url_connection_refused_warns() {
+        // Port 1 on localhost is reserved (tcpmux) and refuses connections.
+        let web_url = fetch_node_web_url("http://127.0.0.1:1").await;
+        assert_eq!(web_url, None);
     }
 
     #[tokio::test]
