@@ -591,16 +591,45 @@ impl Config {
         }
         // GITLAWB_WEB_URL is advertised in GET / so the CLI can print a working
         // View: link. Clap maps "" to Some("") which would produce a broken URL;
-        // reject early instead of serving a malformed link.
-        if let Some(url) = &self.web_url {
-            if url.trim().is_empty() {
-                return Err("GITLAWB_WEB_URL must not be empty or whitespace-only — \
-                     set it to a full URL like https://gitlawb.com or leave it unset."
-                    .into());
+        // reject early instead of serving a malformed link. Non-blank values must
+        // additionally parse as an absolute http(s) URL — the CLI appends
+        // `/{owner}/{repo}` to it, so scheme-less hosts ("gitlawb.com") and other
+        // garbage would render links no browser can follow.
+        if let Some(raw) = &self.web_url {
+            match validate_web_url(raw) {
+                Ok(()) => {}
+                Err(reason) => {
+                    return Err(format!(
+                        "GITLAWB_WEB_URL {reason} — \
+                         set it to an absolute URL like https://gitlawb.com or leave it unset."
+                    ));
+                }
             }
         }
         Ok(())
     }
+}
+
+/// Validate a `web_url` value for use as a browser-reachable base URL.
+/// Blank values are rejected (clap maps `--web-url ""` to `Some("")`), and
+/// non-blank values must parse as absolute `http`/`https` URLs — the CLI
+/// treats this as a string prefix to append paths to, so anything else
+/// produces links no browser can follow.
+pub(crate) fn validate_web_url(raw: &str) -> Result<(), String> {
+    if raw.trim().is_empty() {
+        return Err("must not be empty or whitespace-only".into());
+    }
+    let parsed: url::Url = raw
+        .trim()
+        .parse()
+        .map_err(|_| "is not a valid absolute URL".to_string())?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => return Err(format!("must use http or https, got '{other}:'")),
+    }
+    // url::Url cannot represent a URL without a host for http/https schemes, so
+    // reaching here guarantees an absolute browser-usable base.
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1014,5 +1043,34 @@ mod tests {
             cfg.validate().is_err(),
             "whitespace-only web_url must be rejected"
         );
+    }
+
+    #[test]
+    fn web_url_rejects_non_absolute_or_non_browser_urls() {
+        // Scheme-less host: parses nowhere, renders a broken View: link.
+        for bad in [
+            "gitlawb.com",
+            "not a url",
+            "ftp://files.example.com",
+            "javascript:alert(1)",
+            "https://", // no host
+        ] {
+            let mut cfg = Config::parse_from(["gitlawb-node"]);
+            cfg.web_url = Some(bad.into());
+            assert!(cfg.validate().is_err(), "web_url {bad:?} must be rejected");
+        }
+
+        // Surrounding whitespace around a valid URL is tolerated.
+        let mut cfg = Config::parse_from(["gitlawb-node"]);
+        cfg.web_url = Some("  https://gitlawb.com  ".into());
+        assert!(
+            cfg.validate().is_ok(),
+            "padded-but-valid web_url must validate"
+        );
+
+        // Non-default ports and paths are fine.
+        let mut cfg = Config::parse_from(["gitlawb-node"]);
+        cfg.web_url = Some("http://localhost:8080/ui".into());
+        assert!(cfg.validate().is_ok(), "port+path web_url must validate");
     }
 }

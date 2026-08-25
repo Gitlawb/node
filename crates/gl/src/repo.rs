@@ -223,21 +223,49 @@ async fn resolve_owner_did(_node: &str, dir: Option<&std::path::Path>) -> Result
 }
 
 /// Fetch `GET /` from the node and return the `web_url` if the node advertises one.
-/// Returns `None` on any failure (network error, non-success status, missing field).
+///
+/// The View: link is a nice-to-have, so every failure mode degrades to `None`
+/// rather than failing the enclosing command — but failures are not all silent:
+/// a non-success HTTP status is surfaced as a stderr warning (with the status)
+/// since that means the node itself is misbehaving or unreachable at the app
+/// level, which the user would otherwise never learn. A successful response
+/// that lacks a usable `web_url` (field missing, blank, malformed, or not an
+/// absolute http(s) URL) omits the link silently: self-hosted nodes without a
+/// web front-end are expected to not advertise one (#370).
 pub(crate) async fn fetch_node_web_url(node: &str) -> Option<String> {
     let info_client = NodeClient::new(node, None);
-    let info_resp = info_client.get("/").await.ok()?;
-    if !info_resp.status().is_success() {
+    let info_resp = match info_client.get("/").await {
+        Ok(resp) => resp,
+        Err(_) => return None,
+    };
+    let status = info_resp.status();
+    if !status.is_success() {
+        eprintln!("warning: node info request returned {status}; skipping View link");
         return None;
     }
-    let info: Value = info_resp.json().await.ok()?;
+    let info: Value = match info_resp.json().await {
+        Ok(json) => json,
+        Err(_) => return None,
+    };
+    // Missing field / non-string degrade to None without warning — same contract
+    // as before; only the HTTP-status path warns there.
     let raw = info["web_url"].as_str()?;
     let trimmed = raw.trim().trim_end_matches('/');
     if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
+        return None;
     }
+    // A present-but-malformed value means the node is misconfigured; say so
+    // instead of quietly dropping the link. Mirrors the node-side boot
+    // validation: must parse as an absolute http(s) URL.
+    let malformed = match trimmed.parse::<url::Url>() {
+        Ok(parsed) => !matches!(parsed.scheme(), "http" | "https"),
+        Err(_) => true,
+    };
+    if malformed {
+        eprintln!("warning: node advertised a malformed web_url ({trimmed:?}); skipping View link");
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 async fn cmd_create(
@@ -954,6 +982,64 @@ mod tests {
 
         let web_url = fetch_node_web_url(&server.url()).await;
         assert_eq!(web_url, None);
+    }
+
+    /// A node advertising a present-but-malformed web_url (not an absolute
+    /// http(s) URL) must not yield a View link — and must warn, since a
+    /// malformed advertisement means the node is misconfigured (#370).
+    #[tokio::test]
+    async fn test_fetch_node_web_url_malformed_value_is_rejected() {
+        for bad in ["gitlawb.com", "not a url", "ftp://files.example.com"] {
+            let mut server = mockito::Server::new_async().await;
+            let _m = server
+                .mock("GET", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(r#"{{"web_url":"{bad}"}}"#))
+                .create_async()
+                .await;
+
+            let web_url = fetch_node_web_url(&server.url()).await;
+            assert_eq!(
+                web_url, None,
+                "malformed web_url {bad:?} must not render a View link"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_validates_after_trimming() {
+        // Trailing slash is trimmed before validation; result stays usable.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"web_url":"http://localhost:8080/ui/"}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url.as_deref(), Some("http://localhost:8080/ui"));
+    }
+
+    /// A non-success status must still return None (View link is cosmetic) but
+    /// the status surfaces as a user-visible stderr warning instead of being
+    /// swallowed silently (#370 review).
+    #[tokio::test]
+    async fn test_fetch_node_web_url_non_success_warns_with_status() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(503)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url, None);
+        // The warning itself goes to stderr; mockito can't capture it here, so
+        // this asserts only the None contract. Manual check: run against a
+        // 503-ing node and observe "node info request returned 503" on stderr.
     }
 
     #[tokio::test]
