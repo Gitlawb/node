@@ -353,6 +353,10 @@ pub async fn anchor_encrypted_manifest(
     })
     .collect();
     let data_item = crate::ans104::build_signed_data_item(node_keypair, &tag_refs(&tags), &body)?;
+    // Derive the expected item id from the signed data item BEFORE sending, so
+    // the bundler's acknowledgement can be bound to the exact item we signed
+    // (#224 R3 review).  A mismatch means the bundler accepted a different item.
+    let expected_id = crate::ans104::data_item_id(&data_item);
     // Irys upload target: {bundler_url}/tx/{token}. Built structurally so a
     // query on the base URL is preserved and a fragment is rejected outright.
     let url = bundler_upload_url(bundler_url, bundler_token)?;
@@ -393,6 +397,13 @@ pub async fn anchor_encrypted_manifest(
             ));
         }
     };
+    // Bind the acknowledgement to the signed item: a different valid id means
+    // the bundler accepted a foreign item, not the one we signed and paid for.
+    if tx_id != expected_id {
+        return Err(anyhow::anyhow!(
+            "Bundler returned a different valid id ({tx_id}) than the signed item ({expected_id})"
+        ));
+    }
     tracing::info!(
         repo = %manifest.repo,
         tx_id = %tx_id,
@@ -501,18 +512,22 @@ pub(crate) async fn anchor_item_present(
         // the anchor's JSON payload depending on the gateway implementation and
         // content-negotiation.  Handle both representations:
         //
-        // 1. JSON anchor payload: `GET /{item_id}` resolved to valid JSON → the
-        //    gateway recognises this item_id and returned its content.  A 200
-        //    with JSON for a specific item_id is a positive existence proof — we
-        //    do not re-derive an id from JSON fields because the anchor payload
-        //    does not carry the ANS-104 item id.
+        // 1. JSON anchor payload: `GET /{item_id}` resolved to valid JSON →
+        //    verify it is a gitlawb anchor by checking `schema` matches our
+        //    well-known value.  A generic JSON 200 (e.g. error page, unrelated
+        //    item) must not be treated as present (#224 R4 review).
         //
         // 2. Raw ANS-104 data item: derive the id from the Ed25519 signature
         //    region (bytes 2..66 per ANS-104 spec) and compare against the
         //    probed id — a 200 with a non-matching body is a phantom.
-        if serde_json::from_slice::<serde_json::Value>(&body).is_ok() {
-            // JSON response: the gateway resolved this item_id.
-            return Ok(true);
+        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&body) {
+            if val.get("schema").and_then(|s| s.as_str()) == Some("gitlawb/ref-update/v1") {
+                return Ok(true);
+            }
+            // A JSON response that does not carry our schema is not a positive
+            // existence proof for the probed item_id.  Fall through to the
+            // raw-bytes path — if the body is binary it will be tested there;
+            // if it is JSON-without-schema it will be rejected as non-matching.
         }
         // Raw bytes: derive the ANS-104 item id and verify it matches.
         let body_id = crate::ans104::data_item_id(&body);

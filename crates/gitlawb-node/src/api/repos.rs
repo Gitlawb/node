@@ -2753,7 +2753,8 @@ async fn run_post_receive_job(
     // not a silent skip, so the startup drain retries it.
     let (announce, cid_map) = anchor_cid_rx
         .await
-        .map_err(|_| anyhow::anyhow!("replication tail died before reporting announce/CID"))?;
+        .map_err(|_| anyhow::anyhow!("replication tail died before reporting announce/CID"))?
+        .map_err(|e| anyhow::anyhow!("replication tail visibility lookup failed: {e}"))?;
     // The anchor's issuer is the NODE, not the pusher: `verify_anchor` compares
     // the anchor's outer node_did against the embedded certificate's issuer and
     // rejects a mismatch, and the certificate is signed with `state.node_keypair`.
@@ -3165,6 +3166,10 @@ pub(crate) async fn drain_post_receive_jobs(state: AppState) -> anyhow::Result<u
     Ok(count)
 }
 
+type AnchorCidTx = tokio::sync::oneshot::Sender<
+    std::result::Result<(bool, std::collections::HashMap<String, String>), anyhow::Error>,
+>;
+
 /// The detached post-receive replication tail (#174 F2): everything a landed push
 /// still owes after its git response has been returned: the replication decision,
 /// the per-repo-coalesced pin/encrypt task, and this push's own Pinata + announce
@@ -3177,7 +3182,7 @@ async fn post_receive_replication_tail(
     disk_path: std::path::PathBuf,
     did: String,
     ref_certs: std::collections::HashMap<String, crate::db::RefCertificate>,
-    anchor_cid_tx: tokio::sync::oneshot::Sender<(bool, std::collections::HashMap<String, String>)>,
+    anchor_cid_tx: AnchorCidTx,
 ) {
     // Replication enforcement (Phase 2): decide once per push whether the public
     // may read this repo at all and, if so, which blob OIDs must not leave the
@@ -3186,7 +3191,18 @@ async fn post_receive_replication_tail(
     // objects (which withheld_blob_oids never lists) stay local. Fail closed: a
     // private or undetermined repo never leaks. The announce decision that gates
     // the network-facing sends is taken separately, below.
-    let rules_opt = state.db.list_visibility_rules(&record.id).await.ok();
+    //
+    // A DB error here is propagated (not collapsed to None) so the durable job
+    // fails and remains retryable: an explicit non-public decision may complete
+    // without an anchor, but an unavailable visibility decision must not silently
+    // skip anchoring (#224 R3 review).
+    let rules = match state.db.list_visibility_rules(&record.id).await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = anchor_cid_tx.send(Err(e));
+            return;
+        }
+    };
 
     // #174 F2a: take the per-repo coalescing key BEFORE the walk, not after it.
     // `replication_withheld_set` decides announceability from the rules snapshot
@@ -3197,12 +3213,8 @@ async fn post_receive_replication_tail(
     // materialization before finding out they were going to coalesce; now a push
     // that will coalesce does none of that. Not announceable is the same as
     // before: nothing replicates, so no key is taken and no walk runs.
-    let announce_at_root = match &rules_opt {
-        Some(rules) => {
-            crate::visibility::listable_at_root(rules, record.is_public, &record.owner_did, None)
-        }
-        None => false,
-    };
+    let announce_at_root =
+        crate::visibility::listable_at_root(&rules, record.is_public, &record.owner_did, None);
     let mut coalesced = false;
     let mut inflight = None;
     if announce_at_root {
@@ -3237,7 +3249,7 @@ async fn post_receive_replication_tail(
     } else {
         replication_withheld_set(
             state.git_encrypt_semaphore.clone(),
-            rules_opt.clone(),
+            Some(rules.clone()),
             &record.owner_did,
             record.is_public,
             disk_path.clone(),
@@ -3287,7 +3299,7 @@ async fn post_receive_replication_tail(
             fail_closed_full_scan_objects(
                 state.git_encrypt_semaphore.clone(),
                 disk_path.clone(),
-                rules_opt.clone().unwrap_or_default(),
+                rules.clone(),
                 record.is_public,
                 record.owner_did.clone(),
                 pin_set.candidates,
@@ -3348,7 +3360,7 @@ async fn post_receive_replication_tail(
             ctx,
             inflight_guard,
             object_list,
-            rules_opt.clone(),
+            Some(rules.clone()),
             record.is_public,
         ));
     }
@@ -3418,7 +3430,7 @@ async fn post_receive_replication_tail(
         // it from these once a pin slot frees. rules/owner/is_public drive the fresh
         // fail-closed withheld filter; encrypt_sem + git_bin + timeout keep the re-derive
         // git children under the same INV-22 bounded, group-reaped scan admission.
-        let pinata_rules_opt = rules_opt.clone();
+        let pinata_rules_opt = Some(rules.clone());
         let pinata_owner_did = record.owner_did.clone();
         let pinata_is_public = record.is_public;
         let pinata_git_bin = state.git_bin.clone();
@@ -3492,7 +3504,7 @@ async fn post_receive_replication_tail(
             // are outside the job's durability scope. A panic before this
             // point drops the sender, and the job body treats that as a
             // failure to be retried by the next startup drain.
-            let _ = anchor_cid_tx.send((announce, cid_map.clone()));
+            let _ = anchor_cid_tx.send(Ok((announce, cid_map.clone())));
 
             // Record branch→CID for each ref update and publish gossip
             for (ref_name, old_sha, new_sha) in &ref_updates_clone {

@@ -540,16 +540,17 @@ impl Db {
 // NOTE: the released v1 schema has NO cert-chain columns: `ref_certificates`
 // carries only (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did,
 // signature, issued_at). The chain fields seq, prev, and pusher_sig are added
-// by migration v18 (alongside `arweave_anchors.cert_id` and the
+// by migration v31 (alongside `arweave_anchors.cert_id` and the
 // `irys_tx_id` → `arweave_tx_id` rename); the proof columns
-// signature_input, content_digest, and request_path are added by v19.
-// New installs reach v18/v19 via sequential migration; existing installs with
-// the columns already present are no-ops via IF NOT EXISTS. v20 drops the
+// signature_input, content_digest, and request_path are added by v32.
+// New installs reach v31/v32 via sequential migration; existing installs with
+// the columns already present are no-ops via IF NOT EXISTS. v27 drops the
 // superseded (repo_id, ref_name) unique index that v10 created; that drop is
 // one-way and rollback-unsupported (see the migration's own comment).
-// v21 adds the durable post-receive job table, and v22 turns the
+// v28 adds the durable post-receive job table, v29 turns the
 // `arweave_anchors` row into a per-transition durable claim/outbox
-// (state, item_id, claim_token) with a unique transition index.
+// (state, item_id, claim_token) with a unique transition index, and
+// v30 adds a `lease_since` column for the exclusive-lease clock.
 //
 // Each migration runs in a single transaction, so statements that Postgres
 // forbids inside a transaction (notably `CREATE INDEX CONCURRENTLY`) cannot be
@@ -1230,19 +1231,22 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS request_path TEXT",
         ],
     },
+    // Durable post-receive jobs, anchor outbox, and lease clock (#224 review).
+    // Numbered 27–30: versions 12–16 are claimed by other in-flight branches,
+    // 17 is main's current max, and 18–26 are claimed by #173.
     Migration {
         version: 27,
         name: "drop_ref_certs_repo_ref_unique",
         // ONE-WAY, ROLLBACK-UNSUPPORTED: this drops the unique index that v10
-        // (ref_cert_unique_per_ref) created. Rolling back to v19 would require
+        // (ref_cert_unique_per_ref) created. Rolling back to v26 would require
         // re-creating `idx_ref_certs_repo_ref`, which a release built at v27+
         // cannot do (the migration that created it has been superseded).
         // Operators must treat v27 as terminal: there is no supported downgrade
         // past it. The drop itself is the point of the migration — the old
         // index would reject the second cert insert for a ref, which the
-        // append-only cert chain (v19) requires.
+        // append-only cert chain (v32) requires.
         stmts: &[
-            // Remove the superseded (repo_id, ref_name) unique index (v10).  v19 makes
+            // Remove the superseded (repo_id, ref_name) unique index (v10).  v32 makes
             // the cert chain append-only, which requires multiple rows per
             // (repo_id, ref_name); the unique index would reject the second
             // insert for a ref.  Deferring the drop is impossible for the same
@@ -1282,14 +1286,32 @@ const MIGRATIONS: &[Migration] = &[
     // in `pending` BEFORE any paid upload is attempted, then moves it through
     // `uploading` → `recorded` (or `failed`). The unique (repo, ref_name,
     // old_sha, new_sha) index makes competing workers converge: only one INSERT
-    // wins, so only one worker can ever pay for a given transition. `item_id`
-    // is the ANS-104 data-item id computed from the signed item BEFORE the
-    // upload request is sent; a recovery that finds the row in `pending`/
-    // `uploading` with an `item_id` probes the gateway for that id to decide
+    // Arweave anchoring (#26).  Numbered 29–32: versions 18–26 are claimed by
+    // #173.  v29 (rename + cert columns) must precede v30 (outbox) which
+    // references the renamed column, and v32 (append-only cert chain) must
+    // follow v27 (index drop) and v29 (seq column).
+    Migration {
+        version: 29,
+        name: "arweave_anchor_v2_and_cert_chain",
+        stmts: &[
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS seq BIGINT NOT NULL DEFAULT 1",
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS prev TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000'",
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS pusher_sig TEXT",
+            "ALTER TABLE arweave_anchors ADD COLUMN IF NOT EXISTS cert_id TEXT",
+            // Rename irys_tx_id → arweave_tx_id only if the old column still exists
+            // (fresh databases created by v1 already use arweave_tx_id).
+            "DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='arweave_anchors' AND column_name='irys_tx_id') THEN ALTER TABLE arweave_anchors RENAME COLUMN irys_tx_id TO arweave_tx_id; END IF; END $$",
+            "ALTER TABLE arweave_anchors DROP COLUMN IF EXISTS arweave_url",
+        ],
+    },
+    // Durable anchor outbox (#224 review): per-transition claim/prepare/upload/record
+    // state machine.  `item_id` is the ANS-104 data-item id computed from the signed
+    // item BEFORE the upload request is sent; a recovery that finds the row in
+    // `pending`/`uploading` with an `item_id` probes the gateway for that id to decide
     // whether the crashed upload actually landed before ever issuing a second
     // paid request. `claim_token`/`claimed_at` record who holds the lease.
     Migration {
-        version: 29,
+        version: 30,
         name: "arweave_anchor_outbox",
         stmts: &[
             // Existing rows were all uploaded and recorded by earlier code, so
@@ -1325,10 +1347,48 @@ const MIGRATIONS: &[Migration] = &[
     // and rows later set to `recorded` keep their anchored-at value; 'pre-lease'
     // rows (claim_token IS NULL) are matched by the CAS's NULL branch regardless.
     Migration {
-        version: 30,
+        version: 31,
         name: "arweave_anchor_lease_since",
         stmts: &[
             "ALTER TABLE arweave_anchors ADD COLUMN IF NOT EXISTS lease_since TIMESTAMPTZ",
+        ],
+    },
+    Migration {
+        version: 32,
+        name: "append_only_certs_and_pusher_proof",
+        stmts: &[
+            // Backfill: assign sequential seq values to existing certificates
+            // before creating the unique index. Migrations v10/v11 may have left
+            // multiple rows per repo (from different refs) all at seq = 1.
+            // The prev column is intentionally NOT backfilled here: chain
+            // verification in verify_anchor computes expected_prev dynamically
+            // from the predecessor's 7 canonical fields (repo_id, ref, old,
+            // new, pusher, node, ts), never reading the DB's prev column.
+            // Existing prev values already match what was computed at issuance.
+            r#"UPDATE ref_certificates
+               SET seq = subq.new_seq
+               FROM (
+                   SELECT id, ROW_NUMBER() OVER (
+                       PARTITION BY repo_id ORDER BY issued_at ASC, id ASC
+                   ) AS new_seq
+                   FROM ref_certificates
+               ) subq
+               WHERE ref_certificates.id = subq.id"#,
+            // Make cert chain append-only: add a unique constraint on
+            // (repo_id, seq) so concurrent pushes cannot collide on the same
+            // sequence number.  The superseded (repo_id, ref_name) unique index
+            // is dropped in v27 of this same release — it cannot be deferred
+            // any longer because append-only REQUIRES multiple rows per
+            // (repo_id, ref_name), which a unique index forbids; the two are
+            // mutually exclusive.  Nodes share no database (each runs its own
+            // local Postgres), so the drop cannot strand a mixed-version
+            // writer mid-rollout.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ref_certs_repo_seq ON ref_certificates(repo_id, seq)",
+            // Store the full HTTP Signature context so a third party can verify
+            // the pusher authorization proof (RFC 9421).
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS signature_input TEXT",
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS content_digest TEXT",
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS request_path TEXT",
         ],
     },
 ];
@@ -4697,11 +4757,23 @@ impl Db {
         repo: Option<&str>,
         limit: i64,
     ) -> Result<Vec<ArweaveAnchor>> {
-        let (owner_key, name) = match repo.and_then(|r| r.split_once('/')) {
-            Some((owner, name)) if !owner.is_empty() && !name.is_empty() => {
-                (Some(normalize_owner_key(owner)), Some(name))
-            }
-            _ => (None, None),
+        // A supplied but malformed `repo` filter must not silently become an
+        // unfiltered listing: only an omitted filter selects all visible anchors.
+        // A malformed value (missing owner or name half) cannot match any
+        // repo-group key, so reject it explicitly rather than falling through
+        // to the NULL-safe predicates that treat NULL as "no filter" (#224 R3).
+        let (owner_key, name) = match repo {
+            None => (None, None),
+            Some(r) => match r.split_once('/') {
+                Some((owner, name)) if !owner.is_empty() && !name.is_empty() => {
+                    (Some(normalize_owner_key(owner)), Some(name))
+                }
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "malformed repo filter: expected owner/name, got {r:?}"
+                    ));
+                }
+            },
         };
         let sql = format!(
             "WITH repo_groups AS (
@@ -8338,9 +8410,9 @@ mod ref_certificate_tests {
         );
     }
 
-    /// INV-7: upgrade-path test for migration v19 — seed a database at v18
+    /// INV-7: upgrade-path test for migration v32 — seed a database at v28
     /// with multiple same-repo/different-ref certificates (all at seq=1),
-    /// then let run_migrations() apply v19 and verify (a) seq values are
+    /// then let run_migrations() apply v32 and verify (a) seq values are
     /// distinct per repo, (b) the (repo_id, seq) unique index exists and
     /// rejects a raw INSERT with a colliding seq.
     #[sqlx::test]
@@ -8349,13 +8421,13 @@ mod ref_certificate_tests {
         let db = Db::for_testing(pool.clone());
         db.run_migrations().await.unwrap();
 
-        // 2. Roll back to v18: drop the (repo_id, seq) index and the
-        //    schema_migrations record for v19 so run_migrations() re-applies it.
+        // 2. Roll back to v28: drop the (repo_id, seq) index and the
+        //    schema_migrations record for v32 so run_migrations() re-applies it.
         sqlx::query("DROP INDEX IF EXISTS idx_ref_certs_repo_seq")
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM schema_migrations WHERE version = 19")
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 32")
             .execute(&pool)
             .await
             .unwrap();
@@ -8402,7 +8474,7 @@ mod ref_certificate_tests {
             .unwrap();
         }
 
-        // 4. Re-run migrations — v19 backfills seq.
+        // 4. Re-run migrations — v32 backfills seq.
         db.run_migrations().await.unwrap();
 
         // 5. Assert distinct seq values per repo.
