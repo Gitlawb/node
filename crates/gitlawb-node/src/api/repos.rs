@@ -3149,8 +3149,8 @@ pub async fn fork_repo(
     // archive already sits under this key (a failed create_repo or another
     // writer), and proceeding would create a DB record whose archive is shadowed
     // by bytes that are not this fork. Refuse rather than accept a fork other
-    // nodes would fetch as unrelated content. The local clone is cleaned up on
-    // this path by the caller's error return dropping the handler state.
+    // nodes would fetch as unrelated content. Remove the local mirror clone so
+    // a refused fork does not leave a bare repo on disk.
     state
         .repo_store
         .release_after_write(&forker_did, &fork_name)
@@ -3163,6 +3163,13 @@ pub async fn fork_repo(
                     status,
                     "fork refused: an archive already exists under the fork's key"
                 );
+                if let Err(clean) = std::fs::remove_dir_all(&disk_path) {
+                    tracing::warn!(
+                        path = %disk_path.display(),
+                        err = %clean,
+                        "failed to remove fork clone after precondition loss"
+                    );
+                }
                 AppError::RepoExists(fork_name.clone())
             }
             other => AppError::Git(format!("fork upload failed: {other}")),
@@ -6402,7 +6409,7 @@ mod tests {
                     State(state.clone()),
                     Path((owner.to_string(), name.to_string())),
                     Extension(crate::auth::AuthenticatedDid(
-                        "did:key:z6MkDisconnectWriteLockProofDidAAAAAAAA".to_string(),
+                        "did:key:z6disc".to_string(),
                     )),
                     crate::rate_limit::PeerAddr(Some(
                         "203.0.113.81:5000".parse::<SocketAddr>().unwrap(),
@@ -6554,7 +6561,7 @@ mod tests {
                     State(state.clone()),
                     Path((owner.to_string(), name.to_string())),
                     Extension(crate::auth::AuthenticatedDid(
-                        "did:key:z6MkPushSuccessReleaseProofDidAAAAAAAA".to_string(),
+                        "did:key:z6succ".to_string(),
                     )),
                     crate::rate_limit::PeerAddr(Some(
                         "203.0.113.83:5000".parse::<SocketAddr>().unwrap(),
@@ -6630,7 +6637,7 @@ mod tests {
             .await
             .unwrap();
 
-        let did = "did:key:z6MkLockPoolShedProofDidAAAAAAAAAAAAAAAAAA";
+        let did = "did:key:z6lockpool";
         let peer: SocketAddr = "203.0.113.71:5000".parse().unwrap();
 
         // Occupy the only lock-pool connection with a write on an UNRELATED repo.
@@ -6657,7 +6664,7 @@ mod tests {
 
         // MUST-NOT: with the pool free again, the push is not shed as capacity (it fails
         // later on the nonexistent on-disk repo, which is a git error, not Overloaded).
-        held.release(false).await;
+        let _ = held.release(false).await;
         let admitted = git_receive_pack(
             State(state.clone()),
             Path((owner.to_string(), name.to_string())),

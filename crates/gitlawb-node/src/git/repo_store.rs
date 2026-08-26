@@ -47,6 +47,10 @@ pub struct RepoStore {
     /// `RepoWriteGuard::test_pre_unlock_gate`. Never set outside tests.
     #[cfg(test)]
     pre_unlock_gate: Option<Arc<tokio::sync::Notify>>,
+    /// Per store rather than a process global, so parallel tests do not see each
+    /// other's uploads. See [`RepoStore::tigris_upload_site_reached`].
+    #[cfg(test)]
+    upload_site_reached: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RepoStore {
@@ -60,6 +64,7 @@ impl RepoStore {
             lock_acquire_deadline: LOCK_ACQUIRE_DEADLINE,
             migrated: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             pre_unlock_gate: None,
+            upload_site_reached: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -91,6 +96,14 @@ impl RepoStore {
         self
     }
 
+    /// Test-only: how many write guards from this store have reached the Tigris upload
+    /// site. See [`RepoWriteGuard::release`].
+    #[cfg(test)]
+    pub fn tigris_upload_site_reached(&self) -> usize {
+        self.upload_site_reached
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn new(
         repos_dir: PathBuf,
         tigris: Option<TigrisClient>,
@@ -106,6 +119,8 @@ impl RepoStore {
             migrated: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
             pre_unlock_gate: None,
+            #[cfg(test)]
+            upload_site_reached: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -448,6 +463,8 @@ impl RepoStore {
             publish_fence: UploadPrecondition::Unconditional,
             #[cfg(test)]
             test_pre_unlock_gate: self.pre_unlock_gate.clone(),
+            #[cfg(test)]
+            upload_site_reached: Arc::clone(&self.upload_site_reached),
         };
 
         // Always download the latest from Tigris before writing. Local disk may be
@@ -1040,6 +1057,8 @@ pub struct RepoWriteGuard {
     /// frees the session lock. Never set outside tests.
     #[cfg(test)]
     test_pre_unlock_gate: Option<Arc<tokio::sync::Notify>>,
+    #[cfg(test)]
+    upload_site_reached: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RepoWriteGuard {
@@ -1150,6 +1169,9 @@ impl RepoWriteGuard {
         let mut outcome = ReleaseOutcome::Released;
         // Upload to Tigris only on success.
         if success {
+            #[cfg(test)]
+            self.upload_site_reached
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let Some(tigris) = self.tigris.clone() {
                 // ONE budget for the whole publish, covering both attempts and
                 // the HEAD between them, for the same reason the acquire-side
@@ -2489,6 +2511,8 @@ mod tests {
             publish_fence: UploadPrecondition::Unconditional,
             #[cfg(test)]
             test_pre_unlock_gate: None,
+            #[cfg(test)]
+            upload_site_reached: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         // Must complete without panic and issue no unlock.
         let _ = guard.release(false).await;
@@ -2851,6 +2875,8 @@ mod tests {
             publish_fence: UploadPrecondition::Unconditional,
             #[cfg(test)]
             test_pre_unlock_gate: None,
+            #[cfg(test)]
+            upload_site_reached: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         let _ = guard.release(true).await;
 

@@ -271,10 +271,8 @@ impl TigrisClient {
             .into_bytes();
 
         // The snapshot temp dir is decided HERE, in the async layer, before the
-        // extraction runs. The extraction itself is uncancellable spawn_blocking,
-        // so the dir is created no matter what happens to this future; an
-        // async-layer guard that owns the path removes it when this future is
-        // dropped mid-await (client disconnect, a bounded-transfer timeout).
+        // extraction runs. Cleanup ownership moves into the blocking task so a
+        // cancelled async future cannot drop it while extraction is still running.
         let snapshot_tmp = if publish {
             None
         } else {
@@ -289,47 +287,47 @@ impl TigrisClient {
                 uuid::Uuid::new_v4()
             )))
         };
-        // Armed before the extraction await; disarmed on the success return via
-        // `mem::forget`, leaving the dir to the caller (RepoSnapshot::drop). On
-        // any other exit, including a cancelled future, the guard removes the
-        // dir. This is what closes the leak where a dropped read_snapshot future
-        // abandons a completed extraction.
-        let _cleanup = snapshot_tmp.as_ref().map(|p| SnapshotCleanup(p.clone()));
 
         // Extract tar.zst to a directory.
         let extracted = tokio::task::spawn_blocking({
             let target = target.to_path_buf();
             let snapshot_tmp = snapshot_tmp.clone();
             move || -> Result<PathBuf> {
-                if publish {
-                    decompress_repo(&data, &target)?;
-                    return Ok(target);
-                }
-                // Non-mutating snapshot: unpack into the temp dir decided above.
-                // The live repo path is never touched.
-                let tmp_dir = snapshot_tmp.expect("snapshot path was decided above");
-                std::fs::create_dir_all(&tmp_dir).context("creating temp extract dir")?;
-                let unpack = (|| -> Result<()> {
-                    let decoder = zstd::stream::Decoder::new(&data[..])?;
-                    let mut archive = tar::Archive::new(decoder);
-                    archive.unpack(&tmp_dir).context("unpacking tar.zst")?;
-                    Ok(())
+                // Armed for the whole blocking extraction; disarmed on success via
+                // `mem::forget`, leaving the dir to the caller (RepoSnapshot::drop).
+                let cleanup = snapshot_tmp.as_ref().map(|p| SnapshotCleanup(p.clone()));
+                let result = (|| -> Result<PathBuf> {
+                    if publish {
+                        decompress_repo(&data, &target)?;
+                        return Ok(target);
+                    }
+                    // Non-mutating snapshot: unpack into the temp dir decided above.
+                    // The live repo path is never touched.
+                    let tmp_dir = snapshot_tmp.expect("snapshot path was decided above");
+                    std::fs::create_dir_all(&tmp_dir).context("creating temp extract dir")?;
+                    let unpack = (|| -> Result<()> {
+                        let decoder = zstd::stream::Decoder::new(&data[..])?;
+                        let mut archive = tar::Archive::new(decoder);
+                        archive.unpack(&tmp_dir).context("unpacking tar.zst")?;
+                        Ok(())
+                    })();
+                    if let Err(e) = unpack {
+                        let _ = std::fs::remove_dir_all(&tmp_dir);
+                        return Err(e);
+                    }
+                    Ok(tmp_dir)
                 })();
-                if let Err(e) = unpack {
-                    let _ = std::fs::remove_dir_all(&tmp_dir);
-                    return Err(e);
+                if result.is_ok() {
+                    if let Some(guard) = cleanup {
+                        std::mem::forget(guard);
+                    }
                 }
-                Ok(tmp_dir)
+                result
             }
         })
         .await
         .context("extract task panicked")?
         .context("extracting repo")?;
-
-        // The dir is now the caller's to own: drop the cleanup guard without
-        // removing anything. On a future drop before this point, `_cleanup` runs
-        // and removes the dir even though the extraction completed.
-        std::mem::forget(_cleanup);
 
         info!(key = %key, path = %target.display(), "downloaded repo from tigris");
         Ok(extracted)
