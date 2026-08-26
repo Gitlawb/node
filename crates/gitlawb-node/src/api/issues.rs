@@ -266,10 +266,11 @@ pub async fn close_issue(
     // node whose only copy of the repo is a synced one, which is an ordinary state
     // here, and it would not buy the protection it appears to, because a synced
     // row's recorded owner comes from the peer that sent it. The expensive work
-    // this check guards is bounded ahead of it by the per-IP limiter above, and the
-    // authoritative owner-or-author decision still runs below and again under the
-    // write lock.
+    // this check guards is bounded ahead of it by the per-IP limiter and the read
+    // pool slot taken below, and the authoritative owner-or-author decision still
+    // runs below and again under the write lock.
     {
+        // mirror-rows-handled: synced mirror rows carry no owner rules; read gate only.
         let rules = state.db.list_visibility_rules(&record.id).await?;
         let caller = auth.0.as_str();
         if crate::visibility::visibility_check(
