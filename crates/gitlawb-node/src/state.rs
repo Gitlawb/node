@@ -350,6 +350,7 @@ impl AppState {
         self.ipfs_work_rate_limiter.cleanup().await;
         self.sync_trigger_rate_limiter.cleanup().await;
         self.peer_write_rate_limiter.cleanup().await;
+        self.arweave_rate_limiter.cleanup().await;
     }
 
     /// Trigger graceful shutdown. Idempotent — calling more than once

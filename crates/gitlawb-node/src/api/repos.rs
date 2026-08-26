@@ -2318,66 +2318,10 @@ pub async fn git_receive_pack(
     // change to the client contract than the window it closes.
     let push_succeeded = receive_result.is_ok();
 
-    // Always release the advisory lock — even on error — to prevent stale locks
-    // from blocking subsequent pushes. Only upload to Tigris when the push
-    // succeeded; uploading a half-applied repo would propagate corruption.
-    // Reclaim the write lock from the shared cell (#173 F2). This is only reachable
-    // once `receive_pack` has returned, so the admission guard's copy can only ever
-    // DELAY release, never perform it early; on the disconnect path this line is not
-    // reached at all and the reaper's copy is last.
-    let reclaimed = guard
-        .lock()
-        .expect("repo write-lock mutex poisoned")
-        .take()
-        .expect("the write lock is only taken here, and only once");
-    reclaimed.release(push_succeeded).await;
-    // Clean path: clone (a) already dropped inside run_git_service when the receive-pack
-    // group was reaped; clone (b) held here spanned the success-only Tigris upload that
-    // ran inside release() above. Drop it now so a second same-repo push proceeds the
-    // moment this write is durable, rather than at end of the (longer) handler tail. On
-    // the disconnect path this line is never reached: clone (a) rides the reaper (F3).
-    drop(lease);
-
-    let result = receive_result.map_err(|e| {
-        let app = git_service_app_error(&e);
-        match &app {
-            AppError::Timeout(_) => tracing::warn!(repo = %name, "git receive-pack timed out"),
-            AppError::BadRequest(msg) => {
-                tracing::warn!(repo = %name, err = %msg, "git receive-pack: bad client request")
-            }
-            _ => tracing::error!(repo = %name, err = %e, "git receive-pack failed"),
-        }
-        app
-    })?;
-
-    // Update the repo's updated_at timestamp after a successful push
-    let _ = state.db.touch_repo(&record.id).await;
-
-    // Record the successful push for metrics. The body has already been
-    // consumed by smart_http::receive_pack so we observe size up front.
-    crate::metrics::record_push(&record.id);
-    crate::metrics::observe_pack_size(body_len as f64);
-
+    // ── Durable post-receive job (spawned ABOVE release) ───────────────
+    // The job is persisted and spawned BEFORE guard.release(): a disconnect
+    // during release drops the handler future but the spawned task lives on.
     if push_succeeded {
-        // Everything a landed push owes after git accepted the pack — record_push,
-        // trust score, per-ref signed certificates, and the replication tail — runs
-        // inside a DURABLE POST-RECEIVE JOB, not a bare spawned task. The job is
-        // persisted BEFORE the response is returned: Tokio cancels spawned tasks on
-        // restart/shutdown, so a continuation spawned only in memory left the window
-        // open where a crash between the pack landing and the bookkeeping reaching
-        // record_push/cert dropped a durable push with no cert, accounting, anchor,
-        // or replication and no recovery record. Once the job row is durable the
-        // effects can be replayed idempotently after a crash (see
-        // `process_post_receive_job` and the startup drain in main).
-        //
-        // The enqueue itself is NOT skippable: if it fails, the pack is on disk but
-        // its post-receive work has no recovery record, so acknowledging the push
-        // would be a lie. Refuse the 200 (the client/operator can investigate) and
-        // release the lock exactly like the error path below does. The ordinary
-        // failure here is a DB write failing while other paths still work — rare,
-        // and returning 500 is the honest outcome; retrying the push will not
-        // re-derive the ref updates (git sees them as already applied), so the
-        // operator must treat a 500 as "the push landed but was not recorded".
         let did = auth.0.as_str();
         let job = crate::db::PostReceiveJob {
             id: Uuid::new_v4().to_string(),
@@ -2417,6 +2361,46 @@ pub async fn git_receive_pack(
         }
         tokio::spawn(process_post_receive_job(state.clone(), job));
     }
+
+    // Always release the advisory lock — even on error — to prevent stale locks
+    // from blocking subsequent pushes. Only upload to Tigris when the push
+    // succeeded; uploading a half-applied repo would propagate corruption.
+    // Reclaim the write lock from the shared cell (#173 F2). This is only reachable
+    // once `receive_pack` has returned, so the admission guard's copy can only ever
+    // DELAY release, never perform it early; on the disconnect path this line is not
+    // reached at all and the reaper's copy is last.
+    let reclaimed = guard
+        .lock()
+        .expect("repo write-lock mutex poisoned")
+        .take()
+        .expect("the write lock is only taken here, and only once");
+    reclaimed.release(push_succeeded).await;
+    // Clean path: clone (a) already dropped inside run_git_service when the receive-pack
+    // group was reaped; clone (b) held here spanned the success-only Tigris upload that
+    // ran inside release() above. Drop it now so a second same-repo push proceeds the
+    // moment this write is durable, rather than at end of the (longer) handler tail. On
+    // the disconnect path this line is never reached: clone (a) rides the reaper (F3).
+    drop(lease);
+
+    let result = receive_result.map_err(|e| {
+        let app = git_service_app_error(&e);
+        match &app {
+            AppError::Timeout(_) => tracing::warn!(repo = %name, "git receive-pack timed out"),
+            AppError::BadRequest(msg) => {
+                tracing::warn!(repo = %name, err = %msg, "git receive-pack: bad client request")
+            }
+            _ => tracing::error!(repo = %name, err = %e, "git receive-pack failed"),
+        }
+        app
+    })?;
+
+    // Update the repo's updated_at timestamp after a successful push
+    let _ = state.db.touch_repo(&record.id).await;
+
+    // Record the successful push for metrics. The body has already been
+    // consumed by smart_http::receive_pack so we observe size up front.
+    crate::metrics::record_push(&record.id);
+    crate::metrics::observe_pack_size(body_len as f64);
 
     // Fire push webhooks — one per ref update
     let did = auth.0.as_str();

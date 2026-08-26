@@ -159,6 +159,12 @@ pub(crate) fn signed_request_as(did: &str, method: Method, uri: &str, body: Body
         .uri(uri)
         .header(axum::http::header::CONTENT_TYPE, "application/json")
         .extension(AuthenticatedDid(did.to_string()))
+        .extension(crate::auth::PusherSignature(String::new()))
+        .extension(crate::auth::PusherProof {
+            signature_input: String::new(),
+            content_digest: String::new(),
+            request_path: String::new(),
+        })
         .body(body)
         .expect("request builder")
 }

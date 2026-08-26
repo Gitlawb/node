@@ -1017,6 +1017,14 @@ const MIGRATIONS: &[Migration] = &[
             // is a function of raw content, so a UNIQUE index could reject a legitimate
             // record_pinned_cid insert, and colliding rows serve byte-identical content.
             "CREATE INDEX IF NOT EXISTS idx_pinned_cids_cid ON pinned_cids(cid)",
+        ],
+    },
+    Migration {
+        version: 19,
+        name: "pinned_cids_repo_provenance",
+        stmts: &[
+            // Record the repository a pin came from so GET /ipfs/{cid} resolves a
+            // provenanced pin straight to its ONE source repo instead of scanning every
             // repo (#173, jatmn round 2 — bounds the anonymous fan-out and removes the
             // updated_at-ordering false-404). NEW versioned migration (never appended to
             // the applied v1 pinned_cids table) so a node past v1 gets the column.
@@ -1197,38 +1205,6 @@ const MIGRATIONS: &[Migration] = &[
             // the head of the list", which is the same thing a never-swept node reads.
             "ALTER TABLE pin_repair_sweep ADD COLUMN IF NOT EXISTS discovery_cursor_created_at TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE pin_repair_sweep ADD COLUMN IF NOT EXISTS discovery_cursor_id TEXT NOT NULL DEFAULT ''",
-            // Backfill: assign sequential seq values to existing certificates
-            // before creating the unique index. Migrations v10/v11 may have left
-            // multiple rows per repo (from different refs) all at seq = 1.
-            // The prev column is intentionally NOT backfilled here: chain
-            // verification in verify_anchor computes expected_prev dynamically
-            // from the predecessor's 7 canonical fields (repo_id, ref, old,
-            // new, pusher, node, ts), never reading the DB's prev column.
-            // Existing prev values already match what was computed at issuance.
-            r#"UPDATE ref_certificates
-               SET seq = subq.new_seq
-               FROM (
-                   SELECT id, ROW_NUMBER() OVER (
-                       PARTITION BY repo_id ORDER BY issued_at ASC, id ASC
-                   ) AS new_seq
-                   FROM ref_certificates
-               ) subq
-               WHERE ref_certificates.id = subq.id"#,
-            // Make cert chain append-only: add a unique constraint on
-            // (repo_id, seq) so concurrent pushes cannot collide on the same
-            // sequence number.  The superseded (repo_id, ref_name) unique index
-            // is dropped in v27 of this same release — it cannot be deferred
-            // any longer because append-only REQUIRES multiple rows per
-            // (repo_id, ref_name), which a unique index forbids; the two are
-            // mutually exclusive.  Nodes share no database (each runs its own
-            // local Postgres), so the drop cannot strand a mixed-version
-            // writer mid-rollout.
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ref_certs_repo_seq ON ref_certificates(repo_id, seq)",
-            // Store the full HTTP Signature context so a third party can verify
-            // the pusher authorization proof (RFC 9421).
-            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS signature_input TEXT",
-            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS content_digest TEXT",
-            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS request_path TEXT",
         ],
     },
     // Durable post-receive jobs, anchor outbox, and lease clock (#224 review).
@@ -2874,7 +2850,7 @@ impl Db {
 
         let rows = sqlx::query(
             "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path
-              FROM ref_certificates WHERE repo_id = $1 AND id LIKE $2 ORDER BY seq DESC, issued_at DESC LIMIT $3",
+              FROM ref_certificates WHERE repo_id = $1 AND id LIKE $2 ESCAPE '!' ORDER BY seq DESC, issued_at DESC LIMIT $3",
         )
         .bind(repo_id)
         .bind(&pattern)
