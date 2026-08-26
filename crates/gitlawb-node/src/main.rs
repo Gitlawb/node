@@ -90,6 +90,7 @@ async fn main() -> Result<()> {
 
     // Load or generate the node's identity keypair
     let keypair = load_or_create_keypair(&config)?;
+    let scan_token_key = AppState::derive_scan_token_key(&keypair);
     let node_did = keypair.did();
 
     // One-time metrics init. Must run before any handler that calls into
@@ -394,6 +395,13 @@ async fn main() -> Result<()> {
         rate_limiter,
         create_ip_rate_limiter,
         push_rate_limiter,
+        ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
+        ipfs_max_legacy_probes: AppState::ipfs_legacy_probe_budget(&config),
+        ipfs_legacy_scan_page_rows: crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS,
+        ipfs_max_legacy_scan_rows: AppState::ipfs_legacy_scan_row_budget(&config),
+        ipfs_max_legacy_scan_rule_bytes: crate::api::ipfs::MAX_LEGACY_SCAN_RULE_BYTES_PER_REQUEST,
+        ipfs_scan_token_key: Arc::new(scan_token_key),
+        ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust,
         sync_trigger_rate_limiter,
         peer_write_rate_limiter,
@@ -465,6 +473,11 @@ async fn main() -> Result<()> {
         ),
         ipfs_rate_limiter: rate_limit::RateLimiter::new_bounded(
             config.ipfs_rate_limit,
+            std::time::Duration::from_secs(3600),
+            200_000,
+        ),
+        ipfs_work_rate_limiter: rate_limit::RateLimiter::new_bounded(
+            AppState::ipfs_work_budget(&config),
             std::time::Duration::from_secs(3600),
             200_000,
         ),

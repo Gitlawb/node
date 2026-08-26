@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -353,7 +354,8 @@ impl RepoStore {
                         "advisory-lock pool acquire failed — writes are being shed; \
                          raise GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS or investigate long-held write locks"
                     );
-                    return Err(e).context("advisory-lock pool exhausted or unreachable");
+                    return Err(anyhow::Error::new(LockPoolBusy))
+                        .context(format!("advisory-lock pool exhausted or unreachable: {e}"));
                 }
                 Err(_) => {
                     // The pool checkout itself outlived the remaining budget. Same
@@ -674,40 +676,47 @@ impl RepoStore {
     ///      segment is rejected. This is the CodeQL-recognised barrier
     ///      pattern for `rust/path-injection`.
     fn local_path(&self, owner_did: &str, repo_name: &str) -> Result<(String, PathBuf)> {
-        validate_path_components(owner_did, repo_name)?;
-
         let owner_slug = owner_did.replace([':', '/'], "_");
-        let local_path = self
-            .repos_dir
-            .join(&owner_slug)
-            .join(format!("{repo_name}.git"));
-
-        if !local_path.starts_with(&self.repos_dir) {
-            anyhow::bail!(
-                "computed repo path escaped repos_dir: {}",
-                local_path.display()
-            );
-        }
-
-        // Explicit component walk — sanitisation barrier that static analysers
-        // (CodeQL `rust/path-injection`) recognise. The path must be composed
-        // entirely of Normal segments after the root prefix; any ParentDir or
-        // CurDir component is a traversal attempt.
-        for component in local_path.components() {
-            use std::path::Component;
-            match component {
-                Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {}
-                Component::ParentDir => {
-                    anyhow::bail!("path contains parent-directory component");
-                }
-                Component::CurDir => {
-                    anyhow::bail!("path contains current-directory component");
-                }
-            }
-        }
-
+        let local_path = validated_repo_disk_path(&self.repos_dir, owner_did, repo_name)?;
         Ok((owner_slug, local_path))
     }
+}
+
+/// The three-layer validated form of `store::repo_disk_path`, with NO Tigris fetch and
+/// no `RepoStore` (#173 round 11, F3). Extracted from `RepoStore::local_path` so a
+/// second caller that must not pull a cold repo gets the same barrier instead of the
+/// raw join.
+pub(crate) fn validated_repo_disk_path(
+    repos_dir: &Path,
+    owner_did: &str,
+    repo_name: &str,
+) -> Result<PathBuf> {
+    validate_path_components(owner_did, repo_name)?;
+
+    let owner_slug = owner_did.replace([':', '/'], "_");
+    let local_path = repos_dir.join(&owner_slug).join(format!("{repo_name}.git"));
+
+    if !local_path.starts_with(repos_dir) {
+        anyhow::bail!(
+            "computed repo path escaped repos_dir: {}",
+            local_path.display()
+        );
+    }
+
+    for component in local_path.components() {
+        use std::path::Component;
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {}
+            Component::ParentDir => {
+                anyhow::bail!("path contains parent-directory component");
+            }
+            Component::CurDir => {
+                anyhow::bail!("path contains current-directory component");
+            }
+        }
+    }
+
+    Ok(local_path)
 }
 
 /// Strict allowlist validator for `owner_did` and `repo_name`.
@@ -1447,6 +1456,36 @@ where
 #[cfg(test)]
 pub fn advisory_lock_key_for_test(owner_slug: &str, repo_name: &str) -> i64 {
     advisory_lock_key(owner_slug, repo_name)
+}
+
+/// Error marker for "no lock-pool connection was available in time".
+///
+/// Carried through the `anyhow` chain so the HTTP handler can `downcast_ref` it
+/// and shed a 503 + Retry-After instead of the generic 500 a git error maps to
+/// (#173 F1).
+#[derive(Debug, thiserror::Error)]
+#[error("no lock-pool connection available")]
+pub struct LockPoolBusy;
+
+/// Build a dedicated advisory-lock pool for tests and for callers that derive one
+/// from an existing pool. Connect options are cloned off `source`; the pool is lazy.
+///
+/// The `after_release` hook runs `pg_advisory_unlock_all()` before a connection is
+/// reused, which is what makes cancellation of an in-flight `acquire_write` safe
+/// when combined with the session-pinning design in `RepoWriteGuard`.
+pub fn build_lock_pool(source: &PgPool, max_connections: u32, acquire_timeout: Duration) -> PgPool {
+    PgPoolOptions::new()
+        .max_connections(max_connections)
+        .acquire_timeout(acquire_timeout)
+        .after_release(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("SELECT pg_advisory_unlock_all()")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(true)
+            })
+        })
+        .connect_lazy_with((*source.connect_options()).clone())
 }
 
 /// Compute a stable i64 hash for a Postgres advisory lock key.

@@ -28,6 +28,7 @@ struct SettingsView: View {
     @State private var operatorPrivateKey: String = Config.shared.operatorPrivateKey
     @State private var tigrisBucket: String = Config.shared.tigrisBucket
     @State private var autoSync: Bool = Config.shared.autoSync
+    @State private var enforceOwnerPush: Bool = Config.shared.enforceOwnerPush
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -50,6 +51,15 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Toggle("Sync repos from peers", isOn: $autoSync)
                 Text("Automatically replicate repositories from other nodes in the network")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Toggle("Require repo owner to push", isOn: $enforceOwnerPush)
+                Text("A signature proves who is pushing, not that they own the repo. "
+                     + "Turn this off only during a rolling upgrade whose pushers are "
+                     + "not yet the owner — while off, anyone who can sign may push to "
+                     + "any repo on this node.")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -96,6 +106,7 @@ struct SettingsView: View {
         Config.shared.operatorPrivateKey = operatorPrivateKey
         Config.shared.tigrisBucket = tigrisBucket
         Config.shared.autoSync = autoSync
+        Config.shared.enforceOwnerPush = enforceOwnerPush
 
         Config.shared.persist()
         Config.shared.writeEnvFile()

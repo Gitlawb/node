@@ -294,6 +294,10 @@ services:
       GITLAWB_HOST: 0.0.0.0
       GITLAWB_PUBLIC_URL: ${GITLAWB_PUBLIC_URL:-http://localhost:7545}
       GITLAWB_P2P_PORT: 7546
+      # Owner-only push. Must match the bundled Resources/docker-compose.yml: this
+      # generated file — not the bundled resource — is what a packaged app runs, so
+      # omitting it here leaves the documented opt-out unreachable for those users.
+      GITLAWB_ENFORCE_OWNER_PUSH: ${GITLAWB_ENFORCE_OWNER_PUSH:-true}
       GITLAWB_CHAIN_RPC_URL: ${GITLAWB_CHAIN_RPC_URL:-}
       GITLAWB_CONTRACT_NODE_STAKING: ${GITLAWB_CONTRACT_NODE_STAKING:-}
       GITLAWB_OPERATOR_PRIVATE_KEY: ${GITLAWB_OPERATOR_PRIVATE_KEY:-}

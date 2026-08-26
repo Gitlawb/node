@@ -64,7 +64,8 @@ pub async fn create_issue(
     let guard = state
         .repo_store
         .acquire_write(&record.owner_did, &record.name)
-        .await?;
+        .await
+        .map_err(|e| crate::api::repos::acquire_write_app_error(&e, &repo))?;
     let disk_path = guard.path().to_path_buf();
 
     let create_result = git_issues::create_issue(&disk_path, &issue_id, &json_str);
@@ -369,7 +370,8 @@ pub async fn close_issue(
     let guard = state
         .repo_store
         .acquire_write(&record.owner_did, &record.name)
-        .await?;
+        .await
+        .map_err(|e| crate::api::repos::acquire_write_app_error(&e, &repo))?;
     let disk_path = guard.path().to_path_buf();
 
     // Re-read under the guard and RE-AUTHORIZE against what we read, rather than
@@ -767,6 +769,159 @@ mod tests {
             res.is_ok(),
             "the issue author, who is NOT the repo owner, must still be able to close: {:?}",
             res.err().map(|e| format!("{e:?}"))
+        );
+    }
+}
+
+/// #173 F1 follow-up: issue write paths reach `acquire_write` with no admission
+/// permit, so an exhausted write-lock pool must shed 503 + Retry-After.
+#[cfg(test)]
+mod lock_pool_shed_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use sqlx::PgPool;
+
+    fn seed_repo(owner_did: &str, name: &str) -> crate::db::RepoRecord {
+        let now = Utc::now();
+        crate::db::RepoRecord {
+            id: Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: format!("/tmp/{name}"),
+            forked_from: None,
+            machine_id: None,
+        }
+    }
+
+    async fn one_connection_lock_pool_state(pool: &PgPool) -> AppState {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            std::path::PathBuf::from("/tmp/gitlawb-issues-lockpool"),
+            None,
+            crate::git::repo_store::build_lock_pool(pool, 1, std::time::Duration::from_secs(1)),
+            std::time::Duration::from_secs(300),
+        );
+        state
+    }
+
+    fn assert_sheds_503_with_retry_after(err: AppError, what: &str) {
+        let resp = err.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{what}: an exhausted write-lock pool must shed 503, not a 500 git error"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .map(|v| v.to_str().unwrap()),
+            Some("1"),
+            "{what}: a capacity shed must tell the client when to retry"
+        );
+    }
+
+    #[sqlx::test]
+    async fn create_issue_lock_pool_exhaustion_sheds_503_not_500(pool: PgPool) {
+        let owner = "did:key:zISSUECREATELOCKPOOLAAAAAAAAAAAAAAAAAAAA";
+        let state = one_connection_lock_pool_state(&pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "lp-create"))
+            .await
+            .expect("seed repo");
+
+        let held = state
+            .repo_store
+            .acquire_write(owner, "other-repo")
+            .await
+            .expect("the first write takes the only lock-pool connection");
+
+        let shed = create_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), "lp-create".to_string())),
+            Json(CreateIssueRequest {
+                title: "t".to_string(),
+                body: None,
+                signed_payload: None,
+            }),
+        )
+        .await;
+        let err = shed.expect_err("an exhausted lock pool must fail the call");
+        assert_sheds_503_with_retry_after(err, "create_issue");
+
+        let _ = held.release(false).await;
+        let admitted = create_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), "lp-create".to_string())),
+            Json(CreateIssueRequest {
+                title: "t".to_string(),
+                body: None,
+                signed_payload: None,
+            }),
+        )
+        .await;
+        assert!(
+            !matches!(admitted, Err(AppError::Overloaded(_))),
+            "with the lock pool free, create_issue must not be shed as capacity; got {:?}",
+            admitted.err()
+        );
+    }
+
+    #[sqlx::test]
+    async fn close_issue_lock_pool_exhaustion_sheds_503_not_500(pool: PgPool) {
+        let owner = "did:key:zISSUECLOSELOCKPOOLBBBBBBBBBBBBBBBBBBBBB";
+        let state = one_connection_lock_pool_state(&pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "lp-close"))
+            .await
+            .expect("seed repo");
+
+        let held = state
+            .repo_store
+            .acquire_write(owner, "other-repo")
+            .await
+            .expect("the first write takes the only lock-pool connection");
+
+        let shed = close_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((
+                owner.to_string(),
+                "lp-close".to_string(),
+                "deadbeef".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(None),
+        )
+        .await;
+        let err = shed.expect_err("an exhausted lock pool must fail the call");
+        assert_sheds_503_with_retry_after(err, "close_issue");
+
+        let _ = held.release(false).await;
+        let admitted = close_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((
+                owner.to_string(),
+                "lp-close".to_string(),
+                "deadbeef".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(None),
+        )
+        .await;
+        assert!(
+            !matches!(admitted, Err(AppError::Overloaded(_))),
+            "with the lock pool free, close_issue must not be shed as capacity; got {:?}",
+            admitted.err()
         );
     }
 }

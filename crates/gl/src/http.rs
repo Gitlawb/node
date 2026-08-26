@@ -15,6 +15,47 @@ use icaptcha_client::IcaptchaCfg;
 /// (absorbs proof expiry / first-seen replay).
 const MAX_ICAPTCHA_RETRIES: usize = 2;
 
+/// Total request timeout: from the start of connecting through the end of the
+/// response body, so it bounds a slow download and not just a slow handshake.
+const TOTAL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Follow a redirect only when it stays on the origin that issued it AND re-issues the
+/// identical request-target, and only for as long as the chain bound allows.
+///
+/// The decision itself is [`gitlawb_core::redirect::may_follow`], shared with
+/// `git-remote-gitlawb` so the two signing clients cannot drift apart on it. Refusal
+/// is `stop`, not `error`: the 3xx comes back as an ordinary response and each caller
+/// reports it through the status path it already has.
+///
+/// `Policy::custom` replaces reqwest's built-in limit, so the chain bound is restated
+/// here. Same-origin redirects can cycle, and this is what stops a node answering 302
+/// to itself from being followed indefinitely. It is not what makes the request
+/// finite: `.timeout(...)` on the same builder is a TOTAL request timeout covering the
+/// whole chain, so without this bound the worst case is a 30 second spin, not an
+/// endless one. The bound is what keeps that spin from costing the node a request per
+/// round trip for the full 30 seconds.
+///
+/// `>` and not `>=`: reqwest pushes the redirecting URL onto `previous` before
+/// consulting the policy, so on the first redirect `previous.len()` is already 1, and
+/// `>=` would permit `MAX_REDIRECTS - 1` follows. `Policy::limited(max)` refuses at
+/// `previous.len() > max`, and matching it is the point of reusing its value.
+fn same_origin_redirect(attempt: reqwest::redirect::Attempt<'_>) -> reqwest::redirect::Action {
+    let Some(previous) = attempt.previous().last() else {
+        // No previous URL to compare against. Unreachable through reqwest, which
+        // pushes the redirecting URL before consulting the policy, but the safe
+        // reading of "cannot prove same-origin" is to refuse.
+        return attempt.stop();
+    };
+    if attempt.previous().len() > gitlawb_core::redirect::MAX_REDIRECTS {
+        return attempt.stop();
+    }
+    if gitlawb_core::redirect::may_follow(previous, attempt.url()) {
+        attempt.follow()
+    } else {
+        attempt.stop()
+    }
+}
+
 pub struct NodeClient {
     inner: reqwest::Client,
     pub node_url: String,
@@ -23,8 +64,20 @@ pub struct NodeClient {
 
 impl NodeClient {
     pub fn new(node_url: impl Into<String>, keypair: Option<Keypair>) -> Self {
+        Self::with_timeout(node_url, keypair, TOTAL_REQUEST_TIMEOUT)
+    }
+
+    /// `new` with the total request timeout as a parameter, so a test can drive the
+    /// timeout's behaviour without waiting out the shipped value. `new` supplies the
+    /// shipped one, which is what makes the scaled-down test cover the real client.
+    fn with_timeout(
+        node_url: impl Into<String>,
+        keypair: Option<Keypair>,
+        timeout: std::time::Duration,
+    ) -> Self {
         let inner = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::custom(same_origin_redirect))
             .user_agent(format!("gl/{} gitlawb-cli", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("failed to build HTTP client");
@@ -203,24 +256,64 @@ async fn obtain_proof(cfg: IcaptchaCfg) -> Result<String> {
         .context("iCaptcha solver task panicked")?
 }
 
+/// What a capped body read produced. `text` is the bytes that arrived; the two flags
+/// say why the read stopped where it did, which a caller that CLASSIFIES on the body
+/// cannot work out from the text alone.
+pub(crate) struct CappedBody {
+    /// The bytes read, lossily decoded.
+    pub(crate) text: String,
+    /// The cap cut the body short.
+    pub(crate) truncated: bool,
+    /// A chunk read FAILED part-way through, so the body is not merely short, it is
+    /// unfinished and the node may have had more to say.
+    pub(crate) read_failed: bool,
+}
+
 /// Read at most `cap` bytes of a response body. Bounds the allocation from a
 /// hostile or broken node returning a huge error body — the display is capped
 /// separately, but the read itself must not be unbounded (INV-6, read half).
-pub(crate) async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> String {
+///
+/// `truncated` reports whether the cap cut the body short. A caller that CLASSIFIES
+/// on the body needs it: a cut body fails JSON parse, and a parse failure is
+/// indistinguishable from a node that sent no code at all, so without this flag an
+/// oversized body silently picks a different arm.
+///
+/// `read_failed` reports the other way a body can end early. A mid-body read error
+/// used to leave through the same exit as a clean end of stream, so a 500 whose body
+/// died in transit surfaced as an empty message and the caller was told
+/// `node returned 500: ` with nothing after the colon. That is a report of what the
+/// node said, and the node never got to say it.
+pub(crate) async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> CappedBody {
     let mut buf: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    let mut read_failed = false;
     while buf.len() < cap {
         match resp.chunk().await {
             Ok(Some(chunk)) => {
                 let take = (cap - buf.len()).min(chunk.len());
                 buf.extend_from_slice(&chunk[..take]);
                 if take < chunk.len() {
+                    truncated = true;
                     break; // hit the cap mid-chunk
                 }
             }
-            _ => break, // end of body or read error — return what we have
+            Ok(None) => break, // clean end of body
+            Err(_) => {
+                read_failed = true;
+                break;
+            }
         }
     }
-    String::from_utf8_lossy(&buf).into_owned()
+    // A body that lands exactly on the cap may or may not have more behind it;
+    // report it as cut, since the classification that follows cannot tell either.
+    if buf.len() >= cap {
+        truncated = true;
+    }
+    CappedBody {
+        text: String::from_utf8_lossy(&buf).into_owned(),
+        truncated,
+        read_failed,
+    }
 }
 
 /// Strip terminal-dangerous characters from (and cap the length of) a
@@ -619,6 +712,530 @@ mod tests {
         n.assert();
         ic.challenge.assert();
         ic.answer.assert();
+    }
+
+    // ── redirect policy ─────────────────────────────────────────────────
+
+    /// The signed headers must not survive a redirect off the node's origin.
+    ///
+    /// reqwest strips only `Authorization`, `Cookie`, `Proxy-Authorization` and
+    /// `WWW-Authenticate` across hosts, so `Signature` and `Signature-Input` used to
+    /// ride a 302 straight to whatever origin the node named. The signature binds
+    /// `@method`, `@path` and `content-digest` and nothing about the authority, so the
+    /// receiving host holds a credential that reads path-scoped objects as the caller
+    /// at any node until the clock-skew window closes.
+    ///
+    /// Two mockito servers are two ports on one host, which is exactly the boundary
+    /// this policy draws (and the one reqwest's own header stripping draws). The
+    /// second server answers everything and expects nothing: a followed redirect
+    /// fails the expectation whether or not the signature came with it. MUTATION
+    /// (RED): drop the `.redirect(...)` line and the second server is hit.
+    #[tokio::test]
+    async fn cross_origin_redirect_is_not_followed() {
+        let mut elsewhere = Server::new_async().await;
+        let never = elsewhere
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body("bytes from the redirect target")
+            .expect(0)
+            .create_async()
+            .await;
+        let signature_seen = elsewhere
+            .mock("GET", mockito::Matcher::Any)
+            .match_header("signature", mockito::Matcher::Any)
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mut node = Server::new_async().await;
+        let bounce = node
+            .mock("GET", "/api/v1/thing")
+            .with_status(302)
+            .with_header("location", &format!("{}/api/v1/thing", elsewhere.url()))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = NodeClient::new(node.url(), Some(test_keypair()));
+        let resp = client.get_signed("/api/v1/thing").await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            302,
+            "a refused redirect stops rather than errors, so the caller sees the 3xx \
+             and reports it through the status path it already has"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(
+            !body.contains("bytes from the redirect target"),
+            "the redirect target's bytes must never reach the caller, got: {body}"
+        );
+        bounce.assert_async().await;
+        never.assert_async().await;
+        signature_seen.assert_async().await;
+    }
+
+    /// A node redirecting to itself is same-origin, so the origin predicate follows it
+    /// every time and only the chain bound ends the loop. Deleting the bound left the
+    /// whole suite green, because nothing here had ever built a cycle.
+    ///
+    /// It has a second job now. A redirect back to the identical path and query is the
+    /// only same-origin hop the predicate still follows, so the eleven hits below are
+    /// also this crate's executed proof that such a hop IS followed. The old positive
+    /// fixture drove a trailing-slash rewrite, which the request-target rule refuses,
+    /// and an http-to-https upgrade cannot be mocked over mockito's plain http.
+    ///
+    /// The route answers 301 pointing back at itself. Bounded, the handler is hit
+    /// once for the original request plus `MAX_REDIRECTS` follows and the call returns
+    /// the 301 (a refused redirect stops rather than errors). Unbounded, it runs until
+    /// the client's total request timeout cuts it off, which is a 30 second spin at the
+    /// shipped value and a request per round trip for the node.
+    ///
+    /// MUTATION (RED): delete the `previous().len()` check.
+    #[tokio::test]
+    async fn a_self_redirect_stops_at_the_chain_bound() {
+        let mut node = Server::new_async().await;
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        let loop_route = node
+            .mock("GET", "/api/v1/loop")
+            .with_status(301)
+            .with_header("location", "/api/v1/loop")
+            .with_body_from_request(move |_req| {
+                h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Vec::new()
+            })
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let client = NodeClient::with_timeout(
+            node.url(),
+            Some(test_keypair()),
+            std::time::Duration::from_secs(5),
+        );
+        let resp = client
+            .get_signed("/api/v1/loop")
+            .await
+            .expect("the bound must end the chain, not the timeout");
+
+        assert_eq!(
+            resp.status(),
+            301,
+            "the chain ends by refusing the next hop, so the last 3xx is what comes back"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            gitlawb_core::redirect::MAX_REDIRECTS + 1,
+            "one original request plus MAX_REDIRECTS follows, matching what \
+             Policy::limited(MAX_REDIRECTS) would have permitted"
+        );
+        loop_route.assert_async().await;
+    }
+
+    /// A same-origin hop that REWRITES the request-target is refused, even though the
+    /// origin never changes.
+    ///
+    /// The signature binds `@path` as the literal path-and-query the client signed, and
+    /// the node rebuilds it from the URI it received. A `/api/v1/thing` to
+    /// `/api/v1/thing/` bounce therefore presents a signature over a target the node
+    /// never saw, and every signed read behind such a proxy 401s. Refusing the hop
+    /// hands the caller the 3xx that names what happened instead.
+    ///
+    /// The target mock expects zero hits and is asserted: mockito only checks
+    /// `.expect(N)` when `.assert()` runs, so an unbound or unasserted mock passes
+    /// vacuously.
+    #[tokio::test]
+    async fn same_origin_path_changing_redirect_is_refused() {
+        let mut node = Server::new_async().await;
+        let bounce = node
+            .mock("GET", "/api/v1/thing")
+            .with_status(301)
+            .with_header("location", "/api/v1/thing/")
+            .expect(1)
+            .create_async()
+            .await;
+        let target = node
+            .mock("GET", "/api/v1/thing/")
+            .with_status(200)
+            .with_body("bytes from the rewritten target")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let client = NodeClient::new(node.url(), Some(test_keypair()));
+        let resp = client.get_signed("/api/v1/thing").await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            301,
+            "a refused redirect stops rather than errors, so the caller sees the 3xx \
+             and reports it through the status path it already has"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(
+            !body.contains("bytes from the rewritten target"),
+            "the rewritten target's bytes must never reach the caller, got: {body}"
+        );
+        bounce.assert_async().await;
+        target.assert_async().await;
+    }
+
+    // ── the node's own verification, run over what the client actually sent ──
+
+    /// What the verifying mock made of a request that reached it.
+    ///
+    /// The empty slot (`None`) is its own state and means the mock was never hit at
+    /// all, which is what the refusal test asserts. It must stay distinguishable from
+    /// [`Verdict::WrongIdentity`], because "nobody verified anything" and "something
+    /// verified against the wrong key" are opposite findings.
+    ///
+    /// The payloads are read through `Debug` in the assertion messages and nowhere
+    /// else, which the dead-code pass does not count; they carry the detail that makes
+    /// a failure legible, so they stay.
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    enum Verdict {
+        /// The chain accepted the signature AND the key it resolved is the test's DID.
+        Accepted,
+        /// The chain refused it. Carries the error so a failure reads as the actual
+        /// rejection rather than a bare hit count.
+        Rejected(String),
+        /// The chain accepted a signature made by somebody else. A key resolved from
+        /// the parsed `key_id` is read out of the artifact under verification, so an
+        /// accept on it alone proves consistency, never authenticity.
+        WrongIdentity { expected: String, got: String },
+    }
+
+    /// The node's `require_signature` verification, over a request this crate did not
+    /// build: parse the headers, recompute the content-digest from the body, rebuild
+    /// the signing string over `@method`/`@path`/`content-digest`, Ed25519-verify.
+    /// Returns the DID the signature resolved to, so a caller can pin the identity.
+    ///
+    /// A hand-copy of its twin in `crates/git-remote-gitlawb/src/main.rs`, which gl
+    /// cannot import (`git-remote-gitlawb` is a binary crate and this is its test
+    /// module). Keep the two textually identical apart from the mockito seam around
+    /// them, so an edit to one is visibly an edit to both.
+    ///
+    /// The production verifier both copies mirror is `crate::auth::require_signature` in
+    /// `crates/gitlawb-node/src/auth/mod.rs`. This is a re-implementation, not a call, so
+    /// an edit to that middleware has to land here too: otherwise the copies drift and
+    /// this test keeps passing against a rule the node has stopped applying.
+    ///
+    /// It asserts internally, which is deliberate but constrains its callers: inside
+    /// `with_body_from_request` those assertions fire on the server thread and reach
+    /// the client as a transport error, not as a recorded verdict. So the identity
+    /// check lives in the caller as a [`Verdict`] variant, never as an assert in here.
+    fn node_verifies(
+        method: &str,
+        path_and_query: &str,
+        body: &[u8],
+        sig_input: &str,
+        sig_header: &str,
+        content_digest: &str,
+    ) -> anyhow::Result<String> {
+        use gitlawb_core::http_sig::{build_signing_string, compute_content_digest, HttpSignature};
+        use gitlawb_core::identity::verify;
+        use std::collections::HashMap;
+
+        let sig = HttpSignature::parse(sig_input, sig_header)?;
+        sig.check_created()?;
+        assert!(
+            sig.missing_components().is_empty(),
+            "signature must cover all required components"
+        );
+        assert_eq!(sig.alg, "ed25519");
+        assert_eq!(
+            content_digest,
+            compute_content_digest(body),
+            "content-digest must match the body"
+        );
+        let vk = sig.key_id.to_verifying_key()?;
+        let mut values = HashMap::new();
+        values.insert("@method".to_string(), method.to_uppercase());
+        values.insert("@path".to_string(), path_and_query.to_string());
+        values.insert("content-digest".to_string(), content_digest.to_string());
+        let sig_params_value = sig_input.strip_prefix("sig1=").unwrap_or(sig_input);
+        let components: Vec<&str> = sig.components.iter().map(String::as_str).collect();
+        let signing_string = build_signing_string(&components, sig_params_value, &values)?;
+        let sig_array: [u8; 64] = sig.signature_bytes.as_slice().try_into()?;
+        verify(&vk, signing_string.as_bytes(), &sig_array)?;
+        Ok(sig.key_id.to_string())
+    }
+
+    /// Pull a header value off a received mockito request, or explain which one the
+    /// client failed to send.
+    fn received_header(req: &mockito::Request, name: &str) -> String {
+        req.header(name)
+            .first()
+            .unwrap_or_else(|| panic!("the client sent no {name} header"))
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Run [`node_verifies`] over a GET that arrived at the mock and record what the
+    /// node would have made of it, pinned to `expected_did`.
+    fn record_get_verdict(
+        req: &mockito::Request,
+        expected_did: &str,
+        slot: &std::sync::Arc<std::sync::Mutex<Option<Verdict>>>,
+    ) {
+        let verdict = match node_verifies(
+            "GET",
+            req.path_and_query(),
+            b"",
+            &received_header(req, "signature-input"),
+            &received_header(req, "signature"),
+            &received_header(req, "content-digest"),
+        ) {
+            Ok(did) if did == expected_did => Verdict::Accepted,
+            Ok(did) => Verdict::WrongIdentity {
+                expected: expected_did.to_string(),
+                got: did,
+            },
+            Err(e) => Verdict::Rejected(e.to_string()),
+        };
+        *slot.lock().unwrap() = Some(verdict);
+    }
+
+    /// The finding's repro, now a guard: a rewritten same-origin target must never
+    /// receive the signature, and the proof is the node's own verification, not a hit
+    /// count.
+    ///
+    /// The target mock runs the full `require_signature` chain over the request it
+    /// receives. Post-fix the hop is refused, so the slot stays empty. Pre-fix the hop
+    /// is followed and the slot records the Ed25519 rejection of a signature made over
+    /// `/api/v1/thing` and presented at `/api/v1/thing/`, which is the 401 an operator
+    /// behind such a proxy actually sees. The verdict is asserted first, so a failure
+    /// speaks about verification rather than about reachability.
+    ///
+    /// Its paired positive control is
+    /// `a_direct_signed_get_verifies_under_the_node_verifier`: without it, an empty
+    /// slot would be satisfied just as well by a harness that can never record
+    /// anything.
+    #[tokio::test]
+    async fn a_rewritten_target_never_receives_the_signature() {
+        let kp = test_keypair();
+        let expected_did = kp.did().to_string();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<Verdict>));
+
+        let mut node = Server::new_async().await;
+        let bounce = node
+            .mock("GET", "/api/v1/thing")
+            .with_status(301)
+            .with_header("location", "/api/v1/thing/")
+            .expect(1)
+            .create_async()
+            .await;
+        let recorder = slot.clone();
+        let did_for_target = expected_did.clone();
+        let target = node
+            .mock("GET", "/api/v1/thing/")
+            .with_status(200)
+            .with_body_from_request(move |req| {
+                record_get_verdict(req, &did_for_target, &recorder);
+                Vec::new()
+            })
+            .expect(0)
+            .create_async()
+            .await;
+
+        let client = NodeClient::new(node.url(), Some(kp));
+        let resp = client.get_signed("/api/v1/thing").await.unwrap();
+
+        let verdict = slot.lock().unwrap().take();
+        assert!(
+            verdict.is_none(),
+            "the node's own verifier must never see this request: the signature covers \
+             /api/v1/thing and the rewritten target is /api/v1/thing/, so what arrives \
+             there is a stale request-target; recorded verdict: {verdict:?}"
+        );
+        assert_eq!(
+            resp.status(),
+            301,
+            "the caller sees the 3xx, not the rewritten target's answer"
+        );
+        bounce.assert_async().await;
+        target.assert_async().await;
+    }
+
+    /// The positive control for the test above, and the proof that the client signs
+    /// the query it sends.
+    ///
+    /// A direct signed GET, no redirect anywhere, through the same verifying mock. The
+    /// verdict must be `Accepted`, which is what makes the refusal test's empty slot
+    /// attributable to the refusal rather than to a harness that cannot record. The
+    /// path carries a query, so a client that signed the bare path would land here as
+    /// `Rejected`.
+    #[tokio::test]
+    async fn a_direct_signed_get_verifies_under_the_node_verifier() {
+        let kp = test_keypair();
+        let expected_did = kp.did().to_string();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<Verdict>));
+
+        let mut node = Server::new_async().await;
+        let recorder = slot.clone();
+        let did_for_target = expected_did.clone();
+        let route = node
+            .mock("GET", "/api/v1/thing?x=1")
+            .with_status(200)
+            .with_body_from_request(move |req| {
+                record_get_verdict(req, &did_for_target, &recorder);
+                Vec::new()
+            })
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = NodeClient::new(node.url(), Some(kp));
+        let resp = client.get_signed("/api/v1/thing?x=1").await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let verdict = slot.lock().unwrap().take();
+        assert!(
+            matches!(verdict, Some(Verdict::Accepted)),
+            "a direct signed GET must verify under the node's own chain and resolve to \
+             {expected_did}, or the refusal test's empty slot proves nothing; recorded \
+             verdict: {verdict:?}"
+        );
+        route.assert_async().await;
+    }
+
+    // ── read_body_capped ────────────────────────────────────────────────
+
+    /// A body whose read FAILS mid-stream must be distinguishable from a body that
+    /// ended. Both used to leave through the same `_ => break`, so a 500 whose body
+    /// died in transit produced an empty message and the caller was told
+    /// `node returned 500: ` with nothing after the colon.
+    ///
+    /// The fixture is a raw listener that promises 64 bytes in `Content-Length`,
+    /// writes 5, and closes. mockito cannot express that: it always completes the
+    /// response it advertises. MUTATION (RED): restore the single `_ => break` arm
+    /// (or hard-code `read_failed: false`) and the flag reads false.
+    #[tokio::test]
+    async fn read_body_capped_flags_a_mid_body_read_failure() {
+        let addr = spawn_short_body_listener().await;
+        let resp = reqwest::get(format!("http://{addr}/truncated"))
+            .await
+            .expect("headers arrive before the body is cut");
+        let body = read_body_capped(resp, 8192).await;
+
+        assert!(
+            body.read_failed,
+            "a body cut off mid-stream must be reported as a failed read, not as a \
+             body that ended: got {:?}",
+            body.text
+        );
+        assert!(
+            !body.truncated,
+            "the cap did not cut this one; 5 bytes are nowhere near 8 KiB"
+        );
+    }
+
+    /// The must-not half: a body that ends cleanly must NOT be flagged, or the flag
+    /// means nothing and every terminal starts claiming the node went quiet.
+    #[tokio::test]
+    async fn read_body_capped_does_not_flag_a_clean_body() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", "/ok")
+            .with_status(500)
+            .with_body("node said this")
+            .create_async()
+            .await;
+        let resp = reqwest::get(format!("{}/ok", server.url())).await.unwrap();
+        let body = read_body_capped(resp, 8192).await;
+
+        assert_eq!(body.text, "node said this");
+        assert!(!body.read_failed, "a complete body is not a failed read");
+        assert!(!body.truncated, "a complete body is not a truncated one");
+    }
+
+    /// Answer one request with headers promising more body than gets written, then
+    /// close the connection. Returns the listener's address.
+    async fn spawn_short_body_listener() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 1024];
+            let _ = sock.read(&mut scratch).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 64\r\n\r\nshort")
+                .await;
+            let _ = sock.flush().await;
+            // Drop closes the socket with 59 of the promised bytes never sent.
+        });
+        addr
+    }
+
+    // ── total request timeout ───────────────────────────────────────────
+
+    /// The client's timeout is a TOTAL request timeout, so it bounds a download and
+    /// not just the handshake. `gl ipfs get`'s documentation leans on exactly that:
+    /// the wall-clock deadline covers the search and deliberately stops at the
+    /// response headers, and this timeout is the only thing left bounding the body.
+    ///
+    /// Driven at 250ms through `with_timeout`, the seam `new` itself calls with
+    /// `TOTAL_REQUEST_TIMEOUT`, because a test at the shipped 30s has no place in this
+    /// suite. What that costs is the value; what it proves is the SHAPE, which is the
+    /// part in doubt: that the deadline keeps running once the headers have landed. A
+    /// timeout that covered only the handshake would let this request hang until the
+    /// listener gives up.
+    #[tokio::test]
+    async fn total_timeout_cuts_off_a_body_that_outruns_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 1024];
+            let _ = sock.read(&mut scratch).await;
+            // Headers land immediately, then the body stalls indefinitely.
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\nfirst")
+                .await;
+            let _ = sock.flush().await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+
+        let client = NodeClient::with_timeout(
+            format!("http://{addr}"),
+            None,
+            std::time::Duration::from_millis(250),
+        );
+        let started = std::time::Instant::now();
+        let resp = client.get("/slow").await.expect("headers arrive promptly");
+        assert_eq!(
+            resp.status(),
+            200,
+            "the stall is in the body, not the status"
+        );
+        let err = resp
+            .bytes()
+            .await
+            .expect_err("a body still arriving past the total timeout must be cut off");
+        let elapsed = started.elapsed();
+
+        assert!(
+            err.is_timeout(),
+            "the body read must end in a timeout, got: {err}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the timeout must fire on its own schedule, not wait out the listener; \
+             took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn shipped_client_uses_the_documented_total_timeout() {
+        // The scaled-down test above proves the shape at 250ms. This pins the value
+        // `new` actually ships, so the two together cover the documented behaviour.
+        assert_eq!(TOTAL_REQUEST_TIMEOUT, std::time::Duration::from_secs(30));
     }
 
     #[test]
