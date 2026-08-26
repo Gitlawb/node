@@ -8807,6 +8807,117 @@ mod arweave_anchor_tests {
             .unwrap();
         assert!(db.list_arweave_anchors(None, 50).await.unwrap().is_empty());
     }
+
+    /// #224 R5 review, P2: the per-transition outbox guard must be pinned at the
+    /// ANCHOR-CLAIM layer. `two_concurrent_workers_claim_the_job_once` (api
+    /// tests) races two job executors, but the job-level claim serializes them
+    /// before either reaches `claim_anchor_claim`, so gutting the
+    /// `ON CONFLICT (repo, ref_name, old_sha, new_sha) DO NOTHING` (backed by
+    /// the unique transition index) left that suite green while both workers
+    /// could win the upload obligation. Here two tasks hit
+    /// `claim_anchor_claim` CONCURRENTLY with no job gate in front: exactly one
+    /// may receive `Claimed`; the loser must observe the winner's row as
+    /// `Recover` carrying the winner's lease token, and exactly one row may
+    /// exist for the transition.
+    #[sqlx::test]
+    async fn concurrent_anchor_claims_converge_on_one_row_and_one_owner(pool: PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        let new_sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let old_sha = "0".repeat(40);
+
+        let race = |db: super::Db, old_sha: String| async move {
+            let claim_token = uuid::Uuid::new_v4().to_string();
+            db.claim_anchor_claim(&super::ClaimAnchorInput {
+                repo: "zAlice/myrepo",
+                owner_did: "did:key:zAlice",
+                ref_name: "refs/heads/main",
+                old_sha: &old_sha,
+                new_sha,
+                cid: None,
+                node_did: "did:key:zNODE",
+                cert_id: Some("cert-1"),
+                claim_token: &claim_token,
+                claimed_at: "2026-07-22T00:00:00+00:00",
+            })
+            .await
+            .expect("claim must not error")
+        };
+        let (r1, r2) = tokio::join!(
+            race(db.clone(), old_sha.clone()),
+            race(db.clone(), old_sha.clone())
+        );
+
+        // Exactly one worker wins the INSERT; the other observes a Recover of
+        // the winner's pending row — never a second Claimed.
+        let claimed_ids: Vec<&str> = [&r1, &r2]
+            .into_iter()
+            .filter_map(|r| match r {
+                super::AnchorClaim::Claimed { id } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            claimed_ids.len(),
+            1,
+            "exactly one worker may win the anchor claim; got {r1:?} and {r2:?}"
+        );
+        let winner_token = match (&r1, &r2) {
+            (
+                _,
+                super::AnchorClaim::Recover {
+                    claim_token: Some(t),
+                    ..
+                },
+            )
+            | (
+                super::AnchorClaim::Recover {
+                    claim_token: Some(t),
+                    ..
+                },
+                _,
+            ) => t.clone(),
+            other => panic!(
+                "the losing claim must surface a Recover carrying the winner's lease token; \
+                 got {other:?}"
+            ),
+        };
+        let (winner_id, state, item_id) = match (&r1, &r2) {
+            (super::AnchorClaim::Claimed { id }, _) | (_, super::AnchorClaim::Claimed { id }) => {
+                (id.clone(), "pending", None::<String>)
+            }
+            other => panic!("one side must be Claimed; got {other:?}"),
+        };
+
+        // The row exists exactly once for the transition.
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM arweave_anchors
+             WHERE repo = 'zAlice/myrepo' AND ref_name = 'refs/heads/main'
+               AND old_sha = $1 AND new_sha = $2",
+        )
+        .bind(&old_sha)
+        .bind(new_sha)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 1, "the unique transition index must yield one row");
+
+        // The surviving row is pending, un-uploaded, leased by the winner.
+        let (stored_state, stored_item, stored_token): (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT state, item_id, claim_token FROM arweave_anchors WHERE id = $1")
+                .bind(&winner_id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored_state, state);
+        assert_eq!(stored_item, item_id, "no upload may have been attempted");
+        assert_eq!(
+            stored_token.as_deref(),
+            Some(winner_token.as_str()),
+            "the row's lease token must be the winning worker's"
+        );
+    }
 }
 #[cfg(test)]
 mod ref_update_db_tests {

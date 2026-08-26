@@ -2727,34 +2727,25 @@ async fn run_post_receive_job(
         ref_certs.insert(update.ref_name.clone(), cert);
     }
 
-    // The replication tail's spawned task re-derives the announce decision and
-    // the pin's sha→CID map; the durable Arweave anchoring unit below needs
-    // both. The tail reports them over a oneshot once the pin has landed, so
-    // the job body only anchors after the pinned objects (and their CIDs)
-    // exist — the anchor embeds the real CID, and that is part of the job's
-    // durability scope. The tail itself stays best-effort: it also does the
-    // lower-priority gossip / GraphQL / peer-notify steps, none of which gate
-    // this job's completion.
-    let (anchor_cid_tx, anchor_cid_rx) = tokio::sync::oneshot::channel();
-    post_receive_replication_tail(
+    // The replication tail decides the DURABLE anchor inputs synchronously and
+    // returns them: the announce/visibility decision (fail-closed) and the
+    // locally computed tip CIDs. The best-effort Pinata/announcement worker it
+    // spawns continues independently (#224 R5 review): the durable Arweave
+    // anchoring unit must NOT depend on a best-effort replication worker — a
+    // saturated, disabled, slow, or failing Pinata must never hold the job
+    // lease or block certificate/anchor completion behind a process restart.
+    // The anchor embeds the real, content-derived tip CID either way: a CID is
+    // a pure function of the object bytes, so it needs no provider round-trip.
+    let (announce, cid_map) = post_receive_replication_tail(
         state.clone(),
         record.clone(),
         ref_updates.clone(),
         disk_path,
         did.to_string(),
         ref_certs.clone(),
-        anchor_cid_tx,
     )
-    .await;
-
-    // Durable Arweave anchoring (#224 review): awaited so the job only reaches
-    // `done` after every anchor's upload AND DB row are on record. A tail that
-    // dies before reporting (panic) drops the sender; that is a job failure,
-    // not a silent skip, so the startup drain retries it.
-    let (announce, cid_map) = anchor_cid_rx
-        .await
-        .map_err(|_| anyhow::anyhow!("replication tail died before reporting announce/CID"))?
-        .map_err(|e| anyhow::anyhow!("replication tail visibility lookup failed: {e}"))?;
+    .await
+    .map_err(|e| anyhow::anyhow!("replication tail visibility lookup failed: {e}"))?;
     // The anchor's issuer is the NODE, not the pusher: `verify_anchor` compares
     // the anchor's outer node_did against the embedded certificate's issuer and
     // rejects a mismatch, and the certificate is signed with `state.node_keypair`.
@@ -3166,15 +3157,85 @@ pub(crate) async fn drain_post_receive_jobs(state: AppState) -> anyhow::Result<u
     Ok(count)
 }
 
-type AnchorCidTx = tokio::sync::oneshot::Sender<
-    std::result::Result<(bool, std::collections::HashMap<String, String>), anyhow::Error>,
->;
+/// Compute each push tip's content CID locally (#224 R5 review). A CID is a
+/// pure function of the object bytes (`Cid::from_git_object_bytes`), so the
+/// durable Arweave anchor never needs a Pinata round-trip to learn it: one
+/// bounded, admitted `cat-file` read per non-deletion tip replaces the
+/// provider-derived map the job body used to wait on.
+///
+/// Enrichment, not obligation: a tip that cannot be read here simply anchors
+/// without an embedded CID (the anchor payload treats it as absent), and the
+/// failure is never propagated into the job result. Every read runs under a
+/// scan-admission permit and the repo's own git timeout, matching the
+/// withholding walk's discipline.
+async fn local_tip_cids(
+    encrypt_sem: std::sync::Arc<tokio::sync::Semaphore>,
+    disk_path: std::path::PathBuf,
+    git_bin: String,
+    timeout: std::time::Duration,
+    ref_updates: &[RefUpdate],
+) -> std::collections::HashMap<String, String> {
+    let mut cid_map = std::collections::HashMap::new();
+    for u in ref_updates {
+        if u.new_sha == ZERO_SHA {
+            continue;
+        }
+        let permit =
+            crate::state::acquire_scan_permit(encrypt_sem.clone(), &disk_path, "tip cid read")
+                .await;
+        let deadline = std::time::Instant::now() + timeout;
+        let read = tokio::task::spawn_blocking({
+            let disk_path = disk_path.clone();
+            let git_bin = git_bin.clone();
+            let sha = u.new_sha.clone();
+            move || crate::git::store::read_object_bounded(&git_bin, &disk_path, &sha, deadline)
+        })
+        .await;
+        drop(permit);
+        match read {
+            Ok(Ok(Some((_kind, bytes)))) => {
+                cid_map.insert(
+                    u.new_sha.clone(),
+                    gitlawb_core::cid::Cid::from_git_object_bytes(&bytes).to_string(),
+                );
+            }
+            Ok(Ok(None)) => {
+                tracing::warn!(
+                    sha = %u.new_sha,
+                    "tip object not found locally; anchoring without an embedded CID"
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    sha = %u.new_sha,
+                    err = %e,
+                    "tip object unreadable locally; anchoring without an embedded CID"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    sha = %u.new_sha,
+                    err = %e,
+                    "tip CID read task failed; anchoring without an embedded CID"
+                );
+            }
+        }
+    }
+    cid_map
+}
 
-/// The detached post-receive replication tail (#174 F2): everything a landed push
-/// still owes after its git response has been returned: the replication decision,
-/// the per-repo-coalesced pin/encrypt task, and this push's own Pinata + announce
-/// task. Split out of `git_receive_pack` so the ordering the coalescing gate depends
-/// on is directly testable; the handler spawns it and returns.
+/// The post-receive replication tail (#174 F2): the replication decision, the
+/// per-repo-coalesced pin/encrypt task, and this push's own Pinata + announce
+/// task. Split out of `git_receive_pack` so the ordering the coalescing gate
+/// depends on is directly testable; the handler spawns it and returns.
+///
+/// DURABILITY BOUNDARY (#224 R5 review): the tail is awaited by the durable
+/// post-receive job and returns the anchor's required inputs SYNCHRONOUSLY —
+/// the fail-closed announce decision and the locally computed tip CIDs (a CID
+/// is a pure function of the object bytes, so it needs no provider). The
+/// Pinata pin and the announcement fan-out it dispatches below are strictly
+/// BEST EFFORT: a disabled, saturated, slow, or failing provider can never
+/// hold the job lease or block certificate/anchor completion behind a restart.
 async fn post_receive_replication_tail(
     state: AppState,
     record: RepoRecord,
@@ -3182,8 +3243,7 @@ async fn post_receive_replication_tail(
     disk_path: std::path::PathBuf,
     did: String,
     ref_certs: std::collections::HashMap<String, crate::db::RefCertificate>,
-    anchor_cid_tx: AnchorCidTx,
-) {
+) -> anyhow::Result<(bool, std::collections::HashMap<String, String>)> {
     // Replication enforcement (Phase 2): decide once per push whether the public
     // may read this repo at all and, if so, which blob OIDs must not leave the
     // node. `withheld == None` means this push pins nothing (private / mode A /
@@ -3199,8 +3259,7 @@ async fn post_receive_replication_tail(
     let rules = match state.db.list_visibility_rules(&record.id).await {
         Ok(r) => r,
         Err(e) => {
-            let _ = anchor_cid_tx.send(Err(e));
-            return;
+            return Err(e);
         }
     };
 
@@ -3266,6 +3325,10 @@ async fn post_receive_replication_tail(
     // rules-only predicate there: it has no walk of its own, so the worker's
     // re-derivation is its only fail-closed source.
     let own_walk_failed = announce_at_root && !coalesced && withheld.is_none();
+    // The durable anchor decision is taken from the walk OUTCOME, not the set
+    // itself (the set is consumed below to build the pin list), so capture the
+    // verdict before the move.
+    let walk_vetted = withheld.is_some();
 
     // Resolve the per-push pin candidate set once, off the async worker, then
     // filter to what may actually replicate. Delta path: the reachable-only
@@ -3375,9 +3438,10 @@ async fn post_receive_replication_tail(
     // the same repo would DROP a later push's ref-update announcements (a correctness
     // regression), not merely delay a duplicate. So the task stays one per push and
     // every push's effects fire exactly once. Arweave anchoring is NOT part of this
-    // spawn (#224 review): it is the durable, awaited unit in the job body, which
-    // consumes this task's announce/CID report over a oneshot. Everything this spawn
-    // does is best-effort and outside the post-receive job's durability contract.
+    // spawn (#224 R5 review): it is the durable, awaited unit in the job body, fed by
+    // THIS function's synchronous return value. Everything this spawn does is
+    // best-effort and outside the post-receive job's durability contract — a stalled
+    // or failing provider must not block the anchor.
     //
     // #174 F2 / KTD-3: {bounded memory, no dropped effects, no handler latency} are
     // jointly unsatisfiable by coalesce/shed/block, so instead of retaining the full
@@ -3497,15 +3561,6 @@ async fn post_receive_replication_tail(
             // Build sha→cid map from pinned objects
             let cid_map: std::collections::HashMap<String, String> = pinned.into_iter().collect();
 
-            // Report the announce decision and pin CID map to the durable
-            // Arweave anchoring unit in the job body. Sent before the
-            // lower-priority, best-effort steps below (gossip, GraphQL
-            // broadcast, peer notify) so the job does not wait on them; they
-            // are outside the job's durability scope. A panic before this
-            // point drops the sender, and the job body treats that as a
-            // failure to be retried by the next startup drain.
-            let _ = anchor_cid_tx.send(Ok((announce, cid_map.clone())));
-
             // Record branch→CID for each ref update and publish gossip
             for (ref_name, old_sha, new_sha) in &ref_updates_clone {
                 let cid = cid_map.get(new_sha).map(|s| s.as_str());
@@ -3597,6 +3652,51 @@ async fn post_receive_replication_tail(
             }
         });
     }
+
+    // DURABLE ANCHOR INPUTS (#224 R5 review): decided here, synchronously, from
+    // signals this function already owns — never from the best-effort Pinata
+    // worker above. The job body anchors on this return value alone, so a
+    // disabled, saturated, slow, or failing provider can no longer hold the job
+    // lease or block certificate/anchor completion behind a process restart.
+    //
+    // - Not listable at root: never anchor (unchanged, fail-closed).
+    // - Admitted push: the walk gate the receive-pack tail has always applied —
+    //   an unvetted push (failed withheld walk) does not reach the public
+    //   ledger.
+    // - Coalesced push (#174 F2a contract): the push deliberately ran no walk,
+    //   and re-running one here would reintroduce exactly the scan-pool parking
+    //   F2a removed. Its durable decision is therefore taken from the rules
+    //   snapshot alone (`listable_at_root`); its PINS and announcements remain
+    //   governed by the in-flight worker's fresh vetting. The divergence is
+    //   honest and bounded: the anchor payload (repo/ref/shas/tip-commit CID)
+    //   contains nothing the withheld-blob walk could have classified — only
+    //   blob objects are withholdable, commit/tree tips are public ref
+    //   metadata for any repo that is listable at all.
+    let durable_announce = if !announce_at_root {
+        false
+    } else if !coalesced {
+        walk_vetted
+    } else {
+        announce_at_root
+    };
+
+    // Locally derived tip CIDs: content-addressed from the objects themselves,
+    // so the anchor embeds the real CID with no provider dependency. Only an
+    // announceable push pays for these reads.
+    let cid_map = if durable_announce {
+        local_tip_cids(
+            state.git_encrypt_semaphore.clone(),
+            disk_path,
+            state.git_bin.clone(),
+            std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+            &ref_updates,
+        )
+        .await
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    Ok((durable_announce, cid_map))
 }
 
 /// GET /api/v1/repos/{owner}/{repo}/refs
@@ -10363,10 +10463,11 @@ mod tests {
         }]
     }
 
-    /// Drive the replication tail with a throwaway announce/CID channel. Tests
-    /// that do not exercise the durable Arweave anchor unit (they never await
-    /// the receiver) discard both ends; the spawned Pinata task's report is a
-    /// no-op either way.
+    /// Drive the replication tail and discard its durable anchor inputs (the
+    /// announce decision and local tip CIDs). Tests that do not exercise the
+    /// durable Arweave anchor unit have no use for them; the spawned Pinata
+    /// task keeps running independently either way.
+    #[allow(clippy::let_underscore_future)]
     async fn f2a_tail(
         state: AppState,
         rec: crate::db::RepoRecord,
@@ -10375,8 +10476,7 @@ mod tests {
         did: String,
         certs: std::collections::HashMap<String, crate::db::RefCertificate>,
     ) {
-        let (_tx, _rx) = tokio::sync::oneshot::channel();
-        post_receive_replication_tail(state, rec, updates, path, did, certs, _tx).await;
+        let _ = post_receive_replication_tail(state, rec, updates, path, did, certs).await;
     }
 
     const F2A_PUSHER: &str = "did:key:z6MkF2aPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -10585,7 +10685,6 @@ mod tests {
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
             std::collections::HashMap::new(),
-            tokio::sync::oneshot::channel().0,
         ));
         f2a_wait_for(|| started.exists(), "the admitted push's walk to start").await;
 
@@ -10603,7 +10702,13 @@ mod tests {
             "a push arriving mid-walk must coalesce, not start a second task"
         );
         std::fs::write(&go, b"").unwrap();
-        tail.await.unwrap();
+        // The failed walk suppresses the durable announce (fail closed) but is
+        // not an error: the tail still completes and reports it.
+        let (announce, _cid_map) = tail.await.unwrap().unwrap();
+        assert!(
+            !announce,
+            "a push whose own withheld walk failed must not announce durably"
+        );
 
         f2a_wait_for(
             || f2a_delta_scanned(&log, &c3),
@@ -11450,10 +11555,10 @@ mod tests {
     /// URL and a probe counter.
     async fn f2a_gateway(
         mode: &'static str,
-        // The item store shared with the paired `f2a_bundler`. A real gateway
-        // returns the anchor's JSON payload for `GET /{item_id}`, not raw
-        // ANS-104 bytes. The "present" mode serves a minimal JSON anchor
-        // payload so the recovery probe exercises the JSON path.
+        // The item store shared with the paired `f2a_bundler`. A gateway that
+        // cannot bind its response to the probed id is refused, so "present"
+        // serves the exact uploaded ANS-104 item bytes verbatim — the only
+        // representation whose id the probe can verify.
         uploaded: std::sync::Arc<std::sync::RwLock<Option<Vec<u8>>>>,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use axum::response::IntoResponse;
@@ -11472,29 +11577,17 @@ mod tests {
                         probes.fetch_add(1, Ordering::SeqCst);
                         match mode {
                             "present" => {
-                                // Serve a JSON anchor payload — this is what a
-                                // real gateway returns for GET /{item_id}.
-                                // If nothing has been uploaded yet there is no
-                                // item to be "present", so 404.
+                                // Serve the exact uploaded item bytes: the probe
+                                // only accepts a 2xx whose body derives the
+                                // probed item id. If nothing has been uploaded
+                                // yet there is no item to be "present", so 404.
                                 match uploaded.read().unwrap().clone() {
-                                    Some(_bytes) => {
-                                        let anchor = serde_json::json!({
-                                            "schema": "gitlawb/ref-update/v1",
-                                            "repo": "zAlice/myrepo",
-                                            "repo_id": "repo-uuid",
-                                            "owner_did": "did:key:z6MkOwner",
-                                            "ref_name": "refs/heads/main",
-                                            "old_sha": "0".repeat(40),
-                                            "new_sha": "a".repeat(40),
-                                            "node_did": "did:key:zNODE",
-                                        });
-                                        (
-                                            axum::http::StatusCode::OK,
-                                            [("content-type", "application/json")],
-                                            serde_json::to_vec(&anchor).unwrap(),
-                                        )
-                                            .into_response()
-                                    }
+                                    Some(bytes) => (
+                                        axum::http::StatusCode::OK,
+                                        [("content-type", "application/octet-stream")],
+                                        bytes,
+                                    )
+                                        .into_response(),
                                     None => {
                                         (axum::http::StatusCode::NOT_FOUND, "{}").into_response()
                                     }
@@ -12017,6 +12110,143 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "replaying an anchored job must not pay for a second upload"
+        );
+    }
+
+    /// #224 R5 review, P1: the durable Arweave anchor unit must complete
+    /// independently of the best-effort Pinata worker. The job used to wait for
+    /// a report that worker only sent AFTER acquiring a pin permit, re-deriving
+    /// its object list, and uploading to Pinata — so a disabled, saturated,
+    /// slow, or failing provider held the job lease hostage. Here EVERY pin
+    /// permit is held by the test for the whole job, so the spawned worker
+    /// parks before doing any git or network of its own; the job must still
+    /// reach `done` with the anchor recorded and exactly one paid upload.
+    /// (Pre-refactor this test hung on the oneshot await until the harness
+    /// timeout — the deletion of that await is what turns it green.)
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn post_receive_job_anchors_without_waiting_for_the_pinata_worker(pool: sqlx::PgPool) {
+        use clap::Parser as _;
+
+        let bin = tempfile::TempDir::new().unwrap();
+        let log = bin.path().join("git.log");
+        let git_bin = f2a_logging_git(bin.path(), &log);
+        let (mut state, rec) = f2a_state(pool.clone(), &git_bin, "z6anchor", "a3", false).await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(
+            repos_dir.path().to_path_buf(),
+            pool.clone(),
+        );
+        state
+            .db
+            .register_agent(F2A_PUSHER, &["agent".to_string()])
+            .await
+            .unwrap();
+
+        let uploaded = std::sync::Arc::new(std::sync::RwLock::new(None::<Vec<u8>>));
+        let (bundler_url, calls) = f2a_bundler(0, uploaded.clone()).await;
+        let (gateway_url, _probes) = f2a_gateway("absent", uploaded).await;
+        state.config = std::sync::Arc::new(crate::config::Config::parse_from([
+            "gitlawb-node",
+            "--bundler-url",
+            &bundler_url,
+            "--bundler-account",
+            "zBundlerAccount",
+            "--bundler-token",
+            "matic",
+            "--arweave-gateway",
+            &gateway_url,
+        ]));
+
+        // Starve the pin pool BEFORE the job runs: the detached Pinata worker's
+        // very first act is awaiting a permit from this semaphore.
+        let mut held_pin_permits = Vec::new();
+        while let Ok(permit) = state.pin_semaphore.clone().try_acquire_owned() {
+            held_pin_permits.push(permit);
+        }
+        assert!(
+            !held_pin_permits.is_empty(),
+            "the test must actually hold pin permits for the isolation to be real"
+        );
+
+        let (_, repo_path) = state
+            .repo_store
+            .local_path(&rec.owner_did, &rec.name)
+            .unwrap();
+        std::fs::create_dir_all(&repo_path).unwrap();
+        u5_init_repo(&repo_path);
+        let c1 = u5_commit_file(&repo_path, "a.txt", "one\n");
+
+        let update = f2a_update("refs/heads/main", &c1);
+        let job = crate::db::PostReceiveJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            pusher_did: F2A_PUSHER.to_string(),
+            owner_did: rec.owner_did.clone(),
+            repo_name: rec.name.clone(),
+            repo_id: rec.id.clone(),
+            ref_updates: update
+                .iter()
+                .map(|u| crate::db::JobRefUpdate {
+                    old_sha: u.old_sha.clone(),
+                    new_sha: u.new_sha.clone(),
+                    ref_name: u.ref_name.clone(),
+                })
+                .collect(),
+            attestation: crate::db::PostReceiveAttestation::default(),
+            status: "pending".to_string(),
+            enqueued_at: chrono::Utc::now().to_rfc3339(),
+            attempts: 0,
+            error: None,
+        };
+        state.db.enqueue_post_receive_job(&job).await.unwrap();
+
+        // The job completes to its terminal anchor state while every pin permit
+        // is still held: anchoring never waited on the parked Pinata worker.
+        process_post_receive_job(state.clone(), job.clone()).await;
+
+        drop(held_pin_permits);
+
+        assert_eq!(
+            f2a_job_status(&pool, &job.id).await,
+            "done",
+            "the job must reach its terminal anchor state without the Pinata worker"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one paid upload: the anchor's own"
+        );
+        assert!(
+            state
+                .db
+                .arweave_anchor_exists(&f2a_slug(&rec), "refs/heads/main", ZERO_SHA, &c1)
+                .await
+                .unwrap(),
+            "the anchor must be recorded with a locally derived tip CID"
+        );
+        // The tip CID embedded in gossip/branch mapping is content-derived
+        // locally, matching what a provider round-trip would have reported.
+        let stored_cid: Option<String> =
+            sqlx::query_scalar("SELECT cid FROM arweave_anchors WHERE repo = $1 AND new_sha = $2")
+                .bind(f2a_slug(&rec))
+                .bind(&c1)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored_cid.as_deref(),
+            Some(
+                gitlawb_core::cid::Cid::from_git_object_bytes(&{
+                    let out = std::process::Command::new("git")
+                        .args(["-C", repo_path.to_str().unwrap(), "cat-file", "commit", &c1])
+                        .output()
+                        .unwrap();
+                    out.stdout
+                })
+                .to_string()
+                .as_str()
+            ),
+            "the anchor must embed the locally computed content CID"
         );
     }
 

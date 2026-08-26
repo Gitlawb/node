@@ -508,28 +508,13 @@ pub(crate) async fn anchor_item_present(
             .bytes()
             .await
             .map_err(|e| anyhow::anyhow!("failed to read gateway probe response: {e}"))?;
-        // The gateway may return either the raw ANS-104 data item (binary) or
-        // the anchor's JSON payload depending on the gateway implementation and
-        // content-negotiation.  Handle both representations:
-        //
-        // 1. JSON anchor payload: `GET /{item_id}` resolved to valid JSON →
-        //    verify it is a gitlawb anchor by checking `schema` matches our
-        //    well-known value.  A generic JSON 200 (e.g. error page, unrelated
-        //    item) must not be treated as present (#224 R4 review).
-        //
-        // 2. Raw ANS-104 data item: derive the id from the Ed25519 signature
-        //    region (bytes 2..66 per ANS-104 spec) and compare against the
-        //    probed id — a 200 with a non-matching body is a phantom.
-        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&body) {
-            if val.get("schema").and_then(|s| s.as_str()) == Some("gitlawb/ref-update/v1") {
-                return Ok(true);
-            }
-            // A JSON response that does not carry our schema is not a positive
-            // existence proof for the probed item_id.  Fall through to the
-            // raw-bytes path — if the body is binary it will be tested there;
-            // if it is JSON-without-schema it will be rejected as non-matching.
-        }
-        // Raw bytes: derive the ANS-104 item id and verify it matches.
+        // The only bindable representation is the raw ANS-104 data item: its id
+        // derives from the signature region (bytes 2..66 per ANS-104 spec) and
+        // must equal the probed id. A bare-JSON 200 — even one carrying our own
+        // `schema` field — cannot be bound to the probed id at all, so it is no
+        // proof of presence: a generic gitlawb-shaped JSON 200 served for every
+        // id would otherwise make crash recovery treat an uncertain upload as
+        // landed and skip a needed re-upload (#224 R5 review). Fail closed.
         let body_id = crate::ans104::data_item_id(&body);
         if body_id == item_id {
             return Ok(true);
@@ -706,9 +691,59 @@ pub async fn verify_anchor(
         }
         body_bytes.extend_from_slice(&data);
     }
-    // Parse the payload — could be JSON or raw bytes depending on gateway.
-    // Non-JSON responses are handled as an invalid result rather than an error.
-    let anchor: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+    // ── Bind the response to the REQUESTED transaction id before trusting it ──
+    // (#224 R5 review). Gateways serve the signed ANS-104 data item at /{id};
+    // the id is derived from the signature region, so a 2xx whose bytes do not
+    // carry that id resolved something else, and a proxy returning one cached
+    // payload for every id must never yield `valid: true` for the wrong tx.
+    //
+    // A bare-JSON 200 (no ANS-104 envelope) cannot be bound to the requested
+    // id at all — the id hashes the signature region, which a bare payload
+    // does not carry — so it is refused regardless of its content. The same
+    // well-formed anchor JSON served for two different ids is exactly the
+    // confusion this refuses to adjudicate.
+    let served_id = crate::ans104::data_item_id(&body_bytes);
+    let anchor_json_bytes: &[u8] = if served_id == tx_id {
+        match crate::ans104::data_item_data(&body_bytes) {
+            Ok(data) => data,
+            Err(e) => {
+                return Ok(VerifyResult {
+                    valid: false,
+                    anchor: serde_json::Value::Null,
+                    certificate: None,
+                    errors: vec![format!(
+                        "gateway response carries the requested id but is not a parseable \
+                         ANS-104 data item: {e}"
+                    )],
+                });
+            }
+        }
+    } else if serde_json::from_slice::<serde_json::Value>(&body_bytes).is_ok() {
+        return Ok(VerifyResult {
+            valid: false,
+            anchor: serde_json::Value::Null,
+            certificate: None,
+            errors: vec![
+                "gateway returned a bare-JSON payload for this tx id; only the signed ANS-104 \
+                 data item representation can be bound to the requested id, so this response \
+                 is refused"
+                    .to_string(),
+            ],
+        });
+    } else {
+        return Ok(VerifyResult {
+            valid: false,
+            anchor: serde_json::Value::Null,
+            certificate: None,
+            errors: vec![format!(
+                "gateway returned item {served_id} for requested tx {tx_id} — refusing to \
+                 verify another transaction's payload"
+            )],
+        });
+    };
+    // Parse the unwrapped payload; a non-JSON payload is an invalid result,
+    // not an error.
+    let anchor: serde_json::Value = match serde_json::from_slice(anchor_json_bytes) {
         Ok(v) => v,
         Err(e) => {
             return Ok(VerifyResult {
@@ -719,6 +754,21 @@ pub async fn verify_anchor(
             });
         }
     };
+    // Schema gate: only our well-known ref-update schema is adjudicated here.
+    // Any other JSON — even under a matching id — is not an artifact this
+    // verifier can vouch for.
+    if anchor.get("schema").and_then(|s| s.as_str()) != Some("gitlawb/ref-update/v1") {
+        return Ok(VerifyResult {
+            valid: false,
+            anchor,
+            certificate: None,
+            errors: vec![
+                "anchor payload is missing or has an unexpected 'schema' (expected \
+                 gitlawb/ref-update/v1)"
+                    .to_string(),
+            ],
+        });
+    }
     let cert_value = anchor.get("certificate");
     let cert: Option<crate::db::RefCertificate> = match cert_value {
         Some(v) => serde_json::from_value(v.clone()).ok(),
@@ -1220,6 +1270,27 @@ mod tests {
     use super::*;
     use axum::http::StatusCode;
     use gitlawb_core::identity::Keypair;
+    /// Serve `payload` the way a production gateway does: as the data section of
+    /// a real signed ANS-104 data item, at the item's own id. Returns that id —
+    /// the tx id `verify_anchor` must be called with to hit the mock.
+    async fn serve_signed_anchor(
+        server: &mut mockito::Server,
+        signer: &Keypair,
+        payload: &serde_json::Value,
+    ) -> String {
+        let body = serde_json::to_vec(payload).expect("anchor payload serializes");
+        let item = crate::ans104::build_signed_data_item(signer, &[], &body)
+            .expect("signed data item builds");
+        let id = crate::ans104::data_item_id(&item);
+        server
+            .mock("GET", format!("/{id}").as_str())
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_body(item)
+            .create_async()
+            .await;
+        id
+    }
     /// Spin up an in-process bundler that *enforces* the signed data item
     /// contract: it parses the posted bytes as an ANS-104 item, verifies the
     /// Ed25519 signature against `kp`, checks that every `expected_tag` is
@@ -1951,6 +2022,7 @@ mod tests {
     async fn test_verify_anchor_malformed_node_did() {
         let mut server = mockito::Server::new_async().await;
         let bad_cert_json = serde_json::json!({
+            "schema": "gitlawb/ref-update/v1",
             "certificate": {
                 "id": "cert-1",
                 "repo_id": "repo-uuid",
@@ -1970,13 +2042,9 @@ mod tests {
             "new_sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
             "node_did": "malformed-node-did",
         });
-        let _mock = server
-            .mock("GET", "/test-tx")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(serde_json::to_string(&bad_cert_json).unwrap())
-            .create_async()
-            .await;
+        // Served as a real signed data item at its own id, the way a
+        // production gateway returns it.
+        let tx = serve_signed_anchor(&mut server, &Keypair::generate(), &bad_cert_json).await;
         let client = reqwest::Client::new();
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
@@ -1986,8 +2054,7 @@ mod tests {
         // the DID-parse guard is what must fire. This pins the `invalid node
         // DID` error push: with the anchor claiming the node IS the malformed
         // DID, only parsing the certificate's node_did can reject it.
-        let result =
-            verify_anchor(&client, &server.url(), "test-tx", &db, "malformed-node-did").await;
+        let result = verify_anchor(&client, &server.url(), &tx, &db, "malformed-node-did").await;
         assert!(
             result.is_ok(),
             "Expected Ok response, got Err: {:?}",
@@ -2070,6 +2137,7 @@ mod tests {
             request_path: Some(request_path.to_string()),
         };
         let anchor_json = serde_json::json!({
+            "schema": "gitlawb/ref-update/v1",
             "repo_id": repo_id,
             "ref_name": ref_name,
             "old_sha": old_sha,
@@ -2078,19 +2146,13 @@ mod tests {
             "certificate": cert,
         });
         let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("GET", "/other-node-tx")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(serde_json::to_string(&anchor_json).unwrap())
-            .create_async()
-            .await;
+        let tx = serve_signed_anchor(&mut server, &node_kp, &anchor_json).await;
         let client = reqwest::Client::new();
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
             .expect("lazy pool creation should not fail");
         let db = crate::db::Db::for_testing(pool);
-        let result = verify_anchor(&client, &server.url(), "other-node-tx", &db, &node_did).await;
+        let result = verify_anchor(&client, &server.url(), &tx, &db, &node_did).await;
         let verify_result = result.expect("verify_anchor should return Ok for a served anchor");
         assert!(
             !verify_result.valid,
@@ -2104,7 +2166,6 @@ mod tests {
             "expected the issuer-mismatch error, got: {:?}",
             verify_result.errors
         );
-        _mock.assert_async().await;
     }
     /// Pins the 13-field signature-failure error push: an authentic cert whose
     /// node signature was tampered must fail with the 13-field signature error.
@@ -2180,6 +2241,7 @@ mod tests {
             request_path: Some(request_path.to_string()),
         };
         let anchor_json = serde_json::json!({
+            "schema": "gitlawb/ref-update/v1",
             "repo_id": repo_id,
             "ref_name": ref_name,
             "old_sha": old_sha,
@@ -2188,19 +2250,13 @@ mod tests {
             "certificate": cert,
         });
         let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("GET", "/tampered-13-tx")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(serde_json::to_string(&anchor_json).unwrap())
-            .create_async()
-            .await;
+        let tx = serve_signed_anchor(&mut server, &node_kp, &anchor_json).await;
         let client = reqwest::Client::new();
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
             .expect("lazy pool creation should not fail");
         let db = crate::db::Db::for_testing(pool);
-        let result = verify_anchor(&client, &server.url(), "tampered-13-tx", &db, &node_did).await;
+        let result = verify_anchor(&client, &server.url(), &tx, &db, &node_did).await;
         let verify_result = result.expect("verify_anchor should return Ok for a served anchor");
         assert!(
             !verify_result.valid,
@@ -2214,7 +2270,6 @@ mod tests {
             "expected the 13-field signature error, got: {:?}",
             verify_result.errors
         );
-        _mock.assert_async().await;
     }
     /// Pins the 7-field signature-failure error push: a legacy cert (proof
     /// fields NULL) whose node signature was tampered must fail with the
@@ -2269,6 +2324,7 @@ mod tests {
             request_path: None,
         };
         let anchor_json = serde_json::json!({
+            "schema": "gitlawb/ref-update/v1",
             "repo_id": repo_id,
             "ref_name": ref_name,
             "old_sha": old_sha,
@@ -2277,19 +2333,13 @@ mod tests {
             "certificate": cert,
         });
         let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("GET", "/tampered-7-tx")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(serde_json::to_string(&anchor_json).unwrap())
-            .create_async()
-            .await;
+        let tx = serve_signed_anchor(&mut server, &node_kp, &anchor_json).await;
         let client = reqwest::Client::new();
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
             .expect("lazy pool creation should not fail");
         let db = crate::db::Db::for_testing(pool);
-        let result = verify_anchor(&client, &server.url(), "tampered-7-tx", &db, &node_did).await;
+        let result = verify_anchor(&client, &server.url(), &tx, &db, &node_did).await;
         let verify_result = result.expect("verify_anchor should return Ok for a served anchor");
         assert!(
             !verify_result.valid,
@@ -2300,7 +2350,6 @@ mod tests {
             "expected the 7-field signature error, got: {:?}",
             verify_result.errors
         );
-        _mock.assert_async().await;
     }
     /// A true end-to-end accept: a cert signed by a real node keypair over a
     /// real 13-field payload, with a real RFC 9421 pusher proof, served through
@@ -2409,6 +2458,7 @@ mod tests {
         // The outer identity fields are present and must corroborate against
         // the seeded repo row: expected_repo = normalize_owner_key(owner) / name.
         let anchor_json = serde_json::json!({
+            "schema": "gitlawb/ref-update/v1",
             "repo": format!("{}/myrepo", crate::db::normalize_owner_key(owner_did)),
             "owner_did": owner_did,
             "repo_id": repo_id,
@@ -2418,16 +2468,12 @@ mod tests {
             "node_did": node_did,
             "certificate": cert,
         });
+        // Served as a real signed data item at its own id — the production
+        // gateway representation, so the id binding is exercised positively.
         let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("GET", "/accept-tx")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(serde_json::to_string(&anchor_json).unwrap())
-            .create_async()
-            .await;
+        let tx = serve_signed_anchor(&mut server, &node_kp, &anchor_json).await;
         let client = reqwest::Client::new();
-        let result = verify_anchor(&client, &server.url(), "accept-tx", &db, &node_did).await;
+        let result = verify_anchor(&client, &server.url(), &tx, &db, &node_did).await;
         let r = result.expect("verify_anchor should return Ok for a served anchor");
         assert!(
             r.valid,
@@ -2439,7 +2485,6 @@ mod tests {
             "expected no errors, got: {:?}",
             r.errors
         );
-        _mock.assert_async().await;
     }
     /// Version 2 certificate: the `version` field is included in the signed
     /// payload.  Verification must succeed on the 14-field first pass.
@@ -2519,6 +2564,7 @@ mod tests {
             request_path: Some(request_path.to_string()),
         };
         let anchor_json = serde_json::json!({
+            "schema": "gitlawb/ref-update/v1",
             "repo": format!("{}/myrepo", crate::db::normalize_owner_key(owner_did)),
             "owner_did": owner_did,
             "repo_id": repo_id,
@@ -2529,15 +2575,9 @@ mod tests {
             "certificate": cert,
         });
         let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("GET", "/accept-v2-tx")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(serde_json::to_string(&anchor_json).unwrap())
-            .create_async()
-            .await;
+        let tx = serve_signed_anchor(&mut server, &node_kp, &anchor_json).await;
         let client = reqwest::Client::new();
-        let result = verify_anchor(&client, &server.url(), "accept-v2-tx", &db, &node_did).await;
+        let result = verify_anchor(&client, &server.url(), &tx, &db, &node_did).await;
         let r = result.expect("verify_anchor should return Ok for a served anchor");
         assert!(
             r.valid,
@@ -2549,7 +2589,208 @@ mod tests {
             "expected no errors, got: {:?}",
             r.errors
         );
-        _mock.assert_async().await;
+    }
+    /// The replay attack the id binding closes: a gateway (or proxy) that
+    /// returns the SAME valid anchor JSON for every requested id used to get
+    /// `valid: true` for the wrong tx id, because bare JSON carries nothing
+    /// that ties it to what was asked for. Both ids must now be refused: only
+    /// the signed ANS-104 representation is adjudicated.
+    #[sqlx::test]
+    async fn verify_anchor_refuses_identical_bare_json_served_for_two_ids(pool: sqlx::PgPool) {
+        let node_kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = node_kp.did().as_str().to_string();
+        let pusher_kp = gitlawb_core::identity::Keypair::generate();
+        let owner_did = "did:key:z6MkOwner";
+        let repo_id = "repo-uuid";
+        let ref_name = "refs/heads/main";
+        let old_sha = "0".repeat(40);
+        let new_sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let issued_at = "2026-07-22T00:00:00+00:00";
+        let db = migrated_db(pool).await;
+        db.create_repo(&crate::db::RepoRecord {
+            id: repo_id.to_string(),
+            name: "myrepo".into(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            disk_path: "/tmp/anchor-test".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+        let cert = authentic_13_field_cert(
+            &node_kp,
+            &pusher_kp,
+            repo_id,
+            ref_name,
+            &old_sha,
+            new_sha,
+            &node_did,
+            issued_at,
+            1,
+            &"0".repeat(64),
+        );
+        // A fully authentic anchor payload — everything but the representation
+        // is exactly what the accept test serves.
+        let anchor_json = serde_json::json!({
+            "schema": "gitlawb/ref-update/v1",
+            "repo": format!("{}/myrepo", crate::db::normalize_owner_key(owner_did)),
+            "owner_did": owner_did,
+            "repo_id": repo_id,
+            "ref_name": ref_name,
+            "old_sha": old_sha,
+            "new_sha": new_sha,
+            "node_did": node_did,
+            "certificate": cert,
+        });
+        let body = serde_json::to_string(&anchor_json).unwrap();
+        let mut server = mockito::Server::new_async().await;
+        // The identical bare-JSON payload, served for BOTH ids.
+        for path in ["/right-tx", "/wrong-tx"] {
+            server
+                .mock("GET", path)
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(body.as_str())
+                .create_async()
+                .await;
+        }
+        let client = reqwest::Client::new();
+        for tx in ["right-tx", "wrong-tx"] {
+            let r = verify_anchor(&client, &server.url(), tx, &db, &node_did)
+                .await
+                .expect("verify_anchor should return Ok for a served anchor");
+            assert!(
+                !r.valid,
+                "bare-JSON served for {tx} must not verify as valid"
+            );
+            assert!(
+                r.errors.iter().any(|e| e.contains("bare-JSON")),
+                "the refusal must name the unbindable representation, got: {:?}",
+                r.errors
+            );
+        }
+    }
+    /// A signed item whose bytes ARE a well-formed ANS-104 data item — just not
+    /// the one whose id was requested — must be refused on the id mismatch, not
+    /// verified by content alone.
+    #[sqlx::test]
+    async fn verify_anchor_rejects_a_valid_item_served_under_a_different_id(pool: sqlx::PgPool) {
+        let node_kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = node_kp.did().as_str().to_string();
+        let db = migrated_db(pool).await;
+        let anchor_json = serde_json::json!({
+            "schema": "gitlawb/ref-update/v1",
+            "repo_id": "repo-uuid",
+            "ref_name": "refs/heads/main",
+            "old_sha": "0".repeat(40),
+            "new_sha": "a".repeat(40),
+            "node_did": node_did,
+        });
+        let item = crate::ans104::build_signed_data_item(
+            &node_kp,
+            &[],
+            &serde_json::to_vec(&anchor_json).unwrap(),
+        )
+        .unwrap();
+        let mut server = mockito::Server::new_async().await;
+        // The item's real bytes, served under a DIFFERENT transaction's id.
+        server
+            .mock("GET", "/requested-tx")
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_body(item.clone())
+            .create_async()
+            .await;
+        let client = reqwest::Client::new();
+        let r = verify_anchor(&client, &server.url(), "requested-tx", &db, &node_did)
+            .await
+            .expect("verify_anchor should return Ok for a served anchor");
+        assert!(
+            !r.valid,
+            "another item's bytes must not verify for the requested id"
+        );
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.contains("refusing to verify another transaction's payload")),
+            "expected the id-mismatch refusal, got: {:?}",
+            r.errors
+        );
+    }
+    /// The presence probe accepts ONLY the raw item served at its own id: the
+    /// id derives from the signature region, so this is the one 2xx shape it
+    /// can actually bind to the probed identity.
+    #[tokio::test]
+    async fn probe_accepts_the_raw_item_served_at_its_own_id() {
+        let mut server = mockito::Server::new_async().await;
+        let kp = Keypair::generate();
+        let payload = serde_json::json!({ "schema": "gitlawb/ref-update/v1" });
+        let item =
+            crate::ans104::build_signed_data_item(&kp, &[], &serde_json::to_vec(&payload).unwrap())
+                .unwrap();
+        let id = crate::ans104::data_item_id(&item);
+        let mock = server
+            .mock("GET", format!("/{id}").as_str())
+            .with_status(200)
+            .with_body(item)
+            .create_async()
+            .await;
+        let client = reqwest::Client::new();
+        let present = anchor_item_present(&client, &server.url(), &id)
+            .await
+            .expect("raw item at its own id is present");
+        assert!(present);
+        mock.assert_async().await;
+    }
+    /// A generic gitlawb-shaped JSON 200 must NOT prove presence: crash
+    /// recovery would treat an uncertain upload as landed and skip a needed
+    /// re-upload. The probe fails closed instead (#224 R5 review).
+    #[tokio::test]
+    async fn probe_fails_closed_on_a_gitlawb_shaped_json_200() {
+        let mut server = mockito::Server::new_async().await;
+        let payload = serde_json::json!({
+            "schema": "gitlawb/ref-update/v1",
+            "repo": "zAlice/myrepo",
+            "repo_id": "repo-uuid",
+            "owner_did": "did:key:z6MkOwner",
+            "ref_name": "refs/heads/main",
+            "old_sha": "0".repeat(40),
+            "new_sha": "a".repeat(40),
+            "node_did": "did:key:zNODE",
+        });
+        // Served for EVERY id — the misbehaving gateway from the finding.
+        server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&payload).unwrap())
+            .create_async()
+            .await;
+        let client = reqwest::Client::new();
+        let result = anchor_item_present(&client, &server.url(), "some-item-id").await;
+        assert!(
+            result.is_err(),
+            "an unbindable JSON 200 must fail closed, got {result:?}"
+        );
+    }
+    #[tokio::test]
+    async fn probe_treats_404_as_absent() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/missing-item")
+            .with_status(404)
+            .create_async()
+            .await;
+        let client = reqwest::Client::new();
+        let present = anchor_item_present(&client, &server.url(), "missing-item")
+            .await
+            .expect("404 is a verdict, not an error");
+        assert!(!present);
     }
     /// Fail closed: when the anchor carries outer `repo`/`owner_did` claims but
     /// the node has no record of the repo, corroboration cannot run — and the
@@ -2583,6 +2824,7 @@ mod tests {
         );
         // Forged outer identity fields, no way to corroborate them.
         let anchor_json = serde_json::json!({
+            "schema": "gitlawb/ref-update/v1",
             "repo": "victim-owner/victim-repo",
             "owner_did": owner_did,
             "repo_id": repo_id,
@@ -2593,16 +2835,9 @@ mod tests {
             "certificate": cert,
         });
         let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("GET", "/uncorroborated-tx")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(serde_json::to_string(&anchor_json).unwrap())
-            .create_async()
-            .await;
+        let tx = serve_signed_anchor(&mut server, &node_kp, &anchor_json).await;
         let client = reqwest::Client::new();
-        let result =
-            verify_anchor(&client, &server.url(), "uncorroborated-tx", &db, &node_did).await;
+        let result = verify_anchor(&client, &server.url(), &tx, &db, &node_did).await;
         let r = result.expect("verify_anchor should return Ok for a served anchor");
         assert!(
             !r.valid,
@@ -2615,7 +2850,6 @@ mod tests {
             "expected the uncorroborated-identity error, got: {:?}",
             r.errors
         );
-        _mock.assert_async().await;
     }
     /// A tampered seq on an authentic legacy 7-field cert must fail: the
     /// 7-field signature does not cover seq/prev, so the node's stored row
@@ -2658,6 +2892,7 @@ mod tests {
             request_path: None,
         };
         let anchor_json = serde_json::json!({
+            "schema": "gitlawb/ref-update/v1",
             "repo_id": repo_id,
             "ref_name": ref_name,
             "old_sha": old_sha,
@@ -2666,13 +2901,7 @@ mod tests {
             "certificate": cert,
         });
         let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("GET", "/legacy-tamper-tx")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(serde_json::to_string(&anchor_json).unwrap())
-            .create_async()
-            .await;
+        let tx = serve_signed_anchor(&mut server, &node_kp, &anchor_json).await;
         let client = reqwest::Client::new();
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
@@ -2681,8 +2910,7 @@ mod tests {
         // The cert is not present in the (lazy) node database — no stored row
         // matches its signed (repo_id, ref_name, old_sha, new_sha, ts), so the
         // legacy corroboration must fail closed instead of returning valid.
-        let result =
-            verify_anchor(&client, &server.url(), "legacy-tamper-tx", &db, &node_did).await;
+        let result = verify_anchor(&client, &server.url(), &tx, &db, &node_did).await;
         let r = result.expect("verify_anchor should return Ok for a served anchor");
         assert!(
             !r.valid,
@@ -2696,7 +2924,6 @@ mod tests {
             "expected a corroboration error, got: {:?}",
             r.errors
         );
-        _mock.assert_async().await;
     }
     /// The legacy corroboration must key on the fields the 7-field signature
     /// actually covers — never on `id`, which appears in no signed payload.
@@ -2799,6 +3026,7 @@ mod tests {
             request_path: None,
         };
         let anchor_json = serde_json::json!({
+            "schema": "gitlawb/ref-update/v1",
             "repo_id": repo_id,
             "ref_name": ref_name,
             "old_sha": forged_old,
@@ -2807,26 +3035,13 @@ mod tests {
             "certificate": forged_cert,
         });
         let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("GET", "/forged-borrowed-position-tx")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(serde_json::to_string(&anchor_json).unwrap())
-            .create_async()
-            .await;
+        let tx = serve_signed_anchor(&mut server, &forged_kp, &anchor_json).await;
         let client = reqwest::Client::new();
         // Verify as the forger's own node: node_did, the issuer check, the
         // outer-field cross-check, the signature, and the chain-position
         // checks all line up. ONLY the signed-tuple corroboration can catch
         // that this cert claims a chain position it never earned.
-        let result = verify_anchor(
-            &client,
-            &server.url(),
-            "forged-borrowed-position-tx",
-            &db,
-            &forged_did,
-        )
-        .await;
+        let result = verify_anchor(&client, &server.url(), &tx, &db, &forged_did).await;
         let r = result.expect("verify_anchor should return Ok for a served anchor");
         assert!(
             !r.valid,
@@ -2840,7 +3055,6 @@ mod tests {
             "expected the signed-tuple corroboration to reject the forged cert, got: {:?}",
             r.errors
         );
-        _mock.assert_async().await;
     }
     /// A bundler that returns 500 with a body reflecting the request back — the
     /// scenario a hostile or buggy endpoint uses to leak the credential-bearing

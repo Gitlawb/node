@@ -35,9 +35,7 @@
 //! transactions use; data items deep-hash the serialized tag blob. Zero tags is
 //! an empty blob.
 
-use anyhow::Result;
-#[cfg(test)]
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use base64::Engine as _;
 use sha2::{Digest, Sha256, Sha384};
 
@@ -213,6 +211,58 @@ pub fn verify_data_item(
         tags,
         data: raw_data.to_vec(),
     })
+}
+
+/// Walk the serialized header of a data item and return its data section.
+///
+/// Structural only: the signature is NOT verified here. Callers use this to
+/// unwrap the payload of an item whose identity they have already bound by
+/// other means (`data_item_id` over the served bytes), e.g. a gateway response
+/// for a requested transaction id.
+pub fn data_item_data(item: &[u8]) -> Result<&[u8]> {
+    if item.len() < 2 + SIGNATURE_LEN + OWNER_LEN + 2 + 16 {
+        bail!("data item too short");
+    }
+    let signature_type = u16::from_le_bytes(item[0..2].try_into()?);
+    if signature_type != SIGNATURE_TYPE_ED25519 {
+        bail!("unsupported signature type {signature_type}");
+    }
+
+    let mut p = 2 + SIGNATURE_LEN + OWNER_LEN;
+    // Optional target, then optional anchor: one presence byte each, plus 32
+    // bytes of field when present.
+    for field in ["target", "anchor"] {
+        let present = *item
+            .get(p)
+            .ok_or_else(|| anyhow!("data item truncated in {field} presence"))?;
+        p += 1;
+        match present {
+            0 => {}
+            1 => {
+                p += OWNER_LEN;
+                if p > item.len() {
+                    bail!("data item truncated in {field}");
+                }
+            }
+            other => bail!("invalid {field} presence byte {other}"),
+        }
+    }
+
+    // Skip tag count (8 bytes) + tag byte count (8 bytes), then the tags.
+    let counts_end = p
+        .checked_add(16)
+        .ok_or_else(|| anyhow!("tag byte count overflow"))?;
+    if counts_end > item.len() {
+        bail!("data item truncated in tag counts");
+    }
+    let num_tag_bytes = u64::from_le_bytes(item[p + 8..counts_end].try_into()?) as usize;
+    let tags_end = counts_end
+        .checked_add(num_tag_bytes)
+        .ok_or_else(|| anyhow!("tag byte count overflow"))?;
+    if tags_end > item.len() {
+        bail!("data item truncated in tags");
+    }
+    Ok(&item[tags_end..])
 }
 
 /// The bundler's `deepHash` over the data item's signature fields,
