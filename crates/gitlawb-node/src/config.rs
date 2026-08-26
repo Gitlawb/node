@@ -1566,7 +1566,6 @@ mod tests {
     /// nothing about what this crate declares — it reports the operator's setting.
     /// Asserting the declaration is the env-independent form, and it is the one that
     /// actually fails if someone flips `default_value_t` back.
-
     /// Anchoring is paid, not free: the ANS-104 signature proves authorship,
     /// and the bundler bills the funded account the upload names. A bundler URL
     /// without a declared funded account and payment token must refuse to start,

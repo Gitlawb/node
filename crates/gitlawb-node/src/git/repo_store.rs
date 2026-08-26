@@ -407,7 +407,7 @@ impl RepoStore {
     ///      (or the prefix/root from `repos_dir`); any `ParentDir`/`CurDir`
     ///      segment is rejected. This is the CodeQL-recognised barrier
     ///      pattern for `rust/path-injection`.
-    fn local_path(&self, owner_did: &str, repo_name: &str) -> Result<(String, PathBuf)> {
+    pub(crate) fn local_path(&self, owner_did: &str, repo_name: &str) -> Result<(String, PathBuf)> {
         let owner_slug = owner_did.replace([':', '/'], "_");
         let local_path = validated_repo_disk_path(&self.repos_dir, owner_did, repo_name)?;
         Ok((owner_slug, local_path))

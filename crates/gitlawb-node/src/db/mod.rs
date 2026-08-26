@@ -9996,6 +9996,9 @@ mod cid_candidate_order_tests {
             after, sorted,
             "the order must be a stated one (ascending oid), not whatever the heap holds"
         );
+    }
+}
+
 /// The released v1 migration is immutable: every deployment that already ran it
 /// keeps the ORIGINAL column layout, and later migrations (v18+) do the column
 /// adds and renames against that layout. This test replays that exact upgrade —

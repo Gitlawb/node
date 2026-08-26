@@ -1314,22 +1314,6 @@ mod rate_limiter_sweep_tests {
     }
 }
 
-/// Evict expired entries from every per-key rate limiter on the state.
-///
-/// Named and driven off `AppState` so the periodic sweeper stays in step with
-/// the limiters the router actually mounts: adding a limiter field and
-/// forgetting it here leaves its keys pinned until the map hits `max_keys` and
-/// the inline capacity sweep runs (the `/ipfs` limiter was missed this way).
-async fn sweep_rate_limiters(state: &AppState) {
-    state.rate_limiter.cleanup().await;
-    state.create_ip_rate_limiter.cleanup().await;
-    state.push_rate_limiter.cleanup().await;
-    state.sync_trigger_rate_limiter.cleanup().await;
-    state.peer_write_rate_limiter.cleanup().await;
-    state.ipfs_rate_limiter.cleanup().await;
-    state.arweave_rate_limiter.cleanup().await;
-}
-
 async fn gossip_ping_round(
     db: &Db,
     client: &reqwest::Client,

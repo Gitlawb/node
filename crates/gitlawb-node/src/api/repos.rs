@@ -944,6 +944,8 @@ pub(crate) async fn run_encrypt_pin_task_for_test(
         owner_did,
         repo_name,
         irys_url: String::new(),
+        bundler_account: String::new(),
+        bundler_token: String::new(),
         http_client: std::sync::Arc::clone(&state.http_client),
         node_did: state.node_did.to_string(),
         node_keypair: std::sync::Arc::clone(&state.node_keypair),
@@ -2009,6 +2011,7 @@ async fn notify_peer_of_refs(
 }
 
 /// POST /:owner/:repo.git/git-receive-pack  (AUTH REQUIRED — enforced by middleware)
+#[allow(clippy::too_many_arguments)]
 pub async fn git_receive_pack(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
@@ -2314,15 +2317,6 @@ pub async fn git_receive_pack(
     // would return 200 to the pusher before the durable copy lands, which is a larger
     // change to the client contract than the window it closes.
     let push_succeeded = receive_result.is_ok();
-    if push_succeeded {
-        tokio::spawn(post_receive_replication_tail(
-            state.clone(),
-            record.clone(),
-            ref_updates.clone(),
-            disk_path.clone(),
-            auth.0.to_string(),
-        ));
-    }
 
     // Always release the advisory lock — even on error — to prevent stale locks
     // from blocking subsequent pushes. Only upload to Tigris when the push
@@ -2364,57 +2358,6 @@ pub async fn git_receive_pack(
     crate::metrics::record_push(&record.id);
     crate::metrics::observe_pack_size(body_len as f64);
 
-    // The route is behind `require_signature`, so the verified pusher identity is
-    // always present; use it directly rather than re-parsing the headers.
-    let did = auth.0.as_str();
-    // Collect certs keyed by ref_name so the anchoring loop below uses
-    // the correct per-update certificate rather than a repo-wide latest.
-    let mut ref_certs: std::collections::HashMap<String, crate::db::RefCertificate> =
-        std::collections::HashMap::new();
-    {
-        // Use the first new commit hash we parsed, fall back to timestamp
-        let commit_hash = ref_updates
-            .first()
-            .map(|u| u.new_sha.clone())
-            .unwrap_or_else(|| Utc::now().timestamp().to_string());
-
-        let _ = state.db.record_push(did, &record.id, &commit_hash, 0).await;
-        if let Ok(push_count) = state.db.get_push_count(did).await {
-            // 0.05 base (from registration) + 0.05 per push, capped at 1.0
-            // 1 push → 0.10, 5 pushes → 0.30, 19 pushes → 1.0
-            let new_score = (push_count as f64 * 0.05 + 0.05).min(1.0);
-            let _ = state.db.update_trust_score(did, new_score).await;
-        }
-
-        // Issue a signed certificate for every ref this push advanced, each
-        // carrying that ref's real old→new transition. A multi-ref push must
-        // not collapse to a single cert covering only the first ref.
-        for update in &ref_updates {
-            match cert::issue_ref_certificate(
-                &state,
-                &record.id,
-                &update.ref_name,
-                &update.old_sha,
-                &update.new_sha,
-                did,
-                Some(pusher_sig.0.clone()),
-                Some(pusher_proof.signature_input.clone()),
-                Some(pusher_proof.content_digest.clone()),
-                Some(pusher_proof.request_path.clone()),
-            )
-            .await
-            {
-                Ok(c) => {
-                    tracing::info!(cert_id = %c.id, repo = %record.name, ref_name = %update.ref_name, pusher = %did, "issued ref certificate");
-                    ref_certs.insert(update.ref_name.clone(), c);
-                }
-                Err(e) => {
-                    tracing::warn!(err = %e, ref_name = %update.ref_name, "failed to issue ref certificate")
-                }
-            }
-        }
-    }
-
     if push_succeeded {
         // Everything a landed push owes after git accepted the pack — record_push,
         // trust score, per-ref signed certificates, and the replication tail — runs
@@ -2435,6 +2378,7 @@ pub async fn git_receive_pack(
         // and returning 500 is the honest outcome; retrying the push will not
         // re-derive the ref updates (git sees them as already applied), so the
         // operator must treat a 500 as "the push landed but was not recorded".
+        let did = auth.0.as_str();
         let job = crate::db::PostReceiveJob {
             id: Uuid::new_v4().to_string(),
             pusher_did: did.to_string(),
@@ -2467,8 +2411,6 @@ pub async fn git_receive_pack(
                 "failed to persist post-receive job — the pack landed but its \
                  bookkeeping has no recovery record; refusing the push success"
             );
-            guard.release(push_succeeded).await;
-            drop(lease);
             return Err(AppError::Internal(anyhow::anyhow!(
                 "push landed but the node could not record its post-receive work"
             )));
@@ -2476,38 +2418,8 @@ pub async fn git_receive_pack(
         tokio::spawn(process_post_receive_job(state.clone(), job));
     }
 
-    // Always release the advisory lock — even on error — to prevent stale locks
-    // from blocking subsequent pushes. Only upload to Tigris when the push
-    // succeeded; uploading a half-applied repo would propagate corruption.
-    guard.release(push_succeeded).await;
-    // Clean path: clone (a) already dropped inside run_git_service when the receive-pack
-    // group was reaped; clone (b) held here spanned the success-only Tigris upload that
-    // ran inside release() above. Drop it now so a second same-repo push proceeds the
-    // moment this write is durable, rather than at end of the (longer) handler tail. On
-    // the disconnect path this line is never reached — clone (a) rides the reaper (F3).
-    drop(lease);
-
-    let result = receive_result.map_err(|e| {
-        let app = git_service_app_error(&e);
-        match &app {
-            AppError::Timeout(_) => tracing::warn!(repo = %name, "git receive-pack timed out"),
-            AppError::BadRequest(msg) => {
-                tracing::warn!(repo = %name, err = %msg, "git receive-pack: bad client request")
-            }
-            _ => tracing::error!(repo = %name, err = %e, "git receive-pack failed"),
-        }
-        app
-    })?;
-
-    // Update the repo's updated_at timestamp after a successful push
-    let _ = state.db.touch_repo(&record.id).await;
-
-    // Record the successful push for metrics. The body has already been
-    // consumed by smart_http::receive_pack so we observe size up front.
-    crate::metrics::record_push(&record.id);
-    crate::metrics::observe_pack_size(body_len as f64);
-
     // Fire push webhooks — one per ref update
+    let did = auth.0.as_str();
     if !ref_updates.is_empty() {
         let base_url = state
             .config
@@ -6765,6 +6677,12 @@ mod tests {
             Extension(crate::auth::AuthenticatedDid(did.to_string())),
             crate::rate_limit::PeerAddr(Some(capped)),
             axum::http::HeaderMap::new(),
+            Extension(crate::auth::PusherSignature(String::new())),
+            Extension(crate::auth::PusherProof {
+                signature_input: String::new(),
+                content_digest: String::new(),
+                request_path: String::new(),
+            }),
             axum::body::Bytes::from_static(b"0000"),
         )
         .await;
@@ -6783,6 +6701,12 @@ mod tests {
             Extension(crate::auth::AuthenticatedDid(did.to_string())),
             crate::rate_limit::PeerAddr(Some(other)),
             axum::http::HeaderMap::new(),
+            Extension(crate::auth::PusherSignature(String::new())),
+            Extension(crate::auth::PusherProof {
+                signature_input: String::new(),
+                content_digest: String::new(),
+                request_path: String::new(),
+            }),
             axum::body::Bytes::from_static(b"0000"),
         )
         .await;
@@ -6889,6 +6813,12 @@ mod tests {
                 Extension(crate::auth::AuthenticatedDid(did.to_string())),
                 crate::rate_limit::PeerAddr(Some(peer)),
                 axum::http::HeaderMap::new(),
+                Extension(crate::auth::PusherSignature(String::new())),
+                Extension(crate::auth::PusherProof {
+                    signature_input: String::new(),
+                    content_digest: String::new(),
+                    request_path: String::new(),
+                }),
                 axum::body::Bytes::from_static(b"0000"),
             )
             .await
@@ -6976,6 +6906,12 @@ mod tests {
             Extension(crate::auth::AuthenticatedDid(did.to_string())),
             crate::rate_limit::PeerAddr(Some("203.0.113.62:5000".parse().unwrap())),
             axum::http::HeaderMap::new(),
+            Extension(crate::auth::PusherSignature(String::new())),
+            Extension(crate::auth::PusherProof {
+                signature_input: String::new(),
+                content_digest: String::new(),
+                request_path: String::new(),
+            }),
             axum::body::Bytes::from_static(b"0000"),
         )
         .await;
@@ -7135,6 +7071,12 @@ mod tests {
                         "203.0.113.81:5000".parse::<SocketAddr>().unwrap(),
                     )),
                     axum::http::HeaderMap::new(),
+                    Extension(crate::auth::PusherSignature(String::new())),
+                    Extension(crate::auth::PusherProof {
+                        signature_input: String::new(),
+                        content_digest: String::new(),
+                        request_path: String::new(),
+                    }),
                     axum::body::Bytes::from_static(b"0000"),
                 ));
                 let mut found: Option<i32> = None;
@@ -7289,6 +7231,12 @@ mod tests {
                         "203.0.113.83:5000".parse::<SocketAddr>().unwrap(),
                     )),
                     axum::http::HeaderMap::new(),
+                    Extension(crate::auth::PusherSignature(String::new())),
+                    Extension(crate::auth::PusherProof {
+                        signature_input: String::new(),
+                        content_digest: String::new(),
+                        request_path: String::new(),
+                    }),
                     axum::body::Bytes::from_static(b"0000"),
                 ),
             )
@@ -7377,6 +7325,12 @@ mod tests {
             Extension(crate::auth::AuthenticatedDid(did.to_string())),
             crate::rate_limit::PeerAddr(Some(peer)),
             axum::http::HeaderMap::new(),
+            Extension(crate::auth::PusherSignature(String::new())),
+            Extension(crate::auth::PusherProof {
+                signature_input: String::new(),
+                content_digest: String::new(),
+                request_path: String::new(),
+            }),
             axum::body::Bytes::from_static(b"0000"),
         )
         .await;
@@ -7395,6 +7349,12 @@ mod tests {
             Extension(crate::auth::AuthenticatedDid(did.to_string())),
             crate::rate_limit::PeerAddr(Some("203.0.113.72:5000".parse().unwrap())),
             axum::http::HeaderMap::new(),
+            Extension(crate::auth::PusherSignature(String::new())),
+            Extension(crate::auth::PusherProof {
+                signature_input: String::new(),
+                content_digest: String::new(),
+                request_path: String::new(),
+            }),
             axum::body::Bytes::from_static(b"0000"),
         )
         .await;
@@ -8043,6 +8003,12 @@ mod tests {
                     Extension(crate::auth::AuthenticatedDid(format!("did:key:{owner}"))),
                     crate::rate_limit::PeerAddr(Some(peer.parse::<SocketAddr>().unwrap())),
                     axum::http::HeaderMap::new(),
+                    Extension(crate::auth::PusherSignature(String::new())),
+                    Extension(crate::auth::PusherProof {
+                        signature_input: String::new(),
+                        content_digest: String::new(),
+                        request_path: String::new(),
+                    }),
                     ref_update_body(new_sha),
                 )
                 .await
@@ -8137,6 +8103,12 @@ mod tests {
                 )),
                 crate::rate_limit::PeerAddr(Some(peer)),
                 axum::http::HeaderMap::new(),
+                Extension(crate::auth::PusherSignature(String::new())),
+                Extension(crate::auth::PusherProof {
+                    signature_input: String::new(),
+                    content_digest: String::new(),
+                    request_path: String::new(),
+                }),
                 axum::body::Bytes::from_static(b"0000"),
             ),
         )
@@ -8197,6 +8169,12 @@ mod tests {
                 )),
                 crate::rate_limit::PeerAddr(Some(peer)),
                 axum::http::HeaderMap::new(),
+                Extension(crate::auth::PusherSignature(String::new())),
+                Extension(crate::auth::PusherProof {
+                    signature_input: String::new(),
+                    content_digest: String::new(),
+                    request_path: String::new(),
+                }),
                 ref_update_body("2222222222222222222222222222222222222222"),
             ),
         )
@@ -9424,6 +9402,12 @@ mod tests {
             Extension(crate::auth::AuthenticatedDid(did.to_string())),
             crate::rate_limit::PeerAddr(Some("203.0.113.81:5000".parse::<SocketAddr>().unwrap())),
             axum::http::HeaderMap::new(),
+            Extension(crate::auth::PusherSignature(String::new())),
+            Extension(crate::auth::PusherProof {
+                signature_input: String::new(),
+                content_digest: String::new(),
+                request_path: String::new(),
+            }),
             axum::body::Bytes::from_static(b"0000"),
         ));
         let mut desc: Option<i32> = None;
@@ -9454,6 +9438,12 @@ mod tests {
                     "203.0.113.82:5000".parse::<SocketAddr>().unwrap(),
                 )),
                 axum::http::HeaderMap::new(),
+                Extension(crate::auth::PusherSignature(String::new())),
+                Extension(crate::auth::PusherProof {
+                    signature_input: String::new(),
+                    content_digest: String::new(),
+                    request_path: String::new(),
+                }),
                 axum::body::Bytes::from_static(b"0000"),
             )
             .await
@@ -9548,6 +9538,12 @@ mod tests {
                     Extension(crate::auth::AuthenticatedDid(did.to_string())),
                     crate::rate_limit::PeerAddr(Some(peer.parse::<SocketAddr>().unwrap())),
                     axum::http::HeaderMap::new(),
+                    Extension(crate::auth::PusherSignature(String::new())),
+                    Extension(crate::auth::PusherProof {
+                        signature_input: String::new(),
+                        content_digest: String::new(),
+                        request_path: String::new(),
+                    }),
                     axum::body::Bytes::from_static(b"0000"),
                 ),
             )
@@ -9641,6 +9637,12 @@ mod tests {
             Extension(crate::auth::AuthenticatedDid(did.to_string())),
             crate::rate_limit::PeerAddr(Some("203.0.113.71:5000".parse::<SocketAddr>().unwrap())),
             axum::http::HeaderMap::new(),
+            Extension(crate::auth::PusherSignature(String::new())),
+            Extension(crate::auth::PusherProof {
+                signature_input: String::new(),
+                content_digest: String::new(),
+                request_path: String::new(),
+            }),
             axum::body::Bytes::from_static(b"0000"),
         ));
         for _ in 0..1000 {
@@ -9670,6 +9672,12 @@ mod tests {
                     "203.0.113.72:5000".parse::<SocketAddr>().unwrap(),
                 )),
                 axum::http::HeaderMap::new(),
+                Extension(crate::auth::PusherSignature(String::new())),
+                Extension(crate::auth::PusherProof {
+                    signature_input: String::new(),
+                    content_digest: String::new(),
+                    request_path: String::new(),
+                }),
                 axum::body::Bytes::from_static(b"0000"),
             )
             .await
@@ -9852,6 +9860,12 @@ mod tests {
                     Extension(crate::auth::AuthenticatedDid(did)),
                     crate::rate_limit::PeerAddr(Some(peer)),
                     axum::http::HeaderMap::new(),
+                    Extension(crate::auth::PusherSignature(String::new())),
+                    Extension(crate::auth::PusherProof {
+                        signature_input: String::new(),
+                        content_digest: String::new(),
+                        request_path: String::new(),
+                    }),
                     axum::body::Bytes::from_static(b"0000"),
                 )
                 .await
@@ -9925,6 +9939,12 @@ mod tests {
             )),
             crate::rate_limit::PeerAddr(Some("203.0.113.90:5000".parse::<SocketAddr>().unwrap())),
             axum::http::HeaderMap::new(),
+            Extension(crate::auth::PusherSignature(String::new())),
+            Extension(crate::auth::PusherProof {
+                signature_input: String::new(),
+                content_digest: String::new(),
+                request_path: String::new(),
+            }),
             ref_update_body("1111111111111111111111111111111111111111"),
         )
         .await
@@ -9979,6 +9999,12 @@ mod tests {
                     Extension(crate::auth::AuthenticatedDid(did)),
                     crate::rate_limit::PeerAddr(Some(peer)),
                     axum::http::HeaderMap::new(),
+                    Extension(crate::auth::PusherSignature(String::new())),
+                    Extension(crate::auth::PusherProof {
+                        signature_input: String::new(),
+                        content_digest: String::new(),
+                        request_path: String::new(),
+                    }),
                     axum::body::Bytes::from_static(b"0000"),
                 )
                 .await
@@ -10084,6 +10110,12 @@ mod tests {
                     Extension(crate::auth::AuthenticatedDid(did)),
                     crate::rate_limit::PeerAddr(Some(src)),
                     axum::http::HeaderMap::new(),
+                    Extension(crate::auth::PusherSignature(String::new())),
+                    Extension(crate::auth::PusherProof {
+                        signature_input: String::new(),
+                        content_digest: String::new(),
+                        request_path: String::new(),
+                    }),
                     axum::body::Bytes::from_static(b"0000"),
                 )
                 .await
@@ -10174,6 +10206,12 @@ mod tests {
                     Extension(crate::auth::AuthenticatedDid(format!("did:key:{owner}"))),
                     crate::rate_limit::PeerAddr(Some(edge)),
                     axum::http::HeaderMap::new(),
+                    Extension(crate::auth::PusherSignature(String::new())),
+                    Extension(crate::auth::PusherProof {
+                        signature_input: String::new(),
+                        content_digest: String::new(),
+                        request_path: String::new(),
+                    }),
                     axum::body::Bytes::from_static(b"0000"),
                 )
                 .await
@@ -10267,6 +10305,12 @@ mod tests {
                     Extension(crate::auth::AuthenticatedDid(did.to_string())),
                     crate::rate_limit::PeerAddr(Some(peer)),
                     axum::http::HeaderMap::new(),
+                    Extension(crate::auth::PusherSignature(String::new())),
+                    Extension(crate::auth::PusherProof {
+                        signature_input: String::new(),
+                        content_digest: String::new(),
+                        request_path: String::new(),
+                    }),
                     axum::body::Bytes::from_static(b"0000"),
                 )
                 .await
@@ -10327,6 +10371,12 @@ mod tests {
             )),
             crate::rate_limit::PeerAddr(None),
             axum::http::HeaderMap::new(),
+            Extension(crate::auth::PusherSignature(String::new())),
+            Extension(crate::auth::PusherProof {
+                signature_input: String::new(),
+                content_digest: String::new(),
+                request_path: String::new(),
+            }),
             axum::body::Bytes::from_static(b"0000"),
         )
         .await;
@@ -10371,6 +10421,12 @@ mod tests {
                     Extension(crate::auth::AuthenticatedDid(did.to_string())),
                     crate::rate_limit::PeerAddr(Some(src)),
                     axum::http::HeaderMap::new(),
+                    Extension(crate::auth::PusherSignature(String::new())),
+                    Extension(crate::auth::PusherProof {
+                        signature_input: String::new(),
+                        content_digest: String::new(),
+                        request_path: String::new(),
+                    }),
                     axum::body::Bytes::from_static(b"0000"),
                 ),
             )
@@ -10510,6 +10566,7 @@ mod tests {
             f2a_update("refs/heads/main", &c2),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            std::collections::HashMap::new(),
         )
         .await;
         let after_first = f2a_walks(&log);
@@ -10530,6 +10587,7 @@ mod tests {
             f2a_update("refs/heads/second", &c1),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            std::collections::HashMap::new(),
         )
         .await;
 
@@ -10603,6 +10661,7 @@ mod tests {
             f2a_update("refs/heads/main", &c2),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            std::collections::HashMap::new(),
         )
         .await;
 
@@ -10804,6 +10863,7 @@ mod tests {
             }],
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            std::collections::HashMap::new(),
         )
         .await;
 
@@ -10904,6 +10964,12 @@ mod tests {
             Extension(crate::auth::AuthenticatedDid(format!("did:key:{owner}"))),
             crate::rate_limit::PeerAddr(Some("203.0.113.90:5000".parse::<SocketAddr>().unwrap())),
             axum::http::HeaderMap::new(),
+            Extension(crate::auth::PusherSignature(String::new())),
+            Extension(crate::auth::PusherProof {
+                signature_input: String::new(),
+                content_digest: String::new(),
+                request_path: String::new(),
+            }),
             axum::body::Bytes::from_static(b"0000"),
         )
     }
@@ -11082,6 +11148,7 @@ mod tests {
             }],
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            std::collections::HashMap::new(),
         )
         .await;
 
@@ -11137,6 +11204,7 @@ mod tests {
             f2a_update("refs/heads/main", &c1),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            std::collections::HashMap::new(),
         )
         .await;
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -11178,6 +11246,7 @@ mod tests {
             }],
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            std::collections::HashMap::new(),
         )
         .await;
 
@@ -11275,6 +11344,7 @@ mod tests {
             }],
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            std::collections::HashMap::new(),
         )
         .await;
 

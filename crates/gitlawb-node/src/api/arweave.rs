@@ -69,7 +69,7 @@ pub async fn list_anchors(
     State(state): State<AppState>,
     Query(q): Query<ListAnchorsQuery>,
 ) -> Result<Json<serde_json::Value>> {
-    let limit = q.limit.min(200);
+    let _limit = q.limit.min(200);
     // Bare `?` so connection-class sqlx failures downcast to `AppError::Db` and
     // map to 503 `db_unavailable` (not 500 via `.map_err(AppError::Internal)`) (#251).
     // Clamp to a sane bound; a negative value would become LIMIT -1 in SQL,
