@@ -6408,9 +6408,7 @@ mod tests {
                 let mut fut = Box::pin(git_receive_pack(
                     State(state.clone()),
                     Path((owner.to_string(), name.to_string())),
-                    Extension(crate::auth::AuthenticatedDid(
-                        "did:key:z6disc".to_string(),
-                    )),
+                    Extension(crate::auth::AuthenticatedDid("did:key:z6disc".to_string())),
                     crate::rate_limit::PeerAddr(Some(
                         "203.0.113.81:5000".parse::<SocketAddr>().unwrap(),
                     )),
@@ -6560,9 +6558,7 @@ mod tests {
                 git_receive_pack(
                     State(state.clone()),
                     Path((owner.to_string(), name.to_string())),
-                    Extension(crate::auth::AuthenticatedDid(
-                        "did:key:z6succ".to_string(),
-                    )),
+                    Extension(crate::auth::AuthenticatedDid("did:key:z6succ".to_string())),
                     crate::rate_limit::PeerAddr(Some(
                         "203.0.113.83:5000".parse::<SocketAddr>().unwrap(),
                     )),

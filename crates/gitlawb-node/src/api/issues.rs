@@ -292,6 +292,22 @@ pub async fn close_issue(
     // about to be refused the write.
     let is_owner = crate::api::require_repo_owner(&record, &auth.0).is_ok();
     if !is_owner {
+        // Cap concurrent snapshot work on the shared read pool. The hourly rate
+        // bucket above is not a concurrent-work brake; without this, parallel close
+        // attempts from read-capable callers could each drive a full archive
+        // download and blocking extraction before the author denial below.
+        let _read_permit = state
+            .git_read_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                tracing::warn!(
+                    repo = %repo,
+                    "close_issue snapshot refused — git read pool at capacity"
+                );
+                AppError::Overloaded("git service at capacity, retry shortly".into())
+            })?;
+
         // Not the owner, so the author fallback decides it, and the author lives in
         // the issue's git-JSON blob rather than a DB column.
         //
@@ -871,6 +887,38 @@ mod lock_pool_shed_tests {
             !matches!(admitted, Err(AppError::Overloaded(_))),
             "with the lock pool free, create_issue must not be shed as capacity; got {:?}",
             admitted.err()
+        );
+    }
+
+    #[sqlx::test]
+    async fn close_issue_read_pool_exhaustion_sheds_before_snapshot(pool: PgPool) {
+        use std::sync::Arc;
+        let owner = "did:key:zISSUECLOSEREADPOOLBBBBBBBBBBBBBBBBBBBBB";
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.git_read_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        state
+            .db
+            .create_repo(&seed_repo(owner, "read-cap"))
+            .await
+            .expect("seed repo");
+
+        let shed = close_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(
+                "did:key:zISSUECLOSEREADSTRANGER".to_string(),
+            )),
+            Path((
+                owner.to_string(),
+                "read-cap".to_string(),
+                "deadbeef".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(None),
+        )
+        .await;
+        assert!(
+            matches!(shed, Err(AppError::Overloaded(_))),
+            "an exhausted read pool must shed before snapshot work; got {shed:?}"
         );
     }
 
