@@ -1495,6 +1495,7 @@ pub struct LockPoolBusy;
 /// The `after_release` hook runs `pg_advisory_unlock_all()` before a connection is
 /// reused, which is what makes cancellation of an in-flight `acquire_write` safe
 /// when combined with the session-pinning design in `RepoWriteGuard`.
+#[allow(dead_code)] // production uses Db::lock_pool; tests build pools through this helper
 pub fn build_lock_pool(source: &PgPool, max_connections: u32, acquire_timeout: Duration) -> PgPool {
     PgPoolOptions::new()
         .max_connections(max_connections)

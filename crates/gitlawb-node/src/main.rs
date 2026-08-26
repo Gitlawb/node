@@ -522,7 +522,7 @@ async fn main() -> Result<()> {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                        sweep_rate_limiters(&sweep_state).await;
+                        sweep_state.sweep_rate_limiters().await;
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs() as i64)
@@ -540,6 +540,8 @@ async fn main() -> Result<()> {
             }
         });
     }
+
+    let _legacy_cid_sweep = spawn_legacy_cid_sweep(&state, &config);
 
     let router = server::build_router(state.clone());
     // Re-register the socket bound at startup — same fd, so there was never a
@@ -1124,7 +1126,7 @@ mod rate_limiter_sweep_tests {
         }
 
         tokio::time::sleep(window * 3).await;
-        super::sweep_rate_limiters(&state).await;
+        state.sweep_rate_limiters().await;
 
         for (i, l) in limiters(&state).into_iter().enumerate() {
             assert_eq!(l.tracked_keys().await, 0, "limiter {i} was not swept");
@@ -1132,19 +1134,24 @@ mod rate_limiter_sweep_tests {
     }
 }
 
-/// Evict expired entries from every per-key rate limiter on the state.
-///
-/// Named and driven off `AppState` so the periodic sweeper stays in step with
-/// the limiters the router actually mounts: adding a limiter field and
-/// forgetting it here leaves its keys pinned until the map hits `max_keys` and
-/// the inline capacity sweep runs (the `/ipfs` limiter was missed this way).
-async fn sweep_rate_limiters(state: &AppState) {
-    state.rate_limiter.cleanup().await;
-    state.create_ip_rate_limiter.cleanup().await;
-    state.push_rate_limiter.cleanup().await;
-    state.sync_trigger_rate_limiter.cleanup().await;
-    state.peer_write_rate_limiter.cleanup().await;
-    state.ipfs_rate_limiter.cleanup().await;
+/// it.
+fn spawn_legacy_cid_sweep(state: &AppState, config: &Config) -> tokio::task::JoinHandle<()> {
+    let db = state.db.clone();
+    let repos_dir = config.repos_dir.clone();
+    let git_bin = state.git_bin.clone();
+    let git_timeout = std::time::Duration::from_secs(config.git_service_timeout_secs);
+    let batch = config.pin_repair_sweep_batch;
+    let delay = std::time::Duration::from_secs(config.pin_repair_sweep_delay_secs);
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = ipfs_pin::run_sweep_rearmed(
+                &repos_dir, &git_bin, git_timeout, batch, delay,
+                ipfs_pin::SWEEP_REARM_DELAY, &db,
+            ) => {}
+            _ = shutdown_rx.changed() => {}
+        }
+    })
 }
 
 async fn gossip_ping_round(
