@@ -1,7 +1,7 @@
 //! GET /api/v1/arweave/anchors — list Arweave ref-update anchors.
 
 use axum::{
-    extract::{Query, State},
+    extract::{Extension, Query, State},
     Json,
 };
 use serde::Deserialize;
@@ -24,7 +24,13 @@ fn default_limit() -> i64 {
 pub async fn list_anchors(
     State(state): State<AppState>,
     Query(q): Query<ListAnchorsQuery>,
+    auth: Option<Extension<crate::auth::AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
+    if auth.is_none() {
+        return Err(crate::error::AppError::Unauthorized(
+            "authentication required for anchor listing".into(),
+        ));
+    }
     let limit = q.limit.min(200);
     // Bare `?` so connection-class sqlx failures downcast to `AppError::Db` and
     // map to 503 `db_unavailable` (not 500 via `.map_err(AppError::Internal)`) (#251).
@@ -60,6 +66,7 @@ mod closed_pool_tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/arweave/anchors")
+                    .extension(crate::auth::AuthenticatedDid("did:key:test".into()))
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
