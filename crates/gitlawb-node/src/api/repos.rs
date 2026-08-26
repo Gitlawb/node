@@ -21,24 +21,24 @@ use crate::webhooks;
 /// The git all-zeros object id — the create/delete sentinel in a ref update.
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 
-/// The set of blob OIDs withheld from **anonymous** replication for a repo, or
-/// `None` when the repo must not replicate at all (private / mode A /
-/// undetermined — fail closed). This is the anonymous replication gate:
-/// `caller` is hard-coded to `None` and there is intentionally no caller
-/// parameter, which distinguishes it from the per-caller read-serve projection
-/// in `git_upload_pack` (which passes the real caller). Both the push pin path
-/// and the reconciliation sweep call this helper so the two cannot drift on
-/// what is withheld. `rules` is the already-fetched visibility-rule snapshot
+/// The set of blob and withheld-subtree tree OIDs withheld from **anonymous**
+/// replication for a repo, or `None` when the repo must not replicate at all
+/// (private / mode A / undetermined, fail closed). This is the anonymous
+/// replication gate: `caller` is hard-coded to `None` and there is intentionally
+/// no caller parameter, which distinguishes it from the per-caller read-serve
+/// projection in `git_upload_pack` (which passes the real caller). Both the push
+/// pin path and the reconciliation sweep call this helper so the two cannot drift
+/// on what is withheld. `rules` is the already-fetched visibility-rule snapshot
 /// (callers fetch once and may reuse it, e.g. for encrypt-then-pin).
 ///
 /// Returns `(announce, withheld)`: `announce` is whether the repo may be
 /// announced/replicated to the anonymous public at all (also gates gossip and
-/// Arweave anchoring downstream), and `withheld` is the anonymous withheld blob
-/// set when announceable (`None` when not announceable). A failed/panicked
-/// withheld walk fails closed on both axes: `announce` is forced false and
-/// `withheld` is `None`, so an unvetted push neither replicates blobs nor
-/// announces. Returning both keeps the gate's announce decision a single
-/// source rather than recomputing it at each call site.
+/// Arweave anchoring downstream), and `withheld` is the anonymous withheld object
+/// set (blobs and withheld-subtree trees) when announceable (`None` when not
+/// announceable). A failed/panicked withheld walk fails closed on both axes:
+/// `announce` is forced false and `withheld` is `None`, so an unvetted push
+/// neither replicates objects nor announces. Returning both keeps the gate's
+/// announce decision a single source rather than recomputing it at each call site.
 ///
 /// The walk arm runs under a `git_encrypt_semaphore` admission permit (#174 F4):
 /// by the time the receive-pack tail calls this, the handler's write permit has
@@ -64,13 +64,13 @@ async fn replication_withheld_set(
     }
     let withheld = match rules {
         // No path-scoped rule can withhold anything (covers the empty-rules and
-        // root-only-rules cases), so skip the full withheld_blob_oids walk and
+        // root-only-rules cases), so skip the full withheld_object_oids walk and
         // withhold nothing. The predicate's safety-invariant test guards that
         // this short-circuit matches what the walk would have returned.
         Some(rules) if !visibility_pack::has_path_scoped_rule(&rules) => {
             Some(std::collections::HashSet::new())
         }
-        // withheld_blob_oids walks every ref with blocking `git ls-tree`; keep
+        // withheld_object_oids walks every ref with blocking `git ls-tree`; keep
         // that off the async worker thread.
         Some(rules) => {
             let owner_did = owner_did.to_string();
@@ -83,18 +83,18 @@ async fn replication_withheld_set(
                 // The permit lives inside the blocking closure: a started walk
                 // always completes holding it.
                 let _permit = permit;
-                crate::git::visibility_pack::withheld_blob_oids_bounded(
+                crate::git::visibility_pack::withheld_object_oids_bounded(
                     &disk_path, &git_bin, timeout, &rules, is_public, &owner_did, None,
                 )
             })
             .await
             .map_err(|e| {
-                tracing::warn!(err = %e, "withheld_blob_oids task panicked; skipping replication")
+                tracing::warn!(err = %e, "withheld_object_oids task panicked; skipping replication")
             })
             .ok()
             .and_then(|r| {
                 r.map_err(|e| {
-                    tracing::warn!(err = %e, "withheld_blob_oids failed; skipping replication")
+                    tracing::warn!(err = %e, "withheld_object_oids failed; skipping replication")
                 })
                 .ok()
             })
@@ -111,16 +111,17 @@ async fn replication_withheld_set(
     }
 }
 
-/// The replicable object set for a full-scan pin fallback, failing closed (#99).
+/// The replicable object set for a full-scan pin fallback, failing closed (#99, #172).
 /// The full-scan candidate set includes dangling objects the reachable-only
 /// withheld set never classified, so compute the reachable visibility-allowed
-/// blob set and the all-blob universe off the async worker and keep only
-/// non-blobs plus allowed blobs. Any error in either walk (or a task panic)
+/// blob set, the reachable visibility-allowed tree set, and the all-blob plus
+/// all-tree universes off the async worker and keep only commits/tags plus
+/// allowed blobs plus allowed trees. Any error in any walk (or a task panic)
 /// pins nothing this push, mirroring the degraded-path shape of
 /// `replication_withheld_set`.
 ///
 /// Always walks (there is no no-git arm), so the whole blocking scan runs under
-/// one `git_encrypt_semaphore` admission permit (#174 F4) — see
+/// one `git_encrypt_semaphore` admission permit (#174 F4): see
 /// `acquire_scan_permit` for the defer rationale and the honest residuals.
 #[allow(clippy::too_many_arguments)]
 async fn fail_closed_full_scan_objects(
@@ -139,15 +140,16 @@ async fn fail_closed_full_scan_objects(
         crate::state::acquire_scan_permit(encrypt_sem, &disk_path, "fail-closed full scan").await;
     tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
         let _permit = permit;
-        // One whole-scan deadline shared across both phases (#174 F4). A fresh
-        // `Instant::now() + timeout` for phase 2 let a large-but-successful phase 1 plus
-        // a full phase 2 hold the scan permit ~2x the configured budget. Sharing the
-        // deadline caps total occupancy at ~1x: phase 1 runs against the remaining
-        // budget, and if it consumes the budget phase 2 gets what is left and fails
-        // closed (pins nothing) rather than over-holding — the safe direction. The cost
-        // is honest: a genuinely large repo whose phase 1 nears the budget under-pins
-        // this push rather than the previous silent ~2x hold; size the budget so both
-        // phases normally fit.
+        // One whole-scan deadline shared across every phase (#174 F4). A fresh
+        // `Instant::now() + timeout` for a later phase let a large-but-successful
+        // earlier phase plus a full later phase hold the scan permit ~Nx the
+        // configured budget. Sharing the deadline caps total occupancy at ~1x:
+        // each phase runs against the remaining budget, and if an earlier phase
+        // consumes the budget a later one gets what is left and fails closed
+        // (pins nothing) rather than over-holding, the safe direction. The cost
+        // is honest: a genuinely large repo whose first phase nears the budget
+        // under-pins this push rather than the previous silent ~2x hold; size the
+        // budget so the blob walk, tree walk, and typed enumeration normally fit.
         let deadline = std::time::Instant::now() + timeout;
         let allowed = crate::git::visibility_pack::replicable_blob_set_bounded(
             &disk_path,
@@ -157,19 +159,32 @@ async fn fail_closed_full_scan_objects(
             is_public,
             &owner_did,
         )?;
-        let all_blobs = crate::git::push_delta::all_blob_oids(&disk_path, &git_bin, deadline)?;
+        let allowed_trees = crate::git::visibility_pack::replicable_tree_set_bounded(
+            &disk_path,
+            &git_bin,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            &rules,
+            is_public,
+            &owner_did,
+        )?;
+        let (all_blobs, all_trees) =
+            crate::git::push_delta::all_blob_and_tree_oids(&disk_path, &git_bin, deadline)?;
         Ok(crate::git::visibility_pack::replicable_objects_fail_closed(
-            candidates, &allowed, &all_blobs,
+            candidates,
+            &allowed,
+            &all_blobs,
+            &allowed_trees,
+            &all_trees,
         ))
     })
     .await
     .map_err(|e| {
-        tracing::warn!(err = %e, "fail-closed blob walk task panicked; pinning nothing this push")
+        tracing::warn!(err = %e, "fail-closed object walk task panicked; pinning nothing this push")
     })
     .ok()
     .and_then(|r| {
         r.map_err(|e| {
-            tracing::warn!(err = %e, "fail-closed blob walk failed; pinning nothing this push")
+            tracing::warn!(err = %e, "fail-closed object walk failed; pinning nothing this push")
         })
         .ok()
     })
@@ -2444,10 +2459,10 @@ async fn post_receive_replication_tail(
     did: String,
 ) {
     // Replication enforcement (Phase 2): decide once per push whether the public
-    // may read this repo at all and, if so, which blob OIDs must not leave the
-    // node. `withheld == None` means this push pins nothing (private / mode A /
-    // undetermined, or a walk that failed): skip every pin so even commit and tree
-    // objects (which withheld_blob_oids never lists) stay local. Fail closed: a
+    // may read this repo at all and, if so, which blob and withheld-subtree tree
+    // OIDs must not leave the node. `withheld == None` means this push pins nothing
+    // (private / mode A / undetermined, or a walk that failed): skip every pin so
+    // even commit and tag objects (which the withheld walk never lists) stay local. Fail closed: a
     // private or undetermined repo never leaks. The announce decision that gates
     // the network-facing sends is taken separately, below.
     let rules_opt = state.db.list_visibility_rules(&record.id).await.ok();
@@ -3880,6 +3895,229 @@ mod tests {
             result,
             (false, None),
             "a walk that could not be vetted must suppress the announce (fail closed)"
+        );
+    }
+
+    /// #172: first-push delta (empty old tips, `full_scan == false`) must drop the
+    /// withheld-subtree tree. The withheld set comes from `replication_withheld_set`,
+    /// the production wrapper all three delta call sites already use.
+    #[tokio::test]
+    async fn first_push_delta_drops_withheld_subtree_tree() {
+        use std::process::Command;
+        use std::time::Duration;
+
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        let run = |args: &[&str], dir: &std::path::Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        std::fs::create_dir_all(work.join("public")).unwrap();
+        std::fs::create_dir_all(work.join("secret")).unwrap();
+        std::fs::write(work.join("public/a.txt"), b"public bytes\n").unwrap();
+        std::fs::write(work.join("secret/b.txt"), b"TOP SECRET\n").unwrap();
+        run(&["init", "-q"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        run(&["add", "."], &work);
+        run(&["commit", "-qm", "init"], &work);
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+        let oid = |rev: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "rev-parse {rev}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let head = oid("HEAD");
+        let root_tree = oid("HEAD^{tree}");
+        let public_tree = oid("HEAD:public");
+        let public_blob = oid("HEAD:public/a.txt");
+        let secret_tree = oid("HEAD:secret");
+        let secret_blob = oid("HEAD:secret/b.txt");
+
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
+        let pin_set = crate::git::push_delta::resolve_candidates_for_push(
+            sem.clone(),
+            bare.clone(),
+            vec![head.clone()],
+            vec![],
+            "git".into(),
+            Duration::from_secs(600),
+            false,
+        )
+        .await;
+        assert!(
+            !pin_set.full_scan,
+            "a first push of a commit tip must take the delta path, not full-scan"
+        );
+        assert!(
+            pin_set.candidates.contains(&secret_tree) && pin_set.candidates.contains(&secret_blob),
+            "precondition: the first-push delta includes the withheld tree and blob, \
+             so a later drop is a filter hit, not a missing-candidate skip"
+        );
+
+        let (_announce, withheld) = replication_withheld_set(
+            sem,
+            Some(vec![vis_rule("/secret/**", &[])]),
+            OWNER_DID,
+            true,
+            bare,
+            "git".into(),
+            Duration::from_secs(600),
+        )
+        .await;
+        let withheld = withheld
+            .expect("announceable public repo with a path-scoped rule must yield a withheld set");
+        let replicable =
+            crate::git::visibility_pack::replicable_objects(pin_set.candidates, &withheld);
+        assert!(
+            replicable.contains(&head) && replicable.contains(&root_tree),
+            "commit and root tree still replicate"
+        );
+        assert!(
+            replicable.contains(&public_tree) && replicable.contains(&public_blob),
+            "public tree and blob still replicate"
+        );
+        assert!(
+            !replicable.contains(&secret_tree),
+            "withheld-subtree tree must not survive the first-push delta pin set (#172)"
+        );
+        assert!(
+            !replicable.contains(&secret_blob),
+            "withheld blob still drops"
+        );
+    }
+
+    /// #172: full-scan fallback drops a withheld-subtree tree and a dangling tree,
+    /// keeping the commit, root tree, public tree, and public blob.
+    #[tokio::test]
+    async fn full_scan_drops_withheld_and_dangling_trees() {
+        use std::io::Write;
+        use std::process::Command;
+        use std::time::Duration;
+
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        let run = |args: &[&str], dir: &std::path::Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        std::fs::create_dir_all(work.join("public")).unwrap();
+        std::fs::create_dir_all(work.join("secret")).unwrap();
+        std::fs::write(work.join("public/a.txt"), b"public bytes\n").unwrap();
+        std::fs::write(work.join("secret/b.txt"), b"TOP SECRET\n").unwrap();
+        run(&["init", "-q"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        run(&["add", "."], &work);
+        run(&["commit", "-qm", "init"], &work);
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+        let oid = |rev: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "rev-parse {rev}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let head = oid("HEAD");
+        let root_tree = oid("HEAD^{tree}");
+        let public_tree = oid("HEAD:public");
+        let public_blob = oid("HEAD:public/a.txt");
+        let secret_tree = oid("HEAD:secret");
+        let secret_blob = oid("HEAD:secret/b.txt");
+
+        let mut child = Command::new("git")
+            .args(["mktree"])
+            .current_dir(&bare)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(
+            child.stdin.as_mut().unwrap(),
+            "100644 blob {secret_blob}\tdangling-only-unreferenced.txt"
+        )
+        .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "git mktree");
+        let dangling_tree = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(600);
+        let candidates = crate::git::push_delta::list_all_objects(&bare, "git", deadline).unwrap();
+        assert!(
+            candidates.contains(&dangling_tree),
+            "precondition: dangling tree is in the full-scan universe"
+        );
+        assert!(
+            candidates.contains(&secret_tree) && candidates.contains(&secret_blob),
+            "precondition: full-scan universe includes the withheld tree and blob"
+        );
+
+        let replicable = fail_closed_full_scan_objects(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+            bare,
+            vec![vis_rule("/secret/**", &[])],
+            true,
+            OWNER_DID.to_string(),
+            candidates,
+            "git".into(),
+            Duration::from_secs(600),
+        )
+        .await;
+        assert!(replicable.contains(&head), "HEAD commit kept");
+        assert!(replicable.contains(&root_tree), "root tree kept");
+        assert!(replicable.contains(&public_tree), "public tree kept");
+        assert!(replicable.contains(&public_blob), "public blob kept");
+        assert!(
+            !replicable.contains(&secret_tree),
+            "withheld-subtree tree dropped on full-scan (#172)"
+        );
+        assert!(
+            !replicable.contains(&secret_blob),
+            "withheld blob dropped on full-scan"
+        );
+        assert!(
+            !replicable.contains(&dangling_tree),
+            "dangling tree dropped on full-scan (#172, #99 geometry for trees)"
         );
     }
 
@@ -6859,7 +7097,7 @@ mod tests {
         // (cat-file --batch-all-objects) sleeps 1.5s. With a 2s whole-scan budget the
         // shared deadline leaves phase 2 only ~0.5s, so it is reaped; a fresh 2s budget
         // would let it finish.
-        let body = "#!/bin/sh\ncase \"$1\" in\n  rev-parse) echo deadbeef ;;\n  rev-list) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;\n  ls-tree) sleep 1.5 ;;\n  cat-file) case \"$*\" in *--batch-all-objects*) sleep 1.5 ;; *) : ;; esac ;;\n  *) : ;;\nesac\nexit 0\n";
+        let body = "#!/bin/sh\ncase \"$1\" in\n  rev-parse) echo deadbeef ;;\n  rev-list) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;\n  ls-tree) case \"$*\" in *-rzt*) : ;; *) sleep 1.5 ;; esac ;;\n  cat-file) case \"$*\" in *--batch-all-objects*) sleep 1.5 ;; *) : ;; esac ;;\n  *) : ;;\nesac\nexit 0\n";
         let git_bin = write_fake_git(tmp.path(), body);
         // A candidate that is NOT a blob (never appears in all_blob_oids): kept by
         // replicable_objects_fail_closed only if phase 2 actually ran to completion.
@@ -6882,6 +7120,45 @@ mod tests {
             "a large-but-successful phase 1 must leave phase 2 only the SHARED whole-scan \
              remainder, so it reaps and the scan fails closed; got {objs:?} (a fresh phase-2 \
              budget completed the scan and kept the candidate — the ~2x-budget bug)"
+        );
+    }
+
+    /// #172 / #174 F4 sibling: a successful blob walk that nearly exhausts the
+    /// shared budget must leave the tree allowed-set walk only the remainder, so
+    /// the scan pins nothing. Distinguishes `ls-tree -rzt` (tree) from `ls-tree -rz`
+    /// (blob). Load-bearing together with a fresh timeout on both the tree walk and
+    /// the typed enumeration: those two later phases completing independently would
+    /// keep the non-blob non-tree candidate.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn full_scan_shares_one_deadline_with_tree_allowed_set_walk() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Blob ls-tree -rz sleeps 1.5s; tree ls-tree -rzt sleeps 1.5s; cat-file is
+        // instant. With a 2s whole-scan budget the tree walk is reaped.
+        let body = "#!/bin/sh\ncase \"$1\" in\n  rev-parse) echo deadbeef ;;\n  rev-list) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;\n  ls-tree) case \"$*\" in *-rzt*) sleep 1.5 ;; *) sleep 1.5 ;; esac ;;\n  cat-file) : ;;\n  *) : ;;\nesac\nexit 0\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        let candidates = vec!["cccccccccccccccccccccccccccccccccccccccc".to_string()];
+
+        let sem: Arc<Semaphore> = Arc::new(Semaphore::new(1));
+        let objs = fail_closed_full_scan_objects(
+            sem,
+            tmp.path().to_path_buf(),
+            vec![vis_rule("/secret/**", &[])],
+            true,
+            OWNER_DID.to_string(),
+            candidates,
+            git_bin,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            objs.is_empty(),
+            "a large-but-successful blob walk must leave the tree allowed-set walk only \
+             the SHARED remainder, so it reaps and the scan fails closed; got {objs:?}"
         );
     }
 

@@ -1,7 +1,9 @@
-//! Resolve which blob OIDs must be withheld from a caller because every path
-//! at which the blob appears is denied by the repo's visibility rules. Trees
-//! and commits are never withheld (mode B keeps SHAs intact); only blob
-//! content is held back.
+//! Resolve which object OIDs must be withheld from a caller because every path
+//! at which the object appears is denied by the repo's visibility rules. Blobs
+//! and subtree trees are withholdable (mode B; trees since #135/#173). Commits
+//! and tags are never withheld: they are root-level metadata a "/" reader already
+//! clears. The replication pin path uses [`withheld_object_oids_bounded`] so a
+//! withheld-subtree tree is not exported to public IPFS (#172).
 
 use crate::db::VisibilityRule;
 use crate::visibility::{visibility_check, Decision};
@@ -540,6 +542,79 @@ pub fn withheld_blob_oids_bounded(
     ))
 }
 
+/// Reachable blob AND withheld-subtree tree OIDs the anonymous (or `caller`)
+/// replication audience must not receive. The single source for
+/// `replication_withheld_set`: a blob-only set handed to [`replicable_objects`]
+/// reintroduces #172 (withheld trees pin to public IPFS).
+///
+/// Strict where [`tree_paths`] is lenient. This feeds a withheld filter, so
+/// absence means replicate; a missed reachable tree would leak. The walk
+/// therefore matches [`blob_paths`]: [`assert_all_refs_are_commits`] first, then
+/// a failing `rev-list --all [HEAD]` is an error, then [`object_paths`] (already
+/// fail-closed on ls-tree / non-UTF-8) plus [`root_tree_pairs`]. [`tree_paths`]
+/// stays the lenient allow-list walk for GET /ipfs/{cid} and the full-scan
+/// allowed-tree set, where absence withholds.
+pub fn withheld_object_oids_bounded(
+    repo_path: &Path,
+    git_bin: &str,
+    timeout: Duration,
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    caller: Option<&str>,
+) -> Result<HashSet<String>> {
+    let deadline = Instant::now() + timeout;
+    assert_all_refs_are_commits(repo_path, git_bin, deadline)?;
+    let head_resolves = run_bounded_git(
+        git_bin,
+        &["rev-parse", "--verify", "HEAD"],
+        repo_path,
+        b"",
+        deadline,
+    )
+    .is_ok();
+    let mut rev_args = vec!["rev-list", "--all"];
+    if head_resolves {
+        rev_args.push("HEAD");
+    }
+    let commits_out = run_bounded_git(git_bin, &rev_args, repo_path, b"", deadline)?;
+    let commits: Vec<String> = String::from_utf8_lossy(&commits_out)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let triples = object_paths(repo_path, git_bin, &commits, deadline)?;
+    let mut pairs: Vec<(String, String)> = triples
+        .into_iter()
+        .filter(|(_, _, kind)| kind == "blob" || kind == "tree")
+        .map(|(oid, path, _)| (oid, path))
+        .collect();
+    pairs.extend(root_tree_pairs(repo_path, git_bin, &commits, deadline)?);
+    Ok(withheld_from_pairs(
+        &pairs, rules, is_public, owner_did, caller,
+    ))
+}
+
+/// [`withheld_object_oids_bounded`] with the test walk budget.
+#[cfg(test)]
+pub fn withheld_object_oids(
+    repo_path: &Path,
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    caller: Option<&str>,
+) -> Result<HashSet<String>> {
+    withheld_object_oids_bounded(
+        repo_path,
+        "git",
+        WALK_TIMEOUT,
+        rules,
+        is_public,
+        owner_did,
+        caller,
+    )
+}
+
 /// Withheld set from an already-computed (oid, "/path") listing: a blob is
 /// withheld only when visibility denies the caller at *every* path it appears
 /// at. Split out so a caller that already walked `blob_paths` (e.g.
@@ -588,8 +663,9 @@ pub fn has_path_scoped_rule(rules: &[VisibilityRule]) -> bool {
 
 /// Objects that may replicate to the public: everything not in `withheld`.
 /// Order-preserving. The single seam every replication site (IPFS, Pinata)
-/// passes its object list through; option B would later reroute the withheld
-/// ones through encrypt-then-pin instead of dropping them.
+/// passes its object list through on the delta path. `withheld` MUST be the
+/// combined blob-and-tree set from [`withheld_object_oids_bounded`] (via
+/// `replication_withheld_set`); a blob-only set reintroduces #172.
 pub fn replicable_objects(all: Vec<String>, withheld: &HashSet<String>) -> Vec<String> {
     all.into_iter()
         .filter(|oid| !withheld.contains(oid))
@@ -623,6 +699,23 @@ pub fn replicable_blob_set_bounded(
     owner_did: &str,
 ) -> Result<HashSet<String>> {
     allowed_blob_set_for_caller_bounded(
+        repo_path, git_bin, timeout, rules, is_public, owner_did, None,
+    )
+}
+
+/// Reachable tree OIDs that visibility ALLOWS the anonymous replication
+/// audience at some path. The tree analog of [`replicable_blob_set_bounded`],
+/// used on the fail-closed full-scan pin path so a withheld or dangling tree
+/// is absent and dropped (#172).
+pub fn replicable_tree_set_bounded(
+    repo_path: &Path,
+    git_bin: &str,
+    timeout: Duration,
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+) -> Result<HashSet<String>> {
+    allowed_tree_set_for_caller_bounded(
         repo_path, git_bin, timeout, rules, is_public, owner_did, None,
     )
 }
@@ -827,11 +920,12 @@ fn root_tree_pairs(
 /// Every `(tree_oid, "/path")` pair reachable in `repo_path`: the `kind == "tree"`
 /// slice of [`object_paths`] (subtree trees at their directory paths) PLUS every
 /// reachable commit's root tree at "/" (see [`root_tree_pairs`]). Computes the
-/// reachable-commit set ONCE (leniently — see [`reachable_commit_oids`]; the tree
-/// allowed-set feeds ONLY the `/ipfs/{cid}` tree gate, where absence = fail-closed
-/// 404) and drives both the ls-tree walk and the root-tree pass from it, so the two
-/// cannot diverge and neither re-enumerates. The tree analog of [`blob_paths`],
-/// bounded by the same shared `deadline`.
+/// reachable-commit set ONCE (leniently, see [`reachable_commit_oids`]; the tree
+/// allowed-set feeds the `/ipfs/{cid}` tree gate AND the full-scan pin allow-list,
+/// where absence = fail-closed) and drives both the ls-tree walk and the root-tree
+/// pass from it, so the two cannot diverge and neither re-enumerates. The tree analog
+/// of [`blob_paths`], bounded by the same shared `deadline`. Not for a withheld
+/// filter: that path is [`withheld_object_oids_bounded`].
 fn tree_paths(
     repo_path: &Path,
     git_bin: &str,
@@ -1150,22 +1244,29 @@ pub fn reachable_commit_tag_oids_bounded(
     Ok(set)
 }
 
-/// Objects safe to replicate, failing closed on blobs (#99). A candidate
-/// replicates iff it is NOT a blob (`all_blob_oids` — commits and trees are
-/// structural, never content-withheld) OR it is in `allowed_blobs` (reachable
-/// and visibility-allowed). This drops both withheld reachable blobs and
-/// dangling/unreachable blobs the reachable walk never classified, without
-/// tagging the candidate list with per-object types. Used on the full-scan pin
-/// path, where the candidate set can contain dangling objects the reachable-only
-/// withheld set cannot cover; the delta path keeps `replicable_objects`.
+/// Objects safe to replicate, failing closed on blobs AND trees (#99, #172).
+/// A candidate replicates iff it is neither a known blob nor a known tree
+/// (commits and tags: structural, a "/" reader already clears) OR it is in
+/// `allowed_blobs` OR it is in `allowed_trees`. Trees have been content-withholdable
+/// since #135/#173; the old premise that they always pass is falsified. A dangling
+/// or withheld tree is in `all_tree_oids` and absent from `allowed_trees`, so it
+/// drops. Used on the full-scan pin path, where the candidate set can contain
+/// dangling objects the reachable-only withheld set cannot cover; the delta path
+/// keeps [`replicable_objects`].
 pub fn replicable_objects_fail_closed(
     candidates: Vec<String>,
     allowed_blobs: &HashSet<String>,
     all_blob_oids: &HashSet<String>,
+    allowed_trees: &HashSet<String>,
+    all_tree_oids: &HashSet<String>,
 ) -> Vec<String> {
     candidates
         .into_iter()
-        .filter(|oid| !all_blob_oids.contains(oid) || allowed_blobs.contains(oid))
+        .filter(|oid| {
+            let is_blob = all_blob_oids.contains(oid);
+            let is_tree = all_tree_oids.contains(oid);
+            (!is_blob && !is_tree) || allowed_blobs.contains(oid) || allowed_trees.contains(oid)
+        })
         .collect()
 }
 
@@ -2384,28 +2485,49 @@ esac\n";
     }
 
     #[test]
-    fn fail_closed_keeps_nonblobs_and_allowed_blobs_only() {
-        // Non-blob objects (commit/tree) always pass; a blob passes only if it
-        // is in the allowed set. A withheld blob and a dangling blob (both in
-        // all_blob_oids, neither in allowed) are dropped.
-        let allowed: HashSet<String> = ["b_pub".to_string()].into_iter().collect();
+    fn fail_closed_keeps_commits_allowed_blobs_and_allowed_trees_only() {
+        // Deliberate invariant flip of fail_closed_keeps_nonblobs_and_allowed_blobs_only
+        // (#172). That test's premise ("commits and trees are structural, never
+        // content-withheld") was falsified by #135/#173: a withheld-subtree tree is
+        // content, same as a withheld blob. Commits and tags still pass; a blob or
+        // tree passes only if it is in its allowed set. Withheld and dangling blobs
+        // and trees (in the all-set, absent from allowed) drop.
+        let allowed_blobs: HashSet<String> = ["b_pub".to_string()].into_iter().collect();
         let all_blobs: HashSet<String> = ["b_pub", "b_secret", "b_dangling"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let allowed_trees: HashSet<String> =
+            ["t_root", "t_pub"].into_iter().map(String::from).collect();
+        let all_trees: HashSet<String> = ["t_root", "t_pub", "t_secret", "t_dangling"]
             .into_iter()
             .map(String::from)
             .collect();
         let candidates = vec![
             "commit1".to_string(),
-            "tree1".to_string(),
+            "tag1".to_string(),
+            "t_root".to_string(),
+            "t_pub".to_string(),
+            "t_secret".to_string(),
+            "t_dangling".to_string(),
             "b_pub".to_string(),
             "b_secret".to_string(),
             "b_dangling".to_string(),
         ];
-        let got = replicable_objects_fail_closed(candidates, &allowed, &all_blobs);
+        let got = replicable_objects_fail_closed(
+            candidates,
+            &allowed_blobs,
+            &all_blobs,
+            &allowed_trees,
+            &all_trees,
+        );
         assert_eq!(
             got,
             vec![
                 "commit1".to_string(),
-                "tree1".to_string(),
+                "tag1".to_string(),
+                "t_root".to_string(),
+                "t_pub".to_string(),
                 "b_pub".to_string()
             ]
         );
@@ -2482,8 +2604,12 @@ esac\n";
         );
 
         // Full-scan candidate set includes the dangling blob; fail-closed drops it.
+        // Empty tree sets keep today's keep-all-trees behavior for this blob-only
+        // case (U1 signature adapt; U3 wires the real tree walks).
+        let no_trees: HashSet<String> = HashSet::new();
         let candidates = vec![dangling_oid.clone(), public_oid.clone()];
-        let replicable = replicable_objects_fail_closed(candidates, &allowed, &all_blobs);
+        let replicable =
+            replicable_objects_fail_closed(candidates, &allowed, &all_blobs, &no_trees, &no_trees);
         assert!(
             !replicable.contains(&dangling_oid),
             "#99: a dangling private blob must not replicate"
@@ -2491,6 +2617,210 @@ esac\n";
         assert!(
             replicable.contains(&public_oid),
             "the public blob still replicates"
+        );
+    }
+
+    #[test]
+    fn withheld_object_set_contains_withheld_subtree_tree() {
+        // #172 repro as a test: the withheld /secret tree must enter the combined
+        // withheld set (today's blob-only walk omits it because trees are never in
+        // all_blob_oids). Nested secret/nested is the same leak class.
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        let run = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        std::fs::create_dir_all(work.join("public")).unwrap();
+        std::fs::create_dir_all(work.join("secret/nested")).unwrap();
+        std::fs::write(work.join("public/a.txt"), b"public bytes\n").unwrap();
+        std::fs::write(work.join("secret/b.txt"), b"TOP SECRET\n").unwrap();
+        std::fs::write(work.join("secret/nested/c.txt"), b"NESTED SECRET\n").unwrap();
+        run(&["init", "-q"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        run(&["add", "."], &work);
+        run(&["commit", "-qm", "init"], &work);
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+        let oid = |rev: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "rev-parse {rev}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let secret_tree = oid("HEAD:secret");
+        let nested_tree = oid("HEAD:secret/nested");
+        let secret_blob = oid("HEAD:secret/b.txt");
+        let public_tree = oid("HEAD:public");
+        let public_blob = oid("HEAD:public/a.txt");
+        let root_tree = oid("HEAD^{tree}");
+        let head = oid("HEAD");
+        let rules = [rule("/secret/**", &[])];
+        let withheld = withheld_object_oids(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            withheld.contains(&secret_tree),
+            "withheld /secret tree must be in the combined withheld set (#172)"
+        );
+        assert!(
+            withheld.contains(&nested_tree),
+            "nested withheld tree secret/nested must also be withheld"
+        );
+        assert!(
+            withheld.contains(&secret_blob),
+            "withheld blob remains withheld"
+        );
+        assert!(!withheld.contains(&root_tree), "root tree is allowed at /");
+        assert!(
+            !withheld.contains(&public_tree),
+            "public subtree tree is not withheld"
+        );
+        assert!(
+            !withheld.contains(&public_blob),
+            "public blob is not withheld"
+        );
+        assert!(!withheld.contains(&head), "commits are never withheld");
+
+        let candidates_out = Command::new("git")
+            .args(["rev-list", "--objects", "--no-object-names", "HEAD"])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        assert!(candidates_out.status.success());
+        let candidates: Vec<String> = String::from_utf8_lossy(&candidates_out.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        let replicable = replicable_objects(candidates, &withheld);
+        assert!(
+            replicable.contains(&head) && replicable.contains(&root_tree),
+            "commit and root tree still replicate"
+        );
+        assert!(
+            replicable.contains(&public_tree) && replicable.contains(&public_blob),
+            "public tree and blob still replicate"
+        );
+        assert!(
+            !replicable.contains(&secret_tree) && !replicable.contains(&secret_blob),
+            "secret tree and blob must drop from the replicable set (#172)"
+        );
+        assert!(
+            !replicable.contains(&nested_tree),
+            "nested withheld tree must drop too"
+        );
+    }
+
+    #[test]
+    fn withheld_object_set_blob_slice_matches_withheld_blob_oids() {
+        let (_td, bare, _s, _p) = fixture();
+        let rules = [rule("/secret/**", &[])];
+        let combined = withheld_object_oids(&bare, &rules, true, OWNER, None).unwrap();
+        let blobs = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        let all_blobs =
+            crate::git::push_delta::all_blob_oids(&bare, "git", Instant::now() + WALK_TIMEOUT)
+                .unwrap();
+        let blob_slice: HashSet<String> = combined.intersection(&all_blobs).cloned().collect();
+        assert_eq!(
+            blob_slice, blobs,
+            "combined withheld set's blob slice must equal withheld_blob_oids (R4)"
+        );
+    }
+
+    #[test]
+    fn withheld_object_set_keeps_tree_shared_across_allowed_and_denied_paths() {
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        std::fs::create_dir_all(work.join("pub/sub")).unwrap();
+        std::fs::create_dir_all(work.join("sec/sub")).unwrap();
+        std::fs::write(work.join("pub/sub/f.txt"), b"same bytes\n").unwrap();
+        std::fs::write(work.join("sec/sub/f.txt"), b"same bytes\n").unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&work)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["add", "."]);
+        run(&["commit", "-qm", "seed"]);
+        let oid = |rev: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let pub_sub = oid("HEAD:pub/sub");
+        let sec_sub = oid("HEAD:sec/sub");
+        assert_eq!(pub_sub, sec_sub, "identical content dedups to one tree oid");
+        let rules = [rule("/sec/**", &[])];
+        let withheld = withheld_object_oids(&work, &rules, true, OWNER, None).unwrap();
+        assert!(
+            !withheld.contains(&pub_sub),
+            "a tree reachable at an allowed path is not withheld even when also at a denied path"
+        );
+    }
+
+    #[test]
+    fn withheld_object_set_empty_with_root_only_rules() {
+        let (_td, bare, _s, _p) = fixture();
+        // A caller who has already passed the "/" gate: the listed reader of a
+        // root-only rule. Path-scoped withholding cannot apply, so the set is empty
+        // (R7, the has_path_scoped_rule short-circuit premise).
+        let rules = [rule("/", &["did:key:zFriend"])];
+        let withheld =
+            withheld_object_oids(&bare, &rules, true, OWNER, Some("did:key:zFriend")).unwrap();
+        assert!(
+            withheld.is_empty(),
+            "root-only rules cannot withhold a blob or tree from a caller who passed the / gate (R7)"
+        );
+    }
+
+    #[test]
+    fn withheld_object_walk_fails_closed_on_non_commit_ref() {
+        let (_td, bare, _s, _p) = fixture();
+        let secret_tree = {
+            let out = Command::new("git")
+                .args(["rev-parse", "HEAD:secret"])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        std::fs::write(bare.join("refs/heads/treeref"), format!("{secret_tree}\n")).unwrap();
+        let rules = [rule("/secret/**", &[])];
+        let result = withheld_object_oids(&bare, &rules, true, OWNER, None);
+        assert!(
+            result.is_err(),
+            "a ref that peels to a tree must fail the withheld walk closed (Err), not a partial set"
         );
     }
 
