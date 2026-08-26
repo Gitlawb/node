@@ -1602,7 +1602,7 @@ pub(crate) fn batch_budget_gate(
 /// `object_list` is the already-withheld-filtered OID set to pin: the caller
 /// applies `visibility_pack::replicable_objects` on the delta path or the
 /// `..._fail_closed` filter on the full-scan path before calling, so this
-/// function never sees a withheld blob. `repo_path` is still needed to read each
+/// function never sees a withheld blob or withheld-subtree tree. `repo_path` is still needed to read each
 /// object's bytes, and `git_bin` names the binary those reads run: the production
 /// callers pass the literal `"git"`, and a test passes a fake so the loop's own bound
 /// can be driven with a git that never answers. `repo_id` records the pin's provenance

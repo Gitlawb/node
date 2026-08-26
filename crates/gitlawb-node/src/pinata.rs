@@ -70,7 +70,8 @@ pub async fn pin_object(
 /// Pin any of the given candidate git objects that haven't yet been sent to
 /// Pinata.
 ///
-/// `object_list` is the already-withheld-filtered OID set to pin: the caller
+/// `object_list` is the already-withheld-filtered OID set to pin (blobs and
+/// withheld-subtree trees already dropped): the caller
 /// applies `visibility_pack::replicable_objects` on the delta path or the
 /// `..._fail_closed` filter on the full-scan path before calling. `repo_path` is
 /// still needed to read each object's bytes, and `git_bin` names the binary those
