@@ -6260,6 +6260,9 @@ mod tests {
         // Long enough that the git-service timeout is never what ends this push; the
         // disconnect is.
         cfg.git_service_timeout_secs = 600;
+        // Lock-path test, not owner-push authorization: pin off so the default-on gate
+        // does not reject the proof DID before receive-pack runs.
+        cfg.enforce_owner_push = false;
         state.config = std::sync::Arc::new(cfg);
         state
             .db
@@ -6430,6 +6433,9 @@ mod tests {
             None,
             crate::git::repo_store::build_lock_pool(&pool, 4, std::time::Duration::from_secs(5)),
         );
+        let mut cfg = (*state.config).clone();
+        cfg.enforce_owner_push = false;
+        state.config = std::sync::Arc::new(cfg);
         state
             .db
             .upsert_mirror_repo(owner, name, "/tmp/z6succ-sc1", None, false)
@@ -6516,6 +6522,9 @@ mod tests {
         let owner = "z6lockpool";
         let name = "lp1";
         let mut state = crate::test_support::test_state(pool.clone()).await;
+        let mut cfg = (*state.config).clone();
+        cfg.enforce_owner_push = false;
+        state.config = std::sync::Arc::new(cfg);
         // One lock-pool connection, short checkout timeout so the exhaustion surfaces
         // promptly rather than at the handler's own acquire deadline.
         state.repo_store = crate::git::repo_store::RepoStore::new(
