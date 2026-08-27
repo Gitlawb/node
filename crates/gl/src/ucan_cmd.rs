@@ -1115,7 +1115,7 @@ mod import_binding_tests {
 
 #[cfg(all(test, unix))]
 mod refresh_atomicity_tests {
-    use super::delegation_store_tests::{owned_token, seed_identity, token_for_agent};
+    use super::delegation_store_tests::{owned_token, seed_identity};
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
