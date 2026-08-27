@@ -4078,12 +4078,12 @@ mod tests {
             .await;
         crate::ipfs_pin::pin_new_objects(
             &server.url(),
-            &pub_bare,
+            bare,
             &state.git_bin,
             std::time::Duration::from_secs(state.config.git_service_timeout_secs),
-            vec![fx.public_oid.clone()],
+            vec![oid.to_string()],
             &state.db,
-            &pub_repo.id,
+            repo_id,
             crate::ipfs_pin::PIN_BATCH_BUDGET,
             None,
         )
@@ -5789,7 +5789,7 @@ mod tests {
             .into_iter()
             .find(|r| r.sha256_hex == "po1")
             .expect("po1 row exists");
-        assert_eq!(po1.cid, raw1, "resolver-key cid is the raw CID");
+        assert_eq!(po1.cid, Some(raw1), "resolver-key cid is the raw CID");
         assert_eq!(
             po1.pinata_cid.as_deref(),
             Some("pcid1"),
@@ -5822,7 +5822,8 @@ mod tests {
             .find(|r| r.sha256_hex == "po2")
             .expect("po2 row exists");
         assert_eq!(
-            po2.cid, local2,
+            po2.cid,
+            Some(local2),
             "on conflict the prior local pin's cid is left untouched"
         );
 
@@ -6352,12 +6353,12 @@ mod tests {
             .await;
         crate::ipfs_pin::pin_new_objects(
             &server.url(),
-            &pub_bare,
+            &bare,
             &state.git_bin,
             std::time::Duration::from_secs(state.config.git_service_timeout_secs),
             vec![fx.public_oid.clone()],
             &state.db,
-            &pub_repo.id,
+            &repo.id,
             crate::ipfs_pin::PIN_BATCH_BUDGET,
             None,
         )
@@ -6462,7 +6463,7 @@ mod tests {
             std::time::Duration::from_secs(state.config.git_service_timeout_secs),
             vec![fx.public_oid.clone()],
             &state.db,
-            &repo.id,
+            "repoCG",
             crate::ipfs_pin::PIN_BATCH_BUDGET,
             None,
         )
@@ -6523,12 +6524,12 @@ mod tests {
         // so the repair returns without touching the row.
         crate::ipfs_pin::pin_new_objects(
             &server.url(),
-            bare,
+            &bare,
             &state.git_bin,
             std::time::Duration::from_secs(state.config.git_service_timeout_secs),
-            vec![oid.to_string()],
+            vec![phantom_oid.clone()],
             &state.db,
-            repo_id,
+            "repoUR",
             crate::ipfs_pin::PIN_BATCH_BUDGET,
             None,
         )
@@ -6736,7 +6737,7 @@ mod tests {
                 .await
                 .unwrap()
                 .iter()
-                .any(|r| r.cid == raw_cid),
+                .any(|r| r.cid.as_deref() == Some(raw_cid.as_str())),
             "the repaired row is advertised"
         );
         let (st, body) = cid_parts(
@@ -7356,7 +7357,7 @@ mod tests {
                 .await
                 .unwrap()
                 .iter()
-                .any(|r| r.cid == raw_cid),
+                .any(|r| r.cid.as_deref() == Some(raw_cid.as_str())),
             "the repaired row is advertised again"
         );
     }
@@ -7549,7 +7550,7 @@ mod tests {
                 .await
                 .unwrap()
                 .iter()
-                .any(|r| r.cid == low_raw),
+                .any(|r| r.cid.as_deref() == Some(low_raw.as_str())),
             "the repaired row is advertised again"
         );
     }
@@ -11054,7 +11055,8 @@ mod tests {
             .find(|r| r.sha256_hex == oid)
             .expect("the repaired row is advertised again");
         assert_eq!(
-            rec.cid, raw_cid,
+            rec.cid,
+            Some(raw_cid),
             "the advertised key is the raw-content resolver key"
         );
     }

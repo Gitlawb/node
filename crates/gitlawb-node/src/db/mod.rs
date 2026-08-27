@@ -5580,16 +5580,16 @@ mod migration_tests {
         db.migrate().await.unwrap();
 
         // A stale wrong CID that is neither NULL nor equal to pinata_cid.
-        db.record_pinned_cid("sha_stale", "QmStaleWrong")
+        db.record_pinned_cid("sha_stale", "QmStaleWrong", None)
             .await
             .unwrap();
-        db.record_pinata_cid("sha_stale", "QmPinataX")
+        db.record_pinata_cid("sha_stale", "QmRawStale", "QmPinataX", None)
             .await
             .unwrap();
 
         // Re-pin with the correct CID — must overwrite despite the existing
         // distinct cid column.
-        db.record_pinned_cid("sha_stale", "QmCorrect")
+        db.record_pinned_cid("sha_stale", "QmCorrect", None)
             .await
             .unwrap();
 
@@ -5609,7 +5609,7 @@ mod migration_tests {
         let db = super::Db::for_testing(pool);
         db.migrate().await.unwrap();
 
-        db.record_pinned_cid("sha_fallback", "QmFallback")
+        db.record_pinned_cid("sha_fallback", "QmFallback", None)
             .await
             .unwrap();
         // Simulate a legacy row where cid was forced equal to pinata_cid.
@@ -5621,7 +5621,7 @@ mod migration_tests {
         .unwrap();
 
         // Recording a new (different) Pinata CID must NULL the stale fallback cid.
-        db.record_pinata_cid("sha_fallback", "QmPinataNew")
+        db.record_pinata_cid("sha_fallback", "QmRawFallback", "QmPinataNew", None)
             .await
             .unwrap();
 
@@ -5633,10 +5633,10 @@ mod migration_tests {
         assert_eq!(cid, None, "legacy equal-cid fallback must be cleared");
 
         // But a genuine local pin plus a distinct Pinata CID is preserved.
-        db.record_pinned_cid("sha_genuine", "QmLocalGenuine")
+        db.record_pinned_cid("sha_genuine", "QmLocalGenuine", None)
             .await
             .unwrap();
-        db.record_pinata_cid("sha_genuine", "QmPinataGenuine")
+        db.record_pinata_cid("sha_genuine", "QmRawGenuine", "QmPinataGenuine", None)
             .await
             .unwrap();
         let cid: String =
