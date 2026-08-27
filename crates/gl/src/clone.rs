@@ -385,7 +385,7 @@ async fn recover_encrypted_blobs(
         let plaintext = match open_blob(&envelope, keypair) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("warning: could not decrypt {oid}: {e}");
+                emit_warning(&format!("warning: could not decrypt {oid}: {e}"));
                 continue;
             }
         };
@@ -403,7 +403,9 @@ async fn recover_encrypted_blobs(
                 recovered.push(p.clone());
             }
         } else {
-            eprintln!("warning: recovered blob {oid} hashed to {written}; discarding");
+            emit_warning(&format!(
+                "warning: recovered blob {oid} hashed to {written}; discarding"
+            ));
         }
     }
     Ok(recovered)
@@ -801,7 +803,9 @@ async fn recover_from_arweave(
                 recovered.push(p.clone());
             }
         } else {
-            eprintln!("warning: recovered blob {oid} hashed to {written}; discarding");
+            emit_warning(&format!(
+                "warning: recovered blob {oid} hashed to {written}; discarding"
+            ));
         }
     }
     Ok(recovered)
