@@ -253,7 +253,7 @@ pub(crate) async fn fetch_node_web_url(node: &str) -> Option<String> {
     // An info reply is a DID, a few URLs and counts — 8 KiB is well past what
     // the shape needs; anything longer is hostile or broken (peer.rs precedent).
     let raw_body = crate::http::read_body_capped(info_resp, 8 * 1024).await;
-    let info: Value = match serde_json::from_str(&raw_body) {
+    let info: Value = match serde_json::from_str(&raw_body.text) {
         Ok(json) => json,
         Err(_) => return None,
     };

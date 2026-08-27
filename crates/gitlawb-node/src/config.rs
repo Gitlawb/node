@@ -1527,6 +1527,8 @@ mod tests {
         let mut cfg = Config::parse_from(["gitlawb-node"]);
         cfg.web_url = Some("http://localhost:8080/ui".into());
         assert!(cfg.validate().is_ok(), "port+path web_url must validate");
+    }
+
     /// The DECLARED default, read off the parser rather than out of a parse.
     ///
     /// `Config::parse_from` consults the process environment, so on a host that
@@ -1572,6 +1574,5 @@ mod tests {
         assert!(
             Config::parse_from(["gitlawb-node", "--enforce-owner-push", "true"]).enforce_owner_push
         );
-
     }
 }
