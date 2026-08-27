@@ -1306,6 +1306,178 @@ mod tests {
         );
     }
 
+    /// A repo flagged `quarantined` after admission must produce zero mock IPFS
+    /// traffic. The SQL dedup listing (`list_all_repos_deduped_stable`) filters
+    /// `quarantined = FALSE` at the database, so the row never reaches the
+    /// per-repo loop. The per-row `is_repo_quarantined` re-check is a
+    /// race-only defense: the SQL filter is the primary gate. The strong
+    /// assertion is on the side effects of the sweep pass, not on the
+    /// counter, because a SQL filter that drops a row at the source makes the
+    /// per-row check moot. (Reviewer-1 P2.)
+    #[sqlx::test]
+    async fn sweep_skips_quarantined_repos_before_scan(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        let repo_on_disk = Repo::new();
+        repo_on_disk.commit_file("public.txt", "would be public if scanned\n");
+
+        let rec = seed_repo(
+            "did:key:zQuarOwner",
+            "quar-repo",
+            &repo_on_disk.path.display().to_string(),
+        );
+        db.create_repo(&rec).await.unwrap();
+
+        // Flip quarantine AFTER admission (the realistic flow).
+        let affected = db.set_repo_quarantine(&rec.id, true).await.unwrap();
+        assert_eq!(affected, 1, "the new repo row must take the quarantine");
+
+        // SQL-filter assertion: the dedup listing does not return quarantined
+        // rows. If this changes, the per-row check below catches the race,
+        // but a SQL filter regression would silently start scanning them.
+        let dedup_rows = db.list_all_repos_deduped_stable(None, 100).await.unwrap();
+        assert!(
+            dedup_rows.iter().all(|r| r.id != rec.id),
+            "quarantined repo is excluded from the dedup listing at SQL"
+        );
+
+        // Mock IPFS: any POST is a gate-ordering bug. expect(0) makes the
+        // mock fail if hit.
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"^/api/v0/add.*$".to_string()),
+            )
+            .expect(0)
+            .with_status(200)
+            .with_body(r#"{"Hash":"QmMustNotBeCalled"}"#)
+            .create_async()
+            .await;
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            &server.url(),
+        ]);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let (_tx, mut rx) = watch::channel(false);
+        let mut cursor = None;
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        let (scanned, gaps, filled) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(scanned, 0, "SQL filter drops the quarantined row");
+        assert_eq!(gaps, 0);
+        assert_eq!(filled, 0, "no pin work attempted");
+        assert!(
+            db.list_pinned_cids().await.unwrap().is_empty(),
+            "no pinned_cids rows from a quarantined pass"
+        );
+        m.assert_async().await;
+    }
+
+    /// A non-public repo (`is_public = false`, no visibility rules) must also
+    /// produce zero mock IPFS traffic. The dedup listing returns it (it is not
+    /// quarantined), but the per-repo `listable_at_root` gate aborts before
+    /// the expensive scan. (Reviewer-1 P2.)
+    #[sqlx::test]
+    async fn sweep_skips_private_repos_before_scan(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        let repo_on_disk = Repo::new();
+        repo_on_disk.commit_file("private.txt", "never published\n");
+
+        // Build a private repo row (seed_repo hardcodes is_public=true).
+        let mut rec = seed_repo(
+            "did:key:zPrivateOwner",
+            "priv-repo",
+            &repo_on_disk.path.display().to_string(),
+        );
+        rec.is_public = false;
+        db.create_repo(&rec).await.unwrap();
+
+        // No visibility rules: a private repo with no allow rules is unlistable.
+        assert!(db.list_visibility_rules(&rec.id).await.unwrap().is_empty());
+
+        // The dedup listing DOES return private (non-quarantined) rows, so
+        // the per-repo gate is the actual filter under test.
+        let dedup_rows = db.list_all_repos_deduped_stable(None, 100).await.unwrap();
+        assert!(
+            dedup_rows.iter().any(|r| r.id == rec.id),
+            "private repo is in the dedup listing (filter is per-repo)"
+        );
+
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"^/api/v0/add.*$".to_string()),
+            )
+            .expect(0)
+            .with_status(200)
+            .with_body(r#"{"Hash":"QmMustNotBeCalled"}"#)
+            .create_async()
+            .await;
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            &server.url(),
+        ]);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let (_tx, mut rx) = watch::channel(false);
+        let mut cursor = None;
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        let (scanned, gaps, filled) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+
+        // The private row reaches the per-repo loop (the SQL filter is not
+        // the gate here), the counter increments, then `listable_at_root`
+        // returns false and the work aborts before the scan. Strong assertion
+        // is on side effects.
+        assert!(scanned >= 1, "the private row is in the dedup listing");
+        assert_eq!(gaps, 0, "no gaps on a private-skip");
+        assert_eq!(filled, 0, "no pin work attempted");
+        assert!(
+            db.list_pinned_cids().await.unwrap().is_empty(),
+            "no pinned_cids rows from a private-only pass"
+        );
+        m.assert_async().await;
+    }
+
     /// A public repo with a path-scoped deny must NOT have the withheld blob
     /// pinned in cleartext on a public backend (R2-P1 "must not pin"): the root
     /// stays listable, so the mid-scan refilter AND the pin-boundary re-derivation

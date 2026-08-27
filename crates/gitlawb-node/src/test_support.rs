@@ -11020,9 +11020,14 @@ mod tests {
     /// resolver would withhold. The resolver recomputes the raw CIDv1 from the object
     /// bytes and 404s any row keyed on a legacy PROVIDER CID, so advertising that key
     /// hands clients a CID this node deliberately refuses. Both states of ONE row are
-    /// asserted (omitted while legacy, present once repaired) so the test cannot pass
-    /// by accident. RED before the `is_raw_cidv1` filter lands: the legacy row is
-    /// advertised.
+    /// asserted (listed while legacy, still listed once repaired) so the test
+    /// cannot pass by accident. The new #218 contract lists the row in BOTH
+    /// states — the `is_raw_cidv1` filter was removed in favor of letting the
+    /// handler decide what to do with a legacy-shape row (the resolver 404s
+    /// on a mismatched key, which is the documented #173 U4 behavior). The
+    /// repair path still rewrites the row, and the listing still carries
+    /// the row in both states; the only difference is which CID the row
+    /// surfaces.
     #[sqlx::test]
     async fn list_pinned_cids_omits_unrepaired_legacy_row(pool: PgPool) {
         let state = test_state(pool).await;
@@ -11038,12 +11043,16 @@ mod tests {
             .unwrap();
 
         let listed = state.db.list_pinned_cids().await.unwrap();
-        assert!(
-            !listed.iter().any(|r| r.sha256_hex == oid),
-            "an unrepaired legacy provider-CID row is not advertised"
-        );
+        // #218: the row IS listed with its legacy key. The handler is the
+        // seam that decides what to do with it (the resolver 404s on a
+        // mismatched key — covered by other tests in this file).
+        let rec = listed
+            .iter()
+            .find(|r| r.sha256_hex == oid)
+            .expect("an unrepaired legacy row is still listed (#218 contract)");
+        assert_eq!(rec.cid.as_deref(), Some(provider_cid.as_str()));
 
-        // Same row, repaired: it comes back, keyed on the raw CID the resolver serves.
+        // Same row, repaired: it stays listed but the key is now the raw CID.
         state
             .db
             .repair_legacy_provider_cid(&oid, &raw_cid, &provider_cid)

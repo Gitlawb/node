@@ -510,6 +510,21 @@ fn blob_paths(repo_path: &Path, git_bin: &str, timeout: Duration) -> Result<Vec<
 /// walk. Returns `(blob_paths, tree_paths)` where each is a `Vec<ObjectPath>`.
 /// Used to derive both allowed blobs and allowed trees from a single walk, so
 /// the two sets are consistent and the walk cost is paid only once.
+///
+/// #218 (Reviewer-2 P1): the previous phase 1 used `git ls-tree -rz <commit>`,
+/// which under `-r` recurses into blobs and never emits tree entries; trees
+/// only showed up in the phase-2 catch-all with an empty path, and the
+/// fail-closed filter in `allowed_blob_tree_sets_bounded` then denied every
+/// tree. The sweep could not repair a single tree, so a non-flat repo's git
+/// graph was un-reconstructible from the pinned object set. The fix is
+/// `-r -t` (recursive, show trees too): every reachable tree and blob comes
+/// back with its directory/file path, so the visibility check has something
+/// to gate on. The root tree of each commit is appended separately at path
+/// `/`, because `ls-tree` of a commit only enumerates its children. Trees
+/// reachable only via a non-commit ref (annotated tag of a tree, notes) still
+/// arrive in phase 2 with no path, and the fail-closed filter still denies
+/// them — that is the right outcome for objects whose visibility cannot be
+/// determined.
 fn all_object_paths(
     repo_path: &Path,
     git_bin: &str,
@@ -533,22 +548,41 @@ fn all_object_paths(
     let commits_stdout = String::from_utf8_lossy(&commits_out);
     let mut blob_set: HashSet<(String, String)> = HashSet::new();
     let mut tree_set: HashSet<(String, String)> = HashSet::new();
-    // Phase 1: enumerate objects from ls-tree per commit (gives paths).
+    // Phase 1: enumerate trees AND blobs with their paths via
+    // `git ls-tree -r -t <commit>`. `-t` is the tree counterpart of `-r`:
+    // without it, recursive listings emit only blob entries. Each line is
+    // `<mode> SP <type> SP <oid> TAB <path>`, with NUL between records.
     for commit in commits_stdout.lines() {
         let commit = commit.trim();
         if commit.is_empty() {
             continue;
         }
+        // The root tree of each commit gets path "/" so the whole-repo
+        // visibility gate applies (is_public + "/" rules). ls-tree does not
+        // emit the commit's own tree, only its children.
+        let root_tree_out = run_bounded_git(
+            git_bin,
+            &["rev-parse", &format!("{commit}^{{tree}}")],
+            repo_path,
+            b"",
+            deadline,
+        )?;
+        if let Ok(root_tree_stdout) = std::str::from_utf8(&root_tree_out) {
+            let root_tree = root_tree_stdout.trim();
+            if !root_tree.is_empty() {
+                tree_set.insert((root_tree.to_string(), "/".to_string()));
+            }
+        }
         let listing_out = run_bounded_git(
             git_bin,
-            &["ls-tree", "-rz", commit],
+            &["ls-tree", "-r", "-t", "-z", commit],
             repo_path,
             b"",
             deadline,
         )?;
         let Ok(listing_stdout) = std::str::from_utf8(&listing_out) else {
             anyhow::bail!(
-                "git ls-tree -rz {commit} returned a non-UTF-8 path; \
+                "git ls-tree -r -t -z {commit} returned a non-UTF-8 path; \
                  refusing to produce a partial (under-withheld) set"
             );
         };

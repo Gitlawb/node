@@ -1126,6 +1126,62 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE pin_repair_sweep ADD COLUMN IF NOT EXISTS discovery_cursor_id TEXT NOT NULL DEFAULT ''",
         ],
     },
+    Migration {
+        version: 27,
+        name: "pinata_only_clear_legacy_equal_cid",
+        stmts: &[
+            // #218 (R2-P2): earlier releases wrote `cid = pinata_cid` as a
+            // fallback for objects this node never had on local IPFS. After the
+            // reconciliation sweep ships, `cid IS NOT NULL` is meant to be the
+            // complete provenance predicate (`has_ipfs_cid`), so a fallback row
+            // would be misread as a local pin and the sweep would trust the
+            // remote CID as durability evidence. The two changes below make
+            // NULL a legal `cid` value (the new "Pinata-only" state) and then
+            // clear the legacy equal-cid rows. Reordering matters: the
+            // `DROP NOT NULL` MUST run before the UPDATE, otherwise Postgres
+            // rejects the assignment. Idempotent: both statements are
+            // IF-guarded so re-running them on a node whose rows are already
+            // cleared is a no-op.
+            "ALTER TABLE pinned_cids ALTER COLUMN cid DROP NOT NULL",
+            "UPDATE pinned_cids SET cid = NULL WHERE cid = pinata_cid",
+        ],
+    },
+    Migration {
+        version: 28,
+        name: "node_state_key_value",
+        stmts: &[
+            // #218 (R2-P1): the reconciliation sweep persists its keyset
+            // cursor across restarts so a 100-repo pass is bounded rather
+            // than re-scanned from the head on every boot. Single-row key/value
+            // table, no constraints on `key` so callers can use opaque
+            // strings (e.g. "sweep_cursor", "policy_epoch_lock").
+            // NEW versioned migration (never appended to an applied block,
+            // INV-7).
+            "CREATE TABLE IF NOT EXISTS node_state (\
+                key   TEXT NOT NULL PRIMARY KEY,\
+                value TEXT,\
+                updated_at TEXT NOT NULL\
+             )",
+        ],
+    },
+    Migration {
+        version: 29,
+        name: "repos_policy_epoch",
+        stmts: &[
+            // #218 (R2-P1): the PolicyFence records the policy epoch the
+            // replication path captured its visibility decision under, and
+            // the dispatch paths re-check the epoch before sending the
+            // POST. A policy change increments the epoch; if the dispatch
+            // path reads a different epoch than the replication path did,
+            // it bails without firing the (now-stale) pin. Default 0 so a
+            // row that never went through a transaction reads as the
+            // pre-feature epoch. NOT NULL: every code path that increments
+            // reads and writes the column, so a NULL would be a real bug.
+            // NEW versioned migration (never appended to an applied block,
+            // INV-7).
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS policy_epoch BIGINT NOT NULL DEFAULT 0",
+        ],
+    },
 ];
 
 /// Max distinct source repos recorded per pinned object (F1, #173 jatmn round 8).
@@ -2904,10 +2960,17 @@ impl Db {
         cid: &str,
         repo_id: Option<&str>,
     ) -> Result<()> {
+        // ON CONFLICT also rewrites `cid`: an object pinned once with the wrong
+        // bytes is overwritten by a subsequent push-path pin (R1-P2). The
+        // previous "first-pinner-owns" semantics left stale wrong CIDs in
+        // place, and the sweep gap filter (`cid IS NOT NULL`) excluded them
+        // from re-processing so the stale CID became permanent durability
+        // evidence. `repo_id` is COALESCE'd so a known source wins over NULL.
         sqlx::query(
             "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id)
              VALUES ($1, $2, $3, $4)
              ON CONFLICT(sha256_hex) DO UPDATE SET
+                 cid = EXCLUDED.cid,
                  repo_id = COALESCE(pinned_cids.repo_id, EXCLUDED.repo_id)",
         )
         .bind(sha256_hex)
@@ -3454,15 +3517,17 @@ impl Db {
 
     /// Every pinned object this node ADVERTISES (`GET /api/v1/ipfs/pins`).
     ///
-    /// U4 (#173): rows still keyed on a legacy PROVIDER CID (Kubo dag-pb / Pinata
-    /// CIDv0, written by releases before this branch) are withheld from the listing.
-    /// The `/ipfs/{cid}` resolver recomputes the raw-content CID from the object bytes
-    /// and refuses any row whose stored key does not match, so advertising the legacy
-    /// key hands a client a CID this node deliberately will not serve. The background
-    /// repair sweep rewrites those rows to the raw key, and each one reappears here the
-    /// moment it is repaired. Filtering is done in Rust because the raw-CIDv1 test is a
-    /// multibase+codec decode (`is_raw_cidv1`), not something SQL can express; it is the
-    /// SAME predicate the repair path uses as its cost gate, so the two cannot drift.
+    /// #218: the contract is "every row that has something to advertise". A
+    /// row with `cid` set (any format, including legacy Qm… dag-pb) is
+    /// surfaced as a local pin; a row with `cid IS NULL` and `pinata_cid` set
+    /// is surfaced as a Pinata-only pin so the handler can project
+    /// `effective_cid = pinata_cid`. A row with both columns NULL has
+    /// nothing to serve and is dropped. A corrupt `cid` column surfaces as
+    /// a decode error through `?` instead of being silently misread as a
+    /// Pinata-only row — the previous `try_get().ok()` conflated the two.
+    /// The handler at `api/ipfs.rs::list_pins` is the seam that decides
+    /// what to do with a legacy-shape row (it hands it to the resolver and
+    /// the resolver 404s on mismatch, the documented #173 U4 behavior).
     pub async fn list_pinned_cids(&self) -> Result<Vec<PinnedCidRecord>> {
         let rows = sqlx::query(
             "SELECT sha256_hex, cid, pinned_at, pinata_cid FROM pinned_cids ORDER BY pinned_at DESC",
@@ -3471,18 +3536,21 @@ impl Db {
         .await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
-            if !gitlawb_core::cid::is_raw_cidv1(r.get::<&str, _>("cid")) {
+            // `try_get::<Option<String>>` maps only SQL NULL to None (a
+            // Pinata-only row); a corrupt `cid` column surfaces as a decode
+            // error through `?` instead of being silently misread as a
+            // Pinata-only row. The old `try_get().ok()` conflated the two.
+            let cid: Option<String> = r.try_get("cid")?;
+            let pinata_cid: Option<String> = r.get("pinata_cid");
+            if cid.is_none() && pinata_cid.is_none() {
+                // Nothing to advertise: no local CID, no Pinata CID.
                 continue;
             }
             out.push(PinnedCidRecord {
                 sha256_hex: r.get("sha256_hex"),
-                // `try_get::<Option<String>>` maps only SQL NULL to None (a
-                // Pinata-only row); a corrupt `cid` column surfaces as a decode
-                // error through `?` instead of being silently misread as a
-                // Pinata-only row. The old `try_get().ok()` conflated the two.
-                cid: r.try_get("cid")?,
+                cid,
                 pinned_at: r.get("pinned_at"),
-                pinata_cid: r.get("pinata_cid"),
+                pinata_cid,
             });
         }
         Ok(out)
@@ -3583,14 +3651,36 @@ impl Db {
         pinata_cid: &str,
         repo_id: Option<&str>,
     ) -> Result<()> {
+        // The "Pinata-only" signal is `raw_cid == pinata_cid`: the caller
+        // computed the local resolver key, found it matched the provider
+        // CID, and concluded this object was never on local IPFS. Storing
+        // cid=NULL in that case keeps the provenance predicate
+        // (`cid IS NOT NULL` = real local pin) clean — the v27 bulk-cleared
+        // legacy rows do not resurface.
+        //
+        // ON CONFLICT also clears `cid` when the existing row has the legacy
+        // `cid = pinata_cid` fallback shape (R2-P2). A row in that shape was
+        // never a real local IPFS pin — the value was faked because the
+        // object was Pinata-only — and v27 already bulk-cleared it on
+        // upgrade, but a new push of a Pinata-only object against a pre-v27
+        // row still needs the belt-and-suspenders clear. Distinct cid values
+        // are genuine local pins and are left untouched.
+        let cid = if raw_cid == pinata_cid {
+            None
+        } else {
+            Some(raw_cid)
+        };
         sqlx::query(
             "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid, repo_id)
              VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT(sha256_hex) DO UPDATE SET pinata_cid = EXCLUDED.pinata_cid,
+             ON CONFLICT(sha256_hex) DO UPDATE SET
+                 pinata_cid = EXCLUDED.pinata_cid,
+                 cid = CASE WHEN pinned_cids.cid = pinned_cids.pinata_cid
+                            THEN NULL ELSE pinned_cids.cid END,
                  repo_id = COALESCE(pinned_cids.repo_id, EXCLUDED.repo_id)",
         )
         .bind(sha256_hex)
-        .bind(raw_cid) // resolver-key cid: locally-computed raw CID, never the provider CID
+        .bind(cid) // NULL when raw_cid == pinata_cid (Pinata-only); otherwise the resolver key
         .bind(Utc::now().to_rfc3339())
         .bind(pinata_cid)
         .bind(repo_id)
