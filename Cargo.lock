@@ -3498,6 +3498,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "ed25519-dalek",
  "gitlawb-core",
  "icaptcha-client",
  "mockito",

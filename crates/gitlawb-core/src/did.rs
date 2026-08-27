@@ -71,7 +71,8 @@ impl Did {
 
     /// Resolve the Ed25519 verifying key from a `did:key`.
     ///
-    /// Returns `Err` if the DID is not a `did:key` or the key bytes are invalid.
+    /// Returns `Err` if the DID is not a `did:key`, the key bytes are malformed,
+    /// or the key is a small-order (weak) point.
     pub fn to_verifying_key(&self) -> Result<VerifyingKey> {
         if !self.is_did_key() {
             return Err(Error::InvalidDid(format!(
@@ -106,7 +107,25 @@ impl Did {
             .try_into()
             .map_err(|_| Error::InvalidDid("ed25519 key must be 32 bytes".to_string()))?;
 
-        VerifyingKey::from_bytes(&key_bytes).map_err(|e| Error::InvalidDid(e.to_string()))
+        let key =
+            VerifyingKey::from_bytes(&key_bytes).map_err(|e| Error::InvalidDid(e.to_string()))?;
+
+        // `from_bytes` only decompresses, so it accepts a small-order point.
+        // Such a key satisfies the verification equation for any message, and
+        // every X25519 shared secret derived from it is the all-zero key: the
+        // order-1 and order-2 points convert to the all-zero Montgomery u
+        // directly, and the order-4 and order-8 points are annihilated by the
+        // scalar clamping instead. `is_weak` covers the whole torsion set.
+        // Mixed-order points are correctly NOT rejected, since clamping clears
+        // the cofactor component. Rejecting
+        // at resolution is what makes this the choke point: every consumer that
+        // resolves a DID through here inherits the rejection, and a recipient
+        // that cannot resolve already fails closed downstream.
+        if key.is_weak() {
+            return Err(Error::InvalidDid("small-order ed25519 key".to_string()));
+        }
+
+        Ok(key)
     }
 
     /// Return the full DID string as a `&str`.
@@ -368,5 +387,37 @@ mod tests {
             "did:key method-id is fixed-width"
         );
         did.to_verifying_key().expect("a real did:key must resolve");
+    }
+
+    /// A `did:key` can encode a small-order (weak) Ed25519 point. Such a key
+    /// satisfies the verification equation for any message and, converted to
+    /// Montgomery form for X25519, yields the all-zero shared secret, so an
+    /// envelope sealed to it is decryptable by anyone. Resolution is the choke
+    /// point every `Did`-based consumer shares, so it fails closed here.
+    #[test]
+    fn to_verifying_key_rejects_a_small_order_key() {
+        // The compressed identity point, the canonical small-order key.
+        let mut weak = [0u8; 32];
+        weak[0] = 1;
+        let mut prefixed = Vec::with_capacity(ED25519_MULTICODEC.len() + 32);
+        prefixed.extend_from_slice(ED25519_MULTICODEC);
+        prefixed.extend_from_slice(&weak);
+        let did: Did = format!(
+            "did:key:{}",
+            multibase::encode(multibase::Base::Base58Btc, &prefixed)
+        )
+        .parse()
+        .expect("a small-order did:key is still well-formed");
+
+        let err = did
+            .to_verifying_key()
+            .expect_err("a small-order did:key must not resolve");
+        match err {
+            Error::InvalidDid(msg) => assert!(
+                msg.contains("small-order"),
+                "rejection must name the small-order key, got: {msg}"
+            ),
+            other => panic!("expected Error::InvalidDid, got {other:?}"),
+        }
     }
 }
