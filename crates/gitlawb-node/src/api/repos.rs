@@ -6388,6 +6388,7 @@ mod tests {
                     Extension(crate::auth::AuthenticatedDid(
                         "did:key:z6MkDisconnectWriteLockProofDidAAAAAAAA".to_string(),
                     )),
+                    None,
                     crate::rate_limit::PeerAddr(Some(
                         "203.0.113.81:5000".parse::<SocketAddr>().unwrap(),
                     )),
@@ -6542,6 +6543,7 @@ mod tests {
                     Extension(crate::auth::AuthenticatedDid(
                         "did:key:z6MkPushSuccessReleaseProofDidAAAAAAAA".to_string(),
                     )),
+                    None,
                     crate::rate_limit::PeerAddr(Some(
                         "203.0.113.83:5000".parse::<SocketAddr>().unwrap(),
                     )),
