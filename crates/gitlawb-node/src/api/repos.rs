@@ -3000,6 +3000,17 @@ pub struct ForkRepoRequest {
 }
 
 /// POST /api/v1/repos/:owner/:repo/fork
+/// Argv for the fork's mirror clone, with `--` before the first positional (#374).
+///
+/// Both positionals here are server-derived paths rather than caller-supplied
+/// URLs, so this is defence in depth rather than a reachable injection. It is
+/// still the same argv contract as the other clone sites, and it is extracted for
+/// the same reason: so the delimiter's placement is pinned by a test instead of
+/// resting on review.
+fn fork_clone_args<'a>(source: &'a str, dest: &'a str) -> [&'a str; 5] {
+    ["clone", "--mirror", "--", source, dest]
+}
+
 pub async fn fork_repo(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthenticatedDid>,
@@ -3068,12 +3079,10 @@ pub async fn fork_repo(
 
     // Clone the source repo as a mirror
     let output = std::process::Command::new("git")
-        .args([
-            "clone",
-            "--mirror",
+        .args(fork_clone_args(
             source_path.to_str().unwrap_or(""),
             disk_path.to_str().unwrap_or(""),
-        ])
+        ))
         .output()
         .map_err(|e| AppError::Git(format!("git clone --mirror failed: {e}")))?;
 
@@ -3335,6 +3344,29 @@ fn dedupe_canonical_repos(rows: Vec<(RepoRecord, i64)>) -> Vec<(RepoRecord, i64)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #374: the fork path builds its own `git clone --mirror` argv. Driven
+    /// through real git so a missing or misplaced `--` fails, matching the
+    /// coverage on the `gl clone`, `gl mirror`, and sync sinks.
+    #[test]
+    fn fork_clone_never_parses_the_source_as_a_git_option() {
+        let td = tempfile::TempDir::new().unwrap();
+        let dest = td.path().join("fork.git");
+        let injected = "--upload-pack=false";
+
+        let out = std::process::Command::new("git")
+            .args(fork_clone_args(injected, dest.to_str().unwrap()))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        assert!(!out.status.success(), "an option-shaped source must fail");
+        assert!(
+            stderr.contains(&format!("repository '{injected}'")),
+            "git must name the source as the repository, not consume it as an option: {stderr}"
+        );
+    }
+
     use crate::auth::caller_authorized_to_push;
     use crate::error::AppError;
     use gitlawb_core::identity::Keypair;

@@ -159,8 +159,8 @@ pub fn setup_partial_clone(
 
     if withheld_globs.is_empty() {
         match branch {
-            Some(b) => git_global(&["clone", "-q", "--branch", b, remote_url, dest_str])?,
-            None => git_global(&["clone", "-q", remote_url, dest_str])?,
+            Some(b) => git_global(&["clone", "-q", "--branch", b, "--", remote_url, dest_str])?,
+            None => git_global(&["clone", "-q", "--", remote_url, dest_str])?,
         }
         return Ok(());
     }
@@ -170,6 +170,7 @@ pub fn setup_partial_clone(
         "-q",
         "--filter=blob:none",
         "--no-checkout",
+        "--",
         remote_url,
         dest_str,
     ])?;
@@ -384,7 +385,7 @@ async fn recover_encrypted_blobs(
         let plaintext = match open_blob(&envelope, keypair) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("warning: could not decrypt {oid}: {e}");
+                emit_warning(&format!("warning: could not decrypt {oid}: {e}"));
                 continue;
             }
         };
@@ -402,7 +403,9 @@ async fn recover_encrypted_blobs(
                 recovered.push(p.clone());
             }
         } else {
-            eprintln!("warning: recovered blob {oid} hashed to {written}; discarding");
+            emit_warning(&format!(
+                "warning: recovered blob {oid} hashed to {written}; discarding"
+            ));
         }
     }
     Ok(recovered)
@@ -800,7 +803,9 @@ async fn recover_from_arweave(
                 recovered.push(p.clone());
             }
         } else {
-            eprintln!("warning: recovered blob {oid} hashed to {written}; discarding");
+            emit_warning(&format!(
+                "warning: recovered blob {oid} hashed to {written}; discarding"
+            ));
         }
     }
     Ok(recovered)
@@ -1084,6 +1089,85 @@ mod tests {
             !dest.join("docs/private").exists(),
             "exact-path withheld file must be excluded"
         );
+    }
+
+    #[test]
+    fn setup_partial_clone_plain_without_withheld_paths() {
+        let (td, url) = bare_remote(&[("file.txt", b"hello\n")]);
+        let dest = td.path().join("dest");
+        setup_partial_clone(&dest, &url, &[], &[], None).unwrap();
+        assert!(dest.join("file.txt").exists());
+    }
+
+    #[test]
+    fn setup_partial_clone_with_branch_without_withheld_paths() {
+        let (td, url) = bare_remote(&[("file.txt", b"hello\n")]);
+        let branch_out = Command::new("git")
+            .args([
+                "-C",
+                td.path().join("origin").to_str().unwrap(),
+                "branch",
+                "--show-current",
+            ])
+            .output()
+            .unwrap();
+        let branch = String::from_utf8(branch_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let dest = td.path().join("dest");
+        setup_partial_clone(&dest, &url, &[], &[], Some(&branch)).unwrap();
+        assert!(dest.join("file.txt").exists());
+    }
+
+    /// #374: every `setup_partial_clone` shape interpolates `remote_url` into a
+    /// `git clone` argv. The `--` delimiter is what forces an option-shaped
+    /// remote to be read as a repository rather than parsed as an option.
+    ///
+    /// The assertion is on git's own words — `repository '<value>'`, single-quoted
+    /// — and not merely on the value appearing somewhere in the error. `git_global`
+    /// formats its failure as `git {args:?} failed: {stderr}`, so the injected
+    /// string is already present in the debug-printed argv whether or not the
+    /// delimiter is there; asserting on containment alone would pass with `--`
+    /// deleted. Undelimited, git consumes the value as an option, leaving the
+    /// destination as the only positional, and names *that* instead
+    /// (`repository '<dest>' does not exist`) — so this goes red without the fix.
+    ///
+    /// The payload carries no `:` or space: a colon would make git read the
+    /// argument as an ssh-style `host:path` URL and report a hostname, which is a
+    /// different parse.
+    fn assert_option_shaped_remote_is_a_repository(withheld: &[String], branch: Option<&str>) {
+        let td = TempDir::new().unwrap();
+        let dest = td.path().join("dest");
+        let injected = "--upload-pack=false";
+
+        let err = setup_partial_clone(&dest, injected, withheld, &[], branch)
+            .expect_err("an option-shaped remote is not a repository and must fail")
+            .to_string();
+
+        assert!(
+            err.contains(&format!("repository '{injected}'")),
+            "git must name the argument as the repository, not consume it as an option: {err}"
+        );
+    }
+
+    #[test]
+    fn plain_clone_never_parses_a_remote_as_a_git_option() {
+        assert_option_shaped_remote_is_a_repository(&[], None);
+    }
+
+    #[test]
+    fn branch_clone_never_parses_a_remote_as_a_git_option() {
+        // Pins that `--branch <b>` stays ahead of the delimiter: if `--` were moved
+        // before `--branch`, git would read the branch name as a positional instead.
+        assert_option_shaped_remote_is_a_repository(&[], Some("main"));
+    }
+
+    #[test]
+    fn sparse_clone_never_parses_a_remote_as_a_git_option() {
+        // The withheld-globs arm is a separate argv construction
+        // (`--filter=blob:none --no-checkout`) and needs its own proof.
+        assert_option_shaped_remote_is_a_repository(&["/secret/**".to_string()], None);
     }
 
     #[test]
