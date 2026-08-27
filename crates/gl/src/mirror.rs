@@ -37,6 +37,17 @@ pub struct MirrorArgs {
     pub dir: Option<PathBuf>,
 }
 
+/// Argv for the mirror clone, with `--` immediately before the first positional
+/// so an option-shaped `source` cannot be parsed as a git option (#374).
+///
+/// This is a separate function purely so the delimiter's placement can be driven
+/// through real git by a test. The production call keeps `.status()` rather than
+/// `.output()`: a mirror clone of a large repo streams git's progress to the
+/// user's terminal, and capturing it to assert on stderr here would swallow that.
+fn mirror_clone_args<'a>(source: &'a str, dest: &'a str) -> [&'a str; 5] {
+    ["clone", "--mirror", "--", source, dest]
+}
+
 pub async fn run(args: MirrorArgs) -> Result<()> {
     let source = args.source.trim_end_matches('/').to_string();
 
@@ -81,13 +92,7 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
 
     println!("Cloning source (this may take a while for large repos)...");
     let clone_status = Command::new("git")
-        .args([
-            "clone",
-            "--mirror",
-            "--",
-            &source,
-            mirror_path.to_str().unwrap(),
-        ])
+        .args(mirror_clone_args(&source, mirror_path.to_str().unwrap()))
         .status()
         .context("failed to run git clone — is git installed?")?;
 
@@ -176,6 +181,41 @@ pub fn extract_repo_name(url: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// #374: `gl mirror` interpolates the user-supplied source into a
+    /// `git clone --mirror` argv. `--` must sit immediately before the first
+    /// positional so an option-shaped source is read as a repository.
+    ///
+    /// This drives the production argv through real git rather than asserting on
+    /// the array's contents, so it fails on a delimiter that is missing *or*
+    /// misplaced. It cannot go through `run()`: that loads an identity keypair and
+    /// contacts a node before reaching the clone, and its bail message interpolates
+    /// `{source}` unconditionally, so an assertion there would pass with `--` gone.
+    ///
+    /// Asserting on git's single-quoted `repository '<value>'` is what makes this
+    /// red without the delimiter — undelimited, git consumes the value as an option
+    /// and names the destination as the repository instead.
+    #[test]
+    fn mirror_clone_never_parses_the_source_as_a_git_option() {
+        let td = tempfile::TempDir::new().unwrap();
+        let dest = td.path().join("mirror.git");
+        let injected = "--upload-pack=false";
+
+        let out = Command::new("git")
+            .args(mirror_clone_args(injected, dest.to_str().unwrap()))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        assert!(
+            !out.status.success(),
+            "an option-shaped source is not a repository and must fail the clone"
+        );
+        assert!(
+            stderr.contains(&format!("repository '{injected}'")),
+            "git must name the source as the repository, not consume it as an option: {stderr}"
+        );
+    }
+
     #[test]
     fn test_extract_github_url() {
         assert_eq!(
@@ -246,7 +286,8 @@ mod tests {
             .create_async()
             .await;
 
-        // We can't easily test the git subprocess calls, but we can test the
+        // The git subprocess argv is pinned separately by
+        // `mirror_clone_never_parses_the_source_as_a_git_option`; this covers the
         // API error path by calling the create step directly via NodeClient.
         let kp2 = gitlawb_core::identity::Keypair::generate();
         let client = NodeClient::new(server.url(), Some(kp2));

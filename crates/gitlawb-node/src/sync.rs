@@ -1041,6 +1041,51 @@ mod tests {
         );
     }
 
+    /// #374: `fetch_repo` interpolates the peer's origin URL into
+    /// `git remote set-url`, a second argv construction with the same contract as
+    /// the clone. It needs its own proof: the clone test cannot reach this path.
+    ///
+    /// The assertion is on stored state rather than on the error string, and that
+    /// is deliberate. `git_run` formats its failure as `git {args:?} failed:
+    /// {stderr}`, so the injected value is in the message via the debug-printed
+    /// argv whether or not the delimiter is present — asserting on containment
+    /// would pass with `--` deleted. Delimited, `set-url` succeeds and stores the
+    /// value verbatim; undelimited, git exits 129 with `unknown option` and leaves
+    /// the previous URL in place, so this goes red without the fix.
+    ///
+    /// The fetch that follows the rewrite fails, because the stored URL is not a
+    /// repository. That is expected and ignored: the property under test is what
+    /// `set-url` wrote, not whether the subsequent fetch could succeed.
+    #[tokio::test]
+    async fn fetch_never_parses_a_remote_as_a_git_option() {
+        let td = TempDir::new().unwrap();
+        let local = td.path().join("mirror.git");
+        let local_str = local.to_str().unwrap();
+        let placeholder = "http://example.invalid/x.git";
+
+        assert!(Command::new("git")
+            .args(["init", "-q", "--bare", local_str])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["-C", local_str, "remote", "add", "origin", placeholder])
+            .status()
+            .unwrap()
+            .success());
+
+        let injected = "--upload-pack=false";
+        let _ = fetch_repo(&local, injected, MirrorMode::Plain).await;
+
+        assert_eq!(
+            git_config_get(local_str, "remote.origin.url")
+                .await
+                .as_deref(),
+            Some(injected),
+            "set-url must store an option-shaped remote verbatim, not reject it as an option"
+        );
+    }
+
     #[tokio::test]
     async fn probe_reports_unknown_on_git_error() {
         // A path git cannot resolve as a repo at all (exit 128) is an indeterminate
