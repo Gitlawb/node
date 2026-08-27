@@ -141,22 +141,33 @@ During the cooldown your node still earns rewards if it keeps heartbeating.
 
 ---
 
-## Hardening: owner-only push
+## Owner-only push
 
-By default the node authenticates every `git-receive-pack` push (a valid RFC 9421
-`did:key` signature) but does **not** check that the pusher owns the repo, except
-on branches that are explicitly protected. Because `did:key` is self-certifying,
-any party can generate a key, derive its DID, sign, and push to an unprotected
-branch — authentication is not authorization.
+The node requires the authenticated pusher to be the repo owner on **every**
+branch. A push whose authenticated DID is not the repo owner is rejected with
+HTTP 403 before any ref update is applied. The owner is matched in both the full
+`did:key:z6Mk…` form and its bare `z6Mk…` suffix.
 
-To require the authenticated pusher to be the repo owner on **every** branch, set:
+This is on by default, and the default is the point. The node authenticates every
+`git-receive-pack` push with a valid RFC 9421 `did:key` signature, but `did:key`
+is self-certifying: any party can generate a key, derive its DID and sign.
+Authentication is not authorization, so without this gate every signed caller can
+push to every repository — private ones included — on any branch that is not
+explicitly protected.
+
+### Turning it off
 
 ```bash
-GITLAWB_ENFORCE_OWNER_PUSH=true
+GITLAWB_ENFORCE_OWNER_PUSH=false
 ```
 
-- **Default `false`** on this release — preserves current behavior so live nodes
-  are unaffected by an upgrade. Turn it on once you're ready for owner-only writes.
+Both the environment variable and `--enforce-owner-push false` disable it; the
+bare `--enforce-owner-push` flag still means `true`.
+
+Do this only for a rolling upgrade whose pushers are not yet the repo owner, and
+treat it as temporary: while it is off, your node accepts a push to any repository
+from anyone who can generate a keypair.
+
 - **When `true`** — a push whose authenticated DID is not the repo owner is
   rejected (HTTP 403) before any ref update is applied. The owner is matched in
   both the full `did:key:z6Mk…` form and its bare `z6Mk…` suffix.
@@ -184,9 +195,10 @@ What the node requires, and why:
 | Requirement | Reason |
 |---|---|
 | The chain's **root issuer** is the repo owner | A `did:key` is self-certifying, so anyone can mint a chain. The owner is the only anchor the node holds independently of the token. |
-| The capability names **this** repository | Enforced by the node: a `*` resource is refused outright, so one delegation can never grow to cover repos the owner creates later. `git-remote-gitlawb` also narrows a `*` delegation to the concrete repo when it builds the invocation, but that is convenience — the node does not rely on it. |
+| **Every link** names this repository | A delegation's scope is fixed when it is issued. The node walks the whole proof chain, so a `*` resource authorizes nothing — not in the leaf and not in any proof behind it. Refusing only the leaf would not have been enough: attenuation permits narrowing a `*` parent to a concrete child, so one wildcard grant could otherwise reach every repository the owner has or later creates. `gl ucan delegate` therefore refuses to issue a push-class `*` at all. |
 | **Every link carries an expiry** | There is no revocation path yet. An unbounded delegation could never be withdrawn once leaked, so the node refuses one outright. `gl ucan delegate` defaults to 30 days. |
 | No `nb` constraints | Constraints are reserved but not yet interpreted, so a capability carrying them authorizes nothing rather than silently granting more than the owner intended. |
+| The token is addressed to the pusher | The node requires the proof's audience to equal the invocation's issuer, and `gl ucan import` refuses a token addressed to another identity rather than storing one that can only fail. |
 
 **A delegation does not override branch protection.** A protected branch is your
 explicit marker that even routine writes should stop, so a delegate is still
@@ -218,6 +230,8 @@ short lifetimes reissued often are safer than one long-lived grant.
 **"insufficient $GITLAWB balance"** — fund the operator wallet with at least 10,000 $GITLAWB.
 
 **Node refuses to start with "strict-mode operator check failed"** — either `gl node register` first, or unset `GITLAWB_OPERATOR_STRICT_MODE`.
+
+**Node refuses to start with "GITLAWB_DB_MAX_CONNECTIONS (20) must be at least max_concurrent_git_pushes (32) + 8 headroom"**: raise `GITLAWB_DB_MAX_CONNECTIONS` to at least the push cap plus 8 (40 with the default cap of 32; 48 is the shipped default and the recommended value), or lower `GITLAWB_MAX_CONCURRENT_GIT_PUSHES`. This bites a node upgraded in place that still sets the old pool size of 20. The check is deliberate: each concurrent push pins one pooled connection for its whole receive-pack, so a pool that does not clear the push cap lets a burst of slow pushes starve every other database path.
 
 **Rewards are 0 after a week** — run `gl node onchain-status`. If `currentlyActive: false`, check your heartbeat loop (node logs for `operator heartbeat sent`).
 

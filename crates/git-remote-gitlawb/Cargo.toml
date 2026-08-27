@@ -11,7 +11,7 @@ name = "git-remote-gitlawb"
 path = "src/main.rs"
 
 [dependencies]
-gitlawb-core = { path = "../gitlawb-core" }
+gitlawb-core = { path = "../gitlawb-core", features = ["redirect"] }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
 # Reading the node's DID from `GET /` so a delegated push can address its
