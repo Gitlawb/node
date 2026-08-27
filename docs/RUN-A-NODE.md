@@ -168,16 +168,47 @@ Do this only for a rolling upgrade whose pushers are not yet the repo owner, and
 treat it as temporary: while it is off, your node accepts a push to any repository
 from anyone who can generate a keypair.
 
-### Caution: delegated and CI keys are non-owners
+- **When `true`** — a push whose authenticated DID is not the repo owner is
+  rejected (HTTP 403) before any ref update is applied. The owner is matched in
+  both the full `did:key:z6Mk…` form and its bare `z6Mk…` suffix.
+- **A delegated key can still push.** A non-owner clears this gate by presenting a
+  UCAN whose proof chain roots at the repo owner and which carries `git/push` for
+  this repository. See *Delegating push to a CI agent* below.
 
-Push authorization is owner-only today. A UCAN `git/push` capability is verified
-but **not yet honored for authorization**, so a delegated key cannot push while
-this gate is on, even when it holds a valid capability for the repo.
+### Delegating push to a CI agent
 
-If your automation pushes under its own DID rather than the owner's, it will start
-getting 403s. Either have it push as the owner, or set
-`GITLAWB_ENFORCE_OWNER_PUSH=false` until scoped collaborator / UCAN-delegated push
-rights land — that work is what removes this trade-off.
+The owner issues a capability, the agent stores it, and the git helper presents it
+automatically on every push:
+
+```bash
+# Owner, once per agent per repo:
+gl ucan delegate --to did:key:z6MkAgent… \
+  --cap gitlawb://repos/<owner-did>/<repo> --can git/push --expiry 168
+
+# Agent:
+gl ucan import <token-or-path>
+git push origin main          # git-remote-gitlawb attaches it as X-Ucan
+```
+
+What the node requires, and why:
+
+| Requirement | Reason |
+|---|---|
+| The chain's **root issuer** is the repo owner | A `did:key` is self-certifying, so anyone can mint a chain. The owner is the only anchor the node holds independently of the token. |
+| **Every link** names this repository | A delegation's scope is fixed when it is issued. The node walks the whole proof chain, so a `*` resource authorizes nothing — not in the leaf and not in any proof behind it. Refusing only the leaf would not have been enough: attenuation permits narrowing a `*` parent to a concrete child, so one wildcard grant could otherwise reach every repository the owner has or later creates. `gl ucan delegate` therefore refuses to issue a push-class `*` at all. |
+| **Every link carries an expiry** | There is no revocation path yet. An unbounded delegation could never be withdrawn once leaked, so the node refuses one outright. `gl ucan delegate` defaults to 30 days. |
+| No `nb` constraints | Constraints are reserved but not yet interpreted, so a capability carrying them authorizes nothing rather than silently granting more than the owner intended. |
+| The token is addressed to the pusher | The node requires the proof's audience to equal the invocation's issuer, and `gl ucan import` refuses a token addressed to another identity rather than storing one that can only fail. |
+
+**A delegation does not override branch protection.** A protected branch is your
+explicit marker that even routine writes should stop, so a delegate is still
+refused there and only the owner may push. That is deliberate: if a delegation
+overrode it, issuing any capability would weaken every protection you had set.
+
+**Withdrawal is by expiry only.** There is no revocation today. If a delegated
+token leaks, it remains valid until its `exp`, and the only faster remedy is
+rotating the owner DID the repository is keyed on. Choose `--expiry` accordingly —
+short lifetimes reissued often are safer than one long-lived grant.
 
 ---
 

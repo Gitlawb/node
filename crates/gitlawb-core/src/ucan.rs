@@ -49,11 +49,32 @@ impl Capability {
     /// action field and `repo/admin` in the parent's action position act as
     /// wildcards that cover any delegated value; wildcards on `self` carry no
     /// special meaning.
+    ///
+    /// Constraints (`nb`) participate, and conservatively:
+    ///
+    /// | parent | child | verdict |
+    /// |---|---|---|
+    /// | none | anything | attenuated — adding constraints narrows |
+    /// | some | identical | attenuated |
+    /// | some | different | refused — narrowing is unprovable without semantics |
+    /// | some | none | refused — dropping constraints widens |
+    ///
+    /// The last row is the one that matters. Ignoring `nb` here let a holder of a
+    /// constrained capability re-delegate the same resource and action with the
+    /// constraints removed, and the chain still verified — so a consumer that
+    /// refuses constrained capabilities at the leaf saw an unconstrained one and
+    /// granted it. Since `nb` has no interpreted semantics yet, "different" cannot
+    /// be shown to be narrower and is refused with it.
     pub fn is_attenuated_by(&self, parent: &Capability) -> bool {
         let resource_ok = parent.with == self.with || parent.with == "*";
         let action_ok =
             parent.can == self.can || parent.can == "*" || parent.can == caps::REPO_ADMIN;
-        resource_ok && action_ok
+        let constraints_ok = match (&parent.constraints, &self.constraints) {
+            (None, _) => true,
+            (Some(p), Some(c)) => p == c,
+            (Some(_), None) => false,
+        };
+        resource_ok && action_ok && constraints_ok
     }
 }
 
@@ -144,6 +165,29 @@ impl Ucan {
         } else {
             false
         }
+    }
+
+    /// Whether every link in this chain carries a finite `exp`.
+    ///
+    /// `exp` is optional in the format, and [`Self::is_expired`] reports `false`
+    /// when it is absent — so a link without one never expires. With no revocation
+    /// mechanism, a chain containing such a link is a permanent grant: a leaked
+    /// token cannot be withdrawn, and the issuer's only remedy is to rotate the
+    /// identity the resource is keyed on.
+    ///
+    /// Consumers that turn a UCAN into write authority should require this. It is
+    /// deliberately not enforced inside [`Self::verify_chain`], because a
+    /// non-expiring token is well-formed and may be perfectly appropriate for a
+    /// read-only or advisory capability; whether an unbounded grant is acceptable
+    /// is the consumer's policy, not the format's.
+    pub fn chain_lifetime_is_bounded(&self) -> bool {
+        if self.payload.exp.is_none() {
+            return false;
+        }
+        self.payload
+            .prf
+            .iter()
+            .all(|token| Self::decode(token).is_ok_and(|proof| proof.chain_lifetime_is_bounded()))
     }
 
     /// Check if this UCAN's not-before time is in the future (token not yet valid).
@@ -248,8 +292,16 @@ impl Ucan {
     /// 3. Check the proof is not expired
     /// 4. Recursively verify the proof's own chain
     ///
-    /// A UCAN with no proofs (root capability) passes trivially.
-    pub fn verify_chain(&self) -> Result<()> {
+    /// A UCAN with no proofs is its own root, so it returns its own issuer.
+    ///
+    /// **This establishes internal consistency, not trust.** `did:key` is
+    /// self-certifying, so anyone can mint a keypair and produce a chain that
+    /// verifies. A caller making an authorization decision MUST compare the
+    /// returned root against an identity it trusts for some reason outside this
+    /// token — a repo owner, a configured value, a registry lookup. Discarding
+    /// the return value is only correct when the caller is checking that a token
+    /// is well-formed and deliberately does not care who issued it.
+    pub fn verify_chain(&self) -> Result<Did> {
         // First verify our own signature
         self.verify_signature()?;
 
@@ -261,34 +313,44 @@ impl Ucan {
             return Err(Error::Ucan("token is not yet valid".to_string()));
         }
 
-        for proof_token in &self.payload.prf {
-            let proof = Self::decode(proof_token)
-                .map_err(|e| Error::Ucan(format!("failed to decode proof: {e}")))?;
-
-            // The proof's audience must be this UCAN's issuer
-            if proof.payload.aud != self.payload.iss {
-                return Err(Error::Ucan(format!(
-                    "proof chain broken: proof audience {} does not match issuer {}",
-                    proof.payload.aud, self.payload.iss
-                )));
-            }
-
-            // Every delegated capability must be covered by the proof (attenuation).
-            for cap in &self.payload.att {
-                let covered = proof.payload.att.iter().any(|p| cap.is_attenuated_by(p));
-                if !covered {
-                    return Err(Error::Ucan(format!(
-                        "capability attenuation violated: '{}' on '{}' not covered by proof",
-                        cap.can, cap.with
-                    )));
-                }
-            }
-
-            // Verify the proof's signature and chain recursively
-            proof.verify_chain()?;
+        if self.payload.prf.len() > 1 {
+            return Err(Error::Ucan(
+                "multi-proof chains are not supported: more than one proof means \
+                 more than one root, and which root authorized a given capability \
+                 is ambiguous"
+                    .to_string(),
+            ));
         }
 
-        Ok(())
+        let Some(proof_token) = self.payload.prf.first() else {
+            // No proofs: this token is its own root.
+            return Ok(self.payload.iss.clone());
+        };
+
+        let proof = Self::decode(proof_token)
+            .map_err(|e| Error::Ucan(format!("failed to decode proof: {e}")))?;
+
+        // The proof's audience must be this UCAN's issuer
+        if proof.payload.aud != self.payload.iss {
+            return Err(Error::Ucan(format!(
+                "proof chain broken: proof audience {} does not match issuer {}",
+                proof.payload.aud, self.payload.iss
+            )));
+        }
+
+        // Every delegated capability must be covered by the proof (attenuation).
+        for cap in &self.payload.att {
+            let covered = proof.payload.att.iter().any(|p| cap.is_attenuated_by(p));
+            if !covered {
+                return Err(Error::Ucan(format!(
+                    "capability attenuation violated: '{}' on '{}' not covered by proof",
+                    cap.can, cap.with
+                )));
+            }
+        }
+
+        // Recurse; the root of the proof's chain is the root of ours.
+        proof.verify_chain()
     }
 }
 
@@ -663,5 +725,230 @@ mod tests {
         .unwrap();
 
         delegated.verify_chain().unwrap();
+    }
+
+    #[test]
+    fn verify_chain_returns_the_root_issuer_of_a_delegated_chain() {
+        // owner -> agent (delegation), agent -> node (invocation).
+        // The root is the owner: that is the identity the whole chain rests on,
+        // and the only one a caller can meaningfully anchor a trust decision to.
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let caps_vec = vec![Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH)];
+
+        let delegation =
+            Ucan::issue(&owner, agent.did(), caps_vec.clone(), None).expect("issue delegation");
+        let invocation = Ucan::delegate(&agent, node.did(), caps_vec, None, &delegation)
+            .expect("wrap invocation");
+
+        assert_eq!(
+            invocation.verify_chain().expect("chain must verify"),
+            owner.did(),
+            "the root issuer is the owner who started the chain, not the agent presenting it"
+        );
+    }
+
+    /// A chain is only bounded if EVERY link is. An unbounded link anywhere makes
+    /// the whole grant permanent, because `is_expired` reports false for it and
+    /// there is no revocation path to withdraw it.
+    #[test]
+    fn chain_lifetime_is_bounded_requires_an_expiry_on_every_link() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let cap = || vec![Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH)];
+        let hour = Utc::now() + chrono::Duration::hours(1);
+
+        let bounded_root = Ucan::issue(&owner, agent.did(), cap(), Some(hour)).expect("issue");
+        let unbounded_root = Ucan::issue(&owner, agent.did(), cap(), None).expect("issue");
+
+        assert!(
+            Ucan::delegate(&agent, node.did(), cap(), Some(hour), &bounded_root)
+                .expect("wrap")
+                .chain_lifetime_is_bounded(),
+            "both links finite"
+        );
+        assert!(
+            !Ucan::delegate(&agent, node.did(), cap(), None, &bounded_root)
+                .expect("wrap")
+                .chain_lifetime_is_bounded(),
+            "the leaf has no expiry, so the grant never lapses"
+        );
+        assert!(
+            !Ucan::delegate(&agent, node.did(), cap(), Some(hour), &unbounded_root)
+                .expect("wrap")
+                .chain_lifetime_is_bounded(),
+            "a bounded leaf cannot rescue an unbounded proof: the holder can always \
+             mint a fresh leaf from it"
+        );
+        assert!(
+            !unbounded_root.chain_lifetime_is_bounded(),
+            "a self-issued token with no expiry is itself unbounded"
+        );
+    }
+
+    /// A three-link chain: owner -> lead -> agent, which is the real shape of an
+    /// org delegating to a team lead who delegates to a CI identity.
+    ///
+    /// Every other chain here is depth two, where the immediate proof IS the root —
+    /// so nothing distinguishes recursing to the true root from simply returning the
+    /// proof's issuer. Both `assert_eq!` and `assert_ne!` below are load-bearing:
+    /// without the second, returning the middle issuer would still satisfy a test
+    /// that only checked "not the leaf".
+    #[test]
+    fn verify_chain_walks_past_the_immediate_proof_to_the_true_root() {
+        let owner = Keypair::generate();
+        let lead = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let cap = || vec![Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH)];
+
+        let root = Ucan::issue(&owner, lead.did(), cap(), None).expect("owner -> lead");
+        let mid = Ucan::delegate(&lead, agent.did(), cap(), None, &root).expect("lead -> agent");
+        let leaf = Ucan::delegate(&agent, node.did(), cap(), None, &mid).expect("agent -> node");
+
+        let found = leaf.verify_chain().expect("a three-link chain must verify");
+        assert_eq!(
+            found,
+            owner.did(),
+            "the root is the owner who started the chain, two hops up"
+        );
+        assert_ne!(
+            found,
+            lead.did(),
+            "returning the immediate proof's issuer is not walking to the root"
+        );
+    }
+
+    #[test]
+    fn verify_chain_returns_self_as_root_for_a_self_issued_token() {
+        // A token with no proofs roots at its own issuer. This is what makes a
+        // self-minted token useless: the caller compares this against the repo
+        // owner and it will only ever match when the presenter IS the owner.
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let ucan =
+            Ucan::issue(&agent, node.did(), vec![Capability::new("*", "*")], None).expect("issue");
+
+        assert_eq!(
+            ucan.verify_chain().expect("a root token still verifies"),
+            agent.did(),
+            "a self-minted token roots at the minter, however permissive its capabilities"
+        );
+    }
+
+    /// Stripping `nb` is a widening, and a widening must fail attenuation.
+    ///
+    /// Without this, a constrained delegation is trivially escalated: the holder
+    /// re-delegates the same resource and action with the constraints removed,
+    /// `verify_chain` accepts the chain because attenuation only compared `with`
+    /// and `can`, and a consumer that refuses constrained capabilities at the leaf
+    /// (as the node's push gate does) then sees an unconstrained one and grants it.
+    /// Guarding only the leaf guards the wrong end of the chain.
+    #[test]
+    fn verify_chain_rejects_a_child_that_strips_the_parents_constraints() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+
+        let constrained = Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH)
+            .with_constraints(serde_json::json!({ "refs": ["refs/heads/feat/*"] }));
+        let delegation = Ucan::issue(&owner, agent.did(), vec![constrained], None)
+            .expect("issue constrained delegation");
+
+        // Same resource, same action, constraints dropped.
+        let widened = Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH);
+        let forged =
+            Ucan::delegate(&agent, node.did(), vec![widened], None, &delegation).expect("wrap");
+
+        let err = forged
+            .verify_chain()
+            .expect_err("dropping the parent's constraints must fail attenuation");
+        assert!(
+            err.to_string().contains("attenuation"),
+            "the failure must name attenuation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_chain_accepts_a_child_that_keeps_the_parents_constraints() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+
+        let nb = serde_json::json!({ "refs": ["refs/heads/feat/*"] });
+        let constrained = Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH)
+            .with_constraints(nb.clone());
+        let delegation =
+            Ucan::issue(&owner, agent.did(), vec![constrained.clone()], None).expect("issue");
+        let invocation =
+            Ucan::delegate(&agent, node.did(), vec![constrained], None, &delegation).expect("wrap");
+
+        assert_eq!(
+            invocation
+                .verify_chain()
+                .expect("an unchanged constraint must verify"),
+            owner.did()
+        );
+    }
+
+    #[test]
+    fn an_unconstrained_parent_still_allows_a_child_to_add_constraints() {
+        // Adding `nb` narrows, which is always a legal attenuation.
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+
+        let open = Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH);
+        let delegation = Ucan::issue(&owner, agent.did(), vec![open], None).expect("issue");
+        let narrowed = Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH)
+            .with_constraints(serde_json::json!({ "refs": ["refs/heads/main"] }));
+        let invocation =
+            Ucan::delegate(&agent, node.did(), vec![narrowed], None, &delegation).expect("wrap");
+
+        assert_eq!(
+            invocation.verify_chain().expect("narrowing must verify"),
+            owner.did()
+        );
+    }
+
+    #[test]
+    fn verify_chain_rejects_a_multi_proof_chain() {
+        // Two proofs mean two roots, and nothing says which root authorized a
+        // given capability. Returning either one would be unsound, so refuse.
+        let owner_a = Keypair::generate();
+        let owner_b = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let caps_vec = vec![Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH)];
+
+        let proof_a = Ucan::issue(&owner_a, agent.did(), caps_vec.clone(), None).expect("issue a");
+        let proof_b = Ucan::issue(&owner_b, agent.did(), caps_vec.clone(), None).expect("issue b");
+
+        // `delegate` only ever writes one proof, so build the two-proof payload by hand.
+        let payload = UcanPayload {
+            ucan: "1.0.0".to_string(),
+            iss: agent.did(),
+            aud: node.did(),
+            att: caps_vec,
+            exp: None,
+            nbf: None,
+            prf: vec![
+                proof_a.encode().expect("encode a"),
+                proof_b.encode().expect("encode b"),
+            ],
+        };
+        let signing_bytes = serde_json::to_vec(&payload).expect("serialize payload");
+        let s = agent.sign_b64(&signing_bytes);
+        let multi = Ucan { payload, s };
+
+        let err = multi
+            .verify_chain()
+            .expect_err("a two-proof chain must be refused");
+        assert!(
+            err.to_string().contains("multi-proof"),
+            "the error must name the reason, got: {err}"
+        );
     }
 }

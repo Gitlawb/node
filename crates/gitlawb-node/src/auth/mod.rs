@@ -17,16 +17,155 @@ use crate::state::AppState;
 #[derive(Clone, Debug)]
 pub struct AuthenticatedDid(pub String);
 
+/// A UCAN that passed full chain validation, with the root issuer the chain
+/// rests on. Inserted into request extensions by [`require_ucan_chain`] when
+/// `X-Ucan` is present; absent when the header is.
+///
+/// `root` is carried rather than recomputed so the chain is walked once per
+/// request. Holding this is not itself an authorization decision — a caller must
+/// still compare `root` against an identity it independently trusts, because
+/// `did:key` is self-certifying and anyone can mint a chain that verifies.
+#[derive(Clone, Debug)]
+pub struct VerifiedUcan {
+    pub ucan: Ucan,
+    pub root: Did,
+}
+
 /// Whether `caller` is authorized to push to `record`.
 ///
-/// Phase 1 (`GITLAWB_ENFORCE_OWNER_PUSH`): owner-only, via the canonical
-/// [`crate::api::did_matches`] owner comparison (DID-safe on both sides). This is
-/// intentionally a distinct, intent-named gate rather than a bare owner check so
-/// that Phase 2 can extend it to honor a verified UCAN `git/push` capability as a
-/// pure addition (`did_matches(..) || ucan_grants_push(..)`) without rewriting
-/// call sites.
-pub fn caller_authorized_to_push(record: &crate::db::RepoRecord, caller: &str) -> bool {
+/// The repo owner, or a caller presenting a verified UCAN whose chain roots at
+/// that owner and which carries `git/push` for this repo.
+///
+/// `verified` is optional because `X-Ucan` is: a push carrying no token reaches
+/// the same owner-only decision it always did. The owner check is unconditional
+/// and runs first, so this can only ever turn a refusal into an acceptance,
+/// never the reverse.
+pub fn caller_authorized_to_push(
+    record: &crate::db::RepoRecord,
+    caller: &str,
+    verified: Option<&VerifiedUcan>,
+) -> bool {
     crate::api::did_matches(caller, &record.owner_did)
+        || verified.is_some_and(|v| ucan_grants_push(record, v))
+}
+
+/// Whether `with` names this repository.
+///
+/// Structural, not a string compare: `owner_did` is stored as a full
+/// `did:key:z6Mk…` on canonical rows and as a bare `z6Mk…` on mirror rows, so a
+/// literal match would deny a valid delegation for every mirror.
+///
+/// A resource wildcard is REFUSED here, deliberately, even though
+/// [`gitlawb_core::ucan::Capability::is_attenuated_by`] accepts `"*"` as a parent.
+/// `git-remote-gitlawb` narrows a wildcard delegation to the concrete repo before
+/// signing an invocation, but that is one client's courtesy, not a protocol
+/// boundary: a delegate can sign an otherwise valid `agent -> node` invocation that
+/// keeps `with: "*"`, and it passes attenuation because its proof is `"*"` too.
+/// Accepting it would let a single delegation push to every repository the root DID
+/// owns, including repositories created AFTER the delegation was issued — exactly
+/// the growth `docs/RUN-A-NODE.md` promises cannot happen. An authorization
+/// boundary cannot enforce that by trusting a client-side representation change,
+/// so the node requires a concrete resource of its own.
+fn repo_capability_matches(with: &str, record: &crate::db::RepoRecord) -> bool {
+    let Some(rest) = with.strip_prefix("gitlawb://repos/") else {
+        return false;
+    };
+    // The owner segment is a DID and may contain ':' but never '/', so the last
+    // separator splits owner from name.
+    let Some((owner_seg, name_seg)) = rest.rsplit_once('/') else {
+        return false;
+    };
+    !owner_seg.is_empty()
+        && crate::api::did_matches(owner_seg, &record.owner_did)
+        && name_seg == record.name
+}
+
+/// Whether a verified UCAN authorizes a push to `record`.
+///
+/// Two conditions, both required:
+///   1. The chain roots at this repo's owner. This is the trust anchor — the
+///      repo record is data the node holds independently of the token, so a
+///      self-minted chain cannot satisfy it.
+///   2. Some capability in the leaf covers `git/push` on this repo.
+///
+/// Only the leaf is examined for (2): [`gitlawb_core::ucan::Ucan::verify_chain`]
+/// has already established that each leaf capability is attenuated by its proof,
+/// transitively to the root, so a surviving leaf capability is no broader than
+/// what the root granted.
+///
+/// A capability carrying `nb` (constraints) authorizes nothing. Constraints are
+/// not interpreted yet, and an owner who writes them means to restrict; granting
+/// while ignoring them would be strictly more permissive than intended.
+pub fn ucan_grants_push(record: &crate::db::RepoRecord, verified: &VerifiedUcan) -> bool {
+    if !crate::api::did_matches(&verified.root.to_string(), &record.owner_did) {
+        return false;
+    }
+    // A write capability must lapse on its own. `exp` is optional in the format and
+    // there is no revocation path, so a chain with an unbounded link is a permanent
+    // grant: once the token leaks, the owner cannot withdraw it short of rotating
+    // the DID the repo is keyed on. Refusing here is what makes "the damage window
+    // is the token's expiry" a true statement rather than an aspiration.
+    if !verified.ucan.chain_lifetime_is_bounded() {
+        return false;
+    }
+    if !verified
+        .ucan
+        .payload
+        .att
+        .iter()
+        .any(|cap| push_class_names_repo(cap, record))
+    {
+        return false;
+    }
+    // EVERY link must name this repository, not just the leaf.
+    //
+    // Refusing a wildcard leaf alone did nothing: `is_attenuated_by` accepts a
+    // concrete child under a `*` parent, and that narrowing is exactly what
+    // `build_invocation` performs. So one owner-issued `with: "*"` proof let the
+    // delegate mint a concrete leaf for ANY repository the owner has — or creates
+    // later — and both the chain check and the owner-root check passed. The scope
+    // of a delegation is fixed when it is issued, so a proof that does not name
+    // this repository cannot authorize a push to it.
+    proofs_name_repo(&verified.ucan, record)
+}
+
+/// A capability that is push-class, unconstrained, and names this repository.
+fn push_class_names_repo(
+    cap: &gitlawb_core::ucan::Capability,
+    record: &crate::db::RepoRecord,
+) -> bool {
+    cap.constraints.is_none()
+        && (cap.can == gitlawb_core::ucan::caps::GIT_PUSH
+            || cap.can == "*"
+            || cap.can == gitlawb_core::ucan::caps::REPO_ADMIN)
+        && repo_capability_matches(&cap.with, record)
+}
+
+/// Every proof in the chain carries a capability naming this repository.
+///
+/// `verify_chain` has already established that the chain is internally consistent
+/// and that each link attenuates its parent — but attenuation permits narrowing a
+/// `*` parent to a concrete child, which is the growth this refuses. Called after
+/// `verify_chain`, so `prf` is at most one entry per link and the depth is bounded
+/// by a chain that already walked successfully.
+fn proofs_name_repo(ucan: &gitlawb_core::ucan::Ucan, record: &crate::db::RepoRecord) -> bool {
+    for proof_token in &ucan.payload.prf {
+        let Ok(proof) = gitlawb_core::ucan::Ucan::decode(proof_token) else {
+            return false;
+        };
+        if !proof
+            .payload
+            .att
+            .iter()
+            .any(|cap| push_class_names_repo(cap, record))
+        {
+            return false;
+        }
+        if !proofs_name_repo(&proof, record) {
+            return false;
+        }
+    }
+    true
 }
 
 use gitlawb_core::http_sig::{
@@ -270,7 +409,7 @@ fn validate_ucan_chain(
     token: &str,
     expected_aud: &Did,
     signer_did: &Did,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<VerifiedUcan, (StatusCode, Json<serde_json::Value>)> {
     let ucan = Ucan::decode(token).map_err(|e| {
         (
             StatusCode::UNAUTHORIZED,
@@ -298,14 +437,14 @@ fn validate_ucan_chain(
         )
     })?;
 
-    ucan.verify_chain().map_err(|e| {
+    let root = ucan.verify_chain().map_err(|e| {
         (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "invalid_ucan", "message": e.to_string() })),
         )
     })?;
 
-    Ok(())
+    Ok(VerifiedUcan { ucan, root })
 }
 
 /// Axum middleware that validates a UCAN chain when `X-Ucan` is present.
@@ -358,11 +497,18 @@ pub async fn require_ucan_chain(
         }
     };
 
-    if let Err((status, body)) = validate_ucan_chain(&token, &state.node_did, &signer_did) {
-        return (status, body).into_response();
-    }
+    let verified = match validate_ucan_chain(&token, &state.node_did, &signer_did) {
+        Ok(v) => v,
+        Err((status, body)) => return (status, body).into_response(),
+    };
 
-    tracing::debug!(did = %signer_did, "UCAN chain validated");
+    tracing::debug!(did = %signer_did, root = %verified.root, "UCAN chain validated");
+
+    // Park the verified token where a handler can reach it. Validation alone
+    // grants nothing; the authorization decision is made downstream, by a caller
+    // that knows which identity it trusts for the resource being touched.
+    let mut request = request;
+    request.extensions_mut().insert(verified);
     next.run(request).await
 }
 
@@ -396,6 +542,37 @@ mod tests {
 
     fn bootstrap_ucan(node: &Keypair, agent_did: Did) -> Ucan {
         Ucan::bootstrap(node, agent_did).unwrap()
+    }
+
+    /// The middleware validated a token and threw the result away, so no handler
+    /// could ever read it and `Ucan::can` had no call site in the node. Validation
+    /// must hand back both the token and the root the chain rests on.
+    #[test]
+    fn validate_ucan_chain_hands_back_the_root_and_the_token() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let caps_vec = vec![Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH)];
+
+        let delegation =
+            Ucan::issue(&owner, agent.did(), caps_vec.clone(), None).expect("issue delegation");
+        let invocation = Ucan::delegate(&agent, node.did(), caps_vec, None, &delegation)
+            .expect("wrap invocation");
+        let token = invocation.encode().expect("encode");
+
+        let verified = validate_ucan_chain(&token, &node.did(), &agent.did())
+            .expect("a well-formed owner-rooted invocation must validate");
+
+        assert_eq!(
+            verified.root,
+            owner.did(),
+            "the root must be the owner, so a caller can anchor against the repo record"
+        );
+        assert_eq!(
+            verified.ucan.payload.iss,
+            agent.did(),
+            "the token itself must come back so a caller can read its capabilities"
+        );
     }
 
     fn delegation_ucan(agent: &Keypair, node_did: Did, proof: &Ucan) -> Ucan {
@@ -635,5 +812,281 @@ mod tests {
         let body_bytes = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body_json["error"], "invalid_ucan");
+    }
+}
+
+#[cfg(test)]
+mod ucan_push_tests {
+    use super::*;
+    use gitlawb_core::identity::Keypair;
+    use gitlawb_core::ucan::{caps, Capability, Ucan};
+
+    const OWNER_KEY: &str = "z6MkOwnerAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    /// `RepoRecord` does not derive `Default`, and adding the derive to a
+    /// production DB type purely to serve a test is the wrong direction.
+    fn repo(owner_did: &str, name: &str) -> crate::db::RepoRecord {
+        crate::db::RepoRecord {
+            id: "repo-id".to_string(),
+            name: name.to_string(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            disk_path: "/unused".to_string(),
+            forked_from: None,
+            machine_id: None,
+        }
+    }
+
+    /// The token's own issuer and audience are irrelevant to this predicate: the
+    /// middleware has already bound `iss` to the request signer and `aud` to this
+    /// node. Only the capabilities and the chain's root matter here.
+    fn verified(root: &str, caps_vec: Vec<Capability>) -> VerifiedUcan {
+        verified_with_exp(
+            root,
+            caps_vec,
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        )
+    }
+
+    fn verified_with_exp(
+        root: &str,
+        caps_vec: Vec<Capability>,
+        exp: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> VerifiedUcan {
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let ucan = Ucan::issue(&agent, node.did(), caps_vec, exp).expect("issue");
+        VerifiedUcan {
+            ucan,
+            root: root.parse().expect("root DID must parse"),
+        }
+    }
+
+    fn owner_full() -> String {
+        format!("did:key:{OWNER_KEY}")
+    }
+
+    fn push_cap_for(owner: &str, name: &str) -> Capability {
+        Capability::new(format!("gitlawb://repos/{owner}/{name}"), caps::GIT_PUSH)
+    }
+
+    #[test]
+    fn grants_push_when_the_chain_roots_at_the_owner_and_names_the_repo() {
+        let rec = repo(&owner_full(), "myrepo");
+        let v = verified(&owner_full(), vec![push_cap_for(&owner_full(), "myrepo")]);
+        assert!(ucan_grants_push(&rec, &v));
+    }
+
+    #[test]
+    fn matches_a_bare_owner_key_against_a_full_did_record() {
+        // Mirror rows store the bare key. A literal string compare would fail
+        // here, denying a delegation that is in fact valid.
+        let rec = repo(OWNER_KEY, "myrepo");
+        let v = verified(&owner_full(), vec![push_cap_for(&owner_full(), "myrepo")]);
+        assert!(ucan_grants_push(&rec, &v));
+    }
+
+    /// A perpetual grant is refused even when it is otherwise perfectly valid:
+    /// owner-rooted, right repo, right action. Without revocation, an unbounded
+    /// delegation cannot be withdrawn once it leaks.
+    #[test]
+    fn refuses_a_delegation_that_never_expires() {
+        let rec = repo(&owner_full(), "myrepo");
+        let v = verified_with_exp(
+            &owner_full(),
+            vec![push_cap_for(&owner_full(), "myrepo")],
+            None,
+        );
+        assert!(!ucan_grants_push(&rec, &v));
+    }
+
+    #[test]
+    fn refuses_a_self_minted_root() {
+        // The whole point: a token nobody delegated grants nothing, however
+        // permissive its capabilities look.
+        let stranger = Keypair::generate();
+        let rec = repo(&owner_full(), "myrepo");
+        let v = verified(&stranger.did().to_string(), vec![Capability::new("*", "*")]);
+        assert!(!ucan_grants_push(&rec, &v));
+    }
+
+    #[test]
+    fn refuses_a_capability_for_a_different_repo() {
+        let rec = repo(&owner_full(), "myrepo");
+        let v = verified(
+            &owner_full(),
+            vec![push_cap_for(&owner_full(), "otherrepo")],
+        );
+        assert!(!ucan_grants_push(&rec, &v));
+    }
+
+    #[test]
+    fn refuses_a_capability_carrying_constraints() {
+        // `nb` is not interpreted yet. An owner who writes {"refs": [...]} means
+        // to restrict; honouring the capability while ignoring nb would grant
+        // strictly more than they intended, so it authorizes nothing.
+        let rec = repo(&owner_full(), "myrepo");
+        let v = verified(
+            &owner_full(),
+            vec![push_cap_for(&owner_full(), "myrepo")
+                .with_constraints(serde_json::json!({ "refs": ["refs/heads/feat/*"] }))],
+        );
+        assert!(!ucan_grants_push(&rec, &v));
+    }
+
+    #[test]
+    fn refuses_a_non_push_capability() {
+        let rec = repo(&owner_full(), "myrepo");
+        let v = verified(
+            &owner_full(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{}/myrepo", owner_full()),
+                caps::ISSUE_CREATE,
+            )],
+        );
+        assert!(!ucan_grants_push(&rec, &v));
+    }
+
+    /// A resource wildcard must NOT authorize a push, even though attenuation
+    /// accepts it. The helper narrows a `*` delegation before signing, but the node
+    /// cannot rely on that: a delegate can sign an invocation that keeps the
+    /// wildcard, and it would otherwise reach every repository the owner has — or
+    /// will later create. This test previously asserted the opposite.
+    #[test]
+    fn refuses_a_resource_wildcard_and_honours_repo_admin() {
+        let rec = repo(&owner_full(), "myrepo");
+        let wildcard = verified(&owner_full(), vec![Capability::new("*", caps::GIT_PUSH)]);
+        assert!(
+            !ucan_grants_push(&rec, &wildcard),
+            "a wildcard resource must not authorize a push at the node"
+        );
+
+        // The ACTION wildcard is a different axis and stays: attenuation bounds it,
+        // and it still has to name a concrete repository.
+        let action_wildcard = verified(
+            &owner_full(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{}/myrepo", owner_full()),
+                "*",
+            )],
+        );
+        assert!(ucan_grants_push(&rec, &action_wildcard));
+
+        let admin = verified(
+            &owner_full(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{}/myrepo", owner_full()),
+                caps::REPO_ADMIN,
+            )],
+        );
+        assert!(ucan_grants_push(&rec, &admin));
+    }
+
+    /// The attack the wildcard refusal exists to stop: one `*` delegation reaching a
+    /// repository it was never issued against, including one created afterwards.
+    #[test]
+    fn a_wildcard_delegation_cannot_reach_a_second_repository() {
+        let other = repo(&owner_full(), "a-repo-created-later");
+        let wildcard = verified(&owner_full(), vec![Capability::new("*", caps::GIT_PUSH)]);
+        assert!(!ucan_grants_push(&other, &wildcard));
+    }
+
+    /// The round-8 P1, executed rather than reasoned: an owner-issued `*` PROOF with
+    /// a concrete leaf for a repository that did not exist at issuance. Refusing a
+    /// wildcard *leaf* did nothing here — `is_attenuated_by` accepts a concrete child
+    /// under a `*` parent, and that narrowing is exactly what `build_invocation` did,
+    /// so the first-party helper was the working mint path.
+    #[test]
+    fn a_wildcard_proof_cannot_reach_a_repo_created_later() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        let parent = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new("*", caps::GIT_PUSH)],
+            Some(hour),
+        )
+        .unwrap();
+        let later = format!("gitlawb://repos/{}/a-repo-created-later", owner.did());
+        let invocation = Ucan::delegate(
+            &agent,
+            node.did(),
+            vec![Capability::new(&later, caps::GIT_PUSH)],
+            Some(hour),
+            &parent,
+        )
+        .unwrap();
+
+        let root = invocation.verify_chain().expect("the chain still verifies");
+        let rec = repo(&owner.did().to_string(), "a-repo-created-later");
+        assert!(
+            !ucan_grants_push(
+                &rec,
+                &VerifiedUcan {
+                    ucan: invocation,
+                    root
+                }
+            ),
+            "a wildcard proof must not authorize a repo it never named"
+        );
+    }
+
+    /// The shipping flow must keep working: a proof that names the repository
+    /// authorizes a push to it. Guards against fixing the wildcard by refusing
+    /// everything with a `prf`.
+    #[test]
+    fn a_concrete_proof_still_authorizes_the_repo_it_names() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+        let resource = format!("gitlawb://repos/{}/myrepo", owner.did());
+
+        let parent = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new(&resource, caps::GIT_PUSH)],
+            Some(hour),
+        )
+        .unwrap();
+        let invocation = Ucan::delegate(
+            &agent,
+            node.did(),
+            vec![Capability::new(&resource, caps::GIT_PUSH)],
+            Some(hour),
+            &parent,
+        )
+        .unwrap();
+
+        let root = invocation.verify_chain().expect("chain verifies");
+        let rec = repo(&owner.did().to_string(), "myrepo");
+        assert!(ucan_grants_push(
+            &rec,
+            &VerifiedUcan {
+                ucan: invocation,
+                root
+            }
+        ));
+    }
+
+    #[test]
+    fn refuses_a_malformed_resource_uri() {
+        let rec = repo(&owner_full(), "myrepo");
+        for bad in [
+            "",
+            "myrepo",
+            "https://repos/x/myrepo",
+            "gitlawb://repos/myrepo",
+        ] {
+            let v = verified(&owner_full(), vec![Capability::new(bad, caps::GIT_PUSH)]);
+            assert!(!ucan_grants_push(&rec, &v), "{bad} must not grant push");
+        }
     }
 }

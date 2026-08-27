@@ -67,7 +67,7 @@ Good today:
 Known limitations:
 
 - Repository write authorization is not secure by default: `GITLAWB_ENFORCE_OWNER_PUSH` defaults to `false` for compatibility, so a valid HTTP Signature identifies a pusher but does not enforce owner-only pushes.
-- UCAN proof chains are validated when supplied, but UCAN capabilities are not consulted by write authorization and the root issuer is not independently trust-anchored. UCANs therefore do not yet grant scoped collaborator access.
+- UCAN capabilities are consulted on the push path only. There, the chain's root issuer is anchored to the repository owner, so an owner-rooted, time-bounded delegation that names the repository grants scoped collaborator access for pushing to it, for the `git/push`, `*`, or `repo/admin` actions. A `*` *resource* is refused: a delegation must name the repository it applies to, so it cannot grow to cover repos created later. The rest is unchanged: there is no revocation path, `nb` constraints are refused rather than interpreted, and no other route — reads, pull requests, issues, agents — consults capabilities at all.
 - Agent lifecycle revocation is not enforced by HTTP Signature authorization; do not rely on removing or revoking an agent record to block a compromised signer.
 - Read visibility is not a blanket data-classification boundary: task, IPFS-pin, and Arweave-anchor listings are not repository-gated; withheld path names can be visible to a root reader; and later visibility changes cannot retract content already announced or externally anchored.
 - Peer writes are signed by upgraded nodes, but strict signed-peer enforcement is opt-in during rolling upgrades.
@@ -311,7 +311,7 @@ metadata        local disk / optional S3
 | DID | A user, agent, or node identity derived from an Ed25519 public key. |
 | HTTP Signature | RFC 9421 signature proving control of the DID key for write requests. |
 | Ref certificate | Signed record of a ref update. Useful for audit and replication. |
-| UCAN | Delegation token for future capability-based workflows. |
+| UCAN | Capability token. An owner delegates `git/push` on a repo to another DID; the node honors it when the proof chain roots at that owner. See [`docs/RUN-A-NODE.md`](docs/RUN-A-NODE.md). |
 | Peer announce | Node-to-node HTTP announcement of DID + public URL. |
 | Gossipsub | libp2p topic for ref-update events. |
 | Smart HTTP | Standard git protocol over HTTP for clone/fetch/push. |

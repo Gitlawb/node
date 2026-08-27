@@ -22,7 +22,7 @@ pub struct InitArgs {
     #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
     pub node: String,
 
-    /// Identity directory (default: ~/.gitlawb)
+    /// Identity directory (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
     #[arg(long)]
     pub dir: Option<PathBuf>,
 
@@ -101,10 +101,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
     // Save UCAN if returned
     if let Some(ucan) = payload.get("ucan").and_then(|v| v.as_str()) {
         if !ucan.is_empty() {
-            let ucan_dir = args
-                .dir
-                .clone()
-                .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".gitlawb"));
+            let ucan_dir = crate::identity::gitlawb_dir(args.dir.clone())?;
             std::fs::create_dir_all(&ucan_dir)?;
             let record = json!({
                 "ucan": ucan,
@@ -221,18 +218,15 @@ pub async fn run(args: InitArgs) -> Result<()> {
 }
 
 fn generate_identity(dir: Option<&std::path::Path>) -> Result<gitlawb_core::identity::Keypair> {
-    let base = if let Some(d) = dir {
-        d.to_path_buf()
-    } else {
-        dirs::home_dir()
-            .context("could not determine home directory")?
-            .join(".gitlawb")
-    };
+    let path = crate::identity::key_path_for(dir)?;
+    let base = path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
     std::fs::create_dir_all(&base)?;
 
     let keypair = gitlawb_core::identity::Keypair::generate();
     let pem = keypair.to_pem()?;
-    let path = base.join("identity.pem");
 
     #[cfg(unix)]
     {

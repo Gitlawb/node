@@ -283,7 +283,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "ucan_show",
-            "description": "Show the saved bootstrap UCAN token for this agent.",
+            "description": "Show the saved bootstrap UCAN for this agent: issuer, audience, capabilities, expiry, and signature validity. The token itself is not returned.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -759,15 +759,45 @@ async fn call_tool(
         ]))?),
 
         "ucan_show" => {
-            let ucan_path = dirs::home_dir()
-                .context("no home dir")?
-                .join(".gitlawb/ucan.json");
-            if ucan_path.exists() {
-                let content = std::fs::read_to_string(ucan_path)?;
-                Ok(content)
-            } else {
-                Ok("No UCAN saved. Run `gl register` or use the agent_register tool.".to_string())
+            // The directory the server was started with, like every sibling tool.
+            // Reading the default here while the rest honour `--dir` splits one MCP
+            // session across two identity directories.
+            let ucan_path = crate::identity::gitlawb_dir(dir.map(std::path::Path::to_path_buf))?
+                .join("ucan.json");
+            if !ucan_path.exists() {
+                return Ok(
+                    "No UCAN saved. Run `gl register` or use the agent_register tool.".to_string(),
+                );
             }
+            let content = std::fs::read_to_string(&ucan_path)?;
+            // Decoded fields, matching what `gl ucan show` reports — the two are the
+            // same question asked through different surfaces and should not answer
+            // it in different shapes.
+            //
+            // Returning the file verbatim also handed the caller the bootstrap token
+            // itself. That is the credential the agent presents, and an MCP response
+            // travels further than a terminal: into a model's context, transcripts,
+            // and logs. The fields below are what a caller actually needs to know
+            // whether it is registered and until when.
+            let ucan = crate::ucan_cmd::decode_saved_ucan(&content).with_context(|| {
+                format!("could not read the saved UCAN at {}", ucan_path.display())
+            })?;
+            Ok(serde_json::to_string_pretty(&json!({
+                "issuer": ucan.payload.iss.to_string(),
+                "audience": ucan.payload.aud.to_string(),
+                "version": ucan.payload.ucan,
+                "capabilities": ucan.payload.att.iter()
+                    .map(|c| json!({ "with": c.with, "can": c.can }))
+                    .collect::<Vec<_>>(),
+                "expires": ucan.payload.exp.map(|e| {
+                    chrono::DateTime::from_timestamp(e, 0)
+                        .map(|d| d.to_rfc3339())
+                        .unwrap_or_else(|| e.to_string())
+                }),
+                "expired": ucan.is_expired(),
+                "signature_valid": ucan.verify_signature().is_ok(),
+                "path": ucan_path.display().to_string(),
+            }))?)
         }
 
         "did_resolve" => {
@@ -2031,5 +2061,89 @@ mod tests {
         let tools = tool_definitions();
         let count = tools.as_array().unwrap().len();
         assert_eq!(count, 40, "expected 40 tools, got {count}");
+    }
+}
+
+#[cfg(test)]
+mod ucan_show_tests {
+    use super::*;
+
+    /// The MCP tool and `gl ucan show` answer the same question and must answer it
+    /// in the same shape — decoded fields, not the file. Returning the file verbatim
+    /// also handed back the bootstrap token, which an MCP response carries much
+    /// further than a terminal does.
+    #[tokio::test]
+    async fn ucan_show_returns_decoded_fields_and_withholds_the_token() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let issuer = gitlawb_core::identity::Keypair::generate();
+        let audience = gitlawb_core::identity::Keypair::generate();
+        let token = gitlawb_core::ucan::Ucan::issue(
+            &issuer,
+            audience.did(),
+            vec![gitlawb_core::ucan::Capability::new(
+                "gitlawb://repos/z6MkAbc/myrepo",
+                gitlawb_core::ucan::caps::GIT_PUSH,
+            )],
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+
+        // The envelope shape every writer produces.
+        std::fs::write(
+            dir.path().join("ucan.json"),
+            serde_json::to_string_pretty(&json!({
+                "ucan": token,
+                "node": "https://node.gitlawb.com",
+                "did": issuer.did().to_string(),
+                "saved_at": "2026-08-18T00:00:00Z",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let out = call_tool("ucan_show", json!({}), "http://localhost", Some(dir.path()))
+            .await
+            .expect("ucan_show must read the envelope every writer produces");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("must be JSON");
+
+        assert_eq!(v["issuer"], issuer.did().to_string());
+        assert_eq!(v["audience"], audience.did().to_string());
+        assert_eq!(v["capabilities"][0]["can"], "git/push");
+        assert_eq!(v["expired"], false);
+        assert_eq!(v["signature_valid"], true);
+
+        // NOT `!out.contains(&token)`: the token is itself JSON, so embedding it in
+        // a pretty-printed response escapes every quote and that assertion passes
+        // whether or not the token leaked. The signature is a bare base64 string that
+        // survives escaping unchanged, so it is the substring that actually proves
+        // absence.
+        let sig = serde_json::from_str::<serde_json::Value>(&token).unwrap()["s"]
+            .as_str()
+            .expect("a UCAN carries its signature in `s`")
+            .to_string();
+        assert!(!sig.is_empty());
+        assert!(
+            !out.contains(&sig),
+            "the bootstrap token must not be returned to an MCP caller"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&out)
+                .unwrap()
+                .get("ucan")
+                .is_none(),
+            "no field may carry the token itself"
+        );
+    }
+
+    /// An unregistered agent gets a usable message, not a decode error.
+    #[tokio::test]
+    async fn ucan_show_reports_no_saved_ucan() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let out = call_tool("ucan_show", json!({}), "http://localhost", Some(dir.path()))
+            .await
+            .unwrap();
+        assert!(out.contains("No UCAN saved"), "got: {out}");
     }
 }
