@@ -3491,6 +3491,7 @@ impl Db {
     /// Returns true when this object has a real local IPFS CID. After migration
     /// v27 cleared legacy `cid = pinata_cid` fallback rows (provenance is now
     /// recorded, never inferred), `cid IS NOT NULL` is the complete predicate.
+    #[allow(dead_code)]
     pub async fn has_ipfs_cid(&self, sha256_hex: &str) -> Result<bool> {
         let row = sqlx::query(
             "SELECT COUNT(*) as cnt FROM pinned_cids
@@ -5407,7 +5408,7 @@ mod migration_tests {
         );
 
         // ── Pinata-only INSERT (new post-v12 row) ──────────────────────
-        db.record_pinata_cid("sha_pinata_only", "QmPinataOnly")
+        db.record_pinata_cid("sha_pinata_only", "QmPinataOnly", "QmPinataOnly", None)
             .await
             .unwrap();
         assert!(

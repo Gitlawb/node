@@ -3767,6 +3767,7 @@ mod tests {
             &state.db,
             &pub_repo.id,
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
         m.assert_async().await; // asserts /add was NOT called (already pinned)
@@ -3893,6 +3894,7 @@ mod tests {
             &state.db,
             &pub_repo.id,
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
         m.assert_async().await; // /add NOT called (already pinned)
@@ -4076,13 +4078,14 @@ mod tests {
             .await;
         crate::ipfs_pin::pin_new_objects(
             &server.url(),
-            bare,
+            &pub_bare,
             &state.git_bin,
             std::time::Duration::from_secs(state.config.git_service_timeout_secs),
-            vec![oid.to_string()],
+            vec![fx.public_oid.clone()],
             &state.db,
-            repo_id,
+            &pub_repo.id,
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
         m.assert_async().await;
@@ -4773,6 +4776,7 @@ mod tests {
                     // never truncates the one object under test: what is being measured
                     // is the retry backoff, not the budget.
                     std::time::Duration::from_secs(60),
+                    None,
                 )
                 .await;
                 m.assert_async().await; // the upload is skipped: DB-only path
@@ -4944,6 +4948,7 @@ mod tests {
                 "repoPinataBound",
                 // The bound under test.
                 std::time::Duration::from_secs(2),
+                None,
             ),
         )
         .await
@@ -5011,6 +5016,7 @@ mod tests {
                 &state.db,
                 "repoKuboBound",
                 std::time::Duration::from_secs(2),
+                None,
             ),
         )
         .await
@@ -5073,6 +5079,7 @@ mod tests {
             &state.db,
             "repoPinataRepair",
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
         m.assert_async().await;
@@ -5131,6 +5138,7 @@ mod tests {
             &state.db,
             "repoPinataGate",
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
         m.assert_async().await;
@@ -5203,6 +5211,7 @@ mod tests {
             &state.db,
             "repoPinataWarn",
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
         m.assert_async().await;
@@ -5274,6 +5283,7 @@ mod tests {
             &state.db,
             "repoPinataNoSkip",
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
         m.assert_async().await;
@@ -5909,6 +5919,7 @@ mod tests {
             &state.db,
             "repoZ",
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
         assert!(
@@ -5973,6 +5984,7 @@ mod tests {
                 // (PIN_RECORD_ATTEMPTS x PIN_RECORD_BACKOFF), so the batch budget gate
                 // is never what truncates this run.
                 std::time::Duration::from_secs(60),
+                None,
             )
             .await
         })
@@ -6093,6 +6105,7 @@ mod tests {
                 &db,
                 "repoWedge",
                 crate::ipfs_pin::PIN_BATCH_BUDGET,
+                None,
             ),
         )
         .await
@@ -6223,6 +6236,7 @@ mod tests {
             &state.db,
             "repoBF",
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
 
@@ -6338,13 +6352,14 @@ mod tests {
             .await;
         crate::ipfs_pin::pin_new_objects(
             &server.url(),
-            &bare,
+            &pub_bare,
             &state.git_bin,
             std::time::Duration::from_secs(state.config.git_service_timeout_secs),
             vec![fx.public_oid.clone()],
             &state.db,
-            &repo.id,
+            &pub_repo.id,
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
         m.assert_async().await;
@@ -6447,8 +6462,9 @@ mod tests {
             std::time::Duration::from_secs(state.config.git_service_timeout_secs),
             vec![fx.public_oid.clone()],
             &state.db,
-            "repoCG",
+            &repo.id,
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
         m.assert_async().await;
@@ -6507,13 +6523,14 @@ mod tests {
         // so the repair returns without touching the row.
         crate::ipfs_pin::pin_new_objects(
             &server.url(),
-            &bare,
+            bare,
             &state.git_bin,
             std::time::Duration::from_secs(state.config.git_service_timeout_secs),
-            vec![phantom_oid.clone()],
+            vec![oid.to_string()],
             &state.db,
-            "repoUR",
+            repo_id,
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
 

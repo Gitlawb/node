@@ -897,6 +897,7 @@ mod tests {
                 "repo-git-timeout",
                 // Generous, so a call that ends on time ended on `git_timeout`.
                 Duration::from_secs(60),
+                None,
             ),
         )
         .await
@@ -1315,6 +1316,7 @@ mod tests {
                 &db,
                 "repo-pinata-stalled",
                 Duration::from_millis(1500),
+                None,
             ),
         )
         .await
@@ -1405,6 +1407,7 @@ mod tests {
                 &db,
                 "repo-pinata-skip-stalled",
                 Duration::from_millis(1500),
+                None,
             ),
         )
         .await
@@ -1505,6 +1508,7 @@ mod tests {
                 &db,
                 "repo-pinata-spent-budget",
                 Duration::from_millis(2000),
+                None,
             ),
         );
         let (pinned, ()) = tokio::join!(pin, locker);
@@ -1590,6 +1594,7 @@ mod tests {
                 &db,
                 "repo-pinata-post-upload",
                 Duration::from_millis(1500),
+                None,
             ),
         )
         .await

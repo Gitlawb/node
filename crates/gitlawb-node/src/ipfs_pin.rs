@@ -3315,6 +3315,7 @@ mod tests {
                 &db,
                 "repo-stalled-db",
                 Duration::from_millis(1500),
+                None,
             ),
         )
         .await
@@ -3385,6 +3386,7 @@ mod tests {
                 &db,
                 "repo-skip-stalled",
                 Duration::from_millis(1500),
+                None,
             ),
         )
         .await
@@ -3451,6 +3453,7 @@ mod tests {
                 &db,
                 "repo-multi-stalled",
                 Duration::from_millis(1500),
+                None,
             ),
         )
         .await
@@ -3518,6 +3521,7 @@ mod tests {
                 &db,
                 "repo-spent-budget",
                 Duration::from_millis(2000),
+                None,
             ),
         );
         let (pinned, ()) = tokio::join!(pin, locker);
@@ -3591,6 +3595,7 @@ mod tests {
                 &db,
                 "repo-definite-error",
                 Duration::from_millis(1200),
+                None,
             ),
         );
         let (pinned, ()) = tokio::join!(pin, commit);
@@ -3672,6 +3677,7 @@ mod tests {
                 &db,
                 "repo-marker-floor",
                 Duration::from_millis(1500),
+                None,
             ),
         );
         let (pinned, ()) = tokio::join!(pin, controller);
@@ -3776,6 +3782,7 @@ mod tests {
                 &db,
                 "repo-repair-stalled",
                 Duration::from_millis(2200),
+                None,
             ),
         );
         let (pinned, mut cids_lock) = tokio::join!(pin, controller);
