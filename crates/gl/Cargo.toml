@@ -11,7 +11,7 @@ name = "gl"
 path = "src/main.rs"
 
 [dependencies]
-gitlawb-core = { path = "../gitlawb-core" }
+gitlawb-core = { path = "../gitlawb-core", features = ["redirect"] }
 icaptcha-client = { path = "../icaptcha-client" }
 base64 = { workspace = true }
 tokio = { workspace = true }

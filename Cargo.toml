@@ -55,6 +55,9 @@ uuid = { version = "1", features = ["v4"] }
 url = "2"
 # http client
 reqwest = { version = "0.12", features = ["blocking", "json", "multipart", "rustls-tls"], default-features = false }
+# URL parsing (what reqwest::Url re-exports, so the shared redirect predicate can
+# take a parsed URL without pulling reqwest into gitlawb-core)
+url = "2"
 # HMAC
 hmac = "0.12"
 
