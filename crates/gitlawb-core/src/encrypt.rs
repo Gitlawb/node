@@ -19,8 +19,10 @@ fn x25519_public(vk: &VerifyingKey) -> Result<[u8; 32]> {
     // rebuilt by anyone. Resolution already refuses such a key (see
     // Did::to_verifying_key); this guard covers the SEAL side on its own terms
     // for a caller that obtained the key some other way. The open side
-    // (open_blob's attacker-supplied `eph`) is covered by
-    // is_low_order_montgomery.
+    // (open_blob's attacker-supplied `eph`) skips any entry whose exchange with
+    // this reader yields the all-zero shared secret
+    // (`yields_all_zero_shared_secret`), regardless of whether the bytes decode
+    // to an Edwards point.
     if vk.is_weak() {
         return Err(anyhow::anyhow!("verifying key is a small-order point"));
     }
@@ -336,13 +338,12 @@ mod tests {
         assert!(open_blob(&reframe(&header), &reader).is_err());
     }
 
-    /// A low-order ephemeral public forces the all-zero shared secret, so an
-    /// entry built on it would unwrap for anyone. The header's `eph` is
-    /// attacker-controlled, so the open side must skip it. u = 0 and u = 1 are
-    /// the Montgomery u-coordinates that decompress to a small-order Edwards
-    /// point (u = 0 is the one that produces the all-zero shared secret); the
-    /// other small-order u values fail to decompress and are already skipped
-    /// by the decode path.
+    /// Every standard low-order X25519 encoding must be detected by
+    /// `yields_all_zero_shared_secret`, including encodings that do not
+    /// decompress to an Edwards point (notably `u = p - 1`). The open side
+    /// rejects on the exchange result, not on decode shape, because an
+    /// encoding-shaped check misses non-decompressing low-order inputs while
+    /// still yielding the all-zero shared secret.
     #[test]
     fn all_zero_shared_secret_is_detected_for_every_standard_low_order_encoding() {
         // The seven standard X25519 low-order encodings, driven as a set rather
