@@ -462,8 +462,10 @@ mod tests {
         // eph is the low-order u = 0. The wrap is the encryption of a content
         // key under the all-zero shared secret, so without the guard any
         // reader's ChaChaBox against u = 0 decrypts it.
-        let content_key = [0x42u8; 32];
-        let zero_box = ChaChaBox::new(&XPublic::from([0u8; 32]), &XSecret::from([7u8; 32]));
+        let mut content_key = [0u8; 32];
+        OsRng.fill_bytes(&mut content_key);
+        let attacker_x = XSecret::generate(&mut OsRng);
+        let zero_box = ChaChaBox::new(&XPublic::from([0u8; 32]), &attacker_x);
         let nonce = ChaChaBox::generate_nonce(&mut OsRng);
         let wrap = zero_box.encrypt(&nonce, &content_key[..]).unwrap();
 
@@ -532,8 +534,10 @@ mod tests {
         eph[0] = 0xec;
         eph[31] = 0x7f;
 
-        let content_key = [0x42u8; 32];
-        let zero_box = ChaChaBox::new(&XPublic::from([0u8; 32]), &XSecret::from([7u8; 32]));
+        let mut content_key = [0u8; 32];
+        OsRng.fill_bytes(&mut content_key);
+        let attacker_x = XSecret::generate(&mut OsRng);
+        let zero_box = ChaChaBox::new(&XPublic::from([0u8; 32]), &attacker_x);
         let nonce = ChaChaBox::generate_nonce(&mut OsRng);
         let wrap = crypto_box::aead::Aead::encrypt(&zero_box, &nonce, &content_key[..]).unwrap();
 
@@ -677,7 +681,7 @@ mod tests {
 
         // X25519 against u = 0 is the all-zero shared secret for any scalar, so
         // the sealer's box is reconstructable with a key the attacker picks.
-        let zero_box = ChaChaBox::new(&XPublic::from([0u8; 32]), &XSecret::from([7u8; 32]));
+        let zero_box = ChaChaBox::new(&XPublic::from([0u8; 32]), &XSecret::generate(&mut OsRng));
         for r in header["recipients"].as_array().unwrap() {
             let n = B64.decode(r["nonce"].as_str().unwrap()).unwrap();
             let w = B64.decode(r["wrap"].as_str().unwrap()).unwrap();
