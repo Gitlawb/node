@@ -169,6 +169,7 @@ pub async fn pin_new_objects(
     db: &crate::db::Db,
     repo_id: &str,
     batch_budget: Duration,
+    fence: Option<&crate::ipfs_pin::PolicyFence>,
 ) -> Vec<(String, String)> {
     if jwt.is_empty() {
         return vec![];
@@ -179,6 +180,18 @@ pub async fn pin_new_objects(
     let mut pinned = Vec::new();
 
     for (attempted, sha) in object_list.into_iter().enumerate() {
+        // Policy fence (R1-P1): a visibility narrow that lands after the caller
+        // built this batch must abort it before the next irreversible upload.
+        if let Some(f) = fence {
+            if !f.is_current().await {
+                tracing::warn!(
+                    repo = %f.repo_id(),
+                    unattempted = total - attempted,
+                    "visibility policy changed mid-batch; stopping the Pinata pin loop"
+                );
+                break;
+            }
+        }
         // Top of the iteration, before any of this object's work: an object is never
         // started with a remainder too small to cover a bounded read's teardown. The
         // gate is shared with the IPFS loop so the two cannot drift apart in how they
@@ -393,6 +406,21 @@ pub async fn pin_new_objects(
                 break;
             }
         };
+
+        // Dispatch fence (R1-P1): re-read the policy epoch immediately before
+        // the irreversible HTTP POST. The iteration-top check catches a narrow
+        // that landed before work began; THIS check catches a narrow that landed
+        // during the has_pinata_cid round-trip or the bounded Git read.
+        if let Some(f) = fence {
+            if !f.is_current().await {
+                tracing::warn!(
+                    repo = %f.repo_id(),
+                    unattempted = total - attempted,
+                    "visibility policy changed during preparation; aborting Pinata upload"
+                );
+                break;
+            }
+        }
 
         match pin_object(client, upload_url, jwt, &sha, &data).await {
             Ok(cid) if !cid.is_empty() => {
@@ -687,6 +715,7 @@ mod tests {
                 &db,
                 "repo-merge-test",
                 Duration::from_millis(5500),
+                None,
             ),
         )
         .await
@@ -778,6 +807,7 @@ mod tests {
                 &db,
                 "repo-merge-test",
                 Duration::from_secs(2),
+                None,
             ),
         )
         .await
@@ -968,6 +998,7 @@ mod tests {
                 &db,
                 "repo-merge-test",
                 Duration::from_secs(60),
+                None,
             ),
         )
         .await
@@ -1042,6 +1073,7 @@ mod tests {
                 &db,
                 "repo-merge-test",
                 Duration::from_secs(60),
+                None,
             ),
         )
         .await
@@ -1093,6 +1125,7 @@ mod tests {
                 &db,
                 "repo-merge-test",
                 Duration::from_secs(60),
+                None,
             ),
         )
         .await
@@ -1122,6 +1155,7 @@ mod tests {
                 &db,
                 "repo-merge-test",
                 Duration::from_secs(60),
+                None,
             ),
         )
         .await
@@ -1175,6 +1209,7 @@ mod tests {
                 &db,
                 "repo-merge-test",
                 Duration::from_secs(60),
+                None,
             ),
         )
         .await

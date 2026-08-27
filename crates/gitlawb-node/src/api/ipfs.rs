@@ -2130,13 +2130,40 @@ async fn gate_and_serve(
 
 /// GET /api/v1/ipfs/pins
 ///
-/// Returns all CIDs that have been pinned to the local IPFS node from git
-/// objects received via push. Each entry includes the git SHA-256 hex, the
-/// CIDv1 string, and the timestamp when it was pinned.
+/// Returns all CIDs that have been pinned from git objects received via push.
+/// Each entry includes the git SHA-256 hex, a CIDv1 string, and the timestamp
+/// when it was pinned.  For Pinata-only rows (no local IPFS pin), the `cid`
+/// field carries `pinata_cid` so CLI consumers see a usable value.
+///
+/// Rows with neither a local nor a Pinata CID are omitted so the response
+/// only contains rows with at least one backend. Both `cid` (local IPFS) and
+/// `pinata_cid` (Pinata) are nullable: a row with only `cid` set is local-only,
+/// a row with only `pinata_cid` set is remote-only, and a row with both has
+/// been replicated to both backends.
 pub async fn list_pins(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
     // Bare `?` so connection-class sqlx failures downcast to `AppError::Db` and
     // map to 503 `db_unavailable` (not 500 via `.map_err(AppError::Internal)`) (#251).
     let pins = state.db.list_pinned_cids().await?;
+
+    let pins: Vec<serde_json::Value> = pins
+        .into_iter()
+        .filter(|p| p.cid.is_some() || p.pinata_cid.is_some())
+        .map(|p| {
+            // Backward compatibility: `cid` in the response is the local CID
+            // when present, falling back to the Pinata CID for remote-only rows.
+            // Clients like `gl ipfs list` read only `pin["cid"]`; a NULL here
+            // would render as "?". Both provenance fields are always included so
+            // consumers can distinguish local-only, remote-only, and dual rows.
+            let effective_cid = p.cid.as_deref().or(p.pinata_cid.as_deref());
+            serde_json::json!({
+                "sha256_hex": p.sha256_hex,
+                "cid": effective_cid,
+                "local_cid": p.cid,
+                "pinata_cid": p.pinata_cid,
+                "pinned_at": p.pinned_at,
+            })
+        })
+        .collect();
 
     Ok(Json(serde_json::json!({
         "pins": pins,

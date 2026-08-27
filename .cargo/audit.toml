@@ -35,4 +35,16 @@ ignore = [
     # ever built with the `mysql` feature, or any other consumer of rsa enters
     # the build, at which point it becomes a real reachable advisory.
     "RUSTSEC-2023-0071", # rsa Marvin attack (no fix; not linked in our build)
+
+    # h2 0.4.13 (unbounded empty DATA frames DoS). Present in Cargo.lock because
+    # reqwest/hyper transitively depend on h2. The fix requires h2 >=0.4.16.
+    # REMOVE once #368 lands with a compatible h2 update.
+    "RUSTSEC-2026-0258", # h2 unbounded empty DATA frames
+
+    # lru 0.16.4 (use-after-free in pop()). Reachable via alloy -> alloy-provider.
+    # No fix available: alloy 1.7.3 pins alloy-provider which uses lru 0.16.4.
+    # The lru 0.12.5 advisory (RUSTSEC-2026-0253) is also present (via aws-sdk-s3)
+    # but that was fixed by reverting aws-sdk-s3 upgrade (we kept the older version
+    # to avoid the h2 issue). REMOVE once alloy updates its lru dependency.
+    "RUSTSEC-2026-0253", # lru use-after-free (both 0.12.5 and 0.16.4)
 ]

@@ -12,6 +12,18 @@ use std::process::Stdio;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// A (oid, path) pair for a git object reachable in the repo walk.
+type ObjectPath = (String, String);
+
+/// Four sets derived from one walk: allowed blobs, allowed trees, all blob OIDs,
+/// all tree OIDs.
+type BlobTreeSets = (
+    HashSet<String>,
+    HashSet<String>,
+    HashSet<String>,
+    HashSet<String>,
+);
+
 /// Fixed budget bounding the whole withheld-blob classification walk (#174 U3).
 /// The walk is fast for a real repo; this bound exists to reap a hung or
 /// pathologically slow git child so it cannot pin a served-git permit (the read
@@ -494,6 +506,122 @@ fn blob_paths(repo_path: &Path, git_bin: &str, timeout: Duration) -> Result<Vec<
     Ok(out.into_iter().collect())
 }
 
+/// All reachable blob and tree OIDs with their paths, derived from one bounded
+/// walk. Returns `(blob_paths, tree_paths)` where each is a `Vec<ObjectPath>`.
+/// Used to derive both allowed blobs and allowed trees from a single walk, so
+/// the two sets are consistent and the walk cost is paid only once.
+fn all_object_paths(
+    repo_path: &Path,
+    git_bin: &str,
+    deadline: Instant,
+) -> Result<(Vec<ObjectPath>, Vec<ObjectPath>)> {
+    assert_all_refs_are_commits(repo_path, git_bin, deadline)?;
+
+    let head_resolves = run_bounded_git(
+        git_bin,
+        &["rev-parse", "--verify", "HEAD"],
+        repo_path,
+        b"",
+        deadline,
+    )
+    .is_ok();
+    let mut rev_args = vec!["rev-list", "--all"];
+    if head_resolves {
+        rev_args.push("HEAD");
+    }
+    let commits_out = run_bounded_git(git_bin, &rev_args, repo_path, b"", deadline)?;
+    let commits_stdout = String::from_utf8_lossy(&commits_out);
+    let mut blob_set: HashSet<(String, String)> = HashSet::new();
+    let mut tree_set: HashSet<(String, String)> = HashSet::new();
+    // Phase 1: enumerate objects from ls-tree per commit (gives paths).
+    for commit in commits_stdout.lines() {
+        let commit = commit.trim();
+        if commit.is_empty() {
+            continue;
+        }
+        let listing_out = run_bounded_git(
+            git_bin,
+            &["ls-tree", "-rz", commit],
+            repo_path,
+            b"",
+            deadline,
+        )?;
+        let Ok(listing_stdout) = std::str::from_utf8(&listing_out) else {
+            anyhow::bail!(
+                "git ls-tree -rz {commit} returned a non-UTF-8 path; \
+                 refusing to produce a partial (under-withheld) set"
+            );
+        };
+        for record in listing_stdout.split('\0') {
+            let Some((meta, path)) = record.split_once('\t') else {
+                continue;
+            };
+            let mut parts = meta.split_whitespace();
+            let _mode = parts.next();
+            let kind = parts.next();
+            let oid = parts.next();
+            match kind {
+                Some("blob") => {
+                    if let Some(oid) = oid {
+                        blob_set.insert((oid.to_string(), format!("/{path}")));
+                    }
+                }
+                Some("tree") => {
+                    if let Some(oid) = oid {
+                        tree_set.insert((oid.to_string(), format!("/{path}")));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // Phase 2: enumerate ALL reachable objects via cat-file --batch-all-objects.
+    // This catches dangling objects and objects reachable only through non-commit
+    // refs (tags, notes) that ls-tree misses. Objects found only here have no
+    // path, so they are inserted into the OID sets without a path. The allow
+    // filter in allowed_blob_tree_sets_bounded explicitly denies empty-path
+    // entries (unknown provenance), ensuring they never reach a public pin backend.
+    let batch_out = run_bounded_git(
+        git_bin,
+        &[
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectname) %(objecttype)",
+        ],
+        repo_path,
+        b"",
+        deadline,
+    )?;
+    let batch_stdout = String::from_utf8_lossy(&batch_out);
+    for line in batch_stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let oid = match parts.next() {
+            Some(o) => o,
+            None => continue,
+        };
+        let kind = parts.next();
+        match kind {
+            // Only insert if not already present (ls-tree gives path, this
+            // catch-all has no path; prefer the path-annotated entry).
+            Some("blob") if !blob_set.iter().any(|(o, _)| o == oid) => {
+                blob_set.insert((oid.to_string(), String::new()));
+            }
+            Some("tree") if !tree_set.iter().any(|(o, _)| o == oid) => {
+                tree_set.insert((oid.to_string(), String::new()));
+            }
+            _ => {}
+        }
+    }
+    Ok((
+        blob_set.into_iter().collect(),
+        tree_set.into_iter().collect(),
+    ))
+}
+
 /// Blob OIDs the caller may not read. A blob is withheld only if visibility
 /// denies the caller at *every* path the blob appears at; a blob that is also
 /// reachable through an allowed path is sent (its content is public elsewhere).
@@ -610,21 +738,6 @@ pub fn replicable_blob_set(
     owner_did: &str,
 ) -> Result<HashSet<String>> {
     allowed_blob_set_for_caller(repo_path, rules, is_public, owner_did, None)
-}
-
-/// [`replicable_blob_set`] with an injectable `git_bin` and walk `timeout`, for the
-/// fail-closed full-scan pin path on the receive-pack side.
-pub fn replicable_blob_set_bounded(
-    repo_path: &Path,
-    git_bin: &str,
-    timeout: Duration,
-    rules: &[VisibilityRule],
-    is_public: bool,
-    owner_did: &str,
-) -> Result<HashSet<String>> {
-    allowed_blob_set_for_caller_bounded(
-        repo_path, git_bin, timeout, rules, is_public, owner_did, None,
-    )
 }
 
 /// Reachable blob OIDs that visibility ALLOWS `caller` at some path. The
@@ -1150,29 +1263,84 @@ pub fn reachable_commit_tag_oids_bounded(
     Ok(set)
 }
 
-/// Objects safe to replicate, failing closed on blobs (#99). A candidate
-/// replicates iff it is NOT a blob (`all_blob_oids` — commits and trees are
-/// structural, never content-withheld) OR it is in `allowed_blobs` (reachable
-/// and visibility-allowed). This drops both withheld reachable blobs and
-/// dangling/unreachable blobs the reachable walk never classified, without
-/// tagging the candidate list with per-object types. Used on the full-scan pin
-/// path, where the candidate set can contain dangling objects the reachable-only
-/// withheld set cannot cover; the delta path keeps `replicable_objects`.
+/// Both the allowed blob set and the allowed tree set, derived from ONE bounded
+/// walk so the two are consistent and the walk cost is paid only once. Returns
+/// `(allowed_blobs, allowed_trees, all_blob_oids, all_tree_oids)`.
+///
+/// A blob or tree is "allowed" if visibility permits it at *some* reachable
+/// path; a tree reachable at both an allowed and denied path is allowed (its
+/// metadata is public elsewhere). Commits and tags are not classified here —
+/// the caller decides per type whether the allow-set applies.
+pub fn allowed_blob_tree_sets_bounded(
+    repo_path: &Path,
+    git_bin: &str,
+    deadline: Instant,
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+) -> Result<BlobTreeSets> {
+    let (blob_pairs, tree_pairs) = all_object_paths(repo_path, git_bin, deadline)?;
+    let all_blob_oids: HashSet<String> = blob_pairs.iter().map(|(oid, _)| oid.clone()).collect();
+    let all_tree_oids: HashSet<String> = tree_pairs.iter().map(|(oid, _)| oid.clone()).collect();
+    let mut allowed_blobs = HashSet::new();
+    for (oid, path) in &blob_pairs {
+        // Empty path means unknown provenance (cat-file catch-all with no
+        // ls-tree match). Deny rather than letting it fall through to the
+        // repo-wide default — an unclassified object must not enter a public
+        // pin backend.
+        if !path.is_empty()
+            && visibility_check(rules, is_public, owner_did, None, path) == Decision::Allow
+        {
+            allowed_blobs.insert(oid.clone());
+        }
+    }
+    let mut allowed_trees = HashSet::new();
+    for (oid, path) in &tree_pairs {
+        if !path.is_empty()
+            && visibility_check(rules, is_public, owner_did, None, path) == Decision::Allow
+        {
+            allowed_trees.insert(oid.clone());
+        }
+    }
+    Ok((allowed_blobs, allowed_trees, all_blob_oids, all_tree_oids))
+}
+
+/// Objects safe to replicate, failing closed on blobs (#99) and denied trees
+/// (#172). A candidate replicates iff:
+/// - it is a commit (structural metadata, always safe), OR
+/// - it is a blob AND is in `allowed_blobs` (reachable and visibility-allowed), OR
+/// - it is a tree AND is in `allowed_trees` (reachable and visibility-allowed).
+///
+/// This drops withheld blobs, withheld trees, and dangling/unreachable objects.
+/// Used on the full-scan pin path, where the candidate set can contain objects
+/// the reachable-only withheld set cannot cover; the delta path keeps
+/// `replicable_objects`.
 pub fn replicable_objects_fail_closed(
     candidates: Vec<String>,
     allowed_blobs: &HashSet<String>,
     all_blob_oids: &HashSet<String>,
+    allowed_trees: &HashSet<String>,
+    all_tree_oids: &HashSet<String>,
 ) -> Vec<String> {
     candidates
         .into_iter()
-        .filter(|oid| !all_blob_oids.contains(oid) || allowed_blobs.contains(oid))
+        .filter(|oid| {
+            if all_blob_oids.contains(oid) {
+                // Blobs: fail closed — only allowed blobs pass.
+                allowed_blobs.contains(oid)
+            } else if all_tree_oids.contains(oid) {
+                // Trees: fail closed — only allowed trees pass (#172).
+                // A denied tree exposes child filenames and blob OIDs even
+                // though the secret content itself is excluded.
+                allowed_trees.contains(oid)
+            } else {
+                // Commits/tags: structural metadata, always safe.
+                true
+            }
+        })
         .collect()
 }
 
-/// For every blob withheld from anonymous, the DIDs allowed to read it: the
-/// owner plus any reader DID that `visibility_check` Allows at some path the
-/// blob appears at. Least-privilege: a reader of one private subtree is not a
-/// recipient of a blob that only lives in another.
 #[cfg(test)]
 pub fn withheld_blob_recipients(
     repo_path: &Path,
@@ -2393,6 +2561,8 @@ esac\n";
             .into_iter()
             .map(String::from)
             .collect();
+        let allowed_trees: HashSet<String> = HashSet::new();
+        let all_trees: HashSet<String> = HashSet::new();
         let candidates = vec![
             "commit1".to_string(),
             "tree1".to_string(),
@@ -2400,7 +2570,13 @@ esac\n";
             "b_secret".to_string(),
             "b_dangling".to_string(),
         ];
-        let got = replicable_objects_fail_closed(candidates, &allowed, &all_blobs);
+        let got = replicable_objects_fail_closed(
+            candidates,
+            &allowed,
+            &all_blobs,
+            &allowed_trees,
+            &all_trees,
+        );
         assert_eq!(
             got,
             vec![
@@ -2483,7 +2659,15 @@ esac\n";
 
         // Full-scan candidate set includes the dangling blob; fail-closed drops it.
         let candidates = vec![dangling_oid.clone(), public_oid.clone()];
-        let replicable = replicable_objects_fail_closed(candidates, &allowed, &all_blobs);
+        let allowed_trees: HashSet<String> = HashSet::new();
+        let all_trees: HashSet<String> = HashSet::new();
+        let replicable = replicable_objects_fail_closed(
+            candidates,
+            &allowed,
+            &all_blobs,
+            &allowed_trees,
+            &all_trees,
+        );
         assert!(
             !replicable.contains(&dangling_oid),
             "#99: a dangling private blob must not replicate"

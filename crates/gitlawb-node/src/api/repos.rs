@@ -149,17 +149,17 @@ async fn fail_closed_full_scan_objects(
         // this push rather than the previous silent ~2x hold; size the budget so both
         // phases normally fit.
         let deadline = std::time::Instant::now() + timeout;
-        let allowed = crate::git::visibility_pack::replicable_blob_set_bounded(
-            &disk_path,
-            &git_bin,
-            deadline.saturating_duration_since(std::time::Instant::now()),
-            &rules,
-            is_public,
-            &owner_did,
-        )?;
-        let all_blobs = crate::git::push_delta::all_blob_oids(&disk_path, &git_bin, deadline)?;
+        let (allowed, allowed_trees, all_blobs, all_trees) =
+            crate::git::visibility_pack::allowed_blob_tree_sets_bounded(
+                &disk_path,
+                &git_bin,
+                deadline,
+                &rules,
+                is_public,
+                &owner_did,
+            )?;
         Ok(crate::git::visibility_pack::replicable_objects_fail_closed(
-            candidates, &allowed, &all_blobs,
+            candidates, &allowed, &all_blobs, &allowed_trees, &all_trees,
         ))
     })
     .await
@@ -1403,6 +1403,7 @@ async fn pin_new_objects_gated(
         db,
         repo_id,
         batch_budget,
+        None,
     )
     .await
 }
@@ -1471,7 +1472,14 @@ async fn pin_and_encrypt_objects(
                 &ctx.db,
                 repo_id,
                 &node_seed,
+                // The real git, not `ctx.git_bin`: tests point that at a fake
+                // walk git, and the seal reads must run the real one.
+                "git",
+                crate::ipfs_pin::PIN_BATCH_BUDGET,
                 &recipients,
+                // Push path: recipients derived at admission under a write lease,
+                // no sweep-style snapshot to fence (see PolicyFence's doc).
+                None,
             )
             .await;
 
@@ -2731,6 +2739,9 @@ async fn post_receive_replication_tail(
                         &db_clone,
                         &repo_id,
                         crate::ipfs_pin::PIN_BATCH_BUDGET,
+                        // Push path: no sweep-style batch snapshot to fence (see
+                        // PolicyFence's doc).
+                        None,
                     )
                     .await,
                 )

@@ -1,0 +1,1703 @@
+use rand::Rng;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::watch;
+
+use crate::config::Config;
+use crate::db::Db;
+
+/// How often to run a sweep pass.
+const SWEEP_INTERVAL_SECS: u64 = 3600;
+
+/// Maximum repos to process per pass — prevents the sweep from becoming
+/// the O(repos) amplification the admission-control work exists to prevent.
+const REPOS_PER_PASS: usize = 100;
+
+/// Maximum objects to pin per backend per repo in a single pass — prevents one
+/// large repo from monopolizing the blocking pool or the hourly budget. Applied
+/// after filtering out already-pinned objects so the cap reflects actual work.
+const MAX_OBJECTS_PER_REPO: usize = 50_000;
+
+/// Per-repo deadline for the blocking git scan (list_all_objects + visibility
+/// filter).  A pathological repo that stalls past this is skipped for the pass.
+const REPO_SCAN_DEADLINE: Duration = Duration::from_secs(300);
+
+/// Per-repo deadline for the pinning phase (IPFS + Pinata uploads).  An
+/// unavailable backend that stalls per-object must not hold the sweep for
+/// the entire backlog; this bounds the wall time of each pinning PHASE.
+///
+/// The phases do NOT share one budget (R2-P3): the scan, the mid-scan
+/// visibility re-filter, the per-backend pin-boundary authorization
+/// re-derivation, the withheld-blob walk, and each pin/seal phase each get
+/// their own `REPO_SCAN_DEADLINE` / `PIN_PHASE_DEADLINE`. A repo's worst case
+/// is therefore ADDITIVE, up to ~30min in pathological conditions (scan 5m +
+/// mid-scan re-filter 5m + authz re-derivation 5m + withheld walk 5m + public
+/// pin 5m + encrypted seal 5m), not bounded at a single deadline. That is a
+/// deliberate trade: starving a later phase of the budget the scan consumed
+/// would silently disable the authorization check or the recovery-copy seal
+/// for exactly the large repos the sweep exists for. The sweep runs hourly
+/// and each phase is still individually bounded, so a pathological repo delays
+/// other repos by at most that phase, not the hour.
+const PIN_PHASE_DEADLINE: Duration = Duration::from_secs(300);
+
+/// node_state key under which the sweep's keyset cursor is persisted across
+/// restarts (R2-P1).
+const CURSOR_KEY: &str = "reconciliation_sweep_cursor";
+
+/// Whether the sweep should spawn given the current configuration.
+/// Extracted for testing — test both directions independently.
+fn should_spawn(config: &Config) -> bool {
+    if !config.reconciliation_sweep {
+        return false;
+    }
+    !config.ipfs_api.is_empty() || !config.pinata_jwt.is_empty()
+}
+
+/// Spawn the periodic reconciliation sweep background task.
+/// No-op when neither IPFS nor Pinata is configured, or when
+/// `reconciliation_sweep` is disabled. Returns `true` when the worker was
+/// actually spawned so the caller can gate its own "worker started" logging.
+pub fn spawn(
+    db: Arc<Db>,
+    config: Arc<Config>,
+    http_client: Arc<reqwest::Client>,
+    node_keypair: Arc<gitlawb_core::identity::Keypair>,
+    node_did: gitlawb_core::did::Did,
+    pin_sem: Arc<tokio::sync::Semaphore>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> bool {
+    if !should_spawn(&config) {
+        tracing::info!(
+            "reconciliation sweep: disabled or neither IPFS nor Pinata configured, skipping spawn"
+        );
+        return false;
+    }
+
+    tokio::spawn(async move {
+        let node_seed = *node_keypair.to_seed();
+        // Resume from the persisted cursor (R2-P1): a node restart must not
+        // re-walk every repo, and the cursor is only ever advanced after a
+        // batch completes, so an interrupted pass resumes where it stopped.
+        let mut cursor: Option<String> = match db.get_node_state(CURSOR_KEY).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(err = %e, "failed to load reconciliation sweep cursor from node_state; starting from scratch");
+                None
+            }
+        };
+
+        // First pass: random delay to desynchronize sweep starts across nodes
+        // on a rolling restart (R1-P3). Subsequent passes use the fixed interval.
+        // Generate the delay before the async block to avoid Send issues with thread_rng.
+        let initial_delay = Duration::from_millis(rand::thread_rng().gen_range(0..60000));
+        let mut first_pass = true;
+
+        loop {
+            // On first pass, wait for the initial random delay before starting
+            if first_pass {
+                tracing::debug!(
+                    delay_ms = initial_delay.as_millis() as u64,
+                    "reconciliation sweep: waiting initial jitter delay"
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(initial_delay) => {}
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            tracing::info!("reconciliation sweep: shutdown signal received during initial delay, exiting");
+                            return;
+                        }
+                    }
+                }
+                first_pass = false;
+            }
+
+            let start = std::time::Instant::now();
+            match run_pass(
+                &db,
+                &config,
+                &http_client,
+                &node_seed,
+                &node_did,
+                &pin_sem,
+                REPO_SCAN_DEADLINE,
+                &mut cursor,
+                &mut shutdown_rx,
+            )
+            .await
+            {
+                Ok((count, gaps, filled)) => {
+                    tracing::info!(
+                        repos = count,
+                        gaps_found = gaps,
+                        gaps_filled = filled,
+                        elapsed_ms = start.elapsed().as_millis() as u64,
+                        "reconciliation sweep pass complete"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "reconciliation sweep pass failed");
+                }
+            }
+
+            if *shutdown_rx.borrow() {
+                tracing::info!("reconciliation sweep: shutdown signal received, exiting");
+                return;
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(SWEEP_INTERVAL_SECS)) => {}
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        tracing::info!("reconciliation sweep: shutdown signal received, exiting");
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    true
+}
+
+/// Re-derive the *allowed* public-object set from fresh rules and intersect it
+/// with the scanned object list. Returns `None` when the re-derivation failed
+/// (caller skips the repo). This is the path-scoped-visibility re-filter that
+/// runs against rules re-fetched after the git scan, so a narrowing made
+/// mid-scan is honored before anything is pinned.
+///
+/// The caller hands an absolute `deadline`; the whole re-derivation
+/// (replicable_blob_set_bounded + all_blob_oids) runs against the remaining
+/// budget rather than granting each git child a fresh timeout. The mid-scan
+/// re-filter and each pin-boundary re-derivation each get their OWN fresh
+/// `REPO_SCAN_DEADLINE` (R2-P1) so a scan that exhausts its own budget cannot
+/// disable the authorization-at-dispatch recheck — the read phase is additive
+/// with the pin phases, documented at `PIN_PHASE_DEADLINE`.
+async fn refilter_public_objects(
+    disk: &std::path::Path,
+    rules: &[crate::db::VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    object_list: Vec<String>,
+    deadline: Instant,
+) -> Option<Vec<String>> {
+    let disk_clone = disk.to_path_buf();
+    let rules_clone = rules.to_vec();
+    let owner_clone = owner_did.to_string();
+
+    match tokio::time::timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+            // The shared deadline spans this whole re-filter
+            // (allowed_blob_tree_sets_bounded), so a slow walk is bounded as a
+            // unit rather than granting each git child a fresh timeout.
+            let (allowed, allowed_trees, all_blobs, all_trees) =
+                crate::git::visibility_pack::allowed_blob_tree_sets_bounded(
+                    &disk_clone,
+                    "git",
+                    deadline,
+                    &rules_clone,
+                    is_public,
+                    &owner_clone,
+                )?;
+            Ok(crate::git::visibility_pack::replicable_objects_fail_closed(
+                object_list,
+                &allowed,
+                &all_blobs,
+                &allowed_trees,
+                &all_trees,
+            ))
+        }),
+    )
+    .await
+    {
+        Ok(Ok(Ok(list))) => Some(list),
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(err = %e, "visibility re-derivation failed");
+            None
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(err = %e, "visibility re-derivation task panicked");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("visibility re-derivation deadline exceeded");
+            None
+        }
+    }
+}
+/// Re-check quarantine AND root visibility immediately before an irreversible
+/// public pin (R1-P1). Returns the fresh repo row plus fresh rules, or `None`
+/// when the pin must be skipped. DB failures are treated as skip (never pin on
+/// a stale allow), so one repo's failure does not abort the pass.
+async fn recheck_public_pin(
+    db: &Db,
+    repo_id: &str,
+    repo_slug: &str,
+) -> Option<(crate::db::RepoRecord, Vec<crate::db::VisibilityRule>)> {
+    match db.is_repo_quarantined(repo_id).await {
+        Ok(true) => {
+            tracing::warn!(repo = %repo_slug, "repo quarantined, skipping pin");
+            return None;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(repo = %repo_slug, err = %e, "quarantine recheck failed, skipping pin");
+            return None;
+        }
+    }
+    let rules = match db.list_visibility_rules(repo_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(repo = %repo_slug, err = %e, "visibility rules re-fetch failed, skipping pin");
+            return None;
+        }
+    };
+    let fresh = match db.get_repo_by_id(repo_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            tracing::warn!(repo = %repo_slug, "repo disappeared from DB, skipping pin");
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(repo = %repo_slug, err = %e, "repo re-fetch failed, skipping pin");
+            return None;
+        }
+    };
+    if !crate::visibility::listable_at_root(&rules, fresh.is_public, &fresh.owner_did, None) {
+        tracing::warn!(repo = %repo_slug, "visibility narrowed, skipping pin");
+        return None;
+    }
+    Some((fresh, rules))
+}
+
+/// Compute the deterministic missing set: `all` minus `done`, sorted so two
+/// passes over the same data yield the same pin order. Not capped here — the
+/// caller applies the cap and logs a truncation warning.
+fn missing_oids(all: &[String], done: &[String]) -> Vec<String> {
+    let done_set: HashSet<&str> = done.iter().map(|s| s.as_str()).collect();
+    let mut missing: Vec<String> = all
+        .iter()
+        .filter(|s| !done_set.contains(s.as_str()))
+        .cloned()
+        .collect();
+    missing.sort();
+    missing
+}
+
+/// Cap a missing set, logging once when it was truncated.
+fn cap_missing(v: Vec<String>, repo_slug: &str, backend: &str) -> Vec<String> {
+    if v.len() > MAX_OBJECTS_PER_REPO {
+        tracing::warn!(
+            repo = %repo_slug,
+            backend,
+            cap = MAX_OBJECTS_PER_REPO,
+            "per-repo missing cap reached, truncating"
+        );
+        let mut v = v;
+        v.truncate(MAX_OBJECTS_PER_REPO);
+        v
+    } else {
+        v
+    }
+}
+
+/// Run one sweep pass. Returns `(repos_scanned, gaps_found, gaps_filled)`.
+///
+/// `repos_scanned` counts every repo actually visited this pass (mirror rows
+/// and hard skips excluded, and the loop stops counting the moment a shutdown
+/// signal breaks the batch), so the returned value never overreports work that
+/// a mid-pass shutdown prevented (R1-P3).
+///
+/// Nine args but grouping them would churn every test caller for no behavioral
+/// gain; the pins each arg names are independently documented at their use.
+/// `rederive_budget` is the budget each authorization-at-dispatch
+/// re-derivation runs against: the mid-scan re-filter and each pin-boundary
+/// re-derivation compute their OWN fresh `Instant::now() + rederive_budget`
+/// (R2-P1), so a scan that exhausts `REPO_SCAN_DEADLINE` cannot starve the
+/// visibility recheck that runs right before anything is pinned. Plumbed
+/// through the signature (rather than read as a module const) so the call-site
+/// wiring is testable.
+#[allow(clippy::too_many_arguments)]
+async fn run_pass(
+    db: &Db,
+    config: &Config,
+    http_client: &reqwest::Client,
+    node_seed: &[u8; 32],
+    node_did: &gitlawb_core::did::Did,
+    pin_sem: &Arc<tokio::sync::Semaphore>,
+    rederive_budget: Duration,
+    cursor: &mut Option<String>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> anyhow::Result<(usize, usize, usize)> {
+    // Keyset pagination over repos ordered by immutable id so the cursor is
+    // robust against insertions, deletions, or updated_at shifts.  The LIMIT
+    // is pushed into the SQL query so the hourly pass does not allocate,
+    // transfer, or deduplicate every repo on every sweep.
+    //
+    // Fetch one EXTRA row as a lookahead (R1-P2): `batch.len() < REPOS_PER_PASS`
+    // is a wrong "final page" proxy when the key space ends on an exact multiple
+    // of the page size — that batch LOOKS full, yet no row follows. With a
+    // lookahead row present, the batch is full for real (more remain); without
+    // it, the batch is the terminal page even at exactly REPOS_PER_PASS rows.
+    let fetched = db
+        .list_all_repos_deduped_stable(cursor.as_deref(), REPOS_PER_PASS as i64 + 1)
+        .await?;
+    let has_more = fetched.len() > REPOS_PER_PASS;
+    let batch: Vec<_> = fetched.into_iter().take(REPOS_PER_PASS).collect();
+
+    if batch.is_empty() {
+        // Covered everything: clear the persisted cursor so the next pass
+        // starts a fresh cycle instead of wedging on a stale key.
+        *cursor = None;
+        db.set_node_state(CURSOR_KEY, None).await?;
+        return Ok((0, 0, 0));
+    }
+
+    // Advance the in-memory cursor now so the next page in this run continues
+    // after this batch; the PERSISTED cursor is only moved once the batch fully
+    // completes below, so an interrupted batch is re-walked on restart.
+    let batch_last = batch.last().unwrap().id.clone();
+    *cursor = Some(batch_last.clone());
+
+    let mut total_gaps_found = 0usize;
+    let mut total_gaps_filled = 0usize;
+    let mut repos_scanned = 0usize;
+    let mut batch_completed = true;
+
+    for repo in &batch {
+        if *shutdown_rx.borrow() {
+            tracing::info!("reconciliation sweep: shutdown signal received mid-pass, exiting");
+            batch_completed = false;
+            break;
+        }
+
+        let repo_slug = format!(
+            "{}/{}",
+            crate::db::normalize_owner_key(&repo.owner_did),
+            repo.name
+        );
+
+        // Mirror rows carry a slash-form id written only by upsert_mirror_repo;
+        // they hardcode is_public = true and replicate no visibility rules, so a
+        // sweep over one would irreversibly publish content that the canonical
+        // gate never admitted (R2-P1). Skip them — the canonical row (if any)
+        // is swept under its own id.
+        if repo.id.contains('/') {
+            tracing::debug!(repo = %repo_slug, "mirror row (no canonical repo), skipping sweep");
+            continue;
+        }
+
+        let disk = PathBuf::from(&repo.disk_path);
+        if !disk.exists() {
+            tracing::warn!(repo = %repo_slug, "disk path missing, skipping");
+            continue;
+        }
+
+        // Counted only once the repo has a real chance of work: mirror rows and
+        // missing-disk rows are hard skips and never count as scanned (R1-P3).
+        repos_scanned += 1;
+
+        // Cheap quarantine pre-check BEFORE the expensive git scan (R1-P3):
+        // a repo quarantined since admission should not burn a full scan just
+        // to be told to skip.
+        match db.is_repo_quarantined(&repo.id).await {
+            Ok(true) => {
+                tracing::warn!(repo = %repo_slug, "repo quarantined, skipping");
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(repo = %repo_slug, err = %e, "quarantine check failed, skipping");
+                continue;
+            }
+        }
+
+        let rules = match db.list_visibility_rules(&repo.id).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(repo = %repo_slug, err = %e, "visibility rules fetch failed, skipping");
+                continue;
+            }
+        };
+
+        if !crate::visibility::listable_at_root(&rules, repo.is_public, &repo.owner_did, None) {
+            continue;
+        }
+
+        // ── Full git scan (bounded) ─────────────────────────────────────
+        // One absolute deadline spans the whole scan. The mandatory visibility
+        // re-filter below runs against its OWN fresh budget (`authz_deadline`),
+        // NOT this spent deadline (R2-P1): a scan that legitimately consumes
+        // its whole budget would otherwise compute a zero remaining duration
+        // for the re-filter, time out immediately, and abort the repo
+        // iteration — permanently skipping exactly the large repos the sweep
+        // exists for. The pin-boundary re-derivations use the same fresh-
+        // budget pattern per backend arm, so no later authorization stage can
+        // be starved by the read phase's consumption.
+        let scan_deadline = Instant::now() + REPO_SCAN_DEADLINE;
+        let disk_clone = disk.clone();
+        let owner_clone = repo.owner_did.clone();
+        let rules_clone = rules.clone();
+        let is_public = repo.is_public;
+
+        let object_list = tokio::time::timeout(
+            scan_deadline.saturating_duration_since(Instant::now()),
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+                let all_objs =
+                    crate::git::push_delta::list_all_objects(&disk_clone, "git", scan_deadline)?;
+                let (allowed, allowed_trees, all_blobs, all_trees) =
+                    crate::git::visibility_pack::allowed_blob_tree_sets_bounded(
+                        &disk_clone,
+                        "git",
+                        scan_deadline,
+                        &rules_clone,
+                        is_public,
+                        &owner_clone,
+                    )?;
+                // Fail closed for blobs and denied trees (#172): the
+                // batch-all-objects enumeration carries dangling commits/trees
+                // from an aborted push, which have no path scoping to fail
+                // closed against. Requiring membership in the reachable object
+                // set keeps their messages, authors, parent links, and
+                // tree/file-name metadata off public pin backends (R2).
+                let reachable = crate::git::push_delta::reachable_object_oids(
+                    &disk_clone,
+                    "git",
+                    scan_deadline,
+                )?;
+                Ok(crate::git::visibility_pack::replicable_objects_fail_closed(
+                    all_objs,
+                    &allowed,
+                    &all_blobs,
+                    &allowed_trees,
+                    &all_trees,
+                )
+                .into_iter()
+                .filter(|oid| reachable.contains(oid))
+                .collect())
+            }),
+        )
+        .await;
+
+        let object_list: Vec<String> = match object_list {
+            Ok(Ok(Ok(list))) => list,
+            Ok(Ok(Err(e))) => {
+                tracing::warn!(repo = %repo_slug, err = %e, "full-scan failed, skipping");
+                continue;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(repo = %repo_slug, err = %e, "full-scan task panicked, skipping");
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!(repo = %repo_slug, "full-scan deadline exceeded, skipping");
+                continue;
+            }
+        };
+
+        if object_list.is_empty() {
+            continue;
+        }
+
+        // Fresh budget for the authorization-at-dispatch re-derivations (R1/R2):
+        // the scan may have legitimately consumed its whole `scan_deadline`, and
+        // reusing that deadline here would compute a zero remaining duration,
+        // return None, and turn an empty `to_pin` into a permanent hourly skip
+        // for exactly the large/slow repos the sweep exists for. This deadline is
+        // deliberately NOT shared with the scan. The mid-scan re-filter and each
+        // backend arm each re-derive against their OWN fresh budget (R2-P1): the
+        // IPFS arm re-derives first, and if two stages shared one budget a large
+        // repo that consumed it on an earlier walk would leave the later stage
+        // silently skipped every pass — empty `to_pin` behind a warn.
+
+        // ── Phase 1: Public-object pinning (IPFS + Pinata) ────────────────
+        // Re-check quarantine AND visibility right now (fresh rules + repo row),
+        // then re-derive the allowed set from those fresh rules so a path-scoped
+        // narrowing made mid-scan is honored before anything is pinned.
+        let (fresh_repo, fresh_rules) = match recheck_public_pin(db, &repo.id, &repo_slug).await {
+            Some(v) => v,
+            None => continue,
+        };
+
+        // Visibility may have narrowed mid-scan with a path-scoped deny.
+        // Recompute the allowed set from fresh rules and intersect it with the
+        // existing object_list. Runs against its OWN fresh `authz_deadline`, NOT
+        // the spent `scan_deadline` (R2-P1): the scan may have consumed the whole
+        // read budget, and a reused deadline computes a zero remaining duration,
+        // times out immediately, and aborts the repo iteration before the pin
+        // phases ever run — permanently skipping exactly the large repos the
+        // durability backstop exists for. The pin-boundary re-derivations below
+        // use the same fresh-budget pattern per backend arm.
+        let authz_deadline = Instant::now() + rederive_budget;
+        let refiltered = refilter_public_objects(
+            &disk,
+            &fresh_rules,
+            fresh_repo.is_public,
+            &fresh_repo.owner_did,
+            object_list,
+            authz_deadline,
+        )
+        .await;
+        let Some(object_list) = refiltered else {
+            tracing::warn!(repo = %repo_slug, "fresh-visibility re-filter failed, skipping");
+            continue;
+        };
+        if object_list.is_empty() {
+            continue;
+        }
+
+        let ipfs_enabled = !config.ipfs_api.is_empty();
+        let pinata_enabled = !config.pinata_jwt.is_empty();
+
+        // IPFS-missing set.  A filter DB error skips only the IPFS gap-fill and
+        // lets the Pinata path still run (R1-P3), instead of dropping the repo.
+        let ipfs_missing: Vec<String> = if ipfs_enabled {
+            match db.filter_ipfs_pinned_oids(&object_list).await {
+                Ok(already) => {
+                    cap_missing(missing_oids(&object_list, &already), &repo_slug, "IPFS")
+                }
+                Err(e) => {
+                    tracing::warn!(repo = %repo_slug, err = %e, "filter_ipfs_pinned_oids failed, IPFS gap-fill skipped this pass");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        let pinata_missing: Vec<String> = if pinata_enabled {
+            match db.filter_pinata_pinned_oids(&object_list).await {
+                Ok(already) => {
+                    cap_missing(missing_oids(&object_list, &already), &repo_slug, "Pinata")
+                }
+                Err(e) => {
+                    tracing::warn!(repo = %repo_slug, err = %e, "filter_pinata_pinned_oids failed, Pinata gap-fill skipped this pass");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Count UNIQUE missing objects across both backends (R1-P3): an object
+        // absent from both must not be counted twice.
+        let mut gap_union: HashSet<&str> = HashSet::new();
+        gap_union.extend(ipfs_missing.iter().map(|s| s.as_str()));
+        gap_union.extend(pinata_missing.iter().map(|s| s.as_str()));
+        let repo_gaps = gap_union.len();
+        if repo_gaps > 0 {
+            total_gaps_found += repo_gaps;
+            crate::metrics::record_reconciliation_gaps_found(repo_gaps as u64);
+        }
+
+        // Re-validate quarantine + visibility IMMEDIATELY before each backend
+        // pin (R1-P1) and re-derive the allowed set from the rules read at that
+        // moment, intersecting it with the to-pin list (R2-P1): for
+        // content-addressed public pins a stale allow is effectively
+        // irreversible, and the pin itself takes time. A path-scoped deny that
+        // landed after the mid-scan refilter (which only checks root listability)
+        // is honored here because the candidates are intersected with the set
+        // allowed under the fresh rules, not just root-gated. Each backend runs
+        // under a PolicyFence captured at ITS dispatch boundary, so a narrow that
+        // lands mid-batch aborts the remaining uploads (R1-P1).
+        //
+        // Acquire the same global pin permit the push path holds (R2-P2): the
+        // sweep's pin loops must not bypass `max_concurrent_pin_tasks`. Acquired
+        // only when there is actual pin work; the scan above holds no permit.
+        // The permit is held across the public pin loops AND the encrypted seal
+        // below (which also writes to IPFS) and dropped at the end of this repo's
+        // iteration.
+        let _pin_permit = if !ipfs_missing.is_empty() || !pinata_missing.is_empty() {
+            let permit = pin_sem.clone().acquire_owned().await?;
+            Some(permit)
+        } else {
+            None
+        };
+        let ipfs_fence = if ipfs_enabled && !ipfs_missing.is_empty() {
+            crate::ipfs_pin::PolicyFence::capture(db, &repo.id).await
+        } else {
+            None
+        };
+        let pinata_fence = if pinata_enabled && !pinata_missing.is_empty() {
+            crate::ipfs_pin::PolicyFence::capture(db, &repo.id).await
+        } else {
+            None
+        };
+
+        let pinned_ipfs: Vec<(String, String)> = if ipfs_enabled && !ipfs_missing.is_empty() {
+            match ipfs_fence {
+                None => {
+                    tracing::warn!(repo = %repo_slug, "IPFS policy-epoch capture failed, skipping");
+                    Vec::new()
+                }
+                Some(fence) => match recheck_public_pin(db, &repo.id, &repo_slug).await {
+                    None => Vec::new(),
+                    Some((fresh_repo, fresh_rules)) => {
+                        let to_pin = match refilter_public_objects(
+                            &disk,
+                            &fresh_rules,
+                            fresh_repo.is_public,
+                            &fresh_repo.owner_did,
+                            ipfs_missing,
+                            Instant::now() + rederive_budget,
+                        )
+                        .await
+                        {
+                            Some(list) => list,
+                            None => {
+                                tracing::warn!(repo = %repo_slug, "IPFS pin-boundary re-derivation failed, skipping");
+                                Vec::new()
+                            }
+                        };
+                        if to_pin.is_empty() {
+                            Vec::new()
+                        } else {
+                            match tokio::time::timeout(
+                                PIN_PHASE_DEADLINE,
+                                crate::ipfs_pin::pin_new_objects(
+                                    &config.ipfs_api,
+                                    &disk,
+                                    "git",
+                                    to_pin,
+                                    db,
+                                    crate::ipfs_pin::PIN_BATCH_BUDGET,
+                                    Some(&fence),
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    tracing::warn!(repo = %repo_slug, "IPFS pin phase timed out after {:?}", PIN_PHASE_DEADLINE);
+                                    Vec::new()
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        } else {
+            Vec::new()
+        };
+
+        let pinned_pinata: Vec<(String, String)> = if pinata_enabled && !pinata_missing.is_empty() {
+            match pinata_fence {
+                None => {
+                    tracing::warn!(repo = %repo_slug, "Pinata policy-epoch capture failed, skipping");
+                    Vec::new()
+                }
+                Some(fence) => match recheck_public_pin(db, &repo.id, &repo_slug).await {
+                    None => Vec::new(),
+                    Some((fresh_repo, fresh_rules)) => {
+                        // Own budget (R2-P1): the IPFS arm above may have
+                        // consumed the whole shared deadline, and a reused
+                        // spent deadline here would silently skip Pinata every
+                        // pass for exactly the large repos this sweep exists
+                        // for.
+                        let to_pin = match refilter_public_objects(
+                            &disk,
+                            &fresh_rules,
+                            fresh_repo.is_public,
+                            &fresh_repo.owner_did,
+                            pinata_missing,
+                            Instant::now() + rederive_budget,
+                        )
+                        .await
+                        {
+                            Some(list) => list,
+                            None => {
+                                tracing::warn!(repo = %repo_slug, "Pinata pin-boundary re-derivation failed, skipping");
+                                Vec::new()
+                            }
+                        };
+                        if to_pin.is_empty() {
+                            Vec::new()
+                        } else {
+                            match tokio::time::timeout(
+                                PIN_PHASE_DEADLINE,
+                                crate::pinata::pin_new_objects(
+                                    http_client,
+                                    &config.pinata_upload_url,
+                                    &config.pinata_jwt,
+                                    &disk,
+                                    "git",
+                                    to_pin,
+                                    db,
+                                    crate::ipfs_pin::PIN_BATCH_BUDGET,
+                                    Some(&fence),
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    tracing::warn!(repo = %repo_slug, "Pinata pin phase timed out after {:?}", PIN_PHASE_DEADLINE);
+                                    Vec::new()
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        } else {
+            Vec::new()
+        };
+
+        // `pin_new_objects` returns only objects whose DB record was written
+        // (R1-P3), so a backend that uploaded bytes but failed to persist is
+        // not counted as "filled". Count UNIQUE objects across both backends
+        // (R2-P3): `gaps_found` is the union of missing OIDs, so an object
+        // pinned to BOTH backends must not count twice against that union.
+        let mut filled_union: HashSet<&String> = HashSet::new();
+        filled_union.extend(pinned_ipfs.iter().map(|(sha, _)| sha));
+        filled_union.extend(pinned_pinata.iter().map(|(sha, _)| sha));
+        let repo_filled = filled_union.len();
+        if repo_filled > 0 {
+            total_gaps_filled += repo_filled;
+            crate::metrics::record_reconciliation_gaps_filled(repo_filled as u64);
+
+            tracing::info!(
+                repo = %repo_slug,
+                ipfs = pinned_ipfs.len(),
+                pinata = pinned_pinata.len(),
+                total = repo_filled,
+                "reconciliation sweep filled public-object gaps"
+            );
+        }
+
+        // ── Phase 2: Encrypted recovery-copy resealing (withheld blobs) ──
+
+        // Fence the encrypted path from the point the recipients are derived:
+        // the withheld-blob walk is long, and `encrypt_and_pin` re-checks the
+        // epoch per blob, so a visibility rule moving mid-walk aborts the seal
+        // loop before a stale recipient set is pinned (R1-P1). Captured BEFORE
+        // the rules recheck below, mirroring the public path (R2-P1): if a rule
+        // change landed between a recheck-first ordering's rule read and this
+        // capture, the change would be baked into the recipient set while the
+        // epoch captured after it already reflected the move — `is_current`
+        // would then report current for the whole seal loop and the fence would
+        // never fire for that narrow.
+        let enc_fence = match crate::ipfs_pin::PolicyFence::capture(db, &repo.id).await {
+            Some(f) => f,
+            None => {
+                tracing::warn!(repo = %repo_slug, "policy-epoch capture failed, skipping encrypted pin");
+                continue;
+            }
+        };
+        // Recheck quarantine AND root visibility before encrypted pinning, using
+        // FRESH repo identity (R1-P2): the batch snapshot may predate a narrow.
+        let (fresh_repo2, fresh_rules2) = match recheck_public_pin(db, &repo.id, &repo_slug).await {
+            Some(v) => v,
+            None => continue,
+        };
+
+        let has_path_scoped = crate::git::visibility_pack::has_path_scoped_rule(&fresh_rules2);
+        if has_path_scoped && ipfs_enabled {
+            let p = disk.clone();
+            let owner = fresh_repo2.owner_did.clone();
+            let r = fresh_rules2.clone();
+            let is_public_2 = fresh_repo2.is_public;
+            let recipients = tokio::time::timeout(
+                REPO_SCAN_DEADLINE,
+                tokio::task::spawn_blocking(move || {
+                    crate::git::visibility_pack::withheld_blob_recipients_bounded(
+                        &p,
+                        "git",
+                        REPO_SCAN_DEADLINE,
+                        &r,
+                        is_public_2,
+                        &owner,
+                    )
+                }),
+            )
+            .await;
+
+            let rec = match recipients {
+                Ok(Ok(Ok(rec))) => rec,
+                Ok(Ok(Err(e))) => {
+                    tracing::warn!(
+                        repo = %repo_slug, err = %e,
+                        "withheld_blob_recipients failed, skipping encrypted pin"
+                    );
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        repo = %repo_slug, err = %e,
+                        "withheld_blob_recipients task panicked, skipping encrypted pin"
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        repo = %repo_slug,
+                        "encrypted recovery deadline exceeded, skipping"
+                    );
+                    continue;
+                }
+            };
+
+            if !rec.is_empty() {
+                // The encrypted seal writes to IPFS too, so it runs under the
+                // same global pin permit as the public loops (R2-P2). Reuse the
+                // permit `_pin_permit` already holds for this repo when the
+                // public phase had gaps; only acquire a fresh one when it did
+                // not. One permit per repo, never two (R2-P1): with
+                // `max_concurrent_pin_tasks = 1` a second acquire here would
+                // wait on the very permit this iteration holds and deadlock the
+                // sweep past its guard timeout.
+                let _enc_permit = match &_pin_permit {
+                    Some(_) => None,
+                    None => Some(pin_sem.clone().acquire_owned().await?),
+                };
+                // Bound the seal+pin work (R1-P2): an unavailable backend must
+                // not hold the sweep past the pin-phase budget.
+                let sealed = tokio::time::timeout(
+                    PIN_PHASE_DEADLINE,
+                    crate::encrypted_pin::encrypt_and_pin(
+                        &config.ipfs_api,
+                        &disk,
+                        db,
+                        &repo.id,
+                        node_seed,
+                        "git",
+                        crate::ipfs_pin::PIN_BATCH_BUDGET,
+                        &rec,
+                        Some(&enc_fence),
+                    ),
+                )
+                .await;
+
+                let sealed: Vec<(String, String)> = match sealed {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::warn!(
+                            repo = %repo_slug,
+                            "encrypted pin phase timed out after {:?}",
+                            PIN_PHASE_DEADLINE
+                        );
+                        Vec::new()
+                    }
+                };
+
+                // Anchor only when something was newly sealed this pass.
+                // This avoids unbounded Irys writes on a timer — repos
+                // with no withheld changes do not re-anchor the manifest.
+                if !sealed.is_empty() && !config.irys_url.is_empty() {
+                    // Bind the manifest to the FRESH repo identity re-fetched at
+                    // the pin boundary (`fresh_repo2`), not the batch snapshot:
+                    // a renamed/ownership-changed repo must not anchor encrypted
+                    // recovery copies under a stale owner (R1-P2).
+                    let owner_short = crate::db::normalize_owner_key(&fresh_repo2.owner_did);
+                    let slug = format!("{}/{}", owner_short, fresh_repo2.name);
+                    let ts = chrono::Utc::now().to_rfc3339();
+                    let node_did_str = node_did.to_string();
+
+                    let manifest = crate::arweave::EncryptedManifest {
+                        repo: &slug,
+                        owner_did: &fresh_repo2.owner_did,
+                        node_did: &node_did_str,
+                        timestamp: &ts,
+                        blobs: &sealed,
+                    };
+                    if let Err(e) = crate::arweave::anchor_encrypted_manifest(
+                        http_client,
+                        &config.irys_url,
+                        &manifest,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            repo = %slug,
+                            err = %e,
+                            "encrypted manifest anchor failed (will retry next pass)"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Persist the cursor only when the WHOLE batch completed. If shutdown
+    // interrupted us, leave the persisted cursor at the previous batch's end so
+    // the next run re-walks the unprocessed tail (R2-P1, R1-P3).
+    if batch_completed {
+        // A terminal page (no lookahead row) means the whole key space is
+        // covered: clear the cursor now so the next tick starts a fresh cycle
+        // instead of burning one pass on an empty batch. The lookahead is what
+        // distinguishes "full because more remain" from "full because the key
+        // space ends on an exact page boundary" (R1-P2).
+        if !has_more {
+            *cursor = None;
+            if let Err(e) = db.set_node_state(CURSOR_KEY, None).await {
+                tracing::warn!(err = %e, "failed to clear reconciliation sweep cursor on final page");
+            }
+        } else if let Err(e) = db.set_node_state(CURSOR_KEY, Some(&batch_last)).await {
+            tracing::warn!(err = %e, "failed to persist reconciliation sweep cursor");
+        }
+    }
+
+    Ok((repos_scanned, total_gaps_found, total_gaps_filled))
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::watch;
+
+    /// Build a minimal Config with both IPFS and Pinata fields empty so the
+    /// spawn() gate fires and the function returns without touching the DB.
+    fn empty_pin_config() -> std::sync::Arc<crate::config::Config> {
+        // Config derives clap::Parser; supply only argv[0] (the program name)
+        // so all fields get their defaults (ipfs_api = "", pinata_jwt = "").
+        let cfg = <crate::config::Config as clap::Parser>::parse_from(["gitlawb-node-test"]);
+        std::sync::Arc::new(cfg)
+    }
+
+    /// Build a config with IPFS API set so the gate fires the other way.
+    fn ipfs_config() -> std::sync::Arc<crate::config::Config> {
+        let cfg = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            "http://127.0.0.1:5001",
+        ]);
+        std::sync::Arc::new(cfg)
+    }
+
+    #[test]
+    fn should_spawn_false_when_both_empty() {
+        let cfg = empty_pin_config();
+        assert!(!super::should_spawn(&cfg));
+    }
+
+    #[test]
+    fn should_spawn_true_when_ipfs_set() {
+        let cfg = ipfs_config();
+        assert!(super::should_spawn(&cfg));
+    }
+
+    #[test]
+    fn should_spawn_true_when_pinata_set() {
+        let cfg = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--pinata-jwt",
+            "test-jwt",
+        ]);
+        assert!(super::should_spawn(&cfg));
+    }
+
+    #[test]
+    fn should_spawn_false_when_sweep_disabled() {
+        let cfg = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            "http://127.0.0.1:5001",
+            "--reconciliation-sweep",
+            "false",
+        ]);
+        assert!(!super::should_spawn(&cfg));
+    }
+
+    /// spawn() must return `false` (and not spawn a task, touch the DB, or
+    /// panic) when neither IPFS nor Pinata is configured. This proves the gate
+    /// branch at the top of spawn() is actually reachable and observable.
+    #[tokio::test]
+    async fn test_spawn_gate_skips_when_no_pin_backends_configured() {
+        let config = empty_pin_config();
+        assert!(config.ipfs_api.is_empty(), "ipfs_api should be empty");
+        assert!(config.pinata_jwt.is_empty(), "pinata_jwt should be empty");
+
+        // Use a dummy Db built from a disconnected pool; spawn() must not
+        // reach any code that would touch it.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgresql://localhost/gitlawb_test_nonexistent")
+            .unwrap();
+        let db = std::sync::Arc::new(crate::db::Db::for_testing(pool));
+        let http = std::sync::Arc::new(reqwest::Client::new());
+        let kp = std::sync::Arc::new(gitlawb_core::identity::Keypair::generate());
+        let node_did = kp.did();
+        let (_tx, rx) = watch::channel(false);
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        // spawn() should return false synchronously (no tokio::spawn) and never
+        // await the DB.  The test completes without timeout == gate is live.
+        assert!(
+            !super::spawn(db, config, http, kp, node_did, pin_sem, rx),
+            "gated spawn must report it did not start a worker"
+        );
+    }
+
+    /// spawn() returns true and starts a worker when a backend is configured;
+    /// the caller uses that to gate its own "worker started" logging.
+    #[tokio::test]
+    async fn test_spawn_returns_true_when_ipfs_configured() {
+        let config = ipfs_config();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgresql://localhost/gitlawb_test_nonexistent")
+            .unwrap();
+        let db = std::sync::Arc::new(crate::db::Db::for_testing(pool));
+        let http = std::sync::Arc::new(reqwest::Client::new());
+        let kp = std::sync::Arc::new(gitlawb_core::identity::Keypair::generate());
+        let node_did = kp.did();
+        let (_tx, rx) = watch::channel(false);
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        assert!(
+            super::spawn(db, config, http, kp, node_did, pin_sem, rx),
+            "configured spawn must report it started a worker"
+        );
+    }
+
+    /// The missing set must be deterministic, which is what makes the sweep's
+    /// per-repo pin order reproducible across passes. The cap is applied by
+    /// `cap_missing` at the call site, so `missing_oids` stays uncapped.
+    #[test]
+    fn missing_oids_is_deterministic() {
+        let all = vec![
+            "c".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+            "d".to_string(),
+        ];
+        let done = vec!["b".to_string()];
+
+        let first = super::missing_oids(&all, &done);
+        let second = super::missing_oids(&all, &done);
+        assert_eq!(first, second, "missing set must be deterministic");
+        assert_eq!(
+            first,
+            vec!["a".to_string(), "c".to_string(), "d".to_string()]
+        );
+    }
+
+    /// Constant smoke-check kept as a compile-time tripwire.
+    #[test]
+    fn sweep_interval_constant_is_nonzero() {
+        assert_ne!(super::SWEEP_INTERVAL_SECS, 0);
+    }
+
+    // ── run_pass integration tests ────────────────────────────────────────
+
+    /// Minimal git repo builder (mirrors push_delta's test helper).
+    struct Repo {
+        _td: tempfile::TempDir,
+        path: std::path::PathBuf,
+    }
+
+    impl Repo {
+        fn new() -> Self {
+            let td = tempfile::TempDir::new().unwrap();
+            let path = td.path().to_path_buf();
+            let r = Repo { _td: td, path };
+            r.git(&["init", "-q", "-b", "main"]);
+            r.git(&["config", "user.email", "t@t"]);
+            r.git(&["config", "user.name", "t"]);
+            r
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&self.path)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        fn commit_file(&self, name: &str, body: &str) -> String {
+            std::fs::write(self.path.join(name), body).unwrap();
+            self.git(&["add", name]);
+            self.git(&["commit", "-qm", &format!("add {name}")]);
+            self.git(&["rev-parse", "HEAD"])
+        }
+    }
+
+    fn seed_repo(owner: &str, name: &str, disk_path: &str) -> crate::db::RepoRecord {
+        let now = chrono::Utc::now();
+        crate::db::RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            owner_did: owner.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: disk_path.to_string(),
+            forked_from: None,
+            machine_id: None,
+        }
+    }
+
+    /// The sweep must repair an IPFS durability gap end to end: a public repo
+    /// whose objects were never pinned gets every reachable blob pinned and
+    /// recorded (R2-P2 "test the behavior the PR exists to change").
+    #[sqlx::test]
+    async fn sweep_fills_ipfs_gap_and_persists_cursor(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        let repo_on_disk = Repo::new();
+        repo_on_disk.commit_file("a.txt", "public blob\n");
+
+        let rec = seed_repo(
+            "did:key:zSweepOwner",
+            "sweep-repo",
+            &repo_on_disk.path.display().to_string(),
+        );
+        db.create_repo(&rec).await.unwrap();
+
+        // Mock IPFS: every /api/v0/add returns a fixed CID. mockito's unified
+        // matcher compares the full "path?query" target, so the query string
+        // pin_git_object appends must be part of the mock path.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
+            .expect_at_least(1)
+            .with_status(200)
+            .with_body(r#"{"Hash":"QmSweepMockCid"}"#)
+            .create_async()
+            .await;
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            &server.url(),
+        ]);
+
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let (_tx, mut rx) = watch::channel(false);
+        let mut cursor = None;
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        let (scanned, gaps, filled) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(scanned, 1, "one repo scanned");
+        assert!(gaps >= 1, "at least one missing blob found");
+        assert_eq!(
+            filled, gaps,
+            "every found gap is filled in a clean mock-backed run"
+        );
+        _m.assert_async().await;
+
+        // The recorded pin makes the blob "already done" on the next pass.
+        let blob = repo_on_disk.git(&["rev-parse", "HEAD:a.txt"]);
+        assert!(
+            db.has_ipfs_cid(&blob).await.unwrap(),
+            "pinned CID must be recorded and classified as IPFS-pinned"
+        );
+
+        // Cursor cleared on a short final page (R2-P1): with one repo the batch
+        // is the whole key space, so persisting `batch_last` would just force an
+        // empty tail pass next tick that scans nothing and then clears. Clearing
+        // now means the next pass starts a fresh cycle immediately.
+        let persisted = db.get_node_state(super::CURSOR_KEY).await.unwrap();
+        assert!(
+            persisted.is_none(),
+            "cursor must be cleared after a fully-completed short final page"
+        );
+        assert!(
+            cursor.is_none(),
+            "in-memory cursor follows the persisted one"
+        );
+
+        // Second pass: no gaps remain.
+        let (_, gaps2, filled2) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(gaps2, 0, "second pass finds no remaining gaps");
+        assert_eq!(filled2, 0);
+    }
+
+    /// Mirror rows (slash-form id, hardcoded is_public=true, no replicated
+    /// visibility rules) must be skipped entirely: sweeping one would
+    /// irreversibly publish content the canonical gate never admitted (R2-P1).
+    #[sqlx::test]
+    async fn sweep_skips_mirror_rows(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        let repo_on_disk = Repo::new();
+        repo_on_disk.commit_file("secret.txt", "must not be published\n");
+
+        // A mirror row pointing at a real, public-on-disk repo.
+        db.upsert_mirror_repo(
+            "zMirrorOwner",
+            "mirror-repo",
+            &repo_on_disk.path.display().to_string(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            "http://127.0.0.1:1", // unreachable; must never be hit
+        ]);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let (_tx, mut rx) = watch::channel(false);
+        let mut cursor = None;
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        let (scanned, gaps, filled) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(scanned, 0, "mirror row is not scanned");
+        assert_eq!(gaps, 0, "mirror row produces no gaps");
+        assert_eq!(filled, 0, "mirror row is never pinned");
+
+        // Nothing was recorded for the mirror's content.
+        assert!(
+            db.list_pinned_cids().await.unwrap().is_empty(),
+            "no pinned_cids rows may exist after a mirror-only pass"
+        );
+    }
+
+    /// A public repo with a path-scoped deny must NOT have the withheld blob
+    /// pinned in cleartext on a public backend (R2-P1 "must not pin"): the root
+    /// stays listable, so the mid-scan refilter AND the pin-boundary re-derivation
+    /// are the only layers between a narrowed subtree and irreversible public
+    /// publication.
+    #[sqlx::test]
+    async fn sweep_never_pins_withheld_blob_in_cleartext(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        let repo_on_disk = Repo::new();
+        repo_on_disk.commit_file("public.txt", "public content\n");
+        // git needs the parent directory to exist before `git add` of a nested
+        // path; create it, then stage via `git add -A` through the helper.
+        std::fs::create_dir_all(repo_on_disk.path.join("secret")).unwrap();
+        repo_on_disk.commit_file("secret/secret.txt", "must not go public\n");
+
+        // Blob oids, not commit oids: commits are structural and legitimately
+        // pinned publicly, so the must-not-pin assertion must key on the blob
+        // whose content is denied at `secret/secret.txt`.
+        let public_blob = repo_on_disk.git(&["rev-parse", "HEAD:public.txt"]);
+        let secret_blob = repo_on_disk.git(&["rev-parse", "HEAD:secret/secret.txt"]);
+
+        let rec = seed_repo(
+            "did:key:zSweepWithheldOwner",
+            "sweep-withheld",
+            &repo_on_disk.path.display().to_string(),
+        );
+        db.create_repo(&rec).await.unwrap();
+
+        // Path-scoped deny with no readers: anonymous is allowed the repo root
+        // (public) but denied every blob under /secret/**, whose content must
+        // never reach the public pin backends.
+        db.set_visibility_rule(
+            &rec.id,
+            "/secret/**",
+            crate::db::VisibilityMode::B,
+            &[],
+            &rec.owner_did,
+        )
+        .await
+        .unwrap();
+
+        // Mock IPFS: every /api/v0/add returns a fixed CID (matches pin_git_object's
+        // URL, which appends the cid-version/raw-leaves/pin query).
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
+            .with_status(200)
+            .with_body(r#"{"Hash":"QmWithheldMockCid"}"#)
+            .create_async()
+            .await;
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            &server.url(),
+        ]);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let (_tx, mut rx) = watch::channel(false);
+        let mut cursor = None;
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        let (scanned, gaps, filled) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(scanned, 1, "one repo scanned");
+
+        assert!(gaps >= 1, "public blob is a real gap");
+        let _ = filled; // encrypted/sealed copies do not count toward `filled`
+
+        // The public blob is pinned and recorded as IPFS-pinned.
+        assert!(
+            db.has_ipfs_cid(&public_blob).await.unwrap(),
+            "public blob must be pinned in cleartext"
+        );
+
+        // The withheld blob must NOT appear with an IPFS CID -- never pinned in
+        // cleartext. (`has_ipfs_cid` only matches rows with a non-NULL cid, so an
+        // encrypted copy recorded under `encrypted_blobs` cannot satisfy it.)
+        assert!(
+            !db.has_ipfs_cid(&secret_blob).await.unwrap(),
+            "withheld blob must never be pinned to a public backend in cleartext"
+        );
+    }
+
+    /// The final-page proxy must be the lookahead, not `batch.len() < page`
+    /// (R1-P2): a key space ending on an exact page boundary looks "full" yet
+    /// has no following row, so the cursor must be CLEARED, not persisted to a
+    /// nonexistent next page (which would wedge the sweep into empty tail passes
+    /// every tick). REPOS_PER_PASS repos and nothing more must behave exactly
+    /// like one repo.
+    #[sqlx::test]
+    async fn sweep_clears_cursor_on_exact_page_boundary(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        // Exactly one full page of repos, each with a missing disk path (hard
+        // skip, never scanned, so no pinning side effects).
+        let n = super::REPOS_PER_PASS;
+        for i in 0..n {
+            let rec = seed_repo(
+                "did:key:zExactPageOwner",
+                &format!("exact-repo-{i:04}"),
+                &format!("/nonexistent/disk/path-{i:04}"),
+            );
+            db.create_repo(&rec).await.unwrap();
+        }
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            "http://127.0.0.1:1", // unreachable; must never be hit
+        ]);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let (_tx, mut rx) = watch::channel(false);
+        let mut cursor = None;
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        let (scanned, gaps, filled) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(scanned, 0, "missing-disk rows are hard skips, not scans");
+        assert_eq!(gaps, 0);
+        assert_eq!(filled, 0);
+
+        let persisted = db.get_node_state(super::CURSOR_KEY).await.unwrap();
+        assert!(
+            persisted.is_none(),
+            "an exact-page terminal batch must clear the cursor, not persist it \
+             to a nonexistent next page (would wedge every subsequent tick)"
+        );
+        assert!(
+            cursor.is_none(),
+            "in-memory cursor follows the persisted one"
+        );
+    }
+
+    /// R2-P1 regression: with `max_concurrent_pin_tasks = 1` (a semaphore of
+    /// one permit) a repo that has BOTH public gaps AND encrypted seal work must
+    /// still complete. The sweep holds one permit for the whole repo iteration
+    /// and must reuse it for the seal phase; acquiring a SECOND permit for the
+    /// same repo would wait on the very permit this iteration already holds,
+    /// deadlocking the pass past its guard timeout. The run is wrapped in a
+    /// timeout so a regression fails the test instead of hanging it.
+    #[sqlx::test]
+    async fn run_pass_reuses_the_pin_permit_for_the_seal_at_pool_size_one(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        let repo_on_disk = Repo::new();
+        repo_on_disk.commit_file("public.txt", "public content\n");
+        std::fs::create_dir_all(repo_on_disk.path.join("secret")).unwrap();
+        repo_on_disk.commit_file("secret/secret.txt", "must not go public\n");
+
+        let rec = seed_repo(
+            "did:key:zSweepPoolOneOwner",
+            "sweep-pool-one",
+            &repo_on_disk.path.display().to_string(),
+        );
+        db.create_repo(&rec).await.unwrap();
+
+        // Path-scoped deny carrying one reader: yields withheld blobs whose
+        // recipients make the seal phase reachable (the reviewer's probe).
+        let reader = gitlawb_core::identity::Keypair::generate()
+            .did()
+            .to_string();
+        db.set_visibility_rule(
+            &rec.id,
+            "/secret/**",
+            crate::db::VisibilityMode::B,
+            std::slice::from_ref(&reader),
+            &rec.owner_did,
+        )
+        .await
+        .unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
+            .expect_at_least(1)
+            .with_status(200)
+            .with_body(r#"{"Hash":"QmPoolOneMockCid"}"#)
+            .create_async()
+            .await;
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            &server.url(),
+        ]);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let (_tx, mut rx) = watch::channel(false);
+        let mut cursor = None;
+        // Pool size 1: the permit the iteration holds is the only one.
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+
+        let pass = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            super::run_pass(
+                &db,
+                &config,
+                &http,
+                &node_seed,
+                &node_did,
+                &pin_sem,
+                super::REPO_SCAN_DEADLINE,
+                &mut cursor,
+                &mut rx,
+            ),
+        )
+        .await;
+
+        let (scanned, gaps, _filled) = pass
+            .expect("run_pass must complete, not deadlock waiting on its own permit")
+            .expect("run_pass must succeed");
+        assert_eq!(scanned, 1, "one repo scanned");
+        assert!(gaps >= 1, "public blob is a real gap");
+        _m.assert_async().await;
+    }
+
+    /// P2 regression: the mid-scan visibility re-filter must run against a
+    /// FRESH deadline, not the spent `scan_deadline`. A spent deadline computes
+    /// a zero remaining duration, `tokio::time::timeout` fires immediately, and
+    /// the re-filter returns `None` — which `run_pass` turns into a `continue`
+    /// that aborts the repo iteration before any pin work. That permanently
+    /// skips exactly the large repos whose scans fill the read budget, the
+    /// population the durability backstop exists for. This test proves both
+    /// halves of the contract: a spent deadline starves the re-filter, and a
+    /// fresh deadline lets it complete. `run_pass` passes the fresh
+    /// `authz_deadline` at the mid-scan call site.
+    #[tokio::test]
+    async fn refilter_starves_on_spent_deadline_but_runs_on_fresh_deadline() {
+        let repo_on_disk = Repo::new();
+        repo_on_disk.commit_file("a.txt", "public blob\n");
+        let blob = repo_on_disk.git(&["rev-parse", "HEAD:a.txt"]);
+
+        // Empty rules + public repo: the blob is listable at root and passes the
+        // re-derivation when it actually runs.
+        let rules: Vec<crate::db::VisibilityRule> = Vec::new();
+
+        // Spent deadline (the scan consumed its whole budget): the re-filter
+        // times out immediately and returns None — the starvation class the fix
+        // removes. `run_pass` would `continue` on this and never reach the pin
+        // phases.
+        let spent = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let starved = super::refilter_public_objects(
+            &repo_on_disk.path,
+            &rules,
+            true,
+            "did:key:zStarvationOwner",
+            vec![blob.clone()],
+            spent,
+        )
+        .await;
+        assert!(
+            starved.is_none(),
+            "a spent deadline must starve the visibility re-filter (immediate timeout)"
+        );
+
+        // Fresh deadline (the fix's `authz_deadline`): the re-filter runs to
+        // completion and re-passes the blob.
+        let fresh = std::time::Instant::now() + super::REPO_SCAN_DEADLINE;
+        let ran = super::refilter_public_objects(
+            &repo_on_disk.path,
+            &rules,
+            true,
+            "did:key:zStarvationOwner",
+            vec![blob.clone()],
+            fresh,
+        )
+        .await;
+        assert_eq!(
+            ran,
+            Some(vec![blob]),
+            "a fresh deadline must let the visibility re-filter run to completion"
+        );
+    }
+
+    /// P3 wiring: the mid-scan re-filter's FRESH budget must come from the
+    /// `rederive_budget` plumbed through `run_pass`, not a module const computed
+    /// inside it. With a spent budget `run_pass` must skip the repo entirely
+    /// (nothing pinned) — if the mid-scan call site reverted to the fresh
+    /// `scan_deadline`, the repo would get pinned and this assertion fails.
+    #[sqlx::test]
+    async fn run_pass_starves_repo_on_spent_rederive_budget_and_runs_on_fresh(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        let repo_on_disk = Repo::new();
+        repo_on_disk.commit_file("a.txt", "public blob\n");
+
+        let rec = seed_repo(
+            "did:key:zWiringOwner",
+            "sweep-wiring",
+            &repo_on_disk.path.display().to_string(),
+        );
+        db.create_repo(&rec).await.unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
+            .expect_at_least(1)
+            .with_status(200)
+            .with_body(r#"{"Hash":"QmWiringMockCid"}"#)
+            .create_async()
+            .await;
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            &server.url(),
+        ]);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let (_tx, mut rx) = watch::channel(false);
+        let mut cursor = None;
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        // Spent budget: the mid-scan re-filter's `Instant::now() + ZERO` is
+        // already exhausted by the time the scan finishes, so the recheck times
+        // out immediately and run_pass skips the repo — nothing is pinned.
+        let (scanned, gaps, _filled) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            std::time::Duration::ZERO,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(scanned, 1, "repo is scanned before the re-filter");
+        assert_eq!(gaps, 0, "a starved re-filter must not report gaps");
+        assert!(
+            db.list_pinned_cids().await.unwrap().is_empty(),
+            "a spent re-derive budget must leave the repo unpinned (call-site wiring)"
+        );
+
+        // Fresh budget: the same repo now completes — proving the budget really
+        // flows through the call site, not a module const a test cannot hold.
+        let (_scanned, gaps2, _filled2) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(gaps2 >= 1, "fresh budget lets the re-filter find the gap");
+        let blob = repo_on_disk.git(&["rev-parse", "HEAD:a.txt"]);
+        assert!(
+            db.has_ipfs_cid(&blob).await.unwrap(),
+            "fresh re-derive budget must let the sweep record the pin"
+        );
+        _m.assert_async().await;
+    }
+}

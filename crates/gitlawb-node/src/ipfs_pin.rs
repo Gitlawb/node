@@ -1434,6 +1434,59 @@ fn note_legacy_repair_read() {
 /// have to be documented, validated, and kept meaningful.
 pub const PIN_BATCH_BUDGET: Duration = Duration::from_secs(120);
 
+/// A captured per-repo visibility-policy epoch that fences a pin batch.
+///
+/// The reconciliation sweep reads the epoch immediately before dispatching a
+/// pin loop and passes a fence in; the loop re-reads the epoch before every
+/// upload and aborts the batch the moment it moves. A visibility narrow that
+/// lands mid-batch (a rule made private, a repo quarantined) must not let the
+/// remaining pre-authorized objects still go to a public content-addressed
+/// backend — the narrow is a policy change, and dispatching against the stale
+/// snapshot is the exact irreversible-publication class this fence exists for
+/// (R1-P1). `None` (the push path) means "no fence": the push derives its own
+/// object list at admission and holds a write lease, so no sweep-style batch
+/// snapshot crosses the dispatch boundary.
+#[derive(Clone)]
+pub struct PolicyFence {
+    db: crate::db::Db,
+    repo_id: String,
+    epoch: i64,
+}
+
+impl PolicyFence {
+    /// Capture the current policy epoch for `repo_id`. A read failure is a
+    /// skip, not a retry-with-zero: the caller must not dispatch a batch it
+    /// cannot fence (fail closed on a stale allow).
+    pub async fn capture(db: &crate::db::Db, repo_id: &str) -> Option<Self> {
+        match db.repo_policy_epoch(repo_id).await {
+            Ok(epoch) => Some(PolicyFence {
+                db: db.clone(),
+                repo_id: repo_id.to_string(),
+                epoch,
+            }),
+            Err(e) => {
+                tracing::warn!(repo = %repo_id, err = %e, "policy-epoch read failed; not fencing pin batch");
+                None
+            }
+        }
+    }
+
+    /// Whether the repo's policy epoch is unchanged since capture. A read
+    /// failure is treated as "changed": never dispatch on a policy we cannot
+    /// prove current.
+    pub async fn is_current(&self) -> bool {
+        match self.db.repo_policy_epoch(&self.repo_id).await {
+            Ok(epoch) => epoch == self.epoch,
+            Err(_) => false,
+        }
+    }
+
+    /// The repo this fence guards, for log correlation.
+    pub fn repo_id(&self) -> &str {
+        &self.repo_id
+    }
+}
+
 /// The smallest remainder worth starting a bounded git read (or an add) with.
 ///
 /// A 1ms remainder otherwise buys a child spawned already past its deadline, which
@@ -1530,6 +1583,15 @@ pub async fn pin_git_object(
 
     // Kubo returns newline-delimited JSON; we only care about the last object
     // (there's typically just one for a single-file add).
+    //
+    // The response MUST carry a real `Hash`: a misconfigured `GITLAWB_IPFS_API`
+    // (proxy returning HTML, health check on the wrong port, truncated gateway)
+    // can otherwise answer 2xx with no JSON, and falling back to the locally
+    // computed `expected_cid` would record a row for bytes the backend never
+    // stored. The reconciliation sweep trusts `pinned_cids` rows as durability
+    // evidence, so a silent false positive at pin time becomes a permanent blind
+    // spot for the backstop. A missing `Hash` fails the pin rather than recording
+    // a phantom row (mirrors Pinata's `data.cid` check).
     let body = resp
         .text()
         .await
@@ -1541,8 +1603,26 @@ pub async fn pin_git_object(
             let v: serde_json::Value = serde_json::from_str(line).ok()?;
             v["Hash"].as_str().map(|s| s.to_string())
         })
-        .next_back()
-        .unwrap_or(expected_cid.clone());
+        .next_back();
+    let cid = match cid {
+        Some(cid) => {
+            if cid != expected_cid {
+                tracing::warn!(
+                    sha256 = %sha256_hex,
+                    returned = %cid,
+                    expected = %expected_cid,
+                    "IPFS returned a different CID than computed locally (Kubo chunking may differ); recording the backend's answer"
+                );
+            }
+            cid
+        }
+        None => {
+            return Err(anyhow::anyhow!(
+                "IPFS /api/v0/add returned 2xx without a Hash field; refusing to record \
+                 a CID the backend never acknowledged (misconfigured GITLAWB_IPFS_API?)"
+            ));
+        }
+    };
 
     tracing::debug!(sha256 = %sha256_hex, %cid, "pinned git object to IPFS");
     Ok(cid)
@@ -1620,8 +1700,8 @@ pub(crate) fn batch_budget_gate(
 ///   than [`PIN_READ_FLOOR`] left. It is a gate, not a hard ceiling, since a started
 ///   iteration still runs to completion;
 /// - the git read: `store::read_object_bounded` runs under `spawn_blocking` against the
-///   ABSOLUTE batch deadline (not the loop-top remainder, which the `is_pinned` round-trip
-///   sitting between the two would push past it), with SIGTERM-then-SIGKILL
+///   ABSOLUTE batch deadline (not the loop-top remainder, which the `has_ipfs_cid`
+///   round-trip sitting between the two would push past it), with SIGTERM-then-SIGKILL
 ///   process-group teardown, so a hung `git cat-file` costs this batch its remaining
 ///   budget plus one watchdog teardown instead of holding the permit for the child's
 ///   whole lifetime and blocking a runtime worker while it does;
@@ -1665,10 +1745,11 @@ pub(crate) fn batch_budget_gate(
 /// # Truncation semantics
 ///
 /// A batch stopped at the deadline leaves its remaining objects unpinned, and
-/// nothing sweeps them up afterwards. There is no reconciliation pass over
-/// `pinned_cids`; recovery is opportunistic, happening only if some later push
-/// on the repo takes the full-scan fallback (`push_delta::list_all_objects`) and
-/// re-derives the whole object set, which then re-offers the skipped OIDs.
+/// nothing sweeps them up afterwards on the push path; recovery is opportunistic
+/// (a later full-scan push re-offers the skipped OIDs). The reconciliation
+/// sweep is the systematic backstop: when it is enabled and a pin backend is
+/// configured, it re-derives the public object set each pass and fills any
+/// remaining gap.
 ///
 /// The twin in `pinata.rs` is back at parity on everything that bounds or repairs an
 /// object: it runs the same shared budget gate at the top of every iteration, the same
@@ -1699,6 +1780,7 @@ pub async fn pin_new_objects(
     db: &crate::db::Db,
     repo_id: &str,
     batch_budget: Duration,
+    fence: Option<&PolicyFence>,
 ) -> Vec<(String, String)> {
     if ipfs_api.is_empty() {
         return vec![];
@@ -1709,6 +1791,19 @@ pub async fn pin_new_objects(
     let mut pinned = Vec::new();
 
     for (attempted, sha) in object_list.into_iter().enumerate() {
+        // Policy fence (R1-P1): a visibility narrow that lands after the caller
+        // built this batch must abort it before the next irreversible upload.
+        // Checked FIRST so a changed policy costs nothing beyond the read.
+        if let Some(f) = fence {
+            if !f.is_current().await {
+                tracing::warn!(
+                    repo = %f.repo_id,
+                    unattempted = total - attempted,
+                    "visibility policy changed mid-batch; stopping the pin loop"
+                );
+                break;
+            }
+        }
         // Top of the iteration, before any of this object's work: an object is
         // never started with a remainder too small to cover a bounded read's
         // teardown. Consumed as a guard only: the read below runs against the
@@ -1839,7 +1934,7 @@ pub async fn pin_new_objects(
             }
             Ok(false) => {}
             Err(e) => {
-                tracing::warn!(sha = %sha, err = %e, "DB error checking pinned status");
+                tracing::warn!(sha = %sha, err = %e, "DB error checking IPFS pinned status");
                 continue;
             }
         }
@@ -1853,7 +1948,7 @@ pub async fn pin_new_objects(
         // own deadline regardless.
         //
         // The read runs against the ABSOLUTE batch deadline, not against the remainder
-        // measured at the top of the iteration: the `is_pinned` round-trip above sits
+        // measured at the top of the iteration: the `has_ipfs_cid` round-trip above sits
         // between the two, so `Instant::now() + budget_left` would land past `deadline`
         // by however long the DB took, and under a saturated pool that is the dominant
         // term. A slow DB check must not push the read's own bound out.
@@ -1937,6 +2032,24 @@ pub async fn pin_new_objects(
         else {
             break;
         };
+
+        // Dispatch fence (R1-P1): re-read the policy epoch immediately before
+        // the irreversible HTTP POST. The iteration-top check catches a narrow
+        // that landed before work began; THIS check catches a narrow that landed
+        // during the has_ipfs_cid round-trip or the bounded Git read — both of
+        // which can take seconds and during which a quarantine or rule change may
+        // have committed. Without this, stale plaintext can start uploading
+        // under authorization that is no longer current.
+        if let Some(f) = fence {
+            if !f.is_current().await {
+                tracing::warn!(
+                    repo = %f.repo_id,
+                    unattempted = total - attempted,
+                    "visibility policy changed during preparation; aborting IPFS upload"
+                );
+                break;
+            }
+        }
 
         // Pin to IPFS
         match pin_git_object(ipfs_api, &sha, &data, Some(add_timeout)).await {
@@ -2200,7 +2313,7 @@ mod tests {
         endpoint
     }
 
-    /// A sleeping-but-live endpoint. Answers `200` with an empty body after
+    /// A sleeping-but-live endpoint. Answers `200` with a JSON `Hash` after
     /// `delays[i]` for the i-th request it accepts (the last entry repeats), so
     /// a test can make one add slow and the next fast. Drains the full request,
     /// headers plus the declared `Content-Length` body, before sleeping: exactly
@@ -2208,8 +2321,9 @@ mod tests {
     /// a write failure on the client and turn a slow-but-healthy add into a
     /// different failure shape.
     ///
-    /// An empty body is a successful pin: `pin_git_object` falls back to the CID
-    /// it computed from the bytes when the response carries no `Hash`.
+    /// The response carries a real `Hash` because `pin_git_object` now refuses
+    /// to record a CID a 2xx body did not actually acknowledge: a successful
+    /// pin needs `{"Hash":"..."}`, not an empty body.
     async fn delaying_endpoint(delays: Vec<Duration>) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2246,9 +2360,14 @@ mod tests {
                         }
                     }
                     tokio::time::sleep(delay).await;
+                    let body = b"{\"Hash\":\"QmDelayMockCid\"}";
                     let _ = sock
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
+                                .as_bytes(),
+                        )
                         .await;
+                    let _ = sock.write_all(body).await;
                     let _ = sock.flush().await;
                 });
             }
@@ -2335,6 +2454,74 @@ mod tests {
         );
     }
 
+    /// The misconfigured-`GITLAWB_IPFS_API` false positive (P3): a 2xx response
+    /// that carries no `Hash` field (proxy returning HTML, health check on the
+    /// wrong port, truncated gateway) must FAIL the pin, not fall back to the
+    /// locally computed `expected_cid`. Falling back records a `pinned_cids`
+    /// row for bytes the backend never stored, and the reconciliation sweep
+    /// trusts rows as durability evidence — so the false positive becomes a
+    /// permanent blind spot for the backstop. A missing `Hash` must surface as
+    /// an explicit error, never a successful pin.
+    #[tokio::test]
+    async fn pin_git_object_rejects_a_2xx_without_a_hash_field() {
+        let endpoint = empty_ok_endpoint().await;
+        let inner = tokio::time::timeout(
+            Duration::from_secs(30),
+            pin_git_object(&endpoint, "deadbeef", b"some object bytes\n", None),
+        )
+        .await
+        .expect("wedge guard: an immediate empty 200 cannot take 30s");
+        let err = inner.expect_err(
+            "a 2xx without a Hash field must not surface as a successful pin \
+             (would record a phantom pinned_cids row the sweep then trusts)",
+        );
+        assert!(
+            err.to_string().contains("without a Hash field"),
+            "the error must name the missing Hash so operators diagnose the endpoint: {err:#}"
+        );
+    }
+
+    /// A 200 that answers with an empty body and no `Hash` — the exact shape of
+    /// a proxy or health-check endpoint mistaken for a Kubo API.
+    async fn empty_ok_endpoint() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut acc = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        acc.extend_from_slice(&buf[..n]);
+                        if let Some(hdr_end) =
+                            acc.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+                        {
+                            let headers = String::from_utf8_lossy(&acc[..hdr_end]).to_lowercase();
+                            let len: usize = headers
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse().ok())
+                                .unwrap_or(0);
+                            if acc.len() >= hdr_end + len {
+                                break;
+                            }
+                        }
+                    }
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        endpoint
+    }
+
     /// The second unhardened sink, reached from `sync.rs`. Same shape as above.
     #[tokio::test]
     async fn cat_against_silent_endpoint_errors_within_its_own_timeout() {
@@ -2382,6 +2569,7 @@ mod tests {
                 &db,
                 "repo-batch-budget",
                 Duration::from_millis(5500),
+                None,
             ),
         )
         .await
@@ -2449,6 +2637,7 @@ mod tests {
                 &db,
                 "repo-batch-continues",
                 Duration::from_secs(90),
+                None,
             ),
         )
         .await
@@ -2487,6 +2676,7 @@ mod tests {
                 &db,
                 "repo-batch-rejects",
                 Duration::from_secs(60),
+                None,
             ),
         )
         .await
@@ -2584,6 +2774,7 @@ mod tests {
                 &db,
                 "repo-merge-test",
                 Duration::from_secs(2),
+                None,
             ),
         )
         .await
@@ -2671,6 +2862,7 @@ mod tests {
                 &db,
                 "repo-merge-test",
                 Duration::from_millis(1500),
+                None,
             ),
         )
         .await
@@ -2744,6 +2936,7 @@ mod tests {
                 &db,
                 "repo-merge-test",
                 Duration::from_secs(60),
+                None,
             ),
         )
         .await
@@ -2818,6 +3011,7 @@ mod tests {
                 &db,
                 "repo-merge-test",
                 Duration::from_secs(60),
+                None,
             ),
         )
         .await
@@ -2886,6 +3080,7 @@ mod tests {
                 &db,
                 "repo-merge-test",
                 Duration::from_secs(60),
+                None,
             ),
         )
         .await

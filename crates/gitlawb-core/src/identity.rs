@@ -77,6 +77,14 @@ impl Keypair {
 }
 
 /// Verify an Ed25519 signature.
+///
+/// Strict verification: rejects small-order `R` and small-order public keys
+/// (the identity point, and any point of low order). Ordinary `verify` accepts
+/// a signature forged with the identity point as the public key plus
+/// `R = identity, S = 0`, which verifies for *any* message. `identity::verify`
+/// is the shared primitive behind HTTP request authentication, UCANs, and
+/// certificates, so weak-key acceptance is an authentication bypass, not a
+/// malleability nuance.
 pub fn verify(verifying_key: &VerifyingKey, msg: &[u8], sig_bytes: &[u8; 64]) -> Result<()> {
     let sig = Signature::from_bytes(sig_bytes);
     verifying_key
@@ -205,6 +213,38 @@ mod tests {
         assert!(
             result.is_err(),
             "signature from kp1 must not verify under kp2"
+        );
+    }
+
+    /// The identity-point forgery: with public key A = identity, R = identity,
+    /// and S = 0, the equation `[S]B = R + [k]A` holds for every message,
+    /// because `[k]·identity = identity`. Ordinary (non-strict) Ed25519
+    /// verification accepts it, so the shared `verify` primitive must use
+    /// strict verification, which rejects small-order R and public keys.
+    #[test]
+    fn verify_rejects_identity_point_forgery() {
+        use ed25519_dalek::Verifier;
+        // The identity point (0,1) compresses to y = 1 with sign bit 0.
+        let identity = [
+            1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0,
+        ];
+        let vk = VerifyingKey::from_bytes(&identity).expect("identity point is on the curve");
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[..32].copy_from_slice(&identity);
+        let msg = b"arbitrary message the key owner never signed";
+
+        // Prove the forged signature satisfies the ordinary verification
+        // equation, so the strict check below is what actually defends the
+        // boundary (not a signature that was already invalid everywhere).
+        assert!(
+            vk.verify(msg, &Signature::from_bytes(&sig_bytes)).is_ok(),
+            "identity-point forgery must satisfy ordinary verification (this is why strict is needed)"
+        );
+
+        assert!(
+            verify(&vk, msg, &sig_bytes).is_err(),
+            "strict verification must reject the identity-point forgery"
         );
     }
 
