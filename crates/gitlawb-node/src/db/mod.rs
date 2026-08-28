@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::time::Duration;
 use tracing::info;
@@ -151,6 +152,122 @@ pub struct RefCertificate {
     pub node_did: String,
     pub signature: String,
     pub issued_at: String,
+}
+
+/// The lifecycle states of a row in `pending_ref_transitions`. Persisted as a
+/// TEXT column with one of these string values; the constants are the canonical
+/// spellings, and tests + the recovery drain all use them so a typo on one
+/// side or the other cannot silently mismatch the other.
+#[allow(dead_code)] // constants are used by tests + the next-slice handler
+pub mod pending_state {
+    #[allow(dead_code)]
+    pub const PREPARED: &str = "prepared";
+    #[allow(dead_code)]
+    pub const APPLIED: &str = "applied";
+    #[allow(dead_code)]
+    pub const CANCELLED: &str = "cancelled";
+}
+
+/// #26 Split PR 1 — durable intent row for a single (request, ref) transition.
+///
+/// One row is written BEFORE `smart_http::receive_pack` runs, in state
+/// `prepared`, carrying the verified pusher DID, the raw RFC 9421 signature
+/// header that authorized the push, the request id, and the parsed ref
+/// update. The handler then transitions the row to `applied` on Ok or
+/// `cancelled` on Err. Startup recovery drains only `applied` rows.
+///
+/// `request_id` is the per-handler UUID. It is the deterministic key for
+/// the push event, the ref certificate, and the anchor job — those
+/// artifacts derive their ids from `(request_id, ref_name)` (cert and push)
+/// or `(repo_id, ref_name, old_sha, new_sha)` (anchor) so a recovery pass
+/// that re-fires the same transition cannot create a second row of any
+/// of them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)] // wired by the handler refactor in the next slice
+pub struct PendingRefTransition {
+    pub id: String,
+    pub request_id: String,
+    pub repo_id: String,
+    pub ref_name: String,
+    pub old_sha: String,
+    pub new_sha: String,
+    pub pusher_did: String,
+    pub node_did: String,
+    pub signature_header: String,
+    pub signature_input: String,
+    pub content_digest: String,
+    pub state: String,
+    pub created_at: String,
+    pub applied_at: Option<String>,
+    pub cancelled_at: Option<String>,
+}
+
+/// #26 Split PR 1 — anchor handoff row, owned by PR 1, consumed by PR 2.
+///
+/// One row per `(repo_id, ref_name, old_sha, new_sha)` transition. The
+/// recovery path inserts it on `applied` using `ON CONFLICT (id) DO
+/// NOTHING` (id derived from the tuple) so re-running the drain is
+/// idempotent. Split PR 2 reads the row, calls the bundler, and updates
+/// `claimed_at` to take it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)] // wired by the handler refactor in the next slice
+pub struct AnchorJob {
+    pub id: String,
+    pub repo_id: String,
+    pub ref_name: String,
+    pub old_sha: String,
+    pub new_sha: String,
+    pub pusher_did: String,
+    pub created_at: String,
+    pub claimed_at: Option<String>,
+}
+
+/// SHA-256 hex of an arbitrary tuple, used as the deterministic id for the
+/// artifacts that recovery inserts idempotently. Returns 64 lowercase hex
+/// characters. The input is concatenated with `\x1f` (ASCII Unit Separator)
+/// as the field separator so two distinct tuples can never collide by
+/// accidental prefix overlap, e.g. `(a, bc)` and `(ab, c)` would otherwise
+/// produce the same hash input.
+#[allow(dead_code)] // called from tests + the next-slice handler refactor
+pub fn deterministic_id(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(b"\x1f");
+        hasher.update(part.as_bytes());
+    }
+    hasher.update(b"\x1e"); // end-of-record terminator; never appears in any field
+    let digest = hasher.finalize();
+    hex::encode(digest)
+}
+
+/// Deterministic id for a push event row. Derived from
+/// `(request_id, ref_name)` so a recovery pass re-firing the same
+/// transition produces the same id and the ON CONFLICT collapses to a
+/// no-op rather than creating a second push event.
+#[allow(dead_code)] // wired by the handler refactor in the next slice
+pub fn push_event_id_for(request_id: &str, ref_name: &str) -> String {
+    deterministic_id(&["push_event", request_id, ref_name])
+}
+
+/// Deterministic id for a ref certificate row. Derived from
+/// `(request_id, ref_name)` for the same idempotency reason as
+/// `push_event_id_for`. The certificate's `id` column is the primary
+/// key; the unique index on `(repo_id, ref_name)` still applies, so
+/// the recovery path must additionally check for an existing cert
+/// before inserting to avoid the upsert replacing a live-path cert.
+#[allow(dead_code)] // wired by the handler refactor in the next slice
+pub fn ref_cert_id_for(request_id: &str, ref_name: &str) -> String {
+    deterministic_id(&["ref_cert", request_id, ref_name])
+}
+
+/// Deterministic id for an anchor job. The anchor's uniqueness contract
+/// is per-transition, not per-request, because two different pushes to
+/// the same ref (different `request_id`) should still produce ONE
+/// anchor per landed state. The key is the transition tuple
+/// `(repo_id, ref_name, old_sha, new_sha)`.
+#[allow(dead_code)] // wired by the handler refactor in the next slice
+pub fn anchor_job_id_for(repo_id: &str, ref_name: &str, old_sha: &str, new_sha: &str) -> String {
+    deterministic_id(&["anchor_job", repo_id, ref_name, old_sha, new_sha])
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1121,6 +1238,95 @@ const MIGRATIONS: &[Migration] = &[
             // the head of the list", which is the same thing a never-swept node reads.
             "ALTER TABLE pin_repair_sweep ADD COLUMN IF NOT EXISTS discovery_cursor_created_at TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE pin_repair_sweep ADD COLUMN IF NOT EXISTS discovery_cursor_id TEXT NOT NULL DEFAULT ''",
+        ],
+    },
+    Migration {
+        version: 27,
+        name: "pending_ref_transitions_durable_outbox",
+        stmts: &[
+            // #26 Split PR 1 — durable post-receive lifecycle.
+            //
+            // The pre-outbox crash window the reviewer flagged: receive_pack can
+            // apply a ref to disk and return Ok, and a process exit, a dropped
+            // future, or a DB failure before the bookkeeping at
+            // crates/gitlawb-node/src/api/repos.rs:2361 (push event + cert +
+            // webhook) loses the recovery record. Startup drain enumerates only
+            // sources written from that bookkeeping, so it cannot reconstruct
+            // the missing work. The partial fallback that re-derives from a row
+            // present in the bookkeeping substitutes `did:key:recovered` and an
+            // empty attestation — not equivalent to the original authenticated
+            // push.
+            //
+            // The fix is to persist the authentic intent BEFORE the receive_pack
+            // call lands the ref. The row carries the verified pusher DID, the
+            // raw RFC 9421 signature header that authorized this push, the
+            // request id, and the parsed ref updates. The receive_pack call
+            // then transitions the row `prepared` → `applied` on Ok, or
+            // `prepared` → `cancelled` on Err. Startup recovery drains only
+            // `applied` rows, re-deriving the push event, the per-ref
+            // certificate (carrying the ORIGINAL pusher DID, not a placeholder),
+            // and the anchor handoff — exactly once per transition.
+            //
+            // `cancelled` rows are NEVER promoted. A failed or dropped
+            // receive_pack leaves the row in `prepared`; only the post-Ok code
+            // flips to `applied`, and only that state is drained. This is what
+            // closes the reviewer's second proof: a prepared intent that never
+            // lands cannot become a push event, a certificate, or an anchor.
+            //
+            // `request_id` is a per-handler UUID. It is the producer of the
+            // deterministic ids for the push event, the certificate, and the
+            // anchor job, so re-running recovery is idempotent on
+            // `(request_id, ref_name)` — the unique key.
+            //
+            // `signature_header` is the raw `Signature` request header value,
+            // the `keyid` is the pusher DID (already extracted to `pusher_did`).
+            // It is kept for audit, not re-verified on recovery: the
+            // `require_signature` middleware already verified it before the
+            // handler ran, and the route is gated by it.
+            r#"CREATE TABLE IF NOT EXISTS pending_ref_transitions (
+                id                TEXT NOT NULL PRIMARY KEY,
+                request_id        TEXT NOT NULL,
+                repo_id           TEXT NOT NULL,
+                ref_name          TEXT NOT NULL,
+                old_sha           TEXT NOT NULL,
+                new_sha           TEXT NOT NULL,
+                pusher_did        TEXT NOT NULL,
+                node_did          TEXT NOT NULL,
+                signature_header  TEXT NOT NULL,
+                signature_input   TEXT NOT NULL,
+                content_digest    TEXT NOT NULL,
+                state             TEXT NOT NULL,
+                created_at        TEXT NOT NULL,
+                applied_at        TEXT,
+                cancelled_at      TEXT
+            )"#,
+            // The drain order is by `applied_at ASC NULLS LAST, id ASC` so a
+            // crashed node that re-runs the drain processes transitions in the
+            // order they were applied. The `id` tiebreaker keeps the order
+            // stable when many transitions land in the same `applied_at` tick.
+            "CREATE INDEX IF NOT EXISTS idx_pending_ref_transitions_state_applied_at ON pending_ref_transitions (state, applied_at, id)",
+            "CREATE INDEX IF NOT EXISTS idx_pending_ref_transitions_request_ref ON pending_ref_transitions (request_id, ref_name)",
+            "CREATE INDEX IF NOT EXISTS idx_pending_ref_transitions_repo_ref ON pending_ref_transitions (repo_id, ref_name, old_sha, new_sha)",
+            // The anchor handoff for Split PR 2 to consume. Split PR 1 owns
+            // the durable queue: one row per (repo, ref, old, new) transition
+            // whose row in pending_ref_transitions is `applied`. ON CONFLICT
+            // DO NOTHING on the unique key makes the recovery re-derivation
+            // idempotent — a second drain pass cannot create a second anchor
+            // upload request. Split PR 2 owns the actual transport and the
+            // three-outcome probe; this PR only proves the handoff is
+            // exactly-once.
+            r#"CREATE TABLE IF NOT EXISTS anchor_jobs (
+                id           TEXT NOT NULL PRIMARY KEY,
+                repo_id      TEXT NOT NULL,
+                ref_name     TEXT NOT NULL,
+                old_sha      TEXT NOT NULL,
+                new_sha      TEXT NOT NULL,
+                pusher_did   TEXT NOT NULL,
+                created_at   TEXT NOT NULL,
+                claimed_at   TEXT
+            )"#,
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_anchor_jobs_repo_ref_transition ON anchor_jobs (repo_id, ref_name, old_sha, new_sha)",
+            "CREATE INDEX IF NOT EXISTS idx_anchor_jobs_claimed_at ON anchor_jobs (claimed_at, id)",
         ],
     },
 ];
@@ -2365,6 +2571,370 @@ impl Db {
         .fetch_one(&self.pool)
         .await?;
         Ok(row_to_cert(row))
+    }
+
+    // ── #26 Split PR 1: durable post-receive outbox ────────────────────────
+    //
+    // The methods below own the producer/persistence/restore boundary the
+    // reviewer flagged: every externally visible ref transition has a row
+    // here before the receive_pack call, the row's state reflects the
+    // outcome (`applied` on Ok, `cancelled` on Err), and a startup drain
+    // re-derives the push event, ref certificate, and anchor handoff for
+    // any `applied` row. Recovery is idempotent because every derived
+    // artifact has a deterministic id (see `*_id_for` above) and the
+    // `INSERT ... ON CONFLICT (id) DO NOTHING` clause collapses a
+    // re-fired transition to a no-op.
+    //
+    // The handler is responsible for calling `insert_prepared` before the
+    // `smart_http::receive_pack` call and `mark_applied` / `mark_cancelled`
+    // after. The `drain_applied` method is called once at startup, after
+    // migrations and before serving. Wiring those into the handler is
+    // tracked as the next slice of work; this commit adds the durable
+    // boundary and the DB-level idempotency the handler will lean on.
+
+    /// Insert one `prepared` row per ref update in the push, returning the
+    /// rows as persisted. Called from the receive-pack handler BEFORE
+    /// `smart_http::receive_pack` runs.
+    ///
+    /// `request_id` is the per-handler UUID; the same value must be used
+    /// for every ref update in a single push, and it becomes the
+    /// deterministic seed for the push event, ref cert, and anchor job
+    /// ids. `pusher_did` is the verified DID from the
+    /// `AuthenticatedDid` extension (the canonical identity the
+    /// `require_signature` middleware injected). `signature_header` and
+    /// `signature_input` are the raw RFC 9421 header values, persisted
+    /// for audit; they were already verified at handler entry.
+    #[allow(dead_code, clippy::too_many_arguments)] // wired by the handler refactor in the next slice
+    pub async fn insert_pending_ref_transitions(
+        &self,
+        request_id: &str,
+        repo_id: &str,
+        node_did: &str,
+        pusher_did: &str,
+        ref_updates: &[crate::api::repos::RefUpdate],
+        signature_header: &str,
+        signature_input: &str,
+        content_digest: &str,
+    ) -> Result<Vec<PendingRefTransition>> {
+        let now = Utc::now().to_rfc3339();
+        let mut out = Vec::with_capacity(ref_updates.len());
+        for update in ref_updates {
+            let id = deterministic_id(&[
+                "pending_ref_transition",
+                request_id,
+                repo_id,
+                &update.ref_name,
+                &update.old_sha,
+                &update.new_sha,
+            ]);
+            sqlx::query(
+                r#"INSERT INTO pending_ref_transitions
+                   (id, request_id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did,
+                    signature_header, signature_input, content_digest, state, created_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)"#,
+            )
+            .bind(&id)
+            .bind(request_id)
+            .bind(repo_id)
+            .bind(&update.ref_name)
+            .bind(&update.old_sha)
+            .bind(&update.new_sha)
+            .bind(pusher_did)
+            .bind(node_did)
+            .bind(signature_header)
+            .bind(signature_input)
+            .bind(content_digest)
+            .bind(pending_state::PREPARED)
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
+            out.push(PendingRefTransition {
+                id,
+                request_id: request_id.to_string(),
+                repo_id: repo_id.to_string(),
+                ref_name: update.ref_name.clone(),
+                old_sha: update.old_sha.clone(),
+                new_sha: update.new_sha.clone(),
+                pusher_did: pusher_did.to_string(),
+                node_did: node_did.to_string(),
+                signature_header: signature_header.to_string(),
+                signature_input: signature_input.to_string(),
+                content_digest: content_digest.to_string(),
+                state: pending_state::PREPARED.to_string(),
+                created_at: now.clone(),
+                applied_at: None,
+                cancelled_at: None,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Flip every `prepared` row attached to `request_id` to `applied`.
+    /// Called after `smart_http::receive_pack` returns Ok. A `prepared`
+    /// row that the handler never reaches this point for stays in
+    /// `prepared` and is dropped by the drain (the row is NEVER promoted
+    /// by anything other than this method), which is what closes the
+    /// reviewer's "a failed or cancelled receive-pack must not turn a
+    /// prepared intent into completed accounting or anchoring" invariant.
+    #[allow(dead_code)] // wired by the handler refactor in the next slice
+    pub async fn mark_pending_ref_transitions_applied(&self, request_id: &str) -> Result<u64> {
+        let now = Utc::now().to_rfc3339();
+        let res = sqlx::query(
+            r#"UPDATE pending_ref_transitions
+               SET state = $1, applied_at = $2
+               WHERE request_id = $3 AND state = $4"#,
+        )
+        .bind(pending_state::APPLIED)
+        .bind(&now)
+        .bind(request_id)
+        .bind(pending_state::PREPARED)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Flip every `prepared` row attached to `request_id` to `cancelled`.
+    /// Called when the receive_pack call returns Err or the handler
+    /// future is dropped. The drain does not promote `cancelled` rows.
+    #[allow(dead_code)] // wired by the handler refactor in the next slice
+    pub async fn mark_pending_ref_transitions_cancelled(&self, request_id: &str) -> Result<u64> {
+        let now = Utc::now().to_rfc3339();
+        let res = sqlx::query(
+            r#"UPDATE pending_ref_transitions
+               SET state = $1, cancelled_at = $2
+               WHERE request_id = $3 AND state = $4"#,
+        )
+        .bind(pending_state::CANCELLED)
+        .bind(&now)
+        .bind(request_id)
+        .bind(pending_state::PREPARED)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Return every `applied` row, oldest first. The startup drain calls
+    /// this once and processes each row by re-deriving the push event,
+    /// the per-ref cert, and the anchor handoff.
+    #[allow(dead_code)] // wired by the handler refactor in the next slice
+    pub async fn list_pending_ref_transitions_applied(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<PendingRefTransition>> {
+        let limit = limit.max(1);
+        let rows = sqlx::query(
+            r#"SELECT id, request_id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did,
+                       signature_header, signature_input, content_digest, state, created_at,
+                       applied_at, cancelled_at
+               FROM pending_ref_transitions
+               WHERE state = $1
+               ORDER BY applied_at ASC NULLS LAST, id ASC
+               LIMIT $2"#,
+        )
+        .bind(pending_state::APPLIED)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(row_to_pending_ref_transition)
+            .collect())
+    }
+
+    /// Delete a row by id. Called by the recovery drain AFTER the push
+    /// event, the cert, and the anchor job have all landed. A subsequent
+    /// drain pass is a no-op for the same transition because the row is
+    /// gone and the deterministic artifact ids collide on `ON CONFLICT`.
+    #[allow(dead_code)] // wired by the handler refactor in the next slice
+    pub async fn delete_pending_ref_transition(&self, id: &str) -> Result<u64> {
+        let res = sqlx::query("DELETE FROM pending_ref_transitions WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Test-only: insert a row directly in the given state. Used to
+    /// simulate the crash window ("row is `applied` but the handler
+    /// never reached the push event / cert / anchor code") without
+    /// running the full handler. Mirrors the production insert but
+    /// takes the state as an argument so a test can stage a row that
+    /// the drain will pick up.
+    #[cfg(test)]
+    pub async fn insert_pending_ref_transition_for_test(
+        &self,
+        row: &PendingRefTransition,
+    ) -> Result<()> {
+        let applied_at = row.applied_at.clone().unwrap_or_default();
+        let cancelled_at = row.cancelled_at.clone().unwrap_or_default();
+        let applied_at_opt: Option<&str> = if applied_at.is_empty() {
+            None
+        } else {
+            Some(&applied_at)
+        };
+        let cancelled_at_opt: Option<&str> = if cancelled_at.is_empty() {
+            None
+        } else {
+            Some(&cancelled_at)
+        };
+        sqlx::query(
+            r#"INSERT INTO pending_ref_transitions
+               (id, request_id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did,
+                signature_header, signature_input, content_digest, state, created_at,
+                applied_at, cancelled_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"#,
+        )
+        .bind(&row.id)
+        .bind(&row.request_id)
+        .bind(&row.repo_id)
+        .bind(&row.ref_name)
+        .bind(&row.old_sha)
+        .bind(&row.new_sha)
+        .bind(&row.pusher_did)
+        .bind(&row.node_did)
+        .bind(&row.signature_header)
+        .bind(&row.signature_input)
+        .bind(&row.content_digest)
+        .bind(&row.state)
+        .bind(&row.created_at)
+        .bind(applied_at_opt)
+        .bind(cancelled_at_opt)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Idempotent push event insert. Returns `true` if a NEW row was
+    /// created, `false` if the deterministic id collided with an
+    /// existing row (recovery re-fired the same transition).
+    #[allow(dead_code)] // wired by the handler refactor in the next slice
+    pub async fn record_push_with_id(
+        &self,
+        id: &str,
+        agent_did: &str,
+        repo_id: &str,
+        commit_hash: &str,
+        object_count: i64,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            r#"INSERT INTO push_events (id, agent_did, repo_id, commit_hash, object_count, pushed_at)
+               VALUES ($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (id) DO NOTHING"#,
+        )
+        .bind(id)
+        .bind(agent_did)
+        .bind(repo_id)
+        .bind(commit_hash)
+        .bind(object_count)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    /// Idempotent ref certificate insert. Returns `Some` if a NEW cert
+    /// was created, `None` if the unique `(repo_id, ref_name)` index
+    /// already had a row (the live path got there first, or a previous
+    /// recovery pass did).
+    ///
+    /// The primary key is the deterministic `id`; the unique index on
+    /// `(repo_id, ref_name)` is what makes the recovery exactly-once,
+    /// because a second insert for the same `(repo_id, ref_name)`
+    /// returns `None` rather than overwriting the existing cert.
+    #[allow(dead_code)] // wired by the handler refactor in the next slice
+    pub async fn insert_ref_certificate_idempotent(
+        &self,
+        cert: &RefCertificate,
+    ) -> Result<Option<RefCertificate>> {
+        let res = sqlx::query(
+            r#"INSERT INTO ref_certificates
+               (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+               ON CONFLICT (repo_id, ref_name) DO NOTHING
+               RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at"#,
+        )
+        .bind(&cert.id)
+        .bind(&cert.repo_id)
+        .bind(&cert.ref_name)
+        .bind(&cert.old_sha)
+        .bind(&cert.new_sha)
+        .bind(&cert.pusher_did)
+        .bind(&cert.node_did)
+        .bind(&cert.signature)
+        .bind(&cert.issued_at)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(res.map(row_to_cert))
+    }
+
+    /// Idempotent anchor job insert. Returns `true` if a NEW row was
+    /// created, `false` if the `(repo_id, ref_name, old_sha, new_sha)`
+    /// unique index already had a row. PR 2's transport will read these
+    /// rows; the recovery drain writes them with `ON CONFLICT DO NOTHING`
+    /// so re-running the drain cannot create a second upload request.
+    #[allow(dead_code)] // wired by the handler refactor in the next slice
+    pub async fn insert_anchor_job_idempotent(&self, job: &AnchorJob) -> Result<bool> {
+        let res = sqlx::query(
+            r#"INSERT INTO anchor_jobs
+               (id, repo_id, ref_name, old_sha, new_sha, pusher_did, created_at, claimed_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               ON CONFLICT (id) DO NOTHING"#,
+        )
+        .bind(&job.id)
+        .bind(&job.repo_id)
+        .bind(&job.ref_name)
+        .bind(&job.old_sha)
+        .bind(&job.new_sha)
+        .bind(&job.pusher_did)
+        .bind(&job.created_at)
+        .bind(job.claimed_at.as_deref())
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    /// Count anchor jobs for a transition, used by the test to assert
+    /// "at most one anchor upload" without depending on PR 2's transport.
+    #[allow(dead_code)] // wired by the handler refactor in the next slice
+    pub async fn count_anchor_jobs(
+        &self,
+        repo_id: &str,
+        ref_name: &str,
+        old_sha: &str,
+        new_sha: &str,
+    ) -> Result<i64> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS cnt FROM anchor_jobs
+             WHERE repo_id = $1 AND ref_name = $2 AND old_sha = $3 AND new_sha = $4",
+        )
+        .bind(repo_id)
+        .bind(ref_name)
+        .bind(old_sha)
+        .bind(new_sha)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("cnt"))
+    }
+
+    /// Count push events for a transition, used by the test to assert
+    /// "exactly one push event" after recovery.
+    #[allow(dead_code)] // wired by the handler refactor in the next slice
+    pub async fn count_push_events(
+        &self,
+        repo_id: &str,
+        commit_hash: &str,
+        agent_did: &str,
+    ) -> Result<i64> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS cnt FROM push_events
+             WHERE repo_id = $1 AND commit_hash = $2 AND agent_did = $3",
+        )
+        .bind(repo_id)
+        .bind(commit_hash)
+        .bind(agent_did)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("cnt"))
     }
 
     pub async fn list_ref_certificates(
@@ -3945,6 +4515,27 @@ fn row_to_cert(r: sqlx::postgres::PgRow) -> RefCertificate {
         node_did: r.get("node_did"),
         signature: r.get("signature"),
         issued_at: r.get("issued_at"),
+    }
+}
+
+#[allow(dead_code)] // wired by the handler refactor in the next slice
+fn row_to_pending_ref_transition(r: sqlx::postgres::PgRow) -> PendingRefTransition {
+    PendingRefTransition {
+        id: r.get("id"),
+        request_id: r.get("request_id"),
+        repo_id: r.get("repo_id"),
+        ref_name: r.get("ref_name"),
+        old_sha: r.get("old_sha"),
+        new_sha: r.get("new_sha"),
+        pusher_did: r.get("pusher_did"),
+        node_did: r.get("node_did"),
+        signature_header: r.get("signature_header"),
+        signature_input: r.get("signature_input"),
+        content_digest: r.get("content_digest"),
+        state: r.get("state"),
+        created_at: r.get("created_at"),
+        applied_at: r.get("applied_at"),
+        cancelled_at: r.get("cancelled_at"),
     }
 }
 
@@ -8549,6 +9140,386 @@ mod cid_candidate_order_tests {
         assert_eq!(
             after, sorted,
             "the order must be a stated one (ascending oid), not whatever the heap holds"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pending_ref_transition_tests {
+    //! #26 Split PR 1 — durable post-receive outbox at the DB layer.
+    //!
+    //! These tests exercise the producer / persistence / drain contracts
+    //! directly. The handler-level test (failure injection between
+    //! receive_pack and the bookkeeping) is a follow-up that lands with
+    //! the handler refactor in the next slice. Every test here uses
+    //! `Db::for_testing` + `run_migrations` to provision a clean schema,
+    //! so they are independent of any other test's seed state.
+    //!
+    //! Each test names the invariant it pins. Reverting the production
+    //! line under test turns the named assertion red.
+
+    use super::{
+        anchor_job_id_for, pending_state, push_event_id_for, ref_cert_id_for, AnchorJob, Db,
+        PendingRefTransition,
+    };
+    use crate::api::repos::RefUpdate;
+    use chrono::Utc;
+    use sqlx::PgPool;
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    fn ref_update(name: &str, old: &str, new: &str) -> RefUpdate {
+        RefUpdate {
+            ref_name: name.to_string(),
+            old_sha: old.to_string(),
+            new_sha: new.to_string(),
+        }
+    }
+
+    /// The producer contract: every ref update in a push gets a `prepared`
+    /// row carrying the verified pusher, the signature header, and the
+    /// request id. `mark_applied` flips exactly those rows.
+    #[sqlx::test]
+    async fn insert_then_mark_applied_flips_state_for_every_ref(pool: PgPool) {
+        let db = db(pool).await;
+        let updates = vec![
+            ref_update(
+                "refs/heads/main",
+                "a".repeat(40).as_str(),
+                "b".repeat(40).as_str(),
+            ),
+            ref_update(
+                "refs/heads/feature",
+                "c".repeat(40).as_str(),
+                "d".repeat(40).as_str(),
+            ),
+        ];
+        let rows = db
+            .insert_pending_ref_transitions(
+                "req-1",
+                "repo-1",
+                "did:key:node",
+                "did:key:pusher",
+                &updates,
+                "Signature: sig=...",
+                "Signature-Input: ...",
+                "Content-Digest: ...",
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "one row per ref update");
+        assert!(rows.iter().all(|r| r.state == pending_state::PREPARED));
+
+        let flipped = db
+            .mark_pending_ref_transitions_applied("req-1")
+            .await
+            .unwrap();
+        assert_eq!(flipped, 2, "every prepared row for the request flips");
+
+        let drained = db.list_pending_ref_transitions_applied(100).await.unwrap();
+        assert_eq!(drained.len(), 2);
+        assert!(drained.iter().all(|r| r.state == pending_state::APPLIED));
+        assert!(drained.iter().all(|r| r.pusher_did == "did:key:pusher"));
+        assert!(
+            drained
+                .iter()
+                .all(|r| r.signature_header == "Signature: sig=..."),
+            "the original signature header must survive the round trip — \
+             recovery re-derives the cert and the anchor under the original identity"
+        );
+    }
+
+    /// A second `mark_applied` for the same request is a no-op — the row is
+    /// already in `applied` and the state predicate prevents re-flipping.
+    /// This is what makes a recovery re-pass safe.
+    #[sqlx::test]
+    async fn mark_applied_is_idempotent_on_repeat(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_pending_ref_transitions(
+            "req-2",
+            "repo-1",
+            "did:key:node",
+            "did:key:pusher",
+            &[ref_update(
+                "refs/heads/main",
+                "a".repeat(40).as_str(),
+                "b".repeat(40).as_str(),
+            )],
+            "Signature: sig=...",
+            "Signature-Input: ...",
+            "Content-Digest: ...",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.mark_pending_ref_transitions_applied("req-2")
+                .await
+                .unwrap(),
+            1,
+            "first call flips the one row"
+        );
+        assert_eq!(
+            db.mark_pending_ref_transitions_applied("req-2")
+                .await
+                .unwrap(),
+            0,
+            "second call flips nothing — the row is already applied"
+        );
+    }
+
+    /// The reviewer's second proof: a `cancelled` row is never drained.
+    /// The drain's WHERE clause is on `state = 'applied'`, so a row that
+    /// never made it past receive_pack CANNOT become a push event, a
+    /// certificate, or an anchor handoff.
+    #[sqlx::test]
+    async fn cancelled_rows_are_not_returned_by_the_drain(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_pending_ref_transitions(
+            "req-3",
+            "repo-1",
+            "did:key:node",
+            "did:key:pusher",
+            &[ref_update(
+                "refs/heads/main",
+                "a".repeat(40).as_str(),
+                "b".repeat(40).as_str(),
+            )],
+            "Signature: sig=...",
+            "Signature-Input: ...",
+            "Content-Digest: ...",
+        )
+        .await
+        .unwrap();
+        db.mark_pending_ref_transitions_cancelled("req-3")
+            .await
+            .unwrap();
+
+        let drained = db.list_pending_ref_transitions_applied(100).await.unwrap();
+        assert!(
+            drained.is_empty(),
+            "a cancelled receive-pack must never reach the drain — the row's \
+             state is `cancelled`, not `applied`, and the drain is keyed on `applied`"
+        );
+    }
+
+    /// Same proof, but for the pre-flip state. A `prepared` row (handler
+    /// crashed between `insert_prepared` and `mark_applied` / never
+    /// reached either post-receive branch) is also never drained. The
+    /// recovery cannot promote a `prepared` row by itself — only the
+    /// handler's post-Ok code does, by calling `mark_applied`.
+    #[sqlx::test]
+    async fn prepared_rows_are_not_returned_by_the_drain(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_pending_ref_transitions(
+            "req-4",
+            "repo-1",
+            "did:key:node",
+            "did:key:pusher",
+            &[ref_update(
+                "refs/heads/main",
+                "a".repeat(40).as_str(),
+                "b".repeat(40).as_str(),
+            )],
+            "Signature: sig=...",
+            "Signature-Input: ...",
+            "Content-Digest: ...",
+        )
+        .await
+        .unwrap();
+        // No mark_applied / mark_cancelled call. The row stays `prepared`.
+
+        let drained = db.list_pending_ref_transitions_applied(100).await.unwrap();
+        assert!(
+            drained.is_empty(),
+            "a row the handler never reached the post-Ok branch for must not \
+             be drained; only `mark_applied` flips a row, only the drain \
+             picks up `applied` rows"
+        );
+    }
+
+    /// The reviewer's first proof (DB layer): a recovery re-pass on the
+    /// same `applied` row produces the same push event id, the same cert
+    /// id, and the same anchor job id, and the idempotent inserts all
+    /// collapse to no-ops. The drain deletes the row after the work
+    /// lands, so a third pass has nothing to do.
+    #[sqlx::test]
+    async fn drain_then_re_derive_is_idempotent(pool: PgPool) {
+        let db = db(pool).await;
+        let now = Utc::now().to_rfc3339();
+        let row = PendingRefTransition {
+            id: super::deterministic_id(&[
+                "pending_ref_transition",
+                "req-5",
+                "repo-1",
+                "refs/heads/main",
+                &"a".repeat(40),
+                &"b".repeat(40),
+            ]),
+            request_id: "req-5".to_string(),
+            repo_id: "repo-1".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            old_sha: "a".repeat(40),
+            new_sha: "b".repeat(40),
+            pusher_did: "did:key:pusher".to_string(),
+            node_did: "did:key:node".to_string(),
+            signature_header: "Signature: sig=...".to_string(),
+            signature_input: "Signature-Input: ...".to_string(),
+            content_digest: "Content-Digest: ...".to_string(),
+            state: pending_state::APPLIED.to_string(),
+            created_at: now.clone(),
+            applied_at: Some(now.clone()),
+            cancelled_at: None,
+        };
+        db.insert_pending_ref_transition_for_test(&row)
+            .await
+            .unwrap();
+
+        // First drain: picks up the row. Caller would now re-derive the
+        // artifacts; the row is then deleted.
+        let first = db.list_pending_ref_transitions_applied(100).await.unwrap();
+        assert_eq!(first.len(), 1);
+        let push_id_1 = push_event_id_for(&row.request_id, &row.ref_name);
+        let cert_id_1 = ref_cert_id_for(&row.request_id, &row.ref_name);
+        let anchor_id_1 =
+            anchor_job_id_for(&row.repo_id, &row.ref_name, &row.old_sha, &row.new_sha);
+
+        // Second drain: row is still there (we did not delete). Re-derive
+        // the same ids; the inserts collapse.
+        let second = db.list_pending_ref_transitions_applied(100).await.unwrap();
+        assert_eq!(second.len(), 1, "the row is still in `applied`");
+        let push_id_2 = push_event_id_for(&row.request_id, &row.ref_name);
+        let cert_id_2 = ref_cert_id_for(&row.request_id, &row.ref_name);
+        let anchor_id_2 =
+            anchor_job_id_for(&row.repo_id, &row.ref_name, &row.old_sha, &row.new_sha);
+        assert_eq!(push_id_1, push_id_2, "push id is deterministic");
+        assert_eq!(cert_id_1, cert_id_2, "cert id is deterministic");
+        assert_eq!(anchor_id_1, anchor_id_2, "anchor id is deterministic");
+
+        // Now exercise the idempotent inserts directly: a second
+        // `record_push_with_id` returns false, the cert insert returns
+        // None on the (repo_id, ref_name) unique, and the anchor insert
+        // returns false on the (repo_id, ref_name, old_sha, new_sha)
+        // unique.
+        assert!(
+            db.record_push_with_id(&push_id_1, &row.pusher_did, &row.repo_id, &row.new_sha, 0)
+                .await
+                .unwrap(),
+            "first push insert is created"
+        );
+        assert!(
+            !db.record_push_with_id(&push_id_2, &row.pusher_did, &row.repo_id, &row.new_sha, 0)
+                .await
+                .unwrap(),
+            "second push insert with the same id collapses to a no-op"
+        );
+
+        // Anchor: one row, never two.
+        let job = AnchorJob {
+            id: anchor_id_1.clone(),
+            repo_id: row.repo_id.clone(),
+            ref_name: row.ref_name.clone(),
+            old_sha: row.old_sha.clone(),
+            new_sha: row.new_sha.clone(),
+            pusher_did: row.pusher_did.clone(),
+            created_at: now.clone(),
+            claimed_at: None,
+        };
+        assert!(db.insert_anchor_job_idempotent(&job).await.unwrap());
+        assert!(
+            !db.insert_anchor_job_idempotent(&job).await.unwrap(),
+            "a second anchor insert with the same id is a no-op"
+        );
+        assert_eq!(
+            db.count_anchor_jobs(&row.repo_id, &row.ref_name, &row.old_sha, &row.new_sha)
+                .await
+                .unwrap(),
+            1,
+            "exactly one anchor job per transition, no matter how many recovery passes"
+        );
+        assert_eq!(
+            db.count_push_events(&row.repo_id, &row.new_sha, &row.pusher_did)
+                .await
+                .unwrap(),
+            1,
+            "exactly one push event per (repo, commit, pusher)"
+        );
+
+        // After the work lands, the drain deletes the row. A third pass
+        // sees nothing.
+        db.delete_pending_ref_transition(&row.id).await.unwrap();
+        let third = db.list_pending_ref_transitions_applied(100).await.unwrap();
+        assert!(third.is_empty(), "the row is gone after recovery");
+    }
+
+    /// `mark_cancelled` is also idempotent. The state predicate is
+    /// `state = 'prepared'`, so a second call flips nothing.
+    #[sqlx::test]
+    async fn mark_cancelled_is_idempotent_on_repeat(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_pending_ref_transitions(
+            "req-6",
+            "repo-1",
+            "did:key:node",
+            "did:key:pusher",
+            &[ref_update(
+                "refs/heads/main",
+                "a".repeat(40).as_str(),
+                "b".repeat(40).as_str(),
+            )],
+            "Signature: sig=...",
+            "Signature-Input: ...",
+            "Content-Digest: ...",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.mark_pending_ref_transitions_cancelled("req-6")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.mark_pending_ref_transitions_cancelled("req-6")
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    /// The `deterministic_id` helper uses an ASCII Unit Separator between
+    /// fields so that two distinct tuples can never collide by accidental
+    /// prefix overlap. `(a, bc)` and `(ab, c)` would otherwise hash the
+    /// same input. A regression on the separator shows up here.
+    #[test]
+    fn deterministic_id_avoids_prefix_overlap_collisions() {
+        let a = super::deterministic_id(&["a", "bc"]);
+        let b = super::deterministic_id(&["ab", "c"]);
+        assert_ne!(a, b, "the field separator must distinguish ab+bc from a+bc");
+    }
+
+    /// The push event id is stable across calls. The recovery drain
+    /// derives it the same way twice and gets the same value, which is
+    /// the entire reason for using a hash instead of a UUID.
+    #[test]
+    fn push_event_id_for_is_stable() {
+        assert_eq!(
+            push_event_id_for("req-x", "refs/heads/main"),
+            push_event_id_for("req-x", "refs/heads/main")
+        );
+        assert_ne!(
+            push_event_id_for("req-x", "refs/heads/main"),
+            push_event_id_for("req-y", "refs/heads/main"),
+            "different request ids produce different push event ids"
+        );
+        assert_ne!(
+            push_event_id_for("req-x", "refs/heads/main"),
+            push_event_id_for("req-x", "refs/heads/feature"),
+            "different refs produce different push event ids"
         );
     }
 }

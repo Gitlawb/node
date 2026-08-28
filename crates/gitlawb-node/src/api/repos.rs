@@ -3147,10 +3147,10 @@ pub async fn get_icaptcha_proof(
 /// replication tail at the durability boundary while the certificate and webhook
 /// loops below still iterate their own copy (#174 U5).
 #[derive(Clone)]
-struct RefUpdate {
-    old_sha: String,
-    new_sha: String,
-    ref_name: String,
+pub(crate) struct RefUpdate {
+    pub(crate) old_sha: String,
+    pub(crate) new_sha: String,
+    pub(crate) ref_name: String,
 }
 
 /// Parse git receive-pack pkt-line ref updates from the request body.
