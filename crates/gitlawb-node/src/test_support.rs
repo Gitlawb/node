@@ -557,6 +557,35 @@ mod tests {
         );
     }
 
+    /// Fork disk paths must go through `validated_repo_disk_path` so a user-supplied
+    /// name cannot reach `remove_dir_all` on an escaped path (CodeQL path-injection).
+    #[sqlx::test]
+    async fn fork_rejects_name_that_fails_validated_disk_path(pool: PgPool) {
+        let owner = "did:key:zFORKOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        let repo = seed_repo(owner, "fork-src");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/fork",
+                axum::routing::post(crate::api::repos::fork_repo),
+            )
+            .with_state(state.clone());
+        let too_long = "a".repeat(101);
+        let uri = format!("/api/v1/repos/{owner}/fork-src/fork");
+        let body = Body::from(format!(r#"{{"name":"{too_long}"}}"#));
+        let resp = router
+            .oneshot(signed_request_as(owner, Method::POST, &uri, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "fork names that fail validated_repo_disk_path must be rejected before clone"
+        );
+    }
+
     /// N13: the task handlers bind the acting DID to the signer. A caller signed
     /// as B claiming delegator_did A is rejected before any DB write (DB-free).
     #[sqlx::test]

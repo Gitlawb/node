@@ -710,8 +710,7 @@ pub(crate) fn validated_repo_disk_path(
 ) -> Result<PathBuf> {
     validate_path_components(owner_did, repo_name)?;
 
-    let owner_slug = owner_did.replace([':', '/'], "_");
-    let local_path = repos_dir.join(&owner_slug).join(format!("{repo_name}.git"));
+    let local_path = store::repo_disk_path(repos_dir, owner_did, repo_name);
 
     if !local_path.starts_with(repos_dir) {
         anyhow::bail!(

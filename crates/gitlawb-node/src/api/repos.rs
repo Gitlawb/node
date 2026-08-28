@@ -3146,7 +3146,12 @@ pub async fn fork_repo(
         .await
         .map_err(|e| AppError::Git(e.to_string()))?;
 
-    let disk_path = store::repo_disk_path(&state.config.repos_dir, &forker_did, &fork_name);
+    let disk_path = crate::git::repo_store::validated_repo_disk_path(
+        &state.config.repos_dir,
+        &forker_did,
+        &fork_name,
+    )
+    .map_err(|e| AppError::BadRequest(e.to_string()))?;
 
     // Clone the source repo as a mirror
     let output = std::process::Command::new("git")
