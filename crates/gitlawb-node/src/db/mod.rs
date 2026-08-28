@@ -151,6 +151,13 @@ pub struct RefCertificate {
     pub node_did: String,
     pub signature: String,
     pub issued_at: String,
+    /// #26 Split PR 3 — the wire-format version of this cert. v1 is
+    /// the pre-versioning 7-field payload; v2+ will add optional
+    /// fields without breaking the v1 signature path. An old
+    /// client that ignores this field verifies v1 certs; a new
+    /// client that reads a v1 cert reconstructs the v1 payload
+    /// and verifies normally.
+    pub version: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -658,6 +665,11 @@ const MIGRATIONS: &[Migration] = &[
             )"#,
             "CREATE INDEX IF NOT EXISTS idx_arweave_anchors_repo    ON arweave_anchors(repo)",
             "CREATE INDEX IF NOT EXISTS idx_arweave_anchors_new_sha ON arweave_anchors(new_sha)",
+            // ── Cert payload version (PR 3 of #26 split) ─────────────────────
+            // The ref-cert wire format is versioned so future fields can be
+            // added without breaking old clients (which ignore the field)
+            // or old servers (which default the column to 1).
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1",
             // ── Branch protection ────────────────────────────────────────────
             r#"CREATE TABLE IF NOT EXISTS protected_branches (
                 id         TEXT NOT NULL PRIMARY KEY,
@@ -1121,6 +1133,29 @@ const MIGRATIONS: &[Migration] = &[
             // the head of the list", which is the same thing a never-swept node reads.
             "ALTER TABLE pin_repair_sweep ADD COLUMN IF NOT EXISTS discovery_cursor_created_at TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE pin_repair_sweep ADD COLUMN IF NOT EXISTS discovery_cursor_id TEXT NOT NULL DEFAULT ''",
+        ],
+    },
+    Migration {
+        version: 28,
+        name: "ref_certificates_version",
+        stmts: &[
+            // #26 Split PR 3 — certificate / CLI compatibility. The
+            // ref-cert wire format is versioned so future fields can
+            // be added without breaking old clients (which ignore
+            // the field) or old servers (which default the column
+            // to 1). The current version is 1, which is byte-for-byte
+            // identical to the pre-versioning shape: an old client
+            // reading a v1 cert from a new server sees the same
+            // payload, the same signature, and the same Ed25519
+            // verify path. A new client reading an old server sees
+            // `version` defaulted to 1 and verifies against the v1
+            // payload shape.
+            //
+            // DEFAULT 1 so an existing row reads as v1 without a
+            // backfill migration. NOT NULL so a missing value is a
+            // hard error at insert time rather than a silent v0 that
+            // an old client would interpret as "no version field."
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1",
         ],
     },
 ];
@@ -2336,8 +2371,8 @@ impl Db {
     pub async fn insert_ref_certificate(&self, cert: &RefCertificate) -> Result<RefCertificate> {
         let row = sqlx::query(
             "INSERT INTO ref_certificates
-             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, version)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              ON CONFLICT (repo_id, ref_name) DO UPDATE SET
                 old_sha   = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
                                  THEN EXCLUDED.old_sha   ELSE ref_certificates.old_sha   END,
@@ -2350,8 +2385,10 @@ impl Db {
                 signature = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
                                  THEN EXCLUDED.signature ELSE ref_certificates.signature END,
                 issued_at = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
-                                 THEN EXCLUDED.issued_at ELSE ref_certificates.issued_at END
-             RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at",
+                                 THEN EXCLUDED.issued_at ELSE ref_certificates.issued_at END,
+                version   = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                 THEN EXCLUDED.version   ELSE ref_certificates.version   END
+             RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, version",
         )
         .bind(&cert.id)
         .bind(&cert.repo_id)
@@ -2362,6 +2399,7 @@ impl Db {
         .bind(&cert.node_did)
         .bind(&cert.signature)
         .bind(&cert.issued_at)
+        .bind(cert.version as i32)
         .fetch_one(&self.pool)
         .await?;
         Ok(row_to_cert(row))
@@ -2376,7 +2414,7 @@ impl Db {
         // bounded even if a raw/negative value slips through the handler layer.
         let limit = limit.max(1);
         let rows = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, version
              FROM ref_certificates WHERE repo_id = $1 ORDER BY issued_at DESC LIMIT $2",
         )
         .bind(repo_id)
@@ -2415,7 +2453,7 @@ impl Db {
         let pattern = format!("{}%", escaped_prefix);
 
         let rows = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, version
              FROM ref_certificates WHERE repo_id = $1 AND id LIKE $2 ESCAPE '!' ORDER BY issued_at DESC LIMIT $3",
         )
         .bind(repo_id)
@@ -2428,7 +2466,7 @@ impl Db {
 
     pub async fn get_ref_certificate(&self, id: &str) -> Result<Option<RefCertificate>> {
         let row = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, version
              FROM ref_certificates WHERE id = $1",
         )
         .bind(id)
@@ -3945,6 +3983,7 @@ fn row_to_cert(r: sqlx::postgres::PgRow) -> RefCertificate {
         node_did: r.get("node_did"),
         signature: r.get("signature"),
         issued_at: r.get("issued_at"),
+        version: r.get::<i32, _>("version") as u32,
     }
 }
 
@@ -6574,6 +6613,7 @@ mod ref_certificate_tests {
             node_did: "did:key:zNODE".to_string(),
             signature: "sig".to_string(),
             issued_at: issued_at.to_string(),
+            version: 1,
         }
     }
 

@@ -437,6 +437,7 @@ mod ref_updates_feed_tests {
             node_did: "did:key:z6MkNode".into(),
             signature: "sig".into(),
             issued_at: Utc::now().to_rfc3339(),
+            version: 1,
         }
     }
 
