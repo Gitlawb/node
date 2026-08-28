@@ -3103,11 +3103,7 @@ async fn recover_orphan_ref_transitions(state: AppState) -> anyhow::Result<usize
         // committed but the delete didn't — the deterministic id
         // makes `ON CONFLICT (id) DO NOTHING` collapse that case.
         // Look up the repo's owner_did for the bookkeeping row.
-        let (owner_did, repo_name) = match state
-            .db
-            .get_repo_by_id(&repo_id)
-            .await
-        {
+        let (owner_did, repo_name) = match state.db.get_repo_by_id(&repo_id).await {
             Ok(Some(r)) => (r.owner_did, r.name),
             Ok(None) => {
                 tracing::error!(
@@ -11725,8 +11721,7 @@ mod tests {
         let bin = tempfile::TempDir::new().unwrap();
         let log = bin.path().join("git.log");
         let git_bin = f2a_logging_git(bin.path(), &log);
-        let (mut state, rec) =
-            f2a_state(pool.clone(), &git_bin, "z6persistfail", "c1", true).await;
+        let (mut state, rec) = f2a_state(pool.clone(), &git_bin, "z6persistfail", "c1", true).await;
         let repos_dir = tempfile::TempDir::new().unwrap();
         state.repo_store =
             crate::git::repo_store::RepoStore::for_testing(repos_dir.path().to_path_buf(), pool);
@@ -11760,16 +11755,20 @@ mod tests {
         // because the outbox only persisted the transition identity — wait
         // for the recovery-derived job to land in `done` state, then assert
         // by the recovery's deterministic job id (not by pusher_did).
-        let recovery_id = format!("recovery:{}:refs/heads/main:{}:{}", rec.id, "a".repeat(40), c1);
+        let recovery_id = format!(
+            "recovery:{}:refs/heads/main:{}:{}",
+            rec.id,
+            "a".repeat(40),
+            c1
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
-            let status: String = sqlx::query_scalar(
-                "SELECT status FROM post_receive_jobs WHERE id = $1",
-            )
-            .bind(&recovery_id)
-            .fetch_one(&state.db.pool)
-            .await
-            .unwrap();
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM post_receive_jobs WHERE id = $1")
+                    .bind(&recovery_id)
+                    .fetch_one(&state.db.pool)
+                    .await
+                    .unwrap();
             if status == "done" {
                 break;
             }
@@ -11784,13 +11783,11 @@ mod tests {
         // landed — the recovery is complete. The push row is keyed on the
         // job id, so we look it up directly rather than via pusher_did (the
         // recovery path uses `did:key:recovered` as a placeholder).
-        let push_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM push_events WHERE id = $1",
-        )
-        .bind(&recovery_id)
-        .fetch_one(&state.db.pool)
-        .await
-        .unwrap();
+        let push_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM push_events WHERE id = $1")
+            .bind(&recovery_id)
+            .fetch_one(&state.db.pool)
+            .await
+            .unwrap();
         assert_eq!(push_count, 1, "the recovered push must be recorded");
         let certs = state.db.list_ref_certificates(&rec.id, 10).await.unwrap();
         assert_eq!(
@@ -11823,14 +11820,11 @@ mod tests {
     /// `insert_ref_certificate_tx` PK on the cert id).
     #[cfg(unix)]
     #[sqlx::test]
-    async fn post_receive_recovery_is_idempotent_under_double_drain(
-        pool: sqlx::PgPool,
-    ) {
+    async fn post_receive_recovery_is_idempotent_under_double_drain(pool: sqlx::PgPool) {
         let bin = tempfile::TempDir::new().unwrap();
         let log = bin.path().join("git.log");
         let git_bin = f2a_logging_git(bin.path(), &log);
-        let (mut state, rec) =
-            f2a_state(pool.clone(), &git_bin, "z6idempotent", "c1", true).await;
+        let (mut state, rec) = f2a_state(pool.clone(), &git_bin, "z6idempotent", "c1", true).await;
         let repos_dir = tempfile::TempDir::new().unwrap();
         state.repo_store =
             crate::git::repo_store::RepoStore::for_testing(repos_dir.path().to_path_buf(), pool);
@@ -11855,16 +11849,20 @@ mod tests {
 
         // First drain: recovery + process.
         drain_post_receive_jobs(state.clone()).await.unwrap();
-        let recovery_id = format!("recovery:{}:refs/heads/main:{}:{}", rec.id, "a".repeat(40), c1);
+        let recovery_id = format!(
+            "recovery:{}:refs/heads/main:{}:{}",
+            rec.id,
+            "a".repeat(40),
+            c1
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
-            let status: String = sqlx::query_scalar(
-                "SELECT status FROM post_receive_jobs WHERE id = $1",
-            )
-            .bind(&recovery_id)
-            .fetch_one(&state.db.pool)
-            .await
-            .unwrap();
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM post_receive_jobs WHERE id = $1")
+                    .bind(&recovery_id)
+                    .fetch_one(&state.db.pool)
+                    .await
+                    .unwrap();
             if status == "done" {
                 break;
             }
@@ -11874,13 +11872,12 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        let push_count_after_first: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM push_events WHERE id = $1",
-        )
-        .bind(&recovery_id)
-        .fetch_one(&state.db.pool)
-        .await
-        .unwrap();
+        let push_count_after_first: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM push_events WHERE id = $1")
+                .bind(&recovery_id)
+                .fetch_one(&state.db.pool)
+                .await
+                .unwrap();
         let certs_after_first = state.db.list_ref_certificates(&rec.id, 10).await.unwrap();
         assert_eq!(push_count_after_first, 1);
         assert_eq!(certs_after_first.len(), 1);
@@ -11890,19 +11887,23 @@ mod tests {
         // Give the (no-op) second drain a moment to settle; the assertion
         // below would still pass even if it were racing.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let push_count_after_second: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM push_events WHERE id = $1",
-        )
-        .bind(&recovery_id)
-        .fetch_one(&state.db.pool)
-        .await
-        .unwrap();
+        let push_count_after_second: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM push_events WHERE id = $1")
+                .bind(&recovery_id)
+                .fetch_one(&state.db.pool)
+                .await
+                .unwrap();
         assert_eq!(
             push_count_after_second, push_count_after_first,
             "a second drain must not double-count the push"
         );
         assert_eq!(
-            state.db.list_ref_certificates(&rec.id, 10).await.unwrap().len(),
+            state
+                .db
+                .list_ref_certificates(&rec.id, 10)
+                .await
+                .unwrap()
+                .len(),
             certs_after_first.len(),
             "a second drain must not mint a second certificate"
         );
