@@ -726,8 +726,11 @@ impl Config {
     /// Resolve ~ in p2p_key_path
     pub fn resolved_p2p_key_path(&self) -> PathBuf {
         if self.p2p_key_path.starts_with("~/") {
-            if let Some(home) = dirs_next::home_dir() {
-                return home.join(&self.p2p_key_path[2..]);
+            let suffix = &self.p2p_key_path[2..];
+            if !crate::p2p::tilde_suffix_escapes_home(suffix) {
+                if let Some(home) = dirs_next::home_dir() {
+                    return home.join(suffix);
+                }
             }
         }
         PathBuf::from(&self.p2p_key_path)
@@ -761,38 +764,54 @@ impl Config {
             ));
         }
 
-        // A p2p key path naming no directory puts the node's private key in
-        // whatever directory the process was started from. The node cannot
-        // protect that: `ensure_key_dir` would have to chmod a directory the
-        // operator never nominated as a key directory, and a directory it
-        // cannot secure is one where any local user with write access can
-        // replace the key and choose the node's libp2p identity. Refuse it here,
-        // where the denial actually stops the process, rather than in the p2p
-        // start path, where main.rs logs the error and keeps serving with a
-        // green /health.
-        //
-        // Decided lexically on the resolved path: `canonicalize` would fail on a
-        // parent that does not exist yet (the shipped `~/.gitlawb` default, and
-        // every container's first boot), and comparing against the process
-        // working directory would reject `/data/p2p.key` under the image's
-        // WORKDIR, an absolute directory the operator did name.
-        // `resolved_p2p_key_path` expands a leading `~/` only when a home
-        // directory is resolvable, and otherwise hands back the literal string.
-        // That would leave the shipped default naming a directory called `~`
-        // relative to wherever the process started, which is a real directory
-        // the node would create and chmod, and whose location moves with the
-        // working directory. It passes the check below because `~` is an
-        // ordinary path component, so it has to be caught separately.
-        let p2p_key_path = self.resolved_p2p_key_path();
-        if self.p2p_key_path.starts_with("~/") && p2p_key_path == Path::new(&self.p2p_key_path) {
-            return Err(format!(
-                "GITLAWB_P2P_KEY ({}) starts with `~/` but no home directory could be resolved, \
-                 so it would name a literal `~` directory relative to the working directory. \
-                 Set an absolute path such as /data/keys/p2p.key.",
-                self.p2p_key_path
-            ));
+        // P2P is optional: an HTTP-only node with GITLAWB_P2P_PORT=0 never loads
+        // or creates this key, so refusing startup on an unused path would be a
+        // silent outage with no security benefit.
+        if self.p2p_port > 0 {
+            // A p2p key path naming no directory puts the node's private key in
+            // whatever directory the process was started from. The node cannot
+            // protect that: `ensure_key_dir` would have to chmod a directory the
+            // operator never nominated as a key directory, and a directory it
+            // cannot secure is one where any local user with write access can
+            // replace the key and choose the node's libp2p identity. Refuse it here,
+            // where the denial actually stops the process, rather than in the p2p
+            // start path, where main.rs logs the error and keeps serving with a
+            // green /health.
+            //
+            // Decided lexically on the resolved path: `canonicalize` would fail on a
+            // parent that does not exist yet (the shipped `~/.gitlawb` default, and
+            // every container's first boot), and comparing against the process
+            // working directory would reject `/data/p2p.key` under the image's
+            // WORKDIR, an absolute directory the operator did name.
+            // `resolved_p2p_key_path` expands a leading `~/` only when a home
+            // directory is resolvable, and otherwise hands back the literal string.
+            // That would leave the shipped default naming a directory called `~`
+            // relative to wherever the process started, which is a real directory
+            // the node would create and chmod, and whose location moves with the
+            // working directory. It passes the check below because `~` is an
+            // ordinary path component, so it has to be caught separately.
+            if self.p2p_key_path.starts_with("~/") {
+                let suffix = &self.p2p_key_path[2..];
+                if crate::p2p::tilde_suffix_escapes_home(suffix) {
+                    return Err(format!(
+                        "GITLAWB_P2P_KEY ({}) must stay inside the home directory after `~/` \
+                         expansion; rooted suffixes such as `~//etc/p2p.key` are refused",
+                        self.p2p_key_path
+                    ));
+                }
+            }
+            let p2p_key_path = self.resolved_p2p_key_path();
+            if self.p2p_key_path.starts_with("~/") && p2p_key_path == Path::new(&self.p2p_key_path)
+            {
+                return Err(format!(
+                    "GITLAWB_P2P_KEY ({}) starts with `~/` but no home directory could be resolved, \
+                     so it would name a literal `~` directory relative to the working directory. \
+                     Set an absolute path such as /data/keys/p2p.key.",
+                    self.p2p_key_path
+                ));
+            }
+            crate::p2p::validate_p2p_key_path(&p2p_key_path, Some(&self.p2p_key_path))?;
         }
-        crate::p2p::validate_p2p_key_path(&p2p_key_path, Some(&self.p2p_key_path))?;
 
         Ok(())
     }
@@ -1498,6 +1517,40 @@ mod tests {
 
     fn config_with_p2p_key(path: &str) -> Config {
         Config::parse_from(["gitlawb-node", "--p2p-key-path", path])
+    }
+
+    fn config_with_p2p_port_and_key(port: u16, path: &str) -> Config {
+        Config::parse_from([
+            "gitlawb-node",
+            "--p2p-port",
+            &port.to_string(),
+            "--p2p-key-path",
+            path,
+        ])
+    }
+
+    #[test]
+    fn p2p_disabled_skips_key_path_validation() {
+        for path in ["p2p.key", "~/", "~//etc/p2p.key"] {
+            assert!(
+                config_with_p2p_port_and_key(0, path).validate().is_ok(),
+                "p2p disabled must not validate unused key path {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn p2p_tilde_suffix_that_escapes_home_is_rejected() {
+        if dirs_next::home_dir().is_none() {
+            return;
+        }
+        let err = config_with_p2p_key("~//etc/p2p.key")
+            .validate()
+            .expect_err("~//etc must not escape home");
+        assert!(
+            err.contains("inside the home directory") || err.contains("rooted suffixes"),
+            "escaped tilde suffix must be refused, got: {err}"
+        );
     }
 
     /// A p2p key path that names no directory component would put the node's

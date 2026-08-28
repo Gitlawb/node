@@ -258,6 +258,46 @@ fn key_parent_is_filesystem_root(_key_path: &Path) -> bool {
     false
 }
 
+/// Maximum protobuf-encoded libp2p key size accepted on read.
+const MAX_P2P_KEY_BYTES: usize = 4096;
+
+/// Whether the remainder of a `~/...` value would escape home when joined.
+///
+/// `home.join("/etc/p2p.key")` discards `home` because the right-hand path is
+/// absolute, so doubled separators and rooted suffixes must be rejected first.
+pub(crate) fn tilde_suffix_escapes_home(suffix: &str) -> bool {
+    Path::new(suffix).has_root()
+}
+
+/// Inspect `dir` without following symlinks. Ok when absent; Err when present
+/// but not a real directory.
+pub(crate) fn parent_directory_is_safe_to_mutate(dir: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(md) => {
+            if md.is_symlink() {
+                return Err(format!(
+                    "GITLAWB_P2P_KEY's directory {} must be a real directory, not a symlink",
+                    dir.display()
+                ));
+            }
+            if !md.is_dir() {
+                return Err(format!(
+                    "GITLAWB_P2P_KEY's directory {} must be a directory, not another file type",
+                    dir.display()
+                ));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "failed to inspect key directory {}: {e}",
+                dir.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Whether the configured path names a directory rather than a key file.
 ///
 /// Checked lexically (`~/`, a trailing `/`) and against an existing path on
@@ -313,12 +353,14 @@ pub(crate) fn validate_p2p_key_path(
     }
 
     if let Ok(md) = std::fs::symlink_metadata(key_path) {
-        if md.file_type().is_symlink() {
+        if md.is_symlink() {
             return Err(format!(
                 "GITLAWB_P2P_KEY ({display}) must name a regular key file; symlinks are refused"
             ));
         }
     }
+
+    parent_directory_is_safe_to_mutate(key_parent(key_path))?;
 
     Ok(())
 }
@@ -386,6 +428,8 @@ pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> 
 /// keys. Issue #231 owns the sibling gap in `main.rs`'s own creation path for
 /// that file; nothing here touches it.
 fn ensure_key_dir(dir: &Path) -> Result<()> {
+    parent_directory_is_safe_to_mutate(dir).map_err(|e| anyhow::anyhow!(e))?;
+
     // Missing ancestors are created at the ambient mode. Only the nominated key
     // directory itself is pinned to 0700.
     if let Some(parent) = dir.parent() {
@@ -399,23 +443,38 @@ fn ensure_key_dir(dir: &Path) -> Result<()> {
         }
     }
 
-    if !dir.exists() {
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
+    match std::fs::symlink_metadata(dir) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    parent_directory_is_safe_to_mutate(dir).map_err(|e| anyhow::anyhow!(e))?;
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("failed to create key directory {}", dir.display())
+                    });
+                }
+            }
         }
-        builder
-            .create(dir)
-            .with_context(|| format!("failed to create key directory {}", dir.display()))?;
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("failed to stat key directory {}", dir.display()));
+        }
     }
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let mode = std::fs::metadata(dir)
+        let mode = std::fs::symlink_metadata(dir)
             .with_context(|| format!("failed to stat key directory {}", dir.display()))?
             .permissions()
             .mode()
@@ -559,7 +618,7 @@ fn read_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
 
         let mut file = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(key_path)
             .with_context(|| {
                 format!(
@@ -571,6 +630,13 @@ fn read_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
         let md = file
             .metadata()
             .with_context(|| format!("failed to stat p2p key at {}", key_path.display()))?;
+
+        if !md.is_file() {
+            anyhow::bail!(
+                "p2p key at {} must be a regular file; directories, FIFOs, and special files are refused",
+                key_path.display()
+            );
+        }
 
         let mode = md.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
@@ -584,8 +650,33 @@ fn read_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
         }
 
         let mut buf = Zeroizing::new(Vec::new());
-        file.read_to_end(&mut buf)
-            .with_context(|| format!("failed to read p2p key from {}", key_path.display()))?;
+        let mut chunk = [0u8; 256];
+        loop {
+            match file.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if buf.len() + n > MAX_P2P_KEY_BYTES {
+                        anyhow::bail!(
+                            "p2p key at {} exceeds the maximum accepted size of {} bytes",
+                            key_path.display(),
+                            MAX_P2P_KEY_BYTES
+                        );
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    anyhow::bail!(
+                        "p2p key at {} is not a readable regular file (open would block)",
+                        key_path.display()
+                    );
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("failed to read p2p key from {}", key_path.display())
+                    });
+                }
+            }
+        }
         buf
     };
 
@@ -931,12 +1022,95 @@ mod tests {
     const FIXTURE_SENTINEL: &str = "p2p-key-perms: asserted";
 
     /// Re-invoke this test binary to run one `#[ignore]`d fixture test.
-    #[cfg(unix)]
     fn fixture_command(fixture_test: &str) -> std::process::Command {
         let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
-        cmd.args([fixture_test, "--exact", "--ignored", "--nocapture"])
-            .env("GITLAWB_TEST_FIXTURE", "p2p-key-perms");
+        cmd.args([fixture_test, "--exact", "--ignored", "--nocapture"]);
         cmd
+    }
+
+    #[cfg(unix)]
+    fn fixture_command_with_env(fixture_test: &str, fixture_name: &str) -> std::process::Command {
+        let mut cmd = fixture_command(fixture_test);
+        cmd.env("GITLAWB_TEST_FIXTURE", fixture_name);
+        cmd
+    }
+
+    /// Fixture: refuse key paths that name no directory inside an isolated cwd.
+    #[test]
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=p2p-key-backstop"]
+    fn fixture_p2p_key_backstop_refuses_no_directory() {
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("p2p-key-backstop") {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(dir.path()).expect("chdir into isolated tempdir");
+
+        for path in [
+            "p2p.key",
+            "./p2p.key",
+            "a/../p2p.key",
+            "./keys/../p2p.key",
+            "../p2p.key",
+        ] {
+            let result = load_or_create_p2p_keypair(Path::new(path));
+            let leaked = Path::new(path).exists();
+            let err = result.expect_err(&format!("{path:?} must be refused by the backstop"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("must include a directory")
+                    || msg.contains("names no directory")
+                    || msg.contains("must name a key file"),
+                "{path:?} must be refused before touching the filesystem, got: {msg}"
+            );
+            assert!(!leaked, "{path:?} must not have been created");
+        }
+
+        println!("p2p-key-backstop: asserted");
+    }
+
+    /// The backstop inside `load_or_create_p2p_keypair`, exercised in a child
+    /// process so cwd is not mutated for sibling tests.
+    #[test]
+    fn p2p_key_path_naming_no_directory_is_refused_without_the_config_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("sentinel");
+        std::fs::write(&sentinel, b"keep").unwrap();
+
+        #[cfg(unix)]
+        let output = fixture_command_with_env(
+            "p2p::tests::fixture_p2p_key_backstop_refuses_no_directory",
+            "p2p-key-backstop",
+        )
+        .output()
+        .expect("spawn the backstop fixture");
+
+        #[cfg(not(unix))]
+        let output = {
+            let _ = &sentinel;
+            panic!("backstop child-process fixture is unix-only");
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "the backstop fixture must pass in its child process\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the fixture filter must select exactly one test\n--- stdout ---\n{stdout}"
+        );
+        assert!(
+            stdout.contains("p2p-key-backstop: asserted"),
+            "the fixture must print its sentinel after asserting\n--- stdout ---\n{stdout}"
+        );
+
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"keep",
+            "the parent process cwd must stay untouched"
+        );
     }
 
     /// Fixture: create the key under a zeroed umask and assert the modes the
@@ -991,9 +1165,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn p2p_key_file_is_0600_on_unix() {
-        let output = fixture_command("p2p::tests::fixture_p2p_key_perms_under_zero_umask")
-            .output()
-            .expect("spawn the permission fixture");
+        let output = fixture_command_with_env(
+            "p2p::tests::fixture_p2p_key_perms_under_zero_umask",
+            "p2p-key-perms",
+        )
+        .output()
+        .expect("spawn the permission fixture");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -1025,47 +1202,6 @@ mod tests {
             "the fixture must print {FIXTURE_SENTINEL:?} after its assertions; without it the \
              child may have returned early at its env gate and still reported 1 passed\
              \n--- stdout ---\n{stdout}"
-        );
-    }
-
-    /// The backstop inside `load_or_create_p2p_keypair`, exercised in an isolated
-    /// working directory so a failed guard cannot delete unrelated files.
-    #[test]
-    fn p2p_key_path_naming_no_directory_is_refused_without_the_config_gate() {
-        let dir = tempfile::tempdir().unwrap();
-        let sentinel = dir.path().join("sentinel");
-        std::fs::write(&sentinel, b"keep").unwrap();
-
-        let prev = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(dir.path()).expect("chdir into tempdir");
-        let run = std::panic::catch_unwind(|| {
-            for path in [
-                "p2p.key",
-                "./p2p.key",
-                "a/../p2p.key",
-                "./keys/../p2p.key",
-                "../p2p.key",
-            ] {
-                let result = load_or_create_p2p_keypair(Path::new(path));
-                let leaked = Path::new(path).exists();
-                let err = result.expect_err(&format!("{path:?} must be refused by the backstop"));
-                let msg = format!("{err:#}");
-                assert!(
-                    msg.contains("must include a directory")
-                        || msg.contains("names no directory")
-                        || msg.contains("must name a key file"),
-                    "{path:?} must be refused before touching the filesystem, got: {msg}"
-                );
-                assert!(!leaked, "{path:?} must not have been created");
-            }
-        });
-        std::env::set_current_dir(prev).expect("restore cwd");
-        run.expect("backstop probe must not panic");
-
-        assert_eq!(
-            std::fs::read(&sentinel).unwrap(),
-            b"keep",
-            "the probe must not delete unrelated files in its working directory"
         );
     }
 
@@ -1168,34 +1304,29 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let base = tempfile::tempdir().unwrap();
-        let key_path = base.path().join("a").join("b").join("keys").join("p2p.key");
+        let ancestor_a = base.path().join("a");
+        let ancestor_b = ancestor_a.join("b");
+        std::fs::create_dir_all(&ancestor_b).unwrap();
+        std::fs::set_permissions(&ancestor_a, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&ancestor_b, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let key_path = ancestor_b.join("keys").join("p2p.key");
+        let a_mode_before = std::fs::metadata(&ancestor_a).unwrap().permissions().mode() & 0o777;
+        let b_mode_before = std::fs::metadata(&ancestor_b).unwrap().permissions().mode() & 0o777;
+
         load_or_create_p2p_keypair(&key_path).expect("nested first boot");
 
-        let a_mode = std::fs::metadata(base.path().join("a"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        let b_mode = std::fs::metadata(base.path().join("a").join("b"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        let keys_mode = std::fs::metadata(base.path().join("a").join("b").join("keys"))
+        let a_mode = std::fs::metadata(&ancestor_a).unwrap().permissions().mode() & 0o777;
+        let b_mode = std::fs::metadata(&ancestor_b).unwrap().permissions().mode() & 0o777;
+        let keys_mode = std::fs::metadata(ancestor_b.join("keys"))
             .unwrap()
             .permissions()
             .mode()
             & 0o777;
 
+        assert_eq!(a_mode_before, a_mode, "ancestor a mode must stay unchanged");
+        assert_eq!(b_mode_before, b_mode, "ancestor b mode must stay unchanged");
         assert_eq!(keys_mode, 0o700, "only the nominated key directory is 0700");
-        assert_ne!(
-            a_mode, 0o700,
-            "missing ancestors must keep the ambient mode, not inherit 0700"
-        );
-        assert_ne!(
-            b_mode, 0o700,
-            "intermediate ancestors must not be tightened to 0700"
-        );
     }
 
     #[cfg(unix)]
@@ -1372,6 +1503,150 @@ mod tests {
         assert!(
             msg.contains("invalid p2p key"),
             "a corrupt key must be reported as a decoding failure, got: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p2p_symlinked_key_parent_is_refused_before_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real");
+        std::fs::create_dir(&real_parent).unwrap();
+        std::fs::set_permissions(&real_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let safe = dir.path().join("safe");
+        std::fs::create_dir(&safe).unwrap();
+        let link = safe.join("keys");
+        std::os::unix::fs::symlink(&real_parent, &link).unwrap();
+
+        let key_path = link.join("p2p.key");
+        let mode_before = std::fs::metadata(&real_parent)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+
+        let err = load_or_create_p2p_keypair(&key_path)
+            .expect_err("a symlinked key directory must be refused before chmod");
+        let after = std::fs::metadata(&real_parent)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode_before, after,
+            "refusing a symlink parent must not chmod its target"
+        );
+        assert!(
+            format!("{err:#}").contains("symlink"),
+            "error must name the symlink refusal, got: {err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p2p_key_parent_that_is_a_file_is_refused_before_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent_file = dir.path().join("notadir");
+        std::fs::write(&parent_file, b"x").unwrap();
+        std::fs::set_permissions(&parent_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let key_path = parent_file.join("p2p.key");
+        let mode_before = std::fs::metadata(&parent_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+
+        let err = load_or_create_p2p_keypair(&key_path)
+            .expect_err("a file parent must be refused before chmod");
+        let mode_after = std::fs::metadata(&parent_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode_before, mode_after,
+            "refusing a file parent must not chmod it"
+        );
+        assert!(
+            format!("{err:#}").contains("directory"),
+            "error must name the non-directory parent, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn p2p_concurrent_first_boot_dir_creation_converges() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("keys").join("p2p.key");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let key_path2 = key_path.clone();
+        let b1 = barrier.clone();
+        let b2 = barrier.clone();
+
+        let t1 = std::thread::spawn(move || {
+            b1.wait();
+            load_or_create_p2p_keypair(&key_path)
+        });
+        let t2 = std::thread::spawn(move || {
+            b2.wait();
+            load_or_create_p2p_keypair(&key_path2)
+        });
+
+        let kp1 = t1.join().expect("thread 1").expect("first concurrent boot");
+        let kp2 = t2
+            .join()
+            .expect("thread 2")
+            .expect("second concurrent boot");
+        assert_eq!(
+            PeerId::from(kp1.public()),
+            PeerId::from(kp2.public()),
+            "concurrent first boots must converge on one persisted identity"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p2p_fifo_key_path_is_refused_without_blocking() {
+        use std::ffi::CString;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_dir = dir.path().join("keys");
+        std::fs::create_dir(&key_dir).unwrap();
+        let path = key_dir.join("p2p.key");
+        let c_path = CString::new(path.to_str().expect("utf-8 path")).unwrap();
+        // SAFETY: `mkfifo` creates a FIFO at `c_path` with mode 0600.
+        let ret = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(ret, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        let err = load_or_create_p2p_keypair(&path).expect_err("a FIFO key path must be refused");
+        assert!(
+            format!("{err:#}").contains("regular file"),
+            "FIFO refusal must name the file-type requirement, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn p2p_oversized_key_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_dir = dir.path().join("keys");
+        std::fs::create_dir(&key_dir).unwrap();
+        let path = key_dir.join("p2p.key");
+        std::fs::write(&path, vec![0u8; MAX_P2P_KEY_BYTES + 1]).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let err = load_or_create_p2p_keypair(&path).expect_err("oversized key must be refused");
+        assert!(
+            format!("{err:#}").contains("maximum accepted size"),
+            "oversized refusal must name the size cap, got: {err:#}"
         );
     }
 

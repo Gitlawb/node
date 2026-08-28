@@ -435,7 +435,8 @@ Two things to check before upgrading:
   `/p2p/<PeerId>` suffix stops matching once that peer upgrades. Update the
   suffix, or drop it and let identify supply the current one. Addresses without
   the suffix keep working untouched.
-- `GITLAWB_P2P_KEY` must name a directory. A bare filename is refused at
+- `GITLAWB_P2P_KEY` must name a key file inside a directory, such as
+  `/data/keys/p2p.key` or `./keys/p2p.key`. A bare filename is refused at
   startup, since the node will not keep its identity key in the working
   directory.
 
