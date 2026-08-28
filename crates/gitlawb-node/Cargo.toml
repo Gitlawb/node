@@ -23,6 +23,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+url = { workspace = true }
 axum = { version = "0.8", features = ["http1", "http2", "json", "ws"] }
 async-graphql = { version = "7", features = ["chrono", "uuid", "tracing"] }
 async-graphql-axum = "7"

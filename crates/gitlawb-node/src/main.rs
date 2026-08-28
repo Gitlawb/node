@@ -49,6 +49,7 @@ use state::AppState;
 struct DegradedState {
     node_did: String,
     db_startup: Arc<DbStartupStatus>,
+    web_url: Option<String>,
 }
 
 /// Two independent counters with no cross-field invariant — atomics, not a
@@ -183,6 +184,7 @@ async fn main() -> Result<()> {
         degraded_listener,
         node_did.to_string(),
         Arc::clone(&db_startup),
+        config.web_url.clone(),
         db_ready_rx,
         shutdown_tx.subscribe(),
     ));
@@ -888,11 +890,12 @@ async fn run_degraded_server(
     listener: TcpListener,
     node_did: String,
     db_startup: Arc<DbStartupStatus>,
+    web_url: Option<String>,
     mut db_ready_rx: watch::Receiver<bool>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let addr = listener.local_addr().ok();
-    let router = build_degraded_router(node_did, db_startup);
+    let router = build_degraded_router(node_did, db_startup, web_url);
     info!(?addr, "degraded HTTP server ready");
 
     axum::serve(listener, router)
@@ -909,10 +912,15 @@ async fn run_degraded_server(
     Ok(())
 }
 
-fn build_degraded_router(node_did: String, db_startup: Arc<DbStartupStatus>) -> Router {
+fn build_degraded_router(
+    node_did: String,
+    db_startup: Arc<DbStartupStatus>,
+    web_url: Option<String>,
+) -> Router {
     let state = DegradedState {
         node_did,
         db_startup,
+        web_url,
     };
     // Everything answers 503 with the same body — including /health and
     // /ready, so peer readiness probes and uptime monitors correctly see a
@@ -944,6 +952,9 @@ async fn degraded_node_info(State(state): State<DegradedState>) -> impl IntoResp
         obj.insert("name".into(), "gitlawb-node".into());
         obj.insert("version".into(), env!("CARGO_PKG_VERSION").into());
         obj.insert("did".into(), state.node_did.clone().into());
+        if let Some(web_url) = &state.web_url {
+            obj.insert("web_url".into(), web_url.clone().into());
+        }
     }
     (StatusCode::SERVICE_UNAVAILABLE, Json(body))
 }

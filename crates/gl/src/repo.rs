@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{sanitize_node_msg, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
@@ -222,6 +222,89 @@ async fn resolve_owner_did(_node: &str, dir: Option<&std::path::Path>) -> Result
     Ok(did.split(':').next_back().unwrap_or(&did).to_string())
 }
 
+/// Fetch `GET /` from the node and return the `web_url` if the node advertises one.
+///
+/// The View: link is a nice-to-have, so every failure mode degrades to `None`
+/// rather than failing the enclosing command — but failures are surfaced as
+/// stderr warnings (request error, non-success HTTP status with the status,
+/// malformed advertised value), since they all mean the node itself is
+/// misbehaving or misconfigured, which the user would otherwise never learn.
+/// A successful response that lacks a usable `web_url` (field missing or
+/// blank) omits the link silently: self-hosted nodes without a web front-end
+/// are expected to not advertise one (#370).
+///
+/// The body is treated like every other caller-chosen node reply (INV-6): the
+/// read is capped and an accepted `web_url` must be free of control/bidi bytes
+/// — it reaches the terminal verbatim through the View: line.
+pub(crate) async fn fetch_node_web_url(node: &str) -> Option<String> {
+    let info_client = NodeClient::new(node, None);
+    let info_resp = match info_client.get("/").await {
+        Ok(resp) => resp,
+        Err(err) => {
+            eprintln!("warning: node info request failed ({err}); skipping View link");
+            return None;
+        }
+    };
+    let status = info_resp.status();
+    if !status.is_success() {
+        eprintln!("warning: node info request returned {status}; skipping View link");
+        return None;
+    }
+    // An info reply is a DID, a few URLs and counts — 8 KiB is well past what
+    // the shape needs; anything longer is hostile or broken (peer.rs precedent).
+    let raw_body = crate::http::read_body_capped(info_resp, 8 * 1024).await;
+    let info: Value = match serde_json::from_str(&raw_body.text) {
+        Ok(json) => json,
+        Err(_) => return None,
+    };
+    // Missing field / non-string degrade to None without warning — same contract
+    // as before; only transport- and advertisement-level failures warn there.
+    let raw = info["web_url"].as_str()?;
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    // A present-but-malformed value means the node is misconfigured; say so
+    // instead of quietly dropping the link. Mirrors the node-side boot
+    // validation: must be an absolute http(s) URL with no query or fragment —
+    // the link is built by string-appending `/{owner}/{repo}` to it. Control
+    // and bidi-format bytes are rejected outright (not stripped): they have no
+    // legitimate place in a base URL and would reach the terminal through the
+    // View: line.
+    let malformed_reason: Option<&str> = if trimmed
+        .chars()
+        .any(|c| c.is_control() || gitlawb_core::sanitize::is_bidi_format(c))
+    {
+        Some("contains control or bidi characters")
+    } else {
+        match trimmed.parse::<url::Url>() {
+            Err(_) => Some("not an absolute URL"),
+            Ok(parsed) if !matches!(parsed.scheme(), "http" | "https") => Some("not http(s)"),
+            Ok(parsed) if parsed.query().is_some() || parsed.fragment().is_some() => {
+                Some("contains a query or fragment")
+            }
+            // userinfo is rejected because the `View:` line prints the
+            // value verbatim; a remote advertisement carrying
+            // `user:pass@host` would land that credential in terminal
+            // scrollback and CI logs.
+            Ok(parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
+                Some("contains a username or password")
+            }
+            Ok(_) => None,
+        }
+    };
+    if let Some(reason) = malformed_reason {
+        // The reason string is ours; the advertised value is not — defang it
+        // exactly as it would have been defanged had it been accepted.
+        let shown = sanitize_node_msg(trimmed);
+        eprintln!(
+            "warning: node advertised a malformed web_url ({shown:?}, {reason}); skipping View link"
+        );
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 async fn cmd_create(
     name: String,
     description: Option<String>,
@@ -265,7 +348,11 @@ async fn cmd_create(
     println!("✓ Created repository: {name}");
     println!("  Clone: git clone {gitlawb_url}");
     println!("  HTTP:  {clone_url}");
-    println!("  View:  https://gitlawb.com/{owner_short}/{name}");
+    // Only print View: when the node advertises a web_url — self-hosted nodes
+    // without a web front-end would otherwise produce a 404 link (#370).
+    if let Some(web_url) = fetch_node_web_url(&node).await {
+        println!("  View:  {web_url}/{owner_short}/{name}");
+    }
     if let Some(desc) = payload["description"].as_str().filter(|s| !s.is_empty()) {
         println!("  Desc:  {desc}");
     }
@@ -844,6 +931,226 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_with_web_url() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"web_url":"https://example.com","did":"did:key:z6Mk"}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url.as_deref(), Some("https://example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_trims_trailing_slash() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"web_url":"https://example.com/"}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url.as_deref(), Some("https://example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_without_web_url() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"did":"did:key:z6Mk"}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url, None);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_empty_string() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"web_url":""}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url, None);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_whitespace_only() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"web_url":"   "}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url, None);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_server_error() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(500)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url, None);
+    }
+
+    /// A node advertising a present-but-malformed web_url (not an absolute
+    /// http(s) URL) must not yield a View link — and must warn, since a
+    /// malformed advertisement means the node is misconfigured (#370).
+    #[tokio::test]
+    async fn test_fetch_node_web_url_malformed_value_is_rejected() {
+        for bad in [
+            "gitlawb.com",
+            "not a url",
+            "ftp://files.example.com",
+            // Query/fragment corrupt the appended /{owner}/{repo} path.
+            "https://example.com?a=1",
+            "https://example.com/#faq",
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _m = server
+                .mock("GET", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(r#"{{"web_url":"{bad}"}}"#))
+                .create_async()
+                .await;
+
+            let web_url = fetch_node_web_url(&server.url()).await;
+            assert_eq!(
+                web_url, None,
+                "malformed web_url {bad:?} must not render a View link"
+            );
+        }
+    }
+
+    /// A transport-level failure (connection refused) degrades to None but is
+    /// no longer silent: the request error is surfaced on stderr so an
+    /// unreachable node isn't indistinguishable from one without a web_url.
+    #[tokio::test]
+    async fn test_fetch_node_web_url_connection_refused_warns() {
+        // Port 1 on localhost is reserved (tcpmux) and refuses connections.
+        let web_url = fetch_node_web_url("http://127.0.0.1:1").await;
+        assert_eq!(web_url, None);
+    }
+
+    /// A hostile node can smuggle ANSI/bell/bidi controls inside a web_url that
+    /// still passes http(s) URL parsing — those bytes would reach the terminal
+    /// verbatim through the View: line. The advertised value must be rejected
+    /// outright: no control byte may survive into the returned string.
+    #[tokio::test]
+    async fn test_fetch_node_web_url_rejects_control_bytes() {
+        for bad in [
+            "https://example.com/\x1b[31mred",      // ANSI CSI escape in path
+            "https://example.com\x07",              // bell
+            "https://ex\u{202e}ample.com",          // bidi override (RLO)
+            "https://example.com/\u{200f}",         // RLM format char
+            "\x1b]0;title\x07https://evil.example", // OSC title-set prefix
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _m = server
+                .mock("GET", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(r#"{{"web_url":"{}"}}"#, bad.replace('"', "\\\"")))
+                .create_async()
+                .await;
+
+            let web_url = fetch_node_web_url(&server.url()).await;
+            assert_eq!(
+                web_url, None,
+                "web_url with control bytes {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_node_web_url_validates_after_trimming() {
+        // Trailing slash is trimmed before validation; result stays usable.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"web_url":"http://localhost:8080/ui/"}"#)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url.as_deref(), Some("http://localhost:8080/ui"));
+    }
+
+    /// A remote node that advertises `web_url` with userinfo (`user@`,
+    /// `user:pass@`) must be dropped: the value is reprinted on the `View:`
+    /// line, and a credential embedded in the URL would land in terminal
+    /// scrollback and CI logs. Mirrors the node-side boot validation.
+    #[tokio::test]
+    async fn test_fetch_node_web_url_rejects_userinfo() {
+        for bad in [
+            "https://user@example.com",
+            "https://user:secret@example.com",
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _m = server
+                .mock("GET", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(r#"{{"web_url":"{}"}}"#, bad))
+                .create_async()
+                .await;
+
+            let web_url = fetch_node_web_url(&server.url()).await;
+            assert_eq!(
+                web_url, None,
+                "web_url with userinfo {bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// A non-success status must still return None (View link is cosmetic) but
+    /// the status surfaces as a user-visible stderr warning instead of being
+    /// swallowed silently (#370 review).
+    #[tokio::test]
+    async fn test_fetch_node_web_url_non_success_warns_with_status() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(503)
+            .create_async()
+            .await;
+
+        let web_url = fetch_node_web_url(&server.url()).await;
+        assert_eq!(web_url, None);
+        // The warning itself goes to stderr; mockito can't capture it here, so
+        // this asserts only the None contract. Manual check: run against a
+        // 503-ing node and observe "node info request returned 503" on stderr.
     }
 
     #[tokio::test]
