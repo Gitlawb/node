@@ -252,11 +252,9 @@ pub struct Config {
 
     /// Maximum connections in the PostgreSQL pool. This is a cap, not a floor
     /// (connections open lazily). Size against the database server's
-    /// max_connections, remembering admin tooling opens its own pool. Each
-    /// concurrent write pins one pooled connection for its whole duration (the
-    /// advisory lock in `repo_store::acquire_write` is connection-affine), so this
-    /// must exceed `max_concurrent_git_pushes` by `DB_POOL_APP_HEADROOM` or slow
-    /// pushes starve every other DB path — enforced by `Config::validate`.
+    /// max_connections, remembering admin tooling opens its own pool. Writes pin
+    /// the dedicated lock pool, not this one; this pool still needs enough headroom
+    /// for ordinary request handlers and metadata paths (`DB_POOL_APP_HEADROOM`).
     #[arg(
         long,
         env = "GITLAWB_DB_MAX_CONNECTIONS",
@@ -769,21 +767,23 @@ impl Config {
     /// catches combinations that ship a denial-of-service under otherwise-valid
     /// values. Call once at startup and fail fast on `Err`.
     pub fn validate(&self) -> Result<(), String> {
-        // A write pins one pooled connection for its whole duration (the
-        // connection-affine advisory lock in repo_store::acquire_write), and
-        // concurrent writes are capped at max_concurrent_git_pushes. If the pool
-        // does not exceed that cap by DB_POOL_APP_HEADROOM, a burst of slow pushes
-        // drains every connection and every other DB path 503s. (#174 F1)
-        let floor = (self.max_concurrent_git_pushes as u64) + (Self::DB_POOL_APP_HEADROOM as u64);
-        if (self.db_max_connections as u64) < floor {
+        // Concurrent git writes pin the dedicated lock pool for their whole
+        // duration (connection-affine advisory lock in acquire_write). The main
+        // pool no longer carries that occupancy.
+        if (self.db_lock_pool_max_connections as usize) < self.max_concurrent_git_pushes {
             return Err(format!(
-                "GITLAWB_DB_MAX_CONNECTIONS ({}) must be at least max_concurrent_git_pushes ({}) \
-                 + {} headroom = {}: each concurrent write pins one pooled connection for its whole \
-                 duration, so a smaller pool lets a burst of slow pushes starve every other DB path.",
-                self.db_max_connections,
-                self.max_concurrent_git_pushes,
-                Self::DB_POOL_APP_HEADROOM,
-                floor
+                "GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS ({}) must be at least \
+                 max_concurrent_git_pushes ({}) so every admitted push can pin a \
+                 lock-pool connection for its whole duration",
+                self.db_lock_pool_max_connections, self.max_concurrent_git_pushes
+            ));
+        }
+        let main_floor = Self::DB_POOL_APP_HEADROOM as u64;
+        if (self.db_max_connections as u64) < main_floor {
+            return Err(format!(
+                "GITLAWB_DB_MAX_CONNECTIONS ({}) must be at least {} for non-git \
+                 database paths",
+                self.db_max_connections, main_floor
             ));
         }
         Ok(())
@@ -1422,41 +1422,48 @@ mod tests {
         );
     }
 
-    /// #174 F1: a connection-affine write lock pins a pooled connection per
-    /// concurrent write, so the pool must clear `max_concurrent_git_pushes` by
-    /// `DB_POOL_APP_HEADROOM` or a push burst starves every other DB path.
-    /// `validate()` must reject an under-sized pool at boot.
+    /// #174 F1: concurrent git writes pin the dedicated lock pool, not the main
+    /// pool. `validate()` must reject an under-sized lock pool at boot.
     #[test]
     fn db_pool_must_clear_the_git_push_cap() {
-        // Shipped defaults validate (48 >= 32 + 8).
+        // Shipped defaults validate (lock pool 32 >= pushes 32, main pool >= headroom).
         Config::parse_from(["gitlawb-node"])
             .validate()
             .expect("default config must validate");
 
-        // An under-sized pool relative to the push cap is rejected (20 < 32 + 8).
-        let under = Config::parse_from([
+        // An under-sized lock pool relative to the push cap is rejected.
+        let under_lock = Config::parse_from([
             "gitlawb-node",
-            "--db-max-connections",
-            "20",
+            "--db-lock-pool-max-connections",
+            "16",
             "--max-concurrent-git-pushes",
             "32",
         ]);
         assert!(
-            under.validate().is_err(),
-            "db_max_connections 20 below max_concurrent_git_pushes 32 + headroom must be rejected"
+            under_lock.validate().is_err(),
+            "db_lock_pool_max_connections below max_concurrent_git_pushes must be rejected"
         );
 
-        // Exactly at the floor validates (40 == 32 + 8).
-        let at_floor = Config::parse_from([
+        // Main pool can be smaller than pushes + headroom when the lock pool carries writes.
+        let split = Config::parse_from([
             "gitlawb-node",
             "--db-max-connections",
-            "40",
+            "16",
+            "--db-lock-pool-max-connections",
+            "32",
             "--max-concurrent-git-pushes",
             "32",
         ]);
         assert!(
-            at_floor.validate().is_ok(),
-            "db_max_connections at the floor (pushes + headroom) must validate"
+            split.validate().is_ok(),
+            "a small main pool with a large lock pool must validate"
+        );
+
+        // Main pool still needs the app headroom floor.
+        let under_main = Config::parse_from(["gitlawb-node", "--db-max-connections", "4"]);
+        assert!(
+            under_main.validate().is_err(),
+            "db_max_connections below DB_POOL_APP_HEADROOM must be rejected"
         );
     }
 

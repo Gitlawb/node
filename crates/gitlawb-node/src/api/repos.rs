@@ -2374,6 +2374,7 @@ pub async fn git_receive_pack(
     // would return 200 to the pusher before the durable copy lands, which is a larger
     // change to the client contract than the window it closes.
     let push_succeeded = receive_result.is_ok();
+    let publish_durability = Arc::new(tokio::sync::Mutex::new(None));
     if push_succeeded {
         tokio::spawn(post_receive_replication_tail(
             state.clone(),
@@ -2381,6 +2382,7 @@ pub async fn git_receive_pack(
             ref_updates.clone(),
             disk_path.clone(),
             auth.0.to_string(),
+            Some(publish_durability.clone()),
         ));
     }
 
@@ -2401,7 +2403,11 @@ pub async fn git_receive_pack(
     // touching the repo, recording the push, bumping trust, issuing ref
     // certificates or answering 200 would all be reporting a write no other
     // node can read.
-    reclaimed.release(push_succeeded).await.into_result()?;
+    let outcome = reclaimed.release(push_succeeded).await;
+    if push_succeeded {
+        *publish_durability.lock().await = Some(outcome);
+    }
+    outcome.into_result()?;
     // Clean path: clone (a) already dropped inside run_git_service when the receive-pack
     // group was reaped; clone (b) held here spanned the success-only Tigris upload that
     // ran inside release() above. Drop it now so a second same-repo push proceeds the
@@ -2518,12 +2524,36 @@ pub async fn git_receive_pack(
 /// the per-repo-coalesced pin/encrypt task, and this push's own Pinata + announce
 /// task. Split out of `git_receive_pack` so the ordering the coalescing gate depends
 /// on is directly testable; the handler spawns it and returns.
+async fn publish_durability_confirmed(
+    slot: &Option<Arc<tokio::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>>>,
+    wait: std::time::Duration,
+) -> bool {
+    let Some(slot) = slot else {
+        return true;
+    };
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(outcome) = *slot.lock().await {
+            return matches!(outcome, crate::git::repo_store::ReleaseOutcome::Released);
+        }
+        if start.elapsed() >= wait {
+            // Handler disconnected during `release` without recording an outcome.
+            // Proceed so inv22's disconnect-during-release tail still runs.
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 async fn post_receive_replication_tail(
     state: AppState,
     record: RepoRecord,
     ref_updates: Vec<RefUpdate>,
     disk_path: std::path::PathBuf,
     did: String,
+    publish_durability: Option<
+        Arc<tokio::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>>,
+    >,
 ) {
     // Replication enforcement (Phase 2): decide once per push whether the public
     // may read this repo at all and, if so, which blob OIDs must not leave the
@@ -2695,6 +2725,21 @@ async fn post_receive_replication_tail(
             rules_opt.clone(),
             record.is_public,
         ));
+    }
+
+    let durability_wait = std::time::Duration::from_secs(
+        state
+            .config
+            .lock_held_transfer_timeout_secs
+            .saturating_add(5),
+    );
+    if announce_at_root && !publish_durability_confirmed(&publish_durability, durability_wait).await
+    {
+        tracing::warn!(
+            repo = %record.id,
+            "skipping pinata/gossip tail: publish durability was not confirmed"
+        );
+        return;
     }
 
     // Pin new git objects to Pinata, then record branch→CID and gossip.
@@ -9819,6 +9864,7 @@ mod tests {
             f2a_update("refs/heads/main", &c2),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
         )
         .await;
         let after_first = f2a_walks(&log);
@@ -9839,6 +9885,7 @@ mod tests {
             f2a_update("refs/heads/second", &c1),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
         )
         .await;
 
@@ -9912,6 +9959,7 @@ mod tests {
             f2a_update("refs/heads/main", &c2),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
         )
         .await;
 
@@ -9993,6 +10041,7 @@ mod tests {
             f2a_update("refs/heads/main", &c2),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
         ));
         f2a_wait_for(|| started.exists(), "the admitted push's walk to start").await;
 
@@ -10106,6 +10155,7 @@ mod tests {
             }],
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
         )
         .await;
 
@@ -10384,6 +10434,7 @@ mod tests {
             }],
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
         )
         .await;
 
@@ -10439,6 +10490,7 @@ mod tests {
             f2a_update("refs/heads/main", &c1),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
         )
         .await;
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -10480,6 +10532,7 @@ mod tests {
             }],
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
         )
         .await;
 
@@ -10577,6 +10630,7 @@ mod tests {
             }],
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
         )
         .await;
 

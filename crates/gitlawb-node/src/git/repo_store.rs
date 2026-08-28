@@ -1192,6 +1192,7 @@ impl RepoWriteGuard {
                     Some(Err(PublishRefusal::Fenced)) => outcome = ReleaseOutcome::Fenced,
                     Some(Err(PublishRefusal::Failed(e))) => {
                         warn!(repo = %self.repo_name, err = %e, "failed to upload repo to tigris after write");
+                        outcome = ReleaseOutcome::UploadFailed;
                     }
                     None => {
                         // Timed out is UNKNOWABLE, not failed: the PUT may well
@@ -1203,13 +1204,16 @@ impl RepoWriteGuard {
                         // session, so the lock would free within milliseconds
                         // either way. What actually protects a successor from a
                         // late publish is the conditional PUT on the upload, not
-                        // the lifetime of this lock.
+                        // the lifetime of this lock. The caller still must not
+                        // report success: `into_result` maps this to a retryable
+                        // refusal.
                         warn!(
                             repo = %self.repo_name,
                             "release upload exceeded its bound; the PUT may still land, so the \
                              outcome is unknowable and the conditional upload is what keeps a \
                              late publish from overwriting a successor's archive"
                         );
+                        outcome = ReleaseOutcome::UploadUnknowable;
                     }
                 }
             }
@@ -1345,17 +1349,22 @@ enum RefreshFailure {
 /// `#[must_use]` because dropping it is the whole defect this type exists to
 /// prevent: a publish the store refused would otherwise return 201, fire
 /// webhooks, and record a push that no successor can read.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "a refused publish must reach the caller, or a write that never landed reports success"]
 pub enum ReleaseOutcome {
     /// The lock was released and nothing definitively refused the publish.
     /// Also the answer when there was nothing to publish (a failed write, no
-    /// storage backend) and when the outcome is unknowable (the upload
-    /// exceeded its bound), which keeps those paths behaving as they do today.
+    /// storage backend).
     Released,
     /// The store refused the publish twice. The tree is on local disk but is
     /// NOT in object storage, so the caller must not report success.
     Fenced,
+    /// The archive upload exceeded its under-lock bound. The PUT may still
+    /// land, but durability is unknowable, so the caller must not report
+    /// success.
+    UploadUnknowable,
+    /// The archive upload failed with a definite error (not a fence refusal).
+    UploadFailed,
 }
 
 impl ReleaseOutcome {
@@ -1368,6 +1377,11 @@ impl ReleaseOutcome {
     pub fn into_result(self) -> anyhow::Result<()> {
         match self {
             ReleaseOutcome::Released => Ok(()),
+            ReleaseOutcome::UploadUnknowable | ReleaseOutcome::UploadFailed => {
+                Err(anyhow::Error::new(RepoUnavailable).context(
+                    "archive upload did not complete durably before the lock was released",
+                ))
+            }
             // The raise site inside `publish` already logged the repo and the
             // status, so this carries no detail: the handler layer turns it
             // into a fixed 503 body.
@@ -1537,6 +1551,14 @@ pub(crate) fn advisory_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_durable_release_outcomes_do_not_report_success() {
+        assert!(ReleaseOutcome::Released.into_result().is_ok());
+        assert!(ReleaseOutcome::UploadUnknowable.into_result().is_err());
+        assert!(ReleaseOutcome::UploadFailed.into_result().is_err());
+        assert!(ReleaseOutcome::Fenced.into_result().is_err());
+    }
 
     // ── sync slug validation (#272) ────────────────────────────────────────
 
@@ -5118,12 +5140,17 @@ mod tests {
             started.elapsed() >= bound,
             "A's release must have run out its transfer bound with the PUT in flight"
         );
-        // A timeout is UNKNOWABLE rather than failed, so the release reports an
-        // ordinary success and the lock frees. That is exactly why the fence has
-        // to live in the store: nothing here knows A's bytes are still coming.
+        // A timeout is UNKNOWABLE rather than failed, so the release frees the
+        // lock but must not report durability to the caller. That is exactly why
+        // the fence has to live in the store: nothing here knows A's bytes are
+        // still coming.
         assert!(
-            matches!(outcome_a, ReleaseOutcome::Released),
-            "an abandoned publish reports a plain release, got {outcome_a:?}"
+            matches!(outcome_a, ReleaseOutcome::UploadUnknowable),
+            "an abandoned publish must report unknowable durability, got {outcome_a:?}"
+        );
+        assert!(
+            outcome_a.into_result().is_err(),
+            "unknowable upload must not report success to the caller"
         );
 
         assert!(
@@ -5218,8 +5245,8 @@ mod tests {
         mock.park_next_put();
         let outcome_a = guard_a.release(true).await;
         assert!(
-            matches!(outcome_a, ReleaseOutcome::Released),
-            "an abandoned publish reports a plain release, got {outcome_a:?}"
+            matches!(outcome_a, ReleaseOutcome::UploadUnknowable),
+            "an abandoned publish must report unknowable durability, got {outcome_a:?}"
         );
 
         assert!(
@@ -5304,8 +5331,8 @@ mod tests {
         mock.park_next_put();
         let outcome_a = guard_a.release(true).await;
         assert!(
-            matches!(outcome_a, ReleaseOutcome::Released),
-            "an abandoned publish reports a plain release, got {outcome_a:?}"
+            matches!(outcome_a, ReleaseOutcome::UploadUnknowable),
+            "an abandoned publish must report unknowable durability, got {outcome_a:?}"
         );
 
         assert_eq!(

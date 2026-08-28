@@ -123,20 +123,24 @@ impl From<anyhow::Error> for AppError {
             // 500. The internal message names the owner slug and repo, so the
             // variant carries nothing: the detail stays in the log at the raise
             // site and the client gets a fixed retryable body.
-            Err(err) => match err.downcast::<crate::git::repo_store::RepoBusy>() {
-                Ok(_) => AppError::RepoBusy,
-                // Same reasoning one rung down: a refused under-lock refresh is a
-                // transient storage condition, and its internal message names the
-                // owner slug and repo, so the variant carries nothing.
-                Err(err) => match err.downcast::<crate::git::repo_store::RepoUnavailable>() {
-                    Ok(_) => AppError::RepoUnavailable,
-                    // And one more rung: a publish the store refused twice is
-                    // transient in the same way, and the retry is the client's
-                    // to make. The variant carries nothing for the same reason
-                    // as the two above.
-                    Err(err) => match err.downcast::<crate::git::repo_store::RepoWriteFenced>() {
-                        Ok(_) => AppError::RepoWriteFenced,
-                        Err(err) => AppError::Internal(err),
+            Err(err) => match err.downcast::<crate::git::repo_store::LockPoolBusy>() {
+                Ok(_) => AppError::Overloaded("git write locks at capacity, retry shortly".into()),
+                Err(err) => match err.downcast::<crate::git::repo_store::RepoBusy>() {
+                    Ok(_) => AppError::RepoBusy,
+                    // Same reasoning one rung down: a refused under-lock refresh is a
+                    // transient storage condition, and its internal message names the
+                    // owner slug and repo, so the variant carries nothing.
+                    Err(err) => match err.downcast::<crate::git::repo_store::RepoUnavailable>() {
+                        Ok(_) => AppError::RepoUnavailable,
+                        // And one more rung: a publish the store refused twice is
+                        // transient in the same way, and the retry is the client's
+                        // to make. The variant carries nothing for the same reason
+                        // as the two above.
+                        Err(err) => match err.downcast::<crate::git::repo_store::RepoWriteFenced>()
+                        {
+                            Ok(_) => AppError::RepoWriteFenced,
+                            Err(err) => AppError::Internal(err),
+                        },
                     },
                 },
             },
@@ -296,7 +300,11 @@ impl IntoResponse for AppError {
         // here rather than in bespoke early returns, keeping each variant handled once.
         if matches!(
             self,
-            AppError::Overloaded(_) | AppError::SearchIncomplete { .. }
+            AppError::Overloaded(_)
+                | AppError::SearchIncomplete { .. }
+                | AppError::RepoBusy
+                | AppError::RepoUnavailable
+                | AppError::RepoWriteFenced
         ) {
             resp.headers_mut().insert(
                 axum::http::header::RETRY_AFTER,
@@ -413,5 +421,32 @@ mod tests {
         let err: AppError = anyhow::Error::from(sqlx::Error::PoolClosed).into();
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn lock_pool_busy_via_anyhow_from_is_503_overloaded() {
+        let err: AppError = anyhow::Error::new(crate::git::repo_store::LockPoolBusy).into();
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get("retry-after").unwrap().to_str().unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn repo_busy_unavailable_and_fenced_advertise_retry_after() {
+        for err in [
+            AppError::RepoBusy,
+            AppError::RepoUnavailable,
+            AppError::RepoWriteFenced,
+        ] {
+            let resp = err.into_response();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                resp.headers().get("retry-after").unwrap().to_str().unwrap(),
+                "1"
+            );
+        }
     }
 }
