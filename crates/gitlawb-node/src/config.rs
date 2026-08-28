@@ -734,7 +734,13 @@ impl Config {
     /// Cross-field boot validation. Single-field ranges are enforced by clap; this
     /// catches combinations that ship a denial-of-service under otherwise-valid
     /// values. Call once at startup and fail fast on `Err`.
-    pub fn validate(&self) -> Result<(), String> {
+    ///
+    /// `&mut self` is required so the validator can normalize `web_url` to
+    /// its canonical form after validation: the configured value is
+    /// advertised on public `GET /`, and any consumer reading
+    /// `config.web_url` later must see the same string that was actually
+    /// validated.
+    pub fn validate(&mut self) -> Result<(), String> {
         // A write pins one pooled connection for its whole duration (the
         // connection-affine advisory lock in repo_store::acquire_write), and
         // concurrent writes are capped at max_concurrent_git_pushes. If the pool
@@ -768,6 +774,20 @@ impl Config {
                     ));
                 }
             }
+            // Normalize to one canonical form so every consumer (the regular
+            // and degraded `GET /` handlers, anyone who reads
+            // `config.web_url` directly) sees the same string that was
+            // actually validated. The CLI's own defensive trim would paper
+            // over the divergence on the `View:` line, but that hides the
+            // bug from any other consumer that parses the value verbatim.
+            let canonical = raw
+                .trim()
+                .parse::<url::Url>()
+                .map(|u| u.to_string())
+                .map_err(|_| "is not a valid absolute URL".to_string())?;
+            if canonical != *raw {
+                self.web_url = Some(canonical);
+            }
         }
         Ok(())
     }
@@ -775,10 +795,14 @@ impl Config {
 
 /// Validate a `web_url` value for use as a browser-reachable base URL.
 /// Blank values are rejected (clap maps `--web-url ""` to `Some("")`), and
-/// non-blank values must parse as absolute `http`/`https` URLs with no query
-/// or fragment — the CLI treats this as a string prefix to append paths to,
-/// so anything else produces links no browser can follow (`?a=1/owner/repo`
-/// puts the repo path inside the query string).
+/// non-blank values must parse as absolute `http`/`https` URLs with no
+/// query, fragment, or userinfo — the CLI treats this as a string prefix
+/// to append paths to, so anything else produces links no browser can
+/// follow (`?a=1/owner/repo` puts the repo path inside the query string);
+/// and userinfo is rejected outright because the configured value is
+/// published on public `GET /` and reprinted on the CLI's `View:` line,
+/// so an accidentally configured password would land in public metadata,
+/// terminal scrollback, and CI logs.
 pub(crate) fn validate_web_url(raw: &str) -> Result<(), String> {
     if raw.trim().is_empty() {
         return Err("must not be empty or whitespace-only".into());
@@ -801,6 +825,12 @@ pub(crate) fn validate_web_url(raw: &str) -> Result<(), String> {
     if parsed.fragment().is_some() {
         return Err(
             "must not contain a fragment — it is used as a path prefix for View links".into(),
+        );
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(
+            "must not contain a username or password — it is advertised publicly and printed on the View: line"
+                .into(),
         );
     }
     Ok(())
@@ -1431,7 +1461,7 @@ mod tests {
             .expect("default config must validate");
 
         // An under-sized pool relative to the push cap is rejected (20 < 32 + 8).
-        let under = Config::parse_from([
+        let mut under = Config::parse_from([
             "gitlawb-node",
             "--db-max-connections",
             "20",
@@ -1444,7 +1474,7 @@ mod tests {
         );
 
         // Exactly at the floor validates (40 == 32 + 8).
-        let at_floor = Config::parse_from([
+        let mut at_floor = Config::parse_from([
             "gitlawb-node",
             "--db-max-connections",
             "40",
@@ -1527,6 +1557,57 @@ mod tests {
         let mut cfg = Config::parse_from(["gitlawb-node"]);
         cfg.web_url = Some("http://localhost:8080/ui".into());
         assert!(cfg.validate().is_ok(), "port+path web_url must validate");
+
+        // Userinfo must be rejected: `web_url` is published on public
+        // `GET /` and reprinted on the CLI's `View:` line, so an
+        // accidentally configured password would land in public metadata,
+        // terminal scrollback, and CI logs. Reject username-only and
+        // user+password forms.
+        for bad in [
+            "https://user@example.com",
+            "https://user:secret@example.com",
+            "https://:secret@example.com",
+        ] {
+            let mut cfg = Config::parse_from(["gitlawb-node"]);
+            cfg.web_url = Some(bad.into());
+            assert!(
+                cfg.validate().is_err(),
+                "web_url {bad:?} (userinfo) must be rejected"
+            );
+        }
+    }
+
+    /// `validate()` accepts whitespace-padded input but the stored value
+    /// must match the canonical form actually validated, so every consumer
+    /// (the regular and degraded `GET /` handlers, anyone who reads
+    /// `config.web_url` directly) sees the same string. Without this, an
+    /// operator that sets `GITLAWB_WEB_URL="  https://git.example  "` boots
+    /// a node that advertises `"  https://git.example  "` on public
+    /// metadata — different from what was validated, different from what
+    /// any other consumer would parse.
+    #[test]
+    fn web_url_is_normalized_to_canonical_form_after_validation() {
+        // Padded input is rewritten to the canonical form. `url::Url`'s
+        // own `to_string` is what we use for the canonicalization, and
+        // it always appends a path-separator slash to a bare-host URL,
+        // so the stored value is `https://git.example/` (which is also
+        // what every browser would normalize the operator-typed form to).
+        let mut cfg = Config::parse_from(["gitlawb-node"]);
+        cfg.web_url = Some("  https://git.example  ".into());
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.web_url.as_deref(),
+            Some("https://git.example/"),
+            "stored web_url must be the canonical form, not the operator-typed one"
+        );
+
+        // Already-canonical input is left alone after a no-op
+        // re-normalization — same form comes back out, so any consumer
+        // reading the stored value sees a stable string across calls.
+        let mut cfg = Config::parse_from(["gitlawb-node"]);
+        cfg.web_url = Some("https://git.example/".into());
+        cfg.validate().unwrap();
+        assert_eq!(cfg.web_url.as_deref(), Some("https://git.example/"));
     }
 
     /// The DECLARED default, read off the parser rather than out of a parse.

@@ -283,6 +283,13 @@ pub(crate) async fn fetch_node_web_url(node: &str) -> Option<String> {
             Ok(parsed) if parsed.query().is_some() || parsed.fragment().is_some() => {
                 Some("contains a query or fragment")
             }
+            // userinfo is rejected because the `View:` line prints the
+            // value verbatim; a remote advertisement carrying
+            // `user:pass@host` would land that credential in terminal
+            // scrollback and CI logs.
+            Ok(parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
+                Some("contains a username or password")
+            }
             Ok(_) => None,
         }
     };
@@ -1098,6 +1105,33 @@ mod tests {
 
         let web_url = fetch_node_web_url(&server.url()).await;
         assert_eq!(web_url.as_deref(), Some("http://localhost:8080/ui"));
+    }
+
+    /// A remote node that advertises `web_url` with userinfo (`user@`,
+    /// `user:pass@`) must be dropped: the value is reprinted on the `View:`
+    /// line, and a credential embedded in the URL would land in terminal
+    /// scrollback and CI logs. Mirrors the node-side boot validation.
+    #[tokio::test]
+    async fn test_fetch_node_web_url_rejects_userinfo() {
+        for bad in [
+            "https://user@example.com",
+            "https://user:secret@example.com",
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _m = server
+                .mock("GET", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(r#"{{"web_url":"{}"}}"#, bad))
+                .create_async()
+                .await;
+
+            let web_url = fetch_node_web_url(&server.url()).await;
+            assert_eq!(
+                web_url, None,
+                "web_url with userinfo {bad:?} must be rejected"
+            );
+        }
     }
 
     /// A non-success status must still return None (View link is cosmetic) but
