@@ -769,6 +769,7 @@ pub fn validate_git_ref(name: &str) -> std::result::Result<(), String> {
     if name.starts_with("refs/") {
         return Err("branch ref must be a local branch name, not a fully qualified ref".into());
     }
+    // allow-unbounded-git: stateless check-ref-format on a user-supplied name; no repo acquire or concurrency permit
     let output = Command::new("git")
         .args(["check-ref-format", "--branch", name])
         .output()
