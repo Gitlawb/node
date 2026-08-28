@@ -792,15 +792,7 @@ impl Config {
                 self.p2p_key_path
             ));
         }
-        if crate::p2p::names_no_usable_directory(&p2p_key_path) {
-            return Err(format!(
-                "GITLAWB_P2P_KEY ({}) must include a directory that does not walk back through \
-                 `..`, such as ./keys/p2p.key or /data/keys/p2p.key: the node will not store its \
-                 p2p identity key in the working directory, where the directory holding it \
-                 cannot be secured.",
-                self.p2p_key_path
-            ));
-        }
+        crate::p2p::validate_p2p_key_path(&p2p_key_path, Some(&self.p2p_key_path))?;
 
         Ok(())
     }
@@ -1565,19 +1557,30 @@ mod tests {
             .expect("the shipped default p2p key path must validate");
     }
 
-    /// The one input that separates validating the raw config string from
-    /// validating `resolved_p2p_key_path()`. Raw, `~/` has an empty parent and
-    /// would be rejected; resolved, it is the home directory, whose parent is a
-    /// real directory, so it is accepted. Every other tilde path is accepted
-    /// under both readings and therefore proves nothing.
+    /// `~/` expands to the home directory itself, which is a directory rather
+    /// than a key file, so it must be rejected before its parent is chmodded.
     #[test]
     fn p2p_key_path_is_checked_after_tilde_expansion() {
         if dirs_next::home_dir().is_none() {
             panic!("this test needs a home directory to distinguish raw from resolved");
         }
+        let err = config_with_p2p_key("~/")
+            .validate()
+            .expect_err("`~/` must name a key file, not a directory");
         assert!(
-            config_with_p2p_key("~/").validate().is_ok(),
-            "`~/` resolves to the home directory, whose parent is a real directory"
+            err.contains("must name a key file"),
+            "`~/` must be rejected before chmodding its parent, got: {err}"
+        );
+    }
+
+    #[test]
+    fn p2p_key_path_trailing_directory_separator_is_rejected() {
+        let err = config_with_p2p_key("/data/keys/")
+            .validate()
+            .expect_err("a trailing directory separator must be rejected");
+        assert!(
+            err.contains("must name a key file"),
+            "trailing `/` must be rejected before chmod, got: {err}"
         );
     }
 }
