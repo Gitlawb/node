@@ -1116,7 +1116,8 @@ mod tests {
             );
         }
 
-        for path in ["/p2p.key"] {
+        {
+            let path = "/p2p.key";
             assert!(
                 names_no_usable_directory(Path::new(path))
                     || key_parent_is_filesystem_root(Path::new(path)),
