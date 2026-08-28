@@ -747,9 +747,13 @@ pub fn read_object(repo_path: &Path, sha256_hex: &str) -> Result<Option<(String,
 }
 
 /// Validate a git *branch name* before it is stored or interpolated into a git
-/// argv element. Delegates to `git check-ref-format --branch`, which rejects
-/// symbolic revision names (`HEAD`), option-shaped names (leading `-`), trailing
-/// dots, and every other form git would refuse for `refs/heads/...`.
+/// argv element. Delegates to `git check-ref-format --branch`, then rejects
+/// fully qualified ref paths (`refs/heads/...`, `refs/tags/...`) that git would
+/// accept as branch-name syntax but that resolve as tags or other refs when
+/// passed back to git as bare revision arguments.
+///
+/// Symbolic revision names (`HEAD`), option-shaped names (leading `-`), trailing
+/// dots, and other invalid forms are rejected by check-ref-format itself.
 ///
 /// A `--` delimiter is not the fix at the sink: these arguments are revisions,
 /// and `--` there reinterprets them as pathspecs.
@@ -761,6 +765,9 @@ pub fn read_object(repo_path: &Path, sha256_hex: &str) -> Result<Option<(String,
 pub fn validate_git_ref(name: &str) -> std::result::Result<(), String> {
     if name.is_empty() {
         return Err("branch ref must not be empty".into());
+    }
+    if name.starts_with("refs/") {
+        return Err("branch ref must be a local branch name, not a fully qualified ref".into());
     }
     let output = Command::new("git")
         .args(["check-ref-format", "--branch", name])
@@ -945,6 +952,9 @@ mod tests {
             "HEAD",
             "feature.",
             "feature/x.",
+            "refs/heads/main",
+            "refs/tags/v1",
+            "refs/heads/--output=/tmp/x",
             "--output=/tmp/x",
             "-rf",
             "a b",
