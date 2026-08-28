@@ -16060,11 +16060,11 @@ mod tests {
             }
 
             /// SCENARIO 2. Every re-read attempt fails: the loop must give up on a BOUND
-            /// (asserted as a literal, so raising or removing the bound goes RED) and log
-            /// the give-up at ERROR so the residual loss is observable rather than silent.
+            /// (asserted as a literal, so raising or removing the bound goes RED) and hit
+            /// the give-up path that logs at ERROR in production (asserted here via the
+            /// drain_faults seam, which fires on the same branch as that log).
             #[sqlx::test]
             async fn u2_sustained_repo_reread_failure_is_bounded_and_logged(pool: PgPool) {
-                logcap::install();
                 let state = test_state(pool).await;
                 let owner = new_did();
                 let repo = seed_repo(&owner, "u2-bounded");
@@ -16115,11 +16115,10 @@ mod tests {
                     !state.db.is_pinned(&obj2).await.unwrap(),
                     "with the read never succeeding there is nothing fresh to act on"
                 );
-                let errs = logcap::errors_containing(&repo.id);
                 assert!(
-                    !errs.is_empty(),
-                    "the exhausted drain re-read is logged at ERROR with the repo id, so \
-                     the residual work loss is observable; captured: {errs:?}"
+                    drain_faults::reread_exhausted(&repo.id),
+                    "the exhausted drain re-read must hit the give-up path that logs at \
+                     ERROR in production"
                 );
                 assert!(
                     state.encrypt_inflight.is_empty(),

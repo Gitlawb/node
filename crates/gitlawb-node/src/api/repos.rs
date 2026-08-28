@@ -1005,6 +1005,7 @@ pub(crate) mod drain_faults {
         pub(crate) rules_read_failures_left: usize,
         pub(crate) repo_read_attempts: usize,
         pub(crate) rules_read_attempts: usize,
+        pub(crate) reread_exhausted: bool,
     }
 
     fn table() -> &'static Mutex<HashMap<String, Counters>> {
@@ -1033,6 +1034,25 @@ pub(crate) mod drain_faults {
             .get(repo_id)
             .copied()
             .unwrap_or_default()
+    }
+
+    /// Whether the drain re-read loop exhausted its retry budget for `repo_id`.
+    pub(crate) fn reread_exhausted(repo_id: &str) -> bool {
+        table()
+            .lock()
+            .unwrap()
+            .get(repo_id)
+            .map(|c| c.reread_exhausted)
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn mark_reread_exhausted(repo_id: &str) {
+        table()
+            .lock()
+            .unwrap()
+            .entry(repo_id.to_string())
+            .or_default()
+            .reread_exhausted = true;
     }
 
     /// Production-path hook: count one repo re-read attempt, return whether it must fail.
@@ -1156,6 +1176,8 @@ async fn drain_refresh_state(ctx: &EncryptTaskCtx) -> DrainRefresh {
         "coalesced drain: re-read failed on every attempt; the coalesced push's \
          pin/encrypt pass is dropped (no reconciliation sweep re-derives it)"
     );
+    #[cfg(test)]
+    drain_faults::mark_reread_exhausted(&ctx.repo_id);
     DrainRefresh::Failed
 }
 
@@ -1543,11 +1565,12 @@ async fn pin_and_encrypt_objects(
 /// Map an `acquire_write` failure to the right `AppError`. An exhausted repo write-lock
 /// POOL is a capacity signal, not a broken repo, so it sheds 503 + Retry-After the same
 /// way the admission caps around it do; it used to fall into the generic git 500, which
-/// tells the client nothing about retrying (#173 F1). Anything else stays a git error.
+/// tells the client nothing about retrying (#173 F1). Lock contention and a refused
+/// under-lock refresh are transient and map to fixed-body 503s via [`RepoBusy`] and
+/// [`RepoUnavailable`]; only genuine untyped git failures stay on the 500 path.
 ///
-/// Shared with the non-push `acquire_write` callers (`api/issues.rs`, `api/pulls.rs`)
-/// rather than copied: those hold no admission permit, so they meet an exhausted pool
-/// first, and a second copy of this mapping would be free to drift from the push path.
+/// Shared with every `acquire_write` caller (`receive-pack`, `api/issues.rs`,
+/// `api/pulls.rs`) so the write-acquisition contract cannot drift between routes.
 pub(crate) fn acquire_write_app_error(err: &anyhow::Error, repo: &str) -> AppError {
     if err
         .downcast_ref::<crate::git::repo_store::LockPoolBusy>()
@@ -1555,6 +1578,16 @@ pub(crate) fn acquire_write_app_error(err: &anyhow::Error, repo: &str) -> AppErr
     {
         tracing::warn!(repo = %repo, err = %err, "write-lock pool exhausted; shedding with 503");
         AppError::Overloaded("git write locks at capacity, retry shortly".into())
+    } else if is_expected_transient_acquire_failure(err) {
+        tracing::warn!(repo = %repo, err = %err, "acquire_write failed");
+        if err
+            .downcast_ref::<crate::git::repo_store::RepoBusy>()
+            .is_some()
+        {
+            AppError::RepoBusy
+        } else {
+            AppError::RepoUnavailable
+        }
     } else {
         tracing::error!(repo = %repo, err = %err, "acquire_write failed");
         AppError::Git(err.to_string())
@@ -2255,19 +2288,7 @@ pub async fn git_receive_pack(
         tracing::warn!(repo = %name, "acquire_write timed out; shedding with 503");
         AppError::Overloaded("git service acquisition timed out, retry shortly".into())
     })?
-    .map_err(|e| {
-        if e.downcast_ref::<crate::git::repo_store::LockPoolBusy>()
-            .is_some()
-        {
-            acquire_write_app_error(&e, name)
-        } else if is_expected_transient_acquire_failure(&e) {
-            tracing::warn!(repo = %name, err = %e, "acquire_write failed");
-            AppError::from(e)
-        } else {
-            tracing::error!(repo = %name, err = %e, "acquire_write failed");
-            AppError::Git(e.to_string())
-        }
-    })?;
+    .map_err(|e| acquire_write_app_error(&e, name))?;
     let disk_path = guard.path().to_path_buf();
     tracing::debug!(repo = %name, path = %disk_path.display(), "running git receive-pack");
     let body_len = body.len();
@@ -3628,6 +3649,35 @@ mod tests {
         // Anything the classifier cannot recognize keeps paging at error level.
         let other = anyhow::anyhow!("disk on fire");
         assert!(!is_expected_transient_acquire_failure(&other));
+    }
+
+    #[test]
+    fn acquire_write_app_error_maps_transient_markers_to_retryable_503() {
+        let busy = anyhow::Error::new(crate::git::repo_store::RepoBusy)
+            .context("another write is in progress for alice/demo");
+        assert!(matches!(
+            acquire_write_app_error(&busy, "demo"),
+            AppError::RepoBusy
+        ));
+
+        let unavailable = anyhow::Error::new(crate::git::repo_store::RepoUnavailable)
+            .context("could not read the archive HEAD for alice/demo");
+        assert!(matches!(
+            acquire_write_app_error(&unavailable, "demo"),
+            AppError::RepoUnavailable
+        ));
+
+        let pool = anyhow::Error::new(crate::git::repo_store::LockPoolBusy);
+        assert!(matches!(
+            acquire_write_app_error(&pool, "demo"),
+            AppError::Overloaded(_)
+        ));
+
+        let other = anyhow::anyhow!("disk on fire");
+        assert!(matches!(
+            acquire_write_app_error(&other, "demo"),
+            AppError::Git(_)
+        ));
     }
 
     fn repo_owned_by(owner_did: &str) -> crate::db::RepoRecord {

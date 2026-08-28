@@ -973,4 +973,113 @@ mod lock_pool_shed_tests {
             admitted.err()
         );
     }
+
+    async fn assert_retryable_repo_acquire(err: AppError, what: &str, code: &str) {
+        let resp = err.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{what}: a transient acquire refusal must shed 503, not a 500 git error"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains(code),
+            "{what}: the 503 must carry the {code} code, got {body}"
+        );
+    }
+
+    /// Advisory-lock contention on a non-push mutation must map through the shared
+    /// `acquire_write_app_error` classifier to `repo_busy`, not a 500 git_error.
+    #[sqlx::test]
+    async fn create_issue_contention_sheds_repo_busy_not_500(pool: PgPool) {
+        let owner = "did:key:zISSUECREATEBUSYAAAAAAAAAAAAAAAAAAAAA";
+        let repo_name = "busy-create";
+        let state = crate::test_support::test_state(pool.clone()).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, repo_name))
+            .await
+            .expect("seed repo");
+
+        let held = state
+            .repo_store
+            .acquire_write(owner, repo_name)
+            .await
+            .expect("the first writer takes the advisory lock");
+
+        let shed = create_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), repo_name.to_string())),
+            Json(CreateIssueRequest {
+                title: "t".to_string(),
+                body: None,
+                signed_payload: None,
+            }),
+        )
+        .await;
+        let err = shed.expect_err("contention must refuse the second writer");
+        assert_retryable_repo_acquire(err, "create_issue", "repo_busy").await;
+
+        let _ = held.release(false).await;
+    }
+
+    /// A refused under-lock refresh on a non-push mutation must map to
+    /// `repo_unavailable`, not expose the storage error as a 500 git_error.
+    #[sqlx::test]
+    async fn create_issue_unavailable_sheds_repo_unavailable_not_500(pool: PgPool) {
+        use axum::response::IntoResponse;
+
+        let app = axum::Router::new().route(
+            "/{*key}",
+            axum::routing::any(|method: axum::http::Method| async move {
+                if method == axum::http::Method::HEAD {
+                    let mut resp = axum::http::StatusCode::OK.into_response();
+                    resp.headers_mut()
+                        .insert("etag", axum::http::HeaderValue::from_static("\"gen-1\""));
+                    resp
+                } else {
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let owner = "did:key:zISSUEUNAVAILAAAAAAAAAAAAAAAAAAAAAAA";
+        let repo_name = "unavail-create";
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing_with_tigris(
+            std::path::PathBuf::from("/tmp/gitlawb-issue-unavail"),
+            crate::git::repo_store::build_lock_pool(&pool, 2, std::time::Duration::from_secs(1)),
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint),
+        );
+        state
+            .db
+            .create_repo(&seed_repo(owner, repo_name))
+            .await
+            .expect("seed repo");
+
+        let shed = create_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), repo_name.to_string())),
+            Json(CreateIssueRequest {
+                title: "t".to_string(),
+                body: None,
+                signed_payload: None,
+            }),
+        )
+        .await;
+        let err = shed.expect_err("a failed archive download must refuse the write");
+        assert_retryable_repo_acquire(err, "create_issue", "repo_unavailable").await;
+
+        server.abort();
+    }
 }
