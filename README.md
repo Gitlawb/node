@@ -66,7 +66,7 @@ Good today:
 
 Known limitations:
 
-- Repository write authorization is not secure by default: `GITLAWB_ENFORCE_OWNER_PUSH` defaults to `false` for compatibility, so a valid HTTP Signature identifies a pusher but does not enforce owner-only pushes.
+- Repository write authorization is secure by default: `GITLAWB_ENFORCE_OWNER_PUSH` defaults to `true`, so a valid HTTP Signature identifies a pusher and the node additionally requires that pusher to be the repository owner. Set `GITLAWB_ENFORCE_OWNER_PUSH=false` only for the duration of a rolling upgrade whose pushers are not yet the repo owner. Authentication is not authorization on its own — anyone can mint a `did:key` and sign — so owner enforcement is the only thing that prevents every signed caller from pushing to every repository, private ones included.
 - UCAN proof chains are validated when supplied, but UCAN capabilities are not consulted by write authorization and the root issuer is not independently trust-anchored. UCANs therefore do not yet grant scoped collaborator access.
 - Agent lifecycle revocation is not enforced by HTTP Signature authorization; do not rely on removing or revoking an agent record to block a compromised signer.
 - Read visibility is not a blanket data-classification boundary: task, IPFS-pin, and Arweave-anchor listings are not repository-gated; withheld path names can be visible to a root reader; and later visibility changes cannot retract content already announced or externally anchored.
