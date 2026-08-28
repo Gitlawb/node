@@ -1015,6 +1015,222 @@ mod tests {
         );
     }
 
+    /// Branch-name contract (jatmn #379): create_pr must reject symbolic revision
+    /// names and trailing-dot components that `git check-ref-format --branch` refuses.
+    #[sqlx::test]
+    async fn create_pr_rejects_non_branch_ref_names(pool: PgPool) {
+        let owner = "did:key:zPRBRANCHREFAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        let repo = seed_repo(owner, "branch-ref-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/pulls",
+                    axum::routing::post(crate::api::pulls::create_pr),
+                )
+                .with_state(state.clone())
+        };
+        let uri = format!("/api/v1/repos/{owner}/branch-ref-repo/pulls");
+
+        for (field, bad) in [
+            ("source_branch", "HEAD"),
+            ("source_branch", "feature."),
+            ("source_branch", "feature/x."),
+            ("target_branch", "HEAD"),
+            ("target_branch", "feature."),
+            ("target_branch", "feature/x."),
+        ] {
+            let body_json = if field == "source_branch" {
+                format!(r#"{{"title":"x","source_branch":"{bad}","target_branch":"main"}}"#)
+            } else {
+                format!(r#"{{"title":"x","source_branch":"main","target_branch":"{bad}"}}"#)
+            };
+            let body = Body::from(body_json);
+            let resp = router()
+                .oneshot(signed_request_as(owner, Method::POST, &uri, body))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{field}={bad:?} must be rejected, got {}",
+                resp.status()
+            );
+            let prs = state.db.list_prs(&repo.id).await.expect("list_prs");
+            assert!(
+                prs.is_empty(),
+                "no PR row when {field}={bad:?} is rejected"
+            );
+        }
+    }
+
+    /// Branch-name contract (jatmn #379): create_repo must reject a default_branch
+    /// that is not a real branch name.
+    #[sqlx::test]
+    async fn create_repo_rejects_non_branch_default_branch(pool: PgPool) {
+        let owner = "did:key:zREPOBRANCHREFAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos",
+                    axum::routing::post(crate::api::repos::create_repo),
+                )
+                .with_state(state.clone())
+        };
+
+        for (name_suffix, bad) in [
+            ("head", "HEAD"),
+            ("trail-dot", "feature."),
+            ("trail-dot-comp", "feature/x."),
+        ] {
+            let repo_name = format!("bad-def-{name_suffix}");
+            let body = Body::from(format!(
+                r#"{{"name":"{repo_name}","default_branch":"{bad}"}}"#
+            ));
+            let resp = router()
+                .oneshot(signed_request_as(
+                    owner,
+                    Method::POST,
+                    "/api/v1/repos",
+                    body,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "default_branch={bad:?} must be rejected, got {}",
+                resp.status()
+            );
+            assert!(
+                state
+                    .db
+                    .get_repo(owner, &repo_name)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "no repo row when default_branch={bad:?} is rejected"
+            );
+        }
+    }
+
+    /// SINK GUARD: a legacy row with source_branch=HEAD must be rejected before
+    /// merge_branch runs git. Without the sink guard, git merge HEAD succeeds on
+    /// the checked-out target and the PR is recorded as merged without merging
+    /// the submitted source branch.
+    #[sqlx::test]
+    async fn legacy_pr_row_with_head_source_is_rejected_at_merge_sink(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let src = std::env::temp_dir().join(format!("gl-head-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("f.txt"), b"hi").unwrap();
+        run(&["add", "f.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        run(&["branch", "feature"], &src);
+        std::fs::write(src.join("f.txt"), b"changed").unwrap();
+        run(&["add", "f.txt"], &src);
+        run(&["commit", "-q", "-m", "on feature"], &src);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("head-probe.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+
+        let mut repo = seed_repo(&owner_did, "head-probe");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "x".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: "HEAD".into(),
+            target_branch: "main".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert legacy row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                axum::routing::post(crate::api::pulls::merge_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/head-probe/pulls/1/merge");
+        let resp = router
+            .oneshot(signed_request_as(&owner_did, Method::POST, &uri, Body::empty()))
+            .await
+            .unwrap();
+        assert!(
+            !resp.status().is_success(),
+            "merge must not succeed for source_branch=HEAD, got {}",
+            resp.status()
+        );
+
+        let stored = state
+            .db
+            .get_pr(&repo.id, 1)
+            .await
+            .expect("get_pr")
+            .expect("pr row");
+        assert_eq!(
+            stored.status, "open",
+            "a rejected merge must not record pull_request.merged"
+        );
+    }
+
     /// Adversarial-review GATE-2 (create_issue): filing an issue requires read
     /// access. A non-reader is denied on a private repo before any git work.
     #[sqlx::test]
