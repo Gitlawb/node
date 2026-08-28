@@ -298,6 +298,75 @@ pub(crate) fn parent_directory_is_safe_to_mutate(dir: &Path) -> Result<(), Strin
     Ok(())
 }
 
+/// Mode bits alone do not make something node-owned. A `0700` directory or a
+/// `0600` file belonging to a different user passes every permission check here
+/// while that user keeps the ability to replace what is inside it, which means
+/// they choose the node's libp2p identity. That is the capability the persisted
+/// key exists to take away, so it is refused rather than warned about.
+#[cfg(unix)]
+fn foreign_ownership_error(what: &str, path: &Path, owner_uid: u32, euid: u32) -> Option<String> {
+    if owner_uid == euid {
+        return None;
+    }
+    Some(format!(
+        "p2p {what} {} is owned by uid {} but this node runs as uid {}; that user can \
+         replace it and so decides the node's libp2p identity, which is what the persisted \
+         key exists to prevent. Point {} at a location this user owns, or have the owner \
+         hand it over; the node will not adopt it.",
+        path.display(),
+        owner_uid,
+        euid,
+        if what == "key directory" {
+            "GITLAWB_P2P_KEY's directory"
+        } else {
+            "GITLAWB_P2P_KEY"
+        }
+    ))
+}
+
+/// Refuse a key directory whose existing ancestors are controlled by someone
+/// else, before creating anything inside them.
+#[cfg(unix)]
+fn foreign_ancestor_error(dir: &Path, euid: u32) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    for ancestor in dir.ancestors().skip(1) {
+        let md = match std::fs::metadata(ancestor) {
+            Ok(md) => md,
+            Err(_) => continue,
+        };
+
+        let owner = md.uid();
+        if owner != euid && owner != 0 {
+            return Some(format!(
+                "p2p key directory {} sits under {}, which is owned by uid {} rather than this \
+                 node (uid {}) or root; that user can rename or replace the directory holding \
+                 the key and so control which identity the node presents. Put the key somewhere \
+                 this user or root owns the whole path.",
+                dir.display(),
+                ancestor.display(),
+                owner,
+                euid
+            ));
+        }
+
+        let mode = md.permissions().mode() & 0o777;
+        let sticky = md.permissions().mode() & 0o1000 != 0;
+        if mode & 0o002 != 0 && !sticky {
+            return Some(format!(
+                "p2p key directory {} sits under {}, which has mode {:04o} and is writable \
+                 beyond its owner; anyone with that write access can rename or replace the \
+                 directory holding the key and so control which identity the node presents.",
+                dir.display(),
+                ancestor.display(),
+                mode
+            ));
+        }
+    }
+    None
+}
+
 /// Whether the configured path names a directory rather than a key file.
 ///
 /// Checked lexically (`~/`, a trailing `/`) and against an existing path on
@@ -428,6 +497,14 @@ pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> 
 /// keys. Issue #231 owns the sibling gap in `main.rs`'s own creation path for
 /// that file; nothing here touches it.
 fn ensure_key_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let euid = effective_uid();
+        if let Some(err) = foreign_ancestor_error(dir, euid) {
+            anyhow::bail!(err);
+        }
+    }
+
     parent_directory_is_safe_to_mutate(dir).map_err(|e| anyhow::anyhow!(e))?;
 
     // Missing ancestors are created at the ambient mode. Only the nominated key
@@ -472,13 +549,18 @@ fn ensure_key_dir(dir: &Path) -> Result<()> {
 
     #[cfg(unix)]
     {
+        use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
 
-        let mode = std::fs::symlink_metadata(dir)
-            .with_context(|| format!("failed to stat key directory {}", dir.display()))?
-            .permissions()
-            .mode()
-            & 0o777;
+        let md = std::fs::symlink_metadata(dir)
+            .with_context(|| format!("failed to stat key directory {}", dir.display()))?;
+
+        let euid = effective_uid();
+        if let Some(err) = foreign_ownership_error("key directory", dir, md.uid(), euid) {
+            anyhow::bail!(err);
+        }
+
+        let mode = md.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
             warn!(
                 dir = %dir.display(),
@@ -604,6 +686,55 @@ thread_local! {
     /// Test-only fault injection for the key write. Thread-local so an armed
     /// test cannot disturb the others running beside it.
     static FAIL_KEY_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Test-only override for the process effective uid.
+    static EUID_OVERRIDE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The effective uid the ownership checks compare against.
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    #[cfg(test)]
+    if let Some(uid) = EUID_OVERRIDE.with(|c| c.get()) {
+        return uid;
+    }
+    // SAFETY: `geteuid` only reads the calling process's effective uid.
+    unsafe { libc::geteuid() }
+}
+
+fn read_bounded_key_bytes<R: std::io::Read>(
+    reader: &mut R,
+    key_path: &Path,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let mut buf = Zeroizing::new(Vec::new());
+    let mut chunk = [0u8; 256];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if buf.len() + n > MAX_P2P_KEY_BYTES {
+                    anyhow::bail!(
+                        "p2p key at {} exceeds the maximum accepted size of {} bytes",
+                        key_path.display(),
+                        MAX_P2P_KEY_BYTES
+                    );
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                anyhow::bail!(
+                    "p2p key at {} is not a readable regular file (open would block)",
+                    key_path.display()
+                );
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("failed to read p2p key from {}", key_path.display())
+                });
+            }
+        }
+    }
+    Ok(buf)
 }
 
 /// Read an existing key file, refusing one whose permissions or contents make
@@ -612,7 +743,7 @@ thread_local! {
 fn read_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
     #[cfg(unix)]
     let bytes = {
-        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::fs::PermissionsExt;
 
@@ -638,6 +769,11 @@ fn read_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
             );
         }
 
+        let euid = effective_uid();
+        if let Some(err) = foreign_ownership_error("key", key_path, md.uid(), euid) {
+            anyhow::bail!(err);
+        }
+
         let mode = md.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
             anyhow::bail!(
@@ -649,42 +785,22 @@ fn read_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
             );
         }
 
-        let mut buf = Zeroizing::new(Vec::new());
-        let mut chunk = [0u8; 256];
-        loop {
-            match file.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if buf.len() + n > MAX_P2P_KEY_BYTES {
-                        anyhow::bail!(
-                            "p2p key at {} exceeds the maximum accepted size of {} bytes",
-                            key_path.display(),
-                            MAX_P2P_KEY_BYTES
-                        );
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    anyhow::bail!(
-                        "p2p key at {} is not a readable regular file (open would block)",
-                        key_path.display()
-                    );
-                }
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("failed to read p2p key from {}", key_path.display())
-                    });
-                }
-            }
-        }
-        buf
+        read_bounded_key_bytes(&mut file, key_path)?
     };
 
     #[cfg(not(unix))]
-    let bytes = Zeroizing::new(
-        std::fs::read(key_path)
-            .with_context(|| format!("failed to read p2p key from {}", key_path.display()))?,
-    );
+    let bytes = {
+        let data = std::fs::read(key_path)
+            .with_context(|| format!("failed to read p2p key from {}", key_path.display()))?;
+        if data.len() > MAX_P2P_KEY_BYTES {
+            anyhow::bail!(
+                "p2p key at {} exceeds the maximum accepted size of {} bytes",
+                key_path.display(),
+                MAX_P2P_KEY_BYTES
+            );
+        }
+        Zeroizing::new(data)
+    };
 
     // An empty file decodes as a valid protobuf with a key type of RSA, so
     // without this the operator gets a misleading complaint about a missing
@@ -1071,25 +1187,19 @@ mod tests {
 
     /// The backstop inside `load_or_create_p2p_keypair`, exercised in a child
     /// process so cwd is not mutated for sibling tests.
+    #[cfg(unix)]
     #[test]
     fn p2p_key_path_naming_no_directory_is_refused_without_the_config_gate() {
         let dir = tempfile::tempdir().unwrap();
         let sentinel = dir.path().join("sentinel");
         std::fs::write(&sentinel, b"keep").unwrap();
 
-        #[cfg(unix)]
         let output = fixture_command_with_env(
             "p2p::tests::fixture_p2p_key_backstop_refuses_no_directory",
             "p2p-key-backstop",
         )
         .output()
         .expect("spawn the backstop fixture");
-
-        #[cfg(not(unix))]
-        let output = {
-            let _ = &sentinel;
-            panic!("backstop child-process fixture is unix-only");
-        };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1647,6 +1757,122 @@ mod tests {
         assert!(
             format!("{err:#}").contains("maximum accepted size"),
             "oversized refusal must name the size cap, got: {err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_p2p_keypair_refuses_a_key_owned_by_another_user() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p2p.key");
+        let kp = identity::Keypair::generate_ed25519();
+        std::fs::write(&path, kp.to_protobuf_encoding().unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let real_uid = std::fs::metadata(&path).unwrap().uid();
+        let other = real_uid.wrapping_add(1);
+
+        EUID_OVERRIDE.with(|c| c.set(Some(other)));
+        let result = read_p2p_keypair(&path);
+        EUID_OVERRIDE.with(|c| c.set(None));
+
+        let err = format!(
+            "{:#}",
+            result.expect_err("a foreign-owned key must be refused")
+        );
+        assert!(
+            err.contains(&format!(
+                "owned by uid {real_uid} but this node runs as uid {other}"
+            )),
+            "the refusal must name the file's owner and the running uid, got: {err}"
+        );
+        assert!(
+            read_p2p_keypair(&path).is_ok(),
+            "the same key must load when the owner matches"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_key_dir_refuses_a_directory_owned_by_another_user() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        for mode in [0o700, 0o777] {
+            let dir = tempfile::tempdir().unwrap();
+            let keys = dir.path().to_path_buf();
+            std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            let real_uid = std::fs::metadata(&keys).unwrap().uid();
+            EUID_OVERRIDE.with(|c| c.set(Some(real_uid.wrapping_add(1))));
+            let result = ensure_key_dir(&keys);
+            EUID_OVERRIDE.with(|c| c.set(None));
+
+            let err = format!(
+                "{:#}",
+                result.expect_err("a foreign-owned key directory must be refused")
+            );
+            assert!(
+                err.contains("owned by uid"),
+                "mode {mode:04o} must be refused, got: {err}"
+            );
+            assert!(
+                !err.contains("could not be tightened"),
+                "ownership must be reported before chmod, got: {err}"
+            );
+            assert_eq!(
+                std::fs::metadata(&keys).unwrap().permissions().mode() & 0o777,
+                mode,
+                "a refused directory must not have been chmodded first"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_key_dir_refuses_a_foreign_owned_ancestor() {
+        use std::os::unix::fs::MetadataExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let nested = base.path().join("keys");
+
+        let real_uid = std::fs::metadata(base.path()).unwrap().uid();
+        EUID_OVERRIDE.with(|c| c.set(Some(real_uid.wrapping_add(1))));
+        let result = ensure_key_dir(&nested);
+        EUID_OVERRIDE.with(|c| c.set(None));
+
+        let err = format!(
+            "{:#}",
+            result.expect_err("a directory under a foreign-owned ancestor must be refused")
+        );
+        assert!(
+            err.contains("sits under") && err.contains("control which identity"),
+            "must be refused for the ancestor, got: {err}"
+        );
+        assert!(
+            !nested.exists(),
+            "the key directory must not have been created"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreign_ownership_is_refused_and_matching_ownership_is_not() {
+        let path = Path::new("/data/keys/p2p.key");
+
+        for uid in [0u32, 1000, 65534] {
+            assert!(
+                foreign_ownership_error("key", path, uid, uid).is_none(),
+                "uid {uid} owning its own key must not be refused"
+            );
+        }
+
+        let err = foreign_ownership_error("key", path, 1000, 1001)
+            .expect("a key owned by another uid must be refused");
+        assert!(
+            err.contains("1000") && err.contains("1001"),
+            "the refusal must name both uids, got: {err}"
         );
     }
 
