@@ -15936,65 +15936,6 @@ mod tests {
             use super::*;
             use crate::api::repos::drain_faults;
 
-            /// Process-wide tracing capture so a test can assert the give-up is logged at
-            /// ERROR. A global default subscriber can only be installed once per process,
-            /// so it is shared by every test here and assertions filter on the repo id,
-            /// which is a fresh uuid per test.
-            mod logcap {
-                use std::sync::{Arc, Mutex, OnceLock};
-                use tracing::{Event, Level, Subscriber};
-                use tracing_subscriber::layer::{Context, Layer};
-                use tracing_subscriber::prelude::*;
-
-                type Lines = Arc<Mutex<Vec<(Level, String)>>>;
-
-                fn lines() -> &'static Lines {
-                    static LINES: OnceLock<Lines> = OnceLock::new();
-                    LINES.get_or_init(|| Arc::new(Mutex::new(Vec::new())))
-                }
-
-                struct Capture;
-                impl<S: Subscriber> Layer<S> for Capture {
-                    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-                        struct V(String);
-                        impl tracing::field::Visit for V {
-                            fn record_debug(
-                                &mut self,
-                                field: &tracing::field::Field,
-                                value: &dyn std::fmt::Debug,
-                            ) {
-                                self.0.push_str(&format!(" {}={:?}", field.name(), value));
-                            }
-                        }
-                        let mut v = V(String::new());
-                        event.record(&mut v);
-                        lines()
-                            .lock()
-                            .unwrap()
-                            .push((*event.metadata().level(), v.0));
-                    }
-                }
-
-                pub(super) fn install() {
-                    static ONCE: OnceLock<()> = OnceLock::new();
-                    ONCE.get_or_init(|| {
-                        let _ = tracing::subscriber::set_global_default(
-                            tracing_subscriber::registry().with(Capture),
-                        );
-                    });
-                }
-
-                pub(super) fn errors_containing(needle: &str) -> Vec<String> {
-                    lines()
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .filter(|(lvl, msg)| *lvl == Level::ERROR && msg.contains(needle))
-                        .map(|(_, msg)| msg.clone())
-                        .collect()
-                }
-            }
-
             /// SCENARIO 1. The repo re-read fails once, then succeeds: the drain lap
             /// must still RUN, under the refreshed state, and pin the coalesced push's
             /// object. RED before the fix (the single `Err` returned `None`, the lap
