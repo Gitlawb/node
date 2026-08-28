@@ -213,25 +213,37 @@ pub fn build_router(state: AppState) -> Router {
     // `/ipfs/{cid}` carries `optional_signature` so `get_by_cid` sees the caller
     // identity and can apply per-repo visibility (#110); anonymous callers stay
     // anonymous and still read genuinely public content. `/api/v1/ipfs/pins`
-    // stays unsigned — gating the pin index is tracked separately (#121).
-    // `/ipfs/{cid}` also carries a per-IP flood brake: it is anon-reachable and each
-    // request can drive a full-history git walk, so the per-IP rate limiter is the
-    // outermost layer (rejects a flood before the walk-admission work), mirroring the
-    // push/create routers. The extension MUST be attached or rate_limit_by_ip is a
-    // silent no-op. `/api/v1/ipfs/pins` (no walk) is merged in unbraked, as before.
+    // now carries the same `optional_signature` layer: the handler rejects
+    // requests without a verified `AuthenticatedDid`, so unsigned callers are
+    // denied (anonymous enumeration closed; #121). `/ipfs/{cid}` also carries a
+    // per-IP flood brake: it is anon-reachable and each request can drive a
+    // full-history git walk, so the per-IP rate limiter is the outermost layer
+    // (rejects a flood before the walk-admission work), mirroring the
+    // push/create routers. The extension MUST be attached or rate_limit_by_ip
+    // is a silent no-op. Axum layers only cover routes added before them, so
+    // both `/ipfs/{cid}` and `/api/v1/ipfs/pins` are built first and the auth +
+    // rate-limit layers are applied to the merged result.
     let ipfs_limiter = rate_limit::IpRateLimiter {
         limiter: state.ipfs_rate_limiter.clone(),
         trust: state.push_limiter_trust,
     };
     let ipfs_routes = Router::new()
         .route("/ipfs/{cid}", get(ipfs::get_by_cid))
+        .merge(Router::new().route("/api/v1/ipfs/pins", get(ipfs::list_pins)))
         .layer(middleware::from_fn(auth::optional_signature))
         .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
-        .layer(axum::Extension(ipfs_limiter))
-        .merge(Router::new().route("/api/v1/ipfs/pins", get(ipfs::list_pins)));
+        .layer(axum::Extension(ipfs_limiter));
 
     // ── Arweave permanent anchors ──────────────────────────────────────────
-    let arweave_routes = Router::new().route("/api/v1/arweave/anchors", get(arweave::list_anchors));
+    // `list_anchors` rejects callers without a verified `AuthenticatedDid`, so
+    // unsigned enumeration is denied. The same `optional_signature` layer used
+    // on the other read surfaces is applied here — there is no anonymous
+    // anchor-listing path on a signed-build node, and this commit closes that
+    // gap alongside `/api/v1/ipfs/pins`.
+    let arweave_routes =
+        Router::new()
+            .route("/api/v1/arweave/anchors", get(arweave::list_anchors))
+            .layer(middleware::from_fn(auth::optional_signature));
 
     // ── Bounty routes (write — require HTTP Signature) ─────────────────
     let bounty_write_routes = add_auth_layers(
@@ -658,6 +670,105 @@ mod tests {
             anchors_resp.status(),
             StatusCode::UNAUTHORIZED,
             "anonymous anchors listing must be rejected"
+        );
+    }
+
+    /// Regression: a real RFC-9421 signature produced exactly as `gl` does — built
+    /// with `gitlawb_core::http_sig::sign_request` over a GET, headers attached,
+    /// and sent through the actual `build_router` — is verified by the
+    /// `optional_signature` layer that wraps the pin/anchor routes, and the
+    /// handler returns 200. Pairs with the anonymous-denial test above; one
+    /// proves headers are required, the other proves a valid header is honored.
+    /// Without this test the unsigned-denial test would stay green even if the
+    /// `optional_signature` layer were never wired onto these routes, because
+    /// signed and unsigned requests would fail identically (#134 review).
+    #[sqlx::test]
+    async fn signed_get_pins_and_anchors_succeeds_through_build_router(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let state = test_state(pool).await;
+        let router = build_router(state);
+
+        let kp = Keypair::generate();
+
+        let pins_path = "/api/v1/ipfs/pins";
+        let signed = sign_request(&kp, "GET", pins_path, b"");
+        let pins = Request::builder()
+            .method("GET")
+            .uri(pins_path)
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::empty())
+            .unwrap();
+        let pins_resp = router.clone().oneshot(pins).await.unwrap();
+        assert_eq!(
+            pins_resp.status(),
+            StatusCode::OK,
+            "a valid signature on /api/v1/ipfs/pins must be honored through build_router"
+        );
+
+        let anchors_path = "/api/v1/arweave/anchors";
+        let signed = sign_request(&kp, "GET", anchors_path, b"");
+        let anchors = Request::builder()
+            .method("GET")
+            .uri(anchors_path)
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::empty())
+            .unwrap();
+        let anchors_resp = router.oneshot(anchors).await.unwrap();
+        assert_eq!(
+            anchors_resp.status(),
+            StatusCode::OK,
+            "a valid signature on /api/v1/arweave/anchors must be honored through build_router"
+        );
+    }
+
+    /// Companion to the two regressions above: a request that *carries* signature
+    /// headers but whose signature does not verify (here, garbled) must be denied
+    /// with 401, not silently treated as anonymous and re-checked by the handler.
+    /// This pins the failure mode of the `optional_signature` layer: when the
+    /// caller claims to be signed, the layer must commit to verifying — there is
+    /// no fall-through path that lets a bad signature bypass auth.
+    #[sqlx::test]
+    async fn malformed_signature_on_pins_is_401_through_build_router(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let state = test_state(pool).await;
+        let router = build_router(state);
+
+        let kp = Keypair::generate();
+        let path = "/api/v1/ipfs/pins";
+        let mut signed = sign_request(&kp, "GET", path, b"");
+        // Flip a character well inside the signature value (base64) so the header
+        // still parses but does not verify against the key.
+        let mut tampered = signed.signature.clone();
+        let mid = tampered.len() / 2;
+        let flipped = if tampered.as_bytes()[mid] == b'A' {
+            'B'
+        } else {
+            'A'
+        };
+        tampered.replace_range(mid..mid + 1, &flipped.to_string());
+        signed.signature = tampered;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a malformed signature must be rejected by the auth layer, not silently accepted"
         );
     }
 }
