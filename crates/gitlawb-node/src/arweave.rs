@@ -504,10 +504,25 @@ pub(crate) async fn anchor_item_present(
         // we asked for — a misconfigured gateway/proxy returning 200 for any
         // id would cause us to record a phantom anchor. Fail closed by treating
         // a non-matching 2xx as "cannot determine" rather than "present".
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read gateway probe response: {e}"))?;
+        //
+        // The body is read with a 64 KiB cap (#26 review): the id derives from
+        // the first 66 bytes of the signature region, so anything beyond 64
+        // KiB is provably NOT a real ANS-104 data item and would be
+        // unbounded allocation if the gateway streams a junk body. On cap
+        // overflow the probe returns `Ok(false)` (NOT an error) — a body
+        // that cannot fit in the cap cannot be a real data item, and the
+        // durable recovery path must re-upload rather than fail-closed (a
+        // transient gate flipping a successful upload into a paid retry
+        // is the wrong direction).
+        let (body, overflow) =
+            read_capped_body(resp, &url, &display_url, 65_536).await?;
+        if let Some(overflow_msg) = overflow {
+            tracing::warn!(
+                item_id = %item_id,
+                "{overflow_msg}; treating as absent so the durable job can re-upload"
+            );
+            return Ok(false);
+        }
         // The only bindable representation is the raw ANS-104 data item: its id
         // derives from the signature region (bytes 2..66 per ANS-104 spec) and
         // must equal the probed id. A bare-JSON 200 — even one carrying our own
@@ -547,6 +562,41 @@ fn truncate_for_error(s: &str, max: usize) -> String {
     let mut out = s.chars().take(max).collect::<String>();
     out.push_str("…(truncated)");
     out
+}
+/// Stream a gateway response body with a hard byte cap so a chunked or
+/// header-omitting remote cannot drive multi-hundred-MB allocations
+/// (#26 review). Returns `(body, overflow_text)` — on overflow the body is
+/// empty and `overflow_text` carries the limit-exceeded message the caller
+/// should surface. Mid-stream transport errors are run through the same
+/// credential-safe `remote_send_error` boundary as connection errors so
+/// reqwest's URL-embedded error text cannot leak gateway credentials into
+/// the caller's `VerifyResult` or log.
+async fn read_capped_body(
+    resp: reqwest::Response,
+    url: &str,
+    display_url: &str,
+    limit: usize,
+) -> Result<(Vec<u8>, Option<String>)> {
+    let mut out = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let data = match chunk {
+            Ok(d) => d,
+            Err(e) => {
+                let safe_err = remote_send_error("failed to read response body", &e, url, display_url)
+                    .to_string();
+                return Ok((Vec::new(), Some(safe_err)));
+            }
+        };
+        if out.len() + data.len() > limit {
+            return Ok((
+                Vec::new(),
+                Some(format!("response body exceeds {limit} byte limit")),
+            ));
+        }
+        out.extend_from_slice(&data);
+    }
+    Ok((out, None))
 }
 /// Central redaction boundary for every error that comes from a remote
 /// endpoint the node talked to. reqwest embeds the request URL verbatim in its
@@ -608,13 +658,27 @@ pub struct VerifyResult {
     pub errors: Vec<String>,
 }
 /// Fetch an anchor from Arweave, extract the embedded certificate, and verify
-/// the full chain: certificate signature, prev hash linkage, and pusher signature.
+/// the full chain: ANS-104 envelope signature, certificate signature, prev
+/// hash linkage, and pusher signature.
+///
+/// #26 review: this verifier refuses to adjudicate any 2xx whose envelope
+/// does not sign under the node's current verifying key. That includes the
+/// case of a copied certificate embedded in a foreign envelope: a cert
+/// signed by this node can be wrapped in a third party's ANS-104 item, the
+/// id still derives from the (now-foreign) signature region, and a naive
+/// `data_item_id == tx_id` match would let `verify_anchor` reach the cert
+/// payload and report `valid: true`. Authenticating the envelope against
+/// `node_vk` is the gate that closes this. Legacy 7/13/14-field certs
+/// already on the network continue to verify under their respective payload
+/// forms — the envelope check is the gate for "newly claimed signed
+/// anchors" only.
 pub async fn verify_anchor(
     client: &reqwest::Client,
     gateway_url: &str,
     tx_id: &str,
     db: &crate::db::Db,
     node_did: &str,
+    node_vk: &ed25519_dalek::VerifyingKey,
 ) -> Result<VerifyResult> {
     // Fetch the data item from the Arweave gateway's data path.
     // Gateways serve data at /{tx_id}, not /v1/tx/{id} (which is the bundler API).
@@ -659,37 +723,19 @@ pub async fn verify_anchor(
         });
     }
     // Stream the response body with a running 1 MiB cap so a chunked or
-    // header-omitting gateway cannot drive multi-hundred-MB allocations.
-    let mut body_bytes = Vec::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let data = match chunk {
-            Ok(d) => d,
-            Err(e) => {
-                // Mid-stream transport errors carry the same risk as connection
-                // errors: reqwest can embed the raw request URL in the error
-                // text, so it is masked through the same boundary as above.
-                let safe_err =
-                    remote_send_error("failed to read response body", &e, &url, &display_url)
-                        .to_string();
-                tracing::warn!("{safe_err}");
-                return Ok(VerifyResult {
-                    valid: false,
-                    anchor: serde_json::Value::Null,
-                    certificate: None,
-                    errors: vec![safe_err],
-                });
-            }
-        };
-        if body_bytes.len() + data.len() > 1_048_576 {
-            return Ok(VerifyResult {
-                valid: false,
-                anchor: serde_json::Value::Null,
-                certificate: None,
-                errors: vec!["response body exceeds 1 MiB limit".to_string()],
-            });
-        }
-        body_bytes.extend_from_slice(&data);
+    // header-omitting gateway cannot drive multi-hundred-MB allocations
+    // (#26 review: cap is now in the shared `read_capped_body` helper used
+    // by both verify_anchor and the recovery probe in `anchor_item_present`).
+    let (body_bytes, body_err) =
+        read_capped_body(resp, &url, &display_url, 1_048_576).await?;
+    if let Some(err_msg) = body_err {
+        tracing::warn!("{err_msg}");
+        return Ok(VerifyResult {
+            valid: false,
+            anchor: serde_json::Value::Null,
+            certificate: None,
+            errors: vec![err_msg],
+        });
     }
     // ── Bind the response to the REQUESTED transaction id before trusting it ──
     // (#224 R5 review). Gateways serve the signed ANS-104 data item at /{id};
@@ -704,6 +750,28 @@ pub async fn verify_anchor(
     // confusion this refuses to adjudicate.
     let served_id = crate::ans104::data_item_id(&body_bytes);
     let anchor_json_bytes: &[u8] = if served_id == tx_id {
+        // ── Authenticate the envelope against the node's signing key ──
+        // (#26 review). The id match above binds the served bytes to
+        // the requested tx, but the id is content-derived from the
+        // signature region — anyone can re-sign a copied payload
+        // with their own key and serve it. We MUST verify the
+        // Ed25519 signature, deep-hash, and owner of the envelope
+        // against the node's own verifying key BEFORE unwrapping the
+        // payload, otherwise a copied certificate embedded in a
+        // foreign envelope yields `valid: true` for an anchor this
+        // node never uploaded. The cert chain check that follows
+        // still re-runs under the cert's own self-asserted
+        // `node_did`; that is correct — the cert is what nodes sign
+        // at issuance — but it cannot authenticate the envelope that
+        // delivers the cert.
+        if let Err(e) = crate::ans104::verify_data_item(node_vk, &body_bytes) {
+            return Ok(VerifyResult {
+                valid: false,
+                anchor: serde_json::Value::Null,
+                certificate: None,
+                errors: vec![format!("envelope signature does not match node key: {e}")],
+            });
+        }
         match crate::ans104::data_item_data(&body_bytes) {
             Ok(data) => data,
             Err(e) => {
@@ -1917,7 +1985,8 @@ mod tests {
             .expect("lazy pool creation should not fail");
         let db = crate::db::Db::for_testing(pool);
         let gateway = format!("{}?token=secret", server.url());
-        let r = verify_anchor(&client, &gateway, "some-tx-id", &db, "did:key:zNODE")
+        let dummy_vk = &Keypair::generate().verifying_key();
+        let r = verify_anchor(&client, &gateway, "some-tx-id", &db, "did:key:zNODE", dummy_vk)
             .await
             .expect("verify_anchor should return Ok");
         assert!(!r.valid, "non-certificate JSON should be invalid");
@@ -1933,12 +2002,14 @@ mod tests {
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
             .expect("lazy pool creation should not fail");
         let db = crate::db::Db::for_testing(pool);
+        let dummy_vk = &Keypair::generate().verifying_key();
         let r = verify_anchor(
             &client,
             "https://gateway.example/#fragment",
             "some-tx-id",
             &db,
             "did:key:zNODE",
+            dummy_vk,
         )
         .await
         .expect("verify_anchor should return Ok");
@@ -1979,12 +2050,14 @@ mod tests {
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
             .expect("lazy pool creation should not fail");
         let db = crate::db::Db::for_testing(pool);
+        let dummy_vk = &Keypair::generate().verifying_key();
         let result = verify_anchor(
             &client,
             &server.url(),
             "does-not-exist",
             &db,
             "did:key:zNODE",
+            dummy_vk,
         )
         .await;
         let r = result.expect("verify_anchor should return Ok for gateway errors");
@@ -2002,12 +2075,14 @@ mod tests {
             .expect("lazy pool creation should not fail");
         let db = crate::db::Db::for_testing(pool);
         // Port 1 on loopback refuses connections deterministically.
+        let dummy_vk = &Keypair::generate().verifying_key();
         let result = verify_anchor(
             &client,
             "http://127.0.0.1:1/?token=SECRET",
             "txid",
             &db,
             "did:key:zNODE",
+            dummy_vk,
         )
         .await;
         let r = result.expect("verify_anchor should return Ok for gateway connection errors");
@@ -2044,7 +2119,8 @@ mod tests {
         });
         // Served as a real signed data item at its own id, the way a
         // production gateway returns it.
-        let tx = serve_signed_anchor(&mut server, &Keypair::generate(), &bad_cert_json).await;
+        let envelope_kp = Keypair::generate();
+        let tx = serve_signed_anchor(&mut server, &envelope_kp, &bad_cert_json).await;
         let client = reqwest::Client::new();
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
@@ -2054,7 +2130,7 @@ mod tests {
         // the DID-parse guard is what must fire. This pins the `invalid node
         // DID` error push: with the anchor claiming the node IS the malformed
         // DID, only parsing the certificate's node_did can reject it.
-        let result = verify_anchor(&client, &server.url(), &tx, &db, "malformed-node-did").await;
+        let result = verify_anchor(&client, &server.url(), &tx, &db, "malformed-node-did", &envelope_kp.verifying_key()).await;
         assert!(
             result.is_ok(),
             "Expected Ok response, got Err: {:?}",
@@ -2152,7 +2228,7 @@ mod tests {
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
             .expect("lazy pool creation should not fail");
         let db = crate::db::Db::for_testing(pool);
-        let result = verify_anchor(&client, &server.url(), &tx, &db, &node_did).await;
+        let result = verify_anchor(&client, &server.url(), &tx, &db, &node_did, &node_kp.verifying_key()).await;
         let verify_result = result.expect("verify_anchor should return Ok for a served anchor");
         assert!(
             !verify_result.valid,
@@ -2256,7 +2332,7 @@ mod tests {
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
             .expect("lazy pool creation should not fail");
         let db = crate::db::Db::for_testing(pool);
-        let result = verify_anchor(&client, &server.url(), &tx, &db, &node_did).await;
+        let result = verify_anchor(&client, &server.url(), &tx, &db, &node_did, &node_kp.verifying_key()).await;
         let verify_result = result.expect("verify_anchor should return Ok for a served anchor");
         assert!(
             !verify_result.valid,
@@ -2339,7 +2415,7 @@ mod tests {
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
             .expect("lazy pool creation should not fail");
         let db = crate::db::Db::for_testing(pool);
-        let result = verify_anchor(&client, &server.url(), &tx, &db, &node_did).await;
+        let result = verify_anchor(&client, &server.url(), &tx, &db, &node_did, &node_kp.verifying_key()).await;
         let verify_result = result.expect("verify_anchor should return Ok for a served anchor");
         assert!(
             !verify_result.valid,
@@ -2473,7 +2549,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let tx = serve_signed_anchor(&mut server, &node_kp, &anchor_json).await;
         let client = reqwest::Client::new();
-        let result = verify_anchor(&client, &server.url(), &tx, &db, &node_did).await;
+        let result = verify_anchor(&client, &server.url(), &tx, &db, &node_did, &node_kp.verifying_key()).await;
         let r = result.expect("verify_anchor should return Ok for a served anchor");
         assert!(
             r.valid,
@@ -2577,7 +2653,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let tx = serve_signed_anchor(&mut server, &node_kp, &anchor_json).await;
         let client = reqwest::Client::new();
-        let result = verify_anchor(&client, &server.url(), &tx, &db, &node_did).await;
+        let result = verify_anchor(&client, &server.url(), &tx, &db, &node_did, &node_kp.verifying_key()).await;
         let r = result.expect("verify_anchor should return Ok for a served anchor");
         assert!(
             r.valid,
@@ -2661,7 +2737,7 @@ mod tests {
         }
         let client = reqwest::Client::new();
         for tx in ["right-tx", "wrong-tx"] {
-            let r = verify_anchor(&client, &server.url(), tx, &db, &node_did)
+            let r = verify_anchor(&client, &server.url(), tx, &db, &node_did, &node_kp.verifying_key())
                 .await
                 .expect("verify_anchor should return Ok for a served anchor");
             assert!(
@@ -2707,7 +2783,7 @@ mod tests {
             .create_async()
             .await;
         let client = reqwest::Client::new();
-        let r = verify_anchor(&client, &server.url(), "requested-tx", &db, &node_did)
+        let r = verify_anchor(&client, &server.url(), "requested-tx", &db, &node_did, &node_kp.verifying_key())
             .await
             .expect("verify_anchor should return Ok for a served anchor");
         assert!(
@@ -2837,7 +2913,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let tx = serve_signed_anchor(&mut server, &node_kp, &anchor_json).await;
         let client = reqwest::Client::new();
-        let result = verify_anchor(&client, &server.url(), &tx, &db, &node_did).await;
+        let result = verify_anchor(&client, &server.url(), &tx, &db, &node_did, &node_kp.verifying_key()).await;
         let r = result.expect("verify_anchor should return Ok for a served anchor");
         assert!(
             !r.valid,
@@ -2910,7 +2986,7 @@ mod tests {
         // The cert is not present in the (lazy) node database — no stored row
         // matches its signed (repo_id, ref_name, old_sha, new_sha, ts), so the
         // legacy corroboration must fail closed instead of returning valid.
-        let result = verify_anchor(&client, &server.url(), &tx, &db, &node_did).await;
+        let result = verify_anchor(&client, &server.url(), &tx, &db, &node_did, &node_kp.verifying_key()).await;
         let r = result.expect("verify_anchor should return Ok for a served anchor");
         assert!(
             !r.valid,
@@ -3041,7 +3117,7 @@ mod tests {
         // outer-field cross-check, the signature, and the chain-position
         // checks all line up. ONLY the signed-tuple corroboration can catch
         // that this cert claims a chain position it never earned.
-        let result = verify_anchor(&client, &server.url(), &tx, &db, &forged_did).await;
+        let result = verify_anchor(&client, &server.url(), &tx, &db, &forged_did, &forged_kp.verifying_key()).await;
         let r = result.expect("verify_anchor should return Ok for a served anchor");
         assert!(
             !r.valid,
@@ -3054,6 +3130,339 @@ mod tests {
                 .any(|e| e.contains("no stored certificate matches the signed")),
             "expected the signed-tuple corroboration to reject the forged cert, got: {:?}",
             r.errors
+        );
+    }
+    /// #26 review (P1 envelope auth): when the envelope is signed by the same
+    /// keypair `verify_anchor` is invoked with, the cert chain check that
+    /// follows must still resolve under the existing v2 / 13-field / 7-field
+    /// ladders. This is the accept-path for the new envelope authentication
+    /// step: it should not regress any of the existing cert-version tests
+    /// (those run with `node_kp` signing the envelope), but a dedicated
+    /// happy-path test pins the property.
+    #[sqlx::test]
+    async fn test_verify_anchor_envelope_matching_node_signer_adjudicates(
+        pool: sqlx::PgPool,
+    ) {
+        let node_kp = gitlawb_core::identity::Keypair::generate();
+        let pusher_kp = gitlawb_core::identity::Keypair::generate();
+        let owner_did = "did:key:zAlice";
+        let repo_id = "repo-envelope-happy";
+        let ref_name = "refs/heads/main";
+        let old_sha = "0".repeat(40);
+        let new_sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let issued_at = "2026-07-22T00:00:00+00:00";
+        let db = migrated_db(pool).await;
+        let cert = authentic_13_field_cert(
+            &node_kp,
+            &pusher_kp,
+            repo_id,
+            ref_name,
+            &old_sha,
+            new_sha,
+            owner_did,
+            issued_at,
+            1,
+            &"0".repeat(64),
+        );
+        let anchor_json = serde_json::json!({
+            "schema": "gitlawb/ref-update/v1",
+            "repo": format!("{owner_did}/envelope-happy"),
+            "repo_id": repo_id,
+            "owner_did": owner_did,
+            "ref_name": ref_name,
+            "old_sha": old_sha,
+            "new_sha": new_sha,
+            "node_did": node_kp.did().as_str(),
+            "certificate": cert,
+        });
+        let mut server = mockito::Server::new_async().await;
+        let tx = serve_signed_anchor(&mut server, &node_kp, &anchor_json).await;
+        let client = reqwest::Client::new();
+        let result = verify_anchor(
+            &client,
+            &server.url(),
+            &tx,
+            &db,
+            node_kp.did().as_str(),
+            &node_kp.verifying_key(),
+        )
+        .await
+        .expect("verify_anchor should return Ok");
+        // The cert chain check (not the envelope check) determines validity
+        // here; the 13-field happy-path with a seeded repo row is the
+        // existing `test_verify_anchor_accepts_authentic_13_field_certificate`
+        // behavior. This test's job is to prove the envelope check does
+        // NOT spuriously reject the legitimate signer — i.e. the result
+        // is determined by the cert check downstream, not by an
+        // envelope-mismatch error.
+        let envelope_mismatch = result
+            .errors
+            .iter()
+            .any(|e| e.contains("envelope signature does not match node key"));
+        assert!(
+            !envelope_mismatch,
+            "matching node signer must not trigger envelope-mismatch error, got: {:?}",
+            result.errors
+        );
+    }
+    /// #26 review (P1 envelope auth): a tampered signature byte in the served
+    /// envelope must be rejected. The id-binding check still passes if the
+    /// tampered byte happens to keep the signature region valid (signature
+    /// bytes are 64 bytes, so a single-bit flip almost always changes
+    /// `data_item_id` too), and the envelope check must run on the bytes
+    /// the gateway served, not a re-derived id. Proves the new check
+    /// actually exercises the Ed25519 verify, not just the id match.
+    #[sqlx::test]
+    async fn test_verify_anchor_envelope_with_tampered_signature_is_invalid(
+        pool: sqlx::PgPool,
+    ) {
+        let node_kp = gitlawb_core::identity::Keypair::generate();
+        let pusher_kp = gitlawb_core::identity::Keypair::generate();
+        let owner_did = "did:key:zAlice";
+        let repo_id = "repo-envelope-tamper";
+        let ref_name = "refs/heads/main";
+        let old_sha = "0".repeat(40);
+        let new_sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let issued_at = "2026-07-22T00:00:00+00:00";
+        let db = migrated_db(pool).await;
+        let cert = authentic_13_field_cert(
+            &node_kp,
+            &pusher_kp,
+            repo_id,
+            ref_name,
+            &old_sha,
+            new_sha,
+            owner_did,
+            issued_at,
+            1,
+            &"0".repeat(64),
+        );
+        let anchor_json = serde_json::json!({
+            "schema": "gitlawb/ref-update/v1",
+            "repo": format!("{owner_did}/envelope-tamper"),
+            "repo_id": repo_id,
+            "owner_did": owner_did,
+            "ref_name": ref_name,
+            "old_sha": old_sha,
+            "new_sha": new_sha,
+            "node_did": node_kp.did().as_str(),
+            "certificate": cert,
+        });
+        let mut server = mockito::Server::new_async().await;
+        // Build the envelope directly so we can mutate one byte
+        // (the existing `serve_signed_anchor` helper hides the
+        // raw bytes behind the mock).
+        let body = serde_json::to_vec(&anchor_json).expect("anchor payload serializes");
+        let mut item =
+            crate::ans104::build_signed_data_item(&node_kp, &[], &body).expect("signed item builds");
+        // Tamper one bit in the signature region. The id-binding
+        // check may or may not pass (the signature region is 64
+        // bytes, so the id almost certainly changes) but either way
+        // the envelope check must reject the tampered bytes with the
+        // explicit envelope-mismatch error.
+        item[10] ^= 0x01;
+        let id = crate::ans104::data_item_id(&item);
+        server
+            .mock("GET", format!("/{id}").as_str())
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_body(item)
+            .create_async()
+            .await;
+        let client = reqwest::Client::new();
+        let result = verify_anchor(
+            &client,
+            &server.url(),
+            &id,
+            &db,
+            node_kp.did().as_str(),
+            &node_kp.verifying_key(),
+        )
+        .await
+        .expect("verify_anchor should return Ok");
+        assert!(!result.valid, "tampered envelope must not verify");
+        assert!(
+            result.errors.iter().any(|e| e.contains("envelope signature")),
+            "expected envelope-mismatch error, got: {:?}",
+            result.errors
+        );
+    }
+    /// #26 review (P1 envelope auth): an envelope signed by a foreign
+    /// keypair wrapping a copied certificate (where the cert itself was
+    /// legitimately signed by the node) must be REJECTED. This is the
+    /// test the existing `forged-cert` test at the bottom of this module
+    /// was meant to be but wasn't: the existing test uses a `forged_kp`
+    /// whose DID matches the forged cert, so the envelope and the cert
+    /// agree on the same key — it tests cert forgery, not envelope
+    /// forgery. This test signs the envelope with a *different* keypair
+    /// from the one the cert was issued under, proving the envelope
+    /// authentication step is independent of the cert's self-asserted
+    /// `node_did`.
+    #[sqlx::test]
+    async fn test_verify_anchor_envelope_signed_by_foreign_key_is_invalid(
+        pool: sqlx::PgPool,
+    ) {
+        let node_kp = gitlawb_core::identity::Keypair::generate();
+        let attacker_kp = gitlawb_core::identity::Keypair::generate();
+        let pusher_kp = gitlawb_core::identity::Keypair::generate();
+        let owner_did = "did:key:zAlice";
+        let repo_id = "repo-envelope-foreign";
+        let ref_name = "refs/heads/main";
+        let old_sha = "0".repeat(40);
+        let new_sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let issued_at = "2026-07-22T00:00:00+00:00";
+        let db = migrated_db(pool).await;
+        // Cert is signed by the node — perfectly legitimate.
+        let cert = authentic_13_field_cert(
+            &node_kp,
+            &pusher_kp,
+            repo_id,
+            ref_name,
+            &old_sha,
+            new_sha,
+            owner_did,
+            issued_at,
+            1,
+            &"0".repeat(64),
+        );
+        let anchor_json = serde_json::json!({
+            "schema": "gitlawb/ref-update/v1",
+            "repo": format!("{owner_did}/envelope-foreign"),
+            "repo_id": repo_id,
+            "owner_did": owner_did,
+            "ref_name": ref_name,
+            "old_sha": old_sha,
+            "new_sha": new_sha,
+            "node_did": node_kp.did().as_str(),
+            "certificate": cert,
+        });
+        // Envelope is signed by the ATTACKER, not the node. A naive
+        // id-only verifier would still unwrap the cert and report
+        // `valid: true`. The envelope check must reject.
+        let mut server = mockito::Server::new_async().await;
+        let tx = serve_signed_anchor(&mut server, &attacker_kp, &anchor_json).await;
+        let client = reqwest::Client::new();
+        let result = verify_anchor(
+            &client,
+            &server.url(),
+            &tx,
+            &db,
+            node_kp.did().as_str(),
+            &node_kp.verifying_key(),
+        )
+        .await
+        .expect("verify_anchor should return Ok");
+        assert!(
+            !result.valid,
+            "foreign-envelope-wrapping-copied-cert must not verify"
+        );
+        assert!(
+            result.errors.iter().any(|e| e.contains("envelope signature")),
+            "expected envelope-mismatch error, got: {:?}",
+            result.errors
+        );
+    }
+    /// #26 review (P1 envelope auth): the foreign-envelope case where the
+    /// embedded cert ALSO claims a different `node_did` (so the cert path
+    /// would also fail if it ran) — the envelope check is the first
+    /// line of defense and must refuse before the cert path is even
+    /// reached.
+    #[sqlx::test]
+    async fn test_verify_anchor_envelope_with_copied_cert_claiming_foreign_node_did_is_invalid(
+        pool: sqlx::PgPool,
+    ) {
+        let node_kp = gitlawb_core::identity::Keypair::generate();
+        let attacker_kp = gitlawb_core::identity::Keypair::generate();
+        let attacker_did = attacker_kp.did().as_str().to_string();
+        let pusher_kp = gitlawb_core::identity::Keypair::generate();
+        let owner_did = "did:key:zAlice";
+        let repo_id = "repo-envelope-foreign-did";
+        let ref_name = "refs/heads/main";
+        let old_sha = "0".repeat(40);
+        let new_sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let issued_at = "2026-07-22T00:00:00+00:00";
+        let db = migrated_db(pool).await;
+        // Build a cert with the ATTACKER's DID in the node_did field.
+        // Use the node_kp for the actual signature (so a hypothetical
+        // cert-only verifier would still fail) but flip the node_did
+        // field to the attacker's. The envelope check is what must
+        // refuse this outright.
+        let mut cert = authentic_13_field_cert(
+            &node_kp,
+            &pusher_kp,
+            repo_id,
+            ref_name,
+            &old_sha,
+            new_sha,
+            owner_did,
+            issued_at,
+            1,
+            &"0".repeat(64),
+        );
+        cert.node_did = attacker_did.clone();
+        let anchor_json = serde_json::json!({
+            "schema": "gitlawb/ref-update/v1",
+            "repo": format!("{owner_did}/envelope-foreign-did"),
+            "repo_id": repo_id,
+            "owner_did": owner_did,
+            "ref_name": ref_name,
+            "old_sha": old_sha,
+            "new_sha": new_sha,
+            "node_did": attacker_did,
+            "certificate": cert,
+        });
+        let mut server = mockito::Server::new_async().await;
+        let tx = serve_signed_anchor(&mut server, &attacker_kp, &anchor_json).await;
+        let client = reqwest::Client::new();
+        let result = verify_anchor(
+            &client,
+            &server.url(),
+            &tx,
+            &db,
+            node_kp.did().as_str(),
+            &node_kp.verifying_key(),
+        )
+        .await
+        .expect("verify_anchor should return Ok");
+        assert!(
+            !result.valid,
+            "foreign-envelope-with-foreign-cert-did must not verify"
+        );
+        // Envelope check fires first; the cert check is unreachable.
+        assert!(
+            result.errors.iter().any(|e| e.contains("envelope signature")),
+            "expected envelope-mismatch error (envelope check must run first), got: {:?}",
+            result.errors
+        );
+    }
+    /// #26 review (P2 probe cap): a body larger than 64 KiB is not a real
+    /// ANS-104 data item and must be treated as "not present" (so the
+    /// durable job re-uploads) rather than as an OOM. Two variants:
+    /// first where the body is junk whose id cannot match the probed
+    /// id, second where the body happens to derive to a matching id
+    /// (still >64 KiB) — both must return `Ok(false)`.
+    #[tokio::test]
+    async fn probe_caps_oversized_response_body() {
+        let mut server = mockito::Server::new_async().await;
+        // 128 KiB of zeros — well over the 64 KiB probe cap, well
+        // over any plausible ANS-104 envelope.
+        let oversized = vec![0u8; 128 * 1024];
+        server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_body(oversized)
+            .create_async()
+            .await;
+        let client = reqwest::Client::new();
+        // Pick an item id that does not derive from the zeros body.
+        let probed_id = "a".repeat(43);
+        let present = anchor_item_present(&client, &server.url(), &probed_id)
+            .await
+            .expect("cap overflow must be a verdict, not an error");
+        assert!(
+            !present,
+            "oversized body must be treated as absent (so the durable job re-uploads), got: {present}"
         );
     }
     /// A bundler that returns 500 with a body reflecting the request back — the
@@ -3194,7 +3603,8 @@ mod tests {
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
             .expect("lazy pool creation should not fail");
         let db = crate::db::Db::for_testing(pool);
-        let r = verify_anchor(&client, &gateway, "txid", &db, "did:key:zNODE")
+        let dummy_vk = &Keypair::generate().verifying_key();
+        let r = verify_anchor(&client, &gateway, "txid", &db, "did:key:zNODE", dummy_vk)
             .await
             .expect("verify_anchor should return Ok for a stream error");
         assert!(!r.valid);

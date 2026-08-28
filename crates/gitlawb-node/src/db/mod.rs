@@ -1367,6 +1367,33 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS request_path TEXT",
         ],
     },
+    // Per-transition outbox for post-receive durability (#26 review). The handler
+    // writes one row per (repo, ref, old→new) on the same path that lands the
+    // `post_receive_jobs` row, so a push whose `enqueue_post_receive_job` insert
+    // never commits (process crash, DB failure, dropped future between the bare
+    // repo ref advancing and the bookkeeping row landing) still leaves a
+    // durable recovery record. Startup `recover_orphan_ref_transitions` derives
+    // a deterministic-id `post_receive_job` from any row with no matching job,
+    // and downstream steps are already idempotent on that id
+    // (`record_push_job` keys on the job id, `insert_ref_certificate_tx` on a
+    // deterministic cert id, `claim_anchor_claim` on the transition identity)
+    // so the replay is exactly-once. The composite primary key is the same
+    // identity the Arweave anchor outbox uses.
+    Migration {
+        version: 33,
+        name: "pending_ref_transitions_outbox",
+        stmts: &[
+            r#"CREATE TABLE IF NOT EXISTS pending_ref_transitions (
+                repo_id      TEXT NOT NULL,
+                ref_name     TEXT NOT NULL,
+                old_sha      TEXT NOT NULL,
+                new_sha      TEXT NOT NULL,
+                enqueued_at  TEXT NOT NULL,
+                PRIMARY KEY (repo_id, ref_name, old_sha, new_sha)
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_pending_ref_transitions_repo ON pending_ref_transitions(repo_id)",
+        ],
+    },
 ];
 
 /// Max distinct source repos recorded per pinned object (F1, #173 jatmn round 8).
@@ -2284,6 +2311,20 @@ impl Db {
     /// reaching record_push/cert/anchor would otherwise leave a durable ref
     /// update with no bookkeeping and no recovery record. `ON CONFLICT (id) DO
     /// NOTHING` makes a retried enqueue a no-op.
+    ///
+    /// ACCEPTED RESIDUAL (#26 review): a push that crashes between the bare-repo
+    /// ref advancing and THIS row landing still has its recovery record in
+    /// `pending_ref_transitions` (the per-transition outbox written earlier on
+    /// the same success path). `recover_orphan_ref_transitions` runs first
+    /// inside `drain_post_receive_jobs` and derives a deterministic-id job for
+    /// each orphan row. The recovery uses an empty `attestation`, so the cert
+    /// is 7-field legacy form (the original RFC 9421 proof fields cannot be
+    /// regenerated from the on-disk state). Such certs are accepted by the
+    /// verifier's 7-field fallback but do not carry the original pusher
+    /// signature. The audit chain still resolves under signed-tuple
+    /// corroboration because the cert is signed by the node keypair and
+    /// chained to its predecessor via the per-`repo_id` seq stored at
+    /// issuance.
     pub async fn enqueue_post_receive_job(&self, job: &PostReceiveJob) -> Result<()> {
         sqlx::query(
             "INSERT INTO post_receive_jobs
@@ -2299,6 +2340,104 @@ impl Db {
         .bind(serde_json::to_value(&job.ref_updates)?)
         .bind(serde_json::to_value(&job.attestation)?)
         .bind(&job.enqueued_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Write a per-transition outbox row on the same handler path that lands
+    /// the bare-repo ref and the `post_receive_jobs` row (#26 review). The
+    /// composite primary key is the same identity the Arweave anchor outbox
+    /// uses (repo, ref_name, old_sha, new_sha), so a recovery that joins on
+    /// the four columns cannot duplicate work. `ON CONFLICT DO NOTHING` makes
+    /// a double-write (happy path + drain cleanup) a no-op. Called BEFORE
+    /// `enqueue_post_receive_job` on the success path: if the enqueue
+    /// commits, the recovery step in `drain_post_receive_jobs` deletes this
+    /// row, so the table is bounded by the lifecycle of a single push.
+    pub async fn record_pending_ref_transition(
+        &self,
+        repo_id: &str,
+        ref_name: &str,
+        old_sha: &str,
+        new_sha: &str,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO pending_ref_transitions
+                (repo_id, ref_name, old_sha, new_sha, enqueued_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(repo_id)
+        .bind(ref_name)
+        .bind(old_sha)
+        .bind(new_sha)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Return every (repo_id, ref_name, old_sha, new_sha) row in
+    /// `pending_ref_transitions` that has no matching `post_receive_jobs`
+    /// entry. The JSONB containment operator on `ref_updates` is the
+    /// existing index-free lookup pattern; a GIN index on `ref_updates` can
+    /// be added in a follow-up migration if this becomes hot. Used by
+    /// `recover_orphan_ref_transitions` at startup.
+    pub async fn find_orphan_ref_transitions(
+        &self,
+    ) -> Result<Vec<(String, String, String, String)>> {
+        let rows = sqlx::query(
+            r#"SELECT prt.repo_id AS repo_id,
+                      prt.ref_name AS ref_name,
+                      prt.old_sha AS old_sha,
+                      prt.new_sha AS new_sha
+               FROM pending_ref_transitions prt
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM post_receive_jobs j
+                    WHERE j.repo_id = prt.repo_id
+                      AND j.ref_updates @> jsonb_build_array(
+                              jsonb_build_object(
+                                  'ref_name', prt.ref_name,
+                                  'old_sha',  prt.old_sha,
+                                  'new_sha',  prt.new_sha
+                              )
+                          )
+               )"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push((
+                r.get::<String, _>("repo_id"),
+                r.get::<String, _>("ref_name"),
+                r.get::<String, _>("old_sha"),
+                r.get::<String, _>("new_sha"),
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Delete a single `pending_ref_transitions` row, called by the recovery
+    /// path after the derived `post_receive_jobs` row is durably enqueued.
+    /// Without this, the outbox would grow without bound across many pushes.
+    pub async fn delete_pending_ref_transition(
+        &self,
+        repo_id: &str,
+        ref_name: &str,
+        old_sha: &str,
+        new_sha: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM pending_ref_transitions
+              WHERE repo_id = $1 AND ref_name = $2
+                AND old_sha  = $3 AND new_sha  = $4",
+        )
+        .bind(repo_id)
+        .bind(ref_name)
+        .bind(old_sha)
+        .bind(new_sha)
         .execute(&self.pool)
         .await?;
         Ok(())

@@ -44,9 +44,10 @@ pub const SIGNATURE_TYPE_ED25519: u16 = 2;
 const SIGNATURE_LEN: usize = 64;
 const OWNER_LEN: usize = 32;
 
-/// Parsed contents of a verified data item. Verification is exercised by the
-/// enforcement tests (see `verify_data_item`), which is gated on `cfg(test)`.
-#[cfg(test)]
+/// Parsed contents of a verified data item. Returned by `verify_data_item`
+/// after the Ed25519 signature, deep-hash, and owner are checked. Callers
+/// that need the unwrapped payload of a trusted envelope should use this
+/// rather than the structural-only `data_item_data`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct DataItem {
     pub signature: [u8; 64],
@@ -119,8 +120,11 @@ pub fn data_item_id(item: &[u8]) -> String {
 /// Parse a data item and verify its Ed25519 signature against `verifying_key`
 /// over the deepHash of its own fields. Returns the parsed item (tags + data)
 /// on success. This is exactly what a bundler/gateway does on receipt, so a
-/// test can use it to enforce the signed-upload contract.
-#[cfg(test)]
+/// verifier can use it to enforce the signed-upload contract on the read
+/// path. The signature_type must be Ed25519 and the deep-hash preimage is
+/// recomputed from the bytes the item carries, so a tampered byte, swapped
+/// owner, or substituted tag stream all fail before the caller ever inspects
+/// the payload.
 pub fn verify_data_item(
     verifying_key: &ed25519_dalek::VerifyingKey,
     item: &[u8],
@@ -319,8 +323,14 @@ fn serialize_tags(tags: &[(&str, &str)]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-#[cfg(test)]
 fn deserialize_tags(buf: &[u8]) -> Result<Vec<(String, String)>> {
+    // Zero tags serializes to an empty buffer (matches `serialize_tags` for
+    // `tags.is_empty()`). Without this short-circuit, `read_long` on an empty
+    // buffer would immediately hit EOF and bail with "tag stream truncated
+    // in varint" — a real production item with no tags would never verify.
+    if buf.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut pos = 0usize;
     let mut tags = Vec::new();
     loop {
@@ -350,7 +360,6 @@ fn write_string(out: &mut Vec<u8>, s: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
 fn read_string(buf: &[u8], pos: &mut usize) -> Result<String> {
     let len = read_long(buf, pos)?;
     if len < 0 {
@@ -386,7 +395,6 @@ fn write_long(out: &mut Vec<u8>, n: i64) -> Result<()> {
 }
 
 /// Zigzag + base-128 varint (Avro `readLong`).
-#[cfg(test)]
 fn read_long(buf: &[u8], pos: &mut usize) -> Result<i64> {
     let mut value: u64 = 0;
     let mut shift = 0u32;

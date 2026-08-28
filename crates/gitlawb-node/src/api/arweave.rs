@@ -41,10 +41,16 @@ pub async fn verify_anchor_endpoint(
         ));
     }
     let node_did = state.node_did.to_string();
-    let result =
-        crate::arweave::verify_anchor(&state.http_client, gateway, &tx_id, &state.db, &node_did)
-            .await
-            .map_err(crate::error::AppError::Internal)?;
+    let result = crate::arweave::verify_anchor(
+        &state.http_client,
+        gateway,
+        &tx_id,
+        &state.db,
+        &node_did,
+        &state.node_keypair.verifying_key(),
+    )
+    .await
+    .map_err(crate::error::AppError::Internal)?;
 
     Ok(Json(serde_json::json!({
         "valid": result.valid,
@@ -69,6 +75,25 @@ pub async fn list_anchors(
     State(state): State<AppState>,
     Query(q): Query<ListAnchorsQuery>,
 ) -> Result<Json<serde_json::Value>> {
+    // #26 review: a malformed `?repo=` filter must surface as 400, not 500.
+    // The DB layer (`Db::list_arweave_anchors`) does reject this case, but
+    // its error is an `anyhow!` that the handler's `?` upcasts to
+    // `AppError::Internal` → 500. Mirroring the DB check at the handler
+    // boundary is the cleanest fix and returns the same 400 the existing
+    // `visibility`/`issues`/`peers` handlers return for similar
+    // input-validation failures. The DB-layer check stays as
+    // defense-in-depth so any other internal caller cannot accidentally
+    // turn a malformed filter into an unfiltered listing.
+    if let Some(r) = q.repo.as_deref() {
+        match r.split_once('/') {
+            Some((owner, name)) if !owner.is_empty() && !name.is_empty() => {}
+            _ => {
+                return Err(AppError::BadRequest(format!(
+                    "malformed repo filter: expected owner/name, got {r:?}"
+                )));
+            }
+        }
+    }
     let _limit = q.limit.min(200);
     // Bare `?` so connection-class sqlx failures downcast to `AppError::Db` and
     // map to 503 `db_unavailable` (not 500 via `.map_err(AppError::Internal)`) (#251).
@@ -187,6 +212,34 @@ mod closed_pool_tests {
                 "message": crate::error::DB_UNAVAILABLE_MESSAGE,
             })
         );
+    }
+
+    /// #26 review P3: a malformed `?repo=` filter must be 400, not 500. The DB
+    /// layer rejects it (defense-in-depth) but its `anyhow!` would upcast to
+    /// `AppError::Internal`; the handler now validates the same shape first and
+    /// returns the same 400 the `visibility`/`issues`/`peers` handlers return.
+    #[sqlx::test]
+    async fn list_anchors_malformed_repo_returns_400(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+
+        for malformed in ["foo", "/bar", "foo/", ""] {
+            let resp = Router::new()
+                .route("/api/v1/arweave/anchors", axum::routing::get(list_anchors))
+                .with_state(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v1/arweave/anchors?repo={malformed}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "malformed ?repo={malformed:?} must be 400"
+            );
+        }
     }
 
     /// A credentialed gateway (user:pass in the URL) must not leak into the

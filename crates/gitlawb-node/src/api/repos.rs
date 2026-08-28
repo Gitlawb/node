@@ -2321,8 +2321,38 @@ pub async fn git_receive_pack(
     // ── Durable post-receive job (spawned ABOVE release) ───────────────
     // The job is persisted and spawned BEFORE guard.release(): a disconnect
     // during release drops the handler future but the spawned task lives on.
+    //
+    // #26 review: the per-transition outbox row is written BEFORE
+    // `enqueue_post_receive_job`. If the enqueue then commits, the
+    // recovery step in `drain_post_receive_jobs` deletes the outbox row
+    // and the rest of the bookkeeping proceeds normally. If the enqueue
+    // fails — process crash, DB outage, dropped future between the
+    // bare-repo ref advancing and the bookkeeping row landing — the
+    // outbox row is still on disk and the next start's drain derives a
+    // deterministic-id `PostReceiveJob` for it, with an empty
+    // `attestation` (no RFC 9421 re-proof is possible). The outbox and
+    // the job enqueue are two separate transactions; the outbox is the
+    // recovery fallback, the job is the happy path.
     if push_succeeded {
         let did = auth.0.as_str();
+        for u in &ref_updates {
+            if let Err(e) = state
+                .db
+                .record_pending_ref_transition(&record.id, &u.ref_name, &u.old_sha, &u.new_sha)
+                .await
+            {
+                tracing::error!(
+                    repo = %name,
+                    ref_name = %u.ref_name,
+                    err = %e,
+                    "failed to record pending ref transition outbox row — \
+                     recovery will not see this push"
+                );
+                return Err(AppError::Internal(anyhow::anyhow!(
+                    "push landed but the node could not record its outbox row"
+                )));
+            }
+        }
         let job = crate::db::PostReceiveJob {
             id: Uuid::new_v4().to_string(),
             pusher_did: did.to_string(),
@@ -2358,6 +2388,15 @@ pub async fn git_receive_pack(
             return Err(AppError::Internal(anyhow::anyhow!(
                 "push landed but the node could not record its post-receive work"
             )));
+        }
+        // Outbox rows are now durably covered by the job (the recovery
+        // step finds no orphan), so clean them up. `ON CONFLICT DO NOTHING`
+        // makes a double-cleanup a no-op.
+        for u in &ref_updates {
+            let _ = state
+                .db
+                .delete_pending_ref_transition(&record.id, &u.ref_name, &u.old_sha, &u.new_sha)
+                .await;
         }
         tokio::spawn(process_post_receive_job(state.clone(), job));
     }
@@ -3019,6 +3058,136 @@ async fn anchor_ref_updates(
     Ok(())
 }
 
+/// Startup recovery (#224 + #26): promote orphaned ref transitions into
+/// durable post-receive jobs, then replay every pending job a previous
+/// process left mid-flight. Called once from main right after the AppState
+/// is built, before the HTTP listener serves traffic.
+///
+/// #26 review: the `pending_ref_transitions` outbox row is written on the
+/// same handler path that lands the bare-repo ref. If the
+/// `enqueue_post_receive_job` call in the handler then commits, the
+/// outbox row is cleaned up in the same tick. If the enqueue fails
+/// (process crash, DB outage, dropped future between the ref advancing
+/// and the bookkeeping row landing), the outbox row survives and
+/// `find_orphan_ref_transitions` returns it here. Each orphan becomes a
+/// fresh `PostReceiveJob` with a deterministic id keyed on the
+/// (repo, ref, old→new) identity; the existing `ON CONFLICT (id) DO
+/// NOTHING` enqueue makes a second recovery a no-op. The recovery uses
+/// an empty `attestation` (the original RFC 9421 proof cannot be
+/// regenerated from on-disk state), so the cert is 7-field legacy form
+/// and the verifier's 7-field fallback accepts it. The audit chain
+/// still resolves because the cert is signed by the node keypair and
+/// chained to its predecessor via the per-`repo_id` seq stored at
+/// issuance. See `Db::enqueue_post_receive_job` for the durable-doc
+/// version of this residual.
+async fn recover_orphan_ref_transitions(state: AppState) -> anyhow::Result<usize> {
+    let orphans = state.db.find_orphan_ref_transitions().await?;
+    if orphans.is_empty() {
+        return Ok(0);
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    // Group orphans by repo_id so a multi-ref push with no surviving job
+    // produces one job per ref-update (each ref is its own unit of cert
+    // issuance and anchor upload). The pusher/owner DIDs cannot be
+    // recovered from the outbox (we only persisted the transition
+    // identity), so we use placeholder values that the recovery path
+    // marks as "recovered": the cert is 7-field legacy form regardless
+    // because `attestation` is empty.
+    for (repo_id, ref_name, old_sha, new_sha) in orphans {
+        let job_id = format!("recovery:{repo_id}:{ref_name}:{old_sha}:{new_sha}");
+        // Refuse to re-derive an already-pending recovery (e.g. a
+        // previous drain attempt that crashed before the outbox row
+        // was deleted). The list query already excludes jobs whose
+        // ref_updates match this transition, so a re-derivation
+        // would only happen if the previous recovery enqueue
+        // committed but the delete didn't — the deterministic id
+        // makes `ON CONFLICT (id) DO NOTHING` collapse that case.
+        // Look up the repo's owner_did for the bookkeeping row.
+        let (owner_did, repo_name) = match state
+            .db
+            .get_repo_by_id(&repo_id)
+            .await
+        {
+            Ok(Some(r)) => (r.owner_did, r.name),
+            Ok(None) => {
+                tracing::error!(
+                    repo_id = %repo_id,
+                    "orphan ref transition refers to a missing repo — skipping"
+                );
+                // Best effort: delete the orphan row so a future
+                // drain does not retry it. The bare-repo ref is
+                // still on disk and unaccounted-for, but the node
+                // cannot reconstruct the pusher signature or the
+                // owner identity to do anything safer.
+                let _ = state
+                    .db
+                    .delete_pending_ref_transition(&repo_id, &ref_name, &old_sha, &new_sha)
+                    .await;
+                continue;
+            }
+            Err(e) => {
+                tracing::error!(
+                    repo_id = %repo_id,
+                    err = %e,
+                    "failed to load repo for orphan ref transition recovery — skipping"
+                );
+                continue;
+            }
+        };
+        let job = crate::db::PostReceiveJob {
+            id: job_id.clone(),
+            pusher_did: "did:key:recovered".to_string(),
+            owner_did,
+            repo_name,
+            repo_id: repo_id.clone(),
+            ref_updates: vec![crate::db::JobRefUpdate {
+                old_sha: old_sha.clone(),
+                new_sha: new_sha.clone(),
+                ref_name: ref_name.clone(),
+            }],
+            attestation: crate::db::PostReceiveAttestation::default(),
+            status: "pending".to_string(),
+            enqueued_at: now.clone(),
+            attempts: 0,
+            error: None,
+        };
+        if let Err(e) = state.db.enqueue_post_receive_job(&job).await {
+            tracing::error!(
+                repo_id = %repo_id,
+                ref_name = %ref_name,
+                err = %e,
+                "failed to enqueue recovered post-receive job — outbox row will retry next start"
+            );
+            // Leave the outbox row in place: a future start should
+            // see the same orphan and re-attempt.
+            continue;
+        }
+        if let Err(e) = state
+            .db
+            .delete_pending_ref_transition(&repo_id, &ref_name, &old_sha, &new_sha)
+            .await
+        {
+            // Non-fatal: the deterministic job id means a re-derivation
+            // on a future start will be a no-op, so the outbox row is
+            // safe to keep around (it does not duplicate work).
+            tracing::warn!(
+                repo_id = %repo_id,
+                ref_name = %ref_name,
+                err = %e,
+                "failed to delete outbox row after recovery enqueue; a future drain will be a no-op"
+            );
+        }
+        tracing::info!(
+            job_id = %job_id,
+            repo_id = %repo_id,
+            ref_name = %ref_name,
+            "recovered orphaned ref transition into post-receive job"
+        );
+        tokio::spawn(process_post_receive_job(state.clone(), job));
+    }
+    Ok(0)
+}
+
 /// Startup recovery (#224): replay post-receive jobs a previous process left
 /// mid-flight. Called once from main right after the AppState is built, before
 /// the HTTP listener serves traffic.
@@ -3036,6 +3205,13 @@ async fn anchor_ref_updates(
 /// unprocessed rows stay `pending` and are retried on the next restart (the job
 /// table IS the retry policy).
 pub(crate) async fn drain_post_receive_jobs(state: AppState) -> anyhow::Result<usize> {
+    // #26 review: orphan-recovery runs FIRST so rows in
+    // `pending_ref_transitions` without a matching
+    // `post_receive_jobs` row are promoted into durable jobs before
+    // the reset/drain pass. A second `drain_post_receive_jobs` call
+    // will not re-derive them: the recovery deletes the outbox row
+    // and the deterministic recovery id is `ON CONFLICT DO NOTHING`.
+    recover_orphan_ref_transitions(state.clone()).await?;
     state.db.reset_stale_post_receive_jobs().await?;
     let pending = state.db.list_pending_post_receive_jobs().await?;
     let count = pending.len();
@@ -11526,6 +11702,209 @@ mod tests {
                 .len(),
             1,
             "replaying the job must not mint a second certificate"
+        );
+    }
+
+    /// #26 review P1: a push that crashes between the bare-repo ref advancing
+    /// and the `post_receive_jobs` row landing must still be recovered. The fix
+    /// is a `pending_ref_transitions` outbox: the handler writes a row per
+    /// ref-update BEFORE `enqueue_post_receive_job`. A crash that drops the
+    /// job enqueue leaves an orphan in the outbox; the startup
+    /// `recover_orphan_ref_transitions` derives a deterministic-id job from
+    /// each orphan so the existing `ON CONFLICT (id) DO NOTHING` enqueue makes
+    /// the recovery exactly-once.
+    ///
+    /// This test simulates the crash-between-handler-step window by recording
+    /// the outbox row directly (the handler's success path) and skipping the
+    /// job enqueue entirely. The startup drain — `recover_orphan_ref_transitions`
+    /// BEFORE the existing `reset_stale_post_receive_jobs`/drain — must still
+    /// produce the durable unit of work.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn post_receive_job_survives_persist_failure(pool: sqlx::PgPool) {
+        let bin = tempfile::TempDir::new().unwrap();
+        let log = bin.path().join("git.log");
+        let git_bin = f2a_logging_git(bin.path(), &log);
+        let (mut state, rec) =
+            f2a_state(pool.clone(), &git_bin, "z6persistfail", "c1", true).await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        state.repo_store =
+            crate::git::repo_store::RepoStore::for_testing(repos_dir.path().to_path_buf(), pool);
+        state
+            .db
+            .register_agent(F2A_PUSHER, &["agent".to_string()])
+            .await
+            .unwrap();
+        let (_, repo_path) = state
+            .repo_store
+            .local_path(&rec.owner_did, &rec.name)
+            .unwrap();
+        std::fs::create_dir_all(&repo_path).unwrap();
+        u5_init_repo(&repo_path);
+        let c1 = u5_commit_file(&repo_path, "a.txt", "one\n");
+
+        // (1) Handler wrote the outbox row successfully (the durable boundary
+        // BEFORE the job enqueue). (2) The crash happened in the job-enqueue
+        // step — no `post_receive_jobs` row was ever persisted.
+        state
+            .db
+            .record_pending_ref_transition(&rec.id, "refs/heads/main", &"a".repeat(40), &c1)
+            .await
+            .unwrap();
+
+        // (3) Startup drain runs the recovery helper, which converts the
+        // orphan into a durable job and the existing drain runs the job to
+        // completion. `drain_post_receive_jobs` is the production entry point.
+        drain_post_receive_jobs(state.clone()).await.unwrap();
+        // The recovery uses placeholder pusher_did (`did:key:recovered`)
+        // because the outbox only persisted the transition identity — wait
+        // for the recovery-derived job to land in `done` state, then assert
+        // by the recovery's deterministic job id (not by pusher_did).
+        let recovery_id = format!("recovery:{}:refs/heads/main:{}:{}", rec.id, "a".repeat(40), c1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let status: String = sqlx::query_scalar(
+                "SELECT status FROM post_receive_jobs WHERE id = $1",
+            )
+            .bind(&recovery_id)
+            .fetch_one(&state.db.pool)
+            .await
+            .unwrap();
+            if status == "done" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the recovered job {recovery_id} to land in done (last status: {status})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // (4) The push, the trust score, the certificate, and the tail all
+        // landed — the recovery is complete. The push row is keyed on the
+        // job id, so we look it up directly rather than via pusher_did (the
+        // recovery path uses `did:key:recovered` as a placeholder).
+        let push_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM push_events WHERE id = $1",
+        )
+        .bind(&recovery_id)
+        .fetch_one(&state.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(push_count, 1, "the recovered push must be recorded");
+        let certs = state.db.list_ref_certificates(&rec.id, 10).await.unwrap();
+        assert_eq!(
+            certs.len(),
+            1,
+            "the recovery must issue the per-ref certificate"
+        );
+        assert_eq!(certs[0].ref_name, "refs/heads/main");
+        assert_eq!(certs[0].new_sha, c1);
+        assert!(
+            f2a_walks(&log) >= 1,
+            "the tail's withheld walk must still run after recovery; log:\n{}",
+            f2a_log(&log)
+        );
+
+        // (5) The outbox row is bounded by the recovery: a second drain
+        // produces no second job.
+        let orphans = state.db.find_orphan_ref_transitions().await.unwrap();
+        assert!(
+            orphans.is_empty(),
+            "the recovery must delete the outbox row it consumed"
+        );
+    }
+
+    /// #26 review P1: the recovery is idempotent under a double-drain. The
+    /// second drain must NOT enqueue a second job (the outbox row was deleted
+    /// by the first recovery) AND must NOT mint a second certificate (the
+    /// deterministic id `recovery:{repo_id}:{ref_name}:{old_sha}:{new_sha}`
+    /// hits the `ON CONFLICT (id) DO NOTHING` enqueue and the
+    /// `insert_ref_certificate_tx` PK on the cert id).
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn post_receive_recovery_is_idempotent_under_double_drain(
+        pool: sqlx::PgPool,
+    ) {
+        let bin = tempfile::TempDir::new().unwrap();
+        let log = bin.path().join("git.log");
+        let git_bin = f2a_logging_git(bin.path(), &log);
+        let (mut state, rec) =
+            f2a_state(pool.clone(), &git_bin, "z6idempotent", "c1", true).await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        state.repo_store =
+            crate::git::repo_store::RepoStore::for_testing(repos_dir.path().to_path_buf(), pool);
+        state
+            .db
+            .register_agent(F2A_PUSHER, &["agent".to_string()])
+            .await
+            .unwrap();
+        let (_, repo_path) = state
+            .repo_store
+            .local_path(&rec.owner_did, &rec.name)
+            .unwrap();
+        std::fs::create_dir_all(&repo_path).unwrap();
+        u5_init_repo(&repo_path);
+        let c1 = u5_commit_file(&repo_path, "a.txt", "one\n");
+
+        state
+            .db
+            .record_pending_ref_transition(&rec.id, "refs/heads/main", &"a".repeat(40), &c1)
+            .await
+            .unwrap();
+
+        // First drain: recovery + process.
+        drain_post_receive_jobs(state.clone()).await.unwrap();
+        let recovery_id = format!("recovery:{}:refs/heads/main:{}:{}", rec.id, "a".repeat(40), c1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let status: String = sqlx::query_scalar(
+                "SELECT status FROM post_receive_jobs WHERE id = $1",
+            )
+            .bind(&recovery_id)
+            .fetch_one(&state.db.pool)
+            .await
+            .unwrap();
+            if status == "done" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the first recovery to land in done (last status: {status})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let push_count_after_first: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM push_events WHERE id = $1",
+        )
+        .bind(&recovery_id)
+        .fetch_one(&state.db.pool)
+        .await
+        .unwrap();
+        let certs_after_first = state.db.list_ref_certificates(&rec.id, 10).await.unwrap();
+        assert_eq!(push_count_after_first, 1);
+        assert_eq!(certs_after_first.len(), 1);
+
+        // Second drain: a healthy run after a healthy run must be a no-op.
+        drain_post_receive_jobs(state.clone()).await.unwrap();
+        // Give the (no-op) second drain a moment to settle; the assertion
+        // below would still pass even if it were racing.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let push_count_after_second: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM push_events WHERE id = $1",
+        )
+        .bind(&recovery_id)
+        .fetch_one(&state.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            push_count_after_second, push_count_after_first,
+            "a second drain must not double-count the push"
+        );
+        assert_eq!(
+            state.db.list_ref_certificates(&rec.id, 10).await.unwrap().len(),
+            certs_after_first.len(),
+            "a second drain must not mint a second certificate"
         );
     }
 
