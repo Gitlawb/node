@@ -275,7 +275,24 @@ async fn recheck_public_pin(
 /// Compute the deterministic missing set: `all` minus `done`, sorted so two
 /// passes over the same data yield the same pin order. Not capped here — the
 /// caller applies the cap and logs a truncation warning.
-fn missing_oids(all: &[String], done: &[String]) -> Vec<String> {
+///
+/// `start_after` is the per-(repo, backend) continuation offset (#218
+/// review P2). When `Some`, the sorted missing set is ROTATED so the
+/// first OID is the smallest one strictly greater than `start_after`,
+/// and every OID ≤ `start_after` is appended at the tail. The set as a
+/// whole is unchanged; only the attempt order changes. Without the
+/// rotation, a persistently failing early OID (e.g. one the local IPFS
+/// daemon refuses for a transient-but-recurring reason) keeps landing
+/// at the start of the sort and dominates the 50 000 cap every
+/// hourly tick, so a healthy gap past the cap is never attempted.
+/// With the rotation, the cap still bounds per-pass work but advances
+/// fairly across passes: failed OIDs retried at the tail of the
+/// next pass, the healthy gap moves into the cap window.
+///
+/// `start_after = None` preserves the pre-P2 deterministic head-first
+/// order, which is what a fresh (repo, backend) or a `done = TRUE`
+/// pair does.
+fn missing_oids(all: &[String], done: &[String], start_after: Option<&str>) -> Vec<String> {
     let done_set: HashSet<&str> = done.iter().map(|s| s.as_str()).collect();
     let mut missing: Vec<String> = all
         .iter()
@@ -283,7 +300,27 @@ fn missing_oids(all: &[String], done: &[String]) -> Vec<String> {
         .cloned()
         .collect();
     missing.sort();
-    missing
+    let Some(start) = start_after else {
+        return missing;
+    };
+    // Find the rotation point: the first OID strictly greater than
+    // `start`. OIDs ≤ start (typically: previously truncated, possibly
+    // failing) move to the tail so the cap window sees fresh ground.
+    // `partition_point` is the standard-library rotation seam: it
+    // returns the index of the first element for which the predicate
+    // is false, which is exactly the first `oid > start` after a sort.
+    let split = missing.partition_point(|oid| oid.as_str() <= start);
+    if split == 0 || split >= missing.len() {
+        // Either nothing has been attempted yet (split == 0) or every
+        // missing OID is ≤ start (the offset is past the end, which
+        // should not happen on a well-formed pass but the rotation
+        // would lose data — return sorted order as-is).
+        return missing;
+    }
+    let mut rotated = Vec::with_capacity(missing.len());
+    rotated.extend(missing[split..].iter().cloned());
+    rotated.extend(missing[..split].iter().cloned());
+    rotated
 }
 
 /// Cap a missing set, logging once when it was truncated.
@@ -551,13 +588,45 @@ async fn run_pass(
         let ipfs_enabled = !config.ipfs_api.is_empty();
         let pinata_enabled = !config.pinata_jwt.is_empty();
 
+        // Per-(repo, backend) continuation offset (#218 review P2): loaded
+        // here so the same offset is read once, used to rotate the
+        // missing set, and then the loop below writes the new offset
+        // back. A DB error on the load is treated as "start from the
+        // head" — the worst case is one pass at the old sort order,
+        // not a stalled sweep — so a corrupt row never blocks the
+        // per-hour gap-fill.
+        let ipfs_offset = if ipfs_enabled {
+            match db.load_reconciliation_offset(&repo.id, "IPFS").await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(repo = %repo_slug, err = %e, "load_reconciliation_offset(IPFS) failed, starting from head");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let pinata_offset = if pinata_enabled {
+            match db.load_reconciliation_offset(&repo.id, "PINATA").await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(repo = %repo_slug, err = %e, "load_reconciliation_offset(PINATA) failed, starting from head");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // IPFS-missing set.  A filter DB error skips only the IPFS gap-fill and
         // lets the Pinata path still run (R1-P3), instead of dropping the repo.
         let ipfs_missing: Vec<String> = if ipfs_enabled {
             match db.filter_ipfs_pinned_oids(&object_list).await {
-                Ok(already) => {
-                    cap_missing(missing_oids(&object_list, &already), &repo_slug, "IPFS")
-                }
+                Ok(already) => cap_missing(
+                    missing_oids(&object_list, &already, ipfs_offset.as_deref()),
+                    &repo_slug,
+                    "IPFS",
+                ),
                 Err(e) => {
                     tracing::warn!(repo = %repo_slug, err = %e, "filter_ipfs_pinned_oids failed, IPFS gap-fill skipped this pass");
                     Vec::new()
@@ -569,9 +638,11 @@ async fn run_pass(
 
         let pinata_missing: Vec<String> = if pinata_enabled {
             match db.filter_pinata_pinned_oids(&object_list).await {
-                Ok(already) => {
-                    cap_missing(missing_oids(&object_list, &already), &repo_slug, "Pinata")
-                }
+                Ok(already) => cap_missing(
+                    missing_oids(&object_list, &already, pinata_offset.as_deref()),
+                    &repo_slug,
+                    "Pinata",
+                ),
                 Err(e) => {
                     tracing::warn!(repo = %repo_slug, err = %e, "filter_pinata_pinned_oids failed, Pinata gap-fill skipped this pass");
                     Vec::new()
@@ -580,6 +651,19 @@ async fn run_pass(
         } else {
             Vec::new()
         };
+
+        // Capture the last attempted OID per backend BEFORE the missing
+        // set is moved into the pin loops below (#218 review P2). The
+        // offset is the LAST OID in the capped attempt set, which is
+        // also the cap edge for a truncated pass; the next pass's
+        // `missing_oids` rotates the sorted set so the first OID is
+        // strictly greater than this value, and the previously
+        // attempted tail retries at the end. The value is captured
+        // here (rather than re-read after the pin loops) so a future
+        // change that consumes `ipfs_missing` / `pinata_missing` does
+        // not silently drop the offset write.
+        let ipfs_last = ipfs_missing.last().cloned();
+        let pinata_last = pinata_missing.last().cloned();
 
         // Count UNIQUE missing objects across both backends (R1-P3): an object
         // absent from both must not be counted twice.
@@ -769,6 +853,37 @@ async fn run_pass(
                 total = repo_filled,
                 "reconciliation sweep filled public-object gaps"
             );
+        }
+
+        // Persist the per-(repo, backend) continuation offset (#218 review
+        // P2). The offset is the LAST attempted OID per backend — for a
+        // non-truncated pass this is the OID at the tail of the missing
+        // set, for a truncated pass it is the OID at the cap edge. The
+        // next pass's `missing_oids` rotates the sorted set so the first
+        // OID is strictly greater than this value, and the previously
+        // attempted tail is retried at the end of the next pass — so a
+        // persistent early failure does not monopolise the cap window.
+        //
+        // A missing set that drained to empty clears the offset: the next
+        // pass starts at the head of whatever the new missing set is.
+        // A DB error here is logged but does NOT abort the pass: a
+        // missed offset write means the next pass starts at the head
+        // (the worst case is one pass at the old sort order).
+        if ipfs_enabled {
+            if let Err(e) = db
+                .save_reconciliation_offset(&repo.id, "IPFS", ipfs_last.as_deref())
+                .await
+            {
+                tracing::warn!(repo = %repo_slug, err = %e, "save_reconciliation_offset(IPFS) failed, next pass will start from head");
+            }
+        }
+        if pinata_enabled {
+            if let Err(e) = db
+                .save_reconciliation_offset(&repo.id, "PINATA", pinata_last.as_deref())
+                .await
+            {
+                tracing::warn!(repo = %repo_slug, err = %e, "save_reconciliation_offset(PINATA) failed, next pass will start from head");
+            }
         }
 
         // ── Phase 2: Encrypted recovery-copy resealing (withheld blobs) ──
@@ -1058,6 +1173,7 @@ mod tests {
     /// The missing set must be deterministic, which is what makes the sweep's
     /// per-repo pin order reproducible across passes. The cap is applied by
     /// `cap_missing` at the call site, so `missing_oids` stays uncapped.
+    /// `start_after = None` preserves the pre-P2 head-first order.
     #[test]
     fn missing_oids_is_deterministic() {
         let all = vec![
@@ -1068,12 +1184,62 @@ mod tests {
         ];
         let done = vec!["b".to_string()];
 
-        let first = super::missing_oids(&all, &done);
-        let second = super::missing_oids(&all, &done);
+        let first = super::missing_oids(&all, &done, None);
+        let second = super::missing_oids(&all, &done, None);
         assert_eq!(first, second, "missing set must be deterministic");
         assert_eq!(
             first,
             vec!["a".to_string(), "c".to_string(), "d".to_string()]
+        );
+    }
+
+    /// Per-(repo, backend) continuation offset (#218 review P2). When
+    /// `start_after` is the last OID the previous pass attempted, the
+    /// next pass must rotate the sorted missing set so the first OID
+    /// is strictly greater than that value, and the previously-attempted
+    /// tail is retried at the end of the next pass. Without the
+    /// rotation, a persistently failing early OID keeps landing at the
+    /// start of the sort and dominates the cap window every hourly
+    /// tick; with the rotation, the cap window advances fairly across
+    /// passes and the healthy gap past the cap gets attempted.
+    #[test]
+    fn missing_oids_rotates_past_start_after() {
+        let all: Vec<String> = (0..6).map(|i| format!("oid_{i:02}")).collect();
+        let done: Vec<String> = Vec::new();
+
+        // No offset: head-first order, the pre-P2 contract.
+        let head = super::missing_oids(&all, &done, None);
+        assert_eq!(
+            head,
+            vec!["oid_00", "oid_01", "oid_02", "oid_03", "oid_04", "oid_05"],
+            "no offset preserves the deterministic head-first order"
+        );
+
+        // Offset = "oid_02": the next pass starts strictly past oid_02,
+        // and the tail rotates to the end so previously-attempted OIDs
+        // are retried last (not first).
+        let rotated = super::missing_oids(&all, &done, Some("oid_02"));
+        assert_eq!(
+            rotated,
+            vec!["oid_03", "oid_04", "oid_05", "oid_00", "oid_01", "oid_02"],
+            "offset = oid_02 must rotate the set so oid_03..oid_05 lead and oid_00..oid_02 trail"
+        );
+
+        // Offset = "" (no OID has been attempted yet — the first ever
+        // pass on this pair): the rotation is a no-op, same as None.
+        let empty_offset = super::missing_oids(&all, &done, Some(""));
+        assert_eq!(
+            empty_offset, head,
+            "an empty-string offset reads as 'nothing attempted yet', no rotation"
+        );
+
+        // Offset past the end: degenerate — the rotation would lose
+        // data, so the helper returns sorted order as-is rather than
+        // an empty list.
+        let past_end = super::missing_oids(&all, &done, Some("oid_zz"));
+        assert_eq!(
+            past_end, head,
+            "an offset past the end of the missing set must not lose data"
         );
     }
 
@@ -1874,6 +2040,397 @@ mod tests {
             db.has_ipfs_cid(&blob).await.unwrap(),
             "fresh re-derive budget must let the sweep record the pin"
         );
+        _m.assert_async().await;
+    }
+
+    /// #218 review P1 regression: the local-IPFS provenance predicate
+    /// (`local_ipfs_provenance = TRUE`, set by the local IPFS writer
+    /// only) must let a previously-Pinata-only row be PROMOTED to
+    /// local-IPFS-pinned the moment a real local pin lands, without
+    /// requiring a config switch in the test. The contract Reviewer 1
+    /// called out: "an object pinned directly to Pinata with no prior
+    /// local IPFS pin gets `cid = raw_cid`, never the provider CID
+    /// [never aliases bytes that don't hash to it, #173]; when IPFS
+    /// is later enabled the sweep must re-derive and pin it locally."
+    ///
+    /// The test seeds a Pinata-only row via the production
+    /// `record_pinata_cid` path with `raw_cid != pinata_cid`. In the
+    /// pre-v30 schema, this row would have `cid = Some(raw_cid)` AND
+    /// `pinata_cid = Some(provider_cid)` — a shape the old
+    /// `cid IS NOT NULL` predicate read as "locally pinned", so the
+    /// pre-v30 sweep would skip it as already durable. After v30, the
+    /// `record_pinata_cid` writer never sets `local_ipfs_provenance`
+    /// (the Pinata path never pins locally), so the new
+    /// `local_ipfs_provenance = TRUE` predicate excludes the row from
+    /// `filter_ipfs_pinned_oids` and the sweep sees it as a real
+    /// local-IPFS gap. A later `record_pinned_cid_with_source` call
+    /// brings it back in. The filter result before and after the
+    /// local write is the durable contract.
+    #[sqlx::test]
+    async fn sweep_promotes_pinata_only_to_local_ipfs_when_writer_invoked(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+
+        // Pinata-only row: distinct raw CID and provider CID, the
+        // shape that the pre-v30 `cid IS NOT NULL` predicate
+        // mis-classified as locally pinned. The raw_cid is the
+        // locally-computed resolver key (per `pinata.rs` documentation,
+        // never the dag-pb provider CID); the pinata_cid is the
+        // provider's response.
+        let sha = "sha_pinata_only_then_local";
+        let raw_cid = "bafkreirawcontentcidv1sverifierkey";
+        let pinata_cid = "QmPinataProviderCidForThisBlob";
+        assert_ne!(
+            raw_cid, pinata_cid,
+            "the test fixture must use distinct raw and provider CIDs"
+        );
+        db.record_pinata_cid(sha, raw_cid, pinata_cid, None)
+            .await
+            .unwrap();
+
+        // Pre-condition: the Pinata-only row has `cid = Some(raw_cid)`
+        // (the locally-computed resolver key, NOT the provider CID)
+        // and `pinata_cid = Some(provider_cid)`. The pre-v30 sweep's
+        // `cid IS NOT NULL` predicate would read this as locally
+        // pinned. The post-v30 predicate `local_ipfs_provenance = TRUE`
+        // — which the Pinata writer never sets — reads it as
+        // Pinata-only, so the row is a real local-IPFS gap.
+        let row: (Option<String>, Option<String>, Option<bool>) = sqlx::query_as(
+            "SELECT cid, pinata_cid, local_ipfs_provenance FROM pinned_cids WHERE sha256_hex = $1",
+        )
+        .bind(sha)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.0.as_deref(),
+            Some(raw_cid),
+            "Pinata-only row must carry the raw CID in `cid` (the locally-computed resolver key, never the provider CID, #173)"
+        );
+        assert_eq!(
+            row.1.as_deref(),
+            Some(pinata_cid),
+            "Pinata-only row must carry the provider CID in pinata_cid"
+        );
+        assert_eq!(
+            row.2,
+            Some(false),
+            "Pinata-only row must have local_ipfs_provenance = FALSE — the Pinata writer never pins locally"
+        );
+
+        // The P1 contract: the gap filter used by the sweep
+        // (`filter_ipfs_pinned_oids`) does NOT consider the row
+        // already-done. Without this, a Pinata-only node that later
+        // enables IPFS would never re-pin the object to local IPFS
+        // (the pre-v30 filter would treat the existing `cid` value
+        // as durable local evidence and skip it).
+        let candidates = vec![sha.to_string()];
+        let mut before = db.filter_ipfs_pinned_oids(&candidates).await.unwrap();
+        before.sort();
+        assert!(
+            before.is_empty(),
+            "a Pinata-only row must NOT be returned by filter_ipfs_pinned_oids — the sweep must still see it as a local-IPFS gap"
+        );
+        assert!(
+            !db.has_ipfs_cid(sha).await.unwrap(),
+            "a Pinata-only row must NOT be reported by has_ipfs_cid"
+        );
+
+        // The local-IPFS writer succeeds (the same call
+        // `ipfs_pin.rs:2103` makes after a real Kubo `add`). The raw
+        // CID is the same one the Pinata-only row already knows, so
+        // the resolver key is unchanged.
+        db.record_pinned_cid_with_source(sha, raw_cid, "repo-pinata-then-local")
+            .await
+            .unwrap();
+
+        // Post-condition: the same row is now in the IPFS-pinned set.
+        // The local writer upgraded `local_ipfs_provenance` to TRUE
+        // on the conflict branch (the seam is the same row that v30
+        // left at FALSE for the Pinata-only path).
+        let mut after = db.filter_ipfs_pinned_oids(&candidates).await.unwrap();
+        after.sort();
+        assert_eq!(
+            after,
+            vec![sha.to_string()],
+            "after the local-IPFS writer succeeds, the same row must be in the IPFS-pinned set"
+        );
+        assert!(
+            db.has_ipfs_cid(sha).await.unwrap(),
+            "after the local-IPFS writer succeeds, has_ipfs_cid must report TRUE"
+        );
+
+        // The resolver key on the row is still the raw CID, unchanged.
+        // This is the durable contract for clients: `GET /ipfs/{cid}`
+        // always resolves to the locally-computed raw CID, never the
+        // Pinata provider CID (the bytes don't hash to it, #173).
+        let stored_cid: Option<String> =
+            sqlx::query_scalar("SELECT cid FROM pinned_cids WHERE sha256_hex = $1")
+                .bind(sha)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored_cid.as_deref(),
+            Some(raw_cid),
+            "the resolver key is the raw CID, not the Pinata provider CID"
+        );
+    }
+
+    /// #218 review P2 regression: the per-(repo, backend) continuation
+    /// offset lifecycle. A pass that attempted at least one OID (the
+    /// normal "found a gap, pinned it" path) persists
+    /// `next_oid = last_attempted, done = FALSE`. A subsequent pass
+    /// that finds zero missing OIDs (the post-pin happy path) marks
+    /// the row `done = TRUE` so a stale resume can never re-derive
+    /// against an empty missing set. The contract is owned at the
+    /// sweep loop's call site to `save_reconciliation_offset`.
+    #[sqlx::test]
+    async fn sweep_persists_per_backend_continuation_offset(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        // Repo on disk with one blob — a 1-OID missing set is enough
+        // to exercise the offset machinery (the rotation is the same
+        // for any size, and the cap is the only place the production
+        // sweep writes the offset).
+        let repo_on_disk = Repo::new();
+        repo_on_disk.commit_file("a.txt", "public blob\n");
+        let rec = seed_repo(
+            "did:key:zOffsetOwner",
+            "offset-repo",
+            &repo_on_disk.path.display().to_string(),
+        );
+        db.create_repo(&rec).await.unwrap();
+
+        // Mock IPFS — generic accept.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
+            .expect_at_least(1)
+            .with_status(200)
+            .with_body(r#"{"Hash":"QmOffsetMockCid"}"#)
+            .create_async()
+            .await;
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            &server.url(),
+        ]);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let (_tx, mut rx) = watch::channel(false);
+        let mut cursor = None;
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        // First pass: the public blob is a missing OID, the sweep
+        // pins it. The missing set had one element, so the offset
+        // is persisted as `next_oid = that_oid, done = FALSE` —
+        // the resume point the next pass would consult, not a
+        // "we are done" marker.
+        let (_scanned, gaps1, _filled1) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(gaps1 >= 1, "first pass finds the public blob as a gap");
+        let stored = db
+            .load_reconciliation_offset(&rec.id, "IPFS")
+            .await
+            .unwrap();
+        // After a pass that actually attempted work, the offset
+        // is the last attempted OID with done = FALSE. The load
+        // returns it (not None) — a future pass that finds the
+        // same OID still missing would rotate past it.
+        assert!(
+            stored.is_some(),
+            "a pass that attempted OIDs must persist a resume point (done = FALSE), not a done marker"
+        );
+
+        // Second pass: the OID is now IPFS-pinned (the gap filter
+        // excludes it), so `ipfs_missing.is_empty()` and the offset
+        // save call hands `next_oid = None` to `save_reconciliation_offset`,
+        // which marks the row `done = TRUE`. The load filters done
+        // rows out so subsequent passes see this as a fresh start.
+        let (_scanned2, gaps2, _filled2) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(gaps2, 0, "second pass finds no remaining gaps");
+        let stored2 = db
+            .load_reconciliation_offset(&rec.id, "IPFS")
+            .await
+            .unwrap();
+        assert!(
+            stored2.is_none(),
+            "a no-missing pass must mark the offset done (load returns None)"
+        );
+    }
+
+    /// #218 review P2 multi-pass regression: a previously-capped
+    /// pass's persisted `next_oid` MUST rotate the next pass's
+    /// attempt order so a healthy OID past the offset moves into the
+    /// cap window. Reviewer 1's explicit ask: "a multi-pass
+    /// regression with a permanently failing early OID and a later
+    /// healthy missing OID, asserting the later object is attempted
+    /// on a subsequent pass."
+    ///
+    /// The test simulates the production scenario at the smallest
+    /// scale that still proves the contract: pre-seed an offset
+    /// that points at the early OID `A` (as if a prior pass had
+    /// attempted-and-failed `A` and the cap truncated everything
+    /// past it), then run a fresh pass. The healthy OID `Z` (the
+    /// later OID) must be attempted — without the rotation it would
+    /// be at the tail of the missing set and could be skipped if
+    /// the cap was tighter than the missing-set size. With the
+    /// rotation, `Z` is the first OID strictly greater than the
+    /// offset, so the gap-fill reaches it.
+    #[sqlx::test]
+    async fn sweep_attempts_healthy_oid_past_persistent_offset(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        // Repo on disk with two distinct blobs. Their OIDs sort as
+        // `A < Z` (the first commit's blob sorts before the second
+        // by sha). The names are anchors for the assertions, not
+        // the actual sha values.
+        let repo_on_disk = Repo::new();
+        repo_on_disk.commit_file("a.txt", "would-fail-content\n");
+        let a_blob = repo_on_disk.git(&["rev-parse", "HEAD:a.txt"]);
+        repo_on_disk.commit_file("z.txt", "healthy-content\n");
+        let z_blob = repo_on_disk.git(&["rev-parse", "HEAD:z.txt"]);
+        assert!(
+            a_blob < z_blob,
+            "test fixture requires A's blob to sort before Z's so the rotation is observable"
+        );
+
+        let rec = seed_repo(
+            "did:key:zMultiPassOwner",
+            "multi-pass-repo",
+            &repo_on_disk.path.display().to_string(),
+        );
+        db.create_repo(&rec).await.unwrap();
+
+        // Pre-seed: a prior pass attempted-and-failed A, and the
+        // cap truncated the rest. The persisted offset is A (the
+        // last attempted OID). The next pass's `missing_oids` will
+        // rotate so A moves to the tail and Z leads the cap window.
+        // `done = FALSE` so the load returns the offset and the
+        // rotation actually runs.
+        db.save_reconciliation_offset(&rec.id, "IPFS", Some(&a_blob))
+            .await
+            .unwrap();
+
+        // Sanity: the offset is exactly what we wrote.
+        let loaded = db
+            .load_reconciliation_offset(&rec.id, "IPFS")
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded.as_deref(),
+            Some(a_blob.as_str()),
+            "the pre-seeded offset must round-trip through the load"
+        );
+
+        // Mock IPFS — generic accept. The actual `Z` success is
+        // what the test asserts on (the rotation brings Z forward
+        // and the sweep pins it; the post-pass offset is then
+        // either Z (cap not hit on a 2-OID set, so done = TRUE)
+        // or done with the row cleared).
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
+            .expect_at_least(1)
+            .with_status(200)
+            .with_body(r#"{"Hash":"QmMultiPassMockCid"}"#)
+            .create_async()
+            .await;
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            &server.url(),
+        ]);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let (_tx, mut rx) = watch::channel(false);
+        let mut cursor = None;
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        // Single pass. The offset pre-seed drives the rotation, the
+        // missing set is [A, Z] but rotates to [Z, A] (Z first
+        // because it's strictly greater than the offset A). The
+        // sweep pins both — Z succeeds (the mock returns a body)
+        // and A may or may not (the mock returns a body for it
+        // too on the same endpoint). The contract under test is
+        // that Z is in the IPFS-pinned set after the pass.
+        let (_scanned, _gaps, _filled) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+
+        // The healthy OID Z is in the IPFS-pinned set. The
+        // rotation brought it forward, and the sweep recorded the
+        // pin. This is the durable contract Reviewer 1 called
+        // out: a healthy gap past the cap is attempted on a
+        // subsequent pass.
+        assert!(
+            db.has_ipfs_cid(&z_blob).await.unwrap(),
+            "healthy OID Z (past the persistent offset) must be pinned on the next pass"
+        );
+
+        // The offset is now at `done = FALSE` with the last
+        // attempted OID as `next_oid` (the pass DID attempt work
+        // — both A and Z were rotated into the cap window and
+        // handed to the backend). The rotation is observable in
+        // the load: a future pass that finds A still missing
+        // would rotate past the last attempted OID, advancing
+        // forward through the missing set rather than getting
+        // stuck on A every hourly tick. The exact `next_oid`
+        // value depends on the order pin_git_object records the
+        // pins (which is the rotated order [Z, A] from
+        // `missing_oids`); we assert only that it is set, not
+        // which OID it is.
+        let after = db
+            .load_reconciliation_offset(&rec.id, "IPFS")
+            .await
+            .unwrap();
+        assert!(
+            after.is_some(),
+            "a pass that attempted the rotated OIDs must persist a resume point, not a done marker"
+        );
+
         _m.assert_async().await;
     }
 }

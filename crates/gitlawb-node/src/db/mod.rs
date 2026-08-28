@@ -1182,6 +1182,99 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE repos ADD COLUMN IF NOT EXISTS policy_epoch BIGINT NOT NULL DEFAULT 0",
         ],
     },
+    Migration {
+        version: 30,
+        name: "pinned_cids_local_ipfs_provenance",
+        stmts: &[
+            // #218 review (P1): the Pinata-only state was inferred from
+            // `cid = pinata_cid` and the local-IPFS provenance predicate was
+            // `cid IS NOT NULL`. That conflates two distinct writers: the
+            // local IPFS pin path and the Pinata push path. A Pinata-only
+            // insert against a pre-v27 row could re-introduce a non-NULL
+            // `cid` that the sweep then read as a real local pin, leaving a
+            // durability gap no other sweep pass would close.
+            //
+            // This migration adds a per-row boolean that ONLY the local
+            // IPFS writer sets. After v30 the durable contract is:
+            //
+            //   `local_ipfs_provenance = TRUE` ↔ this row was written by
+            //   the local IPFS pin path (`record_pinned_cid_with_source`),
+            //   which is the only path that has actually pushed the bytes
+            //   into the node's local IPFS daemon.
+            //
+            // Pinata-only rows keep `local_ipfs_provenance = FALSE` and
+            // `cid = NULL` (their `pinata_cid` is the provider CID, which
+            // must not alias raw bytes that do not hash to it, #173).
+            // `list_pinned_cids` keeps returning the stored `cid` resolver
+            // key — the new column is an internal durability signal and
+            // never leaves the resolver / gap-filter boundary.
+            //
+            // Backfill (safe under v27): v27 already cleared every row in
+            // the legacy `cid = pinata_cid` fallback shape back to NULL,
+            // so the only rows still carrying a non-NULL `cid` after v27
+            // are real local IPFS pins. The OR with `pinata_cid IS NULL`
+            // is belt-and-suspenders: a row that was the FIRST local
+            // pin in a dual-backend record (cid set, pinata_cid set,
+            // cid != pinata_cid) is also a real local pin, and v27 left
+            // it alone. NOT NULL DEFAULT FALSE so a pre-v30 row that
+            // somehow slips through the backfill WHERE reads as
+            // "Pinata-only" and gets the safe default; the next sweep
+            // pass re-derives provenance on a re-pin.
+            "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS local_ipfs_provenance BOOLEAN NOT NULL DEFAULT FALSE",
+            "UPDATE pinned_cids SET local_ipfs_provenance = TRUE WHERE cid IS NOT NULL AND (pinata_cid IS NULL OR cid <> pinata_cid)",
+            // Partial index — only ~all-true rows in steady state, but
+            // partial because the gap filter (`filter_ipfs_pinned_oids`)
+            // reads `local_ipfs_provenance = TRUE` and the planner will
+            // Index Only Scan the partial view, which is a fraction of
+            // the pin table. Cheap to maintain because the write path
+            // touches it once per pin and reads are exactly the
+            // already-pinned lookups the sweep is trying to short-circuit.
+            "CREATE INDEX IF NOT EXISTS idx_pinned_cids_local_ipfs_provenance ON pinned_cids (local_ipfs_provenance) WHERE local_ipfs_provenance",
+        ],
+    },
+    Migration {
+        version: 31,
+        name: "reconciliation_offset_per_backend",
+        stmts: &[
+            // #218 review (P2): the per-repo cursor advanced between
+            // repos but not within a repo's missing set, so a
+            // persistently failing early OID kept monopolising the
+            // 50 000 cap and a healthy gap past the cap was never
+            // attempted. This table persists a (repo, backend) →
+            // next-oid continuation, applied as a sort-rotate at the
+            // start of the next pass: the cap still bounds per-pass
+            // work, but the same OIDs do not keep landing in the
+            // truncated prefix every hourly tick.
+            //
+            // The repo-level keyset cursor in `node_state` is unchanged
+            // — this is a *second* cursor. A full pass (no missing
+            // OIDs) clears the row, and the next pass starts at the
+            // head of the sorted list. A truncated pass writes
+            // `next_oid` = the last OID actually handed to the backend,
+            // so the next pass resumes from the OID strictly greater
+            // than that one.
+            //
+            // Per-(repo, backend) granularity rather than per-repo:
+            // Pinata and IPFS are independent writers with independent
+            // failure modes, and a per-repo cursor would conflate the
+            // two. PRIMARY KEY (repo_id, backend) keeps the writes
+            // O(1) per pass; the table grows with the number of repos
+            // the sweep has ever partially processed, which is bounded
+            // by the node's repo count and prunes back to zero on
+            // completion. `next_oid` is the LAST attempted OID (the
+            // rotation in `missing_oids` is "strictly greater than"),
+            // and `done` marks a previously-completed pass so a stale
+            // row never resumes after the missing set has emptied.
+            "CREATE TABLE IF NOT EXISTS reconciliation_offset (
+                 repo_id    TEXT NOT NULL,
+                 backend    TEXT NOT NULL,
+                 next_oid   TEXT NOT NULL,
+                 done       BOOLEAN NOT NULL DEFAULT FALSE,
+                 updated_at TEXT NOT NULL,
+                 PRIMARY KEY (repo_id, backend)
+             )",
+        ],
+    },
 ];
 
 /// Max distinct source repos recorded per pinned object (F1, #173 jatmn round 8).
@@ -2899,6 +2992,115 @@ impl Db {
         }
         Ok(())
     }
+
+    /// Load the reconciliation sweep's per-(repo, backend) continuation offset
+    /// (#218 review P2). Returns the last OID the previous pass on this
+    /// `(repo, backend)` pair actually handed to the backend — the next pass
+    /// rotates the sorted missing set so the first OID is the smallest one
+    /// strictly greater than this value, and the elements ≤ it are appended
+    /// at the tail (so a persistently failing early OID does not monopolise
+    /// the cap window every hourly tick).
+    ///
+    /// `None` is returned in three cases: no row yet (the first pass on
+    /// this pair), the row was marked `done = TRUE` by a previous full pass
+    /// (the next pass starts at the head of the missing list), or the
+    /// caller passes a `repo`/`backend` it never partially processed. The
+    /// reconciliation sweep treats `None` as "start from the head"; the
+    /// "where in the key space are we" question is owned by the
+    /// repo-level keyset cursor in `node_state`, not this table.
+    pub async fn load_reconciliation_offset(
+        &self,
+        repo_id: &str,
+        backend: &str,
+    ) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT next_oid, done FROM reconciliation_offset
+             WHERE repo_id = $1 AND backend = $2",
+        )
+        .bind(repo_id)
+        .bind(backend)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            // `done = TRUE` rows are a previously-completed pass that has
+            // not yet been pruned — treat as a fresh start, same as
+            // absent. Pruning happens on the next `clear` call so a
+            // single-pass sweep does not have to do two writes.
+            Some(r) if !r.get::<bool, _>("done") => Ok(Some(r.get("next_oid"))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Persist a (repo, backend) continuation. `next_oid = None` means
+    /// "this pass completed; mark done". On a real continuation the row is
+    /// upserted with `done = FALSE` so the next pass resumes from the
+    /// stored OID.
+    ///
+    /// The `next_oid` value the caller hands in MUST be the LAST OID
+    /// actually attempted this pass (i.e. the max OID in the truncated
+    /// or fully-drained set), not the first. The rotation in
+    /// `missing_oids` is "strictly greater than", so writing a
+    /// forward-rotated OID here would skip the very objects the
+    /// truncation truncated — the bug the offset exists to prevent.
+    pub async fn save_reconciliation_offset(
+        &self,
+        repo_id: &str,
+        backend: &str,
+        next_oid: Option<&str>,
+    ) -> Result<()> {
+        match next_oid {
+            Some(oid) => {
+                sqlx::query(
+                    "INSERT INTO reconciliation_offset (repo_id, backend, next_oid, done, updated_at)
+                     VALUES ($1, $2, $3, FALSE, $4)
+                     ON CONFLICT (repo_id, backend) DO UPDATE SET
+                         next_oid = EXCLUDED.next_oid,
+                         done = FALSE,
+                         updated_at = EXCLUDED.updated_at",
+                )
+                .bind(repo_id)
+                .bind(backend)
+                .bind(oid)
+                .bind(Utc::now().to_rfc3339())
+                .execute(&self.pool)
+                .await?;
+            }
+            None => {
+                sqlx::query(
+                    "INSERT INTO reconciliation_offset (repo_id, backend, next_oid, done, updated_at)
+                     VALUES ($1, $2, '', TRUE, $3)
+                     ON CONFLICT (repo_id, backend) DO UPDATE SET
+                         next_oid = '',
+                         done = TRUE,
+                         updated_at = EXCLUDED.updated_at",
+                )
+                .bind(repo_id)
+                .bind(backend)
+                .bind(Utc::now().to_rfc3339())
+                .execute(&self.pool)
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove a (repo, backend) row entirely. Used when the sweep cannot
+    /// make progress on this pair (e.g. the repo disappeared from disk or
+    /// was quarantined mid-pass) so the next pass does not resume a stale
+    /// offset against a now-different missing set. Not currently called
+    /// from the sweep loop itself (the early-skip paths would add a DB
+    /// round-trip per skipped repo) but kept on `Db` as the durable
+    /// seam for future operational tooling that needs to invalidate a
+    /// persisted offset without going through a full pass.
+    #[allow(dead_code)]
+    pub async fn clear_reconciliation_offset(&self, repo_id: &str, backend: &str) -> Result<()> {
+        sqlx::query("DELETE FROM reconciliation_offset WHERE repo_id = $1 AND backend = $2")
+            .bind(repo_id)
+            .bind(backend)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 // ── Pinned CIDs ───────────────────────────────────────────────────────────────
@@ -2966,12 +3168,18 @@ impl Db {
         // place, and the sweep gap filter (`cid IS NOT NULL`) excluded them
         // from re-processing so the stale CID became permanent durability
         // evidence. `repo_id` is COALESCE'd so a known source wins over NULL.
+        //
+        // `local_ipfs_provenance = TRUE` is the durable contract (#218 review P1).
+        // This seam exists for legacy, source-less rows in tests and represents
+        // a real local IPFS pin, so the new resolver predicate
+        // (`local_ipfs_provenance = TRUE`, post-v30) sees it as IPFS-pinned.
         sqlx::query(
-            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id)
-             VALUES ($1, $2, $3, $4)
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id, local_ipfs_provenance)
+             VALUES ($1, $2, $3, $4, TRUE)
              ON CONFLICT(sha256_hex) DO UPDATE SET
                  cid = EXCLUDED.cid,
-                 repo_id = COALESCE(pinned_cids.repo_id, EXCLUDED.repo_id)",
+                 repo_id = COALESCE(pinned_cids.repo_id, EXCLUDED.repo_id),
+                 local_ipfs_provenance = TRUE",
         )
         .bind(sha256_hex)
         .bind(cid)
@@ -3249,11 +3457,20 @@ impl Db {
         repo_id: &str,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        // `local_ipfs_provenance = TRUE` here is the durable contract
+        // (#218 review P1): the only path that calls this method
+        // (`ipfs_pin.rs` `pin_git_object` after a successful `add`) has
+        // actually pushed the bytes into the node's local IPFS daemon.
+        // ON CONFLICT upgrades provenance too, so a re-pin of an object
+        // that previously arrived via Pinata-only (cid=NULL, flag=FALSE)
+        // becomes a real local pin from the resolver's perspective the
+        // moment the bytes land locally.
         sqlx::query(
-            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id)
-             VALUES ($1, $2, $3, $4)
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id, local_ipfs_provenance)
+             VALUES ($1, $2, $3, $4, TRUE)
              ON CONFLICT(sha256_hex) DO UPDATE SET
-                 repo_id = COALESCE(pinned_cids.repo_id, EXCLUDED.repo_id)",
+                 repo_id = COALESCE(pinned_cids.repo_id, EXCLUDED.repo_id),
+                 local_ipfs_provenance = TRUE",
         )
         .bind(sha256_hex)
         .bind(cid)
@@ -3556,15 +3773,23 @@ impl Db {
         Ok(out)
     }
 
-    /// Returns true when this object has a real local IPFS CID. After migration
-    /// v27 cleared legacy `cid = pinata_cid` fallback rows (provenance is now
-    /// recorded, never inferred), `cid IS NOT NULL` is the complete predicate.
+    /// Returns true when this object has a real local IPFS CID. The predicate
+    /// is `local_ipfs_provenance = TRUE` (#218 review P1): the boolean is
+    /// set ONLY by the local IPFS writer (`record_pinned_cid_with_source`
+    /// and the legacy `record_pinned_cid` seam) and is NEVER inferred
+    /// from CID shape or equality. A Pinata-only row (cid = NULL,
+    /// pinata_cid set) keeps `local_ipfs_provenance = FALSE`, so the
+    /// sweep's gap filter does not trust it as a real local pin and
+    /// will re-derive by re-pinning if IPFS is enabled later. A
+    /// pre-v30 row is backfilled by migration v30 (rows where cid IS
+    /// NOT NULL and pinata_cid is NULL OR cid != pinata_cid — the same
+    /// shape v27 left as the "real local pin" set).
     #[allow(dead_code)]
     pub async fn has_ipfs_cid(&self, sha256_hex: &str) -> Result<bool> {
         let row = sqlx::query(
             "SELECT COUNT(*) as cnt FROM pinned_cids
              WHERE sha256_hex = $1
-               AND cid IS NOT NULL",
+               AND local_ipfs_provenance = TRUE",
         )
         .bind(sha256_hex)
         .fetch_one(&self.pool)
@@ -3606,9 +3831,13 @@ impl Db {
     }
 
     /// Given a list of sha256_hex values, returns the subset that have a real
-    /// local IPFS CID (`cid IS NOT NULL`; after migration v27 provenance is
-    /// recorded, never inferred from CID inequality). Used by the reconciliation
-    /// sweep to skip IPFS-complete objects.
+    /// local IPFS pin. The predicate is `local_ipfs_provenance = TRUE`
+    /// (#218 review P1): set by the local IPFS writer, never inferred from
+    /// CID shape or equality. Used by the reconciliation sweep to skip
+    /// IPFS-complete objects — a Pinata-only row (cid = NULL, pinata_cid
+    /// set) is NOT excluded, so enabling IPFS later causes the sweep to
+    /// re-derive those rows by re-pinning rather than trusting a missing
+    /// local copy as durable.
     ///
     /// The input is processed in fixed-size chunks so the `ANY($1)` array sent
     /// to Postgres is bounded even when the sweep hands over a full uncapped
@@ -3623,7 +3852,7 @@ impl Db {
             let rows = sqlx::query(
                 "SELECT sha256_hex FROM pinned_cids
                  WHERE sha256_hex = ANY($1)
-                   AND cid IS NOT NULL",
+                   AND local_ipfs_provenance = TRUE",
             )
             .bind(chunk)
             .fetch_all(&self.pool)
@@ -3644,6 +3873,15 @@ impl Db {
     /// to it, #173). On conflict `cid` is left untouched: a prior local pin already
     /// stored the correct raw CID, and the COALESCE backfills a NULL provenance from a
     /// known source while keeping first-pinner-owns.
+    ///
+    /// **This writer does NOT establish local-IPFS provenance** (#218 review P1):
+    /// `local_ipfs_provenance` is left at its DEFAULT FALSE (or the value the row
+    /// already had) because the bytes have not been pushed to the local IPFS daemon
+    /// here, only to Pinata. The resolver's `has_ipfs_cid` / `filter_ipfs_pinned_oids`
+    /// keys on `local_ipfs_provenance = TRUE`, so a Pinata-only row never reads as a
+    /// real local pin. If IPFS is enabled later, the reconciliation sweep will
+    /// re-derive provenance by re-pinning these objects (their `cid IS NULL` or
+    /// `pinata_cid` shape keeps them out of the gap filter's "already done" set).
     pub async fn record_pinata_cid(
         &self,
         sha256_hex: &str,
@@ -3654,22 +3892,30 @@ impl Db {
         // The "Pinata-only" signal is `raw_cid == pinata_cid`: the caller
         // computed the local resolver key, found it matched the provider
         // CID, and concluded this object was never on local IPFS. Storing
-        // cid=NULL in that case keeps the provenance predicate
-        // (`cid IS NOT NULL` = real local pin) clean — the v27 bulk-cleared
-        // legacy rows do not resurface.
+        // cid=NULL in that case keeps the resolver's resolver-key column
+        // honest — a dag-pb provider CID must not become the alias under
+        // which `GET /ipfs/{cid}` serves raw bytes (the bytes do not hash
+        // to it, #173). After v30 the `local_ipfs_provenance` column
+        // carries the durable "real local pin" signal independently, so
+        // the inference here only controls the `cid` shape, not
+        // provenance.
         //
         // ON CONFLICT also clears `cid` when the existing row has the legacy
-        // `cid = pinata_cid` fallback shape (R2-P2). A row in that shape was
-        // never a real local IPFS pin — the value was faked because the
-        // object was Pinata-only — and v27 already bulk-cleared it on
-        // upgrade, but a new push of a Pinata-only object against a pre-v27
-        // row still needs the belt-and-suspenders clear. Distinct cid values
+        // `cid = pinata_cid` fallback shape. A row in that shape was never
+        // a real local IPFS pin — the value was faked because the object
+        // was Pinata-only — and v27 already bulk-cleared it on upgrade,
+        // but a new push of a Pinata-only object against a pre-v27 row
+        // still needs the belt-and-suspenders clear. Distinct cid values
         // are genuine local pins and are left untouched.
         let cid = if raw_cid == pinata_cid {
             None
         } else {
             Some(raw_cid)
         };
+        // `local_ipfs_provenance` is intentionally NOT set here, NOT
+        // touched in the ON CONFLICT branch: this writer does not pin
+        // locally. A later local-IPFS pin (`record_pinned_cid_with_source`)
+        // upgrades the flag.
         sqlx::query(
             "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid, repo_id)
              VALUES ($1, $2, $3, $4, $5)
@@ -5552,6 +5798,203 @@ mod migration_tests {
             "distinct-cid row must survive the backfill"
         );
         assert!(db.has_pinata_cid("sha_equal").await.unwrap());
+    }
+
+    /// #218 review P1: the local-IPFS provenance predicate moved from
+    /// `cid IS NOT NULL` to a dedicated `local_ipfs_provenance` column set
+    /// by the writer (#218 review P1 — provenance is now established at
+    /// the writer boundary, never inferred from CID shape). Migration v30
+    /// backfills the column for existing rows under the same heuristic v27
+    /// uses to identify "real local pin" rows, and `has_ipfs_cid` /
+    /// `filter_ipfs_pinned_oids` key on the new column. This test
+    /// exercises the full chain: pre-v30 schema, the four row shapes,
+    /// the v30 migration, the post-migration column values, and the
+    /// post-migration `has_ipfs_cid` / `filter_ipfs_pinned_oids`
+    /// classification.
+    #[sqlx::test]
+    async fn migration_v30_backfills_local_ipfs_provenance_heuristically(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool.clone());
+
+        // Build a pre-v30 schema: every migration through v29 applied.
+        // Then simulate a v30 upgrade by removing the v30 record from
+        // schema_migrations, dropping the v30 column, and re-running
+        // `migrate()` so v30 lands on the seeded rows. The v12 test
+        // below uses the same pattern.
+        db.migrate().await.unwrap();
+
+        // Reset to a pre-v30 schema: drop the v30 column and the
+        // partial index, and forget the v30 migration record.
+        sqlx::query("ALTER TABLE pinned_cids DROP COLUMN IF EXISTS local_ipfs_provenance")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP INDEX IF EXISTS idx_pinned_cids_local_ipfs_provenance")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 30")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Sanity: pre-v30 — the column does not exist.
+        let col_pre: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+               SELECT 1 FROM information_schema.columns
+               WHERE table_name = 'pinned_cids'
+                 AND column_name = 'local_ipfs_provenance'
+             )",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !col_pre,
+            "pre-v30 schema must not have the local_ipfs_provenance column"
+        );
+
+        // Seed the four row shapes. The shapes are the same as the v12
+        // backfill test (the v27 / v30 lineage) — keeping the fixture
+        // names in sync so a future reader can see the contract evolved
+        // in place rather than being silently rewritten.
+        let now = "2026-07-01T12:00:00Z";
+        let seed = async |sha: &str, cid: Option<&str>, pinata: Option<&str>| {
+            sqlx::query(
+                "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(sha)
+            .bind(cid)
+            .bind(now)
+            .bind(pinata)
+            .execute(&pool)
+            .await
+            .unwrap();
+        };
+
+        // (1) Real local IPFS pin, no Pinata → provenance will backfill as TRUE.
+        seed("sha_v30_real_only", Some("QmRealLocalCid"), None).await;
+        // (2) Both CIDs present and distinct → provenance will backfill as TRUE.
+        seed(
+            "sha_v30_both_distinct",
+            Some("QmLocalForThisBlob"),
+            Some("QmPinataForThisBlob"),
+        )
+        .await;
+        // (3) Pinata-only (post-v27 NULL cid, pinata_cid set) → provenance stays FALSE.
+        seed("sha_v30_pinata_only", None, Some("QmPinataOnlyCid")).await;
+        // (4) Pinata-only with a provider CID. Post-v27 schema makes
+        //     cid NULL, so the backfill leaves provenance at the default.
+        seed("sha_v30_pinata_provider", None, Some("QmPinataProviderCid")).await;
+
+        // Apply v30 by re-running `migrate()`. The runner sees v30
+        // missing from `schema_migrations` and runs the migration body:
+        // the `ALTER TABLE` adds the column, the `UPDATE` backfills
+        // the rows seeded above, and the partial index is created.
+        db.migrate().await.unwrap();
+
+        // The column now exists with the documented default.
+        let col_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+               SELECT 1 FROM information_schema.columns
+               WHERE table_name = 'pinned_cids'
+                 AND column_name = 'local_ipfs_provenance'
+             )",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            col_exists,
+            "v30 migration must add the local_ipfs_provenance column"
+        );
+
+        // The backfill is one UPDATE keyed on
+        // `cid IS NOT NULL AND (pinata_cid IS NULL OR cid <> pinata_cid)`:
+        //   sha_v30_real_only        → TRUE
+        //   sha_v30_both_distinct    → TRUE
+        //   sha_v30_pinata_only      → FALSE (cid is NULL)
+        //   sha_v30_pinata_provider  → FALSE (cid is NULL)
+        let provenance = |sha: &str| {
+            let pool = pool.clone();
+            let sha = sha.to_string();
+            async move {
+                let row: Option<bool> = sqlx::query_scalar(
+                    "SELECT local_ipfs_provenance FROM pinned_cids WHERE sha256_hex = $1",
+                )
+                .bind(&sha)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+                row
+            }
+        };
+
+        assert_eq!(
+            provenance("sha_v30_real_only").await,
+            Some(true),
+            "(1) real local IPFS pin must backfill as provenance = TRUE"
+        );
+        assert_eq!(
+            provenance("sha_v30_both_distinct").await,
+            Some(true),
+            "(2) both-CIDs-distinct row must backfill as provenance = TRUE"
+        );
+        assert_eq!(
+            provenance("sha_v30_pinata_only").await,
+            Some(false),
+            "(3) Pinata-only row (cid NULL) must stay provenance = FALSE"
+        );
+        assert_eq!(
+            provenance("sha_v30_pinata_provider").await,
+            Some(false),
+            "(4) Pinata-only provider-CID row (cid NULL) must stay provenance = FALSE"
+        );
+
+        // The classification predicate `has_ipfs_cid` now keys on
+        // `local_ipfs_provenance = TRUE`. The Pinata-only rows are
+        // EXCLUDED even though pinata_cid is set — this is the durable
+        // contract the v30 migration installs. A later local-IPFS pin
+        // for the same OID (via `record_pinned_cid_with_source`) would
+        // flip the flag and bring it back into the IPFS-pinned set,
+        // which the integration test
+        // `sweep_promotes_pinata_only_to_local_ipfs_when_writer_invoked`
+        // covers.
+        assert!(
+            db.has_ipfs_cid("sha_v30_real_only").await.unwrap(),
+            "(1) has_ipfs_cid must report TRUE for the backfilled real-IPFS row"
+        );
+        assert!(
+            db.has_ipfs_cid("sha_v30_both_distinct").await.unwrap(),
+            "(2) has_ipfs_cid must report TRUE for the backfilled dual-backend row"
+        );
+        assert!(
+            !db.has_ipfs_cid("sha_v30_pinata_only").await.unwrap(),
+            "(3) has_ipfs_cid must report FALSE for a Pinata-only row (cid NULL post-v27)"
+        );
+        assert!(
+            !db.has_ipfs_cid("sha_v30_pinata_provider").await.unwrap(),
+            "(4) has_ipfs_cid must report FALSE for a Pinata-only provider-CID row"
+        );
+
+        // The gap filter used by the sweep (`filter_ipfs_pinned_oids`)
+        // follows the same predicate. A pre-v30 sweep that inferred
+        // Pinata-only from `cid = pinata_cid` would have included
+        // (3) and (4) by accident if the raw CID ever matched the
+        // provider CID; v30's writer-set flag is what stops that.
+        let candidates = vec![
+            "sha_v30_real_only".to_string(),
+            "sha_v30_both_distinct".to_string(),
+            "sha_v30_pinata_only".to_string(),
+            "sha_v30_pinata_provider".to_string(),
+        ];
+        let mut filtered = db.filter_ipfs_pinned_oids(&candidates).await.unwrap();
+        filtered.sort();
+        assert_eq!(
+            filtered,
+            vec!["sha_v30_both_distinct".to_string(), "sha_v30_real_only".to_string()],
+            "filter_ipfs_pinned_oids must return only the local-IPFS-provenance rows, never the Pinata-only ones"
+        );
     }
 
     /// `list_pinned_cids` must map a SQL NULL `cid` (Pinata-only row) to
