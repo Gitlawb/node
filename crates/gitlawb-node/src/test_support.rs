@@ -1065,10 +1065,7 @@ mod tests {
                 resp.status()
             );
             let prs = state.db.list_prs(&repo.id).await.expect("list_prs");
-            assert!(
-                prs.is_empty(),
-                "no PR row when {field}={bad:?} is rejected"
-            );
+            assert!(prs.is_empty(), "no PR row when {field}={bad:?} is rejected");
         }
     }
 
@@ -1217,7 +1214,12 @@ mod tests {
             .with_state(state.clone());
         let uri = format!("/api/v1/repos/{owner_did}/head-probe/pulls/1/merge");
         let resp = router
-            .oneshot(signed_request_as(&owner_did, Method::POST, &uri, Body::empty()))
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
             .await
             .unwrap();
         assert!(
@@ -1324,7 +1326,12 @@ mod tests {
             .with_state(state.clone());
         let uri = format!("/api/v1/repos/{owner_did}/head-tgt-probe/pulls/1/merge");
         let resp = router
-            .oneshot(signed_request_as(&owner_did, Method::POST, &uri, Body::empty()))
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
             .await
             .unwrap();
         assert!(
@@ -1430,7 +1437,12 @@ mod tests {
             .with_state(state.clone());
         let uri = format!("/api/v1/repos/{owner_did}/merge-probe/pulls/1/merge");
         let resp = router
-            .oneshot(signed_request_as(&owner_did, Method::POST, &uri, Body::empty()))
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
             .await
             .unwrap();
         assert!(
