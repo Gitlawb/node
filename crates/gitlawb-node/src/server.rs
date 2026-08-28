@@ -231,7 +231,12 @@ pub fn build_router(state: AppState) -> Router {
         .merge(Router::new().route("/api/v1/ipfs/pins", get(ipfs::list_pins)));
 
     // ── Arweave permanent anchors ──────────────────────────────────────────
-    let arweave_routes = Router::new().route("/api/v1/arweave/anchors", get(arweave::list_anchors));
+    let arweave_routes = Router::new()
+        .route("/api/v1/arweave/anchors", get(arweave::list_anchors))
+        .route(
+            "/api/v1/arweave/anchors/verify/{item_id}",
+            get(arweave::verify_anchor),
+        );
 
     // ── Bounty routes (write — require HTTP Signature) ─────────────────
     let bounty_write_routes = add_auth_layers(

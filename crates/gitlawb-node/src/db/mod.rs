@@ -3874,6 +3874,41 @@ impl Db {
             })
             .collect())
     }
+
+    /// Look up a single Arweave anchor by its Irys / Arweave item
+    /// id (the `id` column, which holds the same value as
+    /// `irys_tx_id` for v1 anchors and the data item id for
+    /// ANS-104 v2 anchors). Returns `None` if no row matches.
+    ///
+    /// Used by the public verify endpoint
+    /// `GET /api/v1/arweave/anchors/verify/{item_id}` to fetch the
+    /// persisted `node_did` so the envelope signature can be
+    /// verified against it.
+    pub async fn get_arweave_anchor_by_item_id(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<ArweaveAnchor>> {
+        let row = sqlx::query(
+            "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, irys_tx_id, arweave_url, node_did, anchored_at
+             FROM arweave_anchors WHERE id = $1",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| ArweaveAnchor {
+            id: r.get("id"),
+            repo: r.get("repo"),
+            owner_did: r.get("owner_did"),
+            ref_name: r.get("ref_name"),
+            old_sha: r.get("old_sha"),
+            new_sha: r.get("new_sha"),
+            cid: r.get("cid"),
+            irys_tx_id: r.get("irys_tx_id"),
+            arweave_url: r.get("arweave_url"),
+            node_did: r.get("node_did"),
+            anchored_at: r.get("anchored_at"),
+        }))
+    }
 }
 
 // ── Row helpers ───────────────────────────────────────────────────────────────
