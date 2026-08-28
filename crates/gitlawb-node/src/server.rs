@@ -240,10 +240,9 @@ pub fn build_router(state: AppState) -> Router {
     // on the other read surfaces is applied here — there is no anonymous
     // anchor-listing path on a signed-build node, and this commit closes that
     // gap alongside `/api/v1/ipfs/pins`.
-    let arweave_routes =
-        Router::new()
-            .route("/api/v1/arweave/anchors", get(arweave::list_anchors))
-            .layer(middleware::from_fn(auth::optional_signature));
+    let arweave_routes = Router::new()
+        .route("/api/v1/arweave/anchors", get(arweave::list_anchors))
+        .layer(middleware::from_fn(auth::optional_signature));
 
     // ── Bounty routes (write — require HTTP Signature) ─────────────────
     let bounty_write_routes = add_auth_layers(
