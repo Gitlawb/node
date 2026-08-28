@@ -2245,6 +2245,68 @@ pub async fn git_receive_pack(
     let admission = smart_http::AdmissionGuard::new(_permit, _caller_permit)
         .with_hold(std::sync::Arc::clone(&guard))
         .with_lease(lease.clone());
+
+    // #26 Split PR 1: durable intent for this push, written BEFORE
+    // the receive_pack call. Every ref update the pusher intends to
+    // land gets a `prepared` row carrying the verified pusher DID,
+    // the raw RFC 9421 signature header, signature-input, and
+    // content-digest that authorized the push, plus the request id.
+    //
+    // The state is flipped to `applied` (Ok) or `cancelled` (Err)
+    // AFTER receive_pack returns. The drain reads only `applied`
+    // rows, so a row that never gets the post-Ok flip stays in
+    // `prepared` (handler crash / dropped future) or `cancelled`
+    // (receive_pack Err) and is never promoted to a push event, a
+    // certificate, or an anchor.
+    //
+    // Inserted AT THE LAST POSSIBLE MOMENT, immediately before the
+    // receive_pack call, so a rejection above (owner enforcement,
+    // branch protection, etc.) does not produce a `prepared` row
+    // that nothing will ever flip.
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let signature_header = headers
+        .get("signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let signature_input = headers
+        .get("signature-input")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let content_digest = headers
+        .get("content-digest")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if let Err(e) = state
+        .db
+        .insert_pending_ref_transitions(
+            &request_id,
+            &record.id,
+            &state.node_did.to_string(),
+            auth.0.as_str(),
+            &ref_updates,
+            &signature_header,
+            &signature_input,
+            &content_digest,
+        )
+        .await
+    {
+        // A durable-intent write failure here means we cannot
+        // guarantee recovery for the upcoming git apply. Refuse the
+        // push with 503 rather than risk a ref landing with no
+        // recovery record.
+        tracing::error!(
+            err = %e,
+            repo = %name,
+            "failed to persist durable post-receive intent; refusing push"
+        );
+        return Err(AppError::Overloaded(
+            "durable intent write failed, retry shortly".into(),
+        ));
+    }
+
     let receive_result = smart_http::receive_pack(
         &state.git_bin,
         &disk_path,
@@ -2253,6 +2315,42 @@ pub async fn git_receive_pack(
         Some(admission),
     )
     .await;
+
+    // #26 Split PR 1: state flip. The drain's WHERE clause keys on
+    // `state = 'applied'`, so this is the ONLY line that promotes a
+    // `prepared` row. A row that lands in this branch is a ref that
+    // Git already applied to disk; the recovery drain will re-derive
+    // the push event, the per-ref certificate, and the anchor
+    // handoff from it on the next startup.
+    if receive_result.is_ok() {
+        if let Err(e) = state
+            .db
+            .mark_pending_ref_transitions_applied(&request_id)
+            .await
+        {
+            tracing::error!(
+                err = %e,
+                request_id = %request_id,
+                repo = %name,
+                "failed to mark pending ref transitions applied; recovery will re-derive"
+            );
+            // Don't fail the push — the ref is on disk and the drain
+            // will pick it up on the next startup regardless.
+        }
+    } else {
+        if let Err(e) = state
+            .db
+            .mark_pending_ref_transitions_cancelled(&request_id)
+            .await
+        {
+            tracing::warn!(
+                err = %e,
+                request_id = %request_id,
+                repo = %name,
+                "failed to mark pending ref transitions cancelled"
+            );
+        }
+    }
 
     // #174 F2/U5: the post-receive replication tail runs in an independently owned
     // task. It parks on `git_encrypt_semaphore` (withheld / candidate / full-scan
@@ -2350,6 +2448,11 @@ pub async fn git_receive_pack(
     // Record push event for trust score and issue a signed ref certificate.
     // The route is behind `require_signature`, so the verified pusher identity is
     // always present; use it directly rather than re-parsing the headers.
+    //
+    // #26 Split PR 1: the push event id, the per-ref cert id, and the
+    // anchor job id are all derived from the same `request_id` captured
+    // above, so a recovery re-pass against the same transition
+    // produces the same primary keys and the idempotent inserts collapse.
     let did = auth.0.as_str();
     {
         // Use the first new commit hash we parsed, fall back to timestamp
@@ -2358,7 +2461,19 @@ pub async fn git_receive_pack(
             .map(|u| u.new_sha.clone())
             .unwrap_or_else(|| Utc::now().timestamp().to_string());
 
-        let _ = state.db.record_push(did, &record.id, &commit_hash, 0).await;
+        // The push event is keyed on the FIRST ref's name so a
+        // multi-ref push collapses to one push event row, not N. The
+        // deterministic id is the same one the recovery drain
+        // derives.
+        let first_ref_name = ref_updates
+            .first()
+            .map(|u| u.ref_name.clone())
+            .unwrap_or_else(|| "refs/heads/main".to_string());
+        let push_event_id = crate::db::push_event_id_for(&request_id, &first_ref_name);
+        let _ = state
+            .db
+            .record_push_with_id(&push_event_id, did, &record.id, &commit_hash, 0)
+            .await;
         if let Ok(push_count) = state.db.get_push_count(did).await {
             // 0.05 base (from registration) + 0.05 per push, capped at 1.0
             // 1 push → 0.10, 5 pushes → 0.30, 19 pushes → 1.0
@@ -2370,22 +2485,51 @@ pub async fn git_receive_pack(
         // carrying that ref's real old→new transition. A multi-ref push must
         // not collapse to a single cert covering only the first ref.
         for update in &ref_updates {
-            match cert::issue_ref_certificate(
+            let cert_id = crate::db::ref_cert_id_for(&request_id, &update.ref_name);
+            match cert::issue_ref_certificate_idempotent(
                 &state,
                 &record.id,
                 &update.ref_name,
                 &update.old_sha,
                 &update.new_sha,
                 did,
+                &cert_id,
             )
             .await
             {
-                Ok(c) => {
+                Ok(Some(c)) => {
                     tracing::info!(cert_id = %c.id, repo = %record.name, ref_name = %update.ref_name, pusher = %did, "issued ref certificate")
+                }
+                Ok(None) => {
+                    tracing::debug!(ref_name = %update.ref_name, repo = %record.name, "ref certificate already exists for this ref, idempotent skip")
                 }
                 Err(e) => {
                     tracing::warn!(err = %e, ref_name = %update.ref_name, "failed to issue ref certificate")
                 }
+            }
+
+            // Anchor handoff: insert an anchor_jobs row keyed on the
+            // per-transition tuple. PR 2 reads this row and uploads
+            // to the bundler. The deterministic id makes a recovery
+            // re-pass a no-op.
+            let anchor_id = crate::db::anchor_job_id_for(
+                &record.id,
+                &update.ref_name,
+                &update.old_sha,
+                &update.new_sha,
+            );
+            let job = crate::db::AnchorJob {
+                id: anchor_id,
+                repo_id: record.id.clone(),
+                ref_name: update.ref_name.clone(),
+                old_sha: update.old_sha.clone(),
+                new_sha: update.new_sha.clone(),
+                pusher_did: did.to_string(),
+                created_at: Utc::now().to_rfc3339(),
+                claimed_at: None,
+            };
+            if let Err(e) = state.db.insert_anchor_job_idempotent(&job).await {
+                tracing::warn!(err = %e, ref_name = %update.ref_name, "failed to enqueue anchor job")
             }
         }
     }

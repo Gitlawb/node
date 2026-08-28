@@ -1966,6 +1966,7 @@ impl Db {
         Ok(())
     }
 
+    #[allow(dead_code)] // legacy live-path entry; PR 3 owns the deprecation decision
     pub async fn record_push(
         &self,
         agent_did: &str,
@@ -2539,6 +2540,7 @@ impl Db {
     /// late-landing older cert cannot regress a ref's persisted state.  Returns
     /// the full row as it now exists in the database (the original row on a
     /// rejected upsert; the passed row on insert).
+    #[allow(dead_code)] // legacy live-path entry; PR 3 owns the deprecation decision
     pub async fn insert_ref_certificate(&self, cert: &RefCertificate) -> Result<RefCertificate> {
         let row = sqlx::query(
             "INSERT INTO ref_certificates

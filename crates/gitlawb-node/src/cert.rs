@@ -15,6 +15,15 @@ use crate::state::AppState;
 ///
 /// Builds a canonical JSON payload, signs it with the node's Ed25519 key,
 /// persists the certificate, and returns it.
+///
+/// #26 Split PR 1: the live handler now uses
+/// [`issue_ref_certificate_idempotent`] so the cert id is deterministic
+/// and recovery re-derives the same primary key. This legacy entry
+/// point remains for callers that prefer a fresh UUID per cert (it
+/// keeps the older `insert_ref_certificate` upsert semantics); Split
+/// PR 3 owns the cert/CLI compatibility decision of whether to keep
+/// it or remove it.
+#[allow(dead_code)] // kept for the PR 3 cert/CLI compat pass
 pub async fn issue_ref_certificate(
     state: &AppState,
     repo_id: &str,
@@ -22,6 +31,56 @@ pub async fn issue_ref_certificate(
     old_sha: &str,
     new_sha: &str,
     pusher_did: &str,
+) -> Result<RefCertificate> {
+    let cert =
+        build_ref_certificate(state, repo_id, ref_name, old_sha, new_sha, pusher_did, None).await?;
+    state.db.insert_ref_certificate(&cert).await
+}
+
+/// #26 Split PR 1 — idempotent variant used by the recovery drain.
+///
+/// `cert_id` is the deterministic id derived from
+/// `(request_id, ref_name)` so a recovery re-pass against the same
+/// transition produces the same primary key. The insert uses
+/// `ON CONFLICT (repo_id, ref_name) DO NOTHING` (the existing
+/// `insert_ref_certificate_idempotent` helper), so the function
+/// returns `None` if a live-path cert already exists for the
+/// `(repo_id, ref_name)` pair, and `Some(cert)` if it wrote a new
+/// one. Either way, exactly one cert row exists for the transition.
+pub async fn issue_ref_certificate_idempotent(
+    state: &AppState,
+    repo_id: &str,
+    ref_name: &str,
+    old_sha: &str,
+    new_sha: &str,
+    pusher_did: &str,
+    cert_id: &str,
+) -> Result<Option<RefCertificate>> {
+    let cert = build_ref_certificate(
+        state,
+        repo_id,
+        ref_name,
+        old_sha,
+        new_sha,
+        pusher_did,
+        Some(cert_id.to_string()),
+    )
+    .await?;
+    state.db.insert_ref_certificate_idempotent(&cert).await
+}
+
+/// Shared cert construction: build the JSON payload, sign it with the
+/// node key, and assemble the `RefCertificate` row. `cert_id_override`
+/// lets the recovery path plug in a deterministic id; the live path
+/// passes `None` and gets a fresh UUID.
+async fn build_ref_certificate(
+    state: &AppState,
+    repo_id: &str,
+    ref_name: &str,
+    old_sha: &str,
+    new_sha: &str,
+    pusher_did: &str,
+    cert_id_override: Option<String>,
 ) -> Result<RefCertificate> {
     let node_did = state.node_did.to_string();
     let issued_at = Utc::now().to_rfc3339();
@@ -40,8 +99,9 @@ pub async fn issue_ref_certificate(
 
     let signature = state.node_keypair.sign_b64(&payload_bytes);
 
-    let cert = RefCertificate {
-        id: Uuid::new_v4().to_string(),
+    let id = cert_id_override.unwrap_or_else(|| Uuid::new_v4().to_string());
+    Ok(RefCertificate {
+        id,
         repo_id: repo_id.to_string(),
         ref_name: ref_name.to_string(),
         old_sha: old_sha.to_string(),
@@ -50,9 +110,5 @@ pub async fn issue_ref_certificate(
         node_did,
         signature,
         issued_at,
-    };
-
-    // Persist and return the row as it exists in the database (on a
-    // conflict the existing row survives when it is newer).
-    state.db.insert_ref_certificate(&cert).await
+    })
 }

@@ -5,6 +5,7 @@ mod bootstrap;
 mod cert;
 mod config;
 mod db;
+mod durable_outbox;
 mod encrypted_pin;
 mod error;
 mod git;
@@ -675,6 +676,21 @@ async fn main() -> Result<()> {
     let shutdown_signal_for_axum = state.subscribe_shutdown();
     let grace = std::time::Duration::from_secs(config.shutdown_grace_secs);
     info!(grace_secs = config.shutdown_grace_secs, "axum server ready");
+
+    // #26 Split PR 1: drain any `applied` rows left by a previous
+    // process that crashed after Git applied a ref but before the
+    // bookkeeping landed. Runs once, BEFORE the server accepts new
+    // pushes, so a recovery re-derivation does not race a fresh push.
+    // Non-fatal: a transient drain failure is logged and the rows
+    // remain `applied` for the next startup to pick up.
+    match durable_outbox::drain_pending_ref_transitions(state.clone(), 1000).await {
+        Ok(0) => {}
+        Ok(n) => info!(n, "drained pending ref transitions from prior run"),
+        Err(e) => warn!(
+            err = %e,
+            "pending ref transition drain failed at startup (non-fatal; will retry on next start)"
+        ),
+    }
 
     // `into_make_service_with_connect_info` exposes the socket peer address as
     // `ConnectInfo<SocketAddr>` so the push limiter can key on the real client
