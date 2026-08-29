@@ -25,22 +25,295 @@
 use crate::cert;
 use crate::db::PendingRefTransition;
 use crate::state::AppState;
+use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 
-/// One drain pass. Returns the number of transitions re-derived. Called
-/// from startup and from the failure-injection test.
+/// Promote `prepared` rows whose `new_sha` matches the on-disk ref to
+/// `applied`, so the recovery drain (which only reads `state =
+/// 'applied'`) picks them up on the next pass. The reconcile runs at
+/// startup, BEFORE the drain.
 ///
-/// `limit` bounds the work per call. The startup caller passes a
-/// generous cap (1000); tests pass a small one to assert behavior
-/// without flooding the database.
+/// This is the second half of the P1-A fix. The first half is the
+/// live handler's `mark_pending_ref_transitions_applied` call, which
+/// can fail or be interrupted AFTER `receive_pack` returned `Ok`. A
+/// `prepared` row whose target ref actually landed on disk has no
+/// recovery path without this step: the drain's WHERE clause does not
+/// see it, and a startup that boots and serves traffic would silently
+/// lose the push event, the cert, and the anchor handoff for that
+/// ref.
+///
+/// Strict SHA equality is the load-bearing correctness check. A row
+/// whose `new_sha` does NOT match the on-disk ref stays `prepared`;
+/// the invariant "a failed receive-pack is never promoted to
+/// completed accounting" is preserved by the equality check, not by
+/// state alone. A `cancelled` row is also never promoted (the
+/// `list_pending_ref_transitions_prepared` SELECT gates on
+/// `state = 'prepared'`, and the UPDATE re-checks the state).
+///
+/// The SHA check alone is not sufficient. A `prepared` row could
+/// have a `new_sha` that currently matches the on-disk ref for a
+/// reason OTHER than its own transition (e.g. a later push
+/// re-introduced the same SHA on the same ref). To prevent the
+/// recovery drain from writing artifacts for a transition the node
+/// cannot prove actually happened, the reconcile ALSO requires the
+/// row's `created_at` to be within [`MAX_RECONCILE_AGE`] of the
+/// current time. Rows older than the window are left `prepared` for
+/// human-attended recovery. This is the second correctness barrier,
+/// and the reason a `prepared` row that happens to match a current
+/// on-disk SHA does not silently turn into completed accounting.
+pub async fn reconcile_prepared_from_disk(state: AppState, limit: i64) -> anyhow::Result<usize> {
+    let rows = state
+        .db
+        .list_pending_ref_transitions_prepared(limit)
+        .await?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    // Group rows by repo so we call `list_refs` once per repo, not
+    // once per row.
+    let mut by_repo: HashMap<String, Vec<&PendingRefTransition>> = HashMap::new();
+    for row in &rows {
+        by_repo.entry(row.repo_id.clone()).or_default().push(row);
+    }
+
+    let mut to_promote: Vec<String> = Vec::new();
+    for (repo_id, repo_rows) in by_repo {
+        let repo = match state.db.get_repo_by_id(&repo_id).await? {
+            Some(r) => r,
+            None => {
+                // The repo row is gone. The outbox rows must have
+                // been orphaned by a hard delete; the reviewer's
+                // invariant does not bind here, so we leave them
+                // `prepared` and let a later startup (or a
+                // human-attended recovery) resolve them. Log so the
+                // operator can act.
+                tracing::warn!(
+                    repo_id = %repo_id,
+                    row_count = repo_rows.len(),
+                    "reconcile: repo row missing; leaving prepared rows untouched"
+                );
+                continue;
+            }
+        };
+        let disk_path = std::path::Path::new(&repo.disk_path);
+        let refs = match crate::git::store::list_refs(disk_path) {
+            Ok(v) => v,
+            Err(e) => {
+                // A `list_refs` failure is not fatal: skip this
+                // repo's group, leave the rows `prepared` for a
+                // later startup.
+                tracing::warn!(
+                    err = %e,
+                    repo_id = %repo_id,
+                    row_count = repo_rows.len(),
+                    "reconcile: list_refs failed; leaving prepared rows untouched"
+                );
+                continue;
+            }
+        };
+        let disk_refs: HashMap<String, String> = refs.into_iter().collect();
+
+        for row in repo_rows {
+            let matches = disk_refs
+                .get(&row.ref_name)
+                .map(|sha| sha == &row.new_sha)
+                .unwrap_or(false);
+            if !matches {
+                let on_disk = disk_refs
+                    .get(&row.ref_name)
+                    .cloned()
+                    .unwrap_or_else(|| "<missing>".to_string());
+                tracing::debug!(
+                    request_id = %row.request_id,
+                    repo_id = %row.repo_id,
+                    ref_name = %row.ref_name,
+                    row_new_sha = %row.new_sha,
+                    on_disk_sha = %on_disk,
+                    "reconcile: row's new_sha does not match on-disk ref; staying prepared"
+                );
+                continue;
+            }
+            // SHA matched. Before promoting, confirm the row is
+            // recent enough to be the transition that produced the
+            // current on-disk SHA. A stale `prepared` row whose
+            // `new_sha` happens to equal the current ref value for
+            // some OTHER reason (e.g. a later push re-introduced
+            // the same SHA) would otherwise be promoted and the
+            // recovery drain would write artifacts for a transition
+            // we cannot prove happened. The `MAX_RECONCILE_AGE`
+            // window bounds the blast radius; older rows require
+            // human-attended recovery.
+            let row_age = DateTime::parse_from_rfc3339(&row.created_at)
+                .ok()
+                .map(|t| Utc::now().signed_duration_since(t.with_timezone(&Utc)))
+                .unwrap_or_else(|| {
+                    // Unparseable `created_at` is a corruption
+                    // signal. Treat the row as unpromotable so a
+                    // human can look at it.
+                    tracing::warn!(
+                        row_id = %row.id,
+                        request_id = %row.request_id,
+                        created_at = %row.created_at,
+                        "reconcile: unparseable created_at; staying prepared (human-attended recovery)"
+                    );
+                    MAX_RECONCILE_AGE + chrono::Duration::seconds(1)
+                });
+            if row_age > MAX_RECONCILE_AGE {
+                tracing::warn!(
+                    row_id = %row.id,
+                    request_id = %row.request_id,
+                    repo_id = %row.repo_id,
+                    ref_name = %row.ref_name,
+                    row_new_sha = %row.new_sha,
+                    row_age_secs = row_age.num_seconds(),
+                    max_reconcile_age_secs = MAX_RECONCILE_AGE.num_seconds(),
+                    "reconcile: row is older than the recovery window; staying prepared (human-attended recovery required)"
+                );
+                continue;
+            }
+            to_promote.push(row.id.clone());
+        }
+    }
+
+    let flipped = state
+        .db
+        .mark_pending_ref_transitions_applied_for_rows(&to_promote)
+        .await?;
+    if flipped > 0 {
+        tracing::info!(
+            flipped,
+            "reconciled prepared -> applied via on-disk ref match"
+        );
+    }
+    Ok(flipped as usize)
+}
+
+/// Per-pass drain budget. Each call to `drain_pending_ref_transitions`
+/// processes at most this many rows.
+pub const DRAIN_PER_PASS_LIMIT: i64 = 1000;
+
+/// Maximum age (relative to `Utc::now()`) at which a `prepared` row
+/// is auto-promoted by [`reconcile_prepared_from_disk`]. Rows older
+/// than this stay `prepared` and require human-attended recovery.
+///
+/// The window bounds the blast radius of a stale-row promotion: the
+/// only way the on-disk SHA matches a `prepared` row's `new_sha` for
+/// an OLD row is if some OTHER push re-introduced the same SHA on
+/// the same ref after the original transition failed. With a bounded
+/// window, that mis-match only matters for `created_at` within the
+/// window — recent enough that an operator can correlate the row
+/// with the live handler's logs. Older rows are deliberately left
+/// `prepared` so a human can audit them rather than have the node
+/// silently write a push event / cert / anchor for a transition the
+/// node has no way to prove actually happened.
+pub const MAX_RECONCILE_AGE: chrono::Duration = chrono::Duration::seconds(24 * 60 * 60);
+
+/// Maximum number of passes the startup drain will run before logging
+/// a residual-backlog warning. With `DRAIN_PER_PASS_LIMIT = 1000` and
+/// `DRAIN_MAX_PASSES = 10`, the startup drain will process up to
+/// 10,000 rows in one boot. Rows beyond that remain `applied` and
+/// are picked up on the next startup.
+pub const DRAIN_MAX_PASSES: usize = 10;
+
+/// One drain pass. Returns the number of transitions fully re-derived
+/// (artifacts written AND row deleted). Production callers use
+/// [`drain_pending_ref_transitions_all`] to drain an unbounded backlog
+/// across multiple passes; tests can call this directly with a small
+/// `limit` to assert behavior on a single batch.
+///
+/// P2-A: a `derive_one` failure on one row is logged but does NOT
+/// abort the rest of the batch — the failing row stays `applied`
+/// for a later startup to retry. A `delete_pending_ref_transition`
+/// failure on a row whose `derive_one` succeeded is also logged and
+/// the row remains `applied`; the next drain re-derives (idempotent
+/// inserts make this safe) and tries the delete again.
 pub async fn drain_pending_ref_transitions(state: AppState, limit: i64) -> anyhow::Result<usize> {
+    drain_pending_ref_transitions_with(state, limit, |s, r| async move { derive_one(&s, &r).await })
+        .await
+}
+
+/// Testable seam for the drain loop. Production code calls
+/// [`drain_pending_ref_transitions`], which delegates here with the
+/// real [`derive_one`]. Tests inject a closure that fails for one
+/// row and succeeds for another to assert that the loop does not
+/// abort on a single error.
+pub async fn drain_pending_ref_transitions_with<F, Fut>(
+    state: AppState,
+    limit: i64,
+    derive_fn: F,
+) -> anyhow::Result<usize>
+where
+    F: Fn(AppState, PendingRefTransition) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
     let rows = state.db.list_pending_ref_transitions_applied(limit).await?;
     let mut count = 0;
     for row in rows {
-        derive_one(&state, &row).await?;
-        state.db.delete_pending_ref_transition(&row.id).await?;
-        count += 1;
+        match derive_fn(state.clone(), row.clone()).await {
+            Ok(()) => {
+                if let Err(e) = state.db.delete_pending_ref_transition(&row.id).await {
+                    tracing::warn!(
+                        err = %e,
+                        row_id = %row.id,
+                        "drain: row derivation succeeded but delete failed; row will be re-derived next startup (idempotent inserts make this safe)"
+                    );
+                    continue;
+                }
+                count += 1;
+            }
+            Err(e) => {
+                tracing::error!(
+                    err = %e,
+                    row_id = %row.id,
+                    request_id = %row.request_id,
+                    "drain: derive_fn failed; row left in `applied` for next startup"
+                );
+            }
+        }
     }
     Ok(count)
+}
+
+/// Drain an unbounded `applied` backlog across multiple passes. The
+/// drain stops as soon as a pass returns fewer rows than
+/// `per_pass_limit` (i.e. the backlog is exhausted). If
+/// `max_passes` passes still leave a full pass of work, a warning is
+/// logged and the function returns the count processed so far; the
+/// residual rows remain `applied` for the next startup.
+///
+/// The startup caller in [`crate::main`] uses
+/// `DRAIN_PER_PASS_LIMIT` and `DRAIN_MAX_PASSES` from this module so
+/// the test that asserts "backlog > 1000 is fully processed" can
+/// reference the same constants.
+pub async fn drain_pending_ref_transitions_all(
+    state: AppState,
+    per_pass_limit: i64,
+    max_passes: usize,
+) -> anyhow::Result<usize> {
+    let mut total = 0;
+    for _ in 0..max_passes {
+        let n = drain_pending_ref_transitions(state.clone(), per_pass_limit).await?;
+        total += n;
+        // `per_pass_limit` is `i64`; `n` is `usize` (the drain
+        // returns a row count). Cast for the comparison.
+        if (n as i64) < per_pass_limit {
+            return Ok(total);
+        }
+    }
+    // One more pass to detect residual backlog. If this pass is also
+    // full, log a warning and return what we have; the next startup
+    // will continue the work.
+    let residual = drain_pending_ref_transitions(state.clone(), per_pass_limit).await?;
+    if (residual as i64) >= per_pass_limit {
+        tracing::warn!(
+            total = total + residual,
+            max_passes,
+            per_pass_limit,
+            "drain backlog exceeds startup budget; residual rows will be picked up on next restart"
+        );
+    }
+    Ok(total + residual)
 }
 
 /// Re-derive the push event, the per-ref certificate, and the anchor
@@ -55,8 +328,15 @@ pub async fn drain_pending_ref_transitions(state: AppState, limit: i64) -> anyho
 /// idempotent (see the module-level comment), so a second drain pass
 /// against the same row is a no-op.
 pub async fn derive_one(state: &AppState, row: &PendingRefTransition) -> anyhow::Result<()> {
-    // Push event: deterministic id, idempotent insert.
-    let push_id = crate::db::push_event_id_for(&row.request_id, &row.ref_name);
+    // Push event: deterministic id, idempotent insert. The id is keyed
+    // on the REQUEST's first ref name (persisted on every row of this
+    // `request_id`) so the recovery push event id matches the live
+    // path's id and a live push followed by a recovery pass collapses
+    // to a single `push_events` row via `ON CONFLICT (id) DO NOTHING`.
+    // Per-ref certs and anchor jobs stay keyed on `row.ref_name` and
+    // `(repo, ref, old, new)` respectively — those are correctly
+    // transition-shaped.
+    let push_id = crate::db::push_event_id_for(&row.request_id, &row.first_ref_name);
     state
         .db
         .record_push_with_id(&push_id, &row.pusher_did, &row.repo_id, &row.new_sha, 0)
@@ -156,6 +436,11 @@ mod drain_tests {
             created_at: now.clone(),
             applied_at: Some(now),
             cancelled_at: None,
+            // The existing tests are single-ref pushes, so the first
+            // ref name is the same as the ref name. The new multi-ref
+            // test sets this explicitly to the request's actual first
+            // ref name across all rows of the same `request_id`.
+            first_ref_name: ref_name.to_string(),
         }
     }
 
@@ -344,5 +629,762 @@ mod drain_tests {
             .await
             .unwrap();
         assert_eq!(anchor_count, 0);
+    }
+
+    // ----- P1-A reconcile tests -----
+    //
+    // These tests cover the startup-time `reconcile_prepared_from_disk`
+    // step: a `prepared` row whose target ref actually landed on disk
+    // is promoted to `applied`; a row whose target did NOT land (or
+    // whose ref is missing) stays `prepared`; a `cancelled` row is
+    // never promoted; and a second call is a no-op.
+    //
+    // The on-disk state is a real bare git repo (so `list_refs` can
+    // read it) seeded with a synthetic commit via the plumbing
+    // commands `mktree` (empty tree) + `commit-tree` (root commit) +
+    // `update-ref` (point a ref at the commit).
+
+    /// Build a real commit on a bare git repo's `ref_name`. Returns
+    /// the new commit SHA. Used by the reconcile tests to seed a
+    /// known SHA on disk so `list_refs` can read it back.
+    fn seed_ref_on_bare(bare_path: &std::path::Path, ref_name: &str) -> String {
+        use std::process::Command;
+        // Empty tree.
+        let tree = String::from_utf8(
+            Command::new("git")
+                .args(["mktree"])
+                .current_dir(bare_path)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("git mktree")
+                .stdout,
+        )
+        .expect("mktree stdout utf8")
+        .trim()
+        .to_string();
+        // Root commit on the empty tree. The env vars override any
+        // missing global config in CI.
+        let commit = String::from_utf8(
+            Command::new("git")
+                .args(["commit-tree", &tree, "-m", "test root"])
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .current_dir(bare_path)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("git commit-tree")
+                .stdout,
+        )
+        .expect("commit-tree stdout utf8")
+        .trim()
+        .to_string();
+        // Point the ref at the commit. `update-ref` writes into the
+        // bare repo's refs/ tree.
+        Command::new("git")
+            .args(["update-ref", ref_name, &commit])
+            .current_dir(bare_path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("git update-ref");
+        commit
+    }
+
+    /// Seed a `RepoRecord` row pointing at `disk_path` and return
+    /// the repo id. Mirrors what `repos::create_repo` does in
+    /// production, but without the rest of the create-repo
+    /// bookkeeping the test does not exercise.
+    async fn seed_repo_row(state: &crate::state::AppState, disk_path: &str) -> String {
+        use crate::db::RepoRecord;
+        use chrono::Utc;
+        let repo_id = uuid::Uuid::new_v4().to_string();
+        state
+            .db
+            .create_repo(&RepoRecord {
+                id: repo_id.clone(),
+                name: "reconcile-test".into(),
+                owner_did: "did:key:z6owner".into(),
+                description: None,
+                is_public: true,
+                default_branch: "main".into(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                disk_path: disk_path.to_string(),
+                forked_from: None,
+                machine_id: None,
+            })
+            .await
+            .expect("create_repo");
+        repo_id
+    }
+
+    #[sqlx::test]
+    async fn reconcile_promotes_prepared_row_when_on_disk_sha_matches(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        // Create a bare repo on disk with refs/heads/main = X.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        crate::git::store::init_bare(&bare).expect("init_bare");
+        let on_disk_sha = seed_ref_on_bare(&bare, "refs/heads/main");
+
+        // Persist a `prepared` row whose `new_sha` matches the on-disk
+        // SHA. This simulates the crash window the reviewer flagged:
+        // receive_pack returned Ok and the ref landed, but the
+        // handler never reached `mark_pending_ref_transitions_applied`.
+        let repo_id = seed_repo_row(&state, bare.to_str().unwrap()).await;
+        let mut row = make_row(&repo_id, "refs/heads/main", &"0".repeat(40), &on_disk_sha);
+        row.state = pending_state::PREPARED.to_string();
+        row.applied_at = None;
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row)
+            .await
+            .unwrap();
+
+        // The drain must NOT see the row before reconcile (it only
+        // reads `applied`).
+        let pre_drain = state
+            .db
+            .list_pending_ref_transitions_applied(100)
+            .await
+            .unwrap();
+        assert!(pre_drain.is_empty(), "drain cannot see a prepared row");
+
+        // Reconcile: the row's new_sha matches the on-disk ref, so it
+        // should be promoted.
+        let n = reconcile_prepared_from_disk(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "exactly one row promoted to applied");
+
+        // The row is now in `applied` and the drain can see it.
+        let after_drain = state
+            .db
+            .list_pending_ref_transitions_applied(100)
+            .await
+            .unwrap();
+        assert_eq!(after_drain.len(), 1, "row is now visible to the drain");
+        assert_eq!(after_drain[0].id, row.id, "the same row is promoted");
+        assert_eq!(after_drain[0].state, pending_state::APPLIED);
+        assert!(
+            after_drain[0].applied_at.is_some(),
+            "applied_at is set on promotion"
+        );
+
+        // The prepared list is now empty.
+        let still_prepared = state
+            .db
+            .list_pending_ref_transitions_prepared(100)
+            .await
+            .unwrap();
+        assert!(
+            still_prepared.is_empty(),
+            "no prepared rows remain after a successful reconcile"
+        );
+    }
+
+    #[sqlx::test]
+    async fn reconcile_leaves_prepared_row_when_on_disk_sha_differs(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        // On-disk SHA is `aaaa...` (the live push landed at this SHA).
+        // The row's `new_sha` is `bbbb...` — the SHA the row CLAIMS
+        // the push went to, but the actual on-disk state disagrees.
+        // This models a row stranded by a `mark_applied` failure on a
+        // push whose target was rolled back, or any case where the
+        // recorded `new_sha` does not match reality.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        crate::git::store::init_bare(&bare).expect("init_bare");
+        let on_disk_sha = seed_ref_on_bare(&bare, "refs/heads/main");
+        assert_ne!(on_disk_sha, "b".repeat(40), "test sanity: SHAs differ");
+
+        let repo_id = seed_repo_row(&state, bare.to_str().unwrap()).await;
+        let mut row = make_row(
+            &repo_id,
+            "refs/heads/main",
+            &"0".repeat(40),
+            &"b".repeat(40),
+        );
+        row.state = pending_state::PREPARED.to_string();
+        row.applied_at = None;
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row)
+            .await
+            .unwrap();
+
+        // Reconcile: the SHA does not match, so NOTHING is promoted.
+        let n = reconcile_prepared_from_disk(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "no row promoted when SHAs do not match");
+
+        // The row is still `prepared` and the drain cannot see it.
+        let after_drain = state
+            .db
+            .list_pending_ref_transitions_applied(100)
+            .await
+            .unwrap();
+        assert!(
+            after_drain.is_empty(),
+            "drain must not see a row whose on-disk SHA does not match"
+        );
+        let still_prepared = state
+            .db
+            .list_pending_ref_transitions_prepared(100)
+            .await
+            .unwrap();
+        assert_eq!(still_prepared.len(), 1, "row stays prepared");
+        assert_eq!(still_prepared[0].id, row.id);
+        assert!(
+            still_prepared[0].applied_at.is_none(),
+            "applied_at is NOT set on a non-promotion"
+        );
+    }
+
+    #[sqlx::test]
+    async fn reconcile_leaves_cancelled_row_untouched(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        // On-disk ref matches the row's `new_sha` — but the row is
+        // `cancelled`, so the reconcile must NEVER promote it. The
+        // reviewer's invariant: a failed receive-pack is never
+        // promoted to completed accounting.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        crate::git::store::init_bare(&bare).expect("init_bare");
+        let on_disk_sha = seed_ref_on_bare(&bare, "refs/heads/main");
+
+        let repo_id = seed_repo_row(&state, bare.to_str().unwrap()).await;
+        let mut row = make_row(&repo_id, "refs/heads/main", &"0".repeat(40), &on_disk_sha);
+        row.state = pending_state::CANCELLED.to_string();
+        row.applied_at = None;
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row)
+            .await
+            .unwrap();
+
+        let n = reconcile_prepared_from_disk(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "cancelled rows are never promoted");
+
+        // The row is still cancelled and the drain still cannot see it.
+        let after_drain = state
+            .db
+            .list_pending_ref_transitions_applied(100)
+            .await
+            .unwrap();
+        assert!(after_drain.is_empty());
+        let still_prepared = state
+            .db
+            .list_pending_ref_transitions_prepared(100)
+            .await
+            .unwrap();
+        assert!(
+            still_prepared.is_empty(),
+            "cancelled rows do not show up in the prepared list either"
+        );
+    }
+
+    #[sqlx::test]
+    async fn reconcile_is_idempotent(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        crate::git::store::init_bare(&bare).expect("init_bare");
+        let on_disk_sha = seed_ref_on_bare(&bare, "refs/heads/main");
+
+        let repo_id = seed_repo_row(&state, bare.to_str().unwrap()).await;
+        let mut row = make_row(&repo_id, "refs/heads/main", &"0".repeat(40), &on_disk_sha);
+        row.state = pending_state::PREPARED.to_string();
+        row.applied_at = None;
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row)
+            .await
+            .unwrap();
+
+        // First call: 1 row promoted.
+        let n1 = reconcile_prepared_from_disk(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(n1, 1);
+        // Second call: 0 rows — the row is no longer `prepared`, so
+        // the list query returns empty.
+        let n2 = reconcile_prepared_from_disk(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(n2, 0, "a second reconcile is a no-op");
+
+        // Final state: applied, with applied_at set.
+        let applied = state
+            .db
+            .list_pending_ref_transitions_applied(100)
+            .await
+            .unwrap();
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].state, pending_state::APPLIED);
+        assert!(applied[0].applied_at.is_some());
+    }
+
+    /// A `prepared` row whose `new_sha` happens to match the current
+    /// on-disk ref value for a reason OTHER than its own transition
+    /// (e.g. a later push re-introduced the same SHA on the same
+    /// ref) must NOT be promoted just because the SHAs match. The
+    /// `MAX_RECONCILE_AGE` window is the second correctness barrier:
+    /// rows older than the window stay `prepared` for
+    /// human-attended recovery.
+    ///
+    /// This test seeds a `prepared` row whose `new_sha` DOES match
+    /// the on-disk ref, but whose `created_at` is 25 hours in the
+    /// past (one hour past `MAX_RECONCILE_AGE = 24h`). The reconcile
+    /// must NOT promote it.
+    #[sqlx::test]
+    async fn reconcile_does_not_promote_stale_prepared_row(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        // On-disk ref with a known SHA.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        crate::git::store::init_bare(&bare).expect("init_bare");
+        let on_disk_sha = seed_ref_on_bare(&bare, "refs/heads/main");
+
+        // Build a `prepared` row whose SHA matches the on-disk ref,
+        // but whose `created_at` is older than `MAX_RECONCILE_AGE`.
+        // This models a row that was stranded by an ancient
+        // `mark_applied` failure and then re-introduced the same
+        // SHA via a later push.
+        let repo_id = seed_repo_row(&state, bare.to_str().unwrap()).await;
+        let mut row = make_row(&repo_id, "refs/heads/main", &"0".repeat(40), &on_disk_sha);
+        row.state = pending_state::PREPARED.to_string();
+        row.applied_at = None;
+        // 25 hours ago — outside the 24h window.
+        row.created_at = (chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
+        // `make_row` derives `id` from the deterministic hash using
+        // the `created_at` it generated at construction time. Now
+        // that we've overwritten `created_at`, the row's `id` no
+        // longer matches what `insert_pending_ref_transitions`
+        // would have produced in production, but the test only
+        // checks the reconcile's behavior, not the id's contents,
+        // so the stale id is harmless here.
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row)
+            .await
+            .unwrap();
+
+        // The SHA matches, but the row is older than the window:
+        // reconcile must NOT promote it.
+        let n = reconcile_prepared_from_disk(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "stale row stays prepared (SHA matched but age exceeded the recovery window)"
+        );
+
+        // The row is still `prepared` and the drain cannot see it.
+        let after_drain = state
+            .db
+            .list_pending_ref_transitions_applied(100)
+            .await
+            .unwrap();
+        assert!(
+            after_drain.is_empty(),
+            "drain must not see a row outside the recovery window"
+        );
+        let still_prepared = state
+            .db
+            .list_pending_ref_transitions_prepared(100)
+            .await
+            .unwrap();
+        assert_eq!(still_prepared.len(), 1, "row stays prepared");
+        assert_eq!(still_prepared[0].id, row.id);
+        assert!(
+            still_prepared[0].applied_at.is_none(),
+            "applied_at is NOT set on a stale row"
+        );
+    }
+
+    /// A `prepared` row that is fresh (within `MAX_RECONCILE_AGE`)
+    /// and SHA-matches the on-disk ref MUST still be promoted. This
+    /// is the existing happy-path contract; the test pins it so a
+    /// future change to the age check does not silently break the
+    /// recovery path for legitimate stranded rows.
+    #[sqlx::test]
+    async fn reconcile_promotes_fresh_prepared_row_with_matching_sha(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        crate::git::store::init_bare(&bare).expect("init_bare");
+        let on_disk_sha = seed_ref_on_bare(&bare, "refs/heads/main");
+
+        let repo_id = seed_repo_row(&state, bare.to_str().unwrap()).await;
+        // `make_row` defaults `created_at` to `Utc::now()`, which is
+        // well within `MAX_RECONCILE_AGE`. The SHA matches. This
+        // row should be promoted.
+        let mut row = make_row(&repo_id, "refs/heads/main", &"0".repeat(40), &on_disk_sha);
+        row.state = pending_state::PREPARED.to_string();
+        row.applied_at = None;
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row)
+            .await
+            .unwrap();
+
+        let n = reconcile_prepared_from_disk(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "fresh row with matching SHA is promoted");
+    }
+
+    // ----- P2-A drain resilience tests -----
+    //
+    // These tests cover the "drain must not abort on first failure"
+    // and "drain must not cap at 1000 rows per startup" findings.
+    // Backlog processing uses the production `drain_pending_ref_transitions_all`
+    // (the `DRAIN_PER_PASS_LIMIT` / `DRAIN_MAX_PASSES` constants from
+    // this module) so the test exercises the same wrapper the
+    // startup calls. Failure isolation uses
+    // `drain_pending_ref_transitions_with` to inject a closure that
+    // errors for one row and succeeds for the next.
+
+    #[sqlx::test]
+    async fn drain_processes_backlog_larger_than_one_pass(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        // Seed 1500 distinct `applied` rows. Each row needs a unique
+        // `request_id` so the deterministic `pending_ref_transition`
+        // PKs (which hash `request_id`) don't collide, and the
+        // push-event / cert / anchor PKs (which also hash
+        // `request_id`) don't collide either.
+        const N: usize = 1500;
+        for i in 0..N {
+            let mut row = make_row(
+                "repo-backlog",
+                "refs/heads/main",
+                &"0".repeat(40),
+                &format!("{:040x}", i as u64),
+            );
+            // Override `request_id` to a unique value per row. The
+            // `id` is derived from this in `make_row`, so the unique
+            // `request_id` also gives a unique row PK.
+            row.request_id = format!("req-{i}");
+            row.id = crate::db::deterministic_id(&[
+                "pending_ref_transition",
+                &row.request_id,
+                &row.repo_id,
+                &row.ref_name,
+                &row.old_sha,
+                &row.new_sha,
+            ]);
+            state
+                .db
+                .insert_pending_ref_transition_for_test(&row)
+                .await
+                .unwrap();
+        }
+
+        // Drain with the production limits. Two passes of 1000 each
+        // cover all 1500 rows; the third pass would be empty and
+        // exits the loop early on the `n < per_pass_limit` check.
+        let total = drain_pending_ref_transitions_all(
+            state.clone(),
+            DRAIN_PER_PASS_LIMIT,
+            DRAIN_MAX_PASSES,
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, N, "drain processed the full backlog");
+
+        // No `applied` rows remain.
+        let after = state
+            .db
+            .list_pending_ref_transitions_applied(10_000)
+            .await
+            .unwrap();
+        assert!(
+            after.is_empty(),
+            "every applied row was processed and deleted"
+        );
+    }
+
+    #[sqlx::test]
+    async fn drain_continues_past_a_failing_row(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        // Seed two `applied` rows, A first so the `ORDER BY applied_at
+        // ASC NULLS LAST, id ASC` query hits A before B. They have
+        // distinct `request_id`s so the deterministic PKs don't
+        // collide.
+        let mut row_a = make_row(
+            "repo-fail-then-pass",
+            "refs/heads/main",
+            &"0".repeat(40),
+            &"a".repeat(40),
+        );
+        row_a.request_id = "req-A".to_string();
+        row_a.id = crate::db::deterministic_id(&[
+            "pending_ref_transition",
+            &row_a.request_id,
+            &row_a.repo_id,
+            &row_a.ref_name,
+            &row_a.old_sha,
+            &row_a.new_sha,
+        ]);
+        let mut row_b = make_row(
+            "repo-fail-then-pass",
+            "refs/heads/main",
+            &"0".repeat(40),
+            &"b".repeat(40),
+        );
+        row_b.request_id = "req-B".to_string();
+        row_b.id = crate::db::deterministic_id(&[
+            "pending_ref_transition",
+            &row_b.request_id,
+            &row_b.repo_id,
+            &row_b.ref_name,
+            &row_b.old_sha,
+            &row_b.new_sha,
+        ]);
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row_a)
+            .await
+            .unwrap();
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row_b)
+            .await
+            .unwrap();
+
+        // Inject a closure that fails for row A and delegates to
+        // `derive_one` for everything else. Row B is processed
+        // normally; row A's failure is logged and the row stays
+        // `applied` for a future retry. The `Fn` bound on the seam
+        // forbids moving the id into the closure, so the closure
+        // clones the id from the outer `row_a_id` local on every
+        // iteration.
+        let row_a_id = row_a.id.clone();
+        let n = drain_pending_ref_transitions_with(state.clone(), 100, |s, r| {
+            let target = row_a_id.clone();
+            async move {
+                if r.id == target {
+                    Err(anyhow::anyhow!("injected derive failure"))
+                } else {
+                    derive_one(&s, &r).await
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "only row B is fully processed and deleted");
+
+        // Row A is still in `applied` (NOT deleted, NOT re-derivable
+        // yet by a future pass that just calls `derive_one` — the
+        // inserted artifacts were never created).
+        let after = state
+            .db
+            .list_pending_ref_transitions_applied(100)
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 1, "row A is still in `applied`");
+        assert_eq!(after[0].id, row_a_id);
+
+        // Row A's artifacts were not created (the closure errored
+        // before any insert ran).
+        let a_push = state
+            .db
+            .count_push_events(&row_a.repo_id, &row_a.new_sha, &row_a.pusher_did)
+            .await
+            .unwrap();
+        assert_eq!(a_push, 0, "row A's push event was not created");
+        let a_anchors = state
+            .db
+            .count_anchor_jobs(
+                &row_a.repo_id,
+                &row_a.ref_name,
+                &row_a.old_sha,
+                &row_a.new_sha,
+            )
+            .await
+            .unwrap();
+        assert_eq!(a_anchors, 0, "row A's anchor job was not created");
+        let a_certs = state
+            .db
+            .list_ref_certificates(&row_a.repo_id, 10)
+            .await
+            .unwrap();
+        // The cert table is per-(repo, ref) with one row. Row B's
+        // drain wrote a cert for this `(repo, ref)`. We need to
+        // check row A's specific cert by its deterministic id —
+        // the row A's `derive_one` never ran, so the row A cert id
+        // must not exist in the table.
+        let a_cert_id = crate::db::ref_cert_id_for(&row_a.request_id, &row_a.ref_name);
+        let a_cert = state.db.get_ref_certificate(&a_cert_id).await.unwrap();
+        assert!(
+            a_cert.is_none(),
+            "row A's specific cert was not created (got {:?})",
+            a_cert.map(|c| c.id)
+        );
+        // The single cert for this `(repo, ref)` is row B's.
+        assert_eq!(a_certs.len(), 1, "row B's cert exists in the table");
+        let b_cert_id = crate::db::ref_cert_id_for(&row_b.request_id, &row_b.ref_name);
+        assert_eq!(a_certs[0].id, b_cert_id, "the only cert is row B's");
+
+        // Row B's other artifacts WERE created (the closure called
+        // the real `derive_one`, which writes the push event and
+        // anchor job for row B).
+        let b_push = state
+            .db
+            .count_push_events(&row_b.repo_id, &row_b.new_sha, &row_b.pusher_did)
+            .await
+            .unwrap();
+        assert_eq!(b_push, 1, "row B's push event was created");
+        let b_anchors = state
+            .db
+            .count_anchor_jobs(
+                &row_b.repo_id,
+                &row_b.ref_name,
+                &row_b.old_sha,
+                &row_b.new_sha,
+            )
+            .await
+            .unwrap();
+        assert_eq!(b_anchors, 1, "row B's anchor job was created");
+    }
+
+    // ----- P2-B multi-ref push event cardinality test -----
+    //
+    // The live handler and the recovery drain must produce the same
+    // push event id for a multi-ref push. The id is keyed on
+    // `(request_id, first_ref_name)` where `first_ref_name` is the
+    // first ref in the live push. Every row of the same `request_id`
+    // carries the same `first_ref_name`, so the recovery drain
+    // produces N identical push event ids for an N-ref push, and
+    // `ON CONFLICT (id) DO NOTHING` collapses them to a single row.
+    //
+    // Certs stay per-ref (one per `(repo, ref)` transition); anchor
+    // jobs stay per-transition (one per `(repo, ref, old, new)` tuple).
+    // The push event is the only artifact that is request-scoped.
+
+    #[sqlx::test]
+    async fn multi_ref_push_produces_exactly_one_event_across_live_and_recovery(
+        pool: sqlx::PgPool,
+    ) {
+        let state = crate::test_support::test_state(pool).await;
+
+        // Three rows for the SAME `request_id`, distinct `ref_name`s.
+        // All three share `first_ref_name = "refs/heads/main"` (the
+        // first ref in the simulated push). The `new_sha` is the
+        // same across all three because this models a push that
+        // advanced a tip commit onto three refs at once (a common
+        // case for `git push --all` or for a single-commit push to
+        // multiple branches).
+        let shared_new_sha = "c".repeat(40);
+        let ref_names = [
+            "refs/heads/main",
+            "refs/heads/feature-a",
+            "refs/heads/feature-b",
+        ];
+        for (i, ref_name) in ref_names.iter().enumerate() {
+            let mut row = make_row("repo-multi", ref_name, &"0".repeat(40), &shared_new_sha);
+            row.request_id = "req-multi".to_string();
+            row.first_ref_name = "refs/heads/main".to_string();
+            row.id = crate::db::deterministic_id(&[
+                "pending_ref_transition",
+                &row.request_id,
+                &row.repo_id,
+                &row.ref_name,
+                &row.old_sha,
+                &row.new_sha,
+            ]);
+            // Vary `old_sha` per row so the anchor job PKs (which
+            // hash `old_sha`) don't collide.
+            row.old_sha = format!("{:040x}", (i + 1) as u64);
+            row.id = crate::db::deterministic_id(&[
+                "pending_ref_transition",
+                &row.request_id,
+                &row.repo_id,
+                &row.ref_name,
+                &row.old_sha,
+                &row.new_sha,
+            ]);
+            state
+                .db
+                .insert_pending_ref_transition_for_test(&row)
+                .await
+                .unwrap();
+        }
+
+        // Drain all three rows.
+        let n = drain_pending_ref_transitions(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(n, 3, "all three rows re-derived");
+
+        // Exactly one push event row, keyed on the deterministic
+        // (request_id, first_ref_name) id. The three rows collapsed
+        // to a single event via `ON CONFLICT (id) DO NOTHING` in
+        // `record_push_with_id`.
+        let push_count = state.db.get_push_count("did:key:z6pusher").await.unwrap();
+        assert_eq!(
+            push_count, 1,
+            "exactly one push event for a multi-ref push (trust-score predicate)"
+        );
+        let events = state
+            .db
+            .count_push_events("repo-multi", &shared_new_sha, "did:key:z6pusher")
+            .await
+            .unwrap();
+        assert_eq!(events, 1, "exactly one push_events row");
+
+        // The deterministic id is the one the live path would have
+        // written.
+        let expected_id = crate::db::push_event_id_for("req-multi", "refs/heads/main");
+        // We don't have a direct "select by id" for push_events; the
+        // count of 1 already proves the cardinality. Assert the id
+        // is stable for completeness.
+        assert_eq!(
+            expected_id,
+            crate::db::push_event_id_for("req-multi", "refs/heads/main"),
+            "push_event_id_for is deterministic"
+        );
+
+        // Certs: one per ref (the cert contract is per-ref, NOT
+        // collapsed by first_ref_name). Three rows → three certs.
+        let certs = state
+            .db
+            .list_ref_certificates("repo-multi", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            certs.len(),
+            3,
+            "one cert per ref transition (not collapsed by first_ref_name)"
+        );
+
+        // Anchor jobs: one per `(repo, ref, old, new)` transition.
+        // Three rows → three anchor jobs.
+        for (i, ref_name) in ref_names.iter().enumerate() {
+            let n = state
+                .db
+                .count_anchor_jobs(
+                    "repo-multi",
+                    ref_name,
+                    &format!("{:040x}", (i + 1) as u64),
+                    &shared_new_sha,
+                )
+                .await
+                .unwrap();
+            assert_eq!(n, 1, "one anchor job per transition");
+        }
     }
 }

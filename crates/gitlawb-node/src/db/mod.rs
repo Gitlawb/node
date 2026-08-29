@@ -200,6 +200,20 @@ pub struct PendingRefTransition {
     pub created_at: String,
     pub applied_at: Option<String>,
     pub cancelled_at: Option<String>,
+    /// The first ref name in the live push's `ref_updates`, persisted on
+    /// every row so the recovery drain can reproduce the live path's
+    /// "one push event per push, keyed on the first ref" cardinality. A
+    /// multi-ref push writes N rows; the recovery drain must NOT emit N
+    /// push events (one per `ref_name`), which would inflate
+    /// `get_push_count` and the trust score. The cert and anchor ids
+    /// stay per-ref / per-transition — only the push event id is
+    /// request-scoped.
+    ///
+    /// Migration v28 added this column with `NOT NULL DEFAULT ''` and a
+    /// backfill `UPDATE` that copies `ref_name` into `first_ref_name`
+    /// for every historic row. The live handler now passes the request's
+    /// actual first ref name explicitly.
+    pub first_ref_name: String,
 }
 
 /// #26 Split PR 1 — anchor handoff row, owned by PR 1, consumed by PR 2.
@@ -1327,6 +1341,31 @@ const MIGRATIONS: &[Migration] = &[
             )"#,
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_anchor_jobs_repo_ref_transition ON anchor_jobs (repo_id, ref_name, old_sha, new_sha)",
             "CREATE INDEX IF NOT EXISTS idx_anchor_jobs_claimed_at ON anchor_jobs (claimed_at, id)",
+        ],
+    },
+    Migration {
+        version: 28,
+        name: "pending_ref_transitions_add_first_ref_name",
+        stmts: &[
+            // #26 Split PR 1 P2-B: the recovery drain must reproduce the
+            // live path's push event cardinality, which is "one push event
+            // per push, keyed on the first ref name". Without a persisted
+            // `first_ref_name` column, the drain would key each outbox
+            // row on its own `ref_name` and emit N push events for an
+            // N-ref push, over-counting `get_push_count` and inflating
+            // the trust score.
+            //
+            // The `NOT NULL DEFAULT ''` is required to add a NOT NULL
+            // column to a non-empty table in a single ALTER; a follow-up
+            // UPDATE backfills the value to `ref_name` for every
+            // historic row. Old rows in `applied` state that the drain
+            // processes will produce one push event per row (the
+            // pre-fix cardinality) — an accepted upgrade-window quirk
+            // with no historic state to regress. New rows written by
+            // the live handler always carry the request's actual
+            // `first_ref_name`.
+            "ALTER TABLE pending_ref_transitions ADD COLUMN IF NOT EXISTS first_ref_name TEXT NOT NULL DEFAULT ''",
+            "UPDATE pending_ref_transitions SET first_ref_name = ref_name WHERE first_ref_name = ''",
         ],
     },
 ];
@@ -2606,6 +2645,13 @@ impl Db {
     /// `require_signature` middleware injected). `signature_header` and
     /// `signature_input` are the raw RFC 9421 header values, persisted
     /// for audit; they were already verified at handler entry.
+    ///
+    /// `first_ref_name` is the FIRST ref name in the live push's
+    /// `ref_updates`. It is persisted on every row of the same
+    /// `request_id` so the recovery drain can reproduce the live
+    /// path's "one push event per push, keyed on the first ref"
+    /// cardinality. The caller computes it from `ref_updates` once and
+    /// passes the same value for every row.
     #[allow(dead_code, clippy::too_many_arguments)] // wired by the handler refactor in the next slice
     pub async fn insert_pending_ref_transitions(
         &self,
@@ -2617,6 +2663,7 @@ impl Db {
         signature_header: &str,
         signature_input: &str,
         content_digest: &str,
+        first_ref_name: &str,
     ) -> Result<Vec<PendingRefTransition>> {
         let now = Utc::now().to_rfc3339();
         let mut out = Vec::with_capacity(ref_updates.len());
@@ -2632,8 +2679,9 @@ impl Db {
             sqlx::query(
                 r#"INSERT INTO pending_ref_transitions
                    (id, request_id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did,
-                    signature_header, signature_input, content_digest, state, created_at)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)"#,
+                    signature_header, signature_input, content_digest, state, created_at,
+                    first_ref_name)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"#,
             )
             .bind(&id)
             .bind(request_id)
@@ -2648,6 +2696,7 @@ impl Db {
             .bind(content_digest)
             .bind(pending_state::PREPARED)
             .bind(&now)
+            .bind(first_ref_name)
             .execute(&self.pool)
             .await?;
             out.push(PendingRefTransition {
@@ -2666,6 +2715,7 @@ impl Db {
                 created_at: now.clone(),
                 applied_at: None,
                 cancelled_at: None,
+                first_ref_name: first_ref_name.to_string(),
             });
         }
         Ok(out)
@@ -2727,7 +2777,7 @@ impl Db {
         let rows = sqlx::query(
             r#"SELECT id, request_id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did,
                        signature_header, signature_input, content_digest, state, created_at,
-                       applied_at, cancelled_at
+                       applied_at, cancelled_at, first_ref_name
                FROM pending_ref_transitions
                WHERE state = $1
                ORDER BY applied_at ASC NULLS LAST, id ASC
@@ -2741,6 +2791,69 @@ impl Db {
             .into_iter()
             .map(row_to_pending_ref_transition)
             .collect())
+    }
+
+    /// Return every `prepared` row, oldest first. The startup
+    /// `reconcile_prepared_from_disk` step enumerates these, checks
+    /// each row's `new_sha` against the on-disk ref via
+    /// `git::store::list_refs`, and promotes the rows whose target
+    /// actually landed to `applied`. Rows that did NOT land (ref
+    /// rejected by receive_pack, or a `mark_applied` error stranded
+    /// the row in `prepared` with the ref still on the old SHA) stay
+    /// in `prepared`.
+    #[allow(dead_code)] // wired by the startup reconcile
+    pub async fn list_pending_ref_transitions_prepared(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<PendingRefTransition>> {
+        let limit = limit.max(1);
+        let rows = sqlx::query(
+            r#"SELECT id, request_id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did,
+                       signature_header, signature_input, content_digest, state, created_at,
+                       applied_at, cancelled_at, first_ref_name
+               FROM pending_ref_transitions
+               WHERE state = $1
+               ORDER BY created_at ASC, id ASC
+               LIMIT $2"#,
+        )
+        .bind(pending_state::PREPARED)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(row_to_pending_ref_transition)
+            .collect())
+    }
+
+    /// Flip a set of `prepared` rows to `applied`. Called by the startup
+    /// reconcile step after the on-disk SHA matches each row's
+    /// `new_sha`. The `state = 'prepared'` guard is the second
+    /// barrier against re-promoting a row that was cancelled by
+    /// another path while the reconcile was in flight; only rows that
+    /// were still `prepared` at the moment the UPDATE runs are
+    /// flipped.
+    #[allow(dead_code)] // wired by the startup reconcile
+    pub async fn mark_pending_ref_transitions_applied_for_rows(
+        &self,
+        ids: &[String],
+    ) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let now = Utc::now().to_rfc3339();
+        let res = sqlx::query(
+            r#"UPDATE pending_ref_transitions
+               SET state = $1, applied_at = $2
+               WHERE id = ANY($3) AND state = $4"#,
+        )
+        .bind(pending_state::APPLIED)
+        .bind(&now)
+        .bind(ids)
+        .bind(pending_state::PREPARED)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
     }
 
     /// Delete a row by id. Called by the recovery drain AFTER the push
@@ -2783,8 +2896,8 @@ impl Db {
             r#"INSERT INTO pending_ref_transitions
                (id, request_id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did,
                 signature_header, signature_input, content_digest, state, created_at,
-                applied_at, cancelled_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"#,
+                applied_at, cancelled_at, first_ref_name)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)"#,
         )
         .bind(&row.id)
         .bind(&row.request_id)
@@ -2801,6 +2914,7 @@ impl Db {
         .bind(&row.created_at)
         .bind(applied_at_opt)
         .bind(cancelled_at_opt)
+        .bind(&row.first_ref_name)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -4538,6 +4652,7 @@ fn row_to_pending_ref_transition(r: sqlx::postgres::PgRow) -> PendingRefTransiti
         created_at: r.get("created_at"),
         applied_at: r.get("applied_at"),
         cancelled_at: r.get("cancelled_at"),
+        first_ref_name: r.get("first_ref_name"),
     }
 }
 
@@ -7307,6 +7422,114 @@ mod ref_certificate_tests {
         );
     }
 
+    /// P1-B: the live handler routes cert issuance through
+    /// `cert::issue_ref_certificate` (the upsert, NOT
+    /// `insert_ref_certificate_idempotent`'s DO NOTHING). This test
+    /// exercises the full `cert::issue_ref_certificate` call path
+    /// end-to-end through the `AppState`, asserting that:
+    ///
+    /// - a re-push to the same `(repo_id, ref_name)` updates
+    ///   `old_sha` / `new_sha` / `pusher_did` / `issued_at` /
+    ///   `signature` to the new transition's values,
+    /// - the deterministic `cert_id` (derived from
+    ///   `ref_cert_id_for(request_id, ref_name)`) is preserved
+    ///   across the re-push, and
+    /// - exactly one cert row exists for the ref after the
+    ///   re-push.
+    ///
+    /// This pins the live-handler contract that the previous
+    /// `issue_ref_certificate_idempotent` call violated. The DB-level
+    /// `insert_ref_certificate_upserts_on_repo_ref` test pins the
+    /// underlying upsert SQL; this test pins the live-handler wrapper.
+    #[sqlx::test]
+    async fn issue_ref_certificate_upserts_on_repo_ref_via_live_path(pool: PgPool) {
+        use crate::cert;
+        use crate::db::ref_cert_id_for;
+
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let repo_id = uuid::Uuid::new_v4().to_string();
+        state
+            .db
+            .create_repo(&RepoRecord {
+                id: repo_id.clone(),
+                name: "cert-upsert-live".into(),
+                owner_did: "did:key:zOWNER".into(),
+                description: None,
+                is_public: true,
+                default_branch: "main".into(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                disk_path: "/tmp/cert-upsert-live".into(),
+                forked_from: None,
+                machine_id: None,
+            })
+            .await
+            .unwrap();
+
+        // First push: 0000 -> 1111, pusher A.
+        let c1 = cert::issue_ref_certificate(
+            &state,
+            &repo_id,
+            "refs/heads/main",
+            "0000",
+            "1111",
+            "did:key:zFirstPusher",
+            &ref_cert_id_for("req-A", "refs/heads/main"),
+        )
+        .await
+        .unwrap();
+
+        // Sleep 1ms so the second push's `issued_at` is strictly
+        // greater than the first. `build_ref_certificate` stamps
+        // `issued_at = Utc::now()`, and the upsert's per-column
+        // guard `EXCLUDED.issued_at > ref_certificates.issued_at`
+        // only updates on strictly-newer timestamps.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+        // Second push: aaaa -> bbbb, pusher B, SAME deterministic
+        // cert id (same `request_id` and `ref_name`).
+        let c2 = cert::issue_ref_certificate(
+            &state,
+            &repo_id,
+            "refs/heads/main",
+            "aaaa",
+            "bbbb",
+            "did:key:zSecondPusher",
+            &ref_cert_id_for("req-A", "refs/heads/main"),
+        )
+        .await
+        .unwrap();
+
+        // The deterministic id is preserved across the re-push.
+        assert_eq!(c1.id, c2.id, "cert id is preserved across re-push");
+        assert_eq!(
+            c1.id,
+            ref_cert_id_for("req-A", "refs/heads/main"),
+            "cert id is the deterministic (request_id, ref_name) hash"
+        );
+
+        // The upsert updated every other field to the second push.
+        assert_eq!(c1.new_sha, "1111", "first push's new_sha");
+        assert_eq!(c2.new_sha, "bbbb", "re-push updates new_sha");
+        assert_eq!(c1.pusher_did, "did:key:zFirstPusher");
+        assert_eq!(c2.pusher_did, "did:key:zSecondPusher");
+        assert_ne!(
+            c1.issued_at, c2.issued_at,
+            "issued_at advances on a re-push"
+        );
+        assert_ne!(c1.signature, c2.signature, "signature is re-signed");
+
+        // Exactly one row in the table for the ref.
+        let certs = state.db.list_ref_certificates(&repo_id, 10).await.unwrap();
+        assert_eq!(certs.len(), 1, "exactly one cert row per ref");
+        assert_eq!(certs[0].id, c1.id, "the original id survives");
+        assert_eq!(certs[0].new_sha, "bbbb", "row reflects the latest push");
+        assert_eq!(
+            certs[0].pusher_did, "did:key:zSecondPusher",
+            "row reflects the latest pusher"
+        );
+    }
+
     #[sqlx::test]
     async fn list_ref_certificates_clamps_negative_limit(pool: PgPool) {
         let db = db(pool).await;
@@ -9210,6 +9433,7 @@ mod pending_ref_transition_tests {
                 "Signature: sig=...",
                 "Signature-Input: ...",
                 "Content-Digest: ...",
+                "refs/heads/main",
             )
             .await
             .unwrap();
@@ -9254,6 +9478,7 @@ mod pending_ref_transition_tests {
             "Signature: sig=...",
             "Signature-Input: ...",
             "Content-Digest: ...",
+            "refs/heads/main",
         )
         .await
         .unwrap();
@@ -9294,6 +9519,7 @@ mod pending_ref_transition_tests {
             "Signature: sig=...",
             "Signature-Input: ...",
             "Content-Digest: ...",
+            "refs/heads/main",
         )
         .await
         .unwrap();
@@ -9330,6 +9556,7 @@ mod pending_ref_transition_tests {
             "Signature: sig=...",
             "Signature-Input: ...",
             "Content-Digest: ...",
+            "refs/heads/main",
         )
         .await
         .unwrap();
@@ -9376,6 +9603,11 @@ mod pending_ref_transition_tests {
             created_at: now.clone(),
             applied_at: Some(now.clone()),
             cancelled_at: None,
+            // Single-ref test, so the request's first ref name is the
+            // same as the ref name. The new multi-ref test sets this
+            // explicitly to the request's actual first ref across all
+            // rows of the same `request_id`.
+            first_ref_name: "refs/heads/main".to_string(),
         };
         db.insert_pending_ref_transition_for_test(&row)
             .await
@@ -9476,6 +9708,7 @@ mod pending_ref_transition_tests {
             "Signature: sig=...",
             "Signature-Input: ...",
             "Content-Digest: ...",
+            "refs/heads/main",
         )
         .await
         .unwrap();

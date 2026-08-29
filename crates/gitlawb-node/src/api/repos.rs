@@ -2279,6 +2279,20 @@ pub async fn git_receive_pack(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    // The first ref name is hoisted here so it is the SAME value
+    // persisted on every `pending_ref_transitions` row of this request
+    // (request-scoped) AND the SAME value used to derive the push event
+    // id below. The recovery drain reads `first_ref_name` from each row
+    // and keys `push_event_id_for` on it, so the live and recovery
+    // paths produce the same id and the ON CONFLICT (id) DO NOTHING in
+    // `record_push_with_id` collapses a live push followed by a recovery
+    // pass into a single push event row. An empty `ref_updates` is
+    // defensive: receive-pack on a push with no refs would have already
+    // been rejected upstream, so this branch is unreachable in practice.
+    let first_ref_name = ref_updates
+        .first()
+        .map(|u| u.ref_name.clone())
+        .unwrap_or_default();
     if let Err(e) = state
         .db
         .insert_pending_ref_transitions(
@@ -2290,6 +2304,7 @@ pub async fn git_receive_pack(
             &signature_header,
             &signature_input,
             &content_digest,
+            &first_ref_name,
         )
         .await
     {
@@ -2464,11 +2479,12 @@ pub async fn git_receive_pack(
         // The push event is keyed on the FIRST ref's name so a
         // multi-ref push collapses to one push event row, not N. The
         // deterministic id is the same one the recovery drain
-        // derives.
-        let first_ref_name = ref_updates
-            .first()
-            .map(|u| u.ref_name.clone())
-            .unwrap_or_else(|| "refs/heads/main".to_string());
+        // derives, because the drain reads `first_ref_name` from the
+        // outbox row (persisted above on every row of this request) and
+        // uses it in the same `push_event_id_for` call. The outer
+        // `first_ref_name` local was hoisted above the
+        // `insert_pending_ref_transitions` call so this id matches
+        // the persisted value exactly.
         let push_event_id = crate::db::push_event_id_for(&request_id, &first_ref_name);
         let _ = state
             .db
@@ -2484,9 +2500,25 @@ pub async fn git_receive_pack(
         // Issue a signed certificate for every ref this push advanced, each
         // carrying that ref's real old→new transition. A multi-ref push must
         // not collapse to a single cert covering only the first ref.
+        //
+        // P1-B: this routes through `issue_ref_certificate` (the
+        // upsert, `ON CONFLICT (repo_id, ref_name) DO UPDATE`) so a
+        // re-push to the same ref updates the row's
+        // `old_sha` / `new_sha` / `pusher_did` / `issued_at` /
+        // `signature` to the new transition while preserving the
+        // original `id` (the `insert_ref_certificate` upsert's
+        // `EXCLUDED.issued_at > ref_certificates.issued_at` guard).
+        // The previous `issue_ref_certificate_idempotent` call
+        // (DO NOTHING) left the first cert's fields frozen on every
+        // later push. The deterministic `cert_id` makes a recovery
+        // re-pass safe: the recovery's `insert_ref_certificate_idempotent`
+        // (DO NOTHING) is a no-op when the live handler has already
+        // written a row, and the live handler's upsert preserves the
+        // original `id` so the deterministic id survives across the
+        // push / recovery / re-push cycle.
         for update in &ref_updates {
             let cert_id = crate::db::ref_cert_id_for(&request_id, &update.ref_name);
-            match cert::issue_ref_certificate_idempotent(
+            match cert::issue_ref_certificate(
                 &state,
                 &record.id,
                 &update.ref_name,
@@ -2497,11 +2529,8 @@ pub async fn git_receive_pack(
             )
             .await
             {
-                Ok(Some(c)) => {
+                Ok(c) => {
                     tracing::info!(cert_id = %c.id, repo = %record.name, ref_name = %update.ref_name, pusher = %did, "issued ref certificate")
-                }
-                Ok(None) => {
-                    tracing::debug!(ref_name = %update.ref_name, repo = %record.name, "ref certificate already exists for this ref, idempotent skip")
                 }
                 Err(e) => {
                     tracing::warn!(err = %e, ref_name = %update.ref_name, "failed to issue ref certificate")

@@ -683,7 +683,34 @@ async fn main() -> Result<()> {
     // pushes, so a recovery re-derivation does not race a fresh push.
     // Non-fatal: a transient drain failure is logged and the rows
     // remain `applied` for the next startup to pick up.
-    match durable_outbox::drain_pending_ref_transitions(state.clone(), 1000).await {
+    //
+    // P1-A: the reconcile step runs FIRST and promotes any `prepared`
+    // row whose target SHA actually landed on disk. This is the path
+    // that recovers a ref when the post-receive
+    // `mark_pending_ref_transitions_applied` call errored or was
+    // interrupted after `receive_pack` returned Ok. Without this
+    // step, the drain (gated on `state = 'applied'`) would never see
+    // those rows.
+    match durable_outbox::reconcile_prepared_from_disk(
+        state.clone(),
+        durable_outbox::DRAIN_PER_PASS_LIMIT,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(n, "reconciled prepared -> applied via on-disk ref match"),
+        Err(e) => warn!(
+            err = %e,
+            "pending ref transition reconcile failed at startup (non-fatal; will retry on next start)"
+        ),
+    }
+    match durable_outbox::drain_pending_ref_transitions_all(
+        state.clone(),
+        durable_outbox::DRAIN_PER_PASS_LIMIT,
+        durable_outbox::DRAIN_MAX_PASSES,
+    )
+    .await
+    {
         Ok(0) => {}
         Ok(n) => info!(n, "drained pending ref transitions from prior run"),
         Err(e) => warn!(
