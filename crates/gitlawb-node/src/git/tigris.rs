@@ -230,7 +230,7 @@ impl TigrisClient {
         &self,
         owner_slug: &str,
         repo_name: &str,
-        local_path: &Path,
+        local_path: &super::repo_store::ValidatedRepoDiskPath,
         swap_authority: Option<Arc<AtomicBool>>,
     ) -> Result<()> {
         self.download_to(owner_slug, repo_name, local_path, true, swap_authority)
@@ -250,12 +250,12 @@ impl TigrisClient {
         &self,
         owner_slug: &str,
         repo_name: &str,
-        target: &Path,
+        target: &super::repo_store::ValidatedRepoDiskPath,
         publish: bool,
         swap_authority: Option<Arc<AtomicBool>>,
     ) -> Result<DownloadExtract> {
         let key = Self::repo_key(owner_slug, repo_name);
-        debug!(key = %key, path = %target.display(), "downloading repo from tigris");
+        debug!(key = %key, path = %target.as_path().display(), "downloading repo from tigris");
 
         let resp = self
             .s3
@@ -293,13 +293,13 @@ impl TigrisClient {
 
         // Extract tar.zst to a directory.
         let extracted = tokio::task::spawn_blocking({
-            let target = target.to_path_buf();
+            let target = target.clone();
             let snapshot_tmp = snapshot_tmp.clone();
             move || -> Result<DownloadExtract> {
                 let result = (|| -> Result<DownloadExtract> {
                     if publish {
                         decompress_repo(&data, &target, swap_authority.as_ref())?;
-                        return Ok(DownloadExtract::Published(target));
+                        return Ok(DownloadExtract::Published(()));
                     }
                     // Non-mutating snapshot: unpack into the temp dir decided above.
                     // The live repo path is never touched.
@@ -324,7 +324,7 @@ impl TigrisClient {
         .context("extract task panicked")?
         .context("extracting repo")?;
 
-        info!(key = %key, path = %target.display(), "downloaded repo from tigris");
+        info!(key = %key, path = %target.as_path().display(), "downloaded repo from tigris");
         Ok(extracted)
     }
 
@@ -382,10 +382,6 @@ pub(crate) struct TempSnapshotDir {
 }
 
 impl TempSnapshotDir {
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-
     pub(crate) fn into_repo_snapshot(self) -> super::repo_store::RepoSnapshot {
         let path = self.path.clone();
         std::mem::forget(self);
@@ -402,7 +398,7 @@ impl Drop for TempSnapshotDir {
 /// What [`TigrisClient::download_to`] produced.
 pub enum DownloadExtract {
     /// Published into the validated live repo path.
-    Published(PathBuf),
+    Published(()),
     /// Unpacked into a throwaway temp dir that cleans up on drop until adopted.
     Snapshot(TempSnapshotDir),
 }
@@ -416,13 +412,14 @@ pub enum DownloadExtract {
 /// leave `local_path` exactly as it was.
 fn decompress_repo(
     data: &[u8],
-    local_path: &Path,
+    local_path: &super::repo_store::ValidatedRepoDiskPath,
     swap_authority: Option<&Arc<AtomicBool>>,
 ) -> Result<()> {
-    let parent = local_path.parent().context("repo path has no parent")?;
+    let live = local_path.as_path();
+    let parent = live.parent().context("repo path has no parent")?;
     std::fs::create_dir_all(parent).context("creating parent dir")?;
 
-    let file_name = local_path
+    let file_name = live
         .file_name()
         .context("repo path has no file name")?
         .to_string_lossy();

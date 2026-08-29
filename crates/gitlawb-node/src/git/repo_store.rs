@@ -194,7 +194,7 @@ impl RepoStore {
                     });
                 }
             }
-            return Ok(local_path);
+            return Ok(local_path.into_path_buf());
         }
 
         // Try downloading from Tigris
@@ -210,13 +210,13 @@ impl RepoStore {
                     .lock()
                     .await
                     .insert(format!("{owner_slug}/{repo_name}"));
-                return Ok(local_path);
+                return Ok(local_path.into_path_buf());
             }
         }
 
         // Not found anywhere — return path anyway; caller will get a meaningful
         // error from git when the path doesn't exist.
-        Ok(local_path)
+        Ok(local_path.into_path_buf())
     }
 
     /// Non-mutating snapshot of a repo's **latest** Tigris state, for reads that
@@ -256,7 +256,9 @@ impl RepoStore {
                             ))
                         })?;
                     return match snapshot {
-                        super::tigris::DownloadExtract::Snapshot(dir) => Ok(dir.into_repo_snapshot()),
+                        super::tigris::DownloadExtract::Snapshot(dir) => {
+                            Ok(dir.into_repo_snapshot())
+                        }
                         super::tigris::DownloadExtract::Published(_) => {
                             unreachable!("snapshot downloads never publish into the live path")
                         }
@@ -275,7 +277,7 @@ impl RepoStore {
 
         // Tigris disabled or repo not in Tigris — fall back to local.
         Ok(RepoSnapshot {
-            path: local_path,
+            path: local_path.into_path_buf(),
             owned: false,
         })
     }
@@ -651,7 +653,7 @@ impl RepoStore {
             });
         }
 
-        Ok(local_path)
+        Ok(local_path.into_path_buf())
     }
 
     /// Upload a repo to Tigris after a write operation (push, merge, fork, etc.).
@@ -710,7 +712,11 @@ impl RepoStore {
     ///      (or the prefix/root from `repos_dir`); any `ParentDir`/`CurDir`
     ///      segment is rejected. This is the CodeQL-recognised barrier
     ///      pattern for `rust/path-injection`.
-    fn local_path(&self, owner_did: &str, repo_name: &str) -> Result<(String, PathBuf)> {
+    fn local_path(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+    ) -> Result<(String, ValidatedRepoDiskPath)> {
         let owner_slug = owner_did.replace([':', '/'], "_");
         let local_path = validated_repo_disk_path(&self.repos_dir, owner_did, repo_name)?;
         Ok((owner_slug, local_path))
@@ -789,6 +795,38 @@ async fn retry_fork_archive_delete(tigris: &TigrisClient, owner_slug: &str, repo
     }
 }
 
+/// A repository disk path that has passed the three-layer validation barrier.
+///
+/// Only [`validated_repo_disk_path`] may construct this type, so sinks such as
+/// `remove_dir_all` / `rename` can take it and static analysers can treat it as
+/// sanitised input (CodeQL `rust/path-injection`).
+#[derive(Debug, Clone)]
+pub(crate) struct ValidatedRepoDiskPath(PathBuf);
+
+impl ValidatedRepoDiskPath {
+    pub(crate) fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    pub(crate) fn into_path_buf(self) -> PathBuf {
+        self.0
+    }
+}
+
+impl std::ops::Deref for ValidatedRepoDiskPath {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for ValidatedRepoDiskPath {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
 /// The three-layer validated form of `store::repo_disk_path`, with NO Tigris fetch and
 /// no `RepoStore` (#173 round 11, F3). Extracted from `RepoStore::local_path` so a
 /// second caller that must not pull a cold repo gets the same barrier instead of the
@@ -797,10 +835,11 @@ pub(crate) fn validated_repo_disk_path(
     repos_dir: &Path,
     owner_did: &str,
     repo_name: &str,
-) -> Result<PathBuf> {
+) -> Result<ValidatedRepoDiskPath> {
     validate_path_components(owner_did, repo_name)?;
 
-    let local_path = store::repo_disk_path(repos_dir, owner_did, repo_name);
+    let owner_slug = owner_did.replace([':', '/'], "_");
+    let local_path = repos_dir.join(&owner_slug).join(format!("{repo_name}.git"));
 
     if !local_path.starts_with(repos_dir) {
         anyhow::bail!(
@@ -809,6 +848,10 @@ pub(crate) fn validated_repo_disk_path(
         );
     }
 
+    // Explicit component walk, sanitisation barrier that static analysers
+    // (CodeQL `rust/path-injection`) recognise. The path must be composed entirely
+    // of Normal segments after the root prefix; any ParentDir or CurDir component
+    // is a traversal attempt.
     for component in local_path.components() {
         use std::path::Component;
         match component {
@@ -822,7 +865,7 @@ pub(crate) fn validated_repo_disk_path(
         }
     }
 
-    Ok(local_path)
+    Ok(ValidatedRepoDiskPath(local_path))
 }
 
 /// Revoke an in-flight publish swap. Any worker that has not yet claimed the
@@ -844,11 +887,12 @@ pub(crate) fn try_claim_swap_commit(authority: &AtomicBool) -> bool {
 /// the path returned from [`validated_repo_disk_path`]; this is the CodeQL barrier
 /// for `rust/path-injection` on the remove/rename sink.
 pub(crate) fn swap_extracted_into_validated_repo(
-    validated_path: &Path,
+    validated_path: &ValidatedRepoDiskPath,
     tmp_dir: &Path,
     swap_authority: Option<&Arc<AtomicBool>>,
 ) -> Result<()> {
-    let lock = super::tigris::publish_lock(validated_path);
+    let live = validated_path.as_path();
+    let lock = super::tigris::publish_lock(live);
     let _publish = lock.lock().expect("publish lock poisoned");
     if let Some(authority) = swap_authority {
         if !try_claim_swap_commit(authority) {
@@ -856,10 +900,10 @@ pub(crate) fn swap_extracted_into_validated_repo(
             anyhow::bail!("publish swap revoked after lock ownership ended");
         }
     }
-    if validated_path.exists() {
-        std::fs::remove_dir_all(validated_path).context("removing stale repo dir")?;
+    if live.exists() {
+        std::fs::remove_dir_all(live).context("removing stale repo dir")?;
     }
-    std::fs::rename(tmp_dir, validated_path).context("swapping extracted repo into place")?;
+    std::fs::rename(tmp_dir, live).context("swapping extracted repo into place")?;
     Ok(())
 }
 
@@ -1189,7 +1233,7 @@ impl Drop for RepoSnapshot {
 pub struct RepoWriteGuard {
     owner_slug: String,
     repo_name: String,
-    pub local_path: PathBuf,
+    pub local_path: ValidatedRepoDiskPath,
     lock_key: i64,
     /// The connection that TOOK the lock. Postgres advisory locks are
     /// session-scoped, so only this session can release it; holding it here is
@@ -1238,7 +1282,7 @@ impl RepoWriteGuard {
 
     /// Path to the bare repo on local disk.
     pub fn path(&self) -> &Path {
-        &self.local_path
+        self.local_path.as_path()
     }
 
     /// Publish the tree this guard wrote, fenced on the generation observed
@@ -2771,7 +2815,7 @@ mod tests {
         let guard = RepoWriteGuard {
             owner_slug: slug,
             repo_name: name.to_string(),
-            local_path: dir.path().to_path_buf(),
+            local_path: validated_repo_disk_path(dir.path(), owner, name).expect("test path"),
             lock_key: key,
             conn: Some(pool.acquire().await.expect("conn")),
             tigris: None,
@@ -3131,11 +3175,13 @@ mod tests {
             pid.0
         };
 
+        let dir = tempfile::TempDir::new().unwrap();
         // A guard whose key was never locked: release()'s unlock returns false.
         let guard = RepoWriteGuard {
             owner_slug: "did_key_z6MkU5".to_string(),
             repo_name: "never-locked".to_string(),
-            local_path: PathBuf::from("/tmp/gitlawb-u5"),
+            local_path: validated_repo_disk_path(dir.path(), "did:key:z6MkU5", "never-locked")
+                .expect("test path"),
             lock_key: 995_001,
             conn: Some(lock_pool.acquire().await.unwrap()),
             tigris: None,
@@ -3705,8 +3751,9 @@ mod tests {
             .await
             .expect("snapshot reads the archive");
         let snap_path = snap.path().to_path_buf();
+        let live_path_buf = live_path.as_path().to_path_buf();
         assert_ne!(
-            snap_path, live_path,
+            snap_path, live_path_buf,
             "the snapshot must unpack into a temp dir, not the live path"
         );
         assert!(
@@ -4918,12 +4965,14 @@ mod tests {
     /// The marker inside whatever archive is currently stored under the key.
     async fn stored_marker(mock: &S3Mock, owner_slug: &str, repo_name: &str) -> String {
         let out = TempDir::new().unwrap();
-        let into = out.path().join("stored.git");
+        let validated = super::validated_repo_disk_path(out.path(), "did:key:stored", "stored")
+            .expect("test repo path must validate");
         mock_tigris(mock)
-            .download(owner_slug, repo_name, &into, None)
+            .download(owner_slug, repo_name, &validated, None)
             .await
             .expect("the stored archive must be readable");
-        std::fs::read_to_string(into.join("MARKER")).expect("the stored archive must be marked")
+        std::fs::read_to_string(validated.join("MARKER"))
+            .expect("the stored archive must be marked")
     }
 
     /// A process-wide sink for warn-level tracing output, installed once.

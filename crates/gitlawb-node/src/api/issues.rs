@@ -1105,7 +1105,8 @@ mod lock_pool_shed_tests {
         let owner = "did:key:zCLOSERATEOWNERAAAAAAAAAAAAAAAAAAAAAAA";
         let stranger = "did:key:zCLOSERATESTRANGERBBBBBBBBBBBBBBBBBB";
         let mut state = crate::test_support::test_state(pool).await;
-        state.close_issue_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.close_issue_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
 
         let mut repo = seed_repo(owner, "priv-close");
@@ -1114,7 +1115,10 @@ mod lock_pool_shed_tests {
 
         let peer: SocketAddr = "203.0.113.88:7000".parse().unwrap();
         assert!(
-            state.close_issue_rate_limiter.check(&peer.ip().to_string()).await,
+            state
+                .close_issue_rate_limiter
+                .check(&peer.ip().to_string())
+                .await,
             "exhaust the close_issue bucket before close_issue"
         );
 
@@ -1141,7 +1145,8 @@ mod lock_pool_shed_tests {
         use std::time::Duration;
 
         let mut state = crate::test_support::test_state(pool).await;
-        state.close_issue_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.close_issue_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
         state.push_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
 

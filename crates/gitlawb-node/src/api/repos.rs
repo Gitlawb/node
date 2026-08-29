@@ -2375,7 +2375,7 @@ pub async fn git_receive_pack(
     // would return 200 to the pusher before the durable copy lands, which is a larger
     // change to the client contract than the window it closes.
     let push_succeeded = receive_result.is_ok();
-    let publish_durability = Arc::new(tokio::sync::Mutex::new(None));
+    let publish_durability = PublishDurabilitySlot::new();
     if push_succeeded {
         tokio::spawn(post_receive_replication_tail(
             state.clone(),
@@ -2383,7 +2383,7 @@ pub async fn git_receive_pack(
             ref_updates.clone(),
             disk_path.clone(),
             auth.0.to_string(),
-            Some(publish_durability.clone()),
+            Some(publish_durability.arc()),
         ));
     }
 
@@ -2406,7 +2406,7 @@ pub async fn git_receive_pack(
     // node can read.
     let outcome = reclaimed.release(push_succeeded).await;
     if push_succeeded {
-        *publish_durability.lock().await = Some(outcome);
+        publish_durability.record(outcome).await;
     }
     outcome.into_result()?;
     // Clean path: clone (a) already dropped inside run_git_service when the receive-pack
@@ -2525,6 +2525,47 @@ pub async fn git_receive_pack(
 /// the per-repo-coalesced pin/encrypt task, and this push's own Pinata + announce
 /// task. Split out of `git_receive_pack` so the ordering the coalescing gate depends
 /// on is directly testable; the handler spawns it and returns.
+/// Records the release-side publish outcome for the detached post-receive tail.
+/// If the handler future is dropped before [`Self::record`], the drop sets
+/// [`ReleaseOutcome::UploadUnknowable`] so the tail can proceed on local disk
+/// without waiting out the full transfer bound.
+struct PublishDurabilitySlot {
+    inner: Arc<tokio::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>>,
+    recorded: std::sync::atomic::AtomicBool,
+}
+
+impl PublishDurabilitySlot {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(None)),
+            recorded: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn arc(&self) -> Arc<tokio::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>> {
+        Arc::clone(&self.inner)
+    }
+
+    async fn record(&self, outcome: crate::git::repo_store::ReleaseOutcome) {
+        self.recorded
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *self.inner.lock().await = Some(outcome);
+    }
+}
+
+impl Drop for PublishDurabilitySlot {
+    fn drop(&mut self) {
+        if self.recorded.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        if let Ok(mut slot) = self.inner.try_lock() {
+            if slot.is_none() {
+                *slot = Some(crate::git::repo_store::ReleaseOutcome::UploadUnknowable);
+            }
+        }
+    }
+}
+
 async fn publish_durability_confirmed(
     slot: &Option<Arc<tokio::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>>>,
     wait: std::time::Duration,
@@ -2535,12 +2576,19 @@ async fn publish_durability_confirmed(
     let start = std::time::Instant::now();
     loop {
         if let Some(outcome) = *slot.lock().await {
-            return matches!(outcome, crate::git::repo_store::ReleaseOutcome::Released);
+            return matches!(
+                outcome,
+                crate::git::repo_store::ReleaseOutcome::Released
+                    | crate::git::repo_store::ReleaseOutcome::UploadUnknowable
+            );
         }
         if start.elapsed() >= wait {
-            // Handler disconnected during `release` without recording an outcome.
-            // Fail closed: a pending inner `None` is not durability.
-            return false;
+            // No outcome within the release-side transfer bound plus slack: the
+            // handler was dropped mid-release after a successful receive-pack, or
+            // release is stuck past its own deadline. The tail is only spawned on
+            // push success, so local-disk replication work may proceed. Explicit
+            // non-Released outcomes are handled above.
+            return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
@@ -3126,8 +3174,8 @@ pub async fn list_federated_repos(
 struct ForkCloneGuard(Option<PathBuf>);
 
 impl ForkCloneGuard {
-    fn new(path: PathBuf) -> Self {
-        Self(Some(path))
+    fn new(path: crate::git::repo_store::ValidatedRepoDiskPath) -> Self {
+        Self(Some(path.into_path_buf()))
     }
 
     fn path(&self) -> &std::path::Path {
@@ -3291,20 +3339,22 @@ pub async fn fork_repo(
     };
 
     if let Err(e) = state.db.create_repo(&record).await {
-        if let Some(committed) = state.db.get_repo(&forker_short, &fork_name).await? {
+        if let Some(committed) = state.db.get_repo(forker_short, &fork_name).await? {
             clone_guard.disarm();
             tracing::warn!(
                 fork = %fork_name,
                 forker = %forker_did,
                 "fork create_repo returned an error but the row is present — treating as success"
             );
-            return Ok((StatusCode::CREATED, Json(to_response(&committed, &state, 0))));
+            return Ok((
+                StatusCode::CREATED,
+                Json(to_response(&committed, &state, 0)),
+            ));
         }
         clone_guard.disarm();
-        let disk_path_for_compensate = disk_path.clone();
         state
             .repo_store
-            .compensate_fork_archive(&forker_did, &fork_name, &disk_path_for_compensate)
+            .compensate_fork_archive(&forker_did, &fork_name, disk_path.as_path())
             .await;
         return Err(e.into());
     }
@@ -3548,13 +3598,13 @@ mod tests {
     const STRANGER_DID: &str = "did:key:z6Mkffonly5tranger0000000000000000000000000000000";
 
     #[tokio::test]
-    async fn publish_durability_confirmed_fails_closed_when_release_never_records() {
+    async fn publish_durability_confirmed_proceeds_when_release_never_records() {
         let slot = Arc::new(tokio::sync::Mutex::new(None));
         let confirmed =
             publish_durability_confirmed(&Some(slot), std::time::Duration::from_millis(30)).await;
         assert!(
-            !confirmed,
-            "a pending release outcome must not be treated as confirmed durability"
+            confirmed,
+            "an abandoned handler leaves the slot pending; after the bounded wait the tail may proceed on local disk"
         );
     }
 
@@ -3571,6 +3621,14 @@ mod tests {
             crate::git::repo_store::ReleaseOutcome::UploadUnknowable,
         )));
         assert!(
+            publish_durability_confirmed(&Some(slot), std::time::Duration::from_millis(5)).await,
+            "an unknowable upload still landed on local disk, so the tail may proceed"
+        );
+
+        let slot = Arc::new(tokio::sync::Mutex::new(Some(
+            crate::git::repo_store::ReleaseOutcome::UploadFailed,
+        )));
+        assert!(
             !publish_durability_confirmed(&Some(slot), std::time::Duration::from_millis(5)).await
         );
     }
@@ -3578,14 +3636,19 @@ mod tests {
     #[test]
     fn fork_clone_guard_removes_mirror_on_drop() {
         let root = tempfile::TempDir::new().unwrap();
-        let mirror = root.path().join("fork.git");
-        std::fs::create_dir_all(&mirror).unwrap();
+        let validated = crate::git::repo_store::validated_repo_disk_path(
+            root.path(),
+            "did:key:testfork",
+            "fork",
+        )
+        .expect("test fork path must validate");
+        std::fs::create_dir_all(validated.as_path()).unwrap();
         {
-            let _guard = ForkCloneGuard::new(mirror.clone());
-            assert!(mirror.exists());
+            let _guard = ForkCloneGuard::new(validated.clone());
+            assert!(validated.exists());
         }
         assert!(
-            !mirror.exists(),
+            !validated.exists(),
             "dropping the fork clone guard must remove the mirror directory"
         );
     }
