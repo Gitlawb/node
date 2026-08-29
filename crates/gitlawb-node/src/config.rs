@@ -397,15 +397,13 @@ pub struct Config {
     /// error rather than a boot-time panic).
     ///
     /// CONNECTION BUDGET. A push holds a Postgres connection from the node's separate
-    /// advisory-lock pool for the whole receive-pack, and that pool is sized from this
-    /// knob (this value + 8, clamped to 64 in `main.rs`). The node's total ceiling is
-    /// therefore `db_max_connections` (default 48) + the lock pool (default 40), i.e.
-    /// 88 by default, and at most `db_max_connections` + 64. Size BOTH against the
-    /// database server's `max_connections`: `db_max_connections`' own doc predates the
-    /// lock pool and no longer covers most of the node's connections. The +8 headroom
-    /// is shared with the three non-push `acquire_write` callers (`api/issues.rs` x2,
-    /// `api/pulls.rs`). Raising this knob past the clamp does NOT buy more lock-pool
-    /// connections; pushes beyond it wait briefly and then shed a 503 + Retry-After.
+    /// advisory-lock pool (`GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS`, default 32) for
+    /// the whole receive-pack. That pool must be at least this value so every
+    /// admitted push can pin a lock-pool connection for its whole duration. Size BOTH
+    /// pools against the database server's `max_connections`: the main pool
+    /// (`GITLAWB_DB_MAX_CONNECTIONS`, default 48) serves ordinary handlers, and the
+    /// lock pool serves writes. Raising this knob does not raise the lock pool;
+    /// set `GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS` explicitly.
     #[arg(
         long,
         env = "GITLAWB_MAX_CONCURRENT_GIT_PUSHES",

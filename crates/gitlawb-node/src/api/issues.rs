@@ -70,12 +70,21 @@ pub async fn create_issue(
 
     let create_result = git_issues::create_issue(&disk_path, &issue_id, &json_str);
 
-    // Always release the advisory lock — even on error; upload to Tigris only on success.
-    // A refused publish short-circuits here, before the trust bump and before
-    // the 201: the issue is on local disk but not in object storage, so no
-    // other node can read it and the client must retry rather than be told it
-    // was filed.
-    guard.release(create_result.is_ok()).await.into_result()?;
+    let release_result = guard.release(create_result.is_ok()).await.into_result();
+    if release_result.is_err() && create_result.is_ok() {
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+        let deadline = std::time::Instant::now() + git_timeout;
+        if let Err(rollback) =
+            git_issues::delete_issue_ref(&state.git_bin, &disk_path, &issue_id, deadline)
+        {
+            tracing::warn!(
+                issue = %issue_id,
+                err = %rollback,
+                "failed to roll back local issue after refused publish"
+            );
+        }
+    }
+    release_result?;
 
     create_result.map_err(|e| AppError::Git(e.to_string()))?;
 
@@ -235,28 +244,16 @@ pub async fn close_issue(
         .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
 
-    // Per-IP flood brake, layered on the same shared limiter and trusted-proxy
-    // policy as the push advertisement. The pre-lock snapshot downloads the
-    // whole archive and runs a blocking extraction, so an unlimited route would
-    // let disposable identities drive unbounded transfer/CPU/disk with parallel
-    // close requests for arbitrary issue ids. Applied before the snapshot work
-    // so a rejected request does none of it.
-    if let Some(key) = crate::rate_limit::client_key(&headers, peer, state.push_limiter_trust) {
-        if !state.push_rate_limiter.check(&key).await {
-            tracing::warn!(repo = %repo, key = %key, "close_issue rate limited");
-            return Err(AppError::TooManyRequests(
-                "rate limit exceeded — try again later".into(),
-            ));
-        }
-    }
-
-    // READ-GATE before any snapshot work. The author fallback below needs the
-    // issue blob, which needs the repo tree, so authorship cannot be established
+    // READ-GATE before any snapshot work or rate charging. The author fallback below
+    // needs the issue blob, which needs the repo tree, so authorship cannot be established
     // without a download; but a caller who cannot even READ the repo must be
     // stopped here, cheaply, before any Tigris transfer or extraction happens.
     // Without this, any signed non-owner could issue parallel close requests for
     // arbitrary issue ids and drive unbounded downloads and blocking extraction
     // (a disposable-identity DoS), because the route has no other pre-authorization.
+    //
+    // Rate limiting runs AFTER this gate so a 429 cannot distinguish a hidden repo
+    // from a missing one (INV-12 read-denial status contract).
     //
     // mirror-rows-handled: a repo row synced from a peer is stored public and
     // carries none of the owner's visibility rules, so for such a row this check
@@ -282,6 +279,21 @@ pub async fn close_issue(
         ) == crate::visibility::Decision::Deny
         {
             return Err(AppError::RepoNotFound(format!("{owner}/{repo}")));
+        }
+    }
+
+    // Per-IP flood brake, layered on the same shared limiter and trusted-proxy
+    // policy as the push advertisement. The pre-lock snapshot downloads the
+    // whole archive and runs a blocking extraction, so an unlimited route would
+    // let disposable identities drive unbounded transfer/CPU/disk with parallel
+    // close requests for arbitrary issue ids. Applied after the read gate so a
+    // denied reader still sees 404, not 429.
+    if let Some(key) = crate::rate_limit::client_key(&headers, peer, state.push_limiter_trust) {
+        if !state.push_rate_limiter.check(&key).await {
+            tracing::warn!(repo = %repo, key = %key, "close_issue rate limited");
+            return Err(AppError::TooManyRequests(
+                "rate limit exceeded — try again later".into(),
+            ));
         }
     }
 
@@ -1079,6 +1091,109 @@ mod lock_pool_shed_tests {
         .await;
         let err = shed.expect_err("a failed archive download must refuse the write");
         assert_retryable_repo_acquire(err, "create_issue", "repo_unavailable").await;
+
+        server.abort();
+    }
+
+    /// A denied reader on a private repo must see 404 even when the caller's rate
+    /// bucket is exhausted. Rate limiting runs after the read gate.
+    #[sqlx::test]
+    async fn close_issue_rate_limit_runs_after_the_read_gate(pool: PgPool) {
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        let owner = "did:key:zCLOSERATEOWNERAAAAAAAAAAAAAAAAAAAAAAA";
+        let stranger = "did:key:zCLOSERATESTRANGERBBBBBBBBBBBBBBBBBB";
+        let mut state = crate::test_support::test_state(pool).await;
+        state.push_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let mut repo = seed_repo(owner, "priv-close");
+        repo.is_public = false;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let peer: SocketAddr = "203.0.113.88:7000".parse().unwrap();
+        assert!(
+            state.push_rate_limiter.check(&peer.ip().to_string()).await,
+            "exhaust the peer bucket before close_issue"
+        );
+
+        let res = close_issue(
+            State(state),
+            Extension(AuthenticatedDid(stranger.to_string())),
+            Path((owner.to_string(), "priv-close".to_string(), "1".to_string())),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(Some(peer)),
+        )
+        .await;
+
+        assert!(
+            matches!(res, Err(AppError::RepoNotFound(_))),
+            "a non-reader must see 404, not 429, even when rate limited: {:?}",
+            res
+        );
+    }
+
+    /// A refused publish must roll back the local issue ref so a retry does not
+    /// mint a second id for the same logical filing attempt.
+    #[sqlx::test]
+    async fn create_issue_rolls_back_local_ref_when_publish_refuses(pool: PgPool) {
+        use axum::response::IntoResponse;
+
+        let app = axum::Router::new().route(
+            "/{*key}",
+            axum::routing::any(|method: axum::http::Method| async move {
+                if method == axum::http::Method::HEAD {
+                    let mut resp = axum::http::StatusCode::OK.into_response();
+                    resp.headers_mut()
+                        .insert("etag", axum::http::HeaderValue::from_static("\"gen-1\""));
+                    resp
+                } else {
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let owner = "did:key:zISSUEROLLBACKAAAAAAAAAAAAAAAAAAAAAAA";
+        let repo_name = "rollback-create";
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let disk = tempfile::TempDir::new().unwrap();
+        crate::git::store::init_bare(&disk.path().join("repo.git")).expect("bare repo");
+        let mut seeded = seed_repo(owner, repo_name);
+        seeded.disk_path = disk.path().join("repo.git").to_string_lossy().to_string();
+        state.db.create_repo(&seeded).await.expect("seed repo");
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing_with_tigris(
+            disk.path().to_path_buf(),
+            crate::git::repo_store::build_lock_pool(&pool, 2, std::time::Duration::from_secs(1)),
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint),
+        );
+
+        let shed = create_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), repo_name.to_string())),
+            Json(CreateIssueRequest {
+                title: "t".to_string(),
+                body: None,
+                signed_payload: None,
+            }),
+        )
+        .await;
+        assert!(
+            shed.is_err(),
+            "a failed archive upload must refuse the write"
+        );
+
+        let issues = git_issues::list_issues(&disk.path().join("repo.git")).expect("list issues");
+        assert!(
+            issues.is_empty(),
+            "the local issue ref must be rolled back after a refused publish, got {issues:?}"
+        );
 
         server.abort();
     }

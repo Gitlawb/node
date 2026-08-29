@@ -657,11 +657,10 @@ impl RepoStore {
     ///
     /// Returns `Err(UploadError::PreconditionLost)` when the create-only upload was
     /// refused because the key already exists. That is a DISTINCT outcome from a
-    /// plain upload failure: the sole caller (fork creation) uses it to refuse the
-    /// fork rather than create a DB record whose archive is shadowed by an orphan
-    /// other nodes would fetch. Plain upload failures are logged and return `Ok`
-    /// for the same reason the guard's release logs-and-succeeds: the local write
-    /// is done and the storage retry is the operator's.
+    /// plain upload failure. The sole caller is fork creation, which uses the
+    /// former to refuse the fork rather than create a DB record shadowed by an
+    /// orphan other nodes would fetch. Plain upload failures are propagated so fork
+    /// creation does not insert a DB row when the archive never landed.
     pub async fn release_after_write(
         &self,
         owner_did: &str,
@@ -693,9 +692,7 @@ impl RepoStore {
                 // Propagated, not logged as success: an orphan archive under
                 // this key shadows the fork for every other node.
                 Err(e @ UploadError::PreconditionLost { .. }) => return Err(e),
-                Err(e) => {
-                    warn!(repo = %repo_name, err = %e, "failed to upload repo to tigris after write");
-                }
+                Err(e) => return Err(e),
             }
         }
         Ok(())
@@ -720,7 +717,12 @@ impl RepoStore {
     /// Best-effort cleanup when fork creation published an archive but failed to persist
     /// the database row. Removes the object-store key this attempt owns and the local
     /// mirror clone so a retry is not blocked by its own orphan.
-    pub async fn compensate_fork_archive(&self, owner_did: &str, repo_name: &str, disk_path: &Path) {
+    pub async fn compensate_fork_archive(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+        disk_path: &Path,
+    ) {
         if let Some(ref tigris) = self.tigris {
             if let Ok((owner_slug, _)) = self.local_path(owner_did, repo_name) {
                 if let Err(e) = tigris.delete(&owner_slug, repo_name).await {
@@ -786,15 +788,14 @@ pub(crate) fn swap_extracted_into_validated_repo(
     tmp_dir: &Path,
     swap_authority: Option<&Arc<AtomicBool>>,
 ) -> Result<()> {
+    let lock = super::tigris::publish_lock(validated_path);
+    let _publish = lock.lock().expect("publish lock poisoned");
     if let Some(authority) = swap_authority {
         if !authority.load(Ordering::Acquire) {
             let _ = std::fs::remove_dir_all(tmp_dir);
             anyhow::bail!("publish swap revoked after lock ownership ended");
         }
     }
-
-    let lock = super::tigris::publish_lock(validated_path);
-    let _publish = lock.lock().expect("publish lock poisoned");
     if validated_path.exists() {
         std::fs::remove_dir_all(validated_path).context("removing stale repo dir")?;
     }
