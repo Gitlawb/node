@@ -18,17 +18,8 @@ use support::probe::{probes_for, Expect, Fixture, Probe, Signer};
 use support::routes::{deny_bearing_routes, GateClass};
 use support::signing::signed_request;
 
-use gitlawb_core::cid::Cid;
 use gitlawb_core::identity::Keypair;
 use gitlawb_node::test_harness::spawn_node;
-
-/// Build the `/ipfs/{cid}` CID for a 64-hex sha2-256 git object id, matching the
-/// node's own `Cid::from_sha256_bytes` (the value `get_by_cid` decodes back).
-fn cid_for_oid(oid_hex: &str) -> String {
-    let bytes = hex::decode(oid_hex).expect("hex oid");
-    let arr: [u8; 32] = bytes.as_slice().try_into().expect("32-byte sha256 oid");
-    Cid::from_sha256_bytes(&arr).to_string()
-}
 
 /// A reqwest client with a bounded timeout so a wedged node route fails the test
 /// fast rather than hanging until the CI job timeout.
@@ -234,6 +225,9 @@ async fn anon_ipfs_read_of_withheld_blob_is_denied(pool: sqlx::PgPool) {
         ],
         "sha256",
     );
+    let cids = node
+        .seed_pinned_cids_for_repo(&owner_did, "u5b-repo", &repo_id, &oids)
+        .await;
     node.withhold_path(
         &repo_id,
         "/secret/**",
@@ -243,8 +237,26 @@ async fn anon_ipfs_read_of_withheld_blob_is_denied(pool: sqlx::PgPool) {
     .await;
 
     let secret_oid = oids["secret/b.txt"].clone();
-    let secret_cid = cid_for_oid(&secret_oid);
-    let public_cid = cid_for_oid(&oids["public/a.txt"]);
+    let secret_cid = cids["secret/b.txt"].clone();
+    let public_cid = cids["public/a.txt"].clone();
+
+    // Public blob first (blob-scoped withhold must not poison sibling reads).
+    let resp = client
+        .get(format!("{}/ipfs/{public_cid}", node.base_url))
+        .send()
+        .await
+        .expect("request sends");
+    let public_status = resp.status().as_u16();
+    let public_body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        public_status,
+        200,
+        "public blob CID must be served to anon; body={public_body:?}"
+    );
+    assert!(
+        public_body.contains("public bytes U5b"),
+        "the public blob content is returned"
+    );
 
     // Anonymous read of the withheld blob's CID: denied, no leak of content or OID.
     let resp = client
@@ -258,22 +270,6 @@ async fn anon_ipfs_read_of_withheld_blob_is_denied(pool: sqlx::PgPool) {
         &["TOPSECRET-U5b", &secret_oid, &secret_oid[..12]],
     )
     .await;
-
-    // The sibling public blob's CID is served to anon (withhold is blob-scoped).
-    let resp = client
-        .get(format!("{}/ipfs/{public_cid}", node.base_url))
-        .send()
-        .await
-        .expect("request sends");
-    assert_eq!(
-        resp.status().as_u16(),
-        200,
-        "public blob CID must be served to anon"
-    );
-    assert!(
-        resp.text().await.unwrap().contains("public bytes U5b"),
-        "the public blob content is returned"
-    );
 
     node.shutdown().await;
 }
@@ -1276,8 +1272,9 @@ mod completeness {
         ("fork_repo", NotDrivenReason::ReadGatingMutation),
         ("star_repo", NotDrivenReason::ReadGatingMutation),
         ("unstar_repo", NotDrivenReason::ReadGatingMutation),
-        // Content-addressed read: driven by the U5b/U8 anon_ipfs/clone cases.
-        ("get_by_cid", NotDrivenReason::ContentAddressedRead),
+        // Content-addressed read: driven by the U5b/U8 anon_ipfs/clone cases via
+        // the internal `gate_and_serve` helper (marker moved off `get_by_cid`).
+        ("gate_and_serve", NotDrivenReason::ContentAddressedRead),
         // Git smart-HTTP reads: driven by the U7/U8 real-clone cases.
         ("git_info_refs", NotDrivenReason::GitSmartHttpRead),
         ("git_upload_pack", NotDrivenReason::GitSmartHttpRead),

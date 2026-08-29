@@ -97,6 +97,9 @@ pub async fn run() -> Result<()> {
     // it has aged past the liveness floor, ~12s into uptime, so aged claim
     // residue cannot linger beside a healthy final (F2). Fire-and-forget.
     spawn_delayed_claim_resweep(config.resolved_key_path());
+    // Sealing key for the legacy-scan continuation tokens, DERIVED from the identity
+    // just loaded so it is the same key after a restart (see `derive_scan_token_key`).
+    let scan_token_key = AppState::derive_scan_token_key(&keypair);
     let node_did = keypair.did();
 
     // One-time metrics init. Must run before any handler that calls into
@@ -389,11 +392,60 @@ pub async fn run() -> Result<()> {
         rate_limiter,
         create_ip_rate_limiter,
         push_rate_limiter,
+        ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
+        ipfs_max_legacy_probes: AppState::ipfs_legacy_probe_budget(&config),
+        ipfs_legacy_scan_page_rows: crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS,
+        ipfs_max_legacy_scan_rows: AppState::ipfs_legacy_scan_row_budget(&config),
+        ipfs_max_legacy_scan_rule_bytes: crate::api::ipfs::MAX_LEGACY_SCAN_RULE_BYTES_PER_REQUEST,
+        ipfs_scan_token_key: Arc::new(scan_token_key),
+        ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust,
         sync_trigger_rate_limiter,
         peer_write_rate_limiter,
         shutdown_tx: shutdown_tx.clone(),
+        git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_git_ops)),
+        git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_git_pushes,
+        )),
+        git_push_advert_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_git_pushes,
+        )),
+        git_encrypt_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_git_pushes,
+        )),
+        pin_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_pin_tasks)),
+        encrypt_inflight: crate::state::EncryptInflight::new(),
+        repo_write_leases: crate::state::RepoWriteLeases::new(config.repo_lease_max_waiters),
+        git_read_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            config.max_concurrent_reads_per_caller,
+        ),
+        git_push_advert_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            rate_limit::per_source_push_cap(config.max_concurrent_git_pushes),
+        ),
+        git_write_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            rate_limit::per_source_push_cap(config.max_concurrent_git_pushes),
+        ),
+        git_ipfs_walk_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_ipfs_walks,
+        )),
+        git_ipfs_walk_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            config.ipfs_walk_per_source,
+        ),
+        ipfs_rate_limiter: rate_limit::RateLimiter::new_bounded(
+            config.ipfs_rate_limit,
+            std::time::Duration::from_secs(3600),
+            200_000,
+        ),
+        ipfs_work_rate_limiter: rate_limit::RateLimiter::new_bounded(
+            AppState::ipfs_work_budget(&config),
+            std::time::Duration::from_secs(3600),
+            200_000,
+        ),
+        git_bin: "git".to_string(),
     };
+    if config.ipfs_rate_limit == 0 {
+        tracing::warn!("GITLAWB_IPFS_RATE_LIMIT=0 — per-IP /ipfs rate limiting disabled");
+    }
 
     // Periodic peer-count poll for the metrics gauge. If p2p is disabled
     // we still set the gauge to 0 so dashboards don't show "no data".
@@ -423,22 +475,14 @@ pub async fn run() -> Result<()> {
 
     // Periodic cleanup of expired rate limit entries + consumed-proof ledger
     {
-        let rl = state.rate_limiter.clone();
-        let create_ip_rl = state.create_ip_rate_limiter.clone();
-        let push_rl = state.push_rate_limiter.clone();
-        let sync_trigger_rl = state.sync_trigger_rate_limiter.clone();
-        let peer_write_rl = state.peer_write_rate_limiter.clone();
+        let cleanup_state = state.clone();
         let db = state.db.clone();
         let mut shutdown_rx = state.subscribe_shutdown();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                        rl.cleanup().await;
-                        create_ip_rl.cleanup().await;
-                        push_rl.cleanup().await;
-                        sync_trigger_rl.cleanup().await;
-                        peer_write_rl.cleanup().await;
+                        cleanup_state.sweep_rate_limiters().await;
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs() as i64)
@@ -456,6 +500,8 @@ pub async fn run() -> Result<()> {
             }
         });
     }
+
+    let _legacy_cid_sweep = spawn_legacy_cid_sweep(&state, &config);
 
     let router = server::build_router(state.clone());
     // Re-register the socket bound at startup — same fd, so there was never a
@@ -620,6 +666,25 @@ where
             tokio::time::sleep(grace).await;
         } => (Ok(()), true),
     }
+}
+
+fn spawn_legacy_cid_sweep(state: &AppState, config: &Config) -> tokio::task::JoinHandle<()> {
+    let db = state.db.clone();
+    let repos_dir = config.repos_dir.clone();
+    let git_bin = state.git_bin.clone();
+    let git_timeout = std::time::Duration::from_secs(config.git_service_timeout_secs);
+    let batch = config.pin_repair_sweep_batch;
+    let delay = std::time::Duration::from_secs(config.pin_repair_sweep_delay_secs);
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = ipfs_pin::run_sweep_rearmed(
+                &repos_dir, &git_bin, git_timeout, batch, delay,
+                ipfs_pin::SWEEP_REARM_DELAY, &db,
+            ) => {}
+            _ = shutdown_rx.changed() => {}
+        }
+    })
 }
 
 fn spawn_shutdown_signal(tx: watch::Sender<bool>) {
@@ -979,8 +1044,22 @@ async fn gossip_task(
                             json.get("node_url").and_then(|v| v.as_str()),
                         ) {
                             if !their_url.is_empty() {
-                                let _ = state.db.upsert_peer(their_did, their_url).await;
-                                tracing::info!(did = %their_did, url = %their_url, "bootstrap peer added");
+                                match state
+                                    .db
+                                    .upsert_peer(
+                                        their_did,
+                                        their_url,
+                                        db::PeerWriteAuthority::Unproven,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        tracing::info!(did = %their_did, url = %their_url, "bootstrap peer added")
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(did = %their_did, url = %their_url, err = %e, "bootstrap peer announce-back rejected")
+                                    }
+                                }
                             }
                         }
                     }
@@ -1032,21 +1111,85 @@ fn build_http_client() -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
-/// Ping a peer's `/health` endpoint and report whether it answered 2xx.
-///
-/// Takes the client by reference so callers supply the shared, no-redirect
-/// `state.http_client`. Peer URLs are attacker-influenceable, so a `3xx` to a
-/// private address must not be followed. Do NOT call this with a bare
-/// `reqwest::Client::new()`: its default follows redirects and would
-/// reintroduce the SSRF this guards against (#93).
+/// Ping a peer's DB-aware `/ready` endpoint and report whether it answered 2xx.
+pub(crate) async fn ping_peer_readiness(client: &reqwest::Client, http_url: &str) -> bool {
+    ping_peer_readiness_with_timeout(client, http_url, OUTBOUND_HTTP_TIMEOUT).await
+}
+
+async fn ping_peer_readiness_with_timeout(
+    client: &reqwest::Client,
+    http_url: &str,
+    timeout: std::time::Duration,
+) -> bool {
+    let base_url = http_url.trim_end_matches('/');
+    let result = tokio::time::timeout(timeout, async {
+        let readiness = client.get(format!("{base_url}/ready")).send().await;
+
+        match readiness {
+            Ok(response) if response.status().is_success() => true,
+            Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
+                info!(
+                    peer_url = %http_url,
+                    "peer has no readiness endpoint; falling back to legacy health probe"
+                );
+                match client.get(format!("{base_url}/health")).send().await {
+                    Ok(response) if response.status().is_success() => true,
+                    Ok(response) => {
+                        warn!(
+                            peer_url = %http_url,
+                            status = %response.status(),
+                            "legacy peer health probe reported unhealthy"
+                        );
+                        false
+                    }
+                    Err(error) => {
+                        warn!(
+                            peer_url = %http_url,
+                            err = %error,
+                            "legacy peer health probe failed"
+                        );
+                        false
+                    }
+                }
+            }
+            Ok(response) => {
+                warn!(
+                    peer_url = %http_url,
+                    status = %response.status(),
+                    "peer readiness probe reported unready"
+                );
+                false
+            }
+            Err(error) => {
+                warn!(
+                    peer_url = %http_url,
+                    err = %error,
+                    "peer readiness probe failed"
+                );
+                false
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(ready) => ready,
+        Err(_) => {
+            warn!(
+                peer_url = %http_url,
+                timeout_ms = timeout.as_millis(),
+                "peer readiness probe timed out"
+            );
+            false
+        }
+    }
+}
+
+const OUTBOUND_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Legacy gossip helper kept for unit tests in this module.
 async fn ping_peer_health(client: &reqwest::Client, http_url: &str) -> bool {
-    let url = format!("{}/health", http_url.trim_end_matches('/'));
-    client
-        .get(&url)
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
+    ping_peer_readiness(client, http_url).await
 }
 
 /// Persist a just-created identity key, removing the file if the write failed

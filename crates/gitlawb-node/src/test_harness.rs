@@ -152,6 +152,7 @@ fn unique_repos_dir() -> PathBuf {
 /// git smart-HTTP routes can serve. P2P is always disabled.
 fn build_state(db: Arc<crate::db::Db>, pool: PgPool, repos_dir: PathBuf) -> AppState {
     let keypair = Keypair::generate();
+    let scan_token_key = crate::state::AppState::derive_scan_token_key(&keypair);
     let node_did = keypair.did();
     let (ref_tx, _) = tokio::sync::broadcast::channel(1);
     let (task_tx, _) = tokio::sync::broadcast::channel(1);
@@ -175,10 +176,32 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool, repos_dir: PathBuf) -> AppS
         rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
         create_ip_rate_limiter: RateLimiter::new(1000, Duration::from_secs(3600)),
         push_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+        ipfs_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+        ipfs_work_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+        ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
+        ipfs_max_legacy_probes: crate::api::ipfs::MAX_LEGACY_PROBES_PER_REQUEST,
+        ipfs_legacy_scan_page_rows: crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS,
+        ipfs_max_legacy_scan_rows: crate::api::ipfs::MAX_LEGACY_SCAN_ROWS_PER_REQUEST,
+        ipfs_max_legacy_scan_rule_bytes: crate::api::ipfs::MAX_LEGACY_SCAN_RULE_BYTES_PER_REQUEST,
+        ipfs_scan_token_key: Arc::new(scan_token_key),
+        ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust: TrustedProxy::None,
         sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
         peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         shutdown_tx: watch::channel(false).0,
+        git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        git_push_advert_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        git_encrypt_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        pin_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        encrypt_inflight: crate::state::EncryptInflight::new(),
+        repo_write_leases: crate::state::RepoWriteLeases::new(8),
+        git_read_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(16),
+        git_push_advert_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(8),
+        git_write_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(8),
+        git_ipfs_walk_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        git_ipfs_walk_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(16),
+        git_bin: "git".to_string(),
     }
 }
 
@@ -386,6 +409,58 @@ impl TestNode {
             )
             .await
             .expect("set visibility rule");
+    }
+
+    /// Record `pinned_cids` rows for every blob OID returned by
+    /// [`Self::seed_bare_repo`] so `/ipfs/{cid}` can resolve via provenance on
+    /// current main (the table is the primary lookup path). CIDs are computed
+    /// from raw object bytes exactly as the production pin path does
+    /// (`Cid::from_git_object_bytes`), not from the git oid hash.
+    /// Returns each seeded path's canonical CID for use in `GET /ipfs/{cid}`.
+    pub async fn seed_pinned_cids_for_repo(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+        repo_id: &str,
+        oids: &std::collections::HashMap<String, String>,
+    ) -> std::collections::HashMap<String, String> {
+        use std::str::FromStr;
+
+        let slug = owner_did.replace([':', '/'], "_");
+        let bare = self
+            .repos_dir
+            .join(&slug)
+            .join(format!("{repo_name}.git"));
+        let mut cids = std::collections::HashMap::new();
+        for (path, oid_hex) in oids {
+            if path == "HEAD" {
+                continue;
+            }
+            let (_ty, raw) = crate::git::store::read_object(&bare, oid_hex)
+                .expect("read seeded object")
+                .expect("seeded object exists in bare repo");
+            let preliminary =
+                gitlawb_core::cid::Cid::from_git_object_bytes(&raw).to_string();
+            let cid = preliminary
+                .parse::<cid::CidGeneric<64>>()
+                .expect("parse production pin cid")
+                .to_string();
+            self.db
+                .record_pinned_cid_with_source(oid_hex, &cid, repo_id)
+                .await
+                .expect("seed pinned_cids row");
+            let roundtrip = self
+                .db
+                .oids_for_cid(&cid)
+                .await
+                .expect("oids_for_cid after seed");
+            assert!(
+                !roundtrip.is_empty(),
+                "pinned_cids seed for {path} did not round-trip cid {cid}"
+            );
+            cids.insert(path.clone(), cid);
+        }
+        cids
     }
 
     /// Create a real bare git repository on disk at the exact path
