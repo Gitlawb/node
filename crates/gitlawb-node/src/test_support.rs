@@ -6318,9 +6318,17 @@ mod tests {
         );
 
         // Legacy-shape row: cid = the PROVIDER CID (raw SQL — the helpers store the
-        // raw CID). The object itself is public and servable.
+        // raw CID). The object itself is public and servable: the bytes are
+        // on local IPFS (so `local_ipfs_provenance = TRUE` under #218 review
+        // P1's writer-owned contract), only the CID key is wrong. Without
+        // `local_ipfs_provenance = TRUE`, the new `has_ipfs_cid` check in
+        // `pin_new_objects` would fall through to the upload path and re-pin
+        // bytes that are already on IPFS — the test's `expect(0)` mock
+        // would fail. Setting the flag reflects the real pre-upgrade
+        // state (a legacy local IPFS pin with the wrong CID).
         sqlx::query(
-            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id, local_ipfs_provenance) \
+             VALUES ($1, $2, $3, $4, TRUE)",
         )
         .bind(&fx.public_oid)
         .bind(&provider_cid)
@@ -11936,7 +11944,15 @@ mod tests {
             "reader's tree body carries the child filename and raw child oid"
         );
 
-        // Root tree (path "/") stays served to anon who passes the "/" gate.
+        // Root tree (path "/") is denied to anon: under #218 review
+        // P1b's recursive structural gate, the root tree's serialized
+        // bytes name the `secret` entry and the secret subtree's
+        // child OID, so admitting it would leak the secret subtree's
+        // existence through the root tree's bytes. The root tree is
+        // a *path-scoped* deny too — the `/secret/**` rule matches
+        // `secret` at depth 1. The reader below confirms a structural
+        // leak: the listed reader can read the *secret subtree* and
+        // its tree body carries `b.txt` plus the raw secret oid.
         let (st, _) = cid_parts(
             cid_router(&state)
                 .oneshot(cid_anon(&root_tree_cid))
@@ -11944,7 +11960,11 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert_eq!(st, StatusCode::OK, "root tree stays served (must-serve)");
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "root tree denied to anon: its entries name the withheld /secret subtree"
+        );
 
         // /public subtree tree stays served to anon (allowed path).
         let (st, _) = cid_parts(
@@ -12134,106 +12154,18 @@ mod tests {
         assert!(body.contains("public bytes"), "owner gets the content");
     }
 
-    /// Fail-closed walk-error arm: if `withheld_blob_oids` errors (here, a ref
-    /// pointing at a non-tree-ish blob, which `git ls-tree -r` cannot traverse —
-    /// the same induction as `visibility_pack::fails_closed_when_a_ref_cannot_be_traversed`),
-    /// the handler skips the whole repo rather than serving. Asserts no leak of the
-    /// withheld blob AND that even the *public* blob in that repo is withheld — the
-    /// latter distinguishes fail-closed-skip from normal per-blob withholding and
-    /// would serve 200 if the error arm wrongly proceeded. The skip carries no
-    /// VERDICT (F2), so the response is the retryable truncation 503, not a 404
-    /// claiming the object is absent — never-serve-unproven and never-404-unproven
-    /// hold together.
-    #[sqlx::test]
-    async fn ipfs_cid_walk_error_fails_closed(pool: PgPool) {
-        use crate::db::VisibilityMode;
-        use gitlawb_core::identity::Keypair;
-
-        let owner = Keypair::generate();
-        let owner_did = owner.did().to_string();
-        let slug = owner_did.replace([':', '/'], "_");
-        let short = owner_did.split(':').next_back().unwrap().to_string();
-        let state = test_state(pool).await;
-
-        let fx = seed_cid_repos(&slug, &short, &["withhold"]);
-        let bare = std::path::PathBuf::from("/tmp")
-            .join(&slug)
-            .join("withhold.git");
-        // Recorded pins so get_by_cid resolves each CID to its oid and reaches the
-        // walk; the 404s below are then the fail-closed skip, not a table miss.
-        let secret_cid = pin_cid_for(&bare, &fx.secret_oid, &state.db).await;
-        let public_cid = pin_cid_for(&bare, &fx.public_oid, &state.db).await;
-
-        // Force the withheld walk to fail closed: a ref pointing at a blob (not
-        // tree-ish) makes `git ls-tree -r` error, which `withheld_blob_oids`
-        // propagates as Err → the handler's `Ok(Err)` arm skips the repo.
-        std::fs::write(
-            bare.join("refs/heads/blobref"),
-            format!("{}\n", fx.secret_oid),
-        )
-        .unwrap();
-
-        state
-            .db
-            .create_repo(&seed_repo(&owner_did, "withhold"))
-            .await
-            .expect("seed repo");
-        let rec = state
-            .db
-            .get_repo(&owner_did, "withhold")
-            .await
-            .unwrap()
-            .unwrap();
-        state
-            .db
-            .set_visibility_rule(&rec.id, "/secret/**", VisibilityMode::B, &[], &owner_did)
-            .await
-            .expect("deny rule");
-
-        // Withheld secret CID under a walk error → the repo is skipped without a
-        // verdict, so the scan is truncated (503), and nothing leaks.
-        let (st, body) = cid_parts(
-            cid_router(&state)
-                .oneshot(cid_anon(&secret_cid))
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(
-            st,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "walk error must not serve the withheld blob — the unproven skip sheds 503"
-        );
-        assert!(
-            !body.contains("TOP SECRET"),
-            "walk-error 503 must not leak the secret"
-        );
-
-        // The PUBLIC blob in the same repo is also not served: the walk error fails
-        // closed by skipping the whole repo. Without the fail-closed arm this would
-        // serve 200, so this assertion is the load-bearing discriminator.
-        let (st, _) = cid_parts(
-            cid_router(&state)
-                .oneshot(cid_anon(&public_cid))
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(
-            st,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "walk error fails closed: repo skipped without a verdict, even the public \
-             blob is not served and the scan sheds 503"
-        );
-    }
-
-    /// #173 review (F2): the commit/tag reachability walk must FAIL CLOSED on a git
-    /// error, exactly like the blob/tree walk. A ref pointing at a nonexistent object
-    /// makes `rev-list --all` fail, so `reachable_commit_tag_oids` returns Err, which
-    /// the handler's shared `Ok(Err) => continue` arm turns into a repo skip. The
-    /// load-bearing discriminator is that the PUBLIC commit is ALSO 404: if the arm
-    /// fail-OPENed (served on error) it would 200. Drives the commit/tag branch of
-    /// the shared fail-closed arm specifically (the sibling test covers blob/tree).
+    /// #218 review P1: the previous `ipfs_cid_walk_error_fails_closed`
+    /// test relied on a ref pointing at a blob to force
+    /// `withheld_blob_oids` to error via the pre-fix
+    /// `assert_all_refs_are_commits` guard. With the guard removed
+    /// (a ref pointing at a non-commit object is a valid Git shape
+    /// that `git rev-list --all` silently skips), the trigger is
+    /// gone. The fail-closed arm is still covered by other tests
+    /// (e.g. `ipfs_cid_commit_tag_walk_error_fails_closed` below uses
+    /// a different trigger: a nonexistent ref object makes
+    /// `rev-list --all` fail, exercising the same shared
+    /// `Ok(Err) => continue` arm). The shared arm is exercised
+    /// here; the redundant blob-path trigger is removed.
     #[sqlx::test]
     async fn ipfs_cid_commit_tag_walk_error_fails_closed(pool: PgPool) {
         use crate::db::VisibilityMode;
@@ -12823,10 +12755,29 @@ mod tests {
             .await
             .expect("path rule");
 
-        // Reachable trees at ALLOWED paths must still serve despite the tag-of-tree.
-        for (cid, want_oid, label) in [
-            (&root_tree_cid, &fx.root_tree_oid, "root tree"),
-            (&public_tree_cid, &fx.public_tree_oid, "public subtree"),
+        // Reachable trees at ALLOWED paths must still serve despite the
+        // tag-of-tree. Under #218 review P1b's recursive structural
+        // gate, anon sees ONLY trees whose structural safety holds at
+        // the caller's path: the public subtree (`/public`) is safe
+        // (its only entry is a blob at an allowed path). The root
+        // tree is NOT safe for anon: its entries include `secret/`
+        // pointing at a denied subtree, so the structural check
+        // denies the root tree. The test asserts the public subtree
+        // serves and the root tree is denied (fail-closed on
+        // subtree metadata leakage).
+        for (cid, want_oid, label, want_status) in [
+            (
+                &root_tree_cid,
+                &fx.root_tree_oid,
+                "root tree",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                &public_tree_cid,
+                &fx.public_tree_oid,
+                "public subtree",
+                StatusCode::OK,
+            ),
         ] {
             let resp = cid_router(&state).oneshot(cid_anon(cid)).await.unwrap();
             let served = resp
@@ -12836,15 +12787,17 @@ mod tests {
                 .map(str::to_string);
             let (st, _) = cid_parts(resp).await;
             assert_eq!(
-                st,
-                StatusCode::OK,
-                "{label} CID must serve despite a pushable tag-of-tree in the repo"
+                st, want_status,
+                "{label} CID status under recursive structural gate: root tree is denied \
+                 because its serialized bytes name the withheld /secret subtree, /public is served"
             );
-            assert_eq!(
-                served.as_deref(),
-                Some(want_oid.as_str()),
-                "{label}: the served object is the reachable tree"
-            );
+            if want_status == StatusCode::OK {
+                assert_eq!(
+                    served.as_deref(),
+                    Some(want_oid.as_str()),
+                    "{label}: the served object is the reachable tree"
+                );
+            }
         }
 
         // Fail-closed preserved: the DENIED subtree's CID is still withheld — the

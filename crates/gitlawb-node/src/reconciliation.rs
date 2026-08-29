@@ -2571,4 +2571,275 @@ mod tests {
 
         m.assert_async().await;
     }
+
+    /// #218 review P1b (recursive at every depth): the structural
+    /// tree gate must deny the entire chain of ancestor trees
+    /// whose entries point at a withheld subtree. This is the
+    /// nested case: a public repo with `/public/secret/file.txt`
+    /// and a `/public/secret/**` deny. The `/public` tree is at
+    /// an allowed path AND its only top-level entry is `secret/`
+    /// (a tree). The secret subtree is denied at `/public/secret`,
+    /// so the secret subtree is excluded — and that propagates up
+    /// through `/public`'s `secret/` entry. The root tree's
+    /// `public/` entry is also denied because `/public` is denied.
+    /// Net: the root tree, `/public` tree, and `/public/secret`
+    /// subtree tree are all absent from `pinned_cids`; the
+    /// `/public/secret/file.txt` blob is denied; only
+    /// `/public/visible.txt` is IPFS-pinned.
+    #[sqlx::test]
+    async fn sweep_does_not_publish_public_ancestor_tree_naming_withheld_subtree(
+        pool: sqlx::PgPool,
+    ) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        // Repo on disk: top-level `public/`, with `public/visible.txt`
+        // and `public/secret/file.txt`. The `/public/secret/**` deny
+        // makes the entire secret subtree off-limits to anon, and
+        // the structural check propagates that up to the `/public`
+        // tree (whose only entry is `secret/`) and to the root
+        // tree (whose only entry is `public/`).
+        let repo_on_disk = Repo::new();
+        std::fs::create_dir_all(repo_on_disk.path.join("public").join("secret")).unwrap();
+        repo_on_disk.commit_file("public/visible.txt", "public bytes\n");
+        repo_on_disk.commit_file("public/secret/file.txt", "TOP SECRET\n");
+
+        // Resolve oids for the assertions.
+        let visible_blob = repo_on_disk.git(&["rev-parse", "HEAD:public/visible.txt"]);
+        let secret_blob = repo_on_disk.git(&["rev-parse", "HEAD:public/secret/file.txt"]);
+        let secret_subtree = repo_on_disk.git(&["rev-parse", "HEAD:public/secret"]);
+        let public_tree = repo_on_disk.git(&["rev-parse", "HEAD:public"]);
+        let root_tree = repo_on_disk.git(&["rev-parse", "HEAD^{tree}"]);
+
+        let rec = seed_repo(
+            "did:key:zNestedWithheldOwner",
+            "nested-withheld-repo",
+            &repo_on_disk.path.display().to_string(),
+        );
+        db.create_repo(&rec).await.unwrap();
+
+        db.set_visibility_rule(
+            &rec.id,
+            "/public/secret/**",
+            crate::db::VisibilityMode::B,
+            &[],
+            &rec.owner_did,
+        )
+        .await
+        .unwrap();
+
+        // Mock IPFS: accept everything. The sweep would happily
+        // upload the whole tree chain if the structural gate let
+        // any of it through; the test asserts none of it does.
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
+            .expect_at_least(1)
+            .with_status(200)
+            .with_body(r#"{"Hash":"QmNestedWithheldMockCid"}"#)
+            .create_async()
+            .await;
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            &server.url(),
+        ]);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let (_tx, mut rx) = watch::channel(false);
+        let mut cursor = None;
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        let (scanned, gaps, _filled) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(scanned, 1, "one repo scanned");
+        assert!(
+            gaps >= 1,
+            "/public/visible.txt blob is a real gap (and the structural gate keeps the entire tree chain out)"
+        );
+
+        // Only /public/visible.txt is IPFS-pinned. Every tree in
+        // the chain — root, /public, /public/secret — is denied by
+        // the structural gate, and the secret blob is denied by
+        // the path gate.
+        assert!(
+            db.has_ipfs_cid(&visible_blob).await.unwrap(),
+            "/public/visible.txt must be IPFS-pinned (its path /public/visible.txt is allowed)"
+        );
+        assert!(
+            !db.has_ipfs_cid(&secret_blob).await.unwrap(),
+            "/public/secret/file.txt must NOT be IPFS-pinned (path /public/secret/** is denied)"
+        );
+
+        let pinned = db.list_pinned_cids().await.unwrap();
+        for p in &pinned {
+            assert_ne!(
+                p.sha256_hex, root_tree,
+                "root tree must not be replicated: its /public/ entry's child tree is structurally denied"
+            );
+            assert_ne!(
+                p.sha256_hex, public_tree,
+                "/public tree must not be replicated: its only entry is the withheld secret/ subtree"
+            );
+            assert_ne!(
+                p.sha256_hex, secret_subtree,
+                "/public/secret subtree tree must not be replicated: its only entry is the withheld file.txt blob"
+            );
+        }
+
+        m.assert_async().await;
+    }
+
+    /// #218 review P1 (non-commit ref acceptance): a repo with a
+    /// pushable tag-of-tree ref (a supported Git shape) must
+    /// still get its commit-reachable public objects classified
+    /// and pinned by the sweep. Before the fix, `all_object_paths`
+    /// called `assert_all_refs_are_commits`, which bailed on any
+    /// ref that didn't peel to a commit. A repo with an annotated
+    /// tag pointing at the root tree would have its whole walk
+    /// fail-closed — no IPFS pin, no Pinata pin, no sweep. The
+    /// fix removes the assertion; `git rev-list --all` already
+    /// silently skips non-commit refs, so the commit-reachable
+    /// object set is what the sweep needs. The tag-of-tree
+    /// itself is not commit-reachable and falls out as an
+    /// empty-path entry that the path-based allow filter drops
+    /// (fail-closed).
+    #[sqlx::test]
+    async fn sweep_repairs_commit_reachable_object_in_repo_with_tag_of_tree(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        // Repo on disk: one public commit with one blob, plus an
+        // annotated tag pointing at a *separate* tree (a manually
+        // mktree'd tree that is NOT commit-reachable). The tag is
+        // a "tag-of-tree" — a valid Git shape, but `git rev-list
+        // --all` skips it (it doesn't peel to a commit). The
+        // separate tree lets the test distinguish the
+        // commit-reachable root tree (which IS in the gap set) from
+        // the unclassifiable tag-of-tree (which is NOT in the gap
+        // set under the new tolerance).
+        let repo_on_disk = Repo::new();
+        repo_on_disk.commit_file("a.txt", "public bytes\n");
+        let blob_oid = repo_on_disk.git(&["rev-parse", "HEAD:a.txt"]);
+        let root_tree = repo_on_disk.git(&["rev-parse", "HEAD^{tree}"]);
+
+        // Create a separate, unrelated tree via `git mktree` —
+        // NOT commit-reachable. The annotated tag will point at
+        // this tree, making the repo a "tag-of-tree" repo.
+        let mktree = std::process::Command::new("git")
+            .args(["mktree"])
+            .current_dir(&repo_on_disk.path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let tree_only_oid =
+            String::from_utf8_lossy(mktree.wait_with_output().unwrap().stdout.as_slice())
+                .trim()
+                .to_string();
+        assert_ne!(
+            tree_only_oid, root_tree,
+            "mktree'd tree is distinct from root tree"
+        );
+
+        let tag_out = std::process::Command::new("git")
+            .args([
+                "tag",
+                "-a",
+                "treetag",
+                &tree_only_oid,
+                "-m",
+                "tag of a tree",
+            ])
+            .current_dir(&repo_on_disk.path)
+            .output()
+            .unwrap();
+        assert!(tag_out.status.success(), "git tag -a");
+
+        let rec = seed_repo(
+            "did:key:zTagOfTreeOwner",
+            "tag-of-tree-repo",
+            &repo_on_disk.path.display().to_string(),
+        );
+        db.create_repo(&rec).await.unwrap();
+
+        // Mock IPFS: accept everything. The sweep must reach the
+        // commit-reachable blob despite the unclassifiable
+        // tag-of-tree ref.
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
+            .expect_at_least(1)
+            .with_status(200)
+            .with_body(r#"{"Hash":"QmTagOfTreeMockCid"}"#)
+            .create_async()
+            .await;
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            &server.url(),
+        ]);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let (_tx, mut rx) = watch::channel(false);
+        let mut cursor = None;
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        let (scanned, _gaps, _filled) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(scanned, 1, "one repo scanned");
+
+        // The commit-reachable blob is IPFS-pinned.
+        assert!(
+            db.has_ipfs_cid(&blob_oid).await.unwrap(),
+            "the commit-reachable public blob must be IPFS-pinned despite the \
+             unclassifiable tag-of-tree ref (assert_all_refs_are_commits is removed)"
+        );
+
+        // The tag-of-tree itself is NOT pinned: it's not
+        // commit-reachable, so it has no path in the ls-tree
+        // walk, and the cat-file catch-all enumerates it with an
+        // empty path which the path-based allow filter drops
+        // (fail-closed). The commit-reachable root tree IS
+        // structurally safe and IS pinned, so the assertion
+        // compares against the tag-of-tree OID specifically.
+        let pinned = db.list_pinned_cids().await.unwrap();
+        for p in &pinned {
+            assert_ne!(
+                p.sha256_hex, tree_only_oid,
+                "tag-of-tree must not be replicated: it's not commit-reachable and the \
+                 empty-path allow filter drops it (fail-closed)"
+            );
+        }
+
+        m.assert_async().await;
+    }
 }
