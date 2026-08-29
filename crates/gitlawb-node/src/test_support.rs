@@ -13766,6 +13766,181 @@ mod tests {
         );
     }
 
+    /// #134 R2 (split buckets): signed `/api/v1/ipfs/pins` polling must NOT debit
+    /// the CID resolver's per-IP flood brake. The pre-fix composition merged
+    /// pins under the same router as `/ipfs/{cid}`, so every signed pin
+    /// request consumed a token from `ipfs_rate_limiter` and a flood of pinned
+    /// traffic could 429 legitimate CID reads. RED before the split (pins
+    /// debited the bucket): a flood of pins followed by a CID request → 429
+    /// on the CID. GREEN after the split: the CID bucket is untouched.
+    #[sqlx::test]
+    async fn ipfs_pins_do_not_debit_the_cid_bucket(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let mut state = test_state(pool).await;
+        // Bucket size 2: any third /ipfs/{cid} request from the same IP would
+        // 429 if the bucket were touched by the preceding pin requests.
+        state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(2, Duration::from_secs(3600));
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(600, Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+
+        // Seed a public, walk-free CID so /ipfs/{cid} serves cheaply. This
+        // matters because the proof half of the test fires a real CID request
+        // and needs the route bucket to be the only thing that can 429 it.
+        let fx = seed_cid_repos(&slug, &short, &["pinsdebit"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("pinsdebit.git");
+        let repo = seed_repo(&owner_did, "pinsdebit");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let cid = pin_cid_for(&bare, &fx.public_oid, &state.db).await;
+
+        let router = crate::server::build_router(state);
+        let peer_ip = "203.0.113.50";
+
+        // Five signed pin requests — more than the bucket — all must 200 (the
+        // pins route has no rate limit; the bucket only charges /ipfs/{cid}).
+        let pins_path = "/api/v1/ipfs/pins";
+        let pins_signed = sign_request(&kp, "GET", pins_path, b"");
+        for i in 0..5 {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(pins_path)
+                .header("content-digest", &pins_signed.content_digest)
+                .header("signature-input", &pins_signed.signature_input)
+                .header("signature", &pins_signed.signature)
+                .header("x-forwarded-for", peer_ip)
+                .body(Body::empty())
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "pin request {i} must not be rate-limited even though the CID bucket is size 2"
+            );
+        }
+
+        // A subsequent /ipfs/{cid} request from the same IP must still serve
+        // 200 — the bucket was untouched by the pin traffic. (If pins had
+        // debited it, the bucket would be empty and the CID request would 429.)
+        let cid_path = format!("/ipfs/{cid}");
+        let cid_signed = sign_request(&kp, "GET", &cid_path, b"");
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(&cid_path)
+            .header("content-digest", cid_signed.content_digest)
+            .header("signature-input", cid_signed.signature_input)
+            .header("signature", cid_signed.signature)
+            .header("x-forwarded-for", peer_ip)
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the CID bucket must still have tokens — pin traffic did not debit it"
+        );
+    }
+
+    /// #134 R2 (split buckets, second half): an EXHAUSTED CID bucket must
+    /// NOT block a valid signed `/api/v1/ipfs/pins` listing. The pre-fix
+    /// composition routed pins through the same middleware stack, so a CID
+    /// flood that exhausted the bucket would 429 the pins endpoint too. RED
+    /// before the split: a CID request that 429s the bucket makes the next
+    /// pin request 429 too. GREEN after the split: pins never see this
+    /// bucket and remain servable.
+    #[sqlx::test]
+    async fn ipfs_pins_survive_an_exhausted_cid_bucket(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let mut state = test_state(pool).await;
+        // Bucket size 1: the first /ipfs/{cid} request from the IP spends the
+        // only token; the second is 429 (proves exhaustion).
+        state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(600, Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+
+        let fx = seed_cid_repos(&slug, &short, &["pinsexh"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("pinsexh.git");
+        let repo = seed_repo(&owner_did, "pinsexh");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let cid = pin_cid_for(&bare, &fx.public_oid, &state.db).await;
+
+        let router = crate::server::build_router(state);
+        let peer_ip = "203.0.113.60";
+
+        // First /ipfs/{cid} request — debits the single CID token, serves 200.
+        let cid_path = format!("/ipfs/{cid}");
+        let cid_signed = sign_request(&kp, "GET", &cid_path, b"");
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(&cid_path)
+            .header("content-digest", cid_signed.content_digest)
+            .header("signature-input", cid_signed.signature_input)
+            .header("signature", cid_signed.signature)
+            .header("x-forwarded-for", peer_ip)
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the first CID request spends the token and serves"
+        );
+
+        // Second /ipfs/{cid} request — bucket empty → 429 (proves the
+        // exhaustion is real and observable on this router). Re-sign because
+        // `SignedHeaders` holds owned `String`s.
+        let cid_signed_2 = sign_request(&kp, "GET", &cid_path, b"");
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(&cid_path)
+            .header("content-digest", cid_signed_2.content_digest)
+            .header("signature-input", cid_signed_2.signature_input)
+            .header("signature", cid_signed_2.signature)
+            .header("x-forwarded-for", peer_ip)
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the second CID request from the same IP is 429 — bucket exhausted"
+        );
+
+        // A signed /api/v1/ipfs/pins request from the SAME IP must still
+        // serve 200 — pins are auth-only and never see this bucket.
+        let pins_path = "/api/v1/ipfs/pins";
+        let pins_signed = sign_request(&kp, "GET", pins_path, b"");
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(pins_path)
+            .header("content-digest", pins_signed.content_digest)
+            .header("signature-input", pins_signed.signature_input)
+            .header("signature", pins_signed.signature)
+            .header("x-forwarded-for", peer_ip)
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "an exhausted CID bucket must not block a valid signed pin listing"
+        );
+    }
+
     /// U5 (R6): the two buckets are independent — the WORK budget can be exhausted
     /// (429) WITHOUT draining the ROUTE bucket. Through the production router, route
     /// generous (5) but work tight (1): one request drives two legacy probes, so the

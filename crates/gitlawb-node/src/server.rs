@@ -210,29 +210,42 @@ pub fn build_router(state: AppState) -> Router {
     .layer(axum::Extension(push_limiter));
 
     // ── IPFS content-addressed retrieval and pin listing ──────────────────
-    // `/ipfs/{cid}` carries `optional_signature` so `get_by_cid` sees the caller
-    // identity and can apply per-repo visibility (#110); anonymous callers stay
-    // anonymous and still read genuinely public content. `/api/v1/ipfs/pins`
-    // now carries the same `optional_signature` layer: the handler rejects
-    // requests without a verified `AuthenticatedDid`, so unsigned callers are
-    // denied (anonymous enumeration closed; #121). `/ipfs/{cid}` also carries a
-    // per-IP flood brake: it is anon-reachable and each request can drive a
-    // full-history git walk, so the per-IP rate limiter is the outermost layer
-    // (rejects a flood before the walk-admission work), mirroring the
-    // push/create routers. The extension MUST be attached or rate_limit_by_ip
-    // is a silent no-op. Axum layers only cover routes added before them, so
-    // both `/ipfs/{cid}` and `/api/v1/ipfs/pins` are built first and the auth +
-    // rate-limit layers are applied to the merged result.
+    // Two independent sub-routers, then merged. They share a URL prefix family
+    // but have separate rate-limit policies and must not share a bucket.
+    //
+    // `/ipfs/{cid}` (CID resolver): carries `optional_signature` so `get_by_cid`
+    // sees the caller identity and can apply per-repo visibility (#110); anon
+    // callers stay anonymous and still read genuinely public content. The
+    // per-IP flood brake is layered on because the resolver is anon-reachable
+    // and each request can drive a full-history git walk — the brake is the
+    // outermost layer (rejects a flood before the walk-admission work), mirroring
+    // the push/create routers. The `IpRateLimiter` extension MUST be attached
+    // or `rate_limit_by_ip` is a silent no-op.
+    //
+    // `/api/v1/ipfs/pins` (pin listing): now carries `optional_signature` only
+    // (#121). The handler rejects requests without a verified `AuthenticatedDid`
+    // with 401. It does NOT carry the CID flood brake — `list_pins` is a single
+    // `list_pinned_cids()` call, no walk, and routing pins through the resolver's
+    // bucket would let `/ipfs/{cid}` traffic exhaust the bucket and 429 the
+    // pins endpoint, or let signed pin polling exhaust the bucket for legitimate
+    // CID reads. The two surfaces have separate availability contracts.
+    //
+    // Both sub-routers are built first with their own layer sets, then merged.
+    // This is the structure the prior routing guidance called for and the
+    // earlier 429 test for `/ipfs/{cid}` (test_support.rs) assumes.
     let ipfs_limiter = rate_limit::IpRateLimiter {
         limiter: state.ipfs_rate_limiter.clone(),
         trust: state.push_limiter_trust,
     };
-    let ipfs_routes = Router::new()
+    let ipfs_cid_routes = Router::new()
         .route("/ipfs/{cid}", get(ipfs::get_by_cid))
-        .merge(Router::new().route("/api/v1/ipfs/pins", get(ipfs::list_pins)))
         .layer(middleware::from_fn(auth::optional_signature))
         .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
         .layer(axum::Extension(ipfs_limiter));
+    let ipfs_pins_routes = Router::new()
+        .route("/api/v1/ipfs/pins", get(ipfs::list_pins))
+        .layer(middleware::from_fn(auth::optional_signature));
+    let ipfs_routes = ipfs_cid_routes.merge(ipfs_pins_routes);
 
     // ── Arweave permanent anchors ──────────────────────────────────────────
     // `list_anchors` rejects callers without a verified `AuthenticatedDid`, so
