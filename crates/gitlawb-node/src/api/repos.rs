@@ -3,6 +3,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use axum::Json;
 use bytes::Bytes;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::auth::{caller_authorized_to_push, AuthenticatedDid};
@@ -3121,6 +3122,40 @@ pub async fn list_federated_repos(
 
 // ── Fork ──────────────────────────────────────────────────────────────────
 
+/// Removes a fork's local mirror clone on every exit until disarmed after the
+/// database row commits.
+struct ForkCloneGuard(Option<PathBuf>);
+
+impl ForkCloneGuard {
+    fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        self.0
+            .as_deref()
+            .expect("fork clone guard disarmed while still in use")
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ForkCloneGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                tracing::warn!(
+                    path = %path.display(),
+                    err = %e,
+                    "failed to remove fork clone during attempt cleanup"
+                );
+            }
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ForkRepoRequest {
     pub name: Option<String>, // defaults to source repo name
@@ -3216,12 +3251,14 @@ pub async fn fork_repo(
         )));
     }
 
+    let mut clone_guard = ForkCloneGuard::new(disk_path.clone());
+
     // Upload fork to Tigris. Create-only: a refused precondition means an orphan
     // archive already sits under this key (a failed create_repo or another
     // writer), and proceeding would create a DB record whose archive is shadowed
     // by bytes that are not this fork. Refuse rather than accept a fork other
-    // nodes would fetch as unrelated content. Remove the local mirror clone so
-    // a refused fork does not leave a bare repo on disk.
+    // nodes would fetch as unrelated content. The clone guard removes the local
+    // mirror on every upload failure path.
     state
         .repo_store
         .release_after_write(&forker_did, &fork_name)
@@ -3234,13 +3271,6 @@ pub async fn fork_repo(
                     status,
                     "fork refused: an archive already exists under the fork's key"
                 );
-                if let Err(clean) = std::fs::remove_dir_all(&disk_path) {
-                    tracing::warn!(
-                        path = %disk_path.display(),
-                        err = %clean,
-                        "failed to remove fork clone after precondition loss"
-                    );
-                }
                 AppError::RepoExists(fork_name.clone())
             }
             other => AppError::Git(format!("fork upload failed: {other}")),
@@ -3256,18 +3286,31 @@ pub async fn fork_repo(
         default_branch: source.default_branch.clone(),
         created_at: now,
         updated_at: now,
-        disk_path: disk_path.to_string_lossy().to_string(),
+        disk_path: clone_guard.path().to_string_lossy().to_string(),
         forked_from: Some(source.id.clone()),
         machine_id: state.machine_id.clone(),
     };
 
     if let Err(e) = state.db.create_repo(&record).await {
+        if let Some(committed) = state.db.get_repo(&forker_short, &fork_name).await? {
+            clone_guard.disarm();
+            tracing::warn!(
+                fork = %fork_name,
+                forker = %forker_did,
+                "fork create_repo returned an error but the row is present — treating as success"
+            );
+            return Ok((StatusCode::CREATED, Json(to_response(&committed, &state, 0))));
+        }
+        clone_guard.disarm();
+        let disk_path_for_compensate = disk_path.clone();
         state
             .repo_store
-            .compensate_fork_archive(&forker_did, &fork_name, &disk_path)
+            .compensate_fork_archive(&forker_did, &fork_name, &disk_path_for_compensate)
             .await;
         return Err(e.into());
     }
+
+    clone_guard.disarm();
 
     // Persist the proof so the fork carries it when it propagates to peers.
     if let Some(p) = verified_proof {

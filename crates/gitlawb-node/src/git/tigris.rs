@@ -253,7 +253,7 @@ impl TigrisClient {
         target: &Path,
         publish: bool,
         swap_authority: Option<Arc<AtomicBool>>,
-    ) -> Result<PathBuf> {
+    ) -> Result<DownloadExtract> {
         let key = Self::repo_key(owner_slug, repo_name);
         debug!(key = %key, path = %target.display(), "downloading repo from tigris");
 
@@ -295,14 +295,11 @@ impl TigrisClient {
         let extracted = tokio::task::spawn_blocking({
             let target = target.to_path_buf();
             let snapshot_tmp = snapshot_tmp.clone();
-            move || -> Result<PathBuf> {
-                // Armed for the whole blocking extraction; disarmed on success via
-                // `mem::forget`, leaving the dir to the caller (RepoSnapshot::drop).
-                let cleanup = snapshot_tmp.as_ref().map(|p| SnapshotCleanup(p.clone()));
-                let result = (|| -> Result<PathBuf> {
+            move || -> Result<DownloadExtract> {
+                let result = (|| -> Result<DownloadExtract> {
                     if publish {
                         decompress_repo(&data, &target, swap_authority.as_ref())?;
-                        return Ok(target);
+                        return Ok(DownloadExtract::Published(target));
                     }
                     // Non-mutating snapshot: unpack into the temp dir decided above.
                     // The live repo path is never touched.
@@ -318,13 +315,8 @@ impl TigrisClient {
                         let _ = std::fs::remove_dir_all(&tmp_dir);
                         return Err(e);
                     }
-                    Ok(tmp_dir)
+                    Ok(DownloadExtract::Snapshot(TempSnapshotDir { path: tmp_dir }))
                 })();
-                if result.is_ok() {
-                    if let Some(guard) = cleanup {
-                        std::mem::forget(guard);
-                    }
-                }
                 result
             }
         })
@@ -382,18 +374,37 @@ pub(crate) fn publish_lock(local_path: &Path) -> Arc<Mutex<()>> {
         .clone()
 }
 
-/// Async-layer cleanup for a snapshot temp dir that the extraction's
-/// `spawn_blocking` created and that would otherwise outlive a cancelled
-/// `download_to` future. Armed before the extraction await, disarmed (via
-/// `mem::forget`) on success so `RepoSnapshot::drop` stays the single owner; on
-/// any other exit the dir is removed even though the extraction ran to
-/// completion.
-struct SnapshotCleanup(PathBuf);
+/// Owns a snapshot temp dir from extraction through handoff to [`RepoSnapshot`].
+/// Dropped when the `spawn_blocking` join result is abandoned, so cancellation
+/// before the outer future resumes still removes the directory.
+pub(crate) struct TempSnapshotDir {
+    path: PathBuf,
+}
 
-impl Drop for SnapshotCleanup {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+impl TempSnapshotDir {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
+
+    pub(crate) fn into_repo_snapshot(self) -> super::repo_store::RepoSnapshot {
+        let path = self.path.clone();
+        std::mem::forget(self);
+        super::repo_store::RepoSnapshot::from_owned_path(path)
+    }
+}
+
+impl Drop for TempSnapshotDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// What [`TigrisClient::download_to`] produced.
+pub enum DownloadExtract {
+    /// Published into the validated live repo path.
+    Published(PathBuf),
+    /// Unpacked into a throwaway temp dir that cleans up on drop until adopted.
+    Snapshot(TempSnapshotDir),
 }
 
 /// Decompress a tar.zst byte vector into a local directory.

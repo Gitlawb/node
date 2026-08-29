@@ -255,10 +255,12 @@ impl RepoStore {
                                 "tigris snapshot download failed during read_snapshot for {owner_slug}/{repo_name}: {e:#}"
                             ))
                         })?;
-                    return Ok(RepoSnapshot {
-                        path: snapshot.clone(),
-                        owned: true,
-                    });
+                    return match snapshot {
+                        super::tigris::DownloadExtract::Snapshot(dir) => Ok(dir.into_repo_snapshot()),
+                        super::tigris::DownloadExtract::Published(_) => {
+                            unreachable!("snapshot downloads never publish into the live path")
+                        }
+                    };
                 }
                 Ok(false) => {}
                 Err(e) => {
@@ -588,7 +590,7 @@ impl RepoStore {
                     //
                     // Refuse the acquire. Returning here drops the guard, whose Drop
                     // frees the lock and its pool slot.
-                    refresh_swap_authority.store(false, Ordering::Release);
+                    revoke_swap_authority(&refresh_swap_authority);
                     //
                     // `error!`, not the sibling `warn!` above, and that is deliberate.
                     // The handler layer demotes every `RepoUnavailable` to warn because
@@ -716,7 +718,9 @@ impl RepoStore {
 
     /// Best-effort cleanup when fork creation published an archive but failed to persist
     /// the database row. Removes the object-store key this attempt owns and the local
-    /// mirror clone so a retry is not blocked by its own orphan.
+    /// mirror clone so a retry is not blocked by its own orphan. Object-store deletion
+    /// is retried asynchronously when the first attempt fails so a transient DELETE does
+    /// not tombstone the fork name.
     pub async fn compensate_fork_archive(
         &self,
         owner_did: &str,
@@ -725,12 +729,21 @@ impl RepoStore {
     ) {
         if let Some(ref tigris) = self.tigris {
             if let Ok((owner_slug, _)) = self.local_path(owner_did, repo_name) {
-                if let Err(e) = tigris.delete(&owner_slug, repo_name).await {
-                    warn!(
-                        repo = %repo_name,
-                        err = %e,
-                        "failed to delete fork archive during create_repo compensation"
-                    );
+                match tigris.delete(&owner_slug, repo_name).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        warn!(
+                            repo = %repo_name,
+                            err = %e,
+                            "failed to delete fork archive during create_repo compensation — scheduling retry"
+                        );
+                        let tigris = tigris.clone();
+                        let slug = owner_slug.clone();
+                        let name = repo_name.to_string();
+                        tokio::spawn(async move {
+                            retry_fork_archive_delete(&tigris, &slug, &name).await;
+                        });
+                    }
                 }
             }
         }
@@ -740,6 +753,38 @@ impl RepoStore {
                 err = %e,
                 "failed to remove fork clone during create_repo compensation"
             );
+        }
+    }
+}
+
+async fn retry_fork_archive_delete(tigris: &TigrisClient, owner_slug: &str, repo_name: &str) {
+    const MAX_ATTEMPTS: u32 = 6;
+    for attempt in 0..MAX_ATTEMPTS {
+        match tigris.delete(owner_slug, repo_name).await {
+            Ok(()) => {
+                info!(
+                    repo = %repo_name,
+                    attempt,
+                    "fork archive compensation delete succeeded on retry"
+                );
+                return;
+            }
+            Err(e) if attempt + 1 < MAX_ATTEMPTS => {
+                warn!(
+                    repo = %repo_name,
+                    attempt,
+                    err = %e,
+                    "fork archive compensation delete failed — retrying"
+                );
+                tokio::time::sleep(Duration::from_secs(1u64 << attempt.min(4))).await;
+            }
+            Err(e) => {
+                warn!(
+                    repo = %repo_name,
+                    err = %e,
+                    "fork archive compensation delete failed after all retries — operator cleanup required"
+                );
+            }
         }
     }
 }
@@ -780,6 +825,21 @@ pub(crate) fn validated_repo_disk_path(
     Ok(local_path)
 }
 
+/// Revoke an in-flight publish swap. Any worker that has not yet claimed the
+/// commit token will refuse before touching the live tree.
+pub(crate) fn revoke_swap_authority(authority: &AtomicBool) {
+    authority.store(false, Ordering::Release);
+}
+
+/// Claim exclusive rights to perform the destructive publish swap. Revocation and
+/// commit are mutually exclusive: only one caller can win the `true -> false`
+/// transition, and that caller alone may remove/rename the live directory.
+pub(crate) fn try_claim_swap_commit(authority: &AtomicBool) -> bool {
+    authority
+        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
 /// Swap a finished extraction into a validated live repo path. The caller must pass
 /// the path returned from [`validated_repo_disk_path`]; this is the CodeQL barrier
 /// for `rust/path-injection` on the remove/rename sink.
@@ -791,7 +851,7 @@ pub(crate) fn swap_extracted_into_validated_repo(
     let lock = super::tigris::publish_lock(validated_path);
     let _publish = lock.lock().expect("publish lock poisoned");
     if let Some(authority) = swap_authority {
-        if !authority.load(Ordering::Acquire) {
+        if !try_claim_swap_commit(authority) {
             let _ = std::fs::remove_dir_all(tmp_dir);
             anyhow::bail!("publish swap revoked after lock ownership ended");
         }
@@ -801,6 +861,29 @@ pub(crate) fn swap_extracted_into_validated_repo(
     }
     std::fs::rename(tmp_dir, validated_path).context("swapping extracted repo into place")?;
     Ok(())
+}
+
+/// Remove a refused write from the unlocked read cache so `acquire` cannot serve
+/// a tree that never landed in object storage.
+fn invalidate_local_write_cache(local_path: &Path, repo_name: &str, reason: &str) {
+    if !local_path.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::remove_dir_all(local_path) {
+        warn!(
+            repo = %repo_name,
+            path = %local_path.display(),
+            err = %e,
+            reason,
+            "failed to invalidate local write cache after a refused publish"
+        );
+    } else {
+        debug!(
+            repo = %repo_name,
+            reason,
+            "invalidated local write cache after a refused publish"
+        );
+    }
 }
 
 /// Strict allowlist validator for `owner_did` and `repo_name`.
@@ -1087,6 +1170,10 @@ impl RepoSnapshot {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    pub(crate) fn from_owned_path(path: PathBuf) -> Self {
+        Self { path, owned: true }
+    }
 }
 
 impl Drop for RepoSnapshot {
@@ -1293,6 +1380,19 @@ impl RepoWriteGuard {
             warn!(repo = %self.repo_name, "write failed — skipping tigris upload to avoid propagating an inconsistent repo");
         }
 
+        if success {
+            match outcome {
+                ReleaseOutcome::Fenced | ReleaseOutcome::UploadFailed => {
+                    invalidate_local_write_cache(
+                        &self.local_path,
+                        &self.repo_name,
+                        "definite publish refusal",
+                    );
+                }
+                ReleaseOutcome::Released | ReleaseOutcome::UploadUnknowable => {}
+            }
+        }
+
         // Release the advisory lock on the SAME session that took it. Unlocking
         // through the pool would land on an arbitrary backend, where the call is a
         // silent no-op.
@@ -1349,7 +1449,7 @@ impl RepoWriteGuard {
 impl Drop for RepoWriteGuard {
     fn drop(&mut self) {
         if let Some(authority) = self.refresh_swap_authority.take() {
-            authority.store(false, Ordering::Release);
+            revoke_swap_authority(&authority);
         }
 
         let Some(mut conn) = self.conn.take() else {
@@ -1634,6 +1734,15 @@ mod tests {
         assert!(ReleaseOutcome::UploadUnknowable.into_result().is_err());
         assert!(ReleaseOutcome::UploadFailed.into_result().is_err());
         assert!(ReleaseOutcome::Fenced.into_result().is_err());
+    }
+
+    #[test]
+    fn swap_commit_token_is_exclusive() {
+        let authority = Arc::new(AtomicBool::new(true));
+        assert!(try_claim_swap_commit(&authority));
+        assert!(!try_claim_swap_commit(&authority));
+        revoke_swap_authority(&authority);
+        assert!(!try_claim_swap_commit(&authority));
     }
 
     #[test]
@@ -5065,11 +5174,16 @@ mod tests {
         // ... and the generation the retry HEADs for moves on before its PUT
         // can use it, so the second attempt loses too.
         mock.roll_generation_after_next_heads(1);
+        let local_path = guard.local_path.clone();
         let outcome = guard.release(true).await;
 
         assert!(
             matches!(outcome, ReleaseOutcome::Fenced),
             "a publish refused twice must be reported to the caller, got {outcome:?}"
+        );
+        assert!(
+            !local_path.exists(),
+            "a fenced publish must invalidate the local read cache"
         );
         let attempts = mock.put_attempts();
         assert_eq!(
