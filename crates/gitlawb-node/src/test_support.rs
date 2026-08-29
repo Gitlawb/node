@@ -187,40 +187,7 @@ mod tests {
     use crate::db::{AgentTask, RepoRecord};
     use axum::http::StatusCode;
     use chrono::Utc;
-    use std::sync::Mutex;
     use tower::ServiceExt;
-
-    static VALIDATE_GIT_BIN_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Serialize tests that override `GITLAWB_TEST_VALIDATE_GIT_BIN` (process-global).
-    struct ValidateGitBinTestOverride {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        prev: Option<String>,
-    }
-
-    impl ValidateGitBinTestOverride {
-        fn missing_git() -> Self {
-            let lock = VALIDATE_GIT_BIN_TEST_LOCK
-                .lock()
-                .expect("validate git bin test lock");
-            let prev = std::env::var("GITLAWB_TEST_VALIDATE_GIT_BIN").ok();
-            std::env::set_var(
-                "GITLAWB_TEST_VALIDATE_GIT_BIN",
-                "/nonexistent/gitlawb-validate-git",
-            );
-            Self { _lock: lock, prev }
-        }
-    }
-
-    impl Drop for ValidateGitBinTestOverride {
-        fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var("GITLAWB_TEST_VALIDATE_GIT_BIN", v),
-                None => std::env::remove_var("GITLAWB_TEST_VALIDATE_GIT_BIN"),
-            }
-        }
-    }
-
     fn seed_repo(owner_did: &str, name: &str) -> RepoRecord {
         let now = Utc::now();
         RepoRecord {
@@ -1082,6 +1049,8 @@ mod tests {
             ("source_branch", "feature."),
             ("source_branch", "feature/x."),
             ("source_branch", "refs/tags/v1"),
+            ("source_branch", "heads/main"),
+            ("source_branch", "tags/v1"),
             ("target_branch", "HEAD"),
             ("target_branch", "@"),
             ("target_branch", "@{-1}"),
@@ -1090,6 +1059,8 @@ mod tests {
             ("target_branch", "feature."),
             ("target_branch", "feature/x."),
             ("target_branch", "refs/heads/main"),
+            ("target_branch", "heads/main"),
+            ("target_branch", "tags/v1"),
         ] {
             let body_json = if field == "source_branch" {
                 format!(r#"{{"title":"x","source_branch":"{bad}","target_branch":"main"}}"#)
@@ -1141,6 +1112,9 @@ mod tests {
             ("trail-dot-comp", "feature/x."),
             ("tag-ref", "refs/tags/v1"),
             ("qualified-head", "refs/heads/main"),
+            ("heads-shorthand", "heads/main"),
+            ("tags-shorthand", "tags/v1"),
+            ("remotes-shorthand", "remotes/origin/main"),
         ] {
             let repo_name = format!("bad-def-{name_suffix}");
             let body = Body::from(format!(
@@ -1636,9 +1610,9 @@ mod tests {
     /// return git_error (500), not bad_request (400).
     #[sqlx::test]
     async fn create_pr_returns_git_error_when_validate_git_ref_cannot_spawn_git(pool: PgPool) {
-        let _git_override = ValidateGitBinTestOverride::missing_git();
         let owner = "did:key:zPRGITSPAWNAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        let state = test_state(pool).await;
+        let mut state = test_state(pool).await;
+        state.git_bin = "/nonexistent/gitlawb-validate-git".into();
         let repo = seed_repo(owner, "git-spawn-pr");
         state.db.create_repo(&repo).await.expect("seed repo");
 
@@ -1675,9 +1649,9 @@ mod tests {
 
     #[sqlx::test]
     async fn create_repo_returns_git_error_when_validate_git_ref_cannot_spawn_git(pool: PgPool) {
-        let _git_override = ValidateGitBinTestOverride::missing_git();
+        let mut state = test_state(pool).await;
+        state.git_bin = "/nonexistent/gitlawb-validate-git".into();
         let owner = "did:key:zREPOGITSPAWNAAAAAAAAAAAAAAAAAAAAAAAAA";
-        let state = test_state(pool).await;
 
         let router = Router::new()
             .route(

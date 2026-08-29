@@ -779,6 +779,10 @@ fn reject_revision_shorthand(name: &str) -> Option<&'static str> {
         "MERGE_HEAD",
         "CHERRY_PICK_HEAD",
         "RERERE_MERGE_HEAD",
+        "REBASE_HEAD",
+        "REVERT_HEAD",
+        "BISECT_HEAD",
+        "AUTO_MERGE",
     ];
     if PSEUDOREFS.contains(&name) {
         return Some("branch ref must not be a git pseudoref name");
@@ -786,39 +790,27 @@ fn reject_revision_shorthand(name: &str) -> Option<&'static str> {
     None
 }
 
-/// Validate a git *branch name* before it is stored or interpolated into a git
-/// argv element. Delegates to `git check-ref-format --branch`, then rejects
-/// fully qualified ref paths (`refs/heads/...`, `refs/tags/...`) that git would
-/// accept as branch-name syntax but that resolve as tags or other refs when
-/// passed back to git as bare revision arguments.
+/// Validate a git *branch name* before it is stored or passed to git subprocesses.
+/// Delegates to `git check-ref-format --branch`, then rejects fully qualified
+/// ref paths, revision-namespace shorthands (`heads/`, `tags/`, `remotes/`), and
+/// symbolic names that git would reinterpret at the sink.
 ///
-/// Symbolic revision names (`HEAD`), option-shaped names (leading `-`), trailing
-/// dots, and other invalid forms are rejected by check-ref-format itself.
-/// Revision shorthands that pass the grammar check (`@`, `@{-1}`, pseudorefs)
-/// are rejected explicitly because git treats them as symbolic revisions at the
-/// sink, not as literal branch names.
+/// At diff/merge/worktree sinks, validated short names are passed as
+/// `refs/heads/{name}` so grammar-valid revision shorthands cannot retarget another
+/// ref namespace. Symbolic revision names (`HEAD`), option-shaped names (leading `-`),
+/// trailing dots, and other invalid forms are rejected by check-ref-format itself.
+/// Revision shorthands that pass the grammar check (`@`, `@{-1}`, pseudorefs) are
+/// rejected explicitly because git treats them as symbolic revisions when bare.
 ///
-/// A `--` delimiter is not the fix at the sink: these arguments are revisions,
-/// and `--` there reinterprets them as pathspecs.
-///
-/// This is the sink-level guard. Storage boundaries (`create_pr`, `create_repo`)
-/// call it too via the `crate::api` re-export to fail fast with a 400, but the
-/// guard here is what makes the property hold for every caller and every row,
+/// Storage boundaries call this via [`validate_git_ref_with_git`] with the configured
+/// git binary. Sink functions call [`validate_git_ref`] (system `git`) then prefix
+/// before building argv, so the property holds for every caller and every row,
 /// including legacy rows and any writer that skipped the boundary check.
-fn validate_git_ref_binary() -> std::borrow::Cow<'static, str> {
-    #[cfg(test)]
-    if let Ok(bin) = std::env::var("GITLAWB_TEST_VALIDATE_GIT_BIN") {
-        return std::borrow::Cow::Owned(bin);
-    }
-    std::borrow::Cow::Borrowed("git")
-}
-
 pub fn validate_git_ref(name: &str) -> std::result::Result<(), GitRefValidationError> {
-    let git_bin = validate_git_ref_binary();
-    validate_git_ref_with_git(git_bin.as_ref(), name)
+    validate_git_ref_with_git("git", name)
 }
 
-fn validate_git_ref_with_git(
+pub(crate) fn validate_git_ref_with_git(
     git_bin: &str,
     name: &str,
 ) -> std::result::Result<(), GitRefValidationError> {
@@ -832,6 +824,11 @@ fn validate_git_ref_with_git(
             "branch ref must be a local branch name, not a fully qualified ref".into(),
         ));
     }
+    if name.starts_with("heads/") || name.starts_with("tags/") || name.starts_with("remotes/") {
+        return Err(GitRefValidationError::Invalid(
+            "branch ref must be a local branch name, not a revision shorthand".into(),
+        ));
+    }
     if let Some(reason) = reject_revision_shorthand(name) {
         return Err(GitRefValidationError::Invalid(reason.into()));
     }
@@ -840,6 +837,7 @@ fn validate_git_ref_with_git(
         .args(["check-ref-format", "--branch", name])
         .output()
         .map_err(|e| {
+            // allow-unbounded-git: stateless check-ref-format on user-supplied name; no repo acquire
             GitRefValidationError::GitUnavailable(format!(
                 "failed to run git check-ref-format: {e}"
             ))
@@ -870,14 +868,26 @@ fn guard_refs(target_branch: &str, source_branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// Stored short branch names are passed to git as explicit local-branch refs so a
+/// syntax-valid name cannot be reinterpreted as a revision shorthand at the sink.
+fn local_branch_ref(short_name: &str) -> String {
+    format!("refs/heads/{short_name}")
+}
+
 /// Get the diff between two branches: changes on source_branch not in target_branch.
 pub fn branch_diff(repo_path: &Path, target_branch: &str, source_branch: &str) -> Result<String> {
     guard_refs(target_branch, source_branch)?;
+    let target = local_branch_ref(target_branch);
+    let source = local_branch_ref(source_branch);
     let output = Command::new("git")
-        .args(["diff", &format!("{target_branch}...{source_branch}")])
+        .args(["diff", &format!("{target}...{source}")])
         .current_dir(repo_path)
         .output()
         .context("failed to run git diff")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git diff failed: {stderr}");
+    }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
@@ -891,13 +901,10 @@ pub fn branch_diff_names(
     source_branch: &str,
 ) -> Result<Vec<String>> {
     guard_refs(target_branch, source_branch)?;
+    let target = local_branch_ref(target_branch);
+    let source = local_branch_ref(source_branch);
     let output = Command::new("git")
-        .args([
-            "diff",
-            "--name-only",
-            "-z",
-            &format!("{target_branch}...{source_branch}"),
-        ])
+        .args(["diff", "--name-only", "-z", &format!("{target}...{source}")])
         .current_dir(repo_path)
         .output()
         .context("failed to run git diff --name-only")?;
@@ -926,6 +933,8 @@ pub fn merge_branch(
     pr_title: &str,
 ) -> Result<String> {
     guard_refs(target_branch, source_branch)?;
+    let target_ref = local_branch_ref(target_branch);
+    let source_ref = local_branch_ref(source_branch);
     let worktree_path = repo_path.join("_merge_worktree");
 
     // Clean up any leftover worktree
@@ -939,7 +948,7 @@ pub fn merge_branch(
 
     // Create worktree on target branch
     let wt = Command::new("git")
-        .args(["worktree", "add", "_merge_worktree", target_branch])
+        .args(["worktree", "add", "_merge_worktree", &target_ref])
         .current_dir(repo_path)
         .output()
         .context("failed to create worktree")?;
@@ -955,7 +964,7 @@ pub fn merge_branch(
         .args([
             "merge",
             "--no-ff",
-            source_branch,
+            &source_ref,
             "-m",
             &format!(
                 "Merge branch '{}' into {} ({})",
@@ -1039,6 +1048,9 @@ mod tests {
             "refs/heads/main",
             "refs/tags/v1",
             "refs/heads/--output=/tmp/x",
+            "heads/main",
+            "tags/v1",
+            "remotes/origin/main",
             "--output=/tmp/x",
             "-rf",
             "a b",

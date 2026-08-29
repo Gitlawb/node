@@ -57,9 +57,9 @@ pub async fn create_pr(
     // default_branch, but validating here as well means a PR can never feed the
     // git sink an unchecked ref even if a default was poisoned by an older row
     // or a future path that skips create_repo's gate.
-    crate::api::validate_git_ref(&req.source_branch)
+    crate::api::validate_git_ref_with_git(&state.git_bin, &req.source_branch)
         .map_err(crate::api::map_git_ref_validation_error)?;
-    crate::api::validate_git_ref(&target_branch)
+    crate::api::validate_git_ref_with_git(&state.git_bin, &target_branch)
         .map_err(crate::api::map_git_ref_validation_error)?;
     let number = state.db.next_pr_number(&record.id).await?;
     let now = Utc::now().to_rfc3339();
