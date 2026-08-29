@@ -2556,6 +2556,20 @@ async fn post_receive_replication_tail(
         Arc<tokio::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>>,
     >,
 ) {
+    let durability_wait = std::time::Duration::from_secs(
+        state
+            .config
+            .lock_held_transfer_timeout_secs
+            .saturating_add(5),
+    );
+    if !publish_durability_confirmed(&publish_durability, durability_wait).await {
+        tracing::warn!(
+            repo = %record.id,
+            "skipping post-receive tail: publish durability was not confirmed"
+        );
+        return;
+    }
+
     // Replication enforcement (Phase 2): decide once per push whether the public
     // may read this repo at all and, if so, which blob OIDs must not leave the
     // node. `withheld == None` means this push pins nothing (private / mode A /
@@ -2726,21 +2740,6 @@ async fn post_receive_replication_tail(
             rules_opt.clone(),
             record.is_public,
         ));
-    }
-
-    let durability_wait = std::time::Duration::from_secs(
-        state
-            .config
-            .lock_held_transfer_timeout_secs
-            .saturating_add(5),
-    );
-    if announce_at_root && !publish_durability_confirmed(&publish_durability, durability_wait).await
-    {
-        tracing::warn!(
-            repo = %record.id,
-            "skipping pinata/gossip tail: publish durability was not confirmed"
-        );
-        return;
     }
 
     // Pin new git objects to Pinata, then record branch→CID and gossip.
@@ -3573,6 +3572,21 @@ mod tests {
         )));
         assert!(
             !publish_durability_confirmed(&Some(slot), std::time::Duration::from_millis(5)).await
+        );
+    }
+
+    #[test]
+    fn fork_clone_guard_removes_mirror_on_drop() {
+        let root = tempfile::TempDir::new().unwrap();
+        let mirror = root.path().join("fork.git");
+        std::fs::create_dir_all(&mirror).unwrap();
+        {
+            let _guard = ForkCloneGuard::new(mirror.clone());
+            assert!(mirror.exists());
+        }
+        assert!(
+            !mirror.exists(),
+            "dropping the fork clone guard must remove the mirror directory"
         );
     }
 
@@ -9911,6 +9925,43 @@ mod tests {
     }
 
     const F2A_PUSHER: &str = "did:key:z6MkF2aPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    /// When publish durability is fenced, the tail must not run walks or take
+    /// coalescing keys before returning.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn post_receive_tail_skips_all_work_when_publish_fenced(pool: sqlx::PgPool) {
+        let repo = tempfile::TempDir::new().unwrap();
+        let bin = tempfile::TempDir::new().unwrap();
+        let log = bin.path().join("git.log");
+        let git_bin = f2a_logging_git(bin.path(), &log);
+        u5_init_repo(repo.path());
+        let c1 = u5_commit_file(repo.path(), "a.txt", "one\n");
+        let (state, rec) = f2a_state(pool, &git_bin, "z6f2afence", "fence-repo", false).await;
+        let slot = Arc::new(tokio::sync::Mutex::new(Some(
+            crate::git::repo_store::ReleaseOutcome::Fenced,
+        )));
+        post_receive_replication_tail(
+            state.clone(),
+            rec,
+            f2a_update("refs/heads/main", &c1),
+            repo.path().to_path_buf(),
+            F2A_PUSHER.to_string(),
+            Some(slot),
+        )
+        .await;
+        assert_eq!(
+            f2a_walks(&log),
+            0,
+            "a fenced publish must not run the replication walk; log:\n{}",
+            f2a_log(&log)
+        );
+        assert_eq!(
+            state.encrypt_inflight.len(),
+            0,
+            "a fenced publish must not take the per-repo coalescing key"
+        );
+    }
 
     /// Scenario 1 (the finding). A second rapid push to the same repo coalesces
     /// WITHOUT running the withheld walk. Asserted on the walk's git children, not

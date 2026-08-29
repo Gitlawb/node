@@ -289,7 +289,7 @@ pub async fn close_issue(
     // close requests for arbitrary issue ids. Applied after the read gate so a
     // denied reader still sees 404, not 429.
     if let Some(key) = crate::rate_limit::client_key(&headers, peer, state.push_limiter_trust) {
-        if !state.push_rate_limiter.check(&key).await {
+        if !state.close_issue_rate_limiter.check(&key).await {
             tracing::warn!(repo = %repo, key = %key, "close_issue rate limited");
             return Err(AppError::TooManyRequests(
                 "rate limit exceeded — try again later".into(),
@@ -1105,7 +1105,7 @@ mod lock_pool_shed_tests {
         let owner = "did:key:zCLOSERATEOWNERAAAAAAAAAAAAAAAAAAAAAAA";
         let stranger = "did:key:zCLOSERATESTRANGERBBBBBBBBBBBBBBBBBB";
         let mut state = crate::test_support::test_state(pool).await;
-        state.push_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.close_issue_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
 
         let mut repo = seed_repo(owner, "priv-close");
@@ -1114,8 +1114,8 @@ mod lock_pool_shed_tests {
 
         let peer: SocketAddr = "203.0.113.88:7000".parse().unwrap();
         assert!(
-            state.push_rate_limiter.check(&peer.ip().to_string()).await,
-            "exhaust the peer bucket before close_issue"
+            state.close_issue_rate_limiter.check(&peer.ip().to_string()).await,
+            "exhaust the close_issue bucket before close_issue"
         );
 
         let res = close_issue(
@@ -1131,6 +1131,29 @@ mod lock_pool_shed_tests {
             matches!(res, Err(AppError::RepoNotFound(_))),
             "a non-reader must see 404, not 429, even when rate limited: {:?}",
             res
+        );
+    }
+
+    /// close_issue and receive-pack must not share one per-IP bucket.
+    #[sqlx::test]
+    async fn close_issue_rate_limit_does_not_drain_push_bucket(pool: PgPool) {
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.close_issue_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.push_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let peer: SocketAddr = "203.0.113.99:7000".parse().unwrap();
+        let key = peer.ip().to_string();
+        assert!(
+            state.close_issue_rate_limiter.check(&key).await,
+            "exhaust only the close_issue bucket"
+        );
+        assert!(
+            state.push_rate_limiter.check(&key).await,
+            "push traffic must keep its own bucket after close_issue is exhausted"
         );
     }
 

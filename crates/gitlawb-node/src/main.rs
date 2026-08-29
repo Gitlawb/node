@@ -346,6 +346,23 @@ async fn main() -> Result<()> {
         tracing::warn!("GITLAWB_PUSH_RATE_LIMIT=0 — per-IP push rate limiting disabled");
     }
 
+    // close_issue drives a full archive download for non-owner author pre-checks.
+    // Keep it on its own bucket so it cannot drain the receive-pack limit.
+    let close_issue_limit = std::env::var("GITLAWB_CLOSE_ISSUE_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(120);
+    let close_issue_rate_limiter = rate_limit::RateLimiter::new_bounded(
+        close_issue_limit,
+        std::time::Duration::from_secs(3600),
+        200_000,
+    );
+    if close_issue_limit == 0 {
+        tracing::warn!(
+            "GITLAWB_CLOSE_ISSUE_RATE_LIMIT=0 — per-IP close_issue rate limiting disabled"
+        );
+    }
+
     // Which forwarded header the edge is trusted to set. Default None (trust
     // nothing, key on the socket peer). Fly nodes set GITLAWB_TRUSTED_PROXY=fly;
     // a node behind Caddy/NGINX sets it to x-forwarded-for.
@@ -395,6 +412,7 @@ async fn main() -> Result<()> {
         rate_limiter,
         create_ip_rate_limiter,
         push_rate_limiter,
+        close_issue_rate_limiter,
         ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
         ipfs_max_legacy_probes: AppState::ipfs_legacy_probe_budget(&config),
         ipfs_legacy_scan_page_rows: crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS,
@@ -1106,6 +1124,7 @@ mod rate_limiter_sweep_tests {
         state.rate_limiter = RateLimiter::new(10, window);
         state.create_ip_rate_limiter = RateLimiter::new(10, window);
         state.push_rate_limiter = RateLimiter::new(10, window);
+        state.close_issue_rate_limiter = RateLimiter::new(10, window);
         state.sync_trigger_rate_limiter = RateLimiter::new(10, window);
         state.peer_write_rate_limiter = RateLimiter::new(10, window);
         state.ipfs_rate_limiter = RateLimiter::new(10, window);
@@ -1115,6 +1134,7 @@ mod rate_limiter_sweep_tests {
                 s.rate_limiter.clone(),
                 s.create_ip_rate_limiter.clone(),
                 s.push_rate_limiter.clone(),
+                s.close_issue_rate_limiter.clone(),
                 s.sync_trigger_rate_limiter.clone(),
                 s.peer_write_rate_limiter.clone(),
                 s.ipfs_rate_limiter.clone(),
