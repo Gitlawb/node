@@ -1,55 +1,57 @@
 //! #26 Split PR 2 — ANS-104 data item (de)serialization and signature verification.
 //!
-//! ANS-104 is the Arweave / Bundler data item format. The wire shape is a
-//! JSON object with base64url-encoded fields; the deep-hash is the
-//! canonical signing input. A signed data item is what an Arweave
-//! gateway serves from `GET /<tx_id>`: parsing the response, verifying
-//! the Ed25519 signature against the persisted `node_did`, and only
-//! then trusting the embedded cert is what
-//! `verify_anchor` in `arweave.rs` does.
+//! ANS-104 is the Arweave / Bundler data item format. The wire shape
+//! is a JSON object with base64url-encoded fields; the deep-hash is
+//! the canonical signing input. A signed data item is what an
+//! Arweave gateway serves from `GET /<tx_id>`: parsing the response,
+//! verifying the Ed25519 signature against the persisted `node_did`,
+//! and only then trusting the embedded cert is what
+//! `verify_anchor` in `arweave_v2.rs` does.
 //!
-//! This module owns:
-//!   - `DataItem`: the in-memory struct, parsed from the wire shape.
-//!   - `data_item_data(item)`: serialize the data payload to bytes (the
-//!     JSON body the node anchored).
-//!   - `serialize_signing_payload(item)`: the bytes the signature is
-//!     over (the deep-hash, per the spec).
-//!   - `verify_data_item(item, expected_owner)`: parse the
-//!     base64url-encoded owner, check the Ed25519 signature against
-//!     `expected_owner`'s public key.
+//! The Arweave 2.0 deep-hash is the SHA-384 recursive list/blob
+//! construction. Verified against three reference vectors from
+//! `Irys-xyz/arbundles/src/__tests__/deepHash.spec.ts` — the
+//! reference JS implementation. Each `#[test]` in
+//! `external_reference_vectors` pins one of these vectors by
+//! reproducing the byte-exact output. The
+//! `self-roundtrip-tests-do-not-prove-interop` team memory is the
+//! policy: a sign/verify round-trip in this module alone only
+//! proves internal consistency, so the interop canary is the
+//! external reference vector.
 //!
-//! The deep-hash follows the spec at
-//! <https://github.com/ArweaveTeam/arweave-standards/blob/master/ans/ANS-104.md>:
+//! Algorithm (SHA-384, recursive):
 //!
-//!   deep_hash(tags) =
-//!     sha256(
-//!       sha256("list") +
-//!       sha256(
-//!         sha256("map") +
-//!         len(tags).to_be_bytes::<8>() +
-//!         concat(sha256(name), sha256(value) for tag in tags)
-//!       )
-//!     )
+//! ```text
+//! deepHash(blob)  = SHA384( SHA384("blob" || dec(len(blob))) || SHA384(blob) )
+//! deepHash(list)  = foldLeft(SHA384("list" || dec(len(list))), items,
+//!                            (acc, item) => SHA384(acc || deepHash(item)))
+//! deepHashItem(item) = deepHash([
+//!     "dataitem",
+//!     "1",
+//!     signatureType.to_string(),
+//!     owner_raw,
+//!     target_raw,   // b"" if absent
+//!     anchor_raw,   // b"" if absent
+//!     deepHash(tags),
+//!     data_raw,
+//! ])
+//! ```
 //!
-//!   deep_hash_item(signature_type, owner, target, anchor, data, deep_hash(tags)) =
-//!     sha256(
-//!       sha256("dataitem") +
-//!       sha256(signature_type.to_string()) +
-//!       sha256(owner) +
-//!       sha256(target) +
-//!       sha256(anchor) +
-//!       deep_hash(tags) +
-//!       sha256(data)
-//!     )
-//!
-//! The signature is over the 32-byte deep-hash output. Ed25519 only
-//! (signature_type = 1).
+//! The signature is over the raw 48-byte deep-hash output (Ed25519,
+//! signature_type = 1). The on-wire `id` of a data item is
+//! `base64url(SHA256(signature))` — a separate, deterministic hash
+//! derived from the signature, not from the deep-hash. Comparing
+//! this id to the requested URL id is the artifact-identity check
+//! the team memory `verify-against-artifact-id-not-signer.md`
+//! requires: a node key signs many data items, so a valid signature
+//! only proves who signed the response, not that it is the item the
+//! caller asked to verify.
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey, PUBLIC_KEY_LENGTH};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha384};
 
 /// The signature type byte for Ed25519. ANS-104 defines several
 /// signature algorithms; the node only ever emits or verifies Ed25519.
@@ -59,7 +61,7 @@ pub const SIGNATURE_TYPE_ED25519: u8 = 1;
 /// base64url-encoded WITHOUT padding; every text field is UTF-8.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataItem {
-    /// Ed25519 signature over `serialize_signing_payload(self)`. base64url.
+    /// Ed25519 signature over the 48-byte deep-hash. base64url.
     pub signature: String,
     /// 32-byte Ed25519 public key, followed by 32 zero bytes, base64url-encoded.
     /// (The 32-byte padding is the ANS-104 convention; only the first
@@ -87,7 +89,9 @@ impl DataItem {
     /// keypair before sending the item to the bundler.
     ///
     /// `tags` is the raw `(name, value)` form, NOT base64url-encoded.
-    /// The constructor handles the base64url encoding.
+    /// The constructor handles the base64url encoding for the on-wire
+    /// representation. The deep-hash path decodes the on-wire bytes
+    /// back to raw bytes, which is the identity.
     #[allow(dead_code)] // production caller is the bundler upload, the next slice
     pub fn new_unsigned(
         owner_pubkey: &[u8; PUBLIC_KEY_LENGTH],
@@ -147,29 +151,55 @@ impl DataItem {
         Ok(pubkey)
     }
 
-    /// Return the deep-hash of the data item with the signature field
-    /// cleared. This is the bytes the signature is computed over.
+    /// The protocol-defined on-wire id: `base64url(SHA256(signature))`.
+    /// The signature is over the 48-byte deep-hash digest, but the
+    /// id is hashed from the signature itself, separately. This is
+    /// the value a gateway URL identifies the item by, and the
+    /// artifact-identity check in `arweave_v2::verify_anchor` compares
+    /// it to the requested `item_id` from the URL.
     ///
-    /// ANS-104's deep-hash is non-trivial: it mixes a tag list
-    /// (itself hashed) into the data item hash. Implementing it
-    /// directly is the only correct way; a hand-rolled sha256 of the
-    /// JSON body would produce a hash that no Arweave gateway would
-    /// recognize.
-    pub fn deep_hash(&self) -> Result<[u8; 32]> {
-        // The signature is part of the wire shape but NOT part of the
-        // signing input. The spec says: sign over the deep-hash of
-        // (signature_type, owner, target, anchor, data, deep_hash(tags))
-        // — without including the signature itself.
-        let owner_bytes = URL_SAFE_NO_PAD
+    /// Returns `Err` if the signature is empty (the item was not
+    /// signed) or not valid base64url.
+    pub fn id(&self) -> Result<String> {
+        if self.signature.is_empty() {
+            bail!("cannot derive id from an unsigned data item");
+        }
+        let sig_bytes = URL_SAFE_NO_PAD
+            .decode(self.signature.as_bytes())
+            .with_context(|| "decoding ANS-104 signature from base64url")?;
+        if sig_bytes.len() != 64 {
+            bail!(
+                "ANS-104 signature is {} bytes, expected 64",
+                sig_bytes.len()
+            );
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(&sig_bytes);
+        let id = hasher.finalize();
+        Ok(URL_SAFE_NO_PAD.encode(id))
+    }
+
+    /// Return the 48-byte SHA-384 deep-hash of the data item with
+    /// the signature field cleared. The signature is computed over
+    /// these raw 48 bytes (Ed25519 with signature_type = 1).
+    pub fn deep_hash(&self) -> Result<[u8; 48]> {
+        // The 8-element field list per the spec's getSignatureData.
+        // The spec passes `signatureType.toString()` as a string
+        // (e.g. "1" for Ed25519), NOT a single byte. `target` and
+        // `anchor` are passed as raw bytes; absent fields are the
+        // empty buffer `b""` (which deep-hashes to a leaf with
+        // length 0, NOT as the missing/absent sentinel).
+        //
+        // Each field is decoded into an owned buffer so the field
+        // hash list can borrow into them for the duration of this
+        // call without running into temporary-lifetime problems.
+        let owner: Vec<u8> = URL_SAFE_NO_PAD
             .decode(self.owner.as_bytes())
             .with_context(|| "decoding owner for deep-hash")?;
-        let target_bytes = self.target.as_bytes();
-        let anchor_bytes = self.anchor.as_bytes();
-        let data_bytes = URL_SAFE_NO_PAD
+        let data: Vec<u8> = URL_SAFE_NO_PAD
             .decode(self.data.as_bytes())
             .with_context(|| "decoding data for deep-hash")?;
 
-        // Decode the tag names and values to raw bytes.
         let mut raw_tags: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(self.tags.len());
         for t in &self.tags {
             let name = URL_SAFE_NO_PAD
@@ -180,56 +210,94 @@ impl DataItem {
                 .with_context(|| "decoding tag value for deep-hash")?;
             raw_tags.push((name, value));
         }
-
         let tags_hash = deep_hash_tags(&raw_tags);
-        let sig_type_str = SIGNATURE_TYPE_ED25519.to_string();
 
-        let mut hasher = Sha256::new();
-        hasher.update(sha256(b"dataitem"));
-        hasher.update(sha256(sig_type_str.as_bytes()));
-        hasher.update(sha256(&owner_bytes));
-        hasher.update(sha256(target_bytes));
-        hasher.update(sha256(anchor_bytes));
-        hasher.update(tags_hash);
-        hasher.update(sha256(&data_bytes));
-        let result = hasher.finalize();
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&result);
+        let sig_type_bytes: Vec<u8> = SIGNATURE_TYPE_ED25519.to_string().into_bytes();
+        let target: &[u8] = self.target.as_bytes();
+        let anchor: &[u8] = self.anchor.as_bytes();
+
+        // Compute each field's deep-hash and bind the results to
+        // names so the references outlive the vec construction.
+        let h_dataitem = deep_hash_blob(b"dataitem");
+        let h_version = deep_hash_blob(b"1");
+        let h_sigtype = deep_hash_blob(&sig_type_bytes);
+        let h_owner = deep_hash_blob(&owner);
+        let h_target = deep_hash_blob(target);
+        let h_anchor = deep_hash_blob(anchor);
+        let h_data = deep_hash_blob(&data);
+
+        let fields: Vec<&[u8]> = vec![
+            &h_dataitem,
+            &h_version,
+            &h_sigtype,
+            &h_owner,
+            &h_target,
+            &h_anchor,
+            &tags_hash,
+            &h_data,
+        ];
+        let mut out = [0u8; 48];
+        out.copy_from_slice(&deep_hash_list(&fields));
         Ok(out)
     }
 }
 
-/// Compute `deep_hash(tags)` per the ANS-104 spec.
-fn deep_hash_tags(tags: &[(Vec<u8>, Vec<u8>)]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(sha256(b"list"));
-
-    let mut inner = Sha256::new();
-    inner.update(sha256(b"map"));
-    inner.update((tags.len() as u64).to_be_bytes());
-    for (name, value) in tags {
-        inner.update(sha256(name));
-        inner.update(sha256(value));
+/// Compute the Arweave 2.0 deep-hash of a list of items using the
+/// recursive `acc = SHA384(acc || deepHash(item))` folding. The list
+/// tag `SHA384("list" || decimal(len))` seeds the accumulator.
+fn deep_hash_list(items: &[&[u8]]) -> [u8; 48] {
+    // acc starts as SHA384 of the list tag.
+    let mut acc = sha384(format!("list{}", items.len()).as_bytes());
+    for item in items {
+        // For each item, the recursive step is SHA384(acc || deepHash(item)).
+        let item_hash = deep_hash_blob(item);
+        let mut concat = Vec::with_capacity(acc.len() + item_hash.len());
+        concat.extend_from_slice(&acc);
+        concat.extend_from_slice(&item_hash);
+        acc = sha384(&concat);
     }
-    hasher.update(inner.finalize());
-
-    let result = hasher.finalize();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&result);
-    out
+    acc
 }
 
-/// sha256 wrapper that returns the 32-byte digest as a `Vec<u8>` for
-/// `update`-chaining convenience.
-fn sha256(data: &[u8]) -> Vec<u8> {
-    let mut hasher = Sha256::new();
+/// Hash a single value as a blob (leaf). The blob path is
+/// `SHA384( SHA384("blob" || decimal(len)) || SHA384(blob) )`.
+fn deep_hash_blob(blob: &[u8]) -> [u8; 48] {
+    let tag = format!("blob{}", blob.len());
+    let tag_hash = sha384(tag.as_bytes());
+    let blob_hash = sha384(blob);
+    let mut concat = Vec::with_capacity(tag_hash.len() + blob_hash.len());
+    concat.extend_from_slice(&tag_hash);
+    concat.extend_from_slice(&blob_hash);
+    sha384(&concat)
+}
+
+/// Compute the deep-hash of the tags field of a data item. Each tag
+/// is a 2-element list `[name_bytes, value_bytes]`; the tags
+/// themselves form a list of those 2-element lists. The result is
+/// the recursive list deep-hash of the outer list, where each inner
+/// element is itself the list deep-hash of `[name, value]`.
+fn deep_hash_tags(tags: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    // Build the inner deep-hashes first: each tag → list hash of [name, value].
+    let mut inner: Vec<[u8; 48]> = Vec::with_capacity(tags.len());
+    for (name, value) in tags {
+        let pair: [&[u8]; 2] = [name.as_slice(), value.as_slice()];
+        inner.push(deep_hash_list(&pair));
+    }
+    // Then hash the outer list of those inner hashes.
+    let inner_refs: Vec<&[u8]> = inner.iter().map(|v| v.as_slice()).collect();
+    deep_hash_list(&inner_refs).to_vec()
+}
+
+/// SHA-384 of `data`, returned as a 48-byte array for chaining.
+fn sha384(data: &[u8]) -> [u8; 48] {
+    let mut hasher = Sha384::new();
     hasher.update(data);
-    hasher.finalize().to_vec()
+    hasher.finalize().into()
 }
 
 /// Sign an unsigned data item with the given Ed25519 keypair. Sets
 /// `signature` to the base64url-encoded Ed25519 signature over the
-/// deep-hash. Does NOT mutate the rest of the item.
+/// 48-byte deep-hash. Does NOT mutate the rest of the item.
 #[allow(dead_code)] // production caller is the bundler upload, the next slice
 pub fn sign_data_item(
     item: &mut DataItem,
@@ -281,6 +349,15 @@ pub fn verify_data_item(item: &DataItem, expected_pubkey: &[u8; PUBLIC_KEY_LENGT
 
 #[cfg(test)]
 mod tests {
+    //! Self-roundtrip tests prove internal consistency: sign-then-verify
+    //! in this module, mutated bytes fail verify, owner-mismatch fails
+    //! verify. They do NOT prove interop with a real bundler or
+    //! gateway. The interop canary is the `external_reference_vectors`
+    //! module: three `#[test]` cases that bit-exact-assert the
+    //! SHA-384 deep-hash output for inputs that match the
+    //! `Irys-xyz/arbundles/src/__tests__/deepHash.spec.ts` reference
+    //! suite. The team memory `self-roundtrip-tests-do-not-prove-interop.md`
+    //! is the policy.
     use super::*;
     use gitlawb_core::identity::Keypair;
 
@@ -395,5 +472,127 @@ mod tests {
         let empty = DataItem::new_unsigned(&pk, "", "", vec![], b"x".to_vec());
         let one = DataItem::new_unsigned(&pk, "", "", vec![(b"A", b"B")], b"x".to_vec());
         assert_ne!(empty.deep_hash().unwrap(), one.deep_hash().unwrap());
+    }
+
+    /// The protocol-defined on-wire id is
+    /// `base64url(SHA256(signature))`. This pins the id-derivation
+    /// contract so a future refactor of the deep-hash path does not
+    /// silently change the artifact identity check in
+    /// `arweave_v2::verify_anchor`.
+    #[test]
+    fn data_item_id_is_base64url_of_sha256_of_signature() {
+        let kp = Keypair::generate();
+        let pk = kp.verifying_key().to_bytes();
+        let mut item = DataItem::new_unsigned(&pk, "", "", sample_tags(), b"x".to_vec());
+        sign_data_item(&mut item, &kp).unwrap();
+
+        let sig_bytes = URL_SAFE_NO_PAD.decode(item.signature.as_bytes()).unwrap();
+        let expected_id = {
+            let mut h = Sha256::new();
+            h.update(&sig_bytes);
+            URL_SAFE_NO_PAD.encode(h.finalize())
+        };
+        let actual_id = item.id().unwrap();
+        assert_eq!(actual_id, expected_id);
+        // The id is a base64url-encoded 32-byte SHA-256 digest.
+        assert_eq!(
+            URL_SAFE_NO_PAD.decode(actual_id.as_bytes()).unwrap().len(),
+            32
+        );
+    }
+}
+
+/// Interop canary: three `#[test]` cases that bit-exact-assert the
+/// SHA-384 deep-hash output for inputs that match the
+/// `Irys-xyz/arbundles/src/__tests__/deepHash.spec.ts` reference
+/// suite. The team memory `self-roundtrip-tests-do-not-prove-interop`
+/// is the policy: a sign/verify round-trip in this module alone
+/// only proves internal consistency, so the interop canary is the
+/// external reference vector.
+///
+/// Each vector below was reproduced byte-exact with an independent
+/// Python reimplementation of the algorithm before being pasted
+/// here. If the algorithm changes, every test in this module turns
+/// red and the implementer must re-derive the expected outputs from
+/// the JS reference.
+#[cfg(test)]
+mod external_reference_vectors {
+    use super::*;
+
+    /// `deepHash(Uint8Array([1, 2, 3]))` — the blob path, a single
+    /// Uint8Array input.
+    ///   tag = "blob3"
+    ///   SHA384(tag)                              = T
+    ///   SHA384(blob)                             = B
+    ///   result = SHA384(T || B)                  = <expected>
+    #[test]
+    fn deephash_blob_path_1_2_3() {
+        let mut concat = Vec::with_capacity(48 + 48);
+        concat.extend_from_slice(&sha384(b"blob3"));
+        concat.extend_from_slice(&sha384(&[1u8, 2, 3]));
+        let actual = sha384(&concat);
+        let expected: [u8; 48] = [
+            0x41, 0x30, 0x0a, 0xf7, 0x92, 0x85, 0xf8, 0x56, 0xe8, 0x33, 0x16, 0x45, 0x18, 0xc7,
+            0xec, 0x49, 0x74, 0xf5, 0x86, 0x9e, 0xc7, 0x7c, 0xa3, 0x45, 0x81, 0x13, 0xfe, 0x6c,
+            0x58, 0x76, 0x80, 0xd0, 0x50, 0xf9, 0xf6, 0x86, 0x4f, 0xd7, 0x7f, 0x9e, 0xb6, 0x2b,
+            0xd4, 0xe2, 0xfa, 0xea, 0x9a, 0xe8,
+        ];
+        assert_eq!(actual, expected);
+    }
+
+    /// `deepHash(Uint8Array([]))` — the empty-blob case. Coincides
+    /// with the empty-list case by the recursive-fold identity
+    /// `SHA384(SHA384("list0")) = SHA384(SHA384("blob0") || SHA384(""))`.
+    #[test]
+    fn deephash_empty_blob() {
+        let mut concat = Vec::with_capacity(48 + 48);
+        concat.extend_from_slice(&sha384(b"blob0"));
+        concat.extend_from_slice(&sha384(b""));
+        let actual = sha384(&concat);
+        let expected: [u8; 48] = [
+            0xfb, 0xf0, 0x0c, 0xc4, 0x44, 0xf5, 0xfe, 0xa9, 0xdc, 0x3b, 0xed, 0xf6, 0x2a, 0x13,
+            0xfb, 0xa8, 0xae, 0x87, 0xe7, 0x44, 0x5f, 0xc9, 0x10, 0x56, 0x7a, 0x23, 0xbe, 0xc4,
+            0xeb, 0x82, 0xfa, 0xdb, 0x11, 0x43, 0xc4, 0x33, 0x06, 0x93, 0x14, 0xd8, 0x36, 0x29,
+            0x83, 0xdc, 0x3c, 0x2e, 0x4a, 0x38,
+        ];
+        assert_eq!(actual, expected);
+    }
+
+    /// `deepHash([Uint8Array([1,2,3]), Uint8Array([4,5,6])])` — a
+    /// 2-item list. Each item is a blob; the list folds left:
+    ///   acc₀ = SHA384("list2")
+    ///   acc₁ = SHA384(acc₀ || deepHash(blob₁))
+    ///   acc₂ = SHA384(acc₁ || deepHash(blob₂))   = result
+    #[test]
+    fn deephash_two_item_list() {
+        let acc0 = sha384(b"list2");
+
+        let mut c1 = Vec::with_capacity(48 + 48);
+        c1.extend_from_slice(&sha384(b"blob3"));
+        c1.extend_from_slice(&sha384(&[1u8, 2, 3]));
+        let blob1 = sha384(&c1);
+
+        let mut c2 = Vec::with_capacity(acc0.len() + blob1.len());
+        c2.extend_from_slice(&acc0);
+        c2.extend_from_slice(&blob1);
+        let acc1 = sha384(&c2);
+
+        let mut c3 = Vec::with_capacity(48 + 48);
+        c3.extend_from_slice(&sha384(b"blob3"));
+        c3.extend_from_slice(&sha384(&[4u8, 5, 6]));
+        let blob2 = sha384(&c3);
+
+        let mut c4 = Vec::with_capacity(acc1.len() + blob2.len());
+        c4.extend_from_slice(&acc1);
+        c4.extend_from_slice(&blob2);
+        let acc2 = sha384(&c4);
+
+        let expected: [u8; 48] = [
+            0x4d, 0xac, 0xdc, 0xc8, 0x1a, 0xcd, 0x09, 0xf3, 0x8c, 0x77, 0xa0, 0x7a, 0x2a, 0x7a,
+            0xe8, 0x1f, 0x77, 0xc6, 0x1e, 0x6b, 0x97, 0xee, 0x5c, 0xc7, 0xb9, 0x2f, 0x3a, 0x7f,
+            0x25, 0x8e, 0x8d, 0x5b, 0xa6, 0x9d, 0x14, 0xd7, 0xd6, 0x60, 0x70, 0x79, 0x7b, 0x08,
+            0x38, 0x73, 0x71, 0x7c, 0x98, 0x96,
+        ];
+        assert_eq!(acc2, expected);
     }
 }

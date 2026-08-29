@@ -98,6 +98,18 @@ pub async fn probe_anchor_item(client: &reqwest::Client, req: &ProbeRequest) -> 
         Err(_) => return ProbeOutcome::Indeterminate,
     };
 
+    // v1 detection: a body carrying `schema: "gitlawb/ref-update/v1"`
+    // is the legacy raw-JSON shape the live path on this branch
+    // writes. The probe returns Present so the v1 dispatch in
+    // `verify_anchor` runs; the field-equality check there is the
+    // v1 integrity guarantee. A body that is valid JSON but does
+    // not carry that schema falls through to the v2 attempt.
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+        if v.get("schema").and_then(|s| s.as_str()) == Some("gitlawb/ref-update/v1") {
+            return ProbeOutcome::Present;
+        }
+    }
+
     let item: DataItem = match serde_json::from_slice(&bytes) {
         Ok(i) => i,
         Err(_) => return ProbeOutcome::Indeterminate,
@@ -120,13 +132,27 @@ pub async fn probe_anchor_item(client: &reqwest::Client, req: &ProbeRequest) -> 
     ProbeOutcome::Present
 }
 
+/// Classify a 404 response from the gateway.
+///
+/// `DefinitivelyAbsent` is reserved for the protocol-defined 404
+/// body shape (`{"status": "not found"}` or `"not_found"`). An
+/// empty body is `Indeterminate`: a proxy, CDN, or misconfigured
+/// gateway may emit a bodyless 404 for many reasons that do not
+/// prove the item was never served, and the recovery policy
+/// (`DefinitivelyAbsent.permits_reupload()` → true) authorizes a
+/// paid re-upload that is irreversible. The team memory
+/// `distinguish-unknown-from-empty.md` is the policy: collapse
+/// `unknown` to `absent` only on the recognized JSON shape, never
+/// on empty.
 async fn classify_404(resp: reqwest::Response) -> ProbeOutcome {
     let bytes = match read_capped_body(resp, 16 * 1024).await {
         Ok(b) => b,
         Err(_) => return ProbeOutcome::Indeterminate,
     };
+    // Empty body — bodyless 404 from a proxy or misconfigured
+    // gateway. NOT a proof of absence.
     if bytes.is_empty() {
-        return ProbeOutcome::DefinitivelyAbsent;
+        return ProbeOutcome::Indeterminate;
     }
     if bytes.len() > 4096 {
         return ProbeOutcome::Indeterminate;
@@ -138,13 +164,25 @@ async fn classify_404(resp: reqwest::Response) -> ProbeOutcome {
             }
         }
     }
+    // JSON body but not the recognized shape. Still not
+    // `DefinitivelyAbsent` — proxies can return any JSON for
+    // arbitrary reasons; only the protocol shape counts.
     ProbeOutcome::Indeterminate
 }
 
-async fn read_capped_body(resp: reqwest::Response, limit: usize) -> std::io::Result<Vec<u8>> {
-    // Check the Content-Length header first; reject before reading if
-    // it advertises more than the cap. This is a fast path that
-    // avoids buffering a body-stuffing attack.
+/// Read a response body up to `limit` bytes, aborting as soon as
+/// the cumulative size crosses the cap. The cap is enforced WHILE
+/// streaming, not after buffering — a chunked response with no
+/// `Content-Length` would otherwise force unbounded allocation
+/// before the post-buffer length check could reject it.
+///
+/// `Content-Length`, when present, is used only as a fast path
+/// optimization: if it advertises more than `limit`, reject
+/// without reading. The streaming loop is the actual enforcement.
+async fn read_capped_body(mut resp: reqwest::Response, limit: usize) -> std::io::Result<Vec<u8>> {
+    // Fast path: a Content-Length over the cap means the server
+    // told us up front the body is too big. Drop the response
+    // without reading any bytes.
     if let Some(cl) = resp.content_length() {
         if cl as usize > limit {
             return Err(std::io::Error::other(
@@ -152,19 +190,33 @@ async fn read_capped_body(resp: reqwest::Response, limit: usize) -> std::io::Res
             ));
         }
     }
-    let bytes = resp.bytes().await.map_err(std::io::Error::other)?;
-    if bytes.len() > limit {
-        return Err(std::io::Error::other(
-            "response body exceeded the configured cap",
-        ));
+
+    // Streaming read. Track the cumulative byte count and abort
+    // (via the `Err` return) the moment the cap is crossed, so a
+    // chunked response that does NOT advertise a Content-Length
+    // header still cannot force unbounded allocation.
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(std::io::Error::other)? {
+        if buf.len() + chunk.len() > limit {
+            return Err(std::io::Error::other(
+                "response body exceeded the configured cap while streaming",
+            ));
+        }
+        buf.extend_from_slice(&chunk);
     }
-    Ok(bytes.to_vec())
+    Ok(buf)
 }
 
 /// Result of `verify_anchor`: the fetched data item, the
 /// verified-or-not flag, and the decoded data payload. On the
 /// error path, `verified` is `false` and `error` carries a
 /// human-readable reason.
+///
+/// `outcome` carries the structured [`ProbeOutcome`] classification
+/// so the HTTP handler can surface the status without parsing the
+/// human-readable `error` string. The team memory
+/// `verify-against-artifact-id-not-signer.md` is the policy: the
+/// `error` field is for human eyes, never for routing decisions.
 #[derive(Debug, Clone)]
 pub struct AnchorVerifyResult {
     pub item_id: String,
@@ -172,26 +224,59 @@ pub struct AnchorVerifyResult {
     pub data_payload: Option<serde_json::Value>,
     pub owner_did: Option<String>,
     pub error: Option<String>,
+    /// The structured classification. `verified: true` is only set
+    /// when `outcome == ProbeOutcome::Present`.
+    pub outcome: ProbeOutcome,
+}
+
+/// Persisted anchor fields used by the dual-format v1 + v2 verify.
+/// The HTTP handler fetches the row from `arweave_anchors` and
+/// passes these in; the verify path uses them to (a) identify the
+/// v1 raw-JSON shape (the live path on this branch writes v1, not
+/// v2) and (b) check the v1 fields match what the gateway serves.
+#[derive(Debug, Clone)]
+pub struct PersistedAnchorFields<'a> {
+    pub repo: &'a str,
+    pub ref_name: &'a str,
+    pub old_sha: &'a str,
+    pub new_sha: &'a str,
+    pub node_did: &'a str,
 }
 
 /// Fetch a persisted anchor from the gateway and verify the
 /// envelope. The full path the public verify endpoint takes.
 ///
-/// `expected_owner_pk` is the persisted `node_did` of the
-/// anchor. The function:
+/// `expected_owner_pk` is the persisted `node_did` of the anchor,
+/// decoded as a 32-byte Ed25519 public key.
 ///
-///   1. Fetches the data item from `gateway_url/<item_id>`.
-///   2. Parses it as an ANS-104 data item.
-///   3. Verifies the Ed25519 signature against `expected_owner_pk`.
-///   4. Decodes the data payload as JSON and returns it.
+/// `persisted` carries the row's `repo`, `ref_name`, `old_sha`,
+/// `new_sha`, `node_did` so the verify path can match the v1
+/// raw-JSON format (the live path on this branch writes v1) and
+/// the v2 artifact-identity check.
 ///
-/// On any failure along this path, returns a result with
+/// The verify path accepts BOTH formats:
+///
+///   - **v2 (ANS-104)**: parse as `DataItem`, verify the Ed25519
+///     signature against `expected_owner_pk`, derive the protocol
+///     id via `DataItem::id()` and require equality with `item_id`.
+///     A stale or malicious mirror serving a different valid
+///     same-owner item is the attack the artifact-id check closes;
+///     the team memory `verify-against-artifact-id-not-signer.md`
+///     is the policy.
+///   - **v1 (raw JSON)**: parse as `serde_json::Value`, require
+///     `schema == "gitlawb/ref-update/v1"`, then field-equality
+///     check `repo`, `ref_name`, `old_sha`, `new_sha`, `node_did`
+///     against the persisted row. v1 has no signature; the Irys
+///     storage plus the JSON parse are the integrity guarantee.
+///
+/// On any failure along either path, returns a result with
 /// `verified: false` and a populated `error`. The caller (the
 /// HTTP handler) decides how to surface the failure.
 pub async fn verify_anchor(
     client: &reqwest::Client,
     item_id: &str,
     expected_owner_pk: &[u8; PUBLIC_KEY_LENGTH],
+    persisted: &PersistedAnchorFields<'_>,
     gateway_url: &str,
 ) -> Result<AnchorVerifyResult> {
     let outcome = probe_anchor_item(
@@ -208,7 +293,7 @@ pub async fn verify_anchor(
         ProbeOutcome::Present => {
             // Re-fetch the body to extract the data payload. The
             // probe already classified the response; here we just
-            // need the parsed item.
+            // need the parsed body.
             let url = format!("{}/{}", gateway_url.trim_end_matches('/'), item_id);
             let resp = client
                 .get(&url)
@@ -218,35 +303,57 @@ pub async fn verify_anchor(
             let bytes = read_capped_body(resp, PROBE_MAX_BODY_BYTES)
                 .await
                 .map_err(|e| anyhow!("re-fetch body: {e}"))?;
-            let item: DataItem = serde_json::from_slice(&bytes)
-                .with_context(|| "re-parsing data item for payload extraction")?;
 
-            // Verify the signature one more time, this time as a
-            // hard error rather than an Indeterminate classification.
-            ans104::verify_data_item(&item, expected_owner_pk)
-                .with_context(|| "verifying ANS-104 envelope signature")?;
-
-            let data_bytes = item
-                .data_bytes()
-                .with_context(|| "decoding ANS-104 data payload")?;
-            let data_payload: serde_json::Value = serde_json::from_slice(&data_bytes)
-                .with_context(|| "decoding data payload as JSON")?;
-
-            // Derive the owner DID from the public key for the API
-            // response.
-            let owner_did = gitlawb_core::did::Did::from_verifying_key(
-                &ed25519_dalek::VerifyingKey::from_bytes(expected_owner_pk)
-                    .map_err(|e| anyhow!("decoding verifying key: {e}"))?,
-            )
-            .to_string();
-
-            Ok(AnchorVerifyResult {
-                item_id: item_id.to_string(),
-                verified: true,
-                data_payload: Some(data_payload),
-                owner_did: Some(owner_did),
-                error: None,
-            })
+            // Format detection: v1 first, by structural schema field.
+            // The v1 raw-JSON shape carries `schema: gitlawb/ref-update/v1`
+            // — a field the v2 ANS-104 DataItem projection never
+            // includes. A v1 body parses as `serde_json::Value`
+            // because DataItem deserialization is lenient about
+            // unknown fields; trying v2 first would silently route
+            // v1 anchors into the v2 path, which would then fail the
+            // signature check (the v1 body has no signature) and
+            // classify every v1 anchor as `Indeterminate`. The team
+            // memory `self-roundtrip-tests-do-not-prove-interop.md`
+            // is the broader reason: format detection is structural
+            // and the structural signal must win over the parse
+            // convenience.
+            let v: serde_json::Value = match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok(AnchorVerifyResult {
+                        item_id: item_id.to_string(),
+                        verified: false,
+                        data_payload: None,
+                        owner_did: None,
+                        error: Some("the gateway response is not valid JSON".to_string()),
+                        outcome: ProbeOutcome::Indeterminate,
+                    });
+                }
+            };
+            if v.get("schema").and_then(|s| s.as_str()) == Some("gitlawb/ref-update/v1") {
+                verify_v1(v, item_id, persisted)
+            } else if let Ok(item) = serde_json::from_value::<DataItem>(v.clone()) {
+                verify_v2(item, item_id, expected_owner_pk, persisted)
+            } else {
+                // JSON parse failed entirely. Per the team memory
+                // `distinguish-unknown-from-empty.md` and
+                // `self-roundtrip-tests-do-not-prove-interop.md`,
+                // this is Indeterminate — the gateway returned
+                // something we cannot classify, NOT a proof of
+                // presence.
+                Ok(AnchorVerifyResult {
+                    item_id: item_id.to_string(),
+                    verified: false,
+                    data_payload: None,
+                    owner_did: None,
+                    error: Some(
+                        "the gateway response did not parse as an ANS-104 \
+                         data item or a recognized v1 raw-JSON payload"
+                            .to_string(),
+                    ),
+                    outcome: ProbeOutcome::Indeterminate,
+                })
+            }
         }
         ProbeOutcome::DefinitivelyAbsent => Ok(AnchorVerifyResult {
             item_id: item_id.to_string(),
@@ -254,6 +361,7 @@ pub async fn verify_anchor(
             data_payload: None,
             owner_did: None,
             error: Some("the gateway reports this item id was never served".to_string()),
+            outcome: ProbeOutcome::DefinitivelyAbsent,
         }),
         ProbeOutcome::Indeterminate => {
             // Re-fetch to give a more specific error reason, but
@@ -271,9 +379,228 @@ pub async fn verify_anchor(
                 error: Some(format!(
                     "verification is indeterminate: the gateway response is ambiguous ({reason})"
                 )),
+                outcome: ProbeOutcome::Indeterminate,
             })
         }
     }
+}
+
+/// v2 verify path. The item is already parsed as `DataItem`; the
+/// signature and id are checked here. Returns a populated
+/// `AnchorVerifyResult` with the appropriate `outcome` (Present
+/// for full success, Indeterminate for any failure that should
+/// not authorize a paid re-upload).
+fn verify_v2(
+    item: DataItem,
+    item_id: &str,
+    expected_owner_pk: &[u8; PUBLIC_KEY_LENGTH],
+    persisted: &PersistedAnchorFields<'_>,
+) -> Result<AnchorVerifyResult> {
+    // Verify the signature. Any failure (bad base64, wrong key,
+    // malformed signature, Ed25519 mismatch) maps to
+    // `Indeterminate` — the team memory
+    // `verify-against-artifact-id-not-signer.md` requires
+    // structural checks beyond the signature, so the signature
+    // alone is not the proof of identity.
+    if let Err(e) = ans104::verify_data_item(&item, expected_owner_pk) {
+        return Ok(AnchorVerifyResult {
+            item_id: item_id.to_string(),
+            verified: false,
+            data_payload: None,
+            owner_did: None,
+            error: Some(format!("ANS-104 signature verification failed: {e}")),
+            outcome: ProbeOutcome::Indeterminate,
+        });
+    }
+
+    // Artifact-identity check: derive the protocol id from the
+    // item and require equality with the requested `item_id`. A
+    // node key signs many data items, so a valid signature only
+    // proves who signed the response — not that the served item
+    // is the one the caller asked to verify. A stale or malicious
+    // mirror serving a different valid same-owner item for
+    // `<requested-id>` would otherwise attest that substitute
+    // payload as verified.
+    let derived_id = match item.id() {
+        Ok(id) => id,
+        Err(e) => {
+            return Ok(AnchorVerifyResult {
+                item_id: item_id.to_string(),
+                verified: false,
+                data_payload: None,
+                owner_did: None,
+                error: Some(format!("deriving ANS-104 data item id: {e}")),
+                outcome: ProbeOutcome::Indeterminate,
+            });
+        }
+    };
+    if derived_id != item_id {
+        return Ok(AnchorVerifyResult {
+            item_id: item_id.to_string(),
+            verified: false,
+            data_payload: None,
+            owner_did: None,
+            error: Some(format!(
+                "ANS-104 artifact id mismatch: the gateway served an item \
+                 signed by the expected owner but its derived id is {derived_id:?}, \
+                 not the requested {item_id:?}; refusing to attest a different item"
+            )),
+            outcome: ProbeOutcome::Indeterminate,
+        });
+    }
+
+    // Decode the data payload and return it.
+    let data_bytes = match item.data_bytes() {
+        Ok(b) => b,
+        Err(e) => {
+            return Ok(AnchorVerifyResult {
+                item_id: item_id.to_string(),
+                verified: false,
+                data_payload: None,
+                owner_did: None,
+                error: Some(format!("decoding ANS-104 data payload: {e}")),
+                outcome: ProbeOutcome::Indeterminate,
+            });
+        }
+    };
+    let data_payload: serde_json::Value = match serde_json::from_slice(&data_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(AnchorVerifyResult {
+                item_id: item_id.to_string(),
+                verified: false,
+                data_payload: None,
+                owner_did: None,
+                error: Some(format!("decoding data payload as JSON: {e}")),
+                outcome: ProbeOutcome::Indeterminate,
+            });
+        }
+    };
+
+    // Derive the owner DID from the public key for the API
+    // response. (v2 stores the public key; the persisted
+    // `node_did` is a string, but the verify path can reconstruct
+    // it from the key.)
+    let owner_did = {
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(expected_owner_pk)
+            .map_err(|e| anyhow!("decoding verifying key: {e}"))?;
+        gitlawb_core::did::Did::from_verifying_key(&vk).to_string()
+    };
+
+    // Compare the persisted row's `node_did` with the one
+    // derived from the verified public key. A mismatch means
+    // someone re-keyed and the row is stale; refuse.
+    if owner_did != persisted.node_did {
+        return Ok(AnchorVerifyResult {
+            item_id: item_id.to_string(),
+            verified: false,
+            data_payload: Some(data_payload),
+            owner_did: Some(owner_did.clone()),
+            error: Some(format!(
+                "persisted node_did {persisted_node_did:?} does not match the \
+                 verified item's signer {owner_did:?}",
+                persisted_node_did = persisted.node_did,
+            )),
+            outcome: ProbeOutcome::Indeterminate,
+        });
+    }
+
+    let _ = persisted; // suppress unused-warning when no other field is read below
+    Ok(AnchorVerifyResult {
+        item_id: item_id.to_string(),
+        verified: true,
+        data_payload: Some(data_payload),
+        owner_did: Some(owner_did),
+        error: None,
+        outcome: ProbeOutcome::Present,
+    })
+}
+
+/// v1 verify path. The v1 raw-JSON shape (used by the live path on
+/// this branch) has no signature; the integrity guarantee is the
+/// Irys storage plus a field-equality check against the persisted
+/// row. A v1 item with all five fields matching the persisted row
+/// is `Present`; a missing schema or any field mismatch is
+/// `Indeterminate`.
+fn verify_v1(
+    v: serde_json::Value,
+    item_id: &str,
+    persisted: &PersistedAnchorFields<'_>,
+) -> Result<AnchorVerifyResult> {
+    let obj = match v.as_object() {
+        Some(o) => o,
+        None => {
+            return Ok(AnchorVerifyResult {
+                item_id: item_id.to_string(),
+                verified: false,
+                data_payload: None,
+                owner_did: None,
+                error: Some(
+                    "v1 verify failed: gateway response is a JSON value, not an object".to_string(),
+                ),
+                outcome: ProbeOutcome::Indeterminate,
+            });
+        }
+    };
+
+    // Schema check first: only `gitlawb/ref-update/v1` is a known v1
+    // payload. Other JSON shapes (e.g. the v2 DataItem projection
+    // parsed as a generic object, or an unrelated body) are
+    // `Indeterminate` — we don't recognize them, not "definitively
+    // absent".
+    let schema = obj.get("schema").and_then(|s| s.as_str());
+    if schema != Some("gitlawb/ref-update/v1") {
+        return Ok(AnchorVerifyResult {
+            item_id: item_id.to_string(),
+            verified: false,
+            data_payload: None,
+            owner_did: None,
+            error: Some(format!(
+                "v1 verify failed: gateway response is JSON but does not \
+                 carry schema=gitlawb/ref-update/v1 (got {schema:?})"
+            )),
+            outcome: ProbeOutcome::Indeterminate,
+        });
+    }
+
+    // Field-equality check: each persisted field must match the
+    // gateway's payload. A mismatch is `Indeterminate` because the
+    // gateway served something that was NOT the anchor the node
+    // recorded.
+    let checks: &[(&str, &str)] = &[
+        ("repo", persisted.repo),
+        ("ref_name", persisted.ref_name),
+        ("old_sha", persisted.old_sha),
+        ("new_sha", persisted.new_sha),
+        ("node_did", persisted.node_did),
+    ];
+    for (key, expected) in checks {
+        let actual = obj.get(*key).and_then(|s| s.as_str());
+        if actual != Some(*expected) {
+            return Ok(AnchorVerifyResult {
+                item_id: item_id.to_string(),
+                verified: false,
+                data_payload: None,
+                owner_did: None,
+                error: Some(format!(
+                    "v1 verify failed: gateway field {key:?} does not match the \
+                     persisted row (expected {expected:?}, got {actual:?})"
+                )),
+                outcome: ProbeOutcome::Indeterminate,
+            });
+        }
+    }
+
+    Ok(AnchorVerifyResult {
+        item_id: item_id.to_string(),
+        verified: true,
+        // The v1 payload IS the data payload the caller wants;
+        // surface the parsed JSON so the handler can echo it.
+        data_payload: Some(v),
+        owner_did: Some(persisted.node_did.to_string()),
+        error: None,
+        outcome: ProbeOutcome::Present,
+    })
 }
 
 #[cfg(test)]
@@ -464,8 +791,13 @@ mod tests {
         assert!(!ProbeOutcome::Indeterminate.permits_reupload());
     }
 
+    /// A bodyless 404 from a proxy or misconfigured gateway is
+    /// `Indeterminate`, NOT `DefinitivelyAbsent`. The team memory
+    /// `distinguish-unknown-from-empty.md` is the policy: an empty
+    /// body does not prove the item was never served, and a paid
+    /// re-upload is irreversible.
     #[tokio::test]
-    async fn probe_404_with_empty_body_is_definitively_absent() {
+    async fn probe_404_with_empty_body_is_indeterminate() {
         let mut server = mockito::Server::new_async().await;
         let _m = server
             .mock("GET", mockito::Matcher::Any)
@@ -475,7 +807,11 @@ mod tests {
             .await;
 
         let outcome = probe_anchor_item(&reqwest::Client::new(), &req_for(server.url())).await;
-        assert_eq!(outcome, ProbeOutcome::DefinitivelyAbsent);
+        assert_eq!(
+            outcome,
+            ProbeOutcome::Indeterminate,
+            "a bodyless 404 is not a proof of absence; the recovery policy must not authorize re-upload on it"
+        );
     }
 
     #[tokio::test]
@@ -519,9 +855,22 @@ mod tests {
 
         let kp = Keypair::generate();
         let pk = kp.verifying_key().to_bytes();
-        let r = verify_anchor(&reqwest::Client::new(), "abc", &pk, &server.url())
-            .await
-            .unwrap();
+        let persisted = PersistedAnchorFields {
+            repo: "alice/r",
+            ref_name: "refs/heads/main",
+            old_sha: "0000",
+            new_sha: "1111",
+            node_did: "did:key:z6node",
+        };
+        let r = verify_anchor(
+            &reqwest::Client::new(),
+            "abc",
+            &pk,
+            &persisted,
+            &server.url(),
+        )
+        .await
+        .unwrap();
         assert!(!r.verified);
         assert!(r.error.is_some());
         assert!(r.error.unwrap().contains("indeterminate"));
@@ -539,15 +888,85 @@ mod tests {
 
         let kp = Keypair::generate();
         let pk = kp.verifying_key().to_bytes();
-        let r = verify_anchor(&reqwest::Client::new(), "abc", &pk, &server.url())
-            .await
-            .unwrap();
+        let persisted = PersistedAnchorFields {
+            repo: "alice/r",
+            ref_name: "refs/heads/main",
+            old_sha: "0000",
+            new_sha: "1111",
+            node_did: "did:key:z6node",
+        };
+        let r = verify_anchor(
+            &reqwest::Client::new(),
+            "abc",
+            &pk,
+            &persisted,
+            &server.url(),
+        )
+        .await
+        .unwrap();
         assert!(!r.verified);
         assert!(r.error.unwrap().contains("never served"));
     }
 
     #[tokio::test]
     async fn verify_anchor_reports_verified_on_signed_item() {
+        let kp = Keypair::generate();
+        let pk = kp.verifying_key().to_bytes();
+        let data = br#"{"repo":"alice/r","ref":"refs/heads/main","old":"0000","new":"1111"}"#;
+        let mut item =
+            DataItem::new_unsigned(&pk, "", "", vec![(b"App-Name", b"gitlawb")], data.to_vec());
+        ans104::sign_data_item(&mut item, &kp).unwrap();
+        // The artifact-identity check requires the URL `item_id` to
+        // match the protocol id derived from the item. The id is
+        // `base64url(SHA256(signature))`; compute it for the URL.
+        let item_id = item.id().unwrap();
+        let body = serde_json::to_string(&item).unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let persisted = PersistedAnchorFields {
+            repo: "alice/r",
+            ref_name: "refs/heads/main",
+            old_sha: "0000",
+            new_sha: "1111",
+            // The persisted `node_did` must match the DID derived
+            // from the verified public key, so build it from the
+            // keypair.
+            node_did: &gitlawb_core::did::Did::from_verifying_key(&kp.verifying_key()).to_string(),
+        };
+        let r = verify_anchor(
+            &reqwest::Client::new(),
+            &item_id,
+            &pk,
+            &persisted,
+            &server.url(),
+        )
+        .await
+        .unwrap();
+        assert!(r.verified);
+        assert!(r.data_payload.is_some());
+        let payload = r.data_payload.unwrap();
+        assert_eq!(payload["repo"], "alice/r");
+        assert_eq!(payload["new"], "1111");
+    }
+
+    /// A valid signed item whose derived id does NOT match the URL
+    /// `item_id` is `Indeterminate` — NOT verified, NOT
+    /// `DefinitivelyAbsent`. The team memory
+    /// `verify-against-artifact-id-not-signer.md` is the policy: a
+    /// node key signs many data items, so a valid signature is
+    /// necessary but not sufficient. A stale or malicious mirror
+    /// serving a different valid same-owner item for `<requested-id>`
+    /// would otherwise attest that substitute payload as verified.
+    #[tokio::test]
+    async fn verify_anchor_id_mismatch_is_indeterminate() {
         let kp = Keypair::generate();
         let pk = kp.verifying_key().to_bytes();
         let data = br#"{"repo":"alice/r","ref":"refs/heads/main","old":"0000","new":"1111"}"#;
@@ -565,13 +984,140 @@ mod tests {
             .create_async()
             .await;
 
-        let r = verify_anchor(&reqwest::Client::new(), "abc", &pk, &server.url())
-            .await
-            .unwrap();
-        assert!(r.verified);
-        assert!(r.data_payload.is_some());
+        // Deliberately request an item_id that does NOT match the
+        // derived protocol id. The signature is valid (the item was
+        // signed by the expected owner) but the artifact identity
+        // does not match.
+        let persisted = PersistedAnchorFields {
+            repo: "alice/r",
+            ref_name: "refs/heads/main",
+            old_sha: "0000",
+            new_sha: "1111",
+            node_did: &gitlawb_core::did::Did::from_verifying_key(&kp.verifying_key()).to_string(),
+        };
+        let r = verify_anchor(
+            &reqwest::Client::new(),
+            "this-is-not-the-items-actual-id",
+            &pk,
+            &persisted,
+            &server.url(),
+        )
+        .await
+        .unwrap();
+        assert!(!r.verified);
+        assert_eq!(r.outcome, ProbeOutcome::Indeterminate);
+        assert!(r.data_payload.is_none(), "no payload on Indeterminate");
+        let err = r.error.unwrap();
+        assert!(
+            err.contains("artifact id mismatch"),
+            "expected artifact-identity error, got: {err}"
+        );
+    }
+
+    /// v1 raw-JSON anchor: when the gateway returns the v1 shape
+    /// with all five persisted fields matching, the verify is
+    /// `Present` and the parsed JSON is the data payload. The
+    /// v1 path has no signature — the Irys storage plus the
+    /// field-equality check are the integrity guarantee.
+    #[tokio::test]
+    async fn verify_anchor_v1_recognized_with_matching_fields() {
+        let kp = Keypair::generate();
+        let pk = kp.verifying_key().to_bytes();
+        let node_did = gitlawb_core::did::Did::from_verifying_key(&kp.verifying_key()).to_string();
+        let v1_body = serde_json::json!({
+            "schema": "gitlawb/ref-update/v1",
+            "repo": "alice/r",
+            "owner_did": node_did,
+            "ref_name": "refs/heads/main",
+            "old_sha": "0000",
+            "new_sha": "1111",
+            "cid": "cid-abc",
+            "timestamp": "2026-08-30T00:00:00Z",
+            "node_did": node_did,
+            "network": "alpha",
+        });
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&v1_body).unwrap())
+            .create_async()
+            .await;
+
+        let persisted = PersistedAnchorFields {
+            repo: "alice/r",
+            ref_name: "refs/heads/main",
+            old_sha: "0000",
+            new_sha: "1111",
+            node_did: &node_did,
+        };
+        let r = verify_anchor(
+            &reqwest::Client::new(),
+            "v1-item-id",
+            &pk,
+            &persisted,
+            &server.url(),
+        )
+        .await
+        .unwrap();
+        assert!(r.verified, "v1 with matching fields is Present");
+        assert_eq!(r.outcome, ProbeOutcome::Present);
         let payload = r.data_payload.unwrap();
+        assert_eq!(payload["schema"], "gitlawb/ref-update/v1");
         assert_eq!(payload["repo"], "alice/r");
-        assert_eq!(payload["new"], "1111");
+    }
+
+    /// A v1 payload with a single field mismatch is `Indeterminate`,
+    /// not `Present`. The integrity guarantee is the
+    /// field-equality check; any mismatch means the gateway served
+    /// something that is NOT the anchor the node recorded.
+    #[tokio::test]
+    async fn verify_anchor_v1_field_mismatch_is_indeterminate() {
+        let node_did = "did:key:z6node".to_string();
+        let v1_body = serde_json::json!({
+            "schema": "gitlawb/ref-update/v1",
+            "repo": "ATTACKER/r",  // MISMATCH with persisted
+            "owner_did": node_did,
+            "ref_name": "refs/heads/main",
+            "old_sha": "0000",
+            "new_sha": "1111",
+            "node_did": node_did,
+        });
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(serde_json::to_string(&v1_body).unwrap())
+            .create_async()
+            .await;
+
+        let kp = Keypair::generate();
+        let pk = kp.verifying_key().to_bytes();
+        let persisted = PersistedAnchorFields {
+            repo: "alice/r", // does NOT match v1_body
+            ref_name: "refs/heads/main",
+            old_sha: "0000",
+            new_sha: "1111",
+            node_did: &node_did,
+        };
+        let r = verify_anchor(
+            &reqwest::Client::new(),
+            "v1-item-id",
+            &pk,
+            &persisted,
+            &server.url(),
+        )
+        .await
+        .unwrap();
+        assert!(!r.verified);
+        assert_eq!(r.outcome, ProbeOutcome::Indeterminate);
+        let err = r.error.unwrap();
+        assert!(
+            err.contains("repo") && err.contains("does not match"),
+            "expected field-equality error mentioning 'repo', got: {err}"
+        );
     }
 }
