@@ -797,21 +797,20 @@ async fn call_tool(
         "git_refs" => {
             let name = args["name"].as_str().context("missing 'name'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let mut resp = client
+            let resp = client
                 .get(&format!(
                     "/{owner}/{name}/info/refs?service=git-upload-pack"
                 ))
                 .await?;
             let status = resp.status();
             if !status.is_success() {
-                let _ =
-                    crate::http::read_body_capped(&mut resp, crate::http::DENIAL_BODY_CAP).await;
+                let _ = crate::http::read_body_capped(resp, crate::http::DENIAL_BODY_CAP).await;
                 anyhow::bail!("git_refs failed ({status})");
             }
-            let bytes =
-                crate::http::read_body_capped(&mut resp, crate::http::GIT_REFS_BODY_CAP).await;
-            validate_git_advertisement(&bytes)?;
-            let refs = parse_info_refs(&bytes);
+            let capped = crate::http::read_body_capped(resp, crate::http::GIT_REFS_BODY_CAP).await;
+            let bytes = capped.text.as_bytes();
+            validate_git_advertisement(bytes)?;
+            let refs = parse_info_refs(bytes);
             Ok(serde_json::to_string_pretty(&refs)?)
         }
 
@@ -1301,11 +1300,11 @@ async fn call_tool(
 /// a `Value` and goes back to the MCP caller as a successful tool result, so a
 /// denial (a replayed signature, a wrong owner, a missing repo) reads as
 /// success. `what` names the tool so the message says which call failed.
-async fn json_ok(what: &str, mut resp: reqwest::Response) -> Result<Value> {
+async fn json_ok(what: &str, resp: reqwest::Response) -> Result<Value> {
     let status = resp.status();
     if !status.is_success() {
-        let raw = crate::http::read_body_capped(&mut resp, 64 * 1024).await;
-        let msg = serde_json::from_slice::<Value>(&raw)
+        let capped = crate::http::read_body_capped(resp, crate::http::DENIAL_BODY_CAP).await;
+        let msg = serde_json::from_str::<Value>(&capped.text)
             .ok()
             .and_then(|body| {
                 body["message"]
@@ -1313,7 +1312,7 @@ async fn json_ok(what: &str, mut resp: reqwest::Response) -> Result<Value> {
                     .or_else(|| body["error"].as_str())
                     .map(str::to_string)
             })
-            .unwrap_or_else(|| String::from_utf8_lossy(&raw).into_owned());
+            .unwrap_or(capped.text);
         anyhow::bail!(
             "{what} failed ({status}): {}",
             crate::http::sanitize_node_msg(&msg)

@@ -71,6 +71,15 @@ pub fn init(version: &str, node_did: &str) {
 }
 
 fn init_once(version: &str, node_did: &str) {
+    // Guard with Once so two concurrent callers cannot both pass an unsynchronized
+    // `REGISTRY.get()` check and then race on `OnceLock::set(...).expect(...)`,
+    // panicking the loser (#192 F4). Once runs the body exactly once, so the
+    // `.expect("set X once")` calls below can never observe an already-set slot.
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| init_inner(version, node_did));
+}
+
+fn init_inner(version: &str, node_did: &str) {
     let registry = Registry::new();
 
     let info = IntGaugeVec::new(
@@ -243,6 +252,17 @@ pub fn record_fetch(repo: &str) {
     }
 }
 
+/// Test-only: current `gitlawb_fetches_total` value for `repo` (0 if the registry
+/// is not initialized). Lets api-layer tests assert the completed-fetch count with
+/// a unique label instead of scraping the encoded text.
+#[cfg(test)]
+pub fn fetch_count_for_test(repo: &str) -> u64 {
+    FETCHES
+        .get()
+        .map(|c| c.with_label_values(&[repo]).get())
+        .unwrap_or(0)
+}
+
 /// Record one HTTP signature check that passed.
 #[allow(dead_code)] // wired in a follow-up; helpers are part of the public metrics surface
 pub fn record_auth_success(route: &str) {
@@ -330,11 +350,11 @@ pub fn encode() -> Result<String, prometheus::Error> {
 mod tests {
     use super::*;
 
-    // Note: these tests are not run in parallel by default (cargo runs
-    // tests in a binary in parallel via threads but the OnceLock guard
-    // means only the first init() call succeeds; subsequent ones are
-    // no-ops). The encode test below is structured so it's safe to run
-    // alongside other tests in the same binary.
+    // Note: cargo runs tests in a binary in parallel via threads, and several
+    // tests here call init(). init() is guarded by std::sync::Once, so concurrent
+    // callers run the body exactly once and never race on the OnceLock setters
+    // (#192 F4). The encode test below is structured so it's safe to run alongside
+    // other tests in the same binary regardless of ordering.
 
     #[test]
     fn encode_after_init_returns_prometheus_text() {
@@ -362,6 +382,24 @@ mod tests {
         assert!(
             body.contains("gitlawb_pushes_total{repo=\"alice/repo\"} 1"),
             "expected the incremented counter to be visible in: {body}"
+        );
+    }
+
+    /// #192 F4: `init` is idempotent and safe to call repeatedly. The panic that
+    /// hit concurrent callers (both passing the old unsynchronized `REGISTRY.get()`
+    /// check, then racing on `OnceLock::set(...).expect(...)`) is fixed by the
+    /// `Once` guard. That race is inherently non-deterministic to assert in the
+    /// shared-binary suite — a 32-thread barrier stress-test reproduces it only in
+    /// isolation (verified: RED before the `Once` fix, GREEN after). This guard
+    /// covers the deterministic half of the contract: a repeat call is a no-op,
+    /// never a panic, and the registry stays usable.
+    #[test]
+    fn init_is_idempotent_no_panic_on_repeat() {
+        init("0.0.0-a", "did:key:a");
+        init("0.0.0-b", "did:key:b");
+        assert!(
+            encode().is_ok(),
+            "registry must stay usable after a repeated init"
         );
     }
 

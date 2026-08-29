@@ -138,14 +138,14 @@ async fn run_in(cwd: &std::path::Path, args: InitArgs) -> Result<()> {
         "description": args.description,
         "is_public": true,
     }))?;
-    let mut resp = client
+    let resp = client
         .post("/api/v1/repos", &body)
         .await
         .context("failed to create repo")?;
     let repo_status = resp.status();
     if !repo_status.is_success() {
-        let raw = crate::http::read_body_capped(&mut resp, crate::http::DENIAL_BODY_CAP).await;
-        let repo_result: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+        let capped = crate::http::read_body_capped(resp, crate::http::DENIAL_BODY_CAP).await;
+        let repo_result: Value = serde_json::from_str(&capped.text).unwrap_or(Value::Null);
         if !repo_already_exists(&repo_result) {
             let msg = repo_result["message"]
                 .as_str()

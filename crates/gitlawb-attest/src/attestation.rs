@@ -16,7 +16,7 @@
 //! by exact match.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -111,7 +111,7 @@ impl Attestation {
             .try_into()
             .map_err(|_| Error::Signature("signature must be 64 bytes".to_string()))?;
         let sig = Signature::from_bytes(&sig_bytes);
-        vk.verify(&bytes, &sig)
+        vk.verify_strict(&bytes, &sig)
             .map_err(|e| Error::Signature(format!("ed25519: {e}")))?;
 
         Ok(vk)
@@ -553,5 +553,40 @@ mod tests {
 
         let err = tampered.verify_signature(cert_hash).unwrap_err();
         assert!(matches!(err, Error::Signature(_)));
+    }
+
+    /// Regression guard for strict verification: a signature forged under a
+    /// weak (small-order) public key satisfies the verification equation
+    /// but must be rejected. The identity point is such a key: with R the
+    /// identity and S = 0, [S]B - [k]A is the identity for any message.
+    #[test]
+    fn verify_rejects_weak_key_signature() {
+        let mut weak_key_bytes = [0u8; 32];
+        weak_key_bytes[0] = 1; // compressed identity point (y = 1, x = 0)
+        let weak_vk = VerifyingKey::from_bytes(&weak_key_bytes).unwrap();
+        assert!(weak_vk.is_weak(), "identity point must be a weak key");
+
+        let cert_hash = sample_cert_hash();
+        let mut forged = [0u8; 64];
+        forged[0] = 1; // R = identity point, S = 0
+        let forged_sig = B64U.encode(forged);
+
+        // Build an attestation with the weak key as signer and the forged
+        // signature. The weak-key check happens at verify time.
+        let mut att = dummy_attestation(&SigningKey::generate(&mut OsRng), cert_hash);
+        let mut buf = Vec::with_capacity(ED25519_MULTICODEC.len() + 32);
+        buf.extend_from_slice(&ED25519_MULTICODEC);
+        buf.extend_from_slice(&weak_key_bytes);
+        att.signer = format!(
+            "did:key:{}",
+            multibase::encode(multibase::Base::Base58Btc, &buf)
+        );
+        att.sig = forged_sig;
+
+        let err = att.verify_signature(cert_hash).unwrap_err();
+        assert!(
+            matches!(err, Error::Signature(_)),
+            "signature under a weak (small-order) public key must be rejected"
+        );
     }
 }

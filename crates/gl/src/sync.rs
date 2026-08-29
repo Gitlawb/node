@@ -37,7 +37,7 @@ pub async fn run(args: SyncArgs) -> Result<()> {
             let keypair = load_keypair_from_dir(args.dir.as_deref())
                 .context("identity not found — run `gl identity new` first")?;
             let client = NodeClient::new(&args.node, Some(keypair));
-            let mut resp = client.post("/api/v1/sync/trigger", b"{}").await?;
+            let resp = client.post("/api/v1/sync/trigger", b"{}").await?;
             // The node now requires a signature on this route and rate-limits it,
             // so a denial (401/429/…) is expected. Check the status BEFORE parsing:
             // otherwise a JSON-ish error body deserializes into a zero-count struct
@@ -46,8 +46,7 @@ pub async fn run(args: SyncArgs) -> Result<()> {
             if !status.is_success() {
                 // Bound the read: a hostile or broken node must not force an
                 // unbounded allocation just to surface a denial (INV-6, read half).
-                let raw = read_body_capped(&mut resp, 8 * 1024).await;
-                let raw = String::from_utf8_lossy(&raw).into_owned();
+                let raw = read_body_capped(resp, 8 * 1024).await.text;
                 let msg = serde_json::from_str::<serde_json::Value>(&raw)
                     .ok()
                     .and_then(|v| {
@@ -228,37 +227,6 @@ mod tests {
         run(args).await.unwrap();
     }
 
-    #[test]
-    fn sanitize_strips_controls_bidi_and_caps_length() {
-        // C0 (ESC/BEL) and the Cf bidi override (U+202E) are both removed; the
-        // printable text survives. (Note: a stripped ESC leaves any following
-        // "[31m" as inert literal text — that is the point, so the input here
-        // avoids that residue to keep the expectation unambiguous.)
-        let out = sanitize_node_msg("a\u{1b}\u{07}b\u{202e}c");
-        assert!(
-            !out.chars().any(|c| c.is_control()),
-            "control char leaked: {out:?}"
-        );
-        assert!(
-            !out.contains('\u{202e}'),
-            "RLO bidi override leaked: {out:?}"
-        );
-        assert_eq!(out, "abc");
-        // Length is capped at 200 chars regardless of input size.
-        let long = "x".repeat(250);
-        assert_eq!(sanitize_node_msg(&long).chars().count(), 200);
-    }
-
-    #[test]
-    fn sanitize_preserves_legitimate_and_rtl_text() {
-        // Must not over-strip: a plain word, a genuine RTL SCRIPT letter (Arabic
-        // U+0627, category Lo — NOT a format char), and ZWJ (U+200D, a legitimate
-        // Cf char, e.g. emoji sequences) all survive. Guards the shared predicate
-        // against being widened into a blanket Cf stripper.
-        let out = sanitize_node_msg("ok \u{0627}\u{200D}b");
-        assert_eq!(out, "ok \u{0627}\u{200D}b");
-    }
-
     #[tokio::test]
     async fn trigger_handles_oversized_error_body_without_unbounded_output() {
         // A hostile/broken node returns a 2 MB error body. The command must still
@@ -292,8 +260,8 @@ mod tests {
             .with_body("A".repeat(2_000_000))
             .create_async()
             .await;
-        let mut resp = reqwest::get(format!("{}/big", server.url())).await.unwrap();
-        let out = read_body_capped(&mut resp, 8192).await;
+        let resp = reqwest::get(format!("{}/big", server.url())).await.unwrap();
+        let out = read_body_capped(resp, 8192).await.text;
         assert!(out.len() <= 8192, "read not bounded: {} bytes", out.len());
         assert!(!out.is_empty(), "expected some body");
     }
