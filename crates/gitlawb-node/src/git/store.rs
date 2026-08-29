@@ -805,8 +805,17 @@ fn reject_revision_shorthand(name: &str) -> Option<&'static str> {
 /// call it too via the `crate::api` re-export to fail fast with a 400, but the
 /// guard here is what makes the property hold for every caller and every row,
 /// including legacy rows and any writer that skipped the boundary check.
+fn validate_git_ref_binary() -> std::borrow::Cow<'static, str> {
+    #[cfg(test)]
+    if let Ok(bin) = std::env::var("GITLAWB_TEST_VALIDATE_GIT_BIN") {
+        return std::borrow::Cow::Owned(bin);
+    }
+    std::borrow::Cow::Borrowed("git")
+}
+
 pub fn validate_git_ref(name: &str) -> std::result::Result<(), GitRefValidationError> {
-    validate_git_ref_with_git("git", name)
+    let git_bin = validate_git_ref_binary();
+    validate_git_ref_with_git(git_bin.as_ref(), name)
 }
 
 fn validate_git_ref_with_git(
