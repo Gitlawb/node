@@ -1261,6 +1261,52 @@ fn check_mode_0600(mode: u32, path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Create the identity key parent directory if missing and ensure it is
+/// owner-only (0700). A group/world-writable parent lets a local co-tenant
+/// unlink or replace the 0600 key file even when the file itself is secure
+/// (#194, INV-23(a)).
+#[cfg(unix)]
+fn ensure_key_parent_dir_private(parent: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create identity key directory {}", parent.display()))?;
+    let mode = std::fs::metadata(parent)
+        .with_context(|| format!("stat identity key directory {}", parent.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode & 0o077 != 0 {
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| {
+                format!(
+                    "tighten identity key directory {} to 0700 (was {mode:o})",
+                    parent.display()
+                )
+            })?;
+        let after = std::fs::metadata(parent)
+            .with_context(|| format!("re-stat identity key directory {}", parent.display()))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if after & 0o077 != 0 {
+            anyhow::bail!(
+                "identity key directory {} has mode {after:o}, expected 0700 — refusing to \
+                 use a world/group-writable private key directory",
+                parent.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_key_parent_dir_private(parent: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create identity key directory {}", parent.display()))?;
+    Ok(())
+}
+
 /// Secure a just-created, still-EMPTY key file before any PEM byte is written
 /// (#194, U2): tighten to 0600, then verify with `ensure_key_mode_0600`. The
 /// pair matters: `create_new`'s requested 0600 is narrowed by the process
@@ -2396,10 +2442,14 @@ fn publish_key_fallback(
     for attempt in 0..KEY_TEMP_ATTEMPTS {
         let candidate = dir.join(format!("{marker_prefix}{}.{attempt}", std::process::id()));
         match (faults.marker_create)().and_then(|()| {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&candidate)
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            opts.open(&candidate)
         }) {
             Ok(f) => {
                 drop(f);
@@ -3249,6 +3299,10 @@ fn load_or_create_keypair_with(
     let mut claims = ClaimSet::empty();
     let mut recovery_allowed = true;
 
+    if let Some(parent) = key_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        ensure_key_parent_dir_private(parent)?;
+    }
+
     // N1 invariant: EVERY arm that returns a successfully resolved keypair
     // (loaded, reloaded, adopted, or generated) must run the durability-gated
     // stale-marker sweep before returning, by funneling through this closure.
@@ -3378,10 +3432,10 @@ fn load_or_create_keypair_with(
             }
         };
 
-        if let Some(parent) = key_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = key_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if let Err(e) = ensure_key_parent_dir_private(parent) {
                 release_recovery_claims(key_path, &mut claims);
-                return Err(e.into());
+                return Err(e);
             }
         }
 
@@ -4596,6 +4650,86 @@ mod identity_key_tests {
     #[test]
     fn permissive_umask_0000_still_publishes_0600() {
         run_umask_case("000", "hardlink");
+    }
+
+    /// #194 (INV-23(a)): a pre-existing group/world-writable key directory is
+    /// tightened to 0700 before publish.
+    #[test]
+    fn writable_key_parent_dir_is_repaired_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path()).expect("root dir");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777))
+            .expect("world-writable root");
+        let key_path = root.path().join("keys").join("identity.pem");
+
+        let kp = load_or_create_keypair_with(
+            &key_path,
+            &|| {},
+            &|| {},
+            PublishFaults::NONE,
+            RecoverySeam::NONE,
+        )
+        .expect("publish under a writable parent must repair the parent dir");
+        assert!(key_path.exists());
+
+        let parent = key_path.parent().expect("parent dir");
+        let mode = std::fs::metadata(parent)
+            .expect("parent exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode,
+            0o700,
+            "the identity key parent directory must be owner-only after publish"
+        );
+        let loaded = super::load_existing_key(&key_path).expect("load");
+        assert_eq!(format!("{}", loaded.did()), format!("{}", kp.did()));
+    }
+
+    /// #194 (INV-23(b)): fallback publish markers must land 0600 even under a
+    /// permissive umask when the write fails and the marker survives for recovery.
+    #[test]
+    fn fallback_publish_marker_is_mode_0600_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let old_mask = unsafe { libc::umask(0) };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let pem = Keypair::generate().to_pem().expect("pem");
+        let faults = PublishFaults {
+            link: || Err(std::io::ErrorKind::Unsupported.into()),
+            fallback_write: || Err(std::io::Error::other("injected fallback write failure")),
+            ..PublishFaults::NONE
+        };
+        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults) {
+            Err(e) => e,
+            Ok(_) => panic!("fallback write failure must surface"),
+        };
+        assert!(
+            format!("{err:#}").contains("injected fallback write failure"),
+            "write failure must propagate: {err:#}"
+        );
+        let markers = names_containing(dir.path(), ".publishing.");
+        assert_eq!(
+            markers.len(),
+            1,
+            "one publish marker must survive the failed write"
+        );
+        let marker_path = dir.path().join(&markers[0]);
+        let mode = std::fs::metadata(&marker_path)
+            .expect("marker exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "fallback publish marker must be owner-only, got {mode:o}"
+        );
+        unsafe { libc::umask(old_mask) };
     }
 
     /// #194 (U2): on a mode-ignoring mount (vfat: chmod silently no-ops) the

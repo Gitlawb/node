@@ -213,6 +213,7 @@ async fn anon_ipfs_read_of_withheld_blob_is_denied(pool: sqlx::PgPool) {
     let owner = Keypair::generate();
     let owner_did = owner.did().to_string();
     let reader = Keypair::generate();
+    let stranger = Keypair::generate();
 
     let repo_id = node.seed_repo(&owner_did, "u5b-repo", true).await;
     // sha256 object format: the /ipfs CID is the sha2-256 object id.
@@ -256,6 +257,50 @@ async fn anon_ipfs_read_of_withheld_blob_is_denied(pool: sqlx::PgPool) {
     assert!(
         public_body.contains("public bytes U5b"),
         "the public blob content is returned"
+    );
+
+    // Signed non-reader on the withheld blob's CID: denied, no leak.
+    let secret_path = format!("/ipfs/{secret_cid}");
+    let resp = signed_request(
+        &client,
+        reqwest::Method::GET,
+        &node.base_url,
+        &secret_path,
+        vec![],
+        &stranger,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_denied(
+        resp,
+        404,
+        &["TOPSECRET-U5b", &secret_oid, &secret_oid[..12]],
+    )
+    .await;
+
+    // Allowlisted reader can fetch the withheld blob.
+    let resp = signed_request(
+        &client,
+        reqwest::Method::GET,
+        &node.base_url,
+        &secret_path,
+        vec![],
+        &reader,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    let reader_status = resp.status().as_u16();
+    let reader_body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        reader_status,
+        200,
+        "allowlisted reader must be served the withheld blob; body={reader_body:?}"
+    );
+    assert!(
+        reader_body.contains("TOPSECRET-U5b"),
+        "the withheld blob content is returned to the reader"
     );
 
     // Anonymous read of the withheld blob's CID: denied, no leak of content or OID.

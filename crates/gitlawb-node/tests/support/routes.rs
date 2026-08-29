@@ -1207,4 +1207,109 @@ mod tests {
              register), checked {checked}"
         );
     }
+
+    /// STRUCTURAL enforcement for `OwnerGate` rows: each row's generator must
+    /// emit exactly one stranger-403 hostile and one owner Not403 control.
+    #[test]
+    fn owner_gate_rows_emit_one_hostile_and_one_control() {
+        use crate::support::probe::{probes_for, tests_support::fx, Expect, Signer};
+
+        let fixture = fx();
+        let mut checked = 0usize;
+        for r in deny_bearing_routes() {
+            if r.gate != GateClass::OwnerGate {
+                continue;
+            }
+            checked += 1;
+            let ps = probes_for(r, &fixture);
+            assert_eq!(
+                ps.len(),
+                2,
+                "owner-gate row {} {} must emit exactly two probes, emitted {}",
+                r.method,
+                r.path,
+                ps.len()
+            );
+            let hostile = ps
+                .iter()
+                .filter(|p| p.signer == Signer::Stranger && matches!(p.expect, Expect::Deny(403)))
+                .count();
+            assert_eq!(
+                hostile, 1,
+                "owner-gate row {} {} must drive exactly one stranger-403 hostile, drove {hostile}",
+                r.method, r.path
+            );
+            let control = ps
+                .iter()
+                .filter(|p| p.signer == Signer::Owner && matches!(p.expect, Expect::Not403))
+                .count();
+            assert_eq!(
+                control, 1,
+                "owner-gate row {} {} must drive exactly one owner Not403 control, drove {control}",
+                r.method, r.path
+            );
+        }
+        assert!(
+            checked >= 6,
+            "expected at least six OwnerGate rows, checked {checked}"
+        );
+    }
+
+    /// STRUCTURAL enforcement for `ReadGate` rows: anon hostile, signed-non-reader
+    /// hostile, and one reachability twin per row.
+    #[test]
+    fn read_gate_rows_emit_hostiles_and_reach_twin() {
+        use crate::support::probe::{probes_for, tests_support::fx, Expect, Signer};
+
+        let fixture = fx();
+        let mut checked = 0usize;
+        for r in deny_bearing_routes() {
+            if r.gate != GateClass::ReadGate {
+                continue;
+            }
+            checked += 1;
+            let ps = probes_for(r, &fixture);
+            assert_eq!(
+                ps.len(),
+                3,
+                "read-gate row {} {} must emit exactly three probes, emitted {}",
+                r.method,
+                r.path,
+                ps.len()
+            );
+            let anon = ps
+                .iter()
+                .filter(|p| p.signer == Signer::Anon && matches!(p.expect, Expect::Deny(_)))
+                .count();
+            assert_eq!(
+                anon, 1,
+                "read-gate row {} {} must drive exactly one anon hostile, drove {anon}",
+                r.method, r.path
+            );
+            let stranger = ps
+                .iter()
+                .filter(|p| {
+                    p.signer == Signer::Stranger && matches!(p.expect, Expect::Deny(404))
+                })
+                .count();
+            assert_eq!(
+                stranger, 1,
+                "read-gate row {} {} must drive exactly one signed-non-reader 404 hostile, drove {stranger}",
+                r.method, r.path
+            );
+            let twin = ps
+                .iter()
+                .filter(|p| matches!(p.expect, Expect::Ok2xx))
+                .count();
+            assert_eq!(
+                twin, 1,
+                "read-gate row {} {} must drive exactly one Ok2xx reach twin, drove {twin}",
+                r.method, r.path
+            );
+        }
+        assert!(
+            checked >= 29,
+            "expected at least twenty-nine ReadGate rows, checked {checked}"
+        );
+    }
 }
