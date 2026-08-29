@@ -1040,10 +1040,15 @@ mod tests {
 
         for (field, bad) in [
             ("source_branch", "HEAD"),
+            ("source_branch", "@"),
+            ("source_branch", "@{-1}"),
+            ("source_branch", "FETCH_HEAD"),
             ("source_branch", "feature."),
             ("source_branch", "feature/x."),
             ("source_branch", "refs/tags/v1"),
             ("target_branch", "HEAD"),
+            ("target_branch", "@"),
+            ("target_branch", "@{-1}"),
             ("target_branch", "feature."),
             ("target_branch", "feature/x."),
             ("target_branch", "refs/heads/main"),
@@ -1087,6 +1092,9 @@ mod tests {
 
         for (name_suffix, bad) in [
             ("head", "HEAD"),
+            ("at-shorthand", "@"),
+            ("reflog-shorthand", "@{-1}"),
+            ("fetch-head", "FETCH_HEAD"),
             ("trail-dot", "feature."),
             ("trail-dot-comp", "feature/x."),
             ("tag-ref", "refs/tags/v1"),
@@ -1225,6 +1233,124 @@ mod tests {
         assert!(
             !resp.status().is_success(),
             "merge must not succeed for source_branch=HEAD, got {}",
+            resp.status()
+        );
+
+        let stored = state
+            .db
+            .get_pr(&repo.id, 1)
+            .await
+            .expect("get_pr")
+            .expect("pr row");
+        assert_eq!(
+            stored.status, "open",
+            "a rejected merge must not record pull_request.merged"
+        );
+    }
+
+    /// SINK GUARD: a legacy row with source_branch=@ must be rejected before
+    /// merge_branch runs git. Without the sink guard, git merge @ is a no-op on
+    /// the checked-out target and the PR is recorded as merged without merging
+    /// the submitted source branch.
+    #[sqlx::test]
+    async fn legacy_pr_row_with_at_shorthand_source_is_rejected_at_merge_sink(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let src = std::env::temp_dir().join(format!("gl-at-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("f.txt"), b"hi").unwrap();
+        run(&["add", "f.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        run(&["branch", "feature"], &src);
+        std::fs::write(src.join("f.txt"), b"changed").unwrap();
+        run(&["add", "f.txt"], &src);
+        run(&["commit", "-q", "-m", "on feature"], &src);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("at-probe.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+
+        let mut repo = seed_repo(&owner_did, "at-probe");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "x".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: "@".into(),
+            target_branch: "main".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert legacy row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                axum::routing::post(crate::api::pulls::merge_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/at-probe/pulls/1/merge");
+        let resp = router
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !resp.status().is_success(),
+            "merge must not succeed for source_branch=@, got {}",
             resp.status()
         );
 

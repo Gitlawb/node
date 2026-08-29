@@ -98,6 +98,17 @@ pub(crate) fn require_repo_owner(record: &RepoRecord, caller: &str) -> Result<()
 /// caller. Its unit tests live beside the definition in `git/store.rs`.
 pub(crate) use crate::git::store::validate_git_ref;
 
+/// Map ref-validation failures to the correct HTTP surface: malformed caller
+/// input stays 400; an inability to run git stays on the git/server-error path.
+pub(crate) fn map_git_ref_validation_error(
+    err: crate::git::store::GitRefValidationError,
+) -> AppError {
+    match err {
+        crate::git::store::GitRefValidationError::Invalid(msg) => AppError::BadRequest(msg),
+        crate::git::store::GitRefValidationError::GitUnavailable(msg) => AppError::Git(msg),
+    }
+}
+
 #[cfg(test)]
 mod did_tests {
     use super::did_matches;

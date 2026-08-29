@@ -746,6 +746,46 @@ pub fn read_object(repo_path: &Path, sha256_hex: &str) -> Result<Option<(String,
     Ok(Some((obj_type, content)))
 }
 
+/// Outcome of validating a stored branch-field value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitRefValidationError {
+    /// Caller supplied a name that is not a valid local branch name.
+    Invalid(String),
+    /// Git could not be executed to validate the name.
+    GitUnavailable(String),
+}
+
+impl std::fmt::Display for GitRefValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(msg) | Self::GitUnavailable(msg) => f.write_str(msg),
+        }
+    }
+}
+
+/// Reject revision shorthands and pseudoref names that `git check-ref-format
+/// --branch` accepts but that git later interprets as symbolic revisions rather
+/// than literal local branch names.
+fn reject_revision_shorthand(name: &str) -> Option<&'static str> {
+    if name == "@" {
+        return Some("branch ref must not be a revision shorthand");
+    }
+    if name.starts_with("@{") {
+        return Some("branch ref must not be a reflog revision expression");
+    }
+    const PSEUDOREFS: &[&str] = &[
+        "FETCH_HEAD",
+        "ORIG_HEAD",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "RERERE_MERGE_HEAD",
+    ];
+    if PSEUDOREFS.contains(&name) {
+        return Some("branch ref must not be a git pseudoref name");
+    }
+    None
+}
+
 /// Validate a git *branch name* before it is stored or interpolated into a git
 /// argv element. Delegates to `git check-ref-format --branch`, then rejects
 /// fully qualified ref paths (`refs/heads/...`, `refs/tags/...`) that git would
@@ -754,6 +794,9 @@ pub fn read_object(repo_path: &Path, sha256_hex: &str) -> Result<Option<(String,
 ///
 /// Symbolic revision names (`HEAD`), option-shaped names (leading `-`), trailing
 /// dots, and other invalid forms are rejected by check-ref-format itself.
+/// Revision shorthands that pass the grammar check (`@`, `@{-1}`, pseudorefs)
+/// are rejected explicitly because git treats them as symbolic revisions at the
+/// sink, not as literal branch names.
 ///
 /// A `--` delimiter is not the fix at the sink: these arguments are revisions,
 /// and `--` there reinterprets them as pathspecs.
@@ -762,34 +805,59 @@ pub fn read_object(repo_path: &Path, sha256_hex: &str) -> Result<Option<(String,
 /// call it too via the `crate::api` re-export to fail fast with a 400, but the
 /// guard here is what makes the property hold for every caller and every row,
 /// including legacy rows and any writer that skipped the boundary check.
-pub fn validate_git_ref(name: &str) -> std::result::Result<(), String> {
+pub fn validate_git_ref(name: &str) -> std::result::Result<(), GitRefValidationError> {
+    validate_git_ref_with_git("git", name)
+}
+
+fn validate_git_ref_with_git(
+    git_bin: &str,
+    name: &str,
+) -> std::result::Result<(), GitRefValidationError> {
     if name.is_empty() {
-        return Err("branch ref must not be empty".into());
+        return Err(GitRefValidationError::Invalid(
+            "branch ref must not be empty".into(),
+        ));
     }
     if name.starts_with("refs/") {
-        return Err("branch ref must be a local branch name, not a fully qualified ref".into());
+        return Err(GitRefValidationError::Invalid(
+            "branch ref must be a local branch name, not a fully qualified ref".into(),
+        ));
+    }
+    if let Some(reason) = reject_revision_shorthand(name) {
+        return Err(GitRefValidationError::Invalid(reason.into()));
     }
     // allow-unbounded-git: stateless check-ref-format on a user-supplied name; no repo acquire or concurrency permit
-    let output = Command::new("git")
+    let output = Command::new(git_bin)
         .args(["check-ref-format", "--branch", name])
         .output()
-        .map_err(|e| format!("failed to run git check-ref-format: {e}"))?;
+        .map_err(|e| {
+            GitRefValidationError::GitUnavailable(format!(
+                "failed to run git check-ref-format: {e}"
+            ))
+        })?;
 
     if output.status.success() {
         Ok(())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(stderr.trim().to_string())
+        Err(GitRefValidationError::Invalid(stderr.trim().to_string()))
     }
 }
 
 /// Reject both refs at the sink, so an option-shaped ref can never reach a git
 /// argv element regardless of how it was stored.
+fn map_ref_validation_to_anyhow(which: &str, err: GitRefValidationError) -> anyhow::Error {
+    match err {
+        GitRefValidationError::Invalid(msg) => {
+            anyhow::anyhow!("invalid {which} branch ref: {msg}")
+        }
+        GitRefValidationError::GitUnavailable(msg) => anyhow::anyhow!("{msg}"),
+    }
+}
+
 fn guard_refs(target_branch: &str, source_branch: &str) -> Result<()> {
-    validate_git_ref(target_branch)
-        .map_err(|e| anyhow::anyhow!("invalid target branch ref: {e}"))?;
-    validate_git_ref(source_branch)
-        .map_err(|e| anyhow::anyhow!("invalid source branch ref: {e}"))?;
+    validate_git_ref(target_branch).map_err(|e| map_ref_validation_to_anyhow("target", e))?;
+    validate_git_ref(source_branch).map_err(|e| map_ref_validation_to_anyhow("source", e))?;
     Ok(())
 }
 
@@ -928,7 +996,7 @@ pub fn repo_disk_path(repos_dir: &Path, owner_did: &str, repo_name: &str) -> Pat
 
 #[cfg(test)]
 mod tests {
-    use super::validate_git_ref;
+    use super::{validate_git_ref, validate_git_ref_with_git, GitRefValidationError};
 
     #[test]
     fn validate_git_ref_accepts_normal_branch_names() {
@@ -938,6 +1006,8 @@ mod tests {
             "release-1.2",
             "v1.0.0",
             "user/fix-bug",
+            "feature@",
+            "user@host",
         ] {
             assert!(
                 validate_git_ref(good).is_ok(),
@@ -951,6 +1021,10 @@ mod tests {
         for bad in [
             "",
             "HEAD",
+            "@",
+            "@{-1}",
+            "FETCH_HEAD",
+            "MERGE_HEAD",
             "feature.",
             "feature/x.",
             "refs/heads/main",
@@ -967,8 +1041,22 @@ mod tests {
             "trailing/",
             "a//b",
         ] {
-            assert!(validate_git_ref(bad).is_err(), "{bad:?} should be rejected");
+            let err = validate_git_ref(bad).expect_err("{bad:?} should be rejected");
+            assert!(
+                matches!(err, GitRefValidationError::Invalid(_)),
+                "{bad:?} should be an invalid-name rejection, got {err:?}"
+            );
         }
+    }
+
+    #[test]
+    fn validate_git_ref_spawn_failure_is_git_unavailable_not_invalid() {
+        let err = validate_git_ref_with_git("/nonexistent/gitlawb-git", "main")
+            .expect_err("missing git binary should fail");
+        assert!(
+            matches!(err, GitRefValidationError::GitUnavailable(_)),
+            "spawn failure must not be classified as invalid input, got {err:?}"
+        );
     }
 
     use super::branch_diff_names;

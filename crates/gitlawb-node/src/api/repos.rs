@@ -245,7 +245,8 @@ pub async fn create_repo(
     // default_branch is caller-supplied and becomes a PR's target_branch when the
     // PR omits one, which is interpolated into a git revision argument. Validate
     // it as a ref so it cannot begin with '-' and inject a git option downstream.
-    crate::api::validate_git_ref(&req.default_branch).map_err(AppError::BadRequest)?;
+    crate::api::validate_git_ref(&req.default_branch)
+        .map_err(crate::api::map_git_ref_validation_error)?;
 
     // Owner is the authenticated agent's DID
     let owner_did = auth.0;
