@@ -250,8 +250,7 @@ async fn anon_ipfs_read_of_withheld_blob_is_denied(pool: sqlx::PgPool) {
     let public_status = resp.status().as_u16();
     let public_body = resp.text().await.unwrap_or_default();
     assert_eq!(
-        public_status,
-        200,
+        public_status, 200,
         "public blob CID must be served to anon; body={public_body:?}"
     );
     assert!(
@@ -294,8 +293,7 @@ async fn anon_ipfs_read_of_withheld_blob_is_denied(pool: sqlx::PgPool) {
     let reader_status = resp.status().as_u16();
     let reader_body = resp.text().await.unwrap_or_default();
     assert_eq!(
-        reader_status,
-        200,
+        reader_status, 200,
         "allowlisted reader must be served the withheld blob; body={reader_body:?}"
     );
     assert!(
@@ -1597,6 +1595,15 @@ mod completeness {
         false
     }
 
+    /// True when `seg` carries the inline claimant gate idiom: a local `is_claimant`
+    /// boolean tied to `claimant_did` before a Forbidden return. submit_bounty uses
+    /// this shape instead of a bare `did_matches(&auth.0, claimant)` call.
+    fn has_claimant_inline_gate(seg: &str) -> bool {
+        seg.contains("is_claimant")
+            && seg.contains("claimant_did")
+            && (seg.contains("Forbidden") || seg.contains("!is_claimant"))
+    }
+
     #[test]
     fn deny_registry_is_not_stale_and_owner_gates_are_all_driven() {
         let server = include_str!("../src/server.rs");
@@ -1764,6 +1771,45 @@ mod completeness {
                 signer_self_marked.contains(*name),
                 "SIGNER_SELF_NOT_DRIVEN lists `{name}`, which no longer carries a \
                  caller-self did_matches gate; update the list"
+            );
+        }
+    }
+
+    /// MULTI-PRINCIPAL INLINE ORPHAN GUARD (#195, F1). submit_bounty and
+    /// dispute_bounty spell their claimant arm with a local `is_claimant` boolean
+    /// instead of a bare `did_matches(&auth.0, claimant)` call, so the signer-self
+    /// classifier cannot catch them. This scan is the twin for that idiom: every
+    /// handler carrying it must be a `MultiPrincipalGate` registry row.
+    #[test]
+    fn multi_principal_inline_claimant_gates_are_all_driven() {
+        let registry_mp: HashSet<&str> = deny_bearing_routes()
+            .iter()
+            .filter(|r| r.gate == GateClass::MultiPrincipalGate)
+            .map(|r| short_handler(r.handler))
+            .collect();
+
+        let api_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/api");
+        let mut inline_mp: HashSet<String> = HashSet::new();
+        for entry in std::fs::read_dir(api_dir).expect("read api dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_some_and(|e| e == "rs") {
+                let src = std::fs::read_to_string(&path).expect("read api file");
+                inline_mp.extend(handlers_matching(&src, has_claimant_inline_gate));
+            }
+        }
+
+        assert!(
+            inline_mp.len() >= 2,
+            "inline claimant gate scan found only {} handlers (expected submit_bounty + dispute_bounty)",
+            inline_mp.len()
+        );
+
+        for h in &inline_mp {
+            assert!(
+                registry_mp.contains(h.as_str()),
+                "handler `{h}` carries an inline claimant gate but is not a \
+                 MultiPrincipalGate row in deny_bearing_routes(); add it so the sweep \
+                 drives its 403"
             );
         }
     }
@@ -2172,6 +2218,29 @@ mod completeness {
         assert!(
             !has_signer_self_did_matches(owner_form),
             "the owner form must NOT be treated as a caller-self gate (no double-count)"
+        );
+    }
+
+    #[test]
+    fn has_claimant_inline_gate_fires_on_submit_and_dispute() {
+        let submit = "let is_claimant = bounty\n.claimant_did\n.as_deref()\n\
+                      .is_some_and(|c| did_matches(&auth.0, c));\n\
+                      if !is_claimant {\n return Err(AppError::Forbidden(\"only the claimant\".into())); }";
+        assert!(has_claimant_inline_gate(submit));
+        let dispute = "let is_creator = did_matches(&auth.0, &bounty.creator_did);\n\
+                       let is_claimant = bounty.claimant_did.as_deref().is_some_and(...);\n\
+                       if !is_creator && !is_claimant {\n return Err(AppError::Forbidden(...)); }";
+        assert!(has_claimant_inline_gate(dispute));
+    }
+
+    #[test]
+    fn has_claimant_inline_gate_ignores_read_only_claimant_use() {
+        let body = "if let Some(ref agent_did) = bounty.claimant_did {\n\
+                        let current = state.db.get_trust_score(agent_did);\n\
+                    }";
+        assert!(
+            !has_claimant_inline_gate(body),
+            "post-gate claimant_did reads must not trip the inline claimant classifier"
         );
     }
 

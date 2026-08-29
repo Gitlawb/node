@@ -1,6 +1,6 @@
 //! INV-8 deny assertion. A denial must be an actual refusal (4xx) whose body
-//! carries none of the data it is withholding, and must never be a 2xx (an
-//! empty-200 rendered as success is the denial-as-success bug this guards).
+//! and headers carry none of the data it is withholding, and must never be a 2xx
+//! (an empty-200 rendered as success is the denial-as-success bug this guards).
 //!
 //! The check is split into a pure `check_denied` (unit-tested below with the
 //! self-check scenarios) and an async `assert_denied` wrapper that reads a real
@@ -39,9 +39,37 @@ pub fn check_denied(
         ));
     }
     for token in withheld {
-        if !token.is_empty() && body.contains(token) {
+        if token.is_empty() {
+            continue;
+        }
+        if body.contains(token) {
             return Err(format!(
                 "withheld token {token:?} leaked in denial body: {body:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Like [`check_denied`] but also scans serialized response headers for withheld
+/// tokens. Call sites that only have a body should keep using `check_denied`.
+pub fn check_denied_with_headers(
+    status: u16,
+    body: &str,
+    header_text: &str,
+    expected: u16,
+    withheld: &[&str],
+) -> Result<(), String> {
+    if let Err(e) = check_denied(status, body, expected, withheld) {
+        return Err(e);
+    }
+    for token in withheld {
+        if token.is_empty() {
+            continue;
+        }
+        if header_text.contains(token) {
+            return Err(format!(
+                "withheld token {token:?} leaked in denial headers: {header_text:?}"
             ));
         }
     }
@@ -52,6 +80,17 @@ pub fn check_denied(
 /// full body once.
 pub async fn assert_denied(resp: reqwest::Response, expected: u16, withheld: &[&str]) {
     let status = resp.status().as_u16();
+    let header_text = resp
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| format!("{}: {}", name.as_str(), v))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     // A body-read failure must NOT fold to "" — an empty body passes the withheld
     // scan vacuously, so an unreadable denial (a mid-body reset/truncation) would be
     // certified leak-free without ever inspecting the bytes. Fail loud instead. A
@@ -61,14 +100,15 @@ pub async fn assert_denied(resp: reqwest::Response, expected: u16, withheld: &[&
         .text()
         .await
         .expect("read denial body: an unreadable denial cannot be certified leak-free");
-    if let Err(reason) = check_denied(status, &body, expected, withheld) {
+    if let Err(reason) = check_denied_with_headers(status, &body, &header_text, expected, withheld)
+    {
         panic!("{reason}");
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::check_denied;
+    use super::{check_denied, check_denied_with_headers};
 
     #[test]
     fn clean_403_with_no_leak_passes() {
@@ -120,6 +160,36 @@ mod tests {
         // An empty token must be skipped, never treated as "contained in every
         // body" — otherwise every denial would spuriously fail as a leak.
         let r = check_denied(403, "any body", 403, &[""]);
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[test]
+    fn leaking_header_fails_and_names_the_token() {
+        let withheld = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let headers = format!("X-Debug: object {withheld}");
+        let r = check_denied_with_headers(
+            404,
+            r#"{"error":"repository not found"}"#,
+            &headers,
+            404,
+            &[withheld],
+        );
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(err.contains("leaked in denial headers"));
+        assert!(err.contains(withheld));
+    }
+
+    #[test]
+    fn clean_headers_with_clean_body_passes() {
+        let withheld = "a1b2c3";
+        let r = check_denied_with_headers(
+            404,
+            r#"{"error":"repository not found"}"#,
+            "Content-Type: application/json",
+            404,
+            &[withheld],
+        );
         assert!(r.is_ok(), "{r:?}");
     }
 }

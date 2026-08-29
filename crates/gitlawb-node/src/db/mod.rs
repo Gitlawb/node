@@ -8278,7 +8278,6 @@ mod peer_authority_tests {
 /// | `prune_non_public_peers` (db/mod.rs) | a delete keyed on a computed bad-DID array; cannot repoint; boot-only caller in main.rs |
 /// | `seed_local_peer` (sync.rs) | excluded by test-module location: a deliberate `upsert_peer` bypass for `file://` fixtures, which the public-URL gate rejects |
 /// | `a_legacy_row_can_still_refresh_its_liveness` (db/mod.rs) | test-only. Seeds a PRE-GATE row by raw SQL on purpose: `upsert_peer` cannot create one, since the gate it is testing refuses exactly that DID. The fixture models what a deployed table already holds |
-/// | `gossip_ping_round_requires_two_failures_before_persisting_unreachable` (main.rs) | test-only fixture seed. Raw SQL because the test drives the readiness HYSTERESIS, which needs a row already at `last_ping_ok = TRUE` before the round runs; it never exercises the announce gate |
 /// | `manual_ping_uses_readiness_without_mutating_federation_gate` (api/peers.rs) | test-only fixture seed, same shape and same reason: the row under test must pre-exist so the assertion is about what the ping does NOT rewrite |
 ///
 /// And the `upsert_peer` CALL-SITE authority table, which the ledger above
@@ -8365,10 +8364,6 @@ mod peers_table_writer_guard {
     /// listed function that no longer has one.
     const LEDGER: &[(&str, usize)] = &[
         ("a_legacy_row_can_still_refresh_its_liveness", 1),
-        (
-            "gossip_ping_round_requires_two_failures_before_persisting_unreachable",
-            1,
-        ),
         (
             "manual_ping_uses_readiness_without_mutating_federation_gate",
             1,

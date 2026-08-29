@@ -197,10 +197,14 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool, repos_dir: PathBuf) -> AppS
         encrypt_inflight: crate::state::EncryptInflight::new(),
         repo_write_leases: crate::state::RepoWriteLeases::new(8),
         git_read_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(16),
-        git_push_advert_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(8),
+        git_push_advert_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(
+            8,
+        ),
         git_write_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(8),
         git_ipfs_walk_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
-        git_ipfs_walk_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(16),
+        git_ipfs_walk_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(
+            16,
+        ),
         git_bin: "git".to_string(),
     }
 }
@@ -427,10 +431,7 @@ impl TestNode {
         use std::str::FromStr;
 
         let slug = owner_did.replace([':', '/'], "_");
-        let bare = self
-            .repos_dir
-            .join(&slug)
-            .join(format!("{repo_name}.git"));
+        let bare = self.repos_dir.join(&slug).join(format!("{repo_name}.git"));
         let mut cids = std::collections::HashMap::new();
         for (path, oid_hex) in oids {
             if path == "HEAD" {
@@ -439,8 +440,7 @@ impl TestNode {
             let (_ty, raw) = crate::git::store::read_object(&bare, oid_hex)
                 .expect("read seeded object")
                 .expect("seeded object exists in bare repo");
-            let preliminary =
-                gitlawb_core::cid::Cid::from_git_object_bytes(&raw).to_string();
+            let preliminary = gitlawb_core::cid::Cid::from_git_object_bytes(&raw).to_string();
             let cid = preliminary
                 .parse::<cid::CidGeneric<64>>()
                 .expect("parse production pin cid")

@@ -1288,9 +1288,7 @@ mod tests {
             );
             let stranger = ps
                 .iter()
-                .filter(|p| {
-                    p.signer == Signer::Stranger && matches!(p.expect, Expect::Deny(404))
-                })
+                .filter(|p| p.signer == Signer::Stranger && matches!(p.expect, Expect::Deny(404)))
                 .count();
             assert_eq!(
                 stranger, 1,

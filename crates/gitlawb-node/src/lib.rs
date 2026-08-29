@@ -1277,13 +1277,14 @@ fn ensure_key_parent_dir_private(parent: &std::path::Path) -> Result<()> {
         .mode()
         & 0o777;
     if mode & 0o077 != 0 {
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| {
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).with_context(
+            || {
                 format!(
                     "tighten identity key directory {} to 0700 (was {mode:o})",
                     parent.display()
                 )
-            })?;
+            },
+        )?;
         let after = std::fs::metadata(parent)
             .with_context(|| format!("re-stat identity key directory {}", parent.display()))?
             .permissions()
@@ -3299,10 +3300,6 @@ fn load_or_create_keypair_with(
     let mut claims = ClaimSet::empty();
     let mut recovery_allowed = true;
 
-    if let Some(parent) = key_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        ensure_key_parent_dir_private(parent)?;
-    }
-
     // N1 invariant: EVERY arm that returns a successfully resolved keypair
     // (loaded, reloaded, adopted, or generated) must run the durability-gated
     // stale-marker sweep before returning, by funneling through this closure.
@@ -3519,6 +3516,11 @@ mod gossip_ssrf_tests {
             .expect(0)
             .create_async()
             .await;
+        let _ready = server
+            .mock("GET", "/ready")
+            .with_status(404)
+            .create_async()
+            .await;
         let _health = server
             .mock("GET", "/health")
             .with_status(302)
@@ -3537,6 +3539,11 @@ mod gossip_ssrf_tests {
     #[tokio::test]
     async fn ping_peer_health_reports_success_on_200() {
         let mut server = mockito::Server::new_async().await;
+        let _ready = server
+            .mock("GET", "/ready")
+            .with_status(404)
+            .create_async()
+            .await;
         let _health = server
             .mock("GET", "/health")
             .with_status(200)
@@ -4681,8 +4688,7 @@ mod identity_key_tests {
             .mode()
             & 0o777;
         assert_eq!(
-            mode,
-            0o700,
+            mode, 0o700,
             "the identity key parent directory must be owner-only after publish"
         );
         let loaded = super::load_existing_key(&key_path).expect("load");
@@ -4725,8 +4731,7 @@ mod identity_key_tests {
             .mode()
             & 0o777;
         assert_eq!(
-            mode,
-            0o600,
+            mode, 0o600,
             "fallback publish marker must be owner-only, got {mode:o}"
         );
         unsafe { libc::umask(old_mask) };
