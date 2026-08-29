@@ -2538,8 +2538,8 @@ async fn publish_durability_confirmed(
         }
         if start.elapsed() >= wait {
             // Handler disconnected during `release` without recording an outcome.
-            // Proceed so inv22's disconnect-during-release tail still runs.
-            return true;
+            // Fail closed: a pending inner `None` is not durability.
+            return false;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
@@ -3261,7 +3261,13 @@ pub async fn fork_repo(
         machine_id: state.machine_id.clone(),
     };
 
-    state.db.create_repo(&record).await?;
+    if let Err(e) = state.db.create_repo(&record).await {
+        state
+            .repo_store
+            .compensate_fork_archive(&forker_did, &fork_name, &disk_path)
+            .await;
+        return Err(e.into());
+    }
 
     // Persist the proof so the fork carries it when it propagates to peers.
     if let Some(p) = verified_proof {
@@ -3498,6 +3504,34 @@ mod tests {
     const OWNER_DID: &str = "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
     const OWNER_SHORT: &str = "z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
     const STRANGER_DID: &str = "did:key:z6Mkffonly5tranger0000000000000000000000000000000";
+
+    #[tokio::test]
+    async fn publish_durability_confirmed_fails_closed_when_release_never_records() {
+        let slot = Arc::new(tokio::sync::Mutex::new(None));
+        let confirmed =
+            publish_durability_confirmed(&Some(slot), std::time::Duration::from_millis(30)).await;
+        assert!(
+            !confirmed,
+            "a pending release outcome must not be treated as confirmed durability"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_durability_confirmed_accepts_only_released() {
+        let slot = Arc::new(tokio::sync::Mutex::new(Some(
+            crate::git::repo_store::ReleaseOutcome::Released,
+        )));
+        assert!(
+            publish_durability_confirmed(&Some(slot), std::time::Duration::from_millis(5)).await
+        );
+
+        let slot = Arc::new(tokio::sync::Mutex::new(Some(
+            crate::git::repo_store::ReleaseOutcome::UploadUnknowable,
+        )));
+        assert!(
+            !publish_durability_confirmed(&Some(slot), std::time::Duration::from_millis(5)).await
+        );
+    }
 
     #[test]
     fn upload_pack_request_finalizes_only_with_done_pktline() {

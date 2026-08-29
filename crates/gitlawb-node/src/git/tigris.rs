@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -230,8 +231,9 @@ impl TigrisClient {
         owner_slug: &str,
         repo_name: &str,
         local_path: &Path,
+        swap_authority: Option<Arc<AtomicBool>>,
     ) -> Result<()> {
-        self.download_to(owner_slug, repo_name, local_path, true)
+        self.download_to(owner_slug, repo_name, local_path, true, swap_authority)
             .await
             .map(|_| ())
     }
@@ -250,6 +252,7 @@ impl TigrisClient {
         repo_name: &str,
         target: &Path,
         publish: bool,
+        swap_authority: Option<Arc<AtomicBool>>,
     ) -> Result<PathBuf> {
         let key = Self::repo_key(owner_slug, repo_name);
         debug!(key = %key, path = %target.display(), "downloading repo from tigris");
@@ -298,7 +301,7 @@ impl TigrisClient {
                 let cleanup = snapshot_tmp.as_ref().map(|p| SnapshotCleanup(p.clone()));
                 let result = (|| -> Result<PathBuf> {
                     if publish {
-                        decompress_repo(&data, &target)?;
+                        decompress_repo(&data, &target, swap_authority.as_ref())?;
                         return Ok(target);
                     }
                     // Non-mutating snapshot: unpack into the temp dir decided above.
@@ -334,7 +337,6 @@ impl TigrisClient {
     }
 
     /// Delete a repo archive from Tigris.
-    #[allow(dead_code)]
     pub async fn delete(&self, owner_slug: &str, repo_name: &str) -> Result<()> {
         let key = Self::repo_key(owner_slug, repo_name);
         self.s3
@@ -367,7 +369,7 @@ fn compress_repo(repo_path: &Path) -> Result<Vec<u8>> {
 /// `decompress_repo`. Concurrent extractions unpack into isolated temp dirs in
 /// parallel, but the final `remove_dir_all` + `rename` must not interleave for
 /// the same `local_path`, or they race to a nondeterministic overwrite/failure.
-fn publish_lock(local_path: &Path) -> Arc<Mutex<()>> {
+pub(crate) fn publish_lock(local_path: &Path) -> Arc<Mutex<()>> {
     // KNOWN LIMITATION: this map is never evicted — one (PathBuf, Arc<Mutex>)
     // entry accrues per distinct repo path for the process lifetime. Bounded by
     // the number of repos a node hosts, so it's negligible for normal use, but
@@ -401,7 +403,11 @@ impl Drop for SnapshotCleanup {
 /// fully succeeds. A corrupt or truncated archive therefore can never clobber a
 /// good existing copy at `local_path` — on failure we discard the temp dir and
 /// leave `local_path` exactly as it was.
-fn decompress_repo(data: &[u8], local_path: &Path) -> Result<()> {
+fn decompress_repo(
+    data: &[u8],
+    local_path: &Path,
+    swap_authority: Option<&Arc<AtomicBool>>,
+) -> Result<()> {
     let parent = local_path.parent().context("repo path has no parent")?;
     std::fs::create_dir_all(parent).context("creating parent dir")?;
 
@@ -430,17 +436,9 @@ fn decompress_repo(data: &[u8], local_path: &Path) -> Result<()> {
         return Err(e);
     }
 
-    // Swap the freshly-extracted repo into place. rename within the same parent
-    // is effectively atomic, but most platforms refuse to rename onto a
-    // non-empty dir, so remove the old copy first. Serialize this per repo path:
-    // concurrent extractions unpack into isolated temp dirs, but their swaps
-    // must not interleave or they race to a nondeterministic overwrite/failure.
-    let lock = publish_lock(local_path);
-    let _publish = lock.lock().expect("publish lock poisoned");
-    if local_path.exists() {
-        std::fs::remove_dir_all(local_path).context("removing stale repo dir")?;
-    }
-    std::fs::rename(&tmp_dir, local_path).context("swapping extracted repo into place")?;
+    // Swap through the validated-path helper so CodeQL sees the barrier before the
+    // remove/rename sink (`rust/path-injection`).
+    super::repo_store::swap_extracted_into_validated_repo(local_path, &tmp_dir, swap_authority)?;
 
     Ok(())
 }

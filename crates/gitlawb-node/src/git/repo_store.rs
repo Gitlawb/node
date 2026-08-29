@@ -10,6 +10,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -129,7 +130,10 @@ impl RepoStore {
     /// spawned to lazily migrate it (on-demand migration for pre-Tigris repos).
     /// Returns the local path to the bare repo.
     pub async fn acquire(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
-        let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
+        // Validate at the sink CodeQL watches (`rust/path-injection`), not only inside
+        // `local_path()`, so `exists` and every later filesystem touch share one barrier.
+        let local_path = validated_repo_disk_path(&self.repos_dir, owner_did, repo_name)?;
+        let owner_slug = owner_did.replace([':', '/'], "_");
 
         // Fast path: repo exists locally
         if local_path.exists() {
@@ -198,7 +202,7 @@ impl RepoStore {
             if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
                 debug!(repo = %repo_name, "cache miss — downloading from tigris");
                 tigris
-                    .download(&owner_slug, repo_name, &local_path)
+                    .download(&owner_slug, repo_name, &local_path, None)
                     .await
                     .context("downloading repo from tigris")?;
                 // Mark as migrated since we just downloaded it
@@ -244,7 +248,7 @@ impl RepoStore {
                     // in the ASYNC layer, armed for the whole download await and
                     // disarmed only when `RepoSnapshot` takes ownership.
                     let snapshot = tigris
-                        .download_to(&owner_slug, repo_name, &local_path, false)
+                        .download_to(&owner_slug, repo_name, &local_path, false, None)
                         .await
                         .map_err(|e| {
                             anyhow::Error::new(RepoUnavailable).context(format!(
@@ -427,7 +431,11 @@ impl RepoStore {
             // second past the deadline would turn a short deadline into a longer
             // wait than the caller was promised.
             if attempt < 59 {
-                tokio::time::sleep(left.min(std::time::Duration::from_secs(1))).await;
+                let remaining = match deadline.checked_duration_since(std::time::Instant::now()) {
+                    Some(remaining) if !remaining.is_zero() => remaining,
+                    _ => break,
+                };
+                tokio::time::sleep(remaining.min(std::time::Duration::from_secs(1))).await;
             }
         }
         let Some(lock_conn) = lock_conn else {
@@ -449,6 +457,7 @@ impl RepoStore {
         // From here the lock is HELD. Any early return must not simply drop the
         // connection back into the pool, so it is handed to the guard immediately
         // below and every exit after this point goes through the guard.
+        let refresh_swap_authority = Arc::new(AtomicBool::new(true));
         let mut guard = RepoWriteGuard {
             owner_slug: owner_slug.clone(),
             repo_name: repo_name.to_string(),
@@ -461,6 +470,7 @@ impl RepoStore {
             // observed under the lock. Only reachable unset when no backend is
             // configured, in which case `release` publishes nothing at all.
             publish_fence: UploadPrecondition::Unconditional,
+            refresh_swap_authority: Some(refresh_swap_authority.clone()),
             #[cfg(test)]
             test_pre_unlock_gate: self.pre_unlock_gate.clone(),
             #[cfg(test)]
@@ -502,7 +512,15 @@ impl RepoStore {
                         Ok(Some(etag)) => {
                             debug!(repo = %repo_name, "write acquire: downloading latest from tigris");
                             let fence = UploadPrecondition::IfMatch(etag);
-                            match tigris.download(&owner_slug, repo_name, &local_path).await {
+                            match tigris
+                                .download(
+                                    &owner_slug,
+                                    repo_name,
+                                    &local_path,
+                                    Some(refresh_swap_authority.clone()),
+                                )
+                                .await
+                            {
                                 Ok(()) => Ok(fence),
                                 Err(err) => Err(RefreshFailure::Download { err, fence }),
                             }
@@ -570,6 +588,7 @@ impl RepoStore {
                     //
                     // Refuse the acquire. Returning here drops the guard, whose Drop
                     // frees the lock and its pool slot.
+                    refresh_swap_authority.store(false, Ordering::Release);
                     //
                     // `error!`, not the sibling `warn!` above, and that is deliberate.
                     // The handler layer demotes every `RepoUnavailable` to warn because
@@ -697,6 +716,30 @@ impl RepoStore {
         let local_path = validated_repo_disk_path(&self.repos_dir, owner_did, repo_name)?;
         Ok((owner_slug, local_path))
     }
+
+    /// Best-effort cleanup when fork creation published an archive but failed to persist
+    /// the database row. Removes the object-store key this attempt owns and the local
+    /// mirror clone so a retry is not blocked by its own orphan.
+    pub async fn compensate_fork_archive(&self, owner_did: &str, repo_name: &str, disk_path: &Path) {
+        if let Some(ref tigris) = self.tigris {
+            if let Ok((owner_slug, _)) = self.local_path(owner_did, repo_name) {
+                if let Err(e) = tigris.delete(&owner_slug, repo_name).await {
+                    warn!(
+                        repo = %repo_name,
+                        err = %e,
+                        "failed to delete fork archive during create_repo compensation"
+                    );
+                }
+            }
+        }
+        if let Err(e) = std::fs::remove_dir_all(disk_path) {
+            warn!(
+                path = %disk_path.display(),
+                err = %e,
+                "failed to remove fork clone during create_repo compensation"
+            );
+        }
+    }
 }
 
 /// The three-layer validated form of `store::repo_disk_path`, with NO Tigris fetch and
@@ -733,6 +776,30 @@ pub(crate) fn validated_repo_disk_path(
     }
 
     Ok(local_path)
+}
+
+/// Swap a finished extraction into a validated live repo path. The caller must pass
+/// the path returned from [`validated_repo_disk_path`]; this is the CodeQL barrier
+/// for `rust/path-injection` on the remove/rename sink.
+pub(crate) fn swap_extracted_into_validated_repo(
+    validated_path: &Path,
+    tmp_dir: &Path,
+    swap_authority: Option<&Arc<AtomicBool>>,
+) -> Result<()> {
+    if let Some(authority) = swap_authority {
+        if !authority.load(Ordering::Acquire) {
+            let _ = std::fs::remove_dir_all(tmp_dir);
+            anyhow::bail!("publish swap revoked after lock ownership ended");
+        }
+    }
+
+    let lock = super::tigris::publish_lock(validated_path);
+    let _publish = lock.lock().expect("publish lock poisoned");
+    if validated_path.exists() {
+        std::fs::remove_dir_all(validated_path).context("removing stale repo dir")?;
+    }
+    std::fs::rename(tmp_dir, validated_path).context("swapping extracted repo into place")?;
+    Ok(())
 }
 
 /// Strict allowlist validator for `owner_did` and `repo_name`.
@@ -1049,6 +1116,10 @@ pub struct RepoWriteGuard {
     /// PUT abandoned by an earlier writer's timeout cannot land on top of a
     /// successor's acknowledged archive.
     publish_fence: UploadPrecondition,
+    /// When set, a timed-out or cancelled under-lock refresh revokes this before the
+    /// guard drops so a detached `spawn_blocking` extraction cannot swap into the live
+    /// tree after its advisory-lock ownership ends.
+    refresh_swap_authority: Option<Arc<AtomicBool>>,
     /// Test-only seam: when set, `release` parks on this gate at the exact point
     /// it is about to await `pg_advisory_unlock` (connection still owned, not yet
     /// released). Dropping the `release` future while it is parked reproduces a
@@ -1276,6 +1347,10 @@ impl RepoWriteGuard {
 
 impl Drop for RepoWriteGuard {
     fn drop(&mut self) {
+        if let Some(authority) = self.refresh_swap_authority.take() {
+            authority.store(false, Ordering::Release);
+        }
+
         let Some(mut conn) = self.conn.take() else {
             // release() already unlocked and handed the connection back.
             return;
@@ -1558,6 +1633,67 @@ mod tests {
         assert!(ReleaseOutcome::UploadUnknowable.into_result().is_err());
         assert!(ReleaseOutcome::UploadFailed.into_result().is_err());
         assert!(ReleaseOutcome::Fenced.into_result().is_err());
+    }
+
+    #[test]
+    fn revoked_publish_swap_cannot_replace_the_live_tree() {
+        let root = tempfile::TempDir::new().unwrap();
+        let repos_dir = root.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let owner = "did:key:z6MkRevokedSwapAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "repo";
+        let live = validated_repo_disk_path(&repos_dir, owner, name).unwrap();
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(live.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let tmp = live
+            .parent()
+            .unwrap()
+            .join(format!(".{}.tmp-extract.test", name));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("HEAD"), "ref: refs/heads/evil\n").unwrap();
+
+        let authority = Arc::new(AtomicBool::new(false));
+        let err = swap_extracted_into_validated_repo(&live, &tmp, Some(&authority))
+            .expect_err("a revoked authority must refuse the swap");
+        assert!(
+            err.to_string().contains("publish swap revoked"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            live.join("HEAD").exists(),
+            "the live tree must survive a revoked late extraction"
+        );
+        assert!(
+            !tmp.exists(),
+            "the temp extraction must be cleaned up on refusal"
+        );
+        let head = std::fs::read_to_string(live.join("HEAD")).unwrap();
+        assert_eq!(head, "ref: refs/heads/main\n");
+    }
+
+    #[test]
+    fn non_revoked_publish_swap_replaces_the_live_tree() {
+        let root = tempfile::TempDir::new().unwrap();
+        let repos_dir = root.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let owner = "did:key:z6MkHappySwapAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "repo";
+        let live = validated_repo_disk_path(&repos_dir, owner, name).unwrap();
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(live.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let tmp = live
+            .parent()
+            .unwrap()
+            .join(format!(".{}.tmp-extract.test", name));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("HEAD"), "ref: refs/heads/new\n").unwrap();
+
+        let authority = Arc::new(AtomicBool::new(true));
+        swap_extracted_into_validated_repo(&live, &tmp, Some(&authority)).expect("swap succeeds");
+        let head = std::fs::read_to_string(live.join("HEAD")).unwrap();
+        assert_eq!(head, "ref: refs/heads/new\n");
     }
 
     // ── sync slug validation (#272) ────────────────────────────────────────
@@ -2531,6 +2667,7 @@ mod tests {
             tigris: None,
             lock_held_transfer_timeout: Duration::from_secs(300),
             publish_fence: UploadPrecondition::Unconditional,
+            refresh_swap_authority: None,
             #[cfg(test)]
             test_pre_unlock_gate: None,
             #[cfg(test)]
@@ -2895,6 +3032,7 @@ mod tests {
             lock_held_transfer_timeout: Duration::from_secs(300),
             // No backend, so nothing is ever published and the fence is unread.
             publish_fence: UploadPrecondition::Unconditional,
+            refresh_swap_authority: None,
             #[cfg(test)]
             test_pre_unlock_gate: None,
             #[cfg(test)]
@@ -4672,7 +4810,7 @@ mod tests {
         let out = TempDir::new().unwrap();
         let into = out.path().join("stored.git");
         mock_tigris(mock)
-            .download(owner_slug, repo_name, &into)
+            .download(owner_slug, repo_name, &into, None)
             .await
             .expect("the stored archive must be readable");
         std::fs::read_to_string(into.join("MARKER")).expect("the stored archive must be marked")
