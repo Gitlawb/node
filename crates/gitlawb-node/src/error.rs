@@ -164,7 +164,15 @@ impl IntoResponse for AppError {
             "message": message,
         }));
 
-        (status, body).into_response()
+        let mut resp = (status, body).into_response();
+        if matches!(self, AppError::TooManyRequests(_)) {
+            use axum::http::HeaderValue;
+            let denial = gitlawb_core::node_denial::NodeDenial::RateLimited.as_str();
+            if let Ok(v) = HeaderValue::from_str(denial) {
+                resp.headers_mut().insert("X-Gitlawb-Error", v);
+            }
+        }
+        resp
     }
 }
 
@@ -184,6 +192,17 @@ mod tests {
         assert_eq!(
             AppError::Git("x".into()).into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn too_many_requests_carries_rate_limited_header() {
+        use axum::http::HeaderValue;
+        let resp = AppError::TooManyRequests("slow down".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get("X-Gitlawb-Error"),
+            Some(&HeaderValue::from_static("rate_limited"))
         );
     }
 }

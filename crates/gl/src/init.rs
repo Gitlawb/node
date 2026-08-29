@@ -138,21 +138,19 @@ async fn run_in(cwd: &std::path::Path, args: InitArgs) -> Result<()> {
         "description": args.description,
         "is_public": true,
     }))?;
-    let resp = client
+    let mut resp = client
         .post("/api/v1/repos", &body)
         .await
         .context("failed to create repo")?;
     let repo_status = resp.status();
-    let repo_result: Value = resp.json().await.context("invalid JSON from create repo")?;
-
     if !repo_status.is_success() {
-        // Key on the node's structured code, never on its prose: the replay
-        // denial's message is "this signature has already been used - sign a
-        // fresh request", which a `contains("already")` check read as "the repo
-        // is already there, carry on" and reported success for a repo that was
-        // never created.
+        let raw = crate::http::read_body_capped(&mut resp, crate::http::DENIAL_BODY_CAP).await;
+        let repo_result: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
         if !repo_already_exists(&repo_result) {
-            let msg = repo_result["message"].as_str().unwrap_or("unknown error");
+            let msg = repo_result["message"]
+                .as_str()
+                .or_else(|| repo_result["error"].as_str())
+                .unwrap_or("unknown error");
             anyhow::bail!(
                 "create repo failed ({repo_status}): {}",
                 crate::http::sanitize_node_msg(msg)
@@ -160,6 +158,7 @@ async fn run_in(cwd: &std::path::Path, args: InitArgs) -> Result<()> {
         }
         println!("  Repository already exists — continuing.");
     } else {
+        let _repo_result: Value = resp.json().await.context("invalid JSON from create repo")?;
         println!("  Repository created.");
     }
 

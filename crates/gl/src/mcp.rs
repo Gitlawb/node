@@ -797,19 +797,20 @@ async fn call_tool(
         "git_refs" => {
             let name = args["name"].as_str().context("missing 'name'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let resp = client
+            let mut resp = client
                 .get(&format!(
                     "/{owner}/{name}/info/refs?service=git-upload-pack"
                 ))
                 .await?;
-            // Same reason as `json_ok`: a denial body would otherwise parse to an
-            // empty ref list and come back as a successful tool result.
             let status = resp.status();
-            let bytes = resp.bytes().await?;
             if !status.is_success() {
+                let _ =
+                    crate::http::read_body_capped(&mut resp, crate::http::DENIAL_BODY_CAP).await;
                 anyhow::bail!("git_refs failed ({status})");
             }
-            // Parse pkt-line refs
+            let bytes =
+                crate::http::read_body_capped(&mut resp, crate::http::GIT_REFS_BODY_CAP).await;
+            validate_git_advertisement(&bytes)?;
             let refs = parse_info_refs(&bytes);
             Ok(serde_json::to_string_pretty(&refs)?)
         }
@@ -1331,6 +1332,33 @@ async fn resolve_owner(args: &Value, client: &NodeClient) -> Result<String> {
     let info = json_ok("owner lookup", client.get("/").await?).await?;
     let did = info["did"].as_str().context("node info missing DID")?;
     Ok(did.split(':').next_back().unwrap_or(did).to_string())
+}
+
+/// Reject JSON/HTML bodies masquerading as git advertisements, and pkt-line
+/// garbage that would parse as an empty ref list.
+fn validate_git_advertisement(bytes: &[u8]) -> Result<()> {
+    if matches!(bytes.first(), Some(b'{') | Some(b'<')) {
+        anyhow::bail!("git_refs failed (200): response was not a git ref advertisement");
+    }
+    let mut pos = 0usize;
+    while pos + 4 <= bytes.len() {
+        let hex = std::str::from_utf8(&bytes[pos..pos + 4])
+            .map_err(|_| anyhow::anyhow!("git_refs failed (200): invalid pkt-line length"))?;
+        let len = usize::from_str_radix(hex, 16)
+            .map_err(|_| anyhow::anyhow!("git_refs failed (200): invalid pkt-line length"))?;
+        if len == 0 {
+            pos += 4;
+            continue;
+        }
+        if len < 4 || pos + len > bytes.len() {
+            anyhow::bail!("git_refs failed (200): truncated pkt-line");
+        }
+        pos += len;
+    }
+    if pos != bytes.len() {
+        anyhow::bail!("git_refs failed (200): response was not a valid git ref advertisement");
+    }
+    Ok(())
 }
 
 /// Parse git pkt-line info/refs response into a list of {ref, sha} objects.
@@ -2271,7 +2299,82 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("403"), "got: {msg}");
         assert!(msg.contains("denied"), "got: {msg}");
-        assert!(!msg.contains('\u{001b}'), "control bytes must be stripped, got: {msg}");
+        assert!(
+            !msg.contains('\u{001b}'),
+            "control bytes must be stripped, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_json_ok_denial_caps_oversized_body() {
+        let mut server = mockito::Server::new_async().await;
+        let huge = "x".repeat(80 * 1024);
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/ghost")
+            .with_status(429)
+            .with_header("content-type", "application/json")
+            .with_body(format!(r#"{{"error":"rate_limited","message":"{huge}"}}"#))
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "repo_get",
+            json!({"owner": "alice", "name": "ghost"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect_err("oversized denial must fail the tool call");
+        assert!(err.to_string().contains("429"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_json_ok_plain_text_denial_surfaces_status() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/ghost")
+            .with_status(429)
+            .with_header("content-type", "text/plain")
+            .with_body("rate limit exceeded")
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "repo_get",
+            json!({"owner": "alice", "name": "ghost"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect_err("plain-text denial must fail the tool call");
+        let msg = err.to_string();
+        assert!(msg.contains("429"), "got: {msg}");
+        assert!(msg.contains("rate limit"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_git_refs_fake_200_json_errors_not_empty_refs() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/alice/secret/info/refs?service=git-upload-pack")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"forbidden"}"#)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "git_refs",
+            json!({"owner": "alice", "name": "secret"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect_err("JSON on a 200 must not parse as an empty ref list");
+        assert!(
+            err.to_string().contains("not a git ref advertisement"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]

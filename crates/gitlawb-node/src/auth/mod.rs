@@ -74,7 +74,7 @@ use gitlawb_core::identity::verify;
 ///
 /// Every write request must carry:
 ///   Content-Digest:   sha-256=:base64hash:
-///   Signature-Input:  sig1=("@method" "@path" "content-digest");keyid="did:key:...";alg="ed25519";created=<unix>
+///   Signature-Input:  sig1=("@method" "@path" "content-digest");keyid="did:key:...";alg="ed25519";created=<unix>;nonce="..."
 ///   Signature:        sig1=:base64signature:
 ///
 /// The middleware:

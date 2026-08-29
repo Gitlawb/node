@@ -20,7 +20,11 @@ const MAX_ICAPTCHA_RETRIES: usize = 2;
 /// error bodies are a few hundred bytes of JSON; anything past this is not one,
 /// and reading it unbounded is exactly the allocation a hostile node would aim
 /// for.
-const DENIAL_BODY_CAP: usize = 64 * 1024;
+pub(crate) const DENIAL_BODY_CAP: usize = 64 * 1024;
+
+/// Max bytes read from a git smart-HTTP ref advertisement. Real ads are small;
+/// this bounds hostile 200 responses on the MCP `git_refs` path.
+pub(crate) const GIT_REFS_BODY_CAP: usize = 256 * 1024;
 
 /// Max characters of a node-supplied message we will echo to the terminal.
 const NODE_MSG_CHARS: usize = 200;

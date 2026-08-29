@@ -1061,6 +1061,9 @@ pub enum ConsumeSignature {
 /// thus ~1024 rows, roughly 440 KB.
 pub const MAX_LIVE_SIGNATURES_PER_KEYID: i64 = 512;
 
+/// Advisory-lock class for serializing per-identity ledger cap checks.
+const LEDGER_CAP_LOCK_CLASS: i32 = 0x676c;
+
 // ── Repos ─────────────────────────────────────────────────────────────────────
 
 pub(crate) fn normalize_owner_key(did: &str) -> &str {
@@ -1549,7 +1552,14 @@ impl Db {
         now: i64,
         expires_at: i64,
     ) -> Result<ConsumeSignature> {
-        let (inserted, live): (i64, i64) = sqlx::query_as(
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
+            .bind(LEDGER_CAP_LOCK_CLASS)
+            .bind(identity)
+            .execute(&mut *tx)
+            .await?;
+
+        let (inserted, live, already_spent): (i64, i64, bool) = sqlx::query_as(
             r#"WITH live AS (
                    SELECT COUNT(*) AS n FROM consumed_signatures
                    WHERE keyid = $2 AND expires_at >= $4
@@ -1560,22 +1570,26 @@ impl Db {
                    RETURNING 1
                )
                SELECT (SELECT COUNT(*) FROM ins) AS inserted,
-                      (SELECT n FROM live)       AS live_count"#,
+                      (SELECT n FROM live)       AS live_count,
+                      EXISTS(
+                          SELECT 1 FROM consumed_signatures WHERE sig_hash = $1
+                      )                          AS already_spent"#,
         )
         .bind(sig_hash)
         .bind(identity)
         .bind(expires_at)
         .bind(now)
         .bind(MAX_LIVE_SIGNATURES_PER_KEYID)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+
+        tx.commit().await?;
 
         if inserted > 0 {
             Ok(ConsumeSignature::Inserted)
+        } else if already_spent {
+            Ok(ConsumeSignature::Replayed)
         } else if live >= MAX_LIVE_SIGNATURES_PER_KEYID {
-            // The insert was suppressed by the cap. A capped identity replaying
-            // an already-spent signature also lands here; that is deliberate,
-            // since the cap is the more actionable condition to report.
             Ok(ConsumeSignature::IdentityLedgerFull)
         } else {
             Ok(ConsumeSignature::Replayed)
@@ -5512,6 +5526,80 @@ mod signature_ledger_tests {
                 .unwrap(),
             ConsumeSignature::Inserted,
             "the cap must lift once the identity's rows expire"
+        );
+    }
+
+    /// A replay at the cap must read as `Replayed`, not `IdentityLedgerFull`.
+    #[sqlx::test]
+    async fn replay_at_identity_cap_returns_replayed(pool: PgPool) {
+        let db = db(pool).await;
+        let kid = "did:key:zFlooder";
+        let cap = super::MAX_LIVE_SIGNATURES_PER_KEYID;
+        let now = 3_000i64;
+        let exp = now + 330;
+
+        for i in 0..cap - 1 {
+            assert_eq!(
+                db.consume_signature(&key(&format!("cap-{i}")), kid, now, exp)
+                    .await
+                    .unwrap(),
+                ConsumeSignature::Inserted
+            );
+        }
+        let spent = key("spent-once");
+        assert_eq!(
+            db.consume_signature(&spent, kid, now, exp).await.unwrap(),
+            ConsumeSignature::Inserted
+        );
+        assert_eq!(
+            db.consume_signature(&spent, kid, now, exp).await.unwrap(),
+            ConsumeSignature::Replayed,
+            "a replay must not be reported as the cap being full"
+        );
+    }
+
+    /// Concurrent distinct signatures cannot push an identity above the cap.
+    #[sqlx::test]
+    async fn concurrent_consume_signature_respects_per_identity_cap(pool: PgPool) {
+        use std::sync::Arc;
+        let db = Arc::new(db(pool).await);
+        let kid = "did:key:zRace";
+        let cap = super::MAX_LIVE_SIGNATURES_PER_KEYID;
+        let now = 4_000i64;
+        let exp = now + 330;
+
+        for i in 0..cap - 5 {
+            assert_eq!(
+                db.consume_signature(&key(&format!("seed-{i}")), kid, now, exp)
+                    .await
+                    .unwrap(),
+                ConsumeSignature::Inserted
+            );
+        }
+
+        let mut handles = Vec::new();
+        for i in 0..20 {
+            let db = Arc::clone(&db);
+            handles.push(tokio::spawn(async move {
+                db.consume_signature(&key(&format!("race-{i}")), kid, now, exp)
+                    .await
+            }));
+        }
+        for handle in handles {
+            drop(handle.await.unwrap());
+        }
+
+        let live: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM consumed_signatures WHERE keyid = $1 AND expires_at >= $2",
+        )
+        .bind(kid)
+        .bind(now)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            live <= cap,
+            "concurrent inserts must not exceed the per-identity cap, saw {live}"
         );
     }
 

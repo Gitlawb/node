@@ -315,13 +315,7 @@ async fn cmd_issue_comment(
         )
         .await
         .context("failed to connect to node")?;
-    let code = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !code.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("comment failed ({code}): {msg}");
-    }
+    json_or_denial::<Value>("comment", resp).await?;
 
     println!("· Comment posted on issue {id}");
     Ok(())

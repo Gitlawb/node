@@ -792,9 +792,9 @@ const NOTIFY_RETRY_BACKOFF: [std::time::Duration; 2] = [
     std::time::Duration::from_secs(5),
 ];
 
-/// Production retry policy for the peer sync fan-out. 60s is roughly ten refs'
-/// worth of full backoff, enough to ride out transient ledger pressure while
-/// keeping the worst case a wedged peer can impose to a minute per peer.
+/// Production retry policy for the peer sync fan-out. 60s is the total sleep
+/// budget shared across every peer in one push's fan-out, not per peer, so an
+/// attacker-fillable peer set cannot multiply retry wall clock.
 const NOTIFY_RETRY_POLICY: NotifyRetryPolicy = NotifyRetryPolicy {
     backoff: &NOTIFY_RETRY_BACKOFF,
     budget: std::time::Duration::from_secs(60),
@@ -983,8 +983,8 @@ async fn notify_peer_of_refs(
     pusher_did: &str,
     owner_did: &str,
     retry: &NotifyRetryPolicy,
+    shared_sleep_budget: &mut std::time::Duration,
 ) -> FanOutSummary {
-    let mut budget_left = retry.budget;
     let mut failed: Vec<&str> = Vec::new();
     let mut last_reason = String::new();
 
@@ -1011,12 +1011,12 @@ async fn notify_peer_of_refs(
                 NotifyAttempt::Fatal(reason) => reason,
                 NotifyAttempt::Retryable(reason) => {
                     // Two bounds, both required. `backoff` caps the attempts
-                    // for this ref; `budget_left` caps the sleeping for the
-                    // whole fan-out so the bound does not scale with the ref
-                    // count. Either one running out ends this ref here.
+                    // for this ref; `shared_sleep_budget` caps the sleeping for
+                    // the whole fan-out across every peer and ref. Either one
+                    // running out ends this ref here.
                     match retry.backoff.get(attempt) {
-                        Some(&wait) if wait <= budget_left => {
-                            budget_left -= wait;
+                        Some(&wait) if wait <= *shared_sleep_budget => {
+                            *shared_sleep_budget -= wait;
                             attempt += 1;
                             tokio::time::sleep(wait).await;
                             continue;
@@ -1548,6 +1548,7 @@ pub async fn git_receive_pack(
             // anchoring above; this is the lowest-priority best-effort step.
             if announce {
                 if let Ok(peers) = db_for_peers.list_peers().await {
+                    let mut shared_retry_sleep = NOTIFY_RETRY_POLICY.budget;
                     for peer in peers {
                         if peer.http_url.is_empty() {
                             continue;
@@ -1570,6 +1571,7 @@ pub async fn git_receive_pack(
                             &pusher_did_clone,
                             &record.owner_did,
                             &NOTIFY_RETRY_POLICY,
+                            &mut shared_retry_sleep,
                         )
                         .await;
                     }
@@ -2043,6 +2045,36 @@ mod tests {
     const OWNER_DID: &str = "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
     const OWNER_SHORT: &str = "z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
     const STRANGER_DID: &str = "did:key:z6Mkffonly5tranger0000000000000000000000000000000";
+
+    #[allow(clippy::too_many_arguments)]
+    async fn notify_peer_with_budget(
+        http_client: &reqwest::Client,
+        node_keypair: &Keypair,
+        peer_did: &str,
+        notify_url: &str,
+        repo_slug: &str,
+        ref_updates: &[(String, String, String)],
+        node_did: &str,
+        pusher_did: &str,
+        owner_did: &str,
+        retry: &NotifyRetryPolicy,
+    ) -> FanOutSummary {
+        let mut sleep_budget = retry.budget;
+        notify_peer_of_refs(
+            http_client,
+            node_keypair,
+            peer_did,
+            notify_url,
+            repo_slug,
+            ref_updates,
+            node_did,
+            pusher_did,
+            owner_did,
+            retry,
+            &mut sleep_budget,
+        )
+        .await
+    }
 
     #[test]
     fn git_service_app_error_classifies_timeout_bad_request_and_git() {
@@ -2639,7 +2671,7 @@ mod tests {
             (ref_b.to_string(), old_b.to_string(), new_b.to_string()),
         ];
 
-        notify_peer_of_refs(
+        notify_peer_with_budget(
             &http_client,
             &keypair,
             "did:key:zPeer",
@@ -2688,7 +2720,7 @@ mod tests {
             new_sha.to_string(),
         )];
 
-        notify_peer_of_refs(
+        notify_peer_with_budget(
             &http_client,
             &keypair,
             "did:key:zPeer",
@@ -2756,8 +2788,66 @@ mod tests {
         assert_eq!(
             NOTIFY_RETRY_POLICY.budget.as_secs(),
             60,
-            "a wedged peer adds at most one minute to the fan-out"
+            "the whole fan-out across every peer adds at most one minute of retry sleep"
         );
+    }
+
+    // Retry sleep budget is shared across peers in one push fan-out, not minted
+    // fresh per announced peer.
+    #[tokio::test]
+    async fn notify_fanout_retry_budget_is_shared_across_peers() {
+        let mut server_a = mockito::Server::new_async().await;
+        let mut server_b = mockito::Server::new_async().await;
+        let keypair = Keypair::generate();
+        let http_client = reqwest::Client::new();
+
+        let mock_a = server_a
+            .mock("POST", SYNC_NOTIFY_PATH)
+            .with_status(429)
+            .with_header("x-gitlawb-error", "signature_ledger_full")
+            .expect(6)
+            .create_async()
+            .await;
+        let mock_b = server_b
+            .mock("POST", SYNC_NOTIFY_PATH)
+            .with_status(429)
+            .with_header("x-gitlawb-error", "signature_ledger_full")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut shared_sleep = FAST_POLICY.budget;
+        notify_peer_of_refs(
+            &http_client,
+            &keypair,
+            "did:key:zPeerA",
+            &format!("{}{SYNC_NOTIFY_PATH}", server_a.url()),
+            "owner/repo",
+            &refs(2),
+            "did:key:zNode",
+            "did:key:zPusher",
+            "did:key:zOwner",
+            &FAST_POLICY,
+            &mut shared_sleep,
+        )
+        .await;
+        notify_peer_of_refs(
+            &http_client,
+            &keypair,
+            "did:key:zPeerB",
+            &format!("{}{SYNC_NOTIFY_PATH}", server_b.url()),
+            "owner/repo",
+            &refs(1),
+            "did:key:zNode",
+            "did:key:zPusher",
+            "did:key:zOwner",
+            &FAST_POLICY,
+            &mut shared_sleep,
+        )
+        .await;
+
+        mock_a.assert_async().await;
+        mock_b.assert_async().await;
     }
 
     // 429 twice then 200: a peer whose ledger rejection clears within the
@@ -2793,7 +2883,7 @@ mod tests {
 
         let notify_url = format!("{}{SYNC_NOTIFY_PATH}", server.url());
 
-        notify_peer_of_refs(
+        notify_peer_with_budget(
             &http_client,
             &keypair,
             "did:key:zPeer",
@@ -2832,7 +2922,7 @@ mod tests {
 
         let notify_url = format!("{}{SYNC_NOTIFY_PATH}", server.url());
 
-        let summary = notify_peer_of_refs(
+        let summary = notify_peer_with_budget(
             &http_client,
             &keypair,
             "did:key:zPeer",
@@ -2886,7 +2976,7 @@ mod tests {
 
         let notify_url = format!("{}{SYNC_NOTIFY_PATH}", server.url());
 
-        notify_peer_of_refs(
+        notify_peer_with_budget(
             &http_client,
             &keypair,
             "did:key:zPeer",
@@ -2925,7 +3015,7 @@ mod tests {
             let mock = m.expect(1).create_async().await;
 
             let notify_url = format!("{}{SYNC_NOTIFY_PATH}", server.url());
-            notify_peer_of_refs(
+            notify_peer_with_budget(
                 &http_client,
                 &keypair,
                 "did:key:zPeer",
@@ -2959,7 +3049,7 @@ mod tests {
             .await;
 
         let notify_url = format!("{}{SYNC_NOTIFY_PATH}", server.url());
-        notify_peer_of_refs(
+        notify_peer_with_budget(
             &http_client,
             &keypair,
             "did:key:zPeer",
@@ -2995,7 +3085,7 @@ mod tests {
 
         let notify_url = format!("{}{SYNC_NOTIFY_PATH}", server.url());
 
-        notify_peer_of_refs(
+        notify_peer_with_budget(
             &http_client,
             &keypair,
             "did:key:zPeer",
@@ -3033,7 +3123,7 @@ mod tests {
         let notify_url = format!("http://127.0.0.1:1{SYNC_NOTIFY_PATH}");
 
         let started = std::time::Instant::now();
-        notify_peer_of_refs(
+        notify_peer_with_budget(
             &http_client,
             &keypair,
             "did:key:zPeer",
@@ -3070,7 +3160,7 @@ mod tests {
             .await;
 
         let notify_url = format!("{}{SYNC_NOTIFY_PATH}", server.url());
-        notify_peer_of_refs(
+        notify_peer_with_budget(
             &http_client,
             &keypair,
             "did:key:zPeer",
