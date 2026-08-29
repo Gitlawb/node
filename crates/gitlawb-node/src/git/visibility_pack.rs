@@ -557,22 +557,26 @@ fn all_object_paths(
         if commit.is_empty() {
             continue;
         }
-        // The root tree of each commit gets path "/" so the whole-repo
-        // visibility gate applies (is_public + "/" rules). ls-tree does not
-        // emit the commit's own tree, only its children.
-        let root_tree_out = run_bounded_git(
+        // #218 review P1b: the root tree of each commit is no longer
+        // assigned the synthetic path "/". A path-based check on "/"
+        // would let the root tree slip into the allowed set even when
+        // its serialized bytes name a denied subtree entry — a
+        // tree's bytes expose the names of its direct entries plus
+        // the OIDs of their children, which IS the metadata a
+        // `/secret/**` deny is meant to withhold. The structural
+        // entry-level check is in `allowed_blob_tree_sets_bounded`,
+        // which enumerates root trees itself (so we don't need to
+        // thread a third return value through this signature).
+        // ls-tree -r -t below still enumerates every reachable
+        // blob/subtree tree at its real path; only the root tree's
+        // gate is restructured.
+        let _root_tree_out = run_bounded_git(
             git_bin,
             &["rev-parse", &format!("{commit}^{{tree}}")],
             repo_path,
             b"",
             deadline,
         )?;
-        if let Ok(root_tree_stdout) = std::str::from_utf8(&root_tree_out) {
-            let root_tree = root_tree_stdout.trim();
-            if !root_tree.is_empty() {
-                tree_set.insert((root_tree.to_string(), "/".to_string()));
-            }
-        }
         let listing_out = run_bounded_git(
             git_bin,
             &["ls-tree", "-r", "-t", "-z", commit],
@@ -940,12 +944,29 @@ fn object_paths(
 /// tree (#173 P2). `run_bounded_git` drains stdout concurrently with the stdin
 /// write, so a large history cannot deadlock the pipes. A commit whose root tree git
 /// cannot resolve fails the pass (bail), failing closed.
-fn root_tree_pairs(
+/// #218 review P1b: returns the set of every reachable commit's root
+/// tree OID without a path. The previous shape returned
+/// `(oid, "/")` so the path-based allowed-set filter would admit
+/// the root tree on the synthetic "/", but a path-based check on
+/// "/" lets a root tree slip into the allowed set even when its
+/// serialized bytes name a denied subtree entry — a tree's bytes
+/// expose the names of its direct entries plus the OIDs of their
+/// children, which IS the metadata a `/secret/**` deny is meant
+/// to withhold. The structural entry-level check is now in
+/// `allowed_tree_set_for_caller_bounded` (caller-aware) and
+/// `allowed_blob_tree_sets_bounded` (sweep, anon-only): a root
+/// tree is admitted only if every entry in its direct listing is
+/// independently safe under the policy.
+///
+/// Returning the root tree oids without a path means the path-based
+/// filter at the call site drops them; the structural post-pass is
+/// what actually admits them.
+fn root_tree_oids(
     repo_path: &Path,
     git_bin: &str,
     commits: &[String],
     deadline: Instant,
-) -> Result<HashSet<(String, String)>> {
+) -> Result<HashSet<String>> {
     if commits.is_empty() {
         return Ok(HashSet::new());
     }
@@ -965,7 +986,7 @@ fn root_tree_pairs(
     for line in String::from_utf8_lossy(&out).lines() {
         let oid = line.trim();
         if !oid.is_empty() {
-            set.insert((oid.to_string(), "/".to_string()));
+            set.insert(oid.to_string());
         }
     }
     Ok(set)
@@ -985,12 +1006,16 @@ fn tree_paths(
     deadline: Instant,
 ) -> Result<HashSet<(String, String)>> {
     let commits = reachable_commit_oids(repo_path, git_bin, deadline)?;
-    let mut out: HashSet<(String, String)> = object_paths(repo_path, git_bin, &commits, deadline)?
-        .into_iter()
-        .filter(|(_, _, kind)| kind == "tree")
-        .map(|(oid, path, _)| (oid, path))
-        .collect();
-    out.extend(root_tree_pairs(repo_path, git_bin, &commits, deadline)?);
+    // Subtree trees at their directory paths; the root tree is
+    // enumerated separately via `root_tree_oids` so the structural
+    // post-pass can apply without overlapping with the empty-path
+    // cat-file catch-all sentinel (#218 review P1b).
+    let mut out: HashSet<(String, String)> = HashSet::new();
+    for (oid, path, kind) in object_paths(repo_path, git_bin, &commits, deadline)? {
+        if kind == "tree" {
+            out.insert((oid, path));
+        }
+    }
     Ok(out)
 }
 
@@ -1056,13 +1081,29 @@ pub fn allowed_tree_set_for_caller_bounded(
     caller: Option<&str>,
 ) -> Result<HashSet<String>> {
     let deadline = Instant::now() + timeout;
-    Ok(allowed_set_from_pairs(
+    let mut allowed = allowed_set_from_pairs(
         &tree_paths(repo_path, git_bin, deadline)?,
         rules,
         is_public,
         owner_did,
         caller,
-    ))
+    );
+    // #218 review P1b: root trees are not in the path-based set
+    // (the synthetic "/" was removed). Apply the structural
+    // entry-level check to each reachable commit's root tree and
+    // admit the ones whose every direct entry is safe under the
+    // caller's visibility policy. The child-tree check uses the
+    // already-allowed set so a denied-subtree tree is correctly
+    // absent, which then excludes its parent root tree.
+    let commits = reachable_commit_oids(repo_path, git_bin, deadline)?;
+    for root_oid in root_tree_oids(repo_path, git_bin, &commits, deadline)? {
+        if structurally_safe_root_tree_for_caller(
+            repo_path, git_bin, &root_oid, rules, is_public, owner_did, caller, &allowed, deadline,
+        )? {
+            allowed.insert(root_oid);
+        }
+    }
+    Ok(allowed)
 }
 
 /// Object bound for the annotated-tag reachability walk (#173, jatmn tag fan-out).
@@ -1301,6 +1342,153 @@ pub fn reachable_commit_tag_oids_bounded(
 /// walk so the two are consistent and the walk cost is paid only once. Returns
 /// `(allowed_blobs, allowed_trees, all_blob_oids, all_tree_oids)`.
 ///
+/// #218 review P1b: enumerate every reachable commit's root tree OID so
+/// the structural entry-level check (`structurally_safe_root_tree`) can
+/// be applied to each. One `git rev-list --all` followed by one
+/// `git rev-parse <commit>^{tree}` per commit, both bounded by
+/// `deadline`; the cost is small (root-tree OIDs are tiny, one git
+/// invocation per commit) and pays for itself the first time the
+/// root tree would otherwise leak a denied subtree's name.
+fn root_tree_oids_bounded(
+    repo_path: &Path,
+    git_bin: &str,
+    deadline: Instant,
+) -> Result<Vec<String>> {
+    let head_resolves = run_bounded_git(
+        git_bin,
+        &["rev-parse", "--verify", "HEAD"],
+        repo_path,
+        b"",
+        deadline,
+    )
+    .is_ok();
+    let mut rev_args = vec!["rev-list", "--all"];
+    if head_resolves {
+        rev_args.push("HEAD");
+    }
+    let commits_out = run_bounded_git(git_bin, &rev_args, repo_path, b"", deadline)?;
+    let commits_stdout = String::from_utf8_lossy(&commits_out);
+    let mut root_oids = Vec::new();
+    for commit in commits_stdout.lines() {
+        let commit = commit.trim();
+        if commit.is_empty() {
+            continue;
+        }
+        let out = run_bounded_git(
+            git_bin,
+            &["rev-parse", &format!("{commit}^{{tree}}")],
+            repo_path,
+            b"",
+            deadline,
+        )?;
+        if let Ok(s) = std::str::from_utf8(&out) {
+            let s = s.trim();
+            if !s.is_empty() {
+                root_oids.push(s.to_string());
+            }
+        }
+    }
+    Ok(root_oids)
+}
+
+/// #218 review P1b: structural safety check for a tree. A tree is safe
+/// to publish iff every direct entry in its serialized bytes is
+/// independently safe. For each entry `(mode, type, child_oid,
+/// filename)` from `git ls-tree <tree_oid>`, the entry is safe when:
+///   - the entry's path "/{filename}" passes the visibility policy,
+///   - AND if the entry is a tree, the child tree is itself in
+///     `already_allowed_trees` (the set the path loop just built).
+/// A single denied-path entry or a denied-child tree drops the
+/// whole tree from the allow set. This is the recursive invariant
+/// the reviewer called out: a tree's bytes expose the names of its
+/// direct entries plus the OIDs of their children, so a tree
+/// reachable at an allowed path can still leak a denied subtree's
+/// existence through its entry listing.
+///
+/// Returns `Ok(true)` if the tree is structurally safe, `Ok(false)`
+/// if any entry fails, `Err` only on a git I/O error.
+fn structurally_safe_root_tree(
+    repo_path: &Path,
+    git_bin: &str,
+    tree_oid: &str,
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    already_allowed_trees: &HashSet<String>,
+    deadline: Instant,
+) -> Result<bool> {
+    structurally_safe_root_tree_for_caller(
+        repo_path,
+        git_bin,
+        tree_oid,
+        rules,
+        is_public,
+        owner_did,
+        None,
+        already_allowed_trees,
+        deadline,
+    )
+}
+
+/// Caller-aware structural check used by `allowed_tree_set_for_caller_bounded`.
+/// Same logic as `structurally_safe_root_tree`, but the per-entry
+/// visibility check is caller-aware so anon / listed reader / owner
+/// each see the structurally-allowed tree set consistent with the
+/// path-based filter.
+fn structurally_safe_root_tree_for_caller(
+    repo_path: &Path,
+    git_bin: &str,
+    tree_oid: &str,
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    caller: Option<&str>,
+    already_allowed_trees: &HashSet<String>,
+    deadline: Instant,
+) -> Result<bool> {
+    // One-level listing of the tree's direct entries. `-z` is NUL-separated
+    // for paths containing special characters; ls-tree emits one header per
+    // entry: `<mode> SP <type> SP <oid> TAB <filename>`. The leading bytes are
+    // exactly the tree's serialized entry headers without the surrounding
+    // tree framing, which is what we want to gate on.
+    let out = run_bounded_git(
+        git_bin,
+        &["ls-tree", "-z", tree_oid],
+        repo_path,
+        b"",
+        deadline,
+    )?;
+    let stdout = match std::str::from_utf8(&out) {
+        Ok(s) => s,
+        Err(_) => return Ok(false), // non-UTF-8: refuse (fail-closed)
+    };
+    for record in stdout.split('\0') {
+        let record = record.trim();
+        if record.is_empty() {
+            continue;
+        }
+        let Some((meta, filename)) = record.split_once('\t') else {
+            return Ok(false);
+        };
+        let mut parts = meta.split_whitespace();
+        let _mode = parts.next();
+        let Some(kind) = parts.next() else {
+            return Ok(false);
+        };
+        let Some(child_oid) = parts.next() else {
+            return Ok(false);
+        };
+        let path = format!("/{filename}");
+        if visibility_check(rules, is_public, owner_did, caller, &path) != Decision::Allow {
+            return Ok(false);
+        }
+        if kind == "tree" && !already_allowed_trees.contains(child_oid) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// A blob or tree is "allowed" if visibility permits it at *some* reachable
 /// path; a tree reachable at both an allowed and denied path is allowed (its
 /// metadata is public elsewhere). Commits and tags are not classified here —
@@ -1336,6 +1524,49 @@ pub fn allowed_blob_tree_sets_bounded(
             allowed_trees.insert(oid.clone());
         }
     }
+
+    // #218 review P1b: the root tree of a public commit is not admitted
+    // by the path-based loop above (it has no real path, since
+    // `ls-tree -r -t` emits descendants but not the root tree itself).
+    // The previous code synthesised path "/" so the whole-repo
+    // visibility gate applied, but a path-based check on "/" lets
+    // a root tree slip through even when its serialized bytes name a
+    // denied subtree entry — a tree's bytes expose the names of its
+    // direct entries plus the OIDs of their children, which IS the
+    // metadata a `/secret/**` deny is meant to withhold.
+    //
+    // The structural fix: a tree is safe to publish iff every entry
+    // in its serialized bytes is independently safe. For the root
+    // tree of a public commit, that means every direct entry's
+    // filename is allowed at "/{filename}" AND, when the entry is a
+    // tree, the child tree is itself in `allowed_trees` (so a
+    // public commit's `/secret` subtree tree, having been excluded
+    // by the path loop above, also excludes the root tree). The
+    // recursion bottoms out because a denied-subtree tree is
+    // excluded at its level — its parent is then excluded because
+    // it has a denied-path child entry.
+    //
+    // We re-enumerate the root tree OIDs here via `git rev-list
+    // --all` + `git ls-tree <commit>` (one level, not recursive).
+    // This is one extra bounded git invocation per commit, but the
+    // listing itself is tiny (one entry per top-level file/dir) and
+    // bounded by the same `deadline` as the rest of the walk.
+    for root_tree_oid in root_tree_oids_bounded(repo_path, git_bin, deadline)? {
+        if !structurally_safe_root_tree(
+            repo_path,
+            git_bin,
+            &root_tree_oid,
+            rules,
+            is_public,
+            owner_did,
+            &allowed_trees,
+            deadline,
+        )? {
+            continue;
+        }
+        allowed_trees.insert(root_tree_oid);
+    }
+
     Ok((allowed_blobs, allowed_trees, all_blob_oids, all_tree_oids))
 }
 
@@ -2039,13 +2270,24 @@ esac\n";
         let reader = "did:key:z6MkReader";
         let rules = [rule("/secret/**", &[reader])];
 
-        // anon: the withheld /secret tree is excluded; root ("/") and /public are in.
+        // anon: the withheld /secret subtree tree is excluded (#172). The
+        // root tree is ALSO excluded (#218 review P1b): its serialized
+        // bytes name the `/secret` entry and the OID of its child
+        // subtree, so publishing it would leak the same metadata the
+        // `/secret/**` deny is meant to withhold. The structural
+        // entry-level check in `allowed_tree_set_for_caller_bounded`
+        // gates the root tree on every direct entry being safe.
+        // `/public` (allowed path) is still in.
         let anon = allowed_tree_set_for_caller(&bare, &rules, true, OWNER, None).unwrap();
         assert!(
             !anon.contains(&secret_tree),
             "withheld /secret subtree tree excluded for anon"
         );
-        assert!(anon.contains(&root_tree), "root tree included (path /)");
+        assert!(
+            !anon.contains(&root_tree),
+            "root tree excluded for anon: its serialized bytes name /secret and the \
+             secret subtree OID, which is the metadata the /secret/** deny must withhold"
+        );
         assert!(anon.contains(&public_tree), "/public subtree tree included");
 
         // listed reader: sees the /secret tree (caller-aware, not a blanket deny).
@@ -2259,19 +2501,26 @@ esac\n";
         let commits = reachable_commit_oids(&bare, "git", Instant::now() + WALK_TIMEOUT).unwrap();
         assert_eq!(commits.len(), N, "all {N} commits reachable");
 
-        // Call root_tree_pairs directly (private, same module) under a liveness
-        // watchdog, then assert it returned every distinct root tree.
+        // Call root_tree_oids directly (private, same module) under a
+        // liveness watchdog, then assert it returned every distinct
+        // root tree. (#218 review P1b: the previous shape returned
+        // `(oid, "/")` pairs so the path-based filter would admit
+        // root trees on the synthetic "/". The new shape is a plain
+        // oid set; the structural post-pass in
+        // `allowed_tree_set_for_caller_bounded` and
+        // `allowed_blob_tree_sets_bounded` is what actually admits
+        // them.)
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(
-                root_tree_pairs(&bare, "git", &commits, Instant::now() + WALK_TIMEOUT)
+                root_tree_oids(&bare, "git", &commits, Instant::now() + WALK_TIMEOUT)
                     .map(|s| s.len()),
             );
         });
         match rx.recv_timeout(std::time::Duration::from_secs(30)) {
             Ok(Ok(len)) => assert_eq!(len, N, "every distinct root tree returned"),
-            Ok(Err(e)) => panic!("root_tree_pairs errored: {e}"),
-            Err(_) => panic!("root_tree_pairs did not return within 30s"),
+            Ok(Err(e)) => panic!("root_tree_oids errored: {e}"),
+            Err(_) => panic!("root_tree_oids did not return within 30s"),
         }
     }
 

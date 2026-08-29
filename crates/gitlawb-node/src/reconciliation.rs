@@ -2433,4 +2433,142 @@ mod tests {
 
         _m.assert_async().await;
     }
+
+    /// #218 review P1b: the reconciliation sweep must not publish a
+    /// public repo's root tree when the root tree's serialized bytes
+    /// name a denied subtree entry. The root tree of a public commit
+    /// with `/secret/**` deny is structurally unsafe: its entries
+    /// include `secret -> <denied-subtree-oid>`, and pinning the
+    /// root tree to a public IPFS/Pinata backend would let anyone who
+    /// obtains the CID inspect the denied subtree's name and child
+    /// OID — the same metadata a `/secret/**` deny is meant to
+    /// withhold. The fix gates the root tree on the structural
+    /// entry-level check in `allowed_blob_tree_sets_bounded`, which
+    /// also covers the per-request `/ipfs/{cid}` tree gate (caller-
+    /// aware variant).
+    ///
+    /// The test seeds a single public commit whose tree has two
+    /// direct entries: `public.txt` (allowed) and `secret/`
+    /// (denied). After a sweep pass with mock IPFS accepting every
+    /// upload, the durable state must include exactly one
+    /// `pinned_cids` row — for the public.txt blob, with
+    /// `local_ipfs_provenance = TRUE` — and zero rows for the root
+    /// tree or the secret subtree tree.
+    #[sqlx::test]
+    async fn sweep_never_pins_root_tree_naming_withheld_subtree(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        // Repo on disk: one public commit with a top-level file and a
+        // top-level directory. The directory is itself a subtree
+        // tree (`secret`) that holds the withheld blob.
+        let repo_on_disk = Repo::new();
+        std::fs::create_dir_all(repo_on_disk.path.join("secret")).unwrap();
+        repo_on_disk.commit_file("public.txt", "public bytes\n");
+        repo_on_disk.commit_file("secret/secret.txt", "withheld bytes\n");
+
+        // Resolve oids so the assertions are precise.
+        let public_blob = repo_on_disk.git(&["rev-parse", "HEAD:public.txt"]);
+        let secret_blob = repo_on_disk.git(&["rev-parse", "HEAD:secret/secret.txt"]);
+        let secret_tree = repo_on_disk.git(&["rev-parse", "HEAD:secret"]);
+        let root_tree = repo_on_disk.git(&["rev-parse", "HEAD^{tree}"]);
+
+        let rec = seed_repo(
+            "did:key:zWithheldSubtreeOwner",
+            "withheld-subtree-repo",
+            &repo_on_disk.path.display().to_string(),
+        );
+        db.create_repo(&rec).await.unwrap();
+
+        // /secret/** deny, with no readers: the public.txt blob is
+        // listable; the secret/ subtree tree and its blob are
+        // withheld. The root tree is structurally unsafe (its entry
+        // list names the denied subtree), and a previously-buggy
+        // synthetic-"/" gate would have admitted it.
+        db.set_visibility_rule(
+            &rec.id,
+            "/secret/**",
+            crate::db::VisibilityMode::B,
+            &[],
+            &rec.owner_did,
+        )
+        .await
+        .unwrap();
+
+        // Mock IPFS: accept everything. The sweep would happily
+        // upload the root tree + secret subtree tree if the gate
+        // let them through; the test asserts they don't.
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
+            .expect_at_least(1)
+            .with_status(200)
+            .with_body(r#"{"Hash":"QmWithheldSubtreeMockCid"}"#)
+            .create_async()
+            .await;
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            &server.url(),
+        ]);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let (_tx, mut rx) = watch::channel(false);
+        let mut cursor = None;
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        let (scanned, gaps, _filled) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(scanned, 1, "one repo scanned");
+        assert!(
+            gaps >= 1,
+            "the public.txt blob is a real gap (and the structural gate keeps the root \
+             tree out of the gap set, so the only gap is the public blob)"
+        );
+
+        // The public blob is the only IPFS-pinned object: the root
+        // tree and the secret subtree tree are absent from
+        // `pinned_cids` because the structural gate excluded them
+        // before they reached the writer.
+        assert!(
+            db.has_ipfs_cid(&public_blob).await.unwrap(),
+            "public.txt blob must be IPFS-pinned (its path /public.txt is allowed)"
+        );
+        assert!(
+            !db.has_ipfs_cid(&secret_blob).await.unwrap(),
+            "secret.txt blob must not be IPFS-pinned (regression of the blob gate; the \
+             public blob gate is exercised by sweep_never_pins_withheld_blob_in_cleartext)"
+        );
+        // The structural fix means the root tree was never a candidate
+        // — assert the durable evidence directly.
+        let pinned = db.list_pinned_cids().await.unwrap();
+        for p in &pinned {
+            assert_ne!(
+                p.sha256_hex, root_tree,
+                "root tree must not be replicated: its serialized bytes name the denied \
+                 /secret subtree entry, which is the metadata /secret/** is meant to withhold"
+            );
+            assert_ne!(
+                p.sha256_hex, secret_tree,
+                "secret subtree tree must not be replicated: its only entry is the \
+                 withheld secret.txt blob, and the structural check excludes it"
+            );
+        }
+
+        m.assert_async().await;
+    }
 }

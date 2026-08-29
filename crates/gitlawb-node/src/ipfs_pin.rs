@@ -1812,19 +1812,35 @@ pub async fn pin_new_objects(
         if batch_budget_gate("IPFS", deadline, pinned.len(), total - attempted).is_none() {
             break;
         }
-        // Skip if already pinned, but first backfill provenance if the existing
-        // pin has none. A legacy pin (recorded before repo_id existed, #173, jatmn)
-        // is skipped here before record_pinned_cid ever runs, so its NULL provenance
-        // would never resolve to one repo and known CIDs keep hitting the scan. The
-        // backfill only sets repo_id (AND repo_id IS NULL guard preserves
-        // first-pinner-owns) and never re-pins the bytes: the object is already on IPFS.
-        // Every DB call from here to the end of the iteration is bounded by the
-        // ABSOLUTE batch deadline (F3, #173): the loop runs under a global pin permit
-        // and a bare await parked it for the whole stall. The elapsed arm is mapped per
-        // site below, never as a blanket "existing error arm": a timeout cancels the
-        // client future but not the statement Postgres is running, so it reports an
-        // UNKNOWN outcome, not a failed write.
-        match db_bounded(deadline, db.is_pinned(&sha)).await {
+        // Skip if the object is ALREADY a real local IPFS pin, but first
+        // backfill provenance if the existing pin has none. A legacy pin
+        // (recorded before repo_id existed, #173, jatmn) is skipped here
+        // before record_pinned_cid ever runs, so its NULL provenance would
+        // never resolve to one repo and known CIDs keep hitting the scan.
+        // The backfill only sets repo_id (AND repo_id IS NULL guard
+        // preserves first-pinner-owns) and never re-pins the bytes: the
+        // object is already on IPFS.
+        //
+        // #218 review P1a: this check keys on `has_ipfs_cid` (writer-owned
+        // `local_ipfs_provenance = TRUE`), NOT on row existence
+        // (`is_pinned`). A Pinata-only row is `is_pinned = true` but
+        // `has_ipfs_cid = false`: the bytes never reached the local IPFS
+        // daemon, only Pinata, and we MUST fall through to the local
+        // writer path so a real local pin lands. Using `is_pinned` here
+        // was the gap that made the Pinata-only → local-IPFS repair
+        // path inert: every sweep pass re-entered this arm, recorded
+        // the source, and continued without ever calling
+        // `pin_git_object` or `record_pinned_cid_with_source`. The flag
+        // stayed FALSE forever.
+        //
+        // Every DB call from here to the end of the iteration is bounded
+        // by the ABSOLUTE batch deadline (F3, #173): the loop runs under
+        // a global pin permit and a bare await parked it for the whole
+        // stall. The elapsed arm is mapped per site below, never as a
+        // blanket "existing error arm": a timeout cancels the client
+        // future but not the statement Postgres is running, so it
+        // reports an UNKNOWN outcome, not a failed write.
+        match db_bounded(deadline, db.has_ipfs_cid(&sha)).await {
             Ok(true) => {
                 // Elapsed here is free to skip: these are reads, so a late server-side
                 // completion costs nothing, and the backfill's own `AND repo_id IS NULL`

@@ -4731,8 +4731,12 @@ mod tests {
         let repo = seed_repo(&owner_did, "u3pinata");
         state.db.create_repo(&repo).await.expect("seed repo");
 
-        // Already carries a pinata_cid, so pin_new_objects takes the skip branch and the
-        // only DB write under test is the source record.
+        // Already a Pinata-pinned row so the Pinata pin loop's
+        // `has_pinata_cid` skip branch fires and the only DB write
+        // under test is the U3 source record retry. The IPFS pin
+        // loop's `is_pinned` / `has_ipfs_cid` skip is a separate
+        // seam (this test exercises the Pinata path, not the IPFS
+        // path), so a Pinata-only seed is the right shape here.
         let (_ty, raw) = crate::git::store::read_object(&bare, &fx.public_oid)
             .unwrap()
             .expect("object readable");

@@ -178,6 +178,15 @@ pub struct PinnedCidRecord {
     pub cid: Option<String>,
     pub pinned_at: String,
     pub pinata_cid: Option<String>,
+    /// #218 review P2: writer-owned local-IPFS provenance. `true` iff this
+    /// row was written by the local-IPFS pin path
+    /// (`record_pinned_cid_with_source`), the only path that has actually
+    /// pushed the bytes into this node's local IPFS daemon. Independent
+    /// of `cid` (a Pinata-only row with `cid = Some(raw_cid)` is
+    /// `local_ipfs_provenance = false`). The API response surfaces this
+    /// as `local_pinned` so consumers can distinguish a real local pin
+    /// from a Pinata-only row whose `cid` is just the raw resolver key.
+    pub local_ipfs_provenance: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1209,19 +1218,30 @@ const MIGRATIONS: &[Migration] = &[
             // key — the new column is an internal durability signal and
             // never leaves the resolver / gap-filter boundary.
             //
-            // Backfill (safe under v27): v27 already cleared every row in
-            // the legacy `cid = pinata_cid` fallback shape back to NULL,
-            // so the only rows still carrying a non-NULL `cid` after v27
-            // are real local IPFS pins. The OR with `pinata_cid IS NULL`
-            // is belt-and-suspenders: a row that was the FIRST local
-            // pin in a dual-backend record (cid set, pinata_cid set,
-            // cid != pinata_cid) is also a real local pin, and v27 left
-            // it alone. NOT NULL DEFAULT FALSE so a pre-v30 row that
-            // somehow slips through the backfill WHERE reads as
-            // "Pinata-only" and gets the safe default; the next sweep
-            // pass re-derives provenance on a re-pin.
+            // STRICT backfill (#218 review P1a): mark as locally pinned
+            // ONLY the rows that are unambiguously local IPFS — `cid`
+            // set and no Pinata CID. The permissive alternative
+            // `cid <> pinata_cid` was wrong because pre-v30
+            // `record_pinata_cid` deliberately produced exactly that
+            // shape (`cid = raw resolver key, pinata_cid = provider
+            // CID, cid != pinata_cid`) for ordinary Pinata-first
+            // uploads without a local Kubo push. The permissive
+            // backfill would mark those rows as locally pinned, the
+            // sweep would filter them as "already durable" via
+            // `has_ipfs_cid = FALSE -> filter excludes them`, and the
+            // operator enabling IPFS later would never get a local
+            // recovery copy. The strict rule leaves dual-shape rows
+            // at the safe default (`FALSE`); the next sweep pass
+            // re-derives by re-pinning, which is cheap and idempotent
+            // (Kubo is idempotent; `record_pinned_cid_with_source`
+            // upgrades the flag on the conflict branch).
+            //
+            // NOT NULL DEFAULT FALSE so a pre-v30 row that somehow
+            // slips through the backfill WHERE reads as "Pinata-only"
+            // and gets the safe default; the next sweep pass
+            // re-derives provenance on a re-pin.
             "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS local_ipfs_provenance BOOLEAN NOT NULL DEFAULT FALSE",
-            "UPDATE pinned_cids SET local_ipfs_provenance = TRUE WHERE cid IS NOT NULL AND (pinata_cid IS NULL OR cid <> pinata_cid)",
+            "UPDATE pinned_cids SET local_ipfs_provenance = TRUE WHERE cid IS NOT NULL AND pinata_cid IS NULL",
             // Partial index — only ~all-true rows in steady state, but
             // partial because the gap filter (`filter_ipfs_pinned_oids`)
             // reads `local_ipfs_provenance = TRUE` and the planner will
@@ -3106,6 +3126,16 @@ impl Db {
 // ── Pinned CIDs ───────────────────────────────────────────────────────────────
 
 impl Db {
+    /// #218 review P1a: the production pin loop now keys its
+    /// "already done" check on `has_ipfs_cid` (writer-owned
+    /// `local_ipfs_provenance = TRUE`), not on row existence. This
+    /// method is kept for tests (`test_support.rs`) that exercise
+    /// other code paths still using the existence semantic, and is
+    /// not called from any production code. The `dead_code` lint
+    /// would otherwise fire on the bin build; tests are
+    /// `#[cfg(test)]` and don't see this allowance propagate from
+    /// the bin target.
+    #[allow(dead_code)]
     pub async fn is_pinned(&self, sha256_hex: &str) -> Result<bool> {
         let row = sqlx::query("SELECT COUNT(*) as cnt FROM pinned_cids WHERE sha256_hex = $1")
             .bind(sha256_hex)
@@ -3465,10 +3495,24 @@ impl Db {
         // that previously arrived via Pinata-only (cid=NULL, flag=FALSE)
         // becomes a real local pin from the resolver's perspective the
         // moment the bytes land locally.
+        //
+        // `cid = COALESCE(pinned_cids.cid, EXCLUDED.cid)` (#218 review
+        // P1a): when a Pinata-only row had `cid = NULL` (the
+        // `raw_cid == pinata_cid` shape produced by
+        // `record_pinata_cid`), the new local pin fills the resolver
+        // key with the local raw CID. A pre-existing non-NULL `cid`
+        // (a real local pin's raw CID, or one set by
+        // `repair_legacy_provider_cid`) is preserved — `EXCLUDED.cid`
+        // is identical to it in normal cases, and COALESCE is
+        // belt-and-suspenders against any future divergence. Without
+        // this, the local pin would land with `local_ipfs_provenance
+        // = TRUE` and `cid = NULL`, and the resolver would have no
+        // local CID to serve the object by.
         sqlx::query(
             "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id, local_ipfs_provenance)
              VALUES ($1, $2, $3, $4, TRUE)
              ON CONFLICT(sha256_hex) DO UPDATE SET
+                 cid = COALESCE(pinned_cids.cid, EXCLUDED.cid),
                  repo_id = COALESCE(pinned_cids.repo_id, EXCLUDED.repo_id),
                  local_ipfs_provenance = TRUE",
         )
@@ -3747,7 +3791,8 @@ impl Db {
     /// the resolver 404s on mismatch, the documented #173 U4 behavior).
     pub async fn list_pinned_cids(&self) -> Result<Vec<PinnedCidRecord>> {
         let rows = sqlx::query(
-            "SELECT sha256_hex, cid, pinned_at, pinata_cid FROM pinned_cids ORDER BY pinned_at DESC",
+            "SELECT sha256_hex, cid, pinned_at, pinata_cid, local_ipfs_provenance
+             FROM pinned_cids ORDER BY pinned_at DESC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -3768,6 +3813,7 @@ impl Db {
                 cid,
                 pinned_at: r.get("pinned_at"),
                 pinata_cid,
+                local_ipfs_provenance: r.get("local_ipfs_provenance"),
             });
         }
         Ok(out)
@@ -5716,13 +5762,27 @@ mod migration_tests {
         assert_eq!(nullable, "YES", "cid must be nullable after v12");
 
         // Classification: has_ipfs_cid.
+        //
+        // (#218 review P1a) the v12 contract — "cid set, no pinata, OR cid
+        // != pinata" — was sufficient only as a v27-era approximation
+        // (after v27 cleared `cid = pinata_cid` rows). The v30 strict
+        // backfill replaces it: only `cid IS NOT NULL AND pinata_cid IS
+        // NULL` rows are real local IPFS pins. The "both distinct"
+        // shape is ambiguous pre-v30 (could be a real local pin
+        // followed by Pinata, or a Pinata-first upload that the writer
+        // happened to set cid=raw on) and the strict rule leaves it
+        // out of the IPFS-pinned set; the next sweep pass re-derives
+        // by re-pinning (cheap, idempotent). The new
+        // `local_ipfs_provenance` column is the authoritative
+        // predicate and `has_ipfs_cid` keys on it.
         assert!(
             db.has_ipfs_cid("sha_real_only").await.unwrap(),
             "real local IPFS CID must be classified as pinned"
         );
         assert!(
-            db.has_ipfs_cid("sha_both_distinct").await.unwrap(),
-            "distinct local CID must be classified as pinned"
+            !db.has_ipfs_cid("sha_both_distinct").await.unwrap(),
+            "distinct-cid + pinata_cid row is ambiguous pre-v30 and the strict backfill \
+             leaves it out of the IPFS-pinned set; the next sweep pass re-derives"
         );
         assert!(
             !db.has_ipfs_cid("sha_legacy_fallback").await.unwrap(),
@@ -5788,14 +5848,22 @@ mod migration_tests {
 
         db.migrate().await.unwrap();
 
-        // Backfilled row now has no local CID; distinct row is untouched.
+        // Backfilled row now has no local CID. The "distinct" row
+        // (cid set, pinata_cid set, cid != pinata_cid) is ambiguous
+        // pre-v30: it could be a real local pin followed by Pinata, or
+        // a Pinata-first upload that the writer happened to set
+        // cid=raw on. Under the v30 strict backfill (cid set AND no
+        // Pinata) it stays out of the IPFS-pinned set; the next sweep
+        // pass re-derives by re-pinning. The v27-era "cid IS NOT
+        // NULL AND cid != pinata_cid" rule that previously classified
+        // this row as IPFS-pinned is no longer authoritative.
         assert!(
             !db.has_ipfs_cid("sha_equal").await.unwrap(),
             "legacy equal-cid row must be cleared to NULL by v27"
         );
         assert!(
-            db.has_ipfs_cid("sha_distinct").await.unwrap(),
-            "distinct-cid row must survive the backfill"
+            !db.has_ipfs_cid("sha_distinct").await.unwrap(),
+            "ambiguous pre-v30 dual row stays out of the IPFS-pinned set under the v30 strict backfill"
         );
         assert!(db.has_pinata_cid("sha_equal").await.unwrap());
     }
@@ -5909,10 +5977,18 @@ mod migration_tests {
             "v30 migration must add the local_ipfs_provenance column"
         );
 
-        // The backfill is one UPDATE keyed on
-        // `cid IS NOT NULL AND (pinata_cid IS NULL OR cid <> pinata_cid)`:
-        //   sha_v30_real_only        → TRUE
-        //   sha_v30_both_distinct    → TRUE
+        // The backfill is one UPDATE keyed on the STRICT rule
+        // `cid IS NOT NULL AND pinata_cid IS NULL`
+        // (#218 review P1a: the previous permissive `cid <> pinata_cid`
+        // clause mis-classified pre-v30 Pinata-first uploads as
+        // local IPFS pins, because `record_pinata_cid` deliberately
+        // produced exactly that shape for ordinary Pinata-first
+        // uploads without a local Kubo push):
+        //   sha_v30_real_only        → TRUE  (cid set, no Pinata)
+        //   sha_v30_both_distinct    → FALSE (cid set, Pinata set —
+        //                                ambiguous pre-v30, the strict
+        //                                backfill errs on the safe side
+        //                                and the sweep re-derives)
         //   sha_v30_pinata_only      → FALSE (cid is NULL)
         //   sha_v30_pinata_provider  → FALSE (cid is NULL)
         let provenance = |sha: &str| {
@@ -5937,8 +6013,11 @@ mod migration_tests {
         );
         assert_eq!(
             provenance("sha_v30_both_distinct").await,
-            Some(true),
-            "(2) both-CIDs-distinct row must backfill as provenance = TRUE"
+            Some(false),
+            "(2) both-CIDs-distinct row is ambiguous pre-v30 (could be a real local \
+             pin followed by Pinata, or a Pinata-first upload that the writer \
+             happened to set cid=raw on); the strict backfill errs on the safe \
+             side and the next sweep pass re-derives provenance on a re-pin"
         );
         assert_eq!(
             provenance("sha_v30_pinata_only").await,
@@ -5951,22 +6030,23 @@ mod migration_tests {
             "(4) Pinata-only provider-CID row (cid NULL) must stay provenance = FALSE"
         );
 
-        // The classification predicate `has_ipfs_cid` now keys on
-        // `local_ipfs_provenance = TRUE`. The Pinata-only rows are
-        // EXCLUDED even though pinata_cid is set — this is the durable
-        // contract the v30 migration installs. A later local-IPFS pin
-        // for the same OID (via `record_pinned_cid_with_source`) would
-        // flip the flag and bring it back into the IPFS-pinned set,
-        // which the integration test
+        // The classification predicate `has_ipfs_cid` keys on
+        // `local_ipfs_provenance = TRUE`. Under the STRICT backfill:
+        // (1) is TRUE (cid set, no Pinata), (2) is FALSE (ambiguous
+        // pre-v30 dual shape, the strict rule leaves it Pinata-only
+        // and the sweep re-derives), (3) and (4) are FALSE (cid NULL).
+        // The integration test
         // `sweep_promotes_pinata_only_to_local_ipfs_when_writer_invoked`
-        // covers.
+        // covers the writer upgrade path that brings a Pinata-only
+        // row into the IPFS-pinned set on a later local IPFS push.
         assert!(
             db.has_ipfs_cid("sha_v30_real_only").await.unwrap(),
             "(1) has_ipfs_cid must report TRUE for the backfilled real-IPFS row"
         );
         assert!(
-            db.has_ipfs_cid("sha_v30_both_distinct").await.unwrap(),
-            "(2) has_ipfs_cid must report TRUE for the backfilled dual-backend row"
+            !db.has_ipfs_cid("sha_v30_both_distinct").await.unwrap(),
+            "(2) has_ipfs_cid must report FALSE for an ambiguous pre-v30 dual row; the \
+             strict backfill errs on the safe side and the sweep re-derives"
         );
         assert!(
             !db.has_ipfs_cid("sha_v30_pinata_only").await.unwrap(),
@@ -5978,10 +6058,7 @@ mod migration_tests {
         );
 
         // The gap filter used by the sweep (`filter_ipfs_pinned_oids`)
-        // follows the same predicate. A pre-v30 sweep that inferred
-        // Pinata-only from `cid = pinata_cid` would have included
-        // (3) and (4) by accident if the raw CID ever matched the
-        // provider CID; v30's writer-set flag is what stops that.
+        // follows the same predicate.
         let candidates = vec![
             "sha_v30_real_only".to_string(),
             "sha_v30_both_distinct".to_string(),
@@ -5992,8 +6069,9 @@ mod migration_tests {
         filtered.sort();
         assert_eq!(
             filtered,
-            vec!["sha_v30_both_distinct".to_string(), "sha_v30_real_only".to_string()],
-            "filter_ipfs_pinned_oids must return only the local-IPFS-provenance rows, never the Pinata-only ones"
+            vec!["sha_v30_real_only".to_string()],
+            "filter_ipfs_pinned_oids must return only the local-IPFS-provenance rows; \
+             under the strict backfill, only the cid-set-no-pinata row qualifies"
         );
     }
 
