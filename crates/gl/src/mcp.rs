@@ -1300,20 +1300,27 @@ async fn call_tool(
 /// a `Value` and goes back to the MCP caller as a successful tool result, so a
 /// denial (a replayed signature, a wrong owner, a missing repo) reads as
 /// success. `what` names the tool so the message says which call failed.
-async fn json_ok(what: &str, resp: reqwest::Response) -> Result<Value> {
+async fn json_ok(what: &str, mut resp: reqwest::Response) -> Result<Value> {
     let status = resp.status();
-    let body: Value = resp
-        .json()
-        .await
-        .with_context(|| format!("{what} failed ({status}): response was not JSON"))?;
     if !status.is_success() {
-        let msg = body["message"]
-            .as_str()
-            .or_else(|| body["error"].as_str())
-            .unwrap_or("unknown error");
-        anyhow::bail!("{what} failed ({status}): {msg}");
+        let raw = crate::http::read_body_capped(&mut resp, 64 * 1024).await;
+        let msg = serde_json::from_slice::<Value>(&raw)
+            .ok()
+            .and_then(|body| {
+                body["message"]
+                    .as_str()
+                    .or_else(|| body["error"].as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| String::from_utf8_lossy(&raw).into_owned());
+        anyhow::bail!(
+            "{what} failed ({status}): {}",
+            crate::http::sanitize_node_msg(&msg)
+        );
     }
-    Ok(body)
+    resp.json::<Value>()
+        .await
+        .with_context(|| format!("{what} failed ({status}): response was not JSON"))
 }
 
 /// Get the owner short-DID from args or default to the node's own DID.
@@ -2240,6 +2247,31 @@ mod tests {
         .await
         .expect_err("a denied ref listing must error, not return an empty ref list");
         assert!(err.to_string().contains("403"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_json_ok_denial_sanitizes_node_message() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/ghost")
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"forbidden","message":"denied\u001b[31m"}"#)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "repo_get",
+            json!({"owner": "alice", "name": "ghost"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect_err("a denied repo_get must fail the tool call");
+        let msg = err.to_string();
+        assert!(msg.contains("403"), "got: {msg}");
+        assert!(msg.contains("denied"), "got: {msg}");
+        assert!(!msg.contains('\u{001b}'), "control bytes must be stripped, got: {msg}");
     }
 
     #[tokio::test]
