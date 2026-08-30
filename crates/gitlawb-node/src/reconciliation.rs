@@ -46,6 +46,19 @@ const PIN_PHASE_DEADLINE: Duration = Duration::from_secs(300);
 /// restarts (R2-P1).
 const CURSOR_KEY: &str = "reconciliation_sweep_cursor";
 
+/// Log message emitted when the Irys anchor call fails after a successful
+/// seal. The contract is one-shot: `plan_seal` returns `SkipUnchanged` on
+/// every subsequent pass once the recipients tag matches, so a failed
+/// anchor here is permanent until a withheld change forces a new seal.
+/// Factored to a const so the test
+/// `encrypted_manifest_anchor_log_does_not_promise_retry` can pin the
+/// "no retry promised" property at the cargo-test level.
+const ENCRYPTED_MANIFEST_ANCHOR_FAILED_MSG: &str =
+    "encrypted manifest anchor failed; this seal will NOT be \
+     retried on a later pass (plan_seal returns SkipUnchanged \
+     when the recipients tag is stable). A subsequent withheld \
+     change forces a new seal and re-anchors the manifest.";
+
 /// Whether the sweep should spawn given the current configuration.
 /// Extracted for testing — test both directions independently.
 fn should_spawn(config: &Config) -> bool {
@@ -1004,6 +1017,20 @@ async fn run_pass(
                 // Anchor only when something was newly sealed this pass.
                 // This avoids unbounded Irys writes on a timer — repos
                 // with no withheld changes do not re-anchor the manifest.
+                //
+                // Contract: anchoring is one-shot per seal. `plan_seal` returns
+                // `SkipUnchanged` on every subsequent pass once the recipients
+                // tag matches, so `sealed` stays empty and this block never
+                // runs again. A transient Irys outage at the moment of a fresh
+                // seal therefore LOSES that anchor permanently — the next pass
+                // has no delta to anchor and no retry fires. This is
+                // intentionally best-effort: re-anchoring an unchanged manifest
+                // would burn Irys writes for no recovery benefit, and durable
+                // retry of a failed seal would need a separate outbox that
+                // survives across the seal-skip path. Operators who need a
+                // guaranteed anchor after a transient outage should re-add a
+                // withheld change (which forces a new seal and re-runs this
+                // block) or anchor via a separate out-of-band process.
                 if !sealed.is_empty() && !config.irys_url.is_empty() {
                     // Bind the manifest to the FRESH repo identity re-fetched at
                     // the pin boundary (`fresh_repo2`), not the batch snapshot:
@@ -1031,7 +1058,8 @@ async fn run_pass(
                         tracing::warn!(
                             repo = %slug,
                             err = %e,
-                            "encrypted manifest anchor failed (will retry next pass)"
+                            "{}",
+                            ENCRYPTED_MANIFEST_ANCHOR_FAILED_MSG
                         );
                     }
                 }
@@ -1247,6 +1275,29 @@ mod tests {
     #[test]
     fn sweep_interval_constant_is_nonzero() {
         assert_ne!(super::SWEEP_INTERVAL_SECS, 0);
+    }
+
+    /// #218 P2 R3 (anchor log contract): the encrypted-manifest anchor is
+    /// one-shot per seal. `plan_seal` returns `SkipUnchanged` on every
+    /// subsequent pass once the recipients tag matches, so `sealed` stays
+    /// empty and the anchor block never runs again. A transient Irys
+    /// outage at the moment of a fresh seal therefore LOSES that anchor
+    /// permanently — the next pass has no delta to anchor. The log MUST
+    /// not promise a retry, because none will fire. This test pins the
+    /// log content via the `ENCRYPTED_MANIFEST_ANCHOR_FAILED_MSG` constant
+    /// so a future "helpful" revert to "will retry next pass" is caught at
+    /// `cargo test` time.
+    #[test]
+    fn encrypted_manifest_anchor_log_does_not_promise_retry() {
+        assert!(
+            !super::ENCRYPTED_MANIFEST_ANCHOR_FAILED_MSG.contains("will retry"),
+            "the encrypted-manifest anchor log must not promise a retry; \
+             plan_seal returns SkipUnchanged on later passes, so a failed \
+             anchor after a successful seal is permanent. See the comment \
+             above the anchor block in run_pass for the one-shot contract. \
+             Got: {:?}",
+            super::ENCRYPTED_MANIFEST_ANCHOR_FAILED_MSG
+        );
     }
 
     // ── run_pass integration tests ────────────────────────────────────────
