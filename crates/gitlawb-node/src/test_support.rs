@@ -1926,9 +1926,7 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
-        let merge_sha = json["merge_sha"]
-            .as_str()
-            .expect("merge_sha in response");
+        let merge_sha = json["merge_sha"].as_str().expect("merge_sha in response");
         assert_eq!(json["status"].as_str(), Some("merged"));
 
         let stored = state
@@ -1950,12 +1948,7 @@ mod tests {
             "reported merge_sha must match refs/heads/main"
         );
         run(
-            &[
-                "merge-base",
-                "--is-ancestor",
-                &feature_tip,
-                &main_after,
-            ],
+            &["merge-base", "--is-ancestor", &feature_tip, &main_after],
             &bare,
         );
         run(
