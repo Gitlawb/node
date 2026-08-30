@@ -71,7 +71,7 @@ Known limitations:
 - Agent lifecycle revocation is not enforced by HTTP Signature authorization; do not rely on removing or revoking an agent record to block a compromised signer.
 - Read visibility is not a blanket data-classification boundary: task, IPFS-pin, and Arweave-anchor listings are not repository-gated; withheld path names can be visible to a root reader; and later visibility changes cannot retract content already announced or externally anchored.
 - Peer writes are signed by upgraded nodes, but strict signed-peer enforcement is opt-in during rolling upgrades.
-- GraphQL mutations require a signed identity (a verified signer bound to the acting DID) but are limited to the agent-task queue; repo writes are not exposed over GraphQL and remain REST-only.
+- GraphQL mutations require a signed identity (a verified signer bound to the acting DID), are limited to the agent-task queue, and are covered by a CI completeness fence that requires signer acquisition and actor binding on every registered mutation; repo writes are not exposed over GraphQL and remain REST-only.
 - Pull-request review comments do not yet have threaded line-level anchors, and merges do not enforce approval requirements.
 
 See:

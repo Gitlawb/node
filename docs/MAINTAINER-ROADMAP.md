@@ -41,7 +41,7 @@ Owner focus: protocol/auth.
 - Close default-open repo write authorization and wire trusted UCAN delegation into repository permissions.
 - Close the remaining visibility gaps: restrict or document task, pin, and anchor metadata routes, and publish an irreversible-publication policy.
 - Add UCAN revocation or blocklisting, with an emergency compromised-key runbook.
-- GraphQL mutations require a verified signer (shipped, #87). Keep the surface limited to the agent-task queue; do not expose an owner-gated repo-write mutation over GraphQL without its owner-gate and REST parity. The `every_graphql_mutation_has_its_gate` fence forces any new mutation to be classified in its table (discovered from the schema, so none can slip in unlisted); the owner-gate and REST parity themselves stay the INV-1 review check, not something the fence proves.
+- GraphQL mutations require a verified signer (shipped, #87). Keep the surface limited to the agent-task queue; do not expose an owner-gated repo-write mutation over GraphQL without its owner-gate and REST parity. The `every_graphql_mutation_has_its_gate` fence forces any new mutation to be classified in its table (discovered from the schema SDL, with an introspection cross-check for hidden fields, so none can slip in unlisted) and requires `require_signer` plus actor binding in each registered resolver; the owner-gate and REST parity themselves stay the INV-1 review check, not something the fence proves.
 - Harden peer registration and outbound peer calls against SSRF and peer-list poisoning.
 - After all live peers upgrade, enable signed peer writes by default.
 

@@ -92,7 +92,7 @@ Fixed or staged in this pass:
 
 Live-network blockers to prioritize:
 
-- GraphQL mutations now require a verified signer bound to the acting DID (#87), and the surface stays limited to the agent-task queue, so there is no public repo-write GraphQL API to gate. Queries remain open by design. (Resolved; kept here as posture, not a live blocker.)
+- GraphQL POST is still open for compatibility; GraphQL mutations should get mutation-aware auth before it becomes a public write API surface.
 - Push authorization is still not capability-complete. A valid DID signature is authentication, not authorization. Owner checks are now enforced on every branch, protected or not (`GITLAWB_ENFORCE_OWNER_PUSH`, on by default); what remains is that a UCAN `git/push` capability is not yet honored, so a delegated or CI key cannot push.
 - UCAN chain validation is incomplete and UCAN revocation/blocklisting is not implemented as an operator feature.
 - Private repository reads are not enforced. `is_public` and `GITLAWB_PUBLIC_READ` exist, but per-repository private-read behavior is not wired.
@@ -151,3 +151,11 @@ Risks:
 4. Harden peer registration and outbound fetch behavior against SSRF and peer-list poisoning.
 5. Add Docker/installer/release smoke tests to CI.
 6. Label PoS/economics docs consistently with the current live contract and rewards status.
+
+## Status updates (post-snapshot)
+
+These entries record security-posture changes after the 2026-05-28 inspection above. They do not rewrite that snapshot's command output or test counts.
+
+### 2026-08-30: GraphQL mutation auth and completeness fence (#87, #219)
+
+At `main` from `bfc44f92` onward, GraphQL mutations require a verified signer bound to the acting DID. The surface stays limited to the agent-task queue; repo writes are not exposed over GraphQL. PR #219 adds `every_graphql_mutation_has_its_gate`, a CI completeness fence that discovers mutations from the built schema SDL (with an introspection cross-check for hidden fields) and requires signer acquisition plus actor binding in each registered resolver.
