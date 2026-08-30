@@ -1123,6 +1123,29 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE pin_repair_sweep ADD COLUMN IF NOT EXISTS discovery_cursor_id TEXT NOT NULL DEFAULT ''",
         ],
     },
+    Migration {
+        version: 27,
+        name: "arweave_anchors_irys_tx_id_index",
+        stmts: &[
+            // #26 split 2/4 (P2, reviewer round 2): backs the verify
+            // endpoint's `SELECT ... WHERE irys_tx_id = $1` at
+            // mod.rs:~3896. Without it every anonymous probe
+            // seq-scans the table (the existing indexes on
+            // `(repo, new_sha)` cannot serve it), so verify becomes
+            // O(rows) and the v2 transport's per-probe O(1) silently
+            // regresses.
+            //
+            // NON-UNIQUE on purpose: `record_arweave_anchor`
+            // generates a fresh UUID per call and a retry of the v2
+            // transport could legitimately write the same
+            // `irys_tx_id` twice; a UNIQUE constraint would fail on
+            // existing data and force a separate backfill decision.
+            // Promote to UNIQUE later only after auditing duplicates.
+            //
+            // NEW versioned migration (never appended to an applied block, INV-7).
+            "CREATE INDEX IF NOT EXISTS idx_arweave_anchors_irys_tx_id ON arweave_anchors(irys_tx_id)",
+        ],
+    },
 ];
 
 /// Max distinct source repos recorded per pinned object (F1, #173 jatmn round 8).
@@ -5131,6 +5154,35 @@ mod migration_tests {
         assert!(db.dequeue_pending_syncs(10).await.unwrap().is_empty());
         assert_eq!(attempted_at_of(&db, "z6Mkfoo/failed").await, None);
         assert_eq!(attempted_at_of(&db, "z6Mkfoo/done").await, None);
+    }
+
+    /// #26 split 2/4 (P2, reviewer round 2): the verify endpoint's
+    /// `SELECT ... WHERE irys_tx_id = $1` at mod.rs:~3896 is a
+    /// sequential scan unless `idx_arweave_anchors_irys_tx_id`
+    /// exists. Migration v27 is the only place that index is
+    /// created. This test pins the index's presence against a
+    /// future change that drops v27 from the array (a typo fix, a
+    /// misread of the review, an accidental revert) — without it
+    /// the suite stays green and the regression only shows up in
+    /// production EXPLAIN plans.
+    #[sqlx::test]
+    async fn migration_v27_creates_irys_tx_id_index(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        let row = sqlx::query(
+            "SELECT 1 AS present FROM pg_indexes
+             WHERE schemaname = 'public'
+               AND tablename = 'arweave_anchors'
+               AND indexname = 'idx_arweave_anchors_irys_tx_id'",
+        )
+        .fetch_optional(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            row.is_some(),
+            "idx_arweave_anchors_irys_tx_id is missing — migration v27 \
+             was not applied. The verify endpoint will seq-scan the table."
+        );
     }
 }
 

@@ -13,6 +13,28 @@ use std::str::FromStr;
 use crate::arweave_v2;
 use crate::auth::AuthenticatedDid;
 use crate::error::{AppError, Result};
+
+/// Single opaque 404 message for `verify_anchor`. All three denial
+/// paths (no row, malformed slug, gate deny) must collapse to this
+/// exact string so a caller comparing two `message` values cannot
+/// distinguish "unknown item id" from "private repo I cannot
+/// read". The 404 body is shaped as
+/// `{"error":"repo_not_found", "message":"repository '<msg>' not found"}`
+/// by `AppError::RepoNotFound`'s response mapping, so changing
+/// `<msg>` is the only knob.
+///
+/// P2 (reviewer round 2, #26 split 2/4): the previous three
+/// paths emitted three different messages
+/// (`"anchor <item_id>"` for no-row / malformed-slug,
+/// `"{owner}/{name}"` from `authorize_repo_read` for the gate).
+/// A caller comparing the two messages could tell the
+/// difference. The existing tests at lines ~514 and ~601 only
+/// checked `error == "repo_not_found"`, so the leak was
+/// invisible to the suite.
+///
+/// Other call sites of `AppError::RepoNotFound` keep their own
+/// messages — this constant is verify-endpoint-only.
+const VERIFY_DENY_MSG: &str = "anchor not found";
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -88,8 +110,10 @@ pub async fn verify_anchor(
         .await?
         .ok_or_else(|| {
             // Same opaque 404 shape as the gate below — never
-            // surface the item id in the error message.
-            AppError::RepoNotFound(format!("anchor {item_id}"))
+            // surface the item id in the error message. The
+            // constant is the single source of truth for the
+            // deny-path body across all three paths.
+            AppError::RepoNotFound(VERIFY_DENY_MSG.to_string())
         })?;
 
     // 2. Gate on repo read. The row's `repo` field is `"{owner}/{name}"`,
@@ -99,8 +123,10 @@ pub async fn verify_anchor(
     let (owner, name) = row
         .repo
         .split_once('/')
-        .ok_or_else(|| AppError::RepoNotFound(format!("anchor {item_id}")))?;
-    crate::api::authorize_repo_read(&state, owner, name, caller, "/").await?;
+        .ok_or_else(|| AppError::RepoNotFound(VERIFY_DENY_MSG.to_string()))?;
+    crate::api::authorize_repo_read(&state, owner, name, caller, "/")
+        .await
+        .map_err(|_| AppError::RepoNotFound(VERIFY_DENY_MSG.to_string()))?;
 
     // 3. Resolve the persisted node_did to raw Ed25519 public key
     //    bytes for the signature check (v2 only — v1 has no
@@ -590,6 +616,13 @@ mod verify_anchor_tests {
              must not distinguish 'no anchor row' from 'denied' for \
              private repos"
         );
+        assert_eq!(
+            v["message"],
+            format!("repository '{}' not found", VERIFY_DENY_MSG),
+            "verify deny path must use the single opaque message \
+             constant so 'unknown item id' and 'private repo' are \
+             indistinguishable to a caller comparing messages"
+        );
     }
 
     /// A caller asking about an `item_id` that does NOT exist in
@@ -623,5 +656,113 @@ mod verify_anchor_tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"], "repo_not_found");
+        assert_eq!(
+            v["message"],
+            format!("repository '{}' not found", VERIFY_DENY_MSG),
+            "unknown-item deny path must use the same opaque message \
+             as the gate-deny path"
+        );
+    }
+
+    /// All three deny paths (no row, malformed slug, gate deny)
+    /// must produce BYTE-IDENTICAL response bodies. A future change
+    /// that diverges any of them — even by reformatting the message
+    /// — flips this test RED, pinning the F3 invariant.
+    #[sqlx::test]
+    async fn verify_endpoint_deny_messages_are_byte_identical(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let kp = Keypair::generate();
+        let node_did = did_of(&kp);
+        let item_id = "item_byte_identical";
+
+        // Seed a private-repo anchor. The gate deny path will be
+        // triggered when the anonymous caller cannot read the
+        // private repo. The unknown-item path is exercised by the
+        // second request (no row for `does-not-exist-identical`).
+        let db = crate::db::Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+        let now = chrono::Utc::now();
+        let repo_id = uuid::Uuid::new_v4().to_string();
+        db.create_repo(&crate::db::RepoRecord {
+            id: repo_id.clone(),
+            name: "r".into(),
+            owner_did: "alice".into(),
+            description: None,
+            is_public: false, // PRIVATE
+            default_branch: "main".into(),
+            created_at: now,
+            updated_at: now,
+            disk_path: "/tmp/r-identical".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO arweave_anchors
+               (id, repo, owner_did, ref_name, old_sha, new_sha, cid, irys_tx_id, arweave_url, node_did, anchored_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"#,
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind("alice/r")
+        .bind("alice")
+        .bind("refs/heads/main")
+        .bind("0".repeat(40))
+        .bind("1".repeat(40))
+        .bind(Option::<String>::None)
+        .bind(item_id)
+        .bind(format!("https://arweave.net/{item_id}"))
+        .bind(&node_did)
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = crate::test_support::test_state(pool).await;
+
+        let router = Router::new()
+            .route(
+                "/api/v1/arweave/anchors/verify/{item_id}",
+                axum::routing::get(verify_anchor),
+            )
+            .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+            .with_state(state);
+
+        // Path 1: gate deny — the row exists, repo is private, caller
+        // is anonymous.
+        let resp_gate = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/arweave/anchors/verify/{item_id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes_gate = axum::body::to_bytes(resp_gate.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        // Path 2: no row — `item_id` has no matching row at all.
+        let resp_unknown = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/arweave/anchors/verify/does-not-exist-identical")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes_unknown = axum::body::to_bytes(resp_unknown.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            bytes_gate, bytes_unknown,
+            "verify deny path (gate) and unknown-item path must produce \
+             byte-identical response bodies; otherwise a caller comparing \
+             the two can distinguish 'private repo' from 'unknown item id'"
+        );
     }
 }

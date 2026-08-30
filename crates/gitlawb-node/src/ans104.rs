@@ -190,6 +190,18 @@ impl DataItem {
         // empty buffer `b""` (which deep-hashes to a leaf with
         // length 0, NOT as the missing/absent sentinel).
         //
+        // P1 (reviewer round 2, #26 split 2/4): each list element
+        // is its RAW bytes (or the already-computed `deepHash(tags)`
+        // for the tags slot). `deep_hash_list` blob-hashes each
+        // element exactly once. The previous implementation called
+        // `deep_hash_blob` on the 7 raw fields HERE and passed the
+        // resulting 48-byte digests into `deep_hash_list`, which
+        // then blob-hashed them AGAIN as 48-byte blobs. Items
+        // signed under that fold do not verify on a standard
+        // bundler/gateway. The test that pins the corrected fold
+        // against a Python stdlib reference is
+        // `dataitem_deep_hash_matches_external_reference` below.
+        //
         // Each field is decoded into an owned buffer so the field
         // hash list can borrow into them for the duration of this
         // call without running into temporary-lifetime problems.
@@ -216,25 +228,17 @@ impl DataItem {
         let target: &[u8] = self.target.as_bytes();
         let anchor: &[u8] = self.anchor.as_bytes();
 
-        // Compute each field's deep-hash and bind the results to
-        // names so the references outlive the vec construction.
-        let h_dataitem = deep_hash_blob(b"dataitem");
-        let h_version = deep_hash_blob(b"1");
-        let h_sigtype = deep_hash_blob(&sig_type_bytes);
-        let h_owner = deep_hash_blob(&owner);
-        let h_target = deep_hash_blob(target);
-        let h_anchor = deep_hash_blob(anchor);
-        let h_data = deep_hash_blob(&data);
-
+        // Eight RAW elements in canonical getSignatureData order.
+        // `deep_hash_list` blob-hashes each exactly once.
         let fields: Vec<&[u8]> = vec![
-            &h_dataitem,
-            &h_version,
-            &h_sigtype,
-            &h_owner,
-            &h_target,
-            &h_anchor,
+            b"dataitem",
+            b"1",
+            &sig_type_bytes,
+            &owner,
+            target,
+            anchor,
             &tags_hash,
-            &h_data,
+            &data,
         ];
         let mut out = [0u8; 48];
         out.copy_from_slice(&deep_hash_list(&fields));
@@ -594,5 +598,77 @@ mod external_reference_vectors {
             0x38, 0x73, 0x71, 0x7c, 0x98, 0x96,
         ];
         assert_eq!(acc2, expected);
+    }
+
+    /// #26 split 2/4 (P1, reviewer round 2) — `DataItem::deep_hash`
+    /// against an EXTERNAL reference, not a self-round-trip.
+    ///
+    /// The fix for the double-fold bug in `DataItem::deep_hash` is
+    /// load-bearing only if we can prove the new fold agrees with
+    /// an independent implementation. The existing
+    /// `sign_then_verify_round_trips` is self-round-tripping — the
+    /// buggy fold is symmetric, so the verify side agrees with the
+    /// sign side and the bug is invisible. This test pins the
+    /// 8-element fold against a Python stdlib (`hashlib.sha384`)
+    /// reference, which uses the same SHA-384 algorithm but a
+    /// different language and a fresh code path.
+    ///
+    /// Fixture: a placeholder Ed25519 owner (32 zero bytes), absent
+    /// target/anchor (`b""` per ANS-104 spec — the spec encodes
+    /// "field absent" as the empty buffer, NOT as 32 zero bytes),
+    /// `b"hello world"` data, two tags
+    /// `("App-Name", "gitlawb")` and `("Content-Type", "text/plain")`,
+    /// signature_type=1. The expected deep-hash was generated
+    /// independently in Python via stdlib `hashlib.sha384` and the
+    /// reference script in the PR description. If you change the
+    /// fold intentionally, re-derive the expected bytes via Python
+    /// (not via this Rust code) before updating the fixture.
+    #[test]
+    fn dataitem_deep_hash_matches_external_reference() {
+        // 32 zero bytes, base64url-encoded without padding.
+        let owner_b64 = URL_SAFE_NO_PAD.encode([0u8; 32]);
+        let data_b64 = URL_SAFE_NO_PAD.encode(b"hello world");
+
+        // `DataItem` is constructed directly (not via
+        // `new_unsigned`) because we need the EXACT raw bytes
+        // (32 zero bytes owner, all-zero signature) for an
+        // external reference. `new_unsigned` would inject a real
+        // keypair; the reference script does not.
+        let item = DataItem {
+            // deep_hash does not read `signature` (the spec's
+            // `getSignatureData` clears the signature slot).
+            signature: URL_SAFE_NO_PAD.encode([0u8; 64]),
+            owner: owner_b64,
+            target: String::new(),
+            anchor: String::new(),
+            tags: vec![
+                DataItemTag {
+                    name: URL_SAFE_NO_PAD.encode(b"App-Name"),
+                    value: URL_SAFE_NO_PAD.encode(b"gitlawb"),
+                },
+                DataItemTag {
+                    name: URL_SAFE_NO_PAD.encode(b"Content-Type"),
+                    value: URL_SAFE_NO_PAD.encode(b"text/plain"),
+                },
+            ],
+            data: data_b64,
+        };
+
+        let dh = item.deep_hash().expect("deep_hash on canonical fixture");
+        let expected: [u8; 48] = [
+            0xdb, 0x54, 0x74, 0x6d, 0xf5, 0x59, 0x2b, 0x40, 0xe6, 0x31, 0x06, 0xe5, 0x6e, 0x4f,
+            0xf1, 0x68, 0xa1, 0x64, 0xcb, 0xfe, 0xcf, 0x64, 0x28, 0x11, 0x4e, 0xfb, 0x19, 0x40,
+            0x81, 0x1b, 0xde, 0x58, 0x12, 0x2d, 0xee, 0xa5, 0x46, 0xbe, 0x1d, 0x0d, 0x37, 0x4d,
+            0xbf, 0xfd, 0x6b, 0xd3, 0x12, 0xc3,
+        ];
+        assert_eq!(
+            dh, expected,
+            "DataItem::deep_hash disagrees with the Python stdlib reference. \
+             This is the regression the reviewer round 2 demanded: the old \
+             fold double-hashed 7 of the 8 fields and the resulting items \
+             did not verify on a standard bundler/gateway. If you intentionally \
+             changed the fold, re-derive the expected bytes via the reference \
+             script before updating the fixture."
+        );
     }
 }
