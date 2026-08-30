@@ -102,8 +102,7 @@ pub async fn assert_denied(resp: reqwest::Response, expected: u16, withheld: &[&
         .expect("read denial body: an unreadable denial cannot be certified leak-free");
     if let Err(reason) = check_denied_with_headers(status, &body, &header_text, expected, withheld)
     {
-        // codeql[rust/cleartext-logging]: leak witness only; reason names the withheld token on failure
-        panic!("{reason}");
+        panic!("{reason}"); // codeql[rust/cleartext-logging]: intentional leak witness on test failure only
     }
 }
 

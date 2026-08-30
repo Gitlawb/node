@@ -39,6 +39,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use clap::Parser;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -66,6 +67,32 @@ struct DbStartupStatus {
     next_retry_secs: AtomicU64,
 }
 
+/// Hard ceiling on the advisory-lock pool's `max_connections`.
+///
+/// `max_concurrent_git_pushes` is validated all the way up to 1_048_576, and the lock
+/// pool used to derive its size straight from that knob, so raising the push cap
+/// silently raised the node's Postgres connection ceiling with no CLI error and no
+/// relation to the server's own `max_connections` (#173 F4). The node's total budget is
+/// now bounded: `db_max_connections` (default 48) + at most this.
+const LOCK_POOL_MAX_CONNECTIONS: u32 = 64;
+
+/// Connections the lock pool keeps above the push cap. Covers the three non-push
+/// `acquire_write` callers (`api/issues.rs` x2, `api/pulls.rs`), which hold no
+/// concurrency permit, so a push never queues here for a connection where it did not
+/// before.
+const LOCK_POOL_PUSH_HEADROOM: u8 = 8;
+
+/// Size the advisory-lock pool for a given push cap: the cap plus
+/// [`LOCK_POOL_PUSH_HEADROOM`], clamped to [`LOCK_POOL_MAX_CONNECTIONS`]. Past the
+/// clamp a push may wait for a lock-pool connection, which is a bounded wait that sheds
+/// a clean 503 (see `LockPoolBusy`), not an unbounded hang.
+fn lock_pool_size(max_concurrent_git_pushes: usize) -> u32 {
+    u32::try_from(max_concurrent_git_pushes)
+        .unwrap_or(u32::MAX)
+        .saturating_add(u32::from(LOCK_POOL_PUSH_HEADROOM))
+        .min(LOCK_POOL_MAX_CONNECTIONS)
+}
+
 /// Boot and run the node to completion. The `gitlawb-node` binary is a thin
 /// `#[tokio::main]` shim over this; keeping the body here (not in `main.rs`)
 /// lets the library own the full module tree so integration tests can link it.
@@ -83,6 +110,13 @@ pub async fn run() -> Result<()> {
     // Merge the embedded seed list of public network nodes into the runtime
     // bootstrap peers. Operators can opt out via GITLAWB_BOOTSTRAP_DISABLE_SEEDS.
     bootstrap::merge_seeds(&mut config);
+
+    // Fail fast on config combinations that are individually in-range but jointly
+    // unsafe — notably a DB pool too small for the concurrent-write cap, which
+    // would let a push burst starve every other DB path (#174 F1).
+    config
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid configuration: {e}"))?;
 
     if !config.public_read {
         warn!(
@@ -297,8 +331,20 @@ pub async fn run() -> Result<()> {
         None
     };
 
-    let repo_store =
-        git::repo_store::RepoStore::new(config.repos_dir.clone(), tigris, db.pool().clone());
+    // Repo write locks run on their own pool, never the main query pool: each push
+    // holds its connection for the whole receive-pack, so a burst of concurrent
+    // pushes drawing from the main pool would park that many connections for the
+    // duration of their receive-packs and starve every other query. That holds
+    // whatever the two pools are sized at, which is why the separation is
+    // structural rather than a consequence of the defaults; config validate()
+    // separately requires db_max_connections >= max_concurrent_git_pushes + 8. See
+    // build_lock_pool for the cancellation semantics (#173).
+    let lock_pool = git::repo_store::build_lock_pool(
+        db.pool(),
+        lock_pool_size(config.max_concurrent_git_pushes),
+        std::time::Duration::from_secs(config.db_acquire_timeout_secs),
+    );
+    let repo_store = git::repo_store::RepoStore::new(config.repos_dir.clone(), tigris, lock_pool);
 
     // Per-DID limiter for the creation endpoints. Keyed on the authenticated
     // DID (attacker-varied), so bound its key set to cap memory.
@@ -1074,6 +1120,8 @@ async fn gossip_task(
 
     // Periodic ping every 5 minutes — exit on shutdown.
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut failed_once: HashSet<String> = HashSet::new();
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -1081,10 +1129,13 @@ async fn gossip_task(
                     Ok(p) => p,
                     Err(_) => continue,
                 };
-                for peer in peers {
-                    let ok = ping_peer_health(&client, &peer.http_url).await;
-                    let _ = state.db.mark_peer_ping(&peer.did, ok).await;
-                }
+                gossip_ping_round(
+                    state.db.as_ref(),
+                    client.as_ref(),
+                    &mut failed_once,
+                    peers,
+                )
+                .await;
             }
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
@@ -1093,6 +1144,47 @@ async fn gossip_task(
                 }
             }
         }
+    }
+}
+
+async fn gossip_ping_round(
+    db: &Db,
+    client: &reqwest::Client,
+    failed_once: &mut HashSet<String>,
+    peers: Vec<db::PeerRecord>,
+) {
+    {
+        let current_dids: HashSet<&str> = peers.iter().map(|peer| peer.did.as_str()).collect();
+        failed_once.retain(|did| current_dids.contains(did.as_str()));
+    }
+    for peer in peers {
+        let ok = ping_peer_readiness(client, &peer.http_url).await;
+        match peer_ping_db_update(failed_once, &peer.did, ok) {
+            Some(reachable) => {
+                if let Err(error) = db.mark_peer_ping(&peer.did, reachable).await {
+                    warn!(did = %peer.did, err = %error, "failed to persist peer readiness");
+                }
+            }
+            None => warn!(
+                did = %peer.did,
+                "peer readiness probe failed once; preserving previous federation status"
+            ),
+        }
+    }
+}
+
+/// Decide whether one readiness sample should update the persisted federation
+/// gate. A success is authoritative immediately. A failure must repeat on the
+/// next gossip tick before it can mark a peer unreachable, so one transient
+/// database hiccup does not hide the peer's repositories for five minutes.
+fn peer_ping_db_update(failed_once: &mut HashSet<String>, did: &str, ready: bool) -> Option<bool> {
+    if ready {
+        failed_once.remove(did);
+        Some(true)
+    } else if failed_once.insert(did.to_owned()) {
+        None
+    } else {
+        Some(false)
     }
 }
 
@@ -1186,11 +1278,6 @@ async fn ping_peer_readiness_with_timeout(
 }
 
 const OUTBOUND_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Legacy gossip helper kept for unit tests in this module.
-async fn ping_peer_health(client: &reqwest::Client, http_url: &str) -> bool {
-    ping_peer_readiness(client, http_url).await
-}
 
 /// Persist a just-created identity key, removing the file if the write failed
 /// (#194, F1). `create_new` makes the inode appear before the PEM is flushed, so a
@@ -3494,8 +3581,34 @@ fn load_or_create_keypair_with(
 }
 
 #[cfg(test)]
+mod lock_pool_sizing_tests {
+    use super::{lock_pool_size, LOCK_POOL_MAX_CONNECTIONS, LOCK_POOL_PUSH_HEADROOM};
+
+    #[test]
+    fn default_push_cap_gets_headroom_over_the_cap() {
+        assert_eq!(lock_pool_size(32), 32 + u32::from(LOCK_POOL_PUSH_HEADROOM));
+        assert_eq!(lock_pool_size(1), 1 + u32::from(LOCK_POOL_PUSH_HEADROOM));
+    }
+
+    #[test]
+    fn an_oversized_push_cap_is_clamped_not_propagated() {
+        assert_eq!(lock_pool_size(1_048_576), LOCK_POOL_MAX_CONNECTIONS);
+        assert_eq!(lock_pool_size(usize::MAX), LOCK_POOL_MAX_CONNECTIONS);
+        let widest = (LOCK_POOL_MAX_CONNECTIONS - u32::from(LOCK_POOL_PUSH_HEADROOM)) as usize;
+        assert_eq!(lock_pool_size(widest), LOCK_POOL_MAX_CONNECTIONS);
+        assert_eq!(
+            lock_pool_size(widest - 1),
+            LOCK_POOL_MAX_CONNECTIONS - 1,
+            "values below the clamp must not be rounded up to it"
+        );
+    }
+}
+
+#[cfg(test)]
 mod gossip_ssrf_tests {
-    use super::ping_peer_health;
+    use super::{gossip_ping_round, peer_ping_db_update, ping_peer_readiness};
+    use sqlx::PgPool;
+    use std::collections::HashSet;
 
     // Build the client exactly as production does (super::build_http_client) so
     // these tests bind the redirect guarantee to the real shared client the
@@ -3503,6 +3616,107 @@ mod gossip_ssrf_tests {
     // fails ping_peer_health_does_not_follow_redirect.
     fn production_http_client() -> reqwest::Client {
         super::build_http_client().expect("failed to build production http client")
+    }
+
+    #[test]
+    fn peer_ping_requires_two_failures_before_marking_unreachable() {
+        let mut failed_once = HashSet::new();
+        let did = "did:key:z6MkPeer";
+
+        assert_eq!(
+            peer_ping_db_update(&mut failed_once, did, false),
+            None,
+            "one transient failure must preserve the persisted federation gate"
+        );
+        assert_eq!(
+            peer_ping_db_update(&mut failed_once, did, false),
+            Some(false),
+            "a sustained failure must mark the peer unreachable"
+        );
+        assert_eq!(
+            peer_ping_db_update(&mut failed_once, did, true),
+            Some(true),
+            "a success must restore reachability immediately"
+        );
+        assert_eq!(
+            peer_ping_db_update(&mut failed_once, did, false),
+            None,
+            "a success must reset the consecutive-failure state"
+        );
+    }
+
+    #[sqlx::test]
+    async fn gossip_ping_round_requires_two_failures_before_persisting_unreachable(pool: PgPool) {
+        let mut server = mockito::Server::new_async().await;
+        let ready = server
+            .mock("GET", "/ready")
+            .with_status(503)
+            .expect(2)
+            .create_async()
+            .await;
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let did = "did:key:z6MkGossipHysteresis";
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
+             VALUES ($1, $2, $3, TRUE, $3)",
+        )
+        .bind(did)
+        .bind(server.url())
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut failed_once = HashSet::from(["did:key:z6MkRemovedPeer".to_owned()]);
+        gossip_ping_round(
+            state.db.as_ref(),
+            &production_http_client(),
+            &mut failed_once,
+            state.db.list_peers().await.unwrap(),
+        )
+        .await;
+        assert!(
+            !failed_once.contains("did:key:z6MkRemovedPeer"),
+            "failure tracking must prune peers outside the current snapshot"
+        );
+        assert!(
+            failed_once.contains(did),
+            "the first failed sample must be retained for the next round"
+        );
+        assert!(
+            state
+                .db
+                .list_peers()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|peer| peer.did == did)
+                .unwrap()
+                .last_ping_ok,
+            "one transient failure must preserve the persisted federation gate"
+        );
+
+        gossip_ping_round(
+            state.db.as_ref(),
+            &production_http_client(),
+            &mut failed_once,
+            state.db.list_peers().await.unwrap(),
+        )
+        .await;
+        assert!(
+            !state
+                .db
+                .list_peers()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|peer| peer.did == did)
+                .unwrap()
+                .last_ping_ok,
+            "two consecutive failed rounds must persist the peer as unreachable"
+        );
+        ready.assert_async().await;
     }
 
     // A peer answering `/health` with a 302 toward an internal address must not
@@ -3528,7 +3742,7 @@ mod gossip_ssrf_tests {
             .create_async()
             .await;
 
-        let ok = ping_peer_health(&production_http_client(), &server.url()).await;
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
 
         assert!(!ok, "a 302 must not count as a healthy peer");
         // expect(0) is enforced only at assert time; this fails if the redirect
@@ -3550,7 +3764,7 @@ mod gossip_ssrf_tests {
             .create_async()
             .await;
 
-        let ok = ping_peer_health(&production_http_client(), &server.url()).await;
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
 
         assert!(ok, "a 200 /health must count as a healthy peer");
     }
@@ -3559,7 +3773,7 @@ mod gossip_ssrf_tests {
     // spurious healthy — the .unwrap_or(false) arm.
     #[tokio::test]
     async fn ping_peer_health_reports_unhealthy_on_connection_error() {
-        let ok = ping_peer_health(&production_http_client(), "http://127.0.0.1:1").await;
+        let ok = ping_peer_readiness(&production_http_client(), "http://127.0.0.1:1").await;
         assert!(!ok, "a connection error must count as an unhealthy peer");
     }
 }

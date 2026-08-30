@@ -302,6 +302,7 @@ async fn anon_ipfs_read_of_withheld_blob_is_denied(pool: sqlx::PgPool) {
     );
 
     // Anonymous read of the withheld blob's CID: denied, no leak of content or OID.
+    // codeql[rust/cleartext-transmission]: loopback harness must request the withheld CID to assert denial
     let resp = client
         .get(format!("{}{}", node.base_url, secret_path))
         .send()
