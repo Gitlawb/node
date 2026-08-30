@@ -2547,9 +2547,9 @@ impl PublishDurabilitySlot {
     }
 
     async fn record(&self, outcome: crate::git::repo_store::ReleaseOutcome) {
+        *self.inner.lock().await = Some(outcome);
         self.recorded
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        *self.inner.lock().await = Some(outcome);
     }
 }
 
@@ -3173,6 +3173,95 @@ pub async fn list_federated_repos(
 /// database row commits.
 struct ForkCloneGuard(Option<PathBuf>);
 
+const FORK_CREATE_CONFIRM_ATTEMPTS: u32 = 5;
+
+/// After `create_repo` fails, re-read the row with bounded retries so a
+/// transport-level error does not skip archive compensation when the insert never
+/// landed, and so a successful insert is not mistaken for a failure.
+async fn confirm_fork_repo_row(
+    db: &crate::db::Db,
+    owner_short: &str,
+    fork_name: &str,
+) -> anyhow::Result<Option<crate::db::RepoRecord>> {
+    let mut delay = std::time::Duration::from_millis(25);
+    for attempt in 0..FORK_CREATE_CONFIRM_ATTEMPTS {
+        match db.get_repo(owner_short, fork_name).await {
+            Ok(row) => return Ok(row),
+            Err(e) if attempt + 1 < FORK_CREATE_CONFIRM_ATTEMPTS => {
+                tracing::warn!(
+                    fork = %fork_name,
+                    attempt,
+                    err = %e,
+                    "fork create_repo confirmation lookup failed — retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay = delay
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_secs(1));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("loop returns on every attempt")
+}
+
+/// When the confirmation lookup stays unavailable after bounded retries, keep
+/// retrying in the background and compensate only after establishing that no row
+/// exists for this fork name.
+async fn schedule_fork_create_recovery(
+    db: std::sync::Arc<crate::db::Db>,
+    repo_store: crate::git::repo_store::RepoStore,
+    owner_short: String,
+    fork_name: String,
+    owner_did: String,
+    disk_path: std::path::PathBuf,
+) {
+    let mut delay = std::time::Duration::from_millis(250);
+    for attempt in 0..12 {
+        match db.get_repo(&owner_short, &fork_name).await {
+            Ok(Some(_)) => {
+                tracing::info!(
+                    fork = %fork_name,
+                    attempt,
+                    "fork create_repo recovery found a committed row — no archive compensation"
+                );
+                return;
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    fork = %fork_name,
+                    attempt,
+                    "fork create_repo recovery confirmed no row — compensating orphan archive"
+                );
+                repo_store
+                    .compensate_fork_archive(&owner_did, &fork_name, disk_path.as_path())
+                    .await;
+                return;
+            }
+            Err(e) if attempt + 1 < 12 => {
+                tracing::warn!(
+                    fork = %fork_name,
+                    attempt,
+                    err = %e,
+                    "fork create_repo recovery lookup failed — retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay = delay
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_secs(30));
+            }
+            Err(e) => {
+                tracing::error!(
+                    fork = %fork_name,
+                    err = %e,
+                    "fork create_repo recovery gave up — orphan archive may remain until operator cleanup"
+                );
+                return;
+            }
+        }
+    }
+}
+
 impl ForkCloneGuard {
     fn new(path: crate::git::repo_store::ValidatedRepoDiskPath) -> Self {
         Self(Some(path.into_path_buf()))
@@ -3339,24 +3428,55 @@ pub async fn fork_repo(
     };
 
     if let Err(e) = state.db.create_repo(&record).await {
-        if let Some(committed) = state.db.get_repo(forker_short, &fork_name).await? {
-            clone_guard.disarm();
-            tracing::warn!(
-                fork = %fork_name,
-                forker = %forker_did,
-                "fork create_repo returned an error but the row is present — treating as success"
-            );
-            return Ok((
-                StatusCode::CREATED,
-                Json(to_response(&committed, &state, 0)),
-            ));
+        match confirm_fork_repo_row(&state.db, forker_short, &fork_name).await {
+            Ok(Some(committed)) => {
+                clone_guard.disarm();
+                tracing::warn!(
+                    fork = %fork_name,
+                    forker = %forker_did,
+                    "fork create_repo returned an error but the row is present — treating as success"
+                );
+                return Ok((
+                    StatusCode::CREATED,
+                    Json(to_response(&committed, &state, 0)),
+                ));
+            }
+            Ok(None) => {
+                clone_guard.disarm();
+                state
+                    .repo_store
+                    .compensate_fork_archive(&forker_did, &fork_name, disk_path.as_path())
+                    .await;
+                return Err(e.into());
+            }
+            Err(lookup_err) => {
+                clone_guard.disarm();
+                let db = std::sync::Arc::clone(&state.db);
+                let repo_store = state.repo_store.clone();
+                let owner_short = forker_short.to_string();
+                let fork_name_cl = fork_name.clone();
+                let owner_did = forker_did.clone();
+                let disk_path_cl = disk_path.as_path().to_path_buf();
+                tokio::spawn(async move {
+                    schedule_fork_create_recovery(
+                        db,
+                        repo_store,
+                        owner_short,
+                        fork_name_cl,
+                        owner_did,
+                        disk_path_cl,
+                    )
+                    .await;
+                });
+                tracing::warn!(
+                    fork = %fork_name,
+                    create_err = %e,
+                    lookup_err = %lookup_err,
+                    "fork create_repo failed and confirmation lookup stayed unavailable — scheduled recovery"
+                );
+                return Err(AppError::RepoUnavailable);
+            }
         }
-        clone_guard.disarm();
-        state
-            .repo_store
-            .compensate_fork_archive(&forker_did, &fork_name, disk_path.as_path())
-            .await;
-        return Err(e.into());
     }
 
     clone_guard.disarm();
@@ -3596,6 +3716,34 @@ mod tests {
     const OWNER_DID: &str = "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
     const OWNER_SHORT: &str = "z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
     const STRANGER_DID: &str = "did:key:z6Mkffonly5tranger0000000000000000000000000000000";
+
+    #[tokio::test]
+    async fn publish_durability_slot_drop_installs_unknowable_when_never_recorded() {
+        let slot = PublishDurabilitySlot::new();
+        let arc = slot.arc();
+        drop(slot);
+        let outcome = *arc.lock().await;
+        assert_eq!(
+            outcome,
+            Some(crate::git::repo_store::ReleaseOutcome::UploadUnknowable),
+            "dropping an unrecorded slot must publish UploadUnknowable for the tail"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_durability_confirmed_proceeds_quickly_after_unrecorded_slot_drop() {
+        let start = std::time::Instant::now();
+        let slot = PublishDurabilitySlot::new();
+        let arc = slot.arc();
+        drop(slot);
+        let confirmed =
+            publish_durability_confirmed(&Some(arc), std::time::Duration::from_millis(50)).await;
+        assert!(confirmed);
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(200),
+            "the tail must not wait out the full transfer bound when the slot already carries UploadUnknowable"
+        );
+    }
 
     #[tokio::test]
     async fn publish_durability_confirmed_proceeds_when_release_never_records() {

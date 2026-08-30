@@ -277,7 +277,7 @@ pub struct Config {
     #[arg(
         long,
         env = "GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS",
-        default_value_t = 32,
+        default_value_t = 40,
         value_parser = clap::value_parser!(u32).range(1..)
     )]
     pub db_lock_pool_max_connections: u32,
@@ -397,9 +397,10 @@ pub struct Config {
     /// error rather than a boot-time panic).
     ///
     /// CONNECTION BUDGET. A push holds a Postgres connection from the node's separate
-    /// advisory-lock pool (`GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS`, default 32) for
-    /// the whole receive-pack. That pool must be at least this value so every
-    /// admitted push can pin a lock-pool connection for its whole duration. Size BOTH
+    /// advisory-lock pool (`GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS`, default 40) for
+    /// the whole receive-pack. That pool must be at least this value plus
+    /// `DB_LOCK_POOL_NON_PUSH_HEADROOM` so admitted pushes and non-push mutations
+    /// can each pin a lock-pool connection for their whole duration. Size BOTH
     /// pools against the database server's `max_connections`: the main pool
     /// (`GITLAWB_DB_MAX_CONNECTIONS`, default 48) serves ordinary handlers, and the
     /// lock pool serves writes. Raising this knob does not raise the lock pool;
@@ -761,6 +762,11 @@ impl Config {
     /// the pool must clear the concurrent-write cap by at least this margin.
     pub const DB_POOL_APP_HEADROOM: u32 = 8;
 
+    /// Lock-pool slots reserved for non-push `acquire_write` callers (issue create,
+    /// close, merge) so a saturated push budget cannot turn ordinary mutations into
+    /// lock-pool exhaustion on unrelated repositories.
+    pub const DB_LOCK_POOL_NON_PUSH_HEADROOM: u32 = 8;
+
     /// Cross-field boot validation. Single-field ranges are enforced by clap; this
     /// catches combinations that ship a denial-of-service under otherwise-valid
     /// values. Call once at startup and fail fast on `Err`.
@@ -768,12 +774,17 @@ impl Config {
         // Concurrent git writes pin the dedicated lock pool for their whole
         // duration (connection-affine advisory lock in acquire_write). The main
         // pool no longer carries that occupancy.
-        if (self.db_lock_pool_max_connections as usize) < self.max_concurrent_git_pushes {
+        let lock_floor = self
+            .max_concurrent_git_pushes
+            .saturating_add(Self::DB_LOCK_POOL_NON_PUSH_HEADROOM as usize);
+        if (self.db_lock_pool_max_connections as usize) < lock_floor {
             return Err(format!(
                 "GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS ({}) must be at least \
-                 max_concurrent_git_pushes ({}) so every admitted push can pin a \
-                 lock-pool connection for its whole duration",
-                self.db_lock_pool_max_connections, self.max_concurrent_git_pushes
+                 max_concurrent_git_pushes ({}) plus {} for non-push mutations \
+                 that share the lock pool",
+                self.db_lock_pool_max_connections,
+                self.max_concurrent_git_pushes,
+                Self::DB_LOCK_POOL_NON_PUSH_HEADROOM
             ));
         }
         let main_floor = Self::DB_POOL_APP_HEADROOM as u64;
@@ -793,10 +804,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lock_pool_size_defaults_to_32_and_rejects_zero() {
+    fn lock_pool_size_defaults_to_40_and_rejects_zero() {
         assert_eq!(
             Config::parse_from(["gitlawb-node"]).db_lock_pool_max_connections,
-            32
+            40
         );
         assert_eq!(
             Config::parse_from(["gitlawb-node", "--db-lock-pool-max-connections", "8"])
@@ -1424,7 +1435,7 @@ mod tests {
     /// pool. `validate()` must reject an under-sized lock pool at boot.
     #[test]
     fn db_pool_must_clear_the_git_push_cap() {
-        // Shipped defaults validate (lock pool 32 >= pushes 32, main pool >= headroom).
+        // Shipped defaults validate (lock pool 40 >= pushes 32 + non-push headroom 8).
         Config::parse_from(["gitlawb-node"])
             .validate()
             .expect("default config must validate");
@@ -1439,7 +1450,20 @@ mod tests {
         ]);
         assert!(
             under_lock.validate().is_err(),
-            "db_lock_pool_max_connections below max_concurrent_git_pushes must be rejected"
+            "db_lock_pool_max_connections below max_concurrent_git_pushes + headroom must be rejected"
+        );
+
+        // Exactly at the push cap without non-push headroom is rejected.
+        let push_only = Config::parse_from([
+            "gitlawb-node",
+            "--db-lock-pool-max-connections",
+            "32",
+            "--max-concurrent-git-pushes",
+            "32",
+        ]);
+        assert!(
+            push_only.validate().is_err(),
+            "db_lock_pool_max_connections equal to max_concurrent_git_pushes must be rejected"
         );
 
         // Main pool can be smaller than pushes + headroom when the lock pool carries writes.
@@ -1448,7 +1472,7 @@ mod tests {
             "--db-max-connections",
             "16",
             "--db-lock-pool-max-connections",
-            "32",
+            "40",
             "--max-concurrent-git-pushes",
             "32",
         ]);
