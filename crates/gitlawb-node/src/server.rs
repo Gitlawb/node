@@ -210,28 +210,52 @@ pub fn build_router(state: AppState) -> Router {
     .layer(axum::Extension(push_limiter));
 
     // ── IPFS content-addressed retrieval and pin listing ──────────────────
-    // `/ipfs/{cid}` carries `optional_signature` so `get_by_cid` sees the caller
-    // identity and can apply per-repo visibility (#110); anonymous callers stay
-    // anonymous and still read genuinely public content. `/api/v1/ipfs/pins`
-    // stays unsigned — gating the pin index is tracked separately (#121).
-    // `/ipfs/{cid}` also carries a per-IP flood brake: it is anon-reachable and each
-    // request can drive a full-history git walk, so the per-IP rate limiter is the
-    // outermost layer (rejects a flood before the walk-admission work), mirroring the
-    // push/create routers. The extension MUST be attached or rate_limit_by_ip is a
-    // silent no-op. `/api/v1/ipfs/pins` (no walk) is merged in unbraked, as before.
+    // Two independent sub-routers, then merged. They share a URL prefix family
+    // but have separate rate-limit policies and must not share a bucket.
+    //
+    // `/ipfs/{cid}` (CID resolver): carries `optional_signature` so `get_by_cid`
+    // sees the caller identity and can apply per-repo visibility (#110); anon
+    // callers stay anonymous and still read genuinely public content. The
+    // per-IP flood brake is layered on because the resolver is anon-reachable
+    // and each request can drive a full-history git walk — the brake is the
+    // outermost layer (rejects a flood before the walk-admission work), mirroring
+    // the push/create routers. The `IpRateLimiter` extension MUST be attached
+    // or `rate_limit_by_ip` is a silent no-op.
+    //
+    // `/api/v1/ipfs/pins` (pin listing): now carries `optional_signature` only
+    // (#121). The handler rejects requests without a verified `AuthenticatedDid`
+    // with 401. It does NOT carry the CID flood brake — `list_pins` is a single
+    // `list_pinned_cids()` call, no walk, and routing pins through the resolver's
+    // bucket would let `/ipfs/{cid}` traffic exhaust the bucket and 429 the
+    // pins endpoint, or let signed pin polling exhaust the bucket for legitimate
+    // CID reads. The two surfaces have separate availability contracts.
+    //
+    // Both sub-routers are built first with their own layer sets, then merged.
+    // This is the structure the prior routing guidance called for and the
+    // earlier 429 test for `/ipfs/{cid}` (test_support.rs) assumes.
     let ipfs_limiter = rate_limit::IpRateLimiter {
         limiter: state.ipfs_rate_limiter.clone(),
         trust: state.push_limiter_trust,
     };
-    let ipfs_routes = Router::new()
+    let ipfs_cid_routes = Router::new()
         .route("/ipfs/{cid}", get(ipfs::get_by_cid))
         .layer(middleware::from_fn(auth::optional_signature))
         .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
-        .layer(axum::Extension(ipfs_limiter))
-        .merge(Router::new().route("/api/v1/ipfs/pins", get(ipfs::list_pins)));
+        .layer(axum::Extension(ipfs_limiter));
+    let ipfs_pins_routes = Router::new()
+        .route("/api/v1/ipfs/pins", get(ipfs::list_pins))
+        .layer(middleware::from_fn(auth::optional_signature));
+    let ipfs_routes = ipfs_cid_routes.merge(ipfs_pins_routes);
 
     // ── Arweave permanent anchors ──────────────────────────────────────────
-    let arweave_routes = Router::new().route("/api/v1/arweave/anchors", get(arweave::list_anchors));
+    // `list_anchors` rejects callers without a verified `AuthenticatedDid`, so
+    // unsigned enumeration is denied. The same `optional_signature` layer used
+    // on the other read surfaces is applied here — there is no anonymous
+    // anchor-listing path on a signed-build node, and this commit closes that
+    // gap alongside `/api/v1/ipfs/pins`.
+    let arweave_routes = Router::new()
+        .route("/api/v1/arweave/anchors", get(arweave::list_anchors))
+        .layer(middleware::from_fn(auth::optional_signature));
 
     // ── Bounty routes (write — require HTTP Signature) ─────────────────
     let bounty_write_routes = add_auth_layers(
@@ -617,5 +641,548 @@ async fn p2p_info(State(state): State<AppState>) -> Json<serde_json::Value> {
             }))
         }
         None => Json(json!({ "enabled": false })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+
+    use crate::db::RepoRecord;
+    use crate::test_support::test_state;
+
+    /// Regression: anonymous callers must not see the pin/anchor index (#121, #134).
+    #[sqlx::test]
+    async fn unsigned_get_pins_and_anchors_is_401_through_build_router(pool: PgPool) {
+        let state = test_state(pool).await;
+        let router = build_router(state);
+
+        let pins = Request::builder()
+            .method("GET")
+            .uri("/api/v1/ipfs/pins?limit=50")
+            .body(Body::empty())
+            .unwrap();
+        let pins_resp = router.clone().oneshot(pins).await.unwrap();
+        assert_eq!(
+            pins_resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "anonymous pin listing must be rejected"
+        );
+
+        let anchors = Request::builder()
+            .method("GET")
+            .uri("/api/v1/arweave/anchors?limit=50")
+            .body(Body::empty())
+            .unwrap();
+        let anchors_resp = router.oneshot(anchors).await.unwrap();
+        assert_eq!(
+            anchors_resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "anonymous anchors listing must be rejected"
+        );
+    }
+
+    /// Regression: a real RFC-9421 signature produced exactly as `gl` does — built
+    /// with `gitlawb_core::http_sig::sign_request` over a GET, headers attached,
+    /// and sent through the actual `build_router` — is verified by the
+    /// `optional_signature` layer that wraps the pin/anchor routes, and the
+    /// handler returns 200. Pairs with the anonymous-denial test above; one
+    /// proves headers are required, the other proves a valid header is honored.
+    /// Without this test the unsigned-denial test would stay green even if the
+    /// `optional_signature` layer were never wired onto these routes, because
+    /// signed and unsigned requests would fail identically (#134 review).
+    #[sqlx::test]
+    async fn signed_get_pins_and_anchors_succeeds_through_build_router(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let state = test_state(pool).await;
+        let router = build_router(state);
+
+        let kp = Keypair::generate();
+
+        let pins_path = "/api/v1/ipfs/pins";
+        let signed = sign_request(&kp, "GET", pins_path, b"");
+        let pins = Request::builder()
+            .method("GET")
+            .uri(pins_path)
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::empty())
+            .unwrap();
+        let pins_resp = router.clone().oneshot(pins).await.unwrap();
+        assert_eq!(
+            pins_resp.status(),
+            StatusCode::OK,
+            "a valid signature on /api/v1/ipfs/pins must be honored through build_router"
+        );
+
+        let anchors_path = "/api/v1/arweave/anchors";
+        let signed = sign_request(&kp, "GET", anchors_path, b"");
+        let anchors = Request::builder()
+            .method("GET")
+            .uri(anchors_path)
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::empty())
+            .unwrap();
+        let anchors_resp = router.oneshot(anchors).await.unwrap();
+        assert_eq!(
+            anchors_resp.status(),
+            StatusCode::OK,
+            "a valid signature on /api/v1/arweave/anchors must be honored through build_router"
+        );
+    }
+
+    /// Companion to the two regressions above: a request that *carries* signature
+    /// headers but whose signature does not verify (here, garbled) must be denied
+    /// with 401, not silently treated as anonymous and re-checked by the handler.
+    /// This pins the failure mode of the `optional_signature` layer: when the
+    /// caller claims to be signed, the layer must commit to verifying — there is
+    /// no fall-through path that lets a bad signature bypass auth.
+    #[sqlx::test]
+    async fn malformed_signature_on_pins_is_401_through_build_router(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let state = test_state(pool).await;
+        let router = build_router(state);
+
+        let kp = Keypair::generate();
+        let path = "/api/v1/ipfs/pins";
+        let mut signed = sign_request(&kp, "GET", path, b"");
+        // Flip a character well inside the signature value (base64) so the header
+        // still parses but does not verify against the key.
+        let mut tampered = signed.signature.clone();
+        let mid = tampered.len() / 2;
+        let flipped = if tampered.as_bytes()[mid] == b'A' {
+            'B'
+        } else {
+            'A'
+        };
+        tampered.replace_range(mid..mid + 1, &flipped.to_string());
+        signed.signature = tampered;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a malformed signature must be rejected by the auth layer, not silently accepted"
+        );
+    }
+
+    // ── Scoped anchor contract (P1 follow-up: ?repo= must authorize_repo_read) ──
+    //
+    // The follow-up review (after the auth-layer wiring landed) found that a
+    // signed but unauthorized caller could still obtain scoped anchor metadata
+    // because the `?repo=` branch handed the user-supplied string straight to
+    // the SQL filter. These tests exercise the full production contract end to
+    // end: real RFC-9421 signature → `optional_signature` layer →
+    // `authorize_repo_read` → SQL. They fail closed if the authz call is moved
+    // after the query or removed entirely.
+
+    /// Inline repo seed for the scoped-anchor tests. Mirrors the shape in
+    /// `test_support::tests::seed_repo` without taking a cross-module private
+    /// helper as a dependency.
+    fn seed_repo_inline(owner_did: &str, name: &str) -> RepoRecord {
+        let now = chrono::Utc::now();
+        RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: format!("/tmp/{name}"),
+            forked_from: None,
+            machine_id: None,
+        }
+    }
+
+    /// Unsigned scoped anchor request → 401, identical to the global anchor
+    /// 401 test. Proves the auth layer fires before any scope decision (no
+    /// existence oracle via the `?repo=` path either).
+    #[sqlx::test]
+    async fn unsigned_scoped_anchors_is_401_through_build_router(pool: PgPool) {
+        let state = test_state(pool).await;
+        let router = build_router(state);
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/arweave/anchors?repo=did:key:zSCOPED%2Fpriv")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "unsigned scoped anchor request must be 401, before any scope lookup"
+        );
+    }
+
+    /// Signed owner on a private repo → 200, anchor metadata returned. Mirrors
+    /// the existing `list_webhooks_accepts_a_real_gl_signature_e2e` shape: real
+    /// signature, real middleware, real `authorize_repo_read`.
+    #[sqlx::test]
+    async fn signed_scoped_anchors_owner_succeeds_through_build_router(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let state = test_state(pool).await;
+
+        let mut repo = seed_repo_inline(&owner_did, "scoped-priv");
+        repo.is_public = false;
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        state
+            .db
+            .record_arweave_anchor(&crate::db::RecordAnchorInput {
+                repo: &format!("{short}/scoped-priv"),
+                owner_did: &owner_did,
+                ref_name: "refs/heads/main",
+                old_sha: "0".repeat(64).as_str(),
+                new_sha: "1".repeat(64).as_str(),
+                cid: Some("bafytest"),
+                irys_tx_id: "irys-owner-tx",
+                arweave_url: "https://arweave.net/owner-tx",
+                node_did: "did:key:zNODE",
+            })
+            .await
+            .expect("seed anchor");
+
+        let path = format!("/api/v1/arweave/anchors?repo={short}/scoped-priv");
+        let signed = sign_request(&kp, "GET", &path, b"");
+        let req = Request::builder()
+            .method("GET")
+            .uri(&path)
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::empty())
+            .unwrap();
+
+        let router = build_router(state);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the owner of a private repo must see their scoped anchors"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains("irys-owner-tx"),
+            "owner must see the anchor's irys tx id; body was: {body}"
+        );
+        // Owner must see the ref name + new SHA so this is not just a count oracle.
+        assert!(
+            body.contains("refs/heads/main"),
+            "owner must see the ref name; body was: {body}"
+        );
+
+        // Sanity: a second test would need a different repo name to avoid
+        // colliding on `did:key:zSCOPED/scoped-priv` in the anchors table.
+        // Distinct repo names per test keep the rows queryable in isolation.
+        let _ = repo;
+    }
+
+    /// #121 R3: the SQL filter must use the canonical stored slug, not the
+    /// user-supplied `?repo=` string. Anchor rows are stored as
+    /// `{normalize_owner_key(owner_did)}/{name}` (the short form). Authz
+    /// passes for the full-DID form, but a literal `WHERE repo=$1` against
+    /// the full DID would match zero rows and return a false empty page,
+    /// breaking callers that legitimately use the full `did:key:…/name`
+    /// form in `?repo=`. RED before the fix: handler built the filter from
+    /// the raw `?repo=` string, so this query returned `anchors: []`.
+    #[sqlx::test]
+    async fn signed_scoped_anchors_full_did_form_matches_stored_slug_through_build_router(
+        pool: PgPool,
+    ) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let state = test_state(pool).await;
+
+        let mut repo = seed_repo_inline(&owner_did, "scoped-did-form");
+        repo.is_public = false;
+        state.db.create_repo(&repo).await.expect("seed repo");
+        // Use the same slug-construction the writer uses
+        // (`db::normalize_owner_key`) so the test reader and the production
+        // writer can't drift if a future change moves the slug off the
+        // short-form. P3 (reviewer-3): the previous `split(':').next_back()`
+        // hand-rolled a third convention that agreed with the writer for
+        // `did:key` owners and diverged for every other method.
+        let short = crate::db::normalize_owner_key(&owner_did).to_string();
+        state
+            .db
+            .record_arweave_anchor(&crate::db::RecordAnchorInput {
+                repo: &format!("{short}/scoped-did-form"),
+                owner_did: &owner_did,
+                ref_name: "refs/heads/main",
+                old_sha: "0".repeat(64).as_str(),
+                new_sha: "1".repeat(64).as_str(),
+                cid: Some("bafytest"),
+                irys_tx_id: "irys-did-form-tx",
+                arweave_url: "https://arweave.net/did-form-tx",
+                node_did: "did:key:zNODE",
+            })
+            .await
+            .expect("seed anchor");
+
+        // P2 (reviewer-3): the previous suite only proved the authorized
+        // row is present. A correct filter must ALSO prove that anchors
+        // for OTHER repos do not leak into the response — the failure
+        // mode of the original bug was a cross-repo leak, not a
+        // fail-safe empty page. Seed a second repo (also under the
+        // same owner, so the authz test stays scoped) with its own
+        // irys_tx_id and assert it is absent from the body.
+        let other_owner = {
+            let kp2 = Keypair::generate();
+            kp2.did().to_string()
+        };
+        let mut other_repo = seed_repo_inline(&other_owner, "other-repo");
+        other_repo.is_public = true;
+        state
+            .db
+            .create_repo(&other_repo)
+            .await
+            .expect("seed other repo");
+        state
+            .db
+            .record_arweave_anchor(&crate::db::RecordAnchorInput {
+                repo: &format!(
+                    "{}/other-repo",
+                    crate::db::normalize_owner_key(&other_owner)
+                ),
+                owner_did: &other_owner,
+                ref_name: "refs/heads/main",
+                old_sha: "0".repeat(64).as_str(),
+                new_sha: "2".repeat(64).as_str(),
+                cid: Some("bafyother"),
+                irys_tx_id: "irys-other-repo-tx",
+                arweave_url: "https://arweave.net/other-tx",
+                node_did: "did:key:zNODE",
+            })
+            .await
+            .expect("seed other anchor");
+
+        // The caller passes the FULL DID form in ?repo=. validate_repo_slug
+        // accepts it, authorize_repo_read resolves it, and the handler MUST
+        // then translate to the canonical stored slug (short form) before
+        // running the SQL — otherwise this returns 200 with anchors: [].
+        let path = format!("/api/v1/arweave/anchors?repo={owner_did}/scoped-did-form");
+        let signed = sign_request(&kp, "GET", &path, b"");
+        let req = Request::builder()
+            .method("GET")
+            .uri(&path)
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::empty())
+            .unwrap();
+
+        let router = build_router(state);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "authz passed via the full DID form, so the response must be 200"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains("irys-did-form-tx"),
+            "the SQL filter must use the stored short slug, not the full DID — \
+             a false-empty page would break callers that pass ?repo=did:key:…/name. \
+             body was: {body}"
+        );
+        assert!(
+            !body.contains("irys-other-repo-tx"),
+            "the scoped anchor filter must exclude other repos' anchors — \
+             a cross-repo leak would expose metadata of repos the caller \
+             did not authorize. body was: {body}"
+        );
+
+        let _ = repo;
+    }
+
+    /// Signed non-reader on a private repo → 404, anchor metadata MUST NOT
+    /// leak. This is the test that catches the "auth-but-no-authz" bug if
+    /// the gate is moved after the SQL query or removed entirely. The 404
+    /// is the standard `repo_not_found` shape — indistinguishable from the
+    /// missing-repo case below.
+    #[sqlx::test]
+    async fn signed_scoped_anchors_non_reader_is_404_no_leak_through_build_router(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let owner_kp = Keypair::generate();
+        let stranger_kp = Keypair::generate();
+        let owner_did = owner_kp.did().to_string();
+        let stranger_did = stranger_kp.did().to_string();
+        let state = test_state(pool).await;
+
+        let mut repo = seed_repo_inline(&owner_did, "scoped-priv-nr");
+        repo.is_public = false;
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let short_owner = owner_did.split(':').next_back().unwrap().to_string();
+        state
+            .db
+            .record_arweave_anchor(&crate::db::RecordAnchorInput {
+                repo: &format!("{short_owner}/scoped-priv-nr"),
+                owner_did: &owner_did,
+                ref_name: "refs/heads/secret",
+                old_sha: "2".repeat(64).as_str(),
+                new_sha: "3".repeat(64).as_str(),
+                cid: Some("bafytest"),
+                irys_tx_id: "irys-secret-tx-DO-NOT-LEAK",
+                arweave_url: "https://arweave.net/secret-tx",
+                node_did: "did:key:zNODE",
+            })
+            .await
+            .expect("seed anchor");
+
+        let _ = stranger_did; // signature carries the DID; this is just documentation
+        let path = format!("/api/v1/arweave/anchors?repo={short_owner}/scoped-priv-nr");
+        let signed = sign_request(&stranger_kp, "GET", &path, b"");
+        let req = Request::builder()
+            .method("GET")
+            .uri(&path)
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::empty())
+            .unwrap();
+
+        let router = build_router(state);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a signed non-reader must be 404 on a private repo's anchors"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            !body.contains("irys-secret-tx-DO-NOT-LEAK"),
+            "the 404 body must not leak the anchor's irys tx id; body was: {body}"
+        );
+        assert!(
+            !body.contains("refs/heads/secret"),
+            "the 404 body must not leak the ref name; body was: {body}"
+        );
+    }
+
+    /// Signed caller on a missing repo → 404, same shape as the non-reader
+    /// case. This is the indistinguishability half: a probe cannot tell
+    /// "private" from "absent" from the response.
+    #[sqlx::test]
+    async fn signed_scoped_anchors_missing_repo_is_404_through_build_router(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let kp = Keypair::generate();
+        let state = test_state(pool).await;
+
+        let short = kp
+            .did()
+            .to_string()
+            .split(':')
+            .next_back()
+            .unwrap()
+            .to_string();
+        let path = format!("/api/v1/arweave/anchors?repo={short}/does-not-exist");
+        let signed = sign_request(&kp, "GET", &path, b"");
+        let req = Request::builder()
+            .method("GET")
+            .uri(&path)
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::empty())
+            .unwrap();
+
+        let router = build_router(state);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a missing repo must 404 indistinguishably from a non-readable private repo"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(
+            v["error"], "repo_not_found",
+            "the 404 body must carry the standard repo_not_found error code"
+        );
+    }
+
+    /// `?limit=-1` must not crash as `LIMIT -1` (Postgres 500). It clamps to
+    /// zero and returns 200 with an empty list — the same shape as a valid
+    /// listing that happens to have no rows in the configured range.
+    #[sqlx::test]
+    async fn signed_anchors_negative_limit_clamps_to_zero_through_build_router(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let kp = Keypair::generate();
+        let state = test_state(pool).await;
+
+        let path = "/api/v1/arweave/anchors?limit=-1";
+        let signed = sign_request(&kp, "GET", path, b"");
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::empty())
+            .unwrap();
+
+        let router = build_router(state);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "?limit=-1 must clamp, not 500"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(v["count"], 0, "clamped limit yields an empty list");
+        assert_eq!(v["anchors"].as_array().map(|a| a.len()), Some(0));
     }
 }
