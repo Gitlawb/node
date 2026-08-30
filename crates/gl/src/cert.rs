@@ -545,7 +545,10 @@ mod tests {
             "2026-07-22T00:00:00+00:00",
             &sig,
         );
-        assert!(verdict.is_ok(), "missing version must take the v1 verify path: {verdict:?}");
+        assert!(
+            verdict.is_ok(),
+            "missing version must take the v1 verify path: {verdict:?}"
+        );
     }
 
     /// #26 Split PR 3: an explicit `version: 1` on a cert is the v1
@@ -596,7 +599,10 @@ mod tests {
             "2026-07-22T00:00:00+00:00",
             &sig,
         );
-        assert!(verdict.is_ok(), "explicit version: 1 must take the v1 verify path: {verdict:?}");
+        assert!(
+            verdict.is_ok(),
+            "explicit version: 1 must take the v1 verify path: {verdict:?}"
+        );
     }
 
     /// #26 Split PR 3 + Reviewer 2: parse_cert_version is the
@@ -644,8 +650,8 @@ mod tests {
         // may collapse to v1.
         for bad in [
             serde_json::json!("two"),
-            serde_json::json!(2.0),      // serde_json::Value::is_f64 is true for this
-            serde_json::json!(2.5),      // obviously fractional
+            serde_json::json!(2.0), // serde_json::Value::is_f64 is true for this
+            serde_json::json!(2.5), // obviously fractional
             serde_json::json!(true),
             serde_json::json!(null),
             serde_json::json!([2]),
@@ -719,7 +725,7 @@ mod tests {
                 "did:key:z6MkPusher",
                 &node_did,
                 "2026-07-22T00:00:00+00:00",
-                &cert_json["signature"].as_str().unwrap(),
+                cert_json["signature"].as_str().unwrap(),
             ),
             Ok(v) => Err(format!(
                 "this client supports cert version 1 only; server returned {v}; upgrade the client to verify"

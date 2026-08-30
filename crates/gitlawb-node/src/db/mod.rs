@@ -7301,15 +7301,22 @@ mod ref_certificate_tests {
     #[sqlx::test]
     async fn v28_ref_certificates_version_applies_on_upgrade(pool: PgPool) {
         async fn version_column_default(pool: &PgPool) -> Option<String> {
+            // fetch_optional (not fetch_one) so a missing column
+            // returns Ok(None) instead of RowNotFound. The whole
+            // point of the precondition assertion below is to
+            // detect a missing column, and RowNotFound would mask
+            // the difference between "the helper is wrong" and
+            // "the migration is wrong".
             sqlx::query_scalar::<_, Option<String>>(
                 "SELECT column_default
                    FROM information_schema.columns
                   WHERE table_name = 'ref_certificates'
                     AND column_name = 'version'",
             )
-            .fetch_one(pool)
+            .fetch_optional(pool)
             .await
             .unwrap()
+            .flatten()
         }
 
         async fn seed_pre_v28_cert(pool: &PgPool) {

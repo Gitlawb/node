@@ -62,13 +62,7 @@ pub async fn issue_ref_certificate(
     // the frozen-vector test below and the live signer cannot drift
     // apart — a regression in either side fails both.
     let payload = v1_signing_payload(
-        repo_id,
-        ref_name,
-        old_sha,
-        new_sha,
-        pusher_did,
-        &node_did,
-        &issued_at,
+        repo_id, ref_name, old_sha, new_sha, pusher_did, &node_did, &issued_at,
     );
     let payload_bytes = serde_json::to_vec(&payload)?;
 
@@ -229,11 +223,10 @@ mod v1_payload_tests {
              signature. v2 certs build a different payload, not this one"
         );
         // Pin the exact set so a future field addition is caught.
-        let expected: std::collections::BTreeSet<&str> = [
-            "new", "node", "old", "pusher", "ref", "repo_id", "ts",
-        ]
-        .into_iter()
-        .collect();
+        let expected: std::collections::BTreeSet<&str> =
+            ["new", "node", "old", "pusher", "ref", "repo_id", "ts"]
+                .into_iter()
+                .collect();
         let actual: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
         assert_eq!(actual, expected, "v1 payload key set is frozen");
     }
