@@ -932,7 +932,13 @@ mod tests {
         let mut repo = seed_repo_inline(&owner_did, "scoped-did-form");
         repo.is_public = false;
         state.db.create_repo(&repo).await.expect("seed repo");
-        let short = owner_did.split(':').next_back().unwrap().to_string();
+        // Use the same slug-construction the writer uses
+        // (`db::normalize_owner_key`) so the test reader and the production
+        // writer can't drift if a future change moves the slug off the
+        // short-form. P3 (reviewer-3): the previous `split(':').next_back()`
+        // hand-rolled a third convention that agreed with the writer for
+        // `did:key` owners and diverged for every other method.
+        let short = crate::db::normalize_owner_key(&owner_did).to_string();
         state
             .db
             .record_arweave_anchor(&crate::db::RecordAnchorInput {
@@ -948,6 +954,43 @@ mod tests {
             })
             .await
             .expect("seed anchor");
+
+        // P2 (reviewer-3): the previous suite only proved the authorized
+        // row is present. A correct filter must ALSO prove that anchors
+        // for OTHER repos do not leak into the response — the failure
+        // mode of the original bug was a cross-repo leak, not a
+        // fail-safe empty page. Seed a second repo (also under the
+        // same owner, so the authz test stays scoped) with its own
+        // irys_tx_id and assert it is absent from the body.
+        let other_owner = {
+            let kp2 = Keypair::generate();
+            kp2.did().to_string()
+        };
+        let mut other_repo = seed_repo_inline(&other_owner, "other-repo");
+        other_repo.is_public = true;
+        state
+            .db
+            .create_repo(&other_repo)
+            .await
+            .expect("seed other repo");
+        state
+            .db
+            .record_arweave_anchor(&crate::db::RecordAnchorInput {
+                repo: &format!(
+                    "{}/other-repo",
+                    crate::db::normalize_owner_key(&other_owner)
+                ),
+                owner_did: &other_owner,
+                ref_name: "refs/heads/main",
+                old_sha: "0".repeat(64).as_str(),
+                new_sha: "2".repeat(64).as_str(),
+                cid: Some("bafyother"),
+                irys_tx_id: "irys-other-repo-tx",
+                arweave_url: "https://arweave.net/other-tx",
+                node_did: "did:key:zNODE",
+            })
+            .await
+            .expect("seed other anchor");
 
         // The caller passes the FULL DID form in ?repo=. validate_repo_slug
         // accepts it, authorize_repo_read resolves it, and the handler MUST
@@ -980,6 +1023,12 @@ mod tests {
             "the SQL filter must use the stored short slug, not the full DID — \
              a false-empty page would break callers that pass ?repo=did:key:…/name. \
              body was: {body}"
+        );
+        assert!(
+            !body.contains("irys-other-repo-tx"),
+            "the scoped anchor filter must exclude other repos' anchors — \
+             a cross-repo leak would expose metadata of repos the caller \
+             did not authorize. body was: {body}"
         );
 
         let _ = repo;
