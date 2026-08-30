@@ -71,7 +71,7 @@ impl RepoStore {
     /// Derives its own lock pool from `pool`, so callers that only have the main
     /// pool (tests, `for_testing` sites in other modules) still get the
     /// `after_release` semantics `acquire_write` depends on.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-harness"))]
     pub fn for_testing(repos_dir: PathBuf, pool: PgPool) -> Self {
         Self::new(
             repos_dir,

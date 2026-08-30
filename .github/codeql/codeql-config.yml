@@ -1,0 +1,4 @@
+name: "Gitlawb CodeQL config"
+paths-ignore:
+  - "**/tests/**"
+  - "**/test_support/**"
