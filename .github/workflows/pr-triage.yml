@@ -91,9 +91,22 @@ jobs:
             // ambiguous and backtracks exponentially: on this workflow's pull_request_target
             // trigger f.patch is fork-controlled, so `#[test` followed by a long `_a` run is
             // a permissionless stall of the triage job.
-            const addsInlineTest = files.some(f =>
-              f.filename.endsWith(".rs") && f.patch &&
-              /^\+[ \t]*#\[[ \t]*(?:cfg[ \t]*\([ \t]*test[ \t]*\)|(?:::[ \t]*)?(?:[\w-]+[ \t]*::[ \t]*)*(?:r#)?(?:[A-Za-z0-9]+_)*test(?:_[A-Za-z0-9]+)*[ \t]*[\]\(])/m.test(f.patch));
+            // Rust allows whitespace, line breaks, and block comments between the
+            // attribute path and ] or (. Match those token separators on one added
+            // line, or a path-only added line followed by a ]/( line.
+            const TEST_ATTR_PATH =
+              "(?:cfg[ \\t]*\\([ \\t]*test[ \\t]*\\)|(?:::[ \\t]*)?(?:[\\w-]+[ \\t]*::[ \\t]*)*(?:r#)?(?:[A-Za-z0-9]+_)*test(?:_[A-Za-z0-9]+)*)";
+            const TEST_ATTR_SEP =
+              "(?:[ \\t\\n]|/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/)*";
+            const addsInlineTest = files.some(f => {
+              if (!f.filename.endsWith(".rs") || !f.patch) return false;
+              const p = f.patch;
+              return (
+                new RegExp("^\\+[ \\t]*#\\[[ \\t]*" + TEST_ATTR_PATH + TEST_ATTR_SEP + "[\\]\\(]", "m").test(p) ||
+                (new RegExp("^\\+[ \\t]*#\\[[ \\t]*" + TEST_ATTR_PATH + TEST_ATTR_SEP + "$", "m").test(p) &&
+                  /^\+[ \t]*[\]\(]/m.test(p))
+              );
+            });
             const touchedTests =
               names.some(n => n.includes("/tests/") || n.endsWith("_test.rs")) || addsInlineTest;
             if (changedRust && !touchedTests) want.add("needs-tests");
