@@ -428,8 +428,6 @@ impl TestNode {
         repo_id: &str,
         oids: &std::collections::HashMap<String, String>,
     ) -> std::collections::HashMap<String, String> {
-        use std::str::FromStr;
-
         let slug = owner_did.replace([':', '/'], "_");
         let bare = self.repos_dir.join(&slug).join(format!("{repo_name}.git"));
         let mut cids = std::collections::HashMap::new();
@@ -486,7 +484,7 @@ impl TestNode {
             let out = std::process::Command::new("git")
                 .args(args)
                 .current_dir(cwd)
-                .output()
+                .output() // allow-unbounded-git: test-harness fixture seeding only
                 .expect("git runs");
             assert!(
                 out.status.success(),

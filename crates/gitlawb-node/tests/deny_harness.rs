@@ -739,7 +739,7 @@ async fn anon_clone_excludes_withheld_subtree_blobs(pool: sqlx::PgPool) {
 
     assert!(
         !listing.contains(&secret_oid),
-        "withheld blob {secret_oid} must be absent from the served pack; listing:\n{listing}"
+        "withheld blob must be absent from the served pack; listing:\n{listing}"
     );
     assert!(
         listing.contains(&public_oid),
