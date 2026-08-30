@@ -795,9 +795,10 @@ fn reject_revision_shorthand(name: &str) -> Option<&'static str> {
 /// ref paths, revision-namespace shorthands (`heads/`, `tags/`, `remotes/`), and
 /// symbolic names that git would reinterpret at the sink.
 ///
-/// At diff/merge/worktree sinks, validated short names are passed as
-/// `refs/heads/{name}` so grammar-valid revision shorthands cannot retarget another
-/// ref namespace. Symbolic revision names (`HEAD`), option-shaped names (leading `-`),
+/// At diff/merge sinks, validated short names are passed as `refs/heads/{name}` so
+/// grammar-valid revision shorthands cannot retarget another ref namespace. The
+/// merge worktree checks out the local branch name instead, so merge commits
+/// advance refs/heads/{target}. Symbolic revision names (`HEAD`), option-shaped
 /// trailing dots, and other invalid forms are rejected by check-ref-format itself.
 /// Revision shorthands that pass the grammar check (`@`, `@{-1}`, pseudorefs) are
 /// rejected explicitly because git treats them as symbolic revisions when bare.
@@ -933,7 +934,6 @@ pub fn merge_branch(
     pr_title: &str,
 ) -> Result<String> {
     guard_refs(target_branch, source_branch)?;
-    let target_ref = local_branch_ref(target_branch);
     let source_ref = local_branch_ref(source_branch);
     let worktree_path = repo_path.join("_merge_worktree");
 
@@ -946,9 +946,10 @@ pub fn merge_branch(
         let _ = std::fs::remove_dir_all(&worktree_path);
     }
 
-    // Create worktree on target branch
+    // Check out the local target branch in the worktree. Passing refs/heads/{name}
+    // would detach HEAD, so a successful merge would not advance refs/heads/{target}.
     let wt = Command::new("git")
-        .args(["worktree", "add", "_merge_worktree", &target_ref])
+        .args(["worktree", "add", "_merge_worktree", target_branch])
         .current_dir(repo_path)
         .output()
         .context("failed to create worktree")?;
