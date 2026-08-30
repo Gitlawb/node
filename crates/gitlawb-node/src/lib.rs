@@ -585,14 +585,14 @@ pub async fn run() -> Result<()> {
     }
 
     // Spawn background gossip: announce to bootstrap peers, then ping known peers periodically
-    {
+    let gossip_handle = {
         let gossip_state = state.clone();
         let bootstrap_peers = config.bootstrap_peers.clone();
         let shutdown_rx = state.subscribe_shutdown();
         tokio::spawn(async move {
             gossip_task(gossip_state, bootstrap_peers, shutdown_rx).await;
-        });
-    }
+        })
+    };
 
     // Start multi-node sync worker if auto_sync is enabled
     if config.auto_sync {
@@ -684,6 +684,7 @@ pub async fn run() -> Result<()> {
     if let Some(h) = metrics_handle {
         h.abort();
     }
+    gossip_handle.abort();
     serve_result?;
     info!("clean exit");
     Ok(())
@@ -1127,11 +1128,15 @@ async fn gossip_task(
             _ = interval.tick() => {
                 let peers = match state.db.list_peers().await {
                     Ok(p) => p,
-                    Err(_) => continue,
+                    Err(e) => {
+                        warn!(err = %e, "gossip: list_peers failed; skipping ping round");
+                        continue;
+                    }
                 };
                 gossip_ping_round(
                     state.db.as_ref(),
                     client.as_ref(),
+                    &mut shutdown_rx,
                     &mut failed_once,
                     peers,
                 )
@@ -1150,6 +1155,7 @@ async fn gossip_task(
 async fn gossip_ping_round(
     db: &Db,
     client: &reqwest::Client,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     failed_once: &mut HashSet<String>,
     peers: Vec<db::PeerRecord>,
 ) {
@@ -1158,7 +1164,14 @@ async fn gossip_ping_round(
         failed_once.retain(|did| current_dids.contains(did.as_str()));
     }
     for peer in peers {
-        let ok = ping_peer_readiness(client, &peer.http_url).await;
+        if *shutdown_rx.borrow() {
+            return;
+        }
+        let ok = tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => return,
+            ready = ping_peer_readiness(client, &peer.http_url) => ready,
+        };
         match peer_ping_db_update(failed_once, &peer.did, ok) {
             Some(reachable) => {
                 if let Err(error) = db.mark_peer_ping(&peer.did, reachable).await {
@@ -3407,6 +3420,26 @@ fn load_or_create_keypair_with(
         // concurrently-publishing winner is handled by the retry in
         // boot_load_key).
         if key_path.exists() {
+            if let Some(parent) = key_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = std::fs::metadata(parent)
+                        .with_context(|| {
+                            format!("stat identity key directory {}", parent.display())
+                        })?
+                        .permissions()
+                        .mode()
+                        & 0o777;
+                    if mode & 0o022 != 0 {
+                        ensure_key_parent_dir_private(parent)?;
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    ensure_key_parent_dir_private(parent)?;
+                }
+            }
             match boot_load_key(key_path, recovery_allowed, seam.load_fault) {
                 BootLoad::Loaded(kp) => {
                     release_recovery_claims(key_path, &mut claims);
@@ -3669,9 +3702,11 @@ mod gossip_ssrf_tests {
         .unwrap();
 
         let mut failed_once = HashSet::from(["did:key:z6MkRemovedPeer".to_owned()]);
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         gossip_ping_round(
             state.db.as_ref(),
             &production_http_client(),
+            &mut shutdown_rx,
             &mut failed_once,
             state.db.list_peers().await.unwrap(),
         )
@@ -3700,6 +3735,7 @@ mod gossip_ssrf_tests {
         gossip_ping_round(
             state.db.as_ref(),
             &production_http_client(),
+            &mut shutdown_rx,
             &mut failed_once,
             state.db.list_peers().await.unwrap(),
         )
@@ -4906,6 +4942,43 @@ mod identity_key_tests {
             "the identity key parent directory must be owner-only after publish"
         );
         let loaded = super::load_existing_key(&key_path).expect("load");
+        assert_eq!(format!("{}", loaded.did()), format!("{}", kp.did()));
+    }
+
+    /// #194 (INV-23(a)): loading an existing key still repairs a writable parent.
+    #[test]
+    fn existing_key_load_repairs_writable_parent_dir_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let parent = root.path().join("keys");
+        std::fs::create_dir_all(&parent).expect("keys dir");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777))
+            .expect("world-writable parent");
+        let key_path = parent.join("identity.pem");
+        let kp = Keypair::generate();
+        std::fs::write(&key_path, kp.to_pem().expect("pem")).expect("write key");
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("key mode");
+
+        let loaded = load_or_create_keypair_with(
+            &key_path,
+            &|| {},
+            &|| {},
+            PublishFaults::NONE,
+            RecoverySeam::NONE,
+        )
+        .expect("load existing key under a writable parent must repair the parent dir");
+
+        let mode = std::fs::metadata(&parent)
+            .expect("parent exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "the identity key parent directory must be owner-only after load"
+        );
         assert_eq!(format!("{}", loaded.did()), format!("{}", kp.did()));
     }
 
