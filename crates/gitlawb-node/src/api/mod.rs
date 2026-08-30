@@ -313,15 +313,32 @@ mod authz_guard {
     ///      from the SDL AST, not from this scrape.
     #[test]
     fn every_graphql_mutation_has_its_gate() {
-        // (Rust snake name, schema field in camelCase, expected gate marker). The
-        // four are Bucket C signer-self (`did_matches(`); a repo-write would be
-        // Bucket A (`require_repo_owner(`). Same-named REST rows live in the guard
-        // above against `api/tasks.rs`.
-        let registered: &[(&str, &str, &str)] = &[
-            ("create_task", "createTask", "did_matches("),
-            ("claim_task", "claimTask", "did_matches("),
-            ("complete_task", "completeTask", "did_matches("),
-            ("fail_task", "failTask", "did_matches("),
+        // (Rust snake name, schema field in camelCase, expected gate markers). The
+        // four are Bucket C signer-self: `/graphql` uses optional_signature, so each
+        // resolver must call `require_signer(ctx)?` and bind the acting DID with
+        // `did_matches(`. A repo-write would be Bucket A (`require_repo_owner(`).
+        // Same-named REST rows live in the guard above against `api/tasks.rs`.
+        let registered: &[(&str, &str, &[&str])] = &[
+            (
+                "create_task",
+                "createTask",
+                &["require_signer(ctx)?", "did_matches("],
+            ),
+            (
+                "claim_task",
+                "claimTask",
+                &["require_signer(ctx)?", "did_matches("],
+            ),
+            (
+                "complete_task",
+                "completeTask",
+                &["require_signer(ctx)?", "did_matches("],
+            ),
+            (
+                "fail_task",
+                "failTask",
+                &["require_signer(ctx)?", "did_matches("],
+            ),
         ];
 
         // Completeness + hidden-mutation cross-check against the REAL schema (#219),
@@ -341,14 +358,16 @@ mod authz_guard {
         }
 
         // Marker present (source scrape; the vacuity limit, backstopped by the
-        // adversarial tests): each resolver body carries its bucket marker.
+        // adversarial tests): each resolver body carries every required gate marker.
         let masked = mask_comments(include_str!("../graphql/mutation.rs"));
-        for (snake, _, marker) in registered {
+        for (snake, _, markers) in registered {
             let body = resolver_body(&masked, snake);
-            assert!(
-                body.contains(marker),
-                "GraphQL mutation `{snake}` is missing its gate marker `{marker}`: gate removed"
-            );
+            for marker in *markers {
+                assert!(
+                    body.contains(marker),
+                    "GraphQL mutation `{snake}` is missing its gate marker `{marker}`: gate removed"
+                );
+            }
         }
     }
 
