@@ -665,11 +665,6 @@ const MIGRATIONS: &[Migration] = &[
             )"#,
             "CREATE INDEX IF NOT EXISTS idx_arweave_anchors_repo    ON arweave_anchors(repo)",
             "CREATE INDEX IF NOT EXISTS idx_arweave_anchors_new_sha ON arweave_anchors(new_sha)",
-            // ── Cert payload version (PR 3 of #26 split) ─────────────────────
-            // The ref-cert wire format is versioned so future fields can be
-            // added without breaking old clients (which ignore the field)
-            // or old servers (which default the column to 1).
-            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1",
             // ── Branch protection ────────────────────────────────────────────
             r#"CREATE TABLE IF NOT EXISTS protected_branches (
                 id         TEXT NOT NULL PRIMARY KEY,
@@ -7284,6 +7279,123 @@ mod ref_certificate_tests {
             "ff00",
             "the update arm touches only the continuation columns, so an in-progress \
              table walk is never rewound by a window rotation"
+        );
+    }
+
+    /// #26 Split PR 3 (INV-7): an existing node past v1 gets the
+    /// `ref_certificates.version` column from its OWN v28 entry, proven
+    /// by dropping the column plus its `schema_migrations` row and
+    /// re-running the real migration code. The migration is the only
+    /// place the column is added (v28 — the v1 bundle no longer
+    /// carries it), so a deletion of v28 must be visible as a missing
+    /// column on a v27 node.
+    ///
+    /// DEFAULT 1 is what makes an existing pre-v28 cert row read as
+    /// v1 without a backfill migration. An upgraded node reads
+    /// every legacy row as version 1 — the same payload the old
+    /// code signed — so a v1 verify path on a new client still
+    /// works against an upgraded database.
+    ///
+    /// MUTATION (RED): delete the v28 entry from `MIGRATIONS` and the
+    /// upgrade path leaves the column missing.
+    #[sqlx::test]
+    async fn v28_ref_certificates_version_applies_on_upgrade(pool: PgPool) {
+        async fn version_column_default(pool: &PgPool) -> Option<String> {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT column_default
+                   FROM information_schema.columns
+                  WHERE table_name = 'ref_certificates'
+                    AND column_name = 'version'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        async fn seed_pre_v28_cert(pool: &PgPool) {
+            // The pre-v28 schema has no `version` column, so a raw
+            // INSERT omitting it is the legacy code path. The node
+            // did not write a version value on v1..v27 — the field
+            // did not exist.
+            sqlx::query(
+                "INSERT INTO ref_certificates
+                 (id, repo_id, ref_name, old_sha, new_sha,
+                  pusher_did, node_did, signature, issued_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 ON CONFLICT (repo_id, ref_name) DO NOTHING",
+            )
+            .bind("legacy-cert-1")
+            .bind("legacy-repo")
+            .bind("refs/heads/main")
+            .bind("0000")
+            .bind("1111")
+            .bind("did:key:zLEGACYPUSHER")
+            .bind("did:key:zLEGACYNODE")
+            .bind("legacy-sig")
+            .bind("2026-07-01T10:00:00+00:00")
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        async fn legacy_row_reads_as_v1(pool: &PgPool) -> i32 {
+            // After v28 the legacy row (inserted without an explicit
+            // version) reads back as 1 via the DEFAULT, not as 0 or
+            // NULL — the latter would be a hard insert error under
+            // NOT NULL DEFAULT, but the read-back is the actual
+            // forward-compat property the v1 verify path relies on.
+            sqlx::query_scalar::<_, i32>(
+                "SELECT version FROM ref_certificates WHERE id = 'legacy-cert-1'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        // 1. Fresh chain: v28 has run, the column exists with DEFAULT 1.
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+        assert_eq!(
+            version_column_default(&pool).await.as_deref(),
+            Some("1"),
+            "v28 must declare the version column with DEFAULT 1"
+        );
+
+        // 2. Roll back to pre-v28: drop the column AND the v28 record.
+        //    The rollback is split into two statements because ALTER
+        //    TABLE ... DROP COLUMN and DELETE run in the same DDL
+        //    surface but the column drop must complete before the
+        //    next step reads schema_migrations.
+        sqlx::query("ALTER TABLE ref_certificates DROP COLUMN version")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 28")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            version_column_default(&pool).await.is_none(),
+            "precondition: column removed and its migration record removed"
+        );
+
+        // 3. Seed a legacy cert on the pre-v28 schema (no version
+        //    column ⇒ the INSERT must omit it).
+        seed_pre_v28_cert(&pool).await;
+
+        // 4. Re-run migrations: v28 must re-add the column with
+        //    DEFAULT 1, and the legacy row must read back as 1.
+        db.run_migrations().await.unwrap();
+        assert_eq!(
+            version_column_default(&pool).await.as_deref(),
+            Some("1"),
+            "v28 must recreate the version column with DEFAULT 1 on an upgrading node"
+        );
+        assert_eq!(
+            legacy_row_reads_as_v1(&pool).await,
+            1,
+            "a pre-v28 cert row reads as version 1 after v28 runs, so the \
+             v1 verify path on a new client still works against an upgraded database"
         );
     }
 

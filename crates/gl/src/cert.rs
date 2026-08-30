@@ -156,16 +156,24 @@ async fn cmd_show(
     let node_did = cert["node_did"].as_str().unwrap_or("?");
     let signature = cert["signature"].as_str().unwrap_or("?");
     let issued_at = cert["issued_at"].as_str().unwrap_or("?");
-    // #26 Split PR 3: read the wire-format version. Defaults to 1
-    // for an old server that does not emit the field, so this
-    // client is forward-compatible with both v1 (pre-versioning)
-    // and v2+ (future) certs. An unknown version is reported and
-    // verification refuses rather than guessing the payload shape.
-    let version: u32 = cert
-        .get("version")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32)
-        .unwrap_or(1);
+    // #26 Split PR 3: read the wire-format version. A MISSING key
+    // selects legacy v1 (an old server that predates the field).
+    // A PRESENT value must be a JSON integer that fits in u32 and
+    // names a version this client supports — otherwise the response
+    // declares a format we cannot represent and we refuse to verify
+    // rather than guess the payload shape. Reviewer 2 finding:
+    // collapsing `null`, a string, a float, or an overflow integer
+    // onto v1 would let a well-signed v1 signature pass `--verify`
+    // against a server that explicitly said "version 2 (or 99, or
+    // 4294967297)" — that is the exact mismatch the field exists
+    // to prevent. parse_cert_version is the load-bearing parser
+    // that distinguishes missing-key (legacy v1) from invalid-value
+    // (unsupported).
+    let parsed_version = parse_cert_version(cert.get("version"));
+    let version_display: String = match &parsed_version {
+        Ok(v) => v.to_string(),
+        Err(reason) => format!("unsupported ({reason})"),
+    };
 
     println!("Ref Certificate: {cert_id}");
     println!("  Ref:       {ref_name}");
@@ -174,7 +182,7 @@ async fn cmd_show(
     println!("  Pusher:    {pusher}");
     println!("  Node DID:  {node_did}");
     println!("  Issued at: {issued_at}");
-    println!("  Version:   {version}");
+    println!("  Version:   {version_display}");
     println!("  Signature: {signature}");
     println!();
 
@@ -184,22 +192,25 @@ async fn cmd_show(
     // This proves the cert is internally authentic — signed by the key it
     // names; the node-DID comparison below covers *which* node that is.
     let repo_id = cert["repo_id"].as_str().unwrap_or("");
-    let verdict = if version == 1 {
-        verify_signature(
+    let verdict = match parsed_version {
+        // v1 is the only version this client verifies. The v1
+        // signed payload is the 7-field canonical form with no
+        // `version` key — see gitlawb-node/src/cert.rs. A future
+        // v2+ cert has a different signed payload shape (the
+        // version field becomes part of the JSON and the field
+        // order changes), so a v2+ cert from a server this client
+        // does not know about must NOT be silently verified as v1.
+        // Reviewer 2: refuse rather than guess; the client and
+        // server must agree on the version.
+        Ok(1) => verify_signature(
             repo_id, ref_name, old_sha, new_sha, pusher, node_did, issued_at, signature,
-        )
-    } else {
-        // A future v2+ cert has a different signed payload shape
-        // (the version field is part of the JSON, and the field
-        // order is different). Refuse rather than guess — the
-        // client and server must agree on the version, and PR 3
-        // ships only v1 verification. Pin a regression test that
-        // this branch returns Err, not Ok, for an unknown
-        // version, so a future client that supports v2 cannot
-        // silently treat a v1 cert as v2.
-        Err(format!(
-            "this client supports cert version 1 only; server returned {version}; upgrade the client to verify"
-        ))
+        ),
+        Ok(v) => Err(format!(
+            "this client supports cert version 1 only; server returned {v}; upgrade the client to verify"
+        )),
+        Err(reason) => Err(format!(
+            "cert declared a version this client cannot represent ({reason}); refusing to verify"
+        )),
     };
 
     println!("Signature verification:");
@@ -308,6 +319,65 @@ fn verify_signature(
 
     gitlawb_core::identity::verify(&verifying_key, &payload_bytes, &sig_bytes)
         .map_err(|_| "Ed25519 signature does not match the signed payload".to_string())
+}
+
+/// Parse the wire-format `version` field of a certificate response.
+///
+/// Semantics (Reviewer 2):
+///   - MISSING key (`None`) → `Ok(1)`. An old server predates the field, so
+///     the cert is by definition the v1 (pre-versioning) shape; the v1
+///     verify path is the only path that can possibly match the bytes.
+///   - PRESENT key must be a JSON integer that fits losslessly in `u32`
+///     and equals a version this client supports. `null`, a string,
+///     a float, an overflow integer, or any version other than 1 all
+///     yield `Err`. Collapsing any of these onto v1 would let a
+///     well-signed v1 signature pass `--verify` against a response
+///     that explicitly declared a format this client cannot represent
+///     — which is exactly the mismatch the version field exists to
+///     prevent.
+///
+/// The supported-version set is hard-coded to `{1}` because PR 3 ships
+/// only v1 verification; bump this set (and the verdict branch) when
+/// v2 verification lands.
+fn parse_cert_version(value: Option<&Value>) -> Result<u32, String> {
+    let v = match value {
+        None => return Ok(1),
+        Some(v) => v,
+    };
+
+    // serde_json::Value::as_u64 rejects strings, floats, booleans,
+    // nulls, arrays, and objects — but it silently truncates floats
+    // that are whole numbers (e.g. 2.0 → 2). We must reject floats
+    // explicitly so a server cannot smuggle a v2 cert through the
+    // float shape.
+    if v.is_f64() {
+        return Err(format!(
+            "version is a JSON number with a fractional part ({v}); expected an integer"
+        ));
+    }
+
+    let n = v.as_u64().ok_or_else(|| {
+        // null / string / bool / array / object — anything that is
+        // not a JSON integer.
+        format!("version is {v}; expected a JSON integer")
+    })?;
+
+    // Lossy narrowing: refuse anything that does not fit in u32.
+    // u32::MAX is 4_294_967_295; serde_json only goes up to u64.
+    if n > u32::MAX as u64 {
+        return Err(format!(
+            "version {n} does not fit in u32 (max {})",
+            u32::MAX
+        ));
+    }
+
+    let n = n as u32;
+    if n != 1 {
+        return Err(format!(
+            "this client supports cert version 1 only; server returned {n}"
+        ));
+    }
+    Ok(1)
 }
 
 async fn resolve_cert_id(client: &NodeClient, owner: &str, name: &str, id: &str) -> Result<String> {
@@ -426,7 +496,12 @@ mod tests {
     /// #26 Split PR 3: a missing `version` field on a cert defaults
     /// to 1, so an old server's response is forward-compatible with
     /// a new client. The v1 verify path is taken, and a
-    /// well-signed v1 cert verifies successfully.
+    /// well-signed v1 cert round-trips through `verify_signature`.
+    ///
+    /// Reviewer 1 finding: the previous shape only parsed the field
+    /// and never called `verify_signature`, so the test could not
+    /// fail if the verdict branch was wired to the wrong path. This
+    /// version signs and verifies the full round-trip.
     #[test]
     fn missing_version_defaults_to_1_and_verifies() {
         let kp = gitlawb_core::identity::Keypair::generate();
@@ -451,28 +526,216 @@ mod tests {
             "new_sha":    "a".repeat(40),
             "pusher_did": "did:key:z6MkPusher",
             "node_did":   node_did,
-            "signature":  sig,
+            "signature":  sig.clone(),
             "issued_at":  "2026-07-22T00:00:00+00:00",
             // no `version` field
         });
-        let version: u32 = cert_json
-            .get("version")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
-            .unwrap_or(1);
-        assert_eq!(version, 1, "missing version defaults to 1");
+
+        // Forward-compat: the parse yields v1 (the only version this
+        // client verifies), and the verdict arm matching Ok(1) feeds
+        // the v1 payload through verify_signature end to end.
+        assert_eq!(parse_cert_version(cert_json.get("version")).unwrap(), 1);
+        let verdict = verify_signature(
+            "repo-1",
+            "refs/heads/main",
+            &"0".repeat(40),
+            &"a".repeat(40),
+            "did:key:z6MkPusher",
+            &node_did,
+            "2026-07-22T00:00:00+00:00",
+            &sig,
+        );
+        assert!(verdict.is_ok(), "missing version must take the v1 verify path: {verdict:?}");
     }
 
     /// #26 Split PR 3: an explicit `version: 1` on a cert is the v1
     /// verify path. A v1 cert with an explicit version verifies the
-    /// same as a v1 cert without one.
+    /// same as a v1 cert without one — round-trip through
+    /// `verify_signature`.
     #[test]
     fn explicit_version_1_takes_v1_path() {
-        let version: u32 = serde_json::json!({ "version": 1 })
-            .get("version")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
-            .unwrap_or(1);
-        assert_eq!(version, 1);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did().as_str().to_string();
+        let payload = serde_json::json!({
+            "repo_id": "repo-1",
+            "ref":     "refs/heads/main",
+            "old":     "0".repeat(40),
+            "new":     "a".repeat(40),
+            "pusher":  "did:key:z6MkPusher",
+            "node":    node_did,
+            "ts":      "2026-07-22T00:00:00+00:00",
+        });
+        let sig = kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
+
+        // Simulate a v1 cert with an explicit `version: 1` field.
+        let cert_json = serde_json::json!({
+            "id":         "test-id",
+            "repo_id":    "repo-1",
+            "ref_name":   "refs/heads/main",
+            "old_sha":    "0".repeat(40),
+            "new_sha":    "a".repeat(40),
+            "pusher_did": "did:key:z6MkPusher",
+            "node_did":   node_did,
+            "signature":  sig.clone(),
+            "issued_at":  "2026-07-22T00:00:00+00:00",
+            "version":    1,
+        });
+
+        // The parse arms the Ok(1) verdict branch, which calls
+        // verify_signature on the v1 payload. A signature mismatch
+        // here would mean the verdict branch was wired to the
+        // wrong path or the payload drifted.
+        assert_eq!(parse_cert_version(cert_json.get("version")).unwrap(), 1);
+        let verdict = verify_signature(
+            "repo-1",
+            "refs/heads/main",
+            &"0".repeat(40),
+            &"a".repeat(40),
+            "did:key:z6MkPusher",
+            &node_did,
+            "2026-07-22T00:00:00+00:00",
+            &sig,
+        );
+        assert!(verdict.is_ok(), "explicit version: 1 must take the v1 verify path: {verdict:?}");
+    }
+
+    /// #26 Split PR 3 + Reviewer 2: parse_cert_version is the
+    /// load-bearing gate that distinguishes a missing-key (legacy
+    /// server) from a present-but-malformed value. The four cases
+    /// below pin every cell of that truth table; collapsing any
+    /// pair would let a server advertise "version 2" (or 99, or
+    /// 4294967297, or "two") while the client runs the v1
+    /// signature path on a different signed payload — a hostile
+    /// misconfiguration that `--verify` must not silently accept.
+    #[test]
+    fn parse_cert_version_truth_table() {
+        // MISSING key → legacy v1 (the v1 path is the only one that
+        // could match pre-versioning bytes).
+        assert_eq!(
+            parse_cert_version(None).unwrap(),
+            1,
+            "a missing version field is the legacy v1 path"
+        );
+
+        // Explicit 1 → v1.
+        assert_eq!(
+            parse_cert_version(Some(&serde_json::json!(1))).unwrap(),
+            1,
+            "explicit version 1 is the v1 path"
+        );
+
+        // Explicit 2 → Err, NOT Ok(1). Reviewer 2: a v1 signature
+        // must not verify against a server that said "version 2".
+        assert!(
+            parse_cert_version(Some(&serde_json::json!(2))).is_err(),
+            "explicit version 2 must not collapse to v1"
+        );
+
+        // u32 overflow (2^32 + 1) → Err, NOT Ok(1). The previous
+        // `.map(|v| v as u32)` silently truncated this to 1.
+        let overflow = serde_json::json!(u64::from(u32::MAX) + 1);
+        assert!(
+            parse_cert_version(Some(&overflow)).is_err(),
+            "a version that overflows u32 must not truncate to 1"
+        );
+
+        // Non-numeric: a string, a float, null, bool — every shape
+        // that is not a JSON integer is rejected. None of these
+        // may collapse to v1.
+        for bad in [
+            serde_json::json!("two"),
+            serde_json::json!(2.0),      // serde_json::Value::is_f64 is true for this
+            serde_json::json!(2.5),      // obviously fractional
+            serde_json::json!(true),
+            serde_json::json!(null),
+            serde_json::json!([2]),
+            serde_json::json!({"v": 2}),
+        ] {
+            assert!(
+                parse_cert_version(Some(&bad)).is_err(),
+                "non-integer version {bad} must not collapse to v1"
+            );
+        }
+    }
+
+    /// #26 Split PR 3: a `version: 2` cert reaches the `Ok(v)` arm of
+    /// the verdict match in `cmd_show`, which must return Err — the
+    /// v2 payload shape is not the bytes this client signs over, so a
+    /// v1 verify call on it would silently pass any well-signed v1
+    /// signature regardless of the version mismatch. Reviewer 1: pin
+    /// the verdict branch end to end, not just the parser.
+    ///
+    /// We exercise the same match arm `cmd_show` uses (Ok(v) where
+    /// v != 1) by feeding a known-bad payload through it. The Ok(1)
+    /// and Err arms are pinned by `parse_cert_version_truth_table`
+    /// and the round-trip tests above.
+    #[test]
+    fn verdict_branch_rejects_v2_even_with_valid_v1_signature() {
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did().as_str().to_string();
+
+        // Sign a v1-shaped payload. This signature is VALID against
+        // v1 bytes — the point of this test is that the verdict
+        // must NOT verify it as v1 just because the signature would
+        // match. The version mismatch is the disqualifier.
+        let payload = serde_json::json!({
+            "repo_id": "repo-1",
+            "ref":     "refs/heads/main",
+            "old":     "0".repeat(40),
+            "new":     "a".repeat(40),
+            "pusher":  "did:key:z6MkPusher",
+            "node":    node_did,
+            "ts":      "2026-07-22T00:00:00+00:00",
+        });
+        let sig = kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
+
+        // Build the cert JSON the way an HTTP client would receive it:
+        // an explicit version: 2. The signature is valid for v1 bytes
+        // but the response says "this is v2".
+        let cert_json = serde_json::json!({
+            "id":         "test-id",
+            "repo_id":    "repo-1",
+            "ref_name":   "refs/heads/main",
+            "old_sha":    "0".repeat(40),
+            "new_sha":    "a".repeat(40),
+            "pusher_did": "did:key:z6MkPusher",
+            "node_did":   node_did,
+            "signature":  sig,
+            "issued_at":  "2026-07-22T00:00:00+00:00",
+            "version":    2,
+        });
+
+        let parsed = parse_cert_version(cert_json.get("version"));
+        // The match in cmd_show has three arms: Ok(1) → verify;
+        // Ok(v) → Err; Err(reason) → Err. v2 is Ok(2), so it lands
+        // in the Ok(v) arm and is rejected with a version-mismatch
+        // reason — the v1 verify path is never called.
+        let verdict = match parsed {
+            Ok(1) => verify_signature(
+                "repo-1",
+                "refs/heads/main",
+                &"0".repeat(40),
+                &"a".repeat(40),
+                "did:key:z6MkPusher",
+                &node_did,
+                "2026-07-22T00:00:00+00:00",
+                &cert_json["signature"].as_str().unwrap(),
+            ),
+            Ok(v) => Err(format!(
+                "this client supports cert version 1 only; server returned {v}; upgrade the client to verify"
+            )),
+            Err(reason) => Err(format!(
+                "cert declared a version this client cannot represent ({reason}); refusing to verify"
+            )),
+        };
+        assert!(
+            verdict.is_err(),
+            "version: 2 must produce Err even when the v1 signature would otherwise verify: {verdict:?}"
+        );
+        let reason = verdict.unwrap_err();
+        assert!(
+            reason.contains("version 1 only") && reason.contains("returned 2"),
+            "the rejection reason must name the version mismatch, not a generic 'invalid signature': {reason}"
+        );
     }
 }
