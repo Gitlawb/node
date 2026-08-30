@@ -910,6 +910,81 @@ mod tests {
         let _ = repo;
     }
 
+    /// #121 R3: the SQL filter must use the canonical stored slug, not the
+    /// user-supplied `?repo=` string. Anchor rows are stored as
+    /// `{normalize_owner_key(owner_did)}/{name}` (the short form). Authz
+    /// passes for the full-DID form, but a literal `WHERE repo=$1` against
+    /// the full DID would match zero rows and return a false empty page,
+    /// breaking callers that legitimately use the full `did:key:…/name`
+    /// form in `?repo=`. RED before the fix: handler built the filter from
+    /// the raw `?repo=` string, so this query returned `anchors: []`.
+    #[sqlx::test]
+    async fn signed_scoped_anchors_full_did_form_matches_stored_slug_through_build_router(
+        pool: PgPool,
+    ) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let state = test_state(pool).await;
+
+        let mut repo = seed_repo_inline(&owner_did, "scoped-did-form");
+        repo.is_public = false;
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        state
+            .db
+            .record_arweave_anchor(&crate::db::RecordAnchorInput {
+                repo: &format!("{short}/scoped-did-form"),
+                owner_did: &owner_did,
+                ref_name: "refs/heads/main",
+                old_sha: "0".repeat(64).as_str(),
+                new_sha: "1".repeat(64).as_str(),
+                cid: Some("bafytest"),
+                irys_tx_id: "irys-did-form-tx",
+                arweave_url: "https://arweave.net/did-form-tx",
+                node_did: "did:key:zNODE",
+            })
+            .await
+            .expect("seed anchor");
+
+        // The caller passes the FULL DID form in ?repo=. validate_repo_slug
+        // accepts it, authorize_repo_read resolves it, and the handler MUST
+        // then translate to the canonical stored slug (short form) before
+        // running the SQL — otherwise this returns 200 with anchors: [].
+        let path = format!("/api/v1/arweave/anchors?repo={owner_did}/scoped-did-form");
+        let signed = sign_request(&kp, "GET", &path, b"");
+        let req = Request::builder()
+            .method("GET")
+            .uri(&path)
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::empty())
+            .unwrap();
+
+        let router = build_router(state);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "authz passed via the full DID form, so the response must be 200"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains("irys-did-form-tx"),
+            "the SQL filter must use the stored short slug, not the full DID — \
+             a false-empty page would break callers that pass ?repo=did:key:…/name. \
+             body was: {body}"
+        );
+
+        let _ = repo;
+    }
+
     /// Signed non-reader on a private repo → 404, anchor metadata MUST NOT
     /// leak. This is the test that catches the "auth-but-no-authz" bug if
     /// the gate is moved after the SQL query or removed entirely. The 404

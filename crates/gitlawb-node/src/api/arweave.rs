@@ -6,6 +6,7 @@ use axum::{
 };
 use serde::Deserialize;
 
+use crate::db::normalize_owner_key;
 use crate::error::{AppError, Result};
 use crate::state::AppState;
 
@@ -59,12 +60,19 @@ pub async fn list_anchors(
         };
         // Read gate. Returns `RepoNotFound` (→ 404) indistinguishably for
         // missing repos, quarantined mirrors, and signed non-readers.
-        crate::api::authorize_repo_read(&state, owner, name, caller, "/").await?;
-        // Reuse the user-supplied slug string for the SQL filter, since the
-        // gate just verified it resolves to a readable repository.
+        let (record, _rules) =
+            crate::api::authorize_repo_read(&state, owner, name, caller, "/").await?;
+        // Build the SQL filter from the canonical stored slug, NOT from the
+        // user-supplied `?repo=` string. Anchor rows are written as
+        // `{normalize_owner_key(owner_did)}/{name}` (the short form), so a
+        // request that passes authz with the full `did:key:…/name` form would
+        // match zero rows and return a false empty page. The gate already
+        // verified the repo is readable; `record.owner_did` is the canonical
+        // identity and `record.name` is the stored name.
+        let stored_slug = format!("{}/{}", normalize_owner_key(&record.owner_did), record.name);
         state
             .db
-            .list_arweave_anchors(Some(&format!("{owner}/{name}")), limit)
+            .list_arweave_anchors(Some(&stored_slug), limit)
             .await?
     } else {
         // No scope → no repo-read decision. Auth-only.
