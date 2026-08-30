@@ -344,8 +344,11 @@ pub async fn close_issue(
         // dir instead of publishing into the live repo path — an unlocked
         // pre-check must not delete or swap the directory under a concurrent
         // guarded write on the same path.
+        // Pre-lock authorization only: bound with the read acquire budget, not the
+        // under-lock transfer timeout a guarded write may hold for minutes.
+        let snapshot_bound_secs = state.config.git_acquire_timeout_secs;
         let snapshot = tokio::time::timeout(
-            std::time::Duration::from_secs(state.config.lock_held_transfer_timeout_secs),
+            std::time::Duration::from_secs(snapshot_bound_secs),
             state
                 .repo_store
                 .read_snapshot(&record.owner_did, &record.name),
@@ -354,8 +357,8 @@ pub async fn close_issue(
         .map_err(|_elapsed| {
             tracing::warn!(
                 repo = %repo,
-                bound_secs = state.config.lock_held_transfer_timeout_secs,
-                "close_issue snapshot exceeded the transfer bound — shedding as a retryable refusal"
+                bound_secs = snapshot_bound_secs,
+                "close_issue snapshot exceeded the read acquire bound — shedding as a retryable refusal"
             );
             AppError::RepoUnavailable
         })??;

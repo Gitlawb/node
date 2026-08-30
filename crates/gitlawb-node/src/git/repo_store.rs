@@ -1454,14 +1454,18 @@ impl RepoWriteGuard {
         if let Some(gate) = self.test_pre_unlock_gate.clone() {
             gate.notified().await;
         }
-        let unlock = match self.conn.as_mut() {
-            Some(conn) => Some(
+        let unlock = if let Some(conn) = self.conn.as_mut() {
+            bounded_transfer(
+                "advisory-unlock",
+                &self.repo_name,
+                self.lock_held_transfer_timeout,
                 sqlx::query_as::<_, (bool,)>("SELECT pg_advisory_unlock($1)")
                     .bind(lock_key)
-                    .fetch_one(&mut **conn)
-                    .await,
-            ),
-            None => None,
+                    .fetch_one(&mut **conn),
+            )
+            .await
+        } else {
+            None
         };
         match unlock {
             Some(Ok((true,))) => {
@@ -1481,6 +1485,14 @@ impl RepoWriteGuard {
                     lock_key,
                     err = %e,
                     "advisory unlock failed — closing the session so the lock cannot outlive it"
+                );
+            }
+            None if self.conn.is_some() => {
+                warn!(
+                    repo = %self.repo_name,
+                    lock_key,
+                    bound_secs = self.lock_held_transfer_timeout.as_secs(),
+                    "advisory unlock exceeded its bound — closing the session so the lock-pool slot is not held longer"
                 );
             }
             None => {}

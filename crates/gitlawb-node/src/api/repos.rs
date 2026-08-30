@@ -2583,12 +2583,15 @@ async fn publish_durability_confirmed(
             );
         }
         if start.elapsed() >= wait {
-            // No outcome within the release-side transfer bound plus slack: the
-            // handler was dropped mid-release after a successful receive-pack, or
-            // release is stuck past its own deadline. The tail is only spawned on
-            // push success, so local-disk replication work may proceed. Explicit
-            // non-Released outcomes are handled above.
-            return true;
+            // No outcome within the release-side transfer bound plus slack. Fail
+            // closed when the slot is still empty; an abandoned handler installs
+            // UploadUnknowable via PublishDurabilitySlot::drop so the tail can
+            // proceed on local disk without waiting out the full bound.
+            return matches!(
+                *slot.lock().await,
+                Some(crate::git::repo_store::ReleaseOutcome::Released)
+                    | Some(crate::git::repo_store::ReleaseOutcome::UploadUnknowable)
+            );
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
@@ -3746,13 +3749,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_durability_confirmed_proceeds_when_release_never_records() {
+    async fn publish_durability_confirmed_fails_closed_when_release_never_records() {
         let slot = Arc::new(tokio::sync::Mutex::new(None));
         let confirmed =
             publish_durability_confirmed(&Some(slot), std::time::Duration::from_millis(30)).await;
         assert!(
-            confirmed,
-            "an abandoned handler leaves the slot pending; after the bounded wait the tail may proceed on local disk"
+            !confirmed,
+            "an empty slot after the bounded wait must not admit the tail; only an installed \
+             Released or UploadUnknowable outcome may"
         );
     }
 
