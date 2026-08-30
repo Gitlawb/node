@@ -206,6 +206,136 @@ mod tests {
         }
     }
 
+    /// `list_refs` must resolve both owner-DID forms to the SAME refs.
+    /// `branch_cids.repo` is written as `{normalize_owner_key(owner_did)}/{name}`
+    /// (`api/repos.rs:2643` -> `:2754`), and `get_repo` resolves `did:key:zX` and
+    /// bare `zX` to one repo, so both path forms authorize. Reading the table with
+    /// the raw path segments instead of the canonical slug returns an empty page
+    /// with a 200, which is a denial rendered as success. The second repo pins the
+    /// other direction: the filter must not widen to another owner's refs.
+    #[sqlx::test]
+    async fn list_refs_resolves_both_owner_did_forms_to_the_canonical_slug(pool: PgPool) {
+        let owner_did = "did:key:zREFSCANON";
+        let other_did = "did:key:zREFSOTHER";
+        let state = test_state(pool).await;
+
+        for did in [owner_did, other_did] {
+            let mut repo = seed_repo(did, "refs-canon");
+            repo.is_public = true;
+            // Same repo name under two owners, so the name-derived disk_path
+            // from the helper would collide on its unique constraint.
+            repo.disk_path = format!("/tmp/refs-canon-{}", crate::db::normalize_owner_key(did));
+            state.db.create_repo(&repo).await.expect("seed repo");
+            // Exactly the slug the production push path writes.
+            let slug = format!("{}/{}", crate::db::normalize_owner_key(did), "refs-canon");
+            let cid = format!("bafy{}", crate::db::normalize_owner_key(did));
+            state
+                .db
+                .upsert_branch_cid(
+                    &slug,
+                    "refs/heads/main",
+                    &"1".repeat(64),
+                    &cid,
+                    "did:key:zNODE",
+                )
+                .await
+                .expect("seed branch cid");
+        }
+
+        async fn body_for(state: &crate::state::AppState, owner: &str) -> String {
+            let router = crate::server::build_router(state.clone());
+            let resp = router
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(format!("/api/v1/repos/{owner}/refs-canon/refs"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "both owner-DID forms resolve to the same repo, so both must authorize"
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
+        for owner in ["zREFSCANON", "did:key:zREFSCANON"] {
+            let body = body_for(&state, owner).await;
+            assert!(
+                body.contains("bafyzREFSCANON"),
+                "?owner={owner} must return the ref written under the canonical slug, \
+                 not an empty page with a 200. body was: {body}"
+            );
+            assert!(
+                !body.contains("bafyzREFSOTHER"),
+                "?owner={owner} must not return another owner's refs. body was: {body}"
+            );
+        }
+    }
+
+    /// The read gate on `list_refs`, driven in the deny direction. Without this
+    /// the slug regression above proves only that the query key is right: every
+    /// repo it seeds is public, so deleting `authorize_repo_read` outright leaves
+    /// it green. A private repo must answer an anonymous caller with the same 404
+    /// a missing repo gets, and must not put a CID in the body on the way out.
+    #[sqlx::test]
+    async fn list_refs_denies_an_anonymous_caller_on_a_private_repo(pool: PgPool) {
+        let owner_did = "did:key:zREFSPRIV";
+        let state = test_state(pool).await;
+
+        let mut repo = seed_repo(owner_did, "refs-private");
+        repo.is_public = false;
+        state.db.create_repo(&repo).await.expect("seed repo");
+        state
+            .db
+            .upsert_branch_cid(
+                &format!(
+                    "{}/{}",
+                    crate::db::normalize_owner_key(owner_did),
+                    "refs-private"
+                ),
+                "refs/heads/main",
+                &"1".repeat(64),
+                "bafyzREFSPRIVSECRET",
+                "did:key:zNODE",
+            )
+            .await
+            .expect("seed branch cid");
+
+        for owner in ["zREFSPRIV", "did:key:zREFSPRIV"] {
+            let router = crate::server::build_router(state.clone());
+            let resp = router
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(format!("/api/v1/repos/{owner}/refs-private/refs"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "anonymous read of a private repo must 404, not disclose it (owner form {owner})"
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&bytes);
+            assert!(
+                !body.contains("bafyzREFSPRIVSECRET"),
+                "the deny body must not carry a pinned CID. body was: {body}"
+            );
+        }
+    }
+
     /// Proves the harness end to end: a migrated DB, a seeded repo, and the
     /// owner gate on an ALREADY-gated endpoint (`PUT /visibility`, gated by
     /// `require_owner`). Non-owner is rejected; owner succeeds. Mounts the

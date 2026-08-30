@@ -2886,10 +2886,21 @@ pub async fn list_refs(
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
-    let (_record, _rules) =
+    let (record, _rules) =
         crate::api::authorize_repo_read(&state, &owner, &repo, caller, "/").await?;
 
-    let repo_slug = format!("{owner}/{repo}");
+    // Build the filter from the canonical stored slug, NOT from the raw path
+    // segments. `branch_cids.repo` is written as
+    // `{normalize_owner_key(owner_did)}/{name}` (the push path builds the same
+    // slug before calling `upsert_branch_cid`), and
+    // `get_repo` resolves both `did:key:zX` and bare `zX` to the same record, so
+    // a request in the full-DID form authorizes and then matches zero rows,
+    // returning an empty page with a 200.
+    let repo_slug = format!(
+        "{}/{}",
+        crate::db::normalize_owner_key(&record.owner_did),
+        record.name
+    );
     let refs = state.db.list_branch_cids(&repo_slug).await?;
 
     Ok(Json(
