@@ -27,17 +27,19 @@ use crate::state::AppState;
 ///
 /// #26 Split PR 1 P1-B: the live handler routes through this
 /// function (the upsert), NOT through
-/// [`issue_ref_certificate_idempotent`] (DO NOTHING). The
-/// idempotent variant is reserved for the recovery drain. Both
-/// paths use the same deterministic `cert_id` so a re-pass is
+/// [`issue_ref_certificate_idempotent`] (DO NOTHING). After the
+/// reviewer-1 round-2 fix, the recovery drain also routes through
+/// this function (P1: refresh a stale cert), so both paths use the
+/// same deterministic `cert_id` and the same upsert. A re-pass is
 /// always safe:
 ///
 /// - Live handler → live upsert: re-push updates the row, preserves
 ///   the original `id`. The contract pinned by
 ///   `insert_ref_certificate_upserts_on_repo_ref` is restored.
 /// - Live handler → recovery: live's `ON CONFLICT (id) DO UPDATE`
-///   preserves the original `id`; the recovery's
-///   `ON CONFLICT (repo_id, ref_name) DO NOTHING` is a no-op.
+///   preserves the original `id`; the recovery's same upsert is
+///   a no-op for an equal-`issued_at` re-run and a refresh for a
+///   strictly-newer one.
 /// - Recovery → live handler: the recovery wrote a row with the
 ///   deterministic `id`; the live upsert (which preserves `id` and
 ///   only updates other fields when `issued_at` is strictly newer)
@@ -65,7 +67,7 @@ pub async fn issue_ref_certificate(
     state.db.insert_ref_certificate(&cert).await
 }
 
-/// #26 Split PR 1 — idempotent variant used by the recovery drain.
+/// #26 Split PR 1 — idempotent variant.
 ///
 /// `cert_id` is the deterministic id derived from
 /// `(request_id, ref_name)` so a recovery re-pass against the same
@@ -74,7 +76,13 @@ pub async fn issue_ref_certificate(
 /// `insert_ref_certificate_idempotent` helper), so the function
 /// returns `None` if a live-path cert already exists for the
 /// `(repo_id, ref_name)` pair, and `Some(cert)` if it wrote a new
-/// one. Either way, exactly one cert row exists for the transition.
+/// one.
+///
+/// Retained for any future caller that wants DO-NOTHING semantics
+/// (e.g. an explicit "never overwrite" handler); the live and
+/// recovery paths both use [`issue_ref_certificate`] (the upsert)
+/// after the P1 fix in #26 Split 1 round 2.
+#[allow(dead_code)]
 pub async fn issue_ref_certificate_idempotent(
     state: &AppState,
     repo_id: &str,

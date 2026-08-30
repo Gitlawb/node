@@ -2666,6 +2666,18 @@ impl Db {
         first_ref_name: &str,
     ) -> Result<Vec<PendingRefTransition>> {
         let now = Utc::now().to_rfc3339();
+        // P2 (reviewer-2 round 2): wrap the multi-row insert in a
+        // transaction. A mid-loop failure used to return the error
+        // and leave the rows already inserted as `prepared`, which
+        // the receive-pack handler then refused to call. The
+        // stranded `prepared` rows were eventually reaped by the
+        // startup reconcile, but the partial-success state was
+        // observable in the DB and could mask a partial push
+        // intent. The transaction rolls the prior inserts back
+        // when any single row fails, so the caller either sees a
+        // complete `prepared` set for the request or sees none of
+        // them and the handler can safely return 503.
+        let mut tx = self.pool.begin().await?;
         let mut out = Vec::with_capacity(ref_updates.len());
         for update in ref_updates {
             let id = deterministic_id(&[
@@ -2697,7 +2709,7 @@ impl Db {
             .bind(pending_state::PREPARED)
             .bind(&now)
             .bind(first_ref_name)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
             out.push(PendingRefTransition {
                 id,
@@ -2718,6 +2730,7 @@ impl Db {
                 first_ref_name: first_ref_name.to_string(),
             });
         }
+        tx.commit().await?;
         Ok(out)
     }
 
@@ -9384,8 +9397,8 @@ mod pending_ref_transition_tests {
     //! line under test turns the named assertion red.
 
     use super::{
-        anchor_job_id_for, pending_state, push_event_id_for, ref_cert_id_for, AnchorJob, Db,
-        PendingRefTransition,
+        anchor_job_id_for, deterministic_id, pending_state, push_event_id_for, ref_cert_id_for,
+        AnchorJob, Db, PendingRefTransition, RepoRecord,
     };
     use crate::api::repos::RefUpdate;
     use chrono::Utc;
@@ -9724,6 +9737,122 @@ mod pending_ref_transition_tests {
                 .unwrap(),
             0
         );
+    }
+
+    /// P2 (reviewer-2 round 2): the multi-row `insert_pending_ref_transitions`
+    /// must be atomic. A mid-loop failure (here simulated by pre-seeding a
+    /// row whose PK collides with the second ref's deterministic id) must
+    /// roll the first row back; otherwise the handler can return 503 after
+    /// some `prepared` rows are already on disk, leaving the request in
+    /// an inconsistent state for the startup reconcile to clean up.
+    #[sqlx::test]
+    async fn insert_pending_ref_transitions_rolls_back_on_mid_loop_failure(pool: sqlx::PgPool) {
+        let db = db(pool).await;
+        // Seed a repo so the FK (if any) is satisfied.
+        db.create_repo(&RepoRecord {
+            id: "repo-atomic".to_string(),
+            name: "atomic".to_string(),
+            owner_did: "did:key:zAtomic".to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: "/tmp/atomic".to_string(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+
+        // Pre-seed a row that collides with the SECOND ref update's
+        // deterministic id, so the loop's second INSERT fails on PK.
+        let second_ref = "refs/heads/feature-a";
+        let second_old = "2".repeat(40);
+        let second_new = "3".repeat(40);
+        let collision_id = deterministic_id(&[
+            "pending_ref_transition",
+            "req-atomic",
+            "repo-atomic",
+            second_ref,
+            &second_old,
+            &second_new,
+        ]);
+        // Direct insert bypassing the helper to land a `prepared` row
+        // with the colliding id.
+        sqlx::query(
+            r#"INSERT INTO pending_ref_transitions
+               (id, request_id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did,
+                signature_header, signature_input, content_digest, state, created_at,
+                first_ref_name)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"#,
+        )
+        .bind(&collision_id)
+        .bind("req-pre-seed")
+        .bind("repo-atomic")
+        .bind(second_ref)
+        .bind(&second_old)
+        .bind(&second_new)
+        .bind("did:key:zPre")
+        .bind("did:key:zNode")
+        .bind("sig-pre")
+        .bind("sig-input-pre")
+        .bind("digest-pre")
+        .bind(pending_state::PREPARED)
+        .bind(Utc::now().to_rfc3339())
+        .bind("refs/heads/main")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Now call the production helper. The first ref (main) inserts
+        // fine; the second ref collides and the loop returns Err.
+        let res = db
+            .insert_pending_ref_transitions(
+                "req-atomic",
+                "repo-atomic",
+                "did:key:zNode",
+                "did:key:zPusher",
+                &[
+                    ref_update("refs/heads/main", &"1".repeat(40), &"2".repeat(40)),
+                    ref_update(second_ref, &second_old, &second_new),
+                ],
+                "sig",
+                "sig-input",
+                "digest",
+                "refs/heads/main",
+            )
+            .await;
+        assert!(
+            res.is_err(),
+            "the colliding insert must return Err (pre-condition for the rollback check)"
+        );
+
+        // The atomicity half: NO `req-atomic` row may exist. Without
+        // the transaction the first row would have been persisted
+        // before the second failed, and the startup reconcile would
+        // later see a stranded `prepared` row pointing at a push
+        // that never ran.
+        let stranded = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pending_ref_transitions WHERE request_id = $1",
+        )
+        .bind("req-atomic")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stranded, 0,
+            "the transaction must roll back the first row when the second fails"
+        );
+        // The pre-seeded row is unaffected.
+        let pres = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pending_ref_transitions WHERE id = $1",
+        )
+        .bind(&collision_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(pres, 1, "the pre-seeded row is untouched");
     }
 
     /// The `deterministic_id` helper uses an ASCII Unit Separator between

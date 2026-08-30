@@ -211,9 +211,14 @@ pub const MAX_RECONCILE_AGE: chrono::Duration = chrono::Duration::seconds(24 * 6
 
 /// Maximum number of passes the startup drain will run before logging
 /// a residual-backlog warning. With `DRAIN_PER_PASS_LIMIT = 1000` and
-/// `DRAIN_MAX_PASSES = 10`, the startup drain will process up to
-/// 10,000 rows in one boot. Rows beyond that remain `applied` and
-/// are picked up on the next startup.
+/// `DRAIN_MAX_PASSES = 10`, the startup drain runs `max_passes` regular
+/// passes (10 × 1000 = 10,000 rows) plus ONE residual pass that
+/// detects overrun and surfaces the residual-backlog warning at
+/// `drain_pending_ref_transitions_all`'s tail. Total rows per boot
+/// before the warning fires: 11,000. Rows beyond that remain
+/// `applied` and are picked up on the next startup. P2-doc
+/// (reviewer-2 round 2): the previous comment said "up to 10,000" but
+/// the residual pass is the +1.
 pub const DRAIN_MAX_PASSES: usize = 10;
 
 /// One drain pass. Returns the number of transitions fully re-derived
@@ -228,7 +233,18 @@ pub const DRAIN_MAX_PASSES: usize = 10;
 /// failure on a row whose `derive_one` succeeded is also logged and
 /// the row remains `applied`; the next drain re-derives (idempotent
 /// inserts make this safe) and tries the delete again.
-pub async fn drain_pending_ref_transitions(state: AppState, limit: i64) -> anyhow::Result<usize> {
+///
+/// P2-D (reviewer-2 round 2): the function returns
+/// `(processed, examined)` rather than just `processed`. The caller
+/// keys the drain's `n < per_pass_limit` exit condition on
+/// `examined` so a pass where every row fails (or every
+/// `derive_one` succeeds but every delete fails) still tells the
+/// outer loop "more rows remain" — the previous `processed` count
+/// was 0 and the loop exited on the first fully-failing pass.
+pub async fn drain_pending_ref_transitions(
+    state: AppState,
+    limit: i64,
+) -> anyhow::Result<(usize, usize)> {
     drain_pending_ref_transitions_with(state, limit, |s, r| async move { derive_one(&s, &r).await })
         .await
 }
@@ -242,13 +258,14 @@ pub async fn drain_pending_ref_transitions_with<F, Fut>(
     state: AppState,
     limit: i64,
     derive_fn: F,
-) -> anyhow::Result<usize>
+) -> anyhow::Result<(usize, usize)>
 where
     F: Fn(AppState, PendingRefTransition) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
     let rows = state.db.list_pending_ref_transitions_applied(limit).await?;
-    let mut count = 0;
+    let mut processed = 0;
+    let examined = rows.len();
     for row in rows {
         match derive_fn(state.clone(), row.clone()).await {
             Ok(()) => {
@@ -260,7 +277,7 @@ where
                     );
                     continue;
                 }
-                count += 1;
+                processed += 1;
             }
             Err(e) => {
                 tracing::error!(
@@ -272,7 +289,7 @@ where
             }
         }
     }
-    Ok(count)
+    Ok((processed, examined))
 }
 
 /// Drain an unbounded `applied` backlog across multiple passes. The
@@ -293,27 +310,32 @@ pub async fn drain_pending_ref_transitions_all(
 ) -> anyhow::Result<usize> {
     let mut total = 0;
     for _ in 0..max_passes {
-        let n = drain_pending_ref_transitions(state.clone(), per_pass_limit).await?;
-        total += n;
-        // `per_pass_limit` is `i64`; `n` is `usize` (the drain
-        // returns a row count). Cast for the comparison.
-        if (n as i64) < per_pass_limit {
+        let (processed, examined) =
+            drain_pending_ref_transitions(state.clone(), per_pass_limit).await?;
+        total += processed;
+        // Key the exit on `examined`, not `processed`. A fully-failing
+        // batch returns processed=0 but examined=per_pass_limit; the
+        // loop must keep draining the backlog, not stop on the first
+        // 0-successes pass (P2-D, reviewer-2 round 2).
+        if (examined as i64) < per_pass_limit {
             return Ok(total);
         }
     }
     // One more pass to detect residual backlog. If this pass is also
     // full, log a warning and return what we have; the next startup
     // will continue the work.
-    let residual = drain_pending_ref_transitions(state.clone(), per_pass_limit).await?;
-    if (residual as i64) >= per_pass_limit {
+    let (residual_processed, residual_examined) =
+        drain_pending_ref_transitions(state.clone(), per_pass_limit).await?;
+    total += residual_processed;
+    if (residual_examined as i64) >= per_pass_limit {
         tracing::warn!(
-            total = total + residual,
+            total,
             max_passes,
             per_pass_limit,
             "drain backlog exceeds startup budget; residual rows will be picked up on next restart"
         );
     }
-    Ok(total + residual)
+    Ok(total)
 }
 
 /// Re-derive the push event, the per-ref certificate, and the anchor
@@ -333,21 +355,52 @@ pub async fn derive_one(state: &AppState, row: &PendingRefTransition) -> anyhow:
     // `request_id`) so the recovery push event id matches the live
     // path's id and a live push followed by a recovery pass collapses
     // to a single `push_events` row via `ON CONFLICT (id) DO NOTHING`.
+    //
+    // P2 (reviewer-1 round 2): for a MULTI-REF push the drain lists
+    // rows in `ORDER BY applied_at ASC, id ASC`; rows in the same
+    // second tie-break on a hash, so the row whose `record_push_with_id`
+    // hits the table first is non-deterministic. The push event is
+    // request-scoped (one per push, not one per ref) and the live
+    // handler at repos.rs:2282-2295 derives its `commit_hash` from
+    // `ref_updates.first().new_sha`. To match the live path exactly,
+    // only the row whose `ref_name` equals the persisted
+    // `first_ref_name` writes the event, and that row's `new_sha` is
+    // by definition the first ref's `new_sha`. Rows for non-first
+    // refs skip the push event write — they have already collapsed to
+    // the same `(request_id, first_ref_name)` id and a second insert
+    // would be a no-op, but the SHAs would still be wrong if the
+    // drain happened to process them first.
+    //
     // Per-ref certs and anchor jobs stay keyed on `row.ref_name` and
     // `(repo, ref, old, new)` respectively — those are correctly
-    // transition-shaped.
-    let push_id = crate::db::push_event_id_for(&row.request_id, &row.first_ref_name);
-    state
-        .db
-        .record_push_with_id(&push_id, &row.pusher_did, &row.repo_id, &row.new_sha, 0)
-        .await?;
+    // transition-shaped and continue to run on every row.
+    if row.ref_name == row.first_ref_name {
+        let push_id = crate::db::push_event_id_for(&row.request_id, &row.first_ref_name);
+        state
+            .db
+            .record_push_with_id(&push_id, &row.pusher_did, &row.repo_id, &row.new_sha, 0)
+            .await?;
+    }
 
     // Ref certificate: the cert is signed by the node, but the
-    // `pusher_did` field carries the ORIGINAL authenticated pusher. The
-    // idempotent insert returns None if a live-path cert already
-    // exists, in which case we leave it alone.
+    // `pusher_did` field carries the ORIGINAL authenticated pusher.
+    //
+    // P1 (reviewer-1 round 2): the recovery path uses the LIVE
+    // `issue_ref_certificate` upsert (`ON CONFLICT (repo_id, ref_name)
+    // DO UPDATE SET … CASE WHEN EXCLUDED.issued_at >
+    // ref_certificates.issued_at …`), not the idempotent DO NOTHING
+    // variant. The previous helper left a stale cert in place if a
+    // live-path cert had been issued before the push actually landed
+    // on disk — the ref on disk was at the new SHA, the cert still
+    // said old. The upsert refreshes the cert's `old_sha` /
+    // `new_sha` / `pusher_did` / `signature` / `issued_at` to the
+    // recovered transition while preserving the deterministic `id`
+    // (the SQL only updates the SHAs/did/signature/ts columns).
+    // Live and recovery still collapse to a single cert row per
+    // `(repo_id, ref_name)` because the `cert_id` from
+    // `ref_cert_id_for` is the same on both paths.
     let cert_id = crate::db::ref_cert_id_for(&row.request_id, &row.ref_name);
-    let _ = cert::issue_ref_certificate_idempotent(
+    let _ = cert::issue_ref_certificate(
         state,
         &row.repo_id,
         &row.ref_name,
@@ -466,10 +519,11 @@ mod drain_tests {
             .await
             .unwrap();
 
-        let n = drain_pending_ref_transitions(state.clone(), 100)
+        let (n, examined) = drain_pending_ref_transitions(state.clone(), 100)
             .await
             .unwrap();
         assert_eq!(n, 1, "exactly one transition re-derived");
+        assert_eq!(examined, 1, "the loop examined the single row");
 
         // Push event: exactly one row, keyed on the deterministic id.
         let _push_id = crate::db::push_event_id_for(&row.request_id, &row.ref_name);
@@ -522,10 +576,11 @@ mod drain_tests {
         );
 
         // A second drain pass is a no-op.
-        let n2 = drain_pending_ref_transitions(state.clone(), 100)
+        let (n2, examined2) = drain_pending_ref_transitions(state.clone(), 100)
             .await
             .unwrap();
         assert_eq!(n2, 0, "a second drain pass has nothing to do");
+        assert_eq!(examined2, 0, "no rows to examine on a second pass");
     }
 
     /// The reviewer's second proof, end-to-end. A `cancelled` row is
@@ -550,7 +605,7 @@ mod drain_tests {
             .await
             .unwrap();
 
-        let n = drain_pending_ref_transitions(state.clone(), 100)
+        let (n, _examined) = drain_pending_ref_transitions(state.clone(), 100)
             .await
             .unwrap();
         assert_eq!(n, 0, "the drain must not promote a cancelled row");
@@ -606,7 +661,7 @@ mod drain_tests {
             .await
             .unwrap();
 
-        let n = drain_pending_ref_transitions(state.clone(), 100)
+        let (n, _examined) = drain_pending_ref_transitions(state.clone(), 100)
             .await
             .unwrap();
         assert_eq!(n, 0, "the drain must not promote a prepared row");
@@ -1173,19 +1228,24 @@ mod drain_tests {
         // clones the id from the outer `row_a_id` local on every
         // iteration.
         let row_a_id = row_a.id.clone();
-        let n = drain_pending_ref_transitions_with(state.clone(), 100, |s, r| {
-            let target = row_a_id.clone();
-            async move {
-                if r.id == target {
-                    Err(anyhow::anyhow!("injected derive failure"))
-                } else {
-                    derive_one(&s, &r).await
+        let (processed, examined) =
+            drain_pending_ref_transitions_with(state.clone(), 100, |s, r| {
+                let target = row_a_id.clone();
+                async move {
+                    if r.id == target {
+                        Err(anyhow::anyhow!("injected derive failure"))
+                    } else {
+                        derive_one(&s, &r).await
+                    }
                 }
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(n, 1, "only row B is fully processed and deleted");
+            })
+            .await
+            .unwrap();
+        assert_eq!(processed, 1, "only row B is fully processed and deleted");
+        assert_eq!(
+            examined, 2,
+            "the loop examined both rows; processed/derivation is independent of pagination"
+        );
 
         // Row A is still in `applied` (NOT deleted, NOT re-derivable
         // yet by a future pass that just calls `derive_one` — the
@@ -1325,10 +1385,11 @@ mod drain_tests {
         }
 
         // Drain all three rows.
-        let n = drain_pending_ref_transitions(state.clone(), 100)
+        let (n, examined) = drain_pending_ref_transitions(state.clone(), 100)
             .await
             .unwrap();
         assert_eq!(n, 3, "all three rows re-derived");
+        assert_eq!(examined, 3, "the loop examined all three rows");
 
         // Exactly one push event row, keyed on the deterministic
         // (request_id, first_ref_name) id. The three rows collapsed
@@ -1386,5 +1447,289 @@ mod drain_tests {
                 .unwrap();
             assert_eq!(n, 1, "one anchor job per transition");
         }
+    }
+
+    // ----- P2 (reviewer-1 round 2): distinct new_shas across refs -----
+    //
+    // The previous multi-ref test shared one `new_sha` across all
+    // refs; that masked the wrong-hash bug. This test gives every ref
+    // a distinct `new_sha` and asserts the persisted `commit_hash` is
+    // the FIRST ref's `new_sha` (the live handler at repos.rs:2292
+    // derives `first_ref_name` from `ref_updates.first()` and uses
+    // that ref's new_sha for the push event). Before the gate on
+    // `row.ref_name == row.first_ref_name` the drain would
+    // `record_push_with_id` for whichever row the `ORDER BY
+    // applied_at, id` query returned first, leaving the wrong hash
+    // for any other drain order.
+    #[sqlx::test]
+    async fn multi_ref_recovery_uses_first_refs_new_sha_for_push_event(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        // Three refs, each with a distinct `new_sha` modelling a
+        // multi-branch push where each ref advanced to a different
+        // tip. The first ref's new_sha is the one the live handler
+        // would have used.
+        let first_new_sha = "a".repeat(40);
+        let second_new_sha = "b".repeat(40);
+        let third_new_sha = "c".repeat(40);
+        let ref_names = [
+            "refs/heads/main",
+            "refs/heads/feature-a",
+            "refs/heads/feature-b",
+        ];
+        let new_shas = [&first_new_sha, &second_new_sha, &third_new_sha];
+        for (i, (ref_name, new_sha)) in ref_names.iter().zip(new_shas.iter()).enumerate() {
+            let mut row = make_row("repo-multi-distinct", ref_name, &"0".repeat(40), new_sha);
+            row.request_id = "req-multi-distinct".to_string();
+            row.first_ref_name = "refs/heads/main".to_string();
+            // Vary `old_sha` per row so the anchor job PKs don't
+            // collide and so the certs distinguish the three
+            // transitions.
+            row.old_sha = format!("{:040x}", (i + 1) as u64);
+            row.id = crate::db::deterministic_id(&[
+                "pending_ref_transition",
+                &row.request_id,
+                &row.repo_id,
+                &row.ref_name,
+                &row.old_sha,
+                &row.new_sha,
+            ]);
+            state
+                .db
+                .insert_pending_ref_transition_for_test(&row)
+                .await
+                .unwrap();
+        }
+
+        // Drain all three rows.
+        let (n, examined) = drain_pending_ref_transitions(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(n, 3, "all three rows re-derived");
+        assert_eq!(examined, 3, "the loop examined all three rows");
+
+        // Exactly one push event row, keyed on the deterministic
+        // (request_id, first_ref_name) id. Only the row whose
+        // `ref_name == first_ref_name` ran `record_push_with_id`,
+        // so the persisted `commit_hash` is the FIRST ref's
+        // `new_sha` — the same value the live path would have
+        // written at repos.rs:2488-2492.
+        let push_count = state.db.get_push_count("did:key:z6pusher").await.unwrap();
+        assert_eq!(push_count, 1, "exactly one push event row");
+        let first_event = state
+            .db
+            .count_push_events("repo-multi-distinct", &first_new_sha, "did:key:z6pusher")
+            .await
+            .unwrap();
+        assert_eq!(
+            first_event, 1,
+            "the persisted commit_hash is the FIRST ref's new_sha"
+        );
+        // The non-first new_shas MUST NOT have a push event
+        // pointing at them — that would be the wrong-hash bug.
+        for other in [&second_new_sha, &third_new_sha] {
+            let n = state
+                .db
+                .count_push_events("repo-multi-distinct", other, "did:key:z6pusher")
+                .await
+                .unwrap();
+            assert_eq!(
+                n, 0,
+                "no push event for the non-first ref's new_sha ({other})"
+            );
+        }
+
+        // Certs and anchors stay per-ref and per-transition
+        // (unchanged from the prior round).
+        let certs = state
+            .db
+            .list_ref_certificates("repo-multi-distinct", 10)
+            .await
+            .unwrap();
+        assert_eq!(certs.len(), 3, "one cert per ref transition");
+    }
+
+    // ----- P2-D (reviewer-2 round 2): all-fail batch does not early-exit -----
+    //
+    // The previous loop's exit condition was `(n as i64) < per_pass_limit`
+    // where `n` was rows *fully processed* (derive + delete). A pass
+    // where every `derive_one` returns Err logs each failure but
+    // increments `count = 0`; the outer loop sees `0 < per_pass_limit`
+    // and returns. Remaining `applied` rows are never attempted that
+    // boot. The fix returns `(processed, examined)` and keys the exit
+    // on `examined`. This test seeds `per_pass_limit` rows with a
+    // closure that fails for every one, then asserts the drain ran
+    // every row (processed=0, examined=per_pass_limit) so the outer
+    // loop continues to the next pass.
+    #[sqlx::test]
+    async fn drain_does_not_exit_early_when_every_row_fails(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        const N: usize = 5;
+        for i in 0..N {
+            let mut row = make_row(
+                "repo-all-fail",
+                "refs/heads/main",
+                &"0".repeat(40),
+                &format!("{:040x}", i as u64),
+            );
+            row.request_id = format!("req-all-fail-{i}");
+            row.id = crate::db::deterministic_id(&[
+                "pending_ref_transition",
+                &row.request_id,
+                &row.repo_id,
+                &row.ref_name,
+                &row.old_sha,
+                &row.new_sha,
+            ]);
+            state
+                .db
+                .insert_pending_ref_transition_for_test(&row)
+                .await
+                .unwrap();
+        }
+
+        let (processed, examined) =
+            drain_pending_ref_transitions_with(state.clone(), N as i64, |_s, _r| async move {
+                Err(anyhow::anyhow!("injected: every row fails"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(processed, 0, "no row was fully processed");
+        assert_eq!(
+            examined, N,
+            "the loop examined every row even though every derive failed"
+        );
+
+        // The all-fail rows are still `applied` for a future retry:
+        // the loop never deletes a row whose derive returned Err.
+        let after = state
+            .db
+            .list_pending_ref_transitions_applied(100)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.len(),
+            N,
+            "failed rows stay `applied` for the next startup"
+        );
+    }
+
+    // ----- P1 (reviewer-1 round 2): recovery refreshes a stale cert -----
+    //
+    // The crash window the reviewer named: the live cert was issued
+    // before the push actually landed on disk (e.g. cert was emitted
+    // at t1, the apply succeeded at t2, the live upsert never re-ran
+    // because the handler errored after the cert write). A second
+    // startup runs the recovery drain, which must update the cert's
+    // `old_sha` / `new_sha` / `pusher_did` / `signature` /
+    // `issued_at` to the new transition. The `id` (deterministic
+    // from `(request_id, ref_name)`) is preserved — the upsert only
+    // touches the SHAs/did/signature/ts columns. Without the upsert
+    // the cert stays at the old transition and consumers reading
+    // `ref_certificates.new_sha` see a value that does not match
+    // the ref on disk.
+
+    #[sqlx::test]
+    async fn recovery_refreshes_stale_cert_to_landed_transition(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        // Seed a repo so the cert FK is satisfied.
+        let owner_did = "did:key:zCertOwner";
+        let rec = crate::db::RepoRecord {
+            id: "repo-cert-refresh".to_string(),
+            name: "cert-refresh".to_string(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            disk_path: "/tmp/cert-refresh".to_string(),
+            forked_from: None,
+            machine_id: None,
+        };
+        state.db.create_repo(&rec).await.unwrap();
+
+        // Insert a STALE cert directly: old SHA → some "stale new" SHA
+        // at t1, with a different pusher DID. This models the live
+        // cert issued before the push landed.
+        let stale_cert_id = crate::db::ref_cert_id_for("req-stale", "refs/heads/main");
+        let stale_old = "0".repeat(40);
+        let stale_new = "1".repeat(40);
+        let stale_pusher = "did:key:zStalePusher";
+        let stale_issued = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
+        state
+            .db
+            .insert_ref_certificate_idempotent(&crate::db::RefCertificate {
+                id: stale_cert_id.clone(),
+                repo_id: rec.id.clone(),
+                ref_name: "refs/heads/main".to_string(),
+                old_sha: stale_old.clone(),
+                new_sha: stale_new.clone(),
+                pusher_did: stale_pusher.to_string(),
+                node_did: state.node_did.to_string(),
+                signature: "stale-signature".to_string(),
+                issued_at: stale_issued.clone(),
+            })
+            .await
+            .unwrap();
+
+        // Seed the durable row with the LANDED transition (what the
+        // push actually applied to disk): a different old_sha and
+        // new_sha, the genuine pusher DID. The drain must refresh
+        // the stale cert to this transition.
+        let landed_old = "2".repeat(40);
+        let landed_new = "3".repeat(40);
+        let landed_pusher = "did:key:zLandedPusher";
+        let mut row = make_row(&rec.id, "refs/heads/main", &landed_old, &landed_new);
+        row.request_id = "req-stale".to_string();
+        row.pusher_did = landed_pusher.to_string();
+        row.first_ref_name = "refs/heads/main".to_string();
+        row.id = crate::db::deterministic_id(&[
+            "pending_ref_transition",
+            &row.request_id,
+            &row.repo_id,
+            &row.ref_name,
+            &row.old_sha,
+            &row.new_sha,
+        ]);
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row)
+            .await
+            .unwrap();
+
+        // Drain. The recovery upsert must overwrite the stale cert
+        // with the landed transition's SHAs / pusher / signature.
+        let (processed, examined) = drain_pending_ref_transitions(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(processed, 1, "the row was drained");
+        assert_eq!(examined, 1, "the loop examined the single row");
+
+        let certs = state.db.list_ref_certificates(&rec.id, 10).await.unwrap();
+        assert_eq!(certs.len(), 1, "exactly one cert row, the same id");
+        let cert = &certs[0];
+        assert_eq!(cert.id, stale_cert_id, "deterministic id preserved");
+        assert_eq!(
+            cert.old_sha, landed_old,
+            "old_sha refreshed to the landed transition"
+        );
+        assert_eq!(
+            cert.new_sha, landed_new,
+            "new_sha refreshed to the landed transition (was the bug)"
+        );
+        assert_eq!(
+            cert.pusher_did, landed_pusher,
+            "pusher refreshed to the actual landed pusher"
+        );
+        assert_ne!(
+            cert.signature, "stale-signature",
+            "signature was re-signed with the landed transition"
+        );
+        // `issued_at` is a free-form string; just assert the row is
+        // populated. The monotonic `issued_at > stale_issued` is what
+        // the upsert's CASE WHEN checks.
+        assert!(!cert.issued_at.is_empty(), "issued_at populated");
     }
 }
