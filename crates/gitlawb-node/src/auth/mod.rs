@@ -530,6 +530,11 @@ mod tests {
             push_limiter_trust: crate::rate_limit::TrustedProxy::None,
             sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
             peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+            // F5 work-in-progress: a previous round added the field to
+            // `state::AppState` but not the test initializer. The field
+            // is unrelated to the F1 ANS-104 work and is initialized to
+            // a generous default so the test binary can compile.
+            arweave_verify_rate_limiter: RateLimiter::new(120, Duration::from_secs(60)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),

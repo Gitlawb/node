@@ -515,6 +515,11 @@ async fn main() -> Result<()> {
             std::time::Duration::from_secs(3600),
             200_000,
         ),
+        arweave_verify_rate_limiter: rate_limit::RateLimiter::new_bounded(
+            config.arweave_verify_rate_limit,
+            std::time::Duration::from_secs(3600),
+            200_000,
+        ),
         // Separate WORK-budget bucket for the resolver's per-probe/per-walk charges (R6).
         // Its capacity is DERIVED from the route limit (no new knob) and floored at the
         // legacy-probe budget, so one full default-config legacy scan never self-throttles
@@ -528,6 +533,11 @@ async fn main() -> Result<()> {
     };
     if config.ipfs_rate_limit == 0 {
         tracing::warn!("GITLAWB_IPFS_RATE_LIMIT=0 — per-IP /ipfs rate limiting disabled");
+    }
+    if config.arweave_verify_rate_limit == 0 {
+        tracing::warn!(
+            "GITLAWB_ARWEAVE_VERIFY_RATE_LIMIT=0 — per-IP /arweave/anchors/verify rate limiting disabled"
+        );
     }
 
     // Periodic peer-count poll for the metrics gauge. If p2p is disabled
@@ -1193,6 +1203,7 @@ mod rate_limiter_sweep_tests {
         state.peer_write_rate_limiter = RateLimiter::new(10, window);
         state.ipfs_rate_limiter = RateLimiter::new(10, window);
         state.ipfs_work_rate_limiter = RateLimiter::new(10, window);
+        state.arweave_verify_rate_limiter = RateLimiter::new(10, window);
 
         let limiters = |s: &crate::state::AppState| {
             [
@@ -1203,6 +1214,7 @@ mod rate_limiter_sweep_tests {
                 s.peer_write_rate_limiter.clone(),
                 s.ipfs_rate_limiter.clone(),
                 s.ipfs_work_rate_limiter.clone(),
+                s.arweave_verify_rate_limiter.clone(),
             ]
         };
         for l in limiters(&state) {

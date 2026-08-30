@@ -5184,6 +5184,95 @@ mod migration_tests {
              was not applied. The verify endpoint will seq-scan the table."
         );
     }
+
+    /// Round-3 P2 (reviewer): the presence test above only proves
+    /// the index EXISTS; a future "fix" could re-add it under a
+    /// non-equivalent name (wrong column, partial index) and the
+    /// presence test would still pass. The verify lookup query
+    /// would then seq-scan. This test pins the index is actually
+    /// USED by the verify lookup: with `enable_seqscan = off`,
+    /// the planner has no other option and the query must succeed;
+    /// with the default plan, the EXPLAIN output must name
+    /// `idx_arweave_anchors_irys_tx_id`. A bug in the index
+    /// definition (wrong column, INCLUDE-only, partial predicate
+    /// excluding the lookup value) flips this test RED.
+    #[sqlx::test]
+    async fn migration_v27_irys_tx_id_index_is_used_by_the_lookup(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        // Seed one row so the planner has data to estimate against.
+        // The actual value of `irys_tx_id` does not matter — the
+        // index lookup path is the same for any string.
+        sqlx::query(
+            r#"INSERT INTO arweave_anchors
+               (id, repo, owner_did, ref_name, old_sha, new_sha, cid, irys_tx_id,
+                arweave_url, node_did, anchored_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"#,
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind("o/r")
+        .bind("o")
+        .bind("refs/heads/main")
+        .bind("0".repeat(40))
+        .bind("1".repeat(40))
+        .bind(Option::<String>::None)
+        .bind("seeded-irys-tx-for-explain")
+        .bind("https://arweave.net/x")
+        .bind("did:key:zN")
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Force the planner to use the index. If the index is
+        // missing or does not cover `irys_tx_id`, the planner
+        // has no other option and the query will fall back to
+        // an error (seqscan disabled, no index to use). This is
+        // the most direct proof the index is wired correctly.
+        sqlx::query("SET enable_seqscan = off")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let row =
+            sqlx::query("SELECT id, repo, irys_tx_id FROM arweave_anchors WHERE irys_tx_id = $1")
+                .bind("seeded-irys-tx-for-explain")
+                .fetch_optional(&db.pool)
+                .await
+                .expect(
+                    "verify lookup failed with seqscan disabled — the index either \
+             does not exist, is on the wrong column, or is a partial index \
+             that excludes this row. The verify endpoint will seq-scan in \
+             production as a result.",
+                );
+        assert!(
+            row.is_some(),
+            "verify lookup returned no row for a seeded value; the index \
+             may be a covering index that does not return the row, or the \
+             planner path is broken"
+        );
+
+        // Reset and confirm the default EXPLAIN names the index.
+        sqlx::query("SET enable_seqscan = on")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let plan: (String,) =
+            sqlx::query_as("EXPLAIN SELECT id FROM arweave_anchors WHERE irys_tx_id = $1")
+                .bind("seeded-irys-tx-for-explain")
+                .fetch_one(&db.pool)
+                .await
+                .expect("EXPLAIN failed; the verify query is broken");
+        let plan_lines: Vec<&str> = plan.0.lines().collect();
+        let plan_text = plan_lines.join(" | ");
+        assert!(
+            plan_text.contains("idx_arweave_anchors_irys_tx_id"),
+            "the default EXPLAIN did not use idx_arweave_anchors_irys_tx_id. \
+             Plan: {plan_text}. The index is present but the planner chose \
+             another path; the verify endpoint will seq-scan in production."
+        );
+    }
 }
 
 #[cfg(test)]

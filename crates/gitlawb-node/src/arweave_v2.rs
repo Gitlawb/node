@@ -24,7 +24,7 @@
 //! authorizes a paid re-upload. `Indeterminate` keeps the outbox
 //! non-terminal and retries the probe.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use ed25519_dalek::PUBLIC_KEY_LENGTH;
 
 use crate::ans104::{self, DataItem};
@@ -75,27 +75,40 @@ pub const PROBE_MAX_BODY_BYTES: usize = 1024 * 1024;
 /// Never panics; never returns `Err`. The classification is
 /// exhaustive: every gateway response falls into exactly one of
 /// the three outcomes.
-pub async fn probe_anchor_item(client: &reqwest::Client, req: &ProbeRequest) -> ProbeOutcome {
+///
+/// Returns `(outcome, body)`: on `Present`, the body is the
+/// capped, validated bytes the probe already consumed (so
+/// `verify_anchor` does not need a second GET to extract the
+/// payload); on `DefinitivelyAbsent` and `Indeterminate`, the
+/// body is `None`. Splitting validation and consumption across
+/// two independent network reads would let a second-read
+/// transport / cap failure become a 500, contradicting the
+/// endpoint's three-outcome model.
+pub async fn probe_anchor_item(
+    client: &reqwest::Client,
+    req: &ProbeRequest,
+) -> (ProbeOutcome, Option<Vec<u8>>) {
     let url = format!("{}/{}", req.gateway_url.trim_end_matches('/'), req.item_id);
 
     let resp = match client.get(&url).send().await {
         Ok(r) => r,
-        Err(_) => return ProbeOutcome::Indeterminate,
+        Err(_) => return (ProbeOutcome::Indeterminate, None),
     };
 
     let status = resp.status();
 
     if status.as_u16() == 404 {
-        return classify_404(resp).await;
+        let outcome = classify_404(resp).await;
+        return (outcome, None);
     }
 
     if !status.is_success() {
-        return ProbeOutcome::Indeterminate;
+        return (ProbeOutcome::Indeterminate, None);
     }
 
     let bytes = match read_capped_body(resp, PROBE_MAX_BODY_BYTES).await {
         Ok(b) => b,
-        Err(_) => return ProbeOutcome::Indeterminate,
+        Err(_) => return (ProbeOutcome::Indeterminate, None),
     };
 
     // v1 detection: a body carrying `schema: "gitlawb/ref-update/v1"`
@@ -106,30 +119,30 @@ pub async fn probe_anchor_item(client: &reqwest::Client, req: &ProbeRequest) -> 
     // not carry that schema falls through to the v2 attempt.
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
         if v.get("schema").and_then(|s| s.as_str()) == Some("gitlawb/ref-update/v1") {
-            return ProbeOutcome::Present;
+            return (ProbeOutcome::Present, Some(bytes));
         }
     }
 
     let item: DataItem = match serde_json::from_slice(&bytes) {
         Ok(i) => i,
-        Err(_) => return ProbeOutcome::Indeterminate,
+        Err(_) => return (ProbeOutcome::Indeterminate, Some(bytes)),
     };
 
     let owner_pk = match item.owner_pubkey() {
         Ok(p) => p,
-        Err(_) => return ProbeOutcome::Indeterminate,
+        Err(_) => return (ProbeOutcome::Indeterminate, Some(bytes)),
     };
 
     if let Some(expected) = req.expected_owner_pk {
         if owner_pk != expected {
-            return ProbeOutcome::Indeterminate;
+            return (ProbeOutcome::Indeterminate, Some(bytes));
         }
         if ans104::verify_data_item(&item, &expected).is_err() {
-            return ProbeOutcome::Indeterminate;
+            return (ProbeOutcome::Indeterminate, Some(bytes));
         }
     }
 
-    ProbeOutcome::Present
+    (ProbeOutcome::Present, Some(bytes))
 }
 
 /// Classify a 404 response from the gateway.
@@ -279,7 +292,7 @@ pub async fn verify_anchor(
     persisted: &PersistedAnchorFields<'_>,
     gateway_url: &str,
 ) -> Result<AnchorVerifyResult> {
-    let outcome = probe_anchor_item(
+    let (outcome, bytes) = probe_anchor_item(
         client,
         &ProbeRequest {
             item_id: item_id.to_string(),
@@ -291,18 +304,28 @@ pub async fn verify_anchor(
 
     match outcome {
         ProbeOutcome::Present => {
-            // Re-fetch the body to extract the data payload. The
-            // probe already classified the response; here we just
-            // need the parsed body.
-            let url = format!("{}/{}", gateway_url.trim_end_matches('/'), item_id);
-            let resp = client
-                .get(&url)
-                .send()
-                .await
-                .with_context(|| "re-fetching data item for payload extraction")?;
-            let bytes = read_capped_body(resp, PROBE_MAX_BODY_BYTES)
-                .await
-                .map_err(|e| anyhow!("re-fetch body: {e}"))?;
+            // Round-3 P2 (reviewer): the probe already consumed
+            // the body once. Re-fetching it here is what produced
+            // the 500-on-second-failure contract the reviewer
+            // called out. Consume the bytes the probe handed back
+            // instead of issuing a second GET.
+            let bytes = match bytes {
+                Some(b) => b,
+                None => {
+                    return Ok(AnchorVerifyResult {
+                        item_id: item_id.to_string(),
+                        verified: false,
+                        data_payload: None,
+                        owner_did: None,
+                        error: Some(
+                            "the probe returned Present without a buffered body — \
+                             this is an internal contract violation"
+                                .to_string(),
+                        ),
+                        outcome: ProbeOutcome::Indeterminate,
+                    });
+                }
+            };
 
             // Format detection: v1 first, by structural schema field.
             // The v1 raw-JSON shape carries `schema: gitlawb/ref-update/v1`
@@ -635,7 +658,7 @@ mod tests {
             .create_async()
             .await;
 
-        let outcome = probe_anchor_item(&reqwest::Client::new(), &req_for(server.url())).await;
+        let (outcome, _) = probe_anchor_item(&reqwest::Client::new(), &req_for(server.url())).await;
         assert_eq!(outcome, ProbeOutcome::DefinitivelyAbsent);
     }
 
@@ -649,7 +672,7 @@ mod tests {
             .create_async()
             .await;
 
-        let outcome = probe_anchor_item(&reqwest::Client::new(), &req_for(server.url())).await;
+        let (outcome, _) = probe_anchor_item(&reqwest::Client::new(), &req_for(server.url())).await;
         assert_eq!(
             outcome,
             ProbeOutcome::Indeterminate,
@@ -667,7 +690,7 @@ mod tests {
             .create_async()
             .await;
 
-        let outcome = probe_anchor_item(&reqwest::Client::new(), &req_for(server.url())).await;
+        let (outcome, _) = probe_anchor_item(&reqwest::Client::new(), &req_for(server.url())).await;
         assert_eq!(outcome, ProbeOutcome::Indeterminate);
     }
 
@@ -692,7 +715,7 @@ mod tests {
 
         let mut req = req_for(server.url());
         req.expected_owner_pk = Some(pk);
-        let outcome = probe_anchor_item(&reqwest::Client::new(), &req).await;
+        let (outcome, _) = probe_anchor_item(&reqwest::Client::new(), &req).await;
         assert_eq!(outcome, ProbeOutcome::Present);
     }
 
@@ -721,7 +744,7 @@ mod tests {
 
         let mut req = req_for(server.url());
         req.expected_owner_pk = Some(pk);
-        let outcome = probe_anchor_item(&reqwest::Client::new(), &req).await;
+        let (outcome, _) = probe_anchor_item(&reqwest::Client::new(), &req).await;
         assert_eq!(outcome, ProbeOutcome::Indeterminate);
     }
 
@@ -736,7 +759,7 @@ mod tests {
             .create_async()
             .await;
 
-        let outcome = probe_anchor_item(&reqwest::Client::new(), &req_for(server.url())).await;
+        let (outcome, _) = probe_anchor_item(&reqwest::Client::new(), &req_for(server.url())).await;
         assert_eq!(outcome, ProbeOutcome::Indeterminate);
     }
 
@@ -750,7 +773,7 @@ mod tests {
             .create_async()
             .await;
 
-        let outcome = probe_anchor_item(&reqwest::Client::new(), &req_for(server.url())).await;
+        let (outcome, _) = probe_anchor_item(&reqwest::Client::new(), &req_for(server.url())).await;
         assert_eq!(outcome, ProbeOutcome::Indeterminate);
     }
 
@@ -780,7 +803,7 @@ mod tests {
 
         let mut req = req_for(server.url());
         req.expected_owner_pk = Some(pk2);
-        let outcome = probe_anchor_item(&reqwest::Client::new(), &req).await;
+        let (outcome, _) = probe_anchor_item(&reqwest::Client::new(), &req).await;
         assert_eq!(outcome, ProbeOutcome::Indeterminate);
     }
 
@@ -806,7 +829,7 @@ mod tests {
             .create_async()
             .await;
 
-        let outcome = probe_anchor_item(&reqwest::Client::new(), &req_for(server.url())).await;
+        let (outcome, _) = probe_anchor_item(&reqwest::Client::new(), &req_for(server.url())).await;
         assert_eq!(
             outcome,
             ProbeOutcome::Indeterminate,
@@ -825,7 +848,7 @@ mod tests {
             .create_async()
             .await;
 
-        let outcome = probe_anchor_item(&reqwest::Client::new(), &req_for(server.url())).await;
+        let (outcome, _) = probe_anchor_item(&reqwest::Client::new(), &req_for(server.url())).await;
         assert_eq!(outcome, ProbeOutcome::Indeterminate);
     }
 
@@ -839,7 +862,7 @@ mod tests {
             .create_async()
             .await;
 
-        let outcome = probe_anchor_item(&reqwest::Client::new(), &req_for(server.url())).await;
+        let (outcome, _) = probe_anchor_item(&reqwest::Client::new(), &req_for(server.url())).await;
         assert_eq!(outcome, ProbeOutcome::Indeterminate);
     }
 

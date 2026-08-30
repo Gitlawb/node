@@ -244,12 +244,24 @@ pub fn build_router(state: AppState) -> Router {
     // (gated) get different layer stacks.
     let arweave_routes = Router::new().route("/api/v1/arweave/anchors", get(arweave::list_anchors));
 
+    // Per-IP admission limit on the verify route. Layer order
+    // matters: `rate_limit_by_ip` is OUTERMOST so an over-limit
+    // caller is shed with 429 BEFORE auth burns CPU. The
+    // invariant lives in `rate_limit.rs:746-760`; the IPFS path
+    // at `:226-231` is the template. The `IpRateLimiter`
+    // extension must be present or `rate_limit_by_ip` silently
+    // no-ops (see the comment at the IPFS mount).
     let arweave_verify_routes = Router::new()
         .route(
             "/api/v1/arweave/anchors/verify/{item_id}",
             get(arweave::verify_anchor),
         )
-        .layer(middleware::from_fn(crate::auth::optional_signature));
+        .layer(middleware::from_fn(crate::auth::optional_signature))
+        .layer(middleware::from_fn(crate::rate_limit::rate_limit_by_ip))
+        .layer(axum::Extension(crate::rate_limit::IpRateLimiter {
+            limiter: state.arweave_verify_rate_limiter.clone(),
+            trust: state.push_limiter_trust,
+        }));
 
     // ── Bounty routes (write — require HTTP Signature) ─────────────────
     let bounty_write_routes = add_auth_layers(

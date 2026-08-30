@@ -1,0 +1,27 @@
+ANS-104 golden vector, captured from arbundles 0.10.x via scripts/ans104_golden.mjs.
+
+Inputs (match scripts/ans104_golden.mjs):
+  data     = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=[]{};':\",./<>?`~"
+  tags     = [{name:"tag1",value:"value1"},{name:"tag2",value:"value2"}]
+  anchor   = "thisSentenceIs32BytesLongTrustMe" (32 bytes ASCII)
+  target   = base64url-decode("OXcT1sVRSA5eGwt2k6Yuz8-3e3g9WJi5uSE99CWqsBs")
+  signer   = EthereumSigner("8da4ef21b864d2cc526dbdb2a120bd2874c36c9d0a1fb7f8c63d7f7a8b41de8f")
+
+Outputs:
+  signature_type = 3 (Ethereum)
+  signature_len  = 65 bytes
+  owner_len      = 512 bytes (RSA pubkey padded to 512)
+  binary_len     = 332 bytes
+  id             = mM5C3u9R1AJp1UL1MUvvLHRo1AGtXYUWi_q0wBCPdfc (base64url of sha256(signature))
+
+binary_hex:
+030000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004d11e94912283d217fd98be5ad59c659aede69bbef0e72a2213edf0fbd8de3cc95030d006b137e22b89e738e5565766b83d12c438fe970e3e729532fcfafad2a701397713d6c551480e5e1b0b7693a62ecfcfb77b783d5898b9b9213df425aab01b017468697353656e74656e63654973333242797465734c6f6e6754727573744d6502000000000000001a000000000000000408746167310c76616c75653108746167320c76616c756532006162636465666768696a6b6c6d6e6f707172737475767778797a4142434445464748494a4b4c4d4e4f505152535455565758595a3031323334353637383921402324255e262a28295f2b2d3d5b5d7b7d3b273a222c2e2f3c3e3f607e
+
+The Rust side will:
+1. Parse binary via DataItem::from_binary (signature_type, signature,
+   owner, target, anchor, tags, data).
+2. Compute deep_hash via DataItem::deep_hash (the 7-element fold with
+   nested tags, per the ANS-104 spec).
+3. Assert sha256(signature_bytes) base64url-encodes to the captured id.
+4. (Optionally) re-derive signature via Ed25519/other signer and
+   confirm arbundles' verify accepts the Rust-built binary.
