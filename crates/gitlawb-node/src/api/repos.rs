@@ -2553,7 +2553,10 @@ impl PublishDurabilitySlot {
     }
 
     async fn record(&self, outcome: crate::git::repo_store::ReleaseOutcome) {
-        *self.inner.lock().expect("publish durability mutex poisoned") = Some(outcome);
+        *self
+            .inner
+            .lock()
+            .expect("publish durability mutex poisoned") = Some(outcome);
         self.recorded
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -2561,10 +2564,7 @@ impl PublishDurabilitySlot {
 
 impl Drop for PublishDurabilitySlot {
     fn drop(&mut self) {
-        if self
-            .recorded
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if self.recorded.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
         if !self
@@ -2592,10 +2592,7 @@ async fn publish_durability_confirmed(
     };
     let start = std::time::Instant::now();
     loop {
-        if let Some(outcome) = *slot
-            .lock()
-            .expect("publish durability mutex poisoned")
-        {
+        if let Some(outcome) = *slot.lock().expect("publish durability mutex poisoned") {
             return matches!(
                 outcome,
                 crate::git::repo_store::ReleaseOutcome::Released
@@ -2608,9 +2605,7 @@ async fn publish_durability_confirmed(
             // UploadUnknowable via PublishDurabilitySlot::drop so the tail can
             // proceed on local disk without waiting out the full bound.
             return matches!(
-                *slot
-                    .lock()
-                    .expect("publish durability mutex poisoned"),
+                *slot.lock().expect("publish durability mutex poisoned"),
                 Some(crate::git::repo_store::ReleaseOutcome::Released)
                     | Some(crate::git::repo_store::ReleaseOutcome::UploadUnknowable)
             );
@@ -3743,15 +3738,13 @@ mod tests {
     const STRANGER_DID: &str = "did:key:z6Mkffonly5tranger0000000000000000000000000000000";
 
     #[tokio::test]
-    async fn publish_durability_slot_drop_installs_unknowable_when_release_started_but_unrecorded(
-    ) {
+    async fn publish_durability_slot_drop_installs_unknowable_when_release_started_but_unrecorded()
+    {
         let slot = PublishDurabilitySlot::new();
         slot.mark_release_started();
         let arc = slot.arc();
         drop(slot);
-        let outcome = *arc
-            .lock()
-            .expect("publish durability mutex poisoned");
+        let outcome = *arc.lock().expect("publish durability mutex poisoned");
         assert_eq!(
             outcome,
             Some(crate::git::repo_store::ReleaseOutcome::UploadUnknowable),
@@ -3786,9 +3779,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         drop(slot);
         holder.join().expect("mutex holder thread");
-        let outcome = *arc
-            .lock()
-            .expect("publish durability mutex poisoned");
+        let outcome = *arc.lock().expect("publish durability mutex poisoned");
         assert_eq!(
             outcome,
             Some(crate::git::repo_store::ReleaseOutcome::UploadUnknowable),

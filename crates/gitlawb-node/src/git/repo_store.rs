@@ -1363,7 +1363,8 @@ impl RepoWriteGuard {
     where
         F: FnOnce(&Path) -> anyhow::Result<()>,
     {
-        self.release_maybe_compensate(success, Some(compensate)).await
+        self.release_maybe_compensate(success, Some(compensate))
+            .await
     }
 
     async fn release_maybe_compensate<F>(
