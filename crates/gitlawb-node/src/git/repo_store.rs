@@ -3710,7 +3710,7 @@ mod tests {
         let base = tempfile::TempDir::new().unwrap();
         let repo_path = base
             .path()
-            .join(&owner_slug)
+            .join(owner_slug)
             .join(format!("{repo_name}.git"));
         std::fs::create_dir_all(repo_path.parent().unwrap()).unwrap();
         crate::git::store::init_bare(&repo_path).expect("seed bare repo");
