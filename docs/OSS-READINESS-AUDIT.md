@@ -151,3 +151,11 @@ Risks:
 4. Harden peer registration and outbound fetch behavior against SSRF and peer-list poisoning.
 5. Add Docker/installer/release smoke tests to CI.
 6. Label PoS/economics docs consistently with the current live contract and rewards status.
+
+## Status updates (post-snapshot)
+
+These entries record security-posture changes after the 2026-05-28 inspection above. They do not rewrite that snapshot's command output or test counts.
+
+### 2026-08-30: GraphQL mutation auth and completeness fence (#87, #219)
+
+At `main` from `bfc44f92` onward, GraphQL mutations require a verified signer bound to the acting DID. The surface stays limited to the agent-task queue; repo writes are not exposed over GraphQL. PR #219 adds `every_graphql_mutation_has_its_gate`, a CI completeness fence that discovers mutations from the built schema SDL (with an introspection cross-check for hidden fields) and requires signer acquisition plus actor binding in each registered resolver.

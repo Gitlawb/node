@@ -186,57 +186,78 @@ mod tests {
             .join("; ")
     }
 
-    /// N2: GraphQL mutations require a verified signer and bind the acting DID to
-    /// it. Unsigned is rejected; a signer other than the claimed actor is
+    /// N2: every GraphQL mutation requires a verified signer and binds the acting
+    /// DID to it. Unsigned is rejected; a signer other than the claimed actor is
     /// rejected; the matching signer passes the auth gate.
     #[sqlx::test]
-    async fn mutation_requires_and_binds_signer(pool: PgPool) {
+    async fn each_mutation_requires_and_binds_signer(pool: PgPool) {
         let state = crate::test_support::test_state(pool).await;
         let schema = state.graphql_schema.as_ref();
-        let assignee = "did:key:zASSIGNEEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        let q = format!(
-            r#"mutation {{ claimTask(id: "no-such-task", assigneeDid: "{assignee}") {{ id }} }}"#
-        );
+        let actor = "did:key:zGQLACTORAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let other = "did:key:zGQLOTHERBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let cases: Vec<(&str, String)> = vec![
+            (
+                "createTask",
+                format!(
+                    r#"mutation {{ createTask(delegatorDid: "{actor}", input: {{ kind: "build", capability: "repo:write" }}) {{ id }} }}"#
+                ),
+            ),
+            (
+                "claimTask",
+                format!(
+                    r#"mutation {{ claimTask(id: "no-such-task", assigneeDid: "{actor}") {{ id }} }}"#
+                ),
+            ),
+            (
+                "completeTask",
+                format!(
+                    r#"mutation {{ completeTask(id: "no-such-task", byDid: "{actor}", input: {{}}) {{ id }} }}"#
+                ),
+            ),
+            (
+                "failTask",
+                format!(
+                    r#"mutation {{ failTask(id: "no-such-task", byDid: "{actor}", input: {{}}) {{ id }} }}"#
+                ),
+            ),
+        ];
 
-        // 1. Unsigned → rejected before any DB work.
-        let resp = schema.execute(Request::new(&q)).await;
-        assert!(
-            errors(&resp).contains("authentication required"),
-            "unsigned mutation must be rejected: {}",
-            errors(&resp)
-        );
+        for (name, q) in &cases {
+            let resp = schema.execute(Request::new(q.as_str())).await;
+            assert!(
+                errors(&resp).contains("authentication required"),
+                "{name}: unsigned mutation must be rejected: {}",
+                errors(&resp)
+            );
 
-        // 2. Signed as someone other than the claimed assignee → rejected.
-        let resp = schema
-            .execute(Request::new(&q).data(AuthenticatedDid(
-                "did:key:zOTHERBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into(),
-            )))
-            .await;
-        assert!(
-            errors(&resp).contains("authenticated signer"),
-            "DID mismatch must be rejected: {}",
-            errors(&resp)
-        );
+            let resp = schema
+                .execute(Request::new(q.as_str()).data(AuthenticatedDid(other.into())))
+                .await;
+            assert!(
+                errors(&resp).contains("authenticated signer"),
+                "{name}: DID mismatch must be rejected: {}",
+                errors(&resp)
+            );
 
-        // 3. Signed as the claimed assignee → passes the auth gate. The missing
-        //    task is a business error from claim_task, not a sqlx fault, so the
-        //    actionable message must survive (not the opaque DB string) (#250).
-        let resp = schema
-            .execute(Request::new(&q).data(AuthenticatedDid(assignee.into())))
-            .await;
-        let errs = errors(&resp);
-        assert!(
-            !errs.contains("authentication required") && !errs.contains("authenticated signer"),
-            "matching signer must pass the auth gate: {errs}"
-        );
-        assert!(
-            errs.contains("task not claimable"),
-            "claim race / missing task must keep its business message: {errs}"
-        );
-        assert!(
-            !errs.contains(crate::graphql::GRAPHQL_DB_ERROR_MESSAGE),
-            "business error must not be rewritten as opaque DB error: {errs}"
-        );
+            let resp = schema
+                .execute(Request::new(q.as_str()).data(AuthenticatedDid(actor.into())))
+                .await;
+            let errs = errors(&resp);
+            assert!(
+                !errs.contains("authentication required") && !errs.contains("authenticated signer"),
+                "{name}: matching signer must pass the auth gate: {errs}"
+            );
+            if *name == "claimTask" {
+                assert!(
+                    errs.contains("task not claimable"),
+                    "claim race / missing task must keep its business message: {errs}"
+                );
+                assert!(
+                    !errs.contains(crate::graphql::GRAPHQL_DB_ERROR_MESSAGE),
+                    "business error must not be rewritten as opaque DB error: {errs}"
+                );
+            }
+        }
     }
 
     /// #250: mutation DB faults must be opaque; create_task hits agent_tasks.
