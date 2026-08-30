@@ -1367,7 +1367,30 @@ impl RepoWriteGuard {
     /// half-applied or otherwise inconsistent repo would propagate corruption to
     /// Tigris (and to every node that later downloads it). The lock is always
     /// released regardless, to avoid stale locks blocking future writes.
-    pub async fn release(mut self, success: bool) -> ReleaseOutcome {
+    pub async fn release(self, success: bool) -> ReleaseOutcome {
+        self.release_maybe_compensate(success, None::<fn(&Path) -> anyhow::Result<()>>)
+            .await
+    }
+
+    /// Like [`release`], but runs `compensate` on the live tree while the advisory
+    /// lock is still held when publish ends in a definite refusal (`Fenced` or
+    /// `UploadFailed`). It is deliberately not run on `UploadUnknowable`, where the
+    /// PUT may still land and a post-release undo would race a successor writer.
+    pub async fn release_compensating<F>(self, success: bool, compensate: F) -> ReleaseOutcome
+    where
+        F: FnOnce(&Path) -> anyhow::Result<()>,
+    {
+        self.release_maybe_compensate(success, Some(compensate)).await
+    }
+
+    async fn release_maybe_compensate<F>(
+        mut self,
+        success: bool,
+        compensate: Option<F>,
+    ) -> ReleaseOutcome
+    where
+        F: FnOnce(&Path) -> anyhow::Result<()>,
+    {
         let mut outcome = ReleaseOutcome::Released;
         // Upload to Tigris only on success.
         if success {
@@ -1432,6 +1455,15 @@ impl RepoWriteGuard {
                         &self.repo_name,
                         "definite publish refusal",
                     );
+                    if let Some(compensate) = compensate {
+                        if let Err(e) = compensate(self.path()) {
+                            warn!(
+                                repo = %self.repo_name,
+                                err = %e,
+                                "compensation after a definite publish refusal failed"
+                            );
+                        }
+                    }
                 }
                 ReleaseOutcome::Released | ReleaseOutcome::UploadUnknowable => {}
             }

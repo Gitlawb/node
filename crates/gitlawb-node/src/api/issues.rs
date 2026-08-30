@@ -66,24 +66,24 @@ pub async fn create_issue(
         .acquire_write(&record.owner_did, &record.name)
         .await
         .map_err(|e| crate::api::repos::acquire_write_app_error(&e, &repo))?;
-    let disk_path = guard.path().to_path_buf();
 
-    let create_result = git_issues::create_issue(&disk_path, &issue_id, &json_str);
+    let create_result = git_issues::create_issue(guard.path(), &issue_id, &json_str);
 
-    let release_result = guard.release(create_result.is_ok()).await.into_result();
-    if release_result.is_err() && create_result.is_ok() {
-        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
-        let deadline = std::time::Instant::now() + git_timeout;
-        if let Err(rollback) =
-            git_issues::delete_issue_ref(&state.git_bin, &disk_path, &issue_id, deadline)
-        {
-            tracing::warn!(
-                issue = %issue_id,
-                err = %rollback,
-                "failed to roll back local issue after refused publish"
-            );
-        }
-    }
+    let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+    let deadline = std::time::Instant::now() + git_timeout;
+    let git_bin = state.git_bin.clone();
+    let issue_id_for_comp = issue_id.clone();
+
+    let release_result = if create_result.is_ok() {
+        guard
+            .release_compensating(true, move |path| {
+                git_issues::delete_issue_ref(&git_bin, path, &issue_id_for_comp, deadline)
+            })
+            .await
+            .into_result()
+    } else {
+        guard.release(false).await.into_result()
+    };
     release_result?;
 
     create_result.map_err(|e| AppError::Git(e.to_string()))?;

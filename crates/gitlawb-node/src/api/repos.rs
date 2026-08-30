@@ -2530,24 +2530,24 @@ pub async fn git_receive_pack(
 /// [`ReleaseOutcome::UploadUnknowable`] so the tail can proceed on local disk
 /// without waiting out the full transfer bound.
 struct PublishDurabilitySlot {
-    inner: Arc<tokio::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>>,
+    inner: Arc<std::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>>,
     recorded: std::sync::atomic::AtomicBool,
 }
 
 impl PublishDurabilitySlot {
     fn new() -> Self {
         Self {
-            inner: Arc::new(tokio::sync::Mutex::new(None)),
+            inner: Arc::new(std::sync::Mutex::new(None)),
             recorded: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    fn arc(&self) -> Arc<tokio::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>> {
+    fn arc(&self) -> Arc<std::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>> {
         Arc::clone(&self.inner)
     }
 
     async fn record(&self, outcome: crate::git::repo_store::ReleaseOutcome) {
-        *self.inner.lock().await = Some(outcome);
+        *self.inner.lock().expect("publish durability mutex poisoned") = Some(outcome);
         self.recorded
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -2555,19 +2555,24 @@ impl PublishDurabilitySlot {
 
 impl Drop for PublishDurabilitySlot {
     fn drop(&mut self) {
-        if self.recorded.load(std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .recorded
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return;
         }
-        if let Ok(mut slot) = self.inner.try_lock() {
-            if slot.is_none() {
-                *slot = Some(crate::git::repo_store::ReleaseOutcome::UploadUnknowable);
-            }
+        let mut slot = self
+            .inner
+            .lock()
+            .expect("publish durability mutex poisoned");
+        if slot.is_none() {
+            *slot = Some(crate::git::repo_store::ReleaseOutcome::UploadUnknowable);
         }
     }
 }
 
 async fn publish_durability_confirmed(
-    slot: &Option<Arc<tokio::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>>>,
+    slot: &Option<Arc<std::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>>>,
     wait: std::time::Duration,
 ) -> bool {
     let Some(slot) = slot else {
@@ -2575,7 +2580,10 @@ async fn publish_durability_confirmed(
     };
     let start = std::time::Instant::now();
     loop {
-        if let Some(outcome) = *slot.lock().await {
+        if let Some(outcome) = *slot
+            .lock()
+            .expect("publish durability mutex poisoned")
+        {
             return matches!(
                 outcome,
                 crate::git::repo_store::ReleaseOutcome::Released
@@ -2588,7 +2596,9 @@ async fn publish_durability_confirmed(
             // UploadUnknowable via PublishDurabilitySlot::drop so the tail can
             // proceed on local disk without waiting out the full bound.
             return matches!(
-                *slot.lock().await,
+                *slot
+                    .lock()
+                    .expect("publish durability mutex poisoned"),
                 Some(crate::git::repo_store::ReleaseOutcome::Released)
                     | Some(crate::git::repo_store::ReleaseOutcome::UploadUnknowable)
             );
@@ -2604,7 +2614,7 @@ async fn post_receive_replication_tail(
     disk_path: std::path::PathBuf,
     did: String,
     publish_durability: Option<
-        Arc<tokio::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>>,
+        Arc<std::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>>,
     >,
 ) {
     let durability_wait = std::time::Duration::from_secs(
@@ -3725,11 +3735,37 @@ mod tests {
         let slot = PublishDurabilitySlot::new();
         let arc = slot.arc();
         drop(slot);
-        let outcome = *arc.lock().await;
+        let outcome = *arc
+            .lock()
+            .expect("publish durability mutex poisoned");
         assert_eq!(
             outcome,
             Some(crate::git::repo_store::ReleaseOutcome::UploadUnknowable),
             "dropping an unrecorded slot must publish UploadUnknowable for the tail"
+        );
+    }
+
+    #[test]
+    fn publish_durability_slot_drop_waits_for_contended_mutex() {
+        let slot = PublishDurabilitySlot::new();
+        let arc = slot.arc();
+        let holder = {
+            let arc = Arc::clone(&arc);
+            std::thread::spawn(move || {
+                let _guard = arc.lock().expect("publish durability mutex poisoned");
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        drop(slot);
+        holder.join().expect("mutex holder thread");
+        let outcome = *arc
+            .lock()
+            .expect("publish durability mutex poisoned");
+        assert_eq!(
+            outcome,
+            Some(crate::git::repo_store::ReleaseOutcome::UploadUnknowable),
+            "drop must block until it can install UploadUnknowable, not give up on try_lock"
         );
     }
 
@@ -3750,7 +3786,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_durability_confirmed_fails_closed_when_release_never_records() {
-        let slot = Arc::new(tokio::sync::Mutex::new(None));
+        let slot = Arc::new(std::sync::Mutex::new(None));
         let confirmed =
             publish_durability_confirmed(&Some(slot), std::time::Duration::from_millis(30)).await;
         assert!(
@@ -3762,14 +3798,14 @@ mod tests {
 
     #[tokio::test]
     async fn publish_durability_confirmed_accepts_only_released() {
-        let slot = Arc::new(tokio::sync::Mutex::new(Some(
+        let slot = Arc::new(std::sync::Mutex::new(Some(
             crate::git::repo_store::ReleaseOutcome::Released,
         )));
         assert!(
             publish_durability_confirmed(&Some(slot), std::time::Duration::from_millis(5)).await
         );
 
-        let slot = Arc::new(tokio::sync::Mutex::new(Some(
+        let slot = Arc::new(std::sync::Mutex::new(Some(
             crate::git::repo_store::ReleaseOutcome::UploadUnknowable,
         )));
         assert!(
@@ -3777,7 +3813,7 @@ mod tests {
             "an unknowable upload still landed on local disk, so the tail may proceed"
         );
 
-        let slot = Arc::new(tokio::sync::Mutex::new(Some(
+        let slot = Arc::new(std::sync::Mutex::new(Some(
             crate::git::repo_store::ReleaseOutcome::UploadFailed,
         )));
         assert!(
@@ -10153,7 +10189,7 @@ mod tests {
         u5_init_repo(repo.path());
         let c1 = u5_commit_file(repo.path(), "a.txt", "one\n");
         let (state, rec) = f2a_state(pool, &git_bin, "z6f2afence", "fence-repo", false).await;
-        let slot = Arc::new(tokio::sync::Mutex::new(Some(
+        let slot = Arc::new(std::sync::Mutex::new(Some(
             crate::git::repo_store::ReleaseOutcome::Fenced,
         )));
         post_receive_replication_tail(

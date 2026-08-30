@@ -61,9 +61,10 @@ pub fn create_issue(repo_path: &Path, issue_id: &str, json: &str) -> Result<()> 
     Ok(())
 }
 
-/// Remove a single issue ref after a failed publish rolled back the handler's view
-/// of the write. Best-effort: a failed delete leaves a local-only orphan, which is
-/// still better than telling the client to retry into a duplicate id.
+/// Remove a single issue ref while the write guard still holds the advisory lock,
+/// after a definite publish refusal. Best-effort: a failed delete leaves a
+/// local-only orphan, which is still better than telling the client to retry into a
+/// duplicate id. Not used on `UploadUnknowable`, where the PUT may still land.
 pub fn delete_issue_ref(
     git_bin: &str,
     repo_path: &Path,
