@@ -526,7 +526,7 @@ impl RepoStore {
                                 .await
                             {
                                 Ok(()) => Ok(fence),
-                                Err(err) => Err(RefreshFailure::Download { err, fence }),
+                                Err(err) => Err(RefreshFailure::Download { err }),
                             }
                         }
                         Ok(None) => Ok(UploadPrecondition::IfAbsent),
@@ -538,33 +538,16 @@ impl RepoStore {
 
             match refreshed {
                 Some(Ok(fence)) => guard.publish_fence = fence,
-                Some(Err(RefreshFailure::Download { err, fence })) => {
-                    // The archive is present but unreadable: a corrupt or partial
-                    // upload, or a transient GET failure. We KNOW the fetch failed,
-                    // so falling back to a valid local copy is sound and
-                    // release(success) re-uploads a good archive. Only hard-fail
-                    // when there is no local copy to fall back to.
-                    if local_path.exists() {
-                        warn!(repo = %repo_name, err = %err,
-                            "write acquire: tigris refresh failed — falling back to local copy");
-                        // Still fence on what the HEAD saw. The download failing
-                        // says nothing about the generation stored, so publishing
-                        // unconditionally here would reintroduce exactly the
-                        // overwrite this carries the ETag to prevent.
-                        guard.publish_fence = fence;
-                    } else {
-                        // No local copy, so the write cannot proceed and the
-                        // archive's readability is unknowable. Same epistemic
-                        // class as the HEAD arm: a transient storage blip must be
-                        // a retryable refusal, not a 500 that tells the client the
-                        // failure is permanent. Wrap so the handler layer's
-                        // `RepoUnavailable` downcast maps this to a retryable 503
-                        // with a fixed body; the detail (which repo, why) stays in
-                        // this error chain for the log.
-                        return Err(anyhow::Error::new(RepoUnavailable).context(format!(
-                            "tigris download failed during acquire_write for {owner_slug}/{repo_name}: {err:#}"
-                        )));
-                    }
+                Some(Err(RefreshFailure::Download { err, .. })) => {
+                    // HEAD established a stored generation but the GET failed, so we
+                    // do not know whether the local tree matches it. Proceeding on a
+                    // cached copy and publishing fenced on the observed ETag can
+                    // overwrite a newer archive with stale-local + this write.
+                    warn!(repo = %repo_name, err = %err,
+                        "write acquire: tigris download failed under the lock — refusing rather than writing against an unverified local tree");
+                    return Err(anyhow::Error::new(RepoUnavailable).context(format!(
+                        "tigris download failed during acquire_write for {owner_slug}/{repo_name}: {err:#}"
+                    )));
                 }
                 Some(Err(RefreshFailure::Unknown(e))) => {
                     // The HEAD itself failed, so we do not know whether a newer
@@ -1595,16 +1578,15 @@ const LOCK_ACQUIRE_DEADLINE: Duration = Duration::from_secs(90);
 /// Why an under-lock refresh did not complete, split by what it leaves us knowing.
 ///
 /// `Unknown` (the existence check failed) and `Download` (the archive is there and
-/// unreadable) must not share a branch: only the second establishes that the local
-/// copy is a sound thing to fall back to and re-upload.
+/// unreadable) must not share a branch: neither establishes that the local tree
+/// matches the generation the HEAD observed.
 enum RefreshFailure {
     Unknown(anyhow::Error),
-    /// Carries the fence the HEAD observed alongside the error, because the
-    /// fallback arm still publishes later and must be fenced on the generation
-    /// it saw. `Unknown` carries none: that arm refuses the write outright.
+    /// Carries the GET error. The under-lock path refuses the write rather than
+    /// falling back to local, because a failed GET does not prove the cached tree
+    /// is current.
     Download {
         err: anyhow::Error,
-        fence: UploadPrecondition,
     },
 }
 
@@ -3684,6 +3666,69 @@ mod tests {
             Ok(guard) => {
                 let _ = guard.release(false).await;
                 panic!("a failed download with no local copy must refuse the write");
+            }
+        };
+        assert!(
+            err.downcast_ref::<RepoUnavailable>().is_some(),
+            "the refusal must be typed so the handler layer maps it to a retryable 503, got {err:#}"
+        );
+
+        server.abort();
+    }
+
+    /// A failed under-lock GET must refuse even when a local copy exists. HEAD
+    /// only establishes the stored generation, not that the cached tree matches
+    /// it, so writing against stale-local + new commits can overwrite a newer
+    /// archive when the GET fails transiently.
+    #[sqlx::test]
+    async fn acquire_write_refuses_when_the_download_fails_with_a_local_copy(pool: PgPool) {
+        use axum::response::IntoResponse;
+
+        let app = axum::Router::new().route(
+            "/{*key}",
+            axum::routing::any(|method: axum::http::Method| async move {
+                if method == axum::http::Method::HEAD {
+                    let mut resp = axum::http::StatusCode::OK.into_response();
+                    resp.headers_mut()
+                        .insert("etag", axum::http::HeaderValue::from_static("\"gen-1\""));
+                    resp
+                } else {
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let owner = "did:key:z6MkStaleLocalWrite";
+        let repo_name = "writerepo";
+        let owner_slug = crate::db::normalize_owner_key(owner);
+        let base = tempfile::TempDir::new().unwrap();
+        let repo_path = base
+            .path()
+            .join(&owner_slug)
+            .join(format!("{repo_name}.git"));
+        std::fs::create_dir_all(repo_path.parent().unwrap()).unwrap();
+        crate::git::store::init_bare(&repo_path).expect("seed bare repo");
+
+        let opts = (*pool.connect_options()).clone();
+        let lock_pool = no_reap_pool(&opts, 2).await;
+        let store = RepoStore::for_testing_with_tigris(
+            base.path().to_path_buf(),
+            lock_pool,
+            TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint),
+        );
+
+        let err = match store.acquire_write(owner, repo_name).await {
+            Err(e) => e,
+            Ok(guard) => {
+                let _ = guard.release(false).await;
+                panic!(
+                    "a failed download with a local copy must refuse rather than write against an unverified tree"
+                );
             }
         };
         assert!(

@@ -2376,20 +2376,6 @@ pub async fn git_receive_pack(
     // change to the client contract than the window it closes.
     let push_succeeded = receive_result.is_ok();
     let publish_durability = PublishDurabilitySlot::new();
-    if push_succeeded {
-        tokio::spawn(post_receive_replication_tail(
-            state.clone(),
-            record.clone(),
-            ref_updates.clone(),
-            disk_path.clone(),
-            auth.0.to_string(),
-            Some(publish_durability.arc()),
-        ));
-    }
-
-    // Always release the advisory lock — even on error — to prevent stale locks
-    // from blocking subsequent pushes. Only upload to Tigris when the push
-    // succeeded; uploading a half-applied repo would propagate corruption.
     // Reclaim the write lock from the shared cell (#173 F2). This is only reachable
     // once `receive_pack` has returned, so the admission guard's copy can only ever
     // DELAY release, never perform it early; on the disconnect path this line is not
@@ -2399,6 +2385,17 @@ pub async fn git_receive_pack(
         .expect("repo write-lock mutex poisoned")
         .take()
         .expect("the write lock is only taken here, and only once");
+    if push_succeeded {
+        publish_durability.mark_release_started();
+        tokio::spawn(post_receive_replication_tail(
+            state.clone(),
+            record.clone(),
+            ref_updates.clone(),
+            disk_path.clone(),
+            auth.0.to_string(),
+            Some(publish_durability.arc()),
+        ));
+    }
     // Short-circuit on a refused publish BEFORE anything downstream observes
     // the push. The pack is on local disk but not in object storage, so
     // touching the repo, recording the push, bumping trust, issuing ref
@@ -2526,12 +2523,15 @@ pub async fn git_receive_pack(
 /// task. Split out of `git_receive_pack` so the ordering the coalescing gate depends
 /// on is directly testable; the handler spawns it and returns.
 /// Records the release-side publish outcome for the detached post-receive tail.
-/// If the handler future is dropped before [`Self::record`], the drop sets
-/// [`ReleaseOutcome::UploadUnknowable`] so the tail can proceed on local disk
-/// without waiting out the full transfer bound.
+/// If the handler future is dropped after [`Self::mark_release_started`] but
+/// before [`Self::record`], the drop sets [`ReleaseOutcome::UploadUnknowable`]
+/// so the tail can proceed on local disk without waiting out the full transfer
+/// bound. A drop before release starts leaves the slot empty so the tail fails
+/// closed rather than treating an unattempted publish as unknowably durable.
 struct PublishDurabilitySlot {
     inner: Arc<std::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>>,
     recorded: std::sync::atomic::AtomicBool,
+    release_started: std::sync::atomic::AtomicBool,
 }
 
 impl PublishDurabilitySlot {
@@ -2539,7 +2539,13 @@ impl PublishDurabilitySlot {
         Self {
             inner: Arc::new(std::sync::Mutex::new(None)),
             recorded: std::sync::atomic::AtomicBool::new(false),
+            release_started: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn mark_release_started(&self) {
+        self.release_started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn arc(&self) -> Arc<std::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>> {
@@ -2557,6 +2563,12 @@ impl Drop for PublishDurabilitySlot {
     fn drop(&mut self) {
         if self
             .recorded
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        if !self
+            .release_started
             .load(std::sync::atomic::Ordering::SeqCst)
         {
             return;
@@ -3731,8 +3743,10 @@ mod tests {
     const STRANGER_DID: &str = "did:key:z6Mkffonly5tranger0000000000000000000000000000000";
 
     #[tokio::test]
-    async fn publish_durability_slot_drop_installs_unknowable_when_never_recorded() {
+    async fn publish_durability_slot_drop_installs_unknowable_when_release_started_but_unrecorded(
+    ) {
         let slot = PublishDurabilitySlot::new();
+        slot.mark_release_started();
         let arc = slot.arc();
         drop(slot);
         let outcome = *arc
@@ -3741,13 +3755,26 @@ mod tests {
         assert_eq!(
             outcome,
             Some(crate::git::repo_store::ReleaseOutcome::UploadUnknowable),
-            "dropping an unrecorded slot must publish UploadUnknowable for the tail"
+            "dropping an unrecorded slot after release starts must publish UploadUnknowable for the tail"
+        );
+    }
+
+    #[test]
+    fn publish_durability_slot_drop_leaves_empty_before_release_starts() {
+        let slot = PublishDurabilitySlot::new();
+        let arc = slot.arc();
+        drop(slot);
+        assert_eq!(
+            *arc.lock().expect("publish durability mutex poisoned"),
+            None,
+            "dropping before release starts must not synthesize durability for the tail"
         );
     }
 
     #[test]
     fn publish_durability_slot_drop_waits_for_contended_mutex() {
         let slot = PublishDurabilitySlot::new();
+        slot.mark_release_started();
         let arc = slot.arc();
         let holder = {
             let arc = Arc::clone(&arc);
@@ -3773,6 +3800,7 @@ mod tests {
     async fn publish_durability_confirmed_proceeds_quickly_after_unrecorded_slot_drop() {
         let start = std::time::Instant::now();
         let slot = PublishDurabilitySlot::new();
+        slot.mark_release_started();
         let arc = slot.arc();
         drop(slot);
         let confirmed =

@@ -225,7 +225,8 @@ fn f4_release_keeps_conn_owned_until_unlock_resolves() {
     let repo_store = src("git/repo_store.rs");
 
     let rel_start = repo_store
-        .find("pub async fn release(mut self")
+        .find("pub async fn release(self")
+        .or_else(|| repo_store.find("pub async fn release(mut self"))
         .expect("F4 gate: repo_store.rs no longer defines RepoWriteGuard::release");
     let rel_end = repo_store[rel_start..]
         .find("impl Drop for RepoWriteGuard")
