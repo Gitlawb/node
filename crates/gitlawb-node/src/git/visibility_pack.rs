@@ -3580,6 +3580,49 @@ esac\n";
         );
     }
 
+    /// Write a blob into `bare`'s object store that NO commit reaches, and
+    /// return its OID.
+    ///
+    /// #218 review round 8 P2 (why this exists): the phase-2 ref tests used to
+    /// hang the ref on `fixture()`'s `secret` blob, which is COMMITTED at
+    /// `secret/b.txt`. Phase 1's per-commit `ls-tree` therefore already yielded
+    /// `(secret, "/secret/b.txt")`, the `/secret/**` rule already denied it, and
+    /// the `withheld.contains(&secret)` assertion passed with phase 2 deleted
+    /// outright — the tests bound nothing. A blob written straight to the object
+    /// store is absent from every commit's tree, so phase 1 cannot see it and the
+    /// ONLY way it reaches the withheld set is the `for-each-ref` phase. That is
+    /// also the exact shape of the leak: `rev_list_keep`'s
+    /// `git rev-list --objects --all` DOES follow a ref to such a blob (verified
+    /// against stock git), so an under-withheld one ships in the clone pack.
+    ///
+    /// `hash-object -w --stdin` is the minimal way to produce it; committing the
+    /// content and then orphaning the commit reaches the same state by a longer
+    /// route, and would additionally leave the content in a reflog the walk does
+    /// not read.
+    #[cfg(test)]
+    fn orphan_blob(bare: &Path, content: &str) -> String {
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut child = Command::new("git")
+            .args(["hash-object", "-w", "--stdin"])
+            .current_dir(bare)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(content.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "git hash-object failed");
+        let oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert!(!oid.is_empty(), "git hash-object produced no OID");
+        oid
+    }
+
     #[test]
     fn skips_a_ref_pointing_at_a_blob() {
         // #218 review round 1: a ref pointing at a blob is a valid Git
@@ -3597,18 +3640,66 @@ esac\n";
         // adds a `for-each-ref` phase 2 to `blob_paths` that
         // enumerates non-commit ref targets and inserts them with
         // empty path; the deny-side caller withholds empty-path
-        // entries by OID. This test now asserts the secret blob is
-        // actually withheld.
-        let (_td, bare, secret, _public) = fixture();
-        std::fs::write(bare.join("refs/heads/blobref"), format!("{secret}\n")).unwrap();
+        // entries by OID.
+        //
+        // #218 review round 8 P2 (non-vacuity): the blob under test is
+        // `orphan_blob`'s, reachable ONLY through the ref written below —
+        // no commit's tree names it, so phase 1 contributes nothing for it
+        // and the assertion binds phase 2 alone. Verified by mutation:
+        // neutralizing the phase-2 filter turns this RED.
+        let (_td, bare, _secret, _public) = fixture();
+        let orphan = orphan_blob(&bare, "TOP SECRET, ref-only\n");
+        std::fs::write(bare.join("refs/heads/blobref"), format!("{orphan}\n")).unwrap();
         let rules = [rule("/secret/**", &[])];
         let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None)
             .expect("a ref pointing at a non-commit object no longer fails the whole walk");
         assert!(
-            withheld.contains(&secret),
-            "the secret blob's OID must be withheld when reachable only via a direct \
-             ref-to-blob — otherwise the smart-http serve filter would advertise it \
-             via `git rev-list --objects --all` and the cloned pack would carry the bytes"
+            withheld.contains(&orphan),
+            "a blob reachable ONLY via a direct ref-to-blob must be withheld — no \
+             commit path names it, so nothing but the for-each-ref phase can put it \
+             in the deny set, while `git rev-list --objects --all` already serves it"
+        );
+    }
+
+    /// #218 review round 8 P1 (the allow side of the same pair): the
+    /// `GET /ipfs/{cid}` gate consumes the SAME `blob_paths` listing through
+    /// `allowed_blob_set_for_caller_bounded`. Before the shared `pair_decision`,
+    /// that consumer ran `visibility_check(..., "")` on a phase-2 entry, and on a
+    /// public repo no glob matches the empty path so the answer was `Allow` — the
+    /// serve filter withheld the OID while the IPFS gate handed the bytes over.
+    /// The two sides must agree: an anonymous caller is denied, the owner is not.
+    #[test]
+    fn ref_only_blob_is_denied_on_the_allow_side_too() {
+        let (_td, bare, _secret, _public) = fixture();
+        let orphan = orphan_blob(&bare, "TOP SECRET, ref-only, allow side\n");
+        std::fs::write(bare.join("refs/heads/blobref"), format!("{orphan}\n")).unwrap();
+        // A PUBLIC repo with a rule that cannot match an empty path: the
+        // pre-fix path-based check returned Allow here.
+        let rules = [rule("/secret/**", &[])];
+
+        let anon = allowed_blob_set_for_caller(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            !anon.contains(&orphan),
+            "the allow side must NOT admit a ref-only blob to an anonymous caller — \
+             the serve filter withholds this exact OID, and a disagreement means \
+             `GET /ipfs/{{cid}}` serves what the clone pack refused"
+        );
+
+        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            withheld.contains(&orphan) && !anon.contains(&orphan),
+            "deny side and allow side must reach the SAME verdict for one OID"
+        );
+
+        // The owner is the one identity the empty-path policy admits, so the
+        // test also proves the shared decision is owner-only rather than
+        // deny-everything (which would pass the assertion above vacuously).
+        let owner_set = allowed_blob_set_for_caller(&bare, &rules, true, OWNER, Some(OWNER))
+            .expect("owner walk must succeed");
+        assert!(
+            owner_set.contains(&orphan),
+            "the owner — the only identity that could have created the ref tip — \
+             must still be able to read a ref-only blob"
         );
     }
 
@@ -3651,13 +3742,23 @@ esac\n";
         // this and failed the whole walk closed; round 1 drops
         // the guard. #218 review round 3 P1: same shape as
         // `skips_a_ref_pointing_at_a_blob` — the deny set must
-        // include the secret blob. The annotated tag
-        // `blobtag` peels to `secret`, not a commit; `git
-        // rev-list --all` skips the tag; the round-3 phase-2
-        // `for-each-ref` in `blob_paths` enumerates the tag and
-        // inserts `secret` with empty path; the deny-side caller
-        // withholds by OID.
-        let (_td, bare, secret, _public) = fixture();
+        // include the blob. The annotated tag `blobtag` peels to
+        // the blob, not a commit; `git rev-list --all` skips the
+        // tag; the phase-2 `for-each-ref` in `blob_paths`
+        // enumerates the tag and inserts the referent with an
+        // empty path; the deny-side caller withholds by OID.
+        //
+        // #218 review round 8 P1 (peeling) + P2 (non-vacuity): this is the
+        // shape the ref walk MISSED before the peeled atoms were added.
+        // `%(objecttype)` of an annotated tag is `tag`, so the blob/tree arms
+        // never saw the referent and the tag contributed nothing; the OLD test
+        // passed anyway only because its blob was also committed at
+        // `secret/b.txt` and phase 1 withheld it. The blob here is
+        // `orphan_blob`'s — reachable through the tag and nothing else — so
+        // the assertion now fails without BOTH the phase and its peel.
+        // Verified by mutation: neutralizing the phase-2 filter turns this RED.
+        let (_td, bare, _secret, _public) = fixture();
+        let orphan = orphan_blob(&bare, "TOP SECRET, tag-only\n");
         let run = |args: &[&str]| {
             assert!(
                 Command::new("git")
@@ -3671,17 +3772,96 @@ esac\n";
         };
         run(&["config", "user.email", "t@t"]);
         run(&["config", "user.name", "t"]);
-        run(&["tag", "-a", "-m", "blobtag", "blobtag", &secret]);
+        run(&["tag", "-a", "-m", "blobtag", "blobtag", &orphan]);
 
         let rules = [rule("/secret/**", &[])];
         let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None)
             .expect("an annotated tag of a blob no longer fails the whole walk");
         assert!(
-            withheld.contains(&secret),
-            "the secret blob's OID must be withheld when reachable only via an \
-             annotated tag — otherwise the smart-http serve filter would advertise it \
-             via `git rev-list --objects --all` (which DOES peel tags) and the cloned \
-             pack would carry the bytes"
+            withheld.contains(&orphan),
+            "a blob reachable only via an ANNOTATED tag must be withheld — the ref's \
+             own object type is `tag`, so only the peeled referent puts it in the deny \
+             set, while `git rev-list --objects --all` (which DOES peel tags) serves it"
+        );
+    }
+
+    /// #218 review round 8 P1: the peel must survive a NESTED annotated tag
+    /// (tag -> tag -> blob). Stock git's `%(*objectname)` peels the whole chain,
+    /// so this covers the shipped behavior; the fake-git twin below covers a git
+    /// that peels only one level.
+    #[test]
+    fn skips_a_nested_annotated_tag_of_a_blob() {
+        let (_td, bare, _secret, _public) = fixture();
+        let orphan = orphan_blob(&bare, "TOP SECRET, nested-tag-only\n");
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&bare)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["tag", "-a", "-m", "inner", "blobtag-inner", &orphan]);
+        run(&["tag", "-a", "-m", "outer", "blobtag-outer", "blobtag-inner"]);
+        // Only the outer tag stays a ref, so the blob is reachable exclusively
+        // through a two-level tag chain.
+        run(&["tag", "-d", "blobtag-inner"]);
+
+        let rules = [rule("/secret/**", &[])];
+        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None)
+            .expect("a nested annotated tag of a blob must not fail the walk closed");
+        assert!(
+            withheld.contains(&orphan),
+            "a blob behind a tag-of-a-tag must be withheld: `rev-list --objects --all` \
+             peels the whole chain and serves it, so the deny set has to as well"
+        );
+    }
+
+    /// #218 review round 8 P1: drives the one-level-peel fallback that stock git
+    /// (2.50) never reaches. A fake git answers `for-each-ref` with a peeled type
+    /// of `tag` — the shape `push_delta.rs`'s ref-type guard documents — and the
+    /// walk must finish the peel via `rev-parse <oid>^{}` + `cat-file -t` and
+    /// withhold the final blob, rather than bail and 500 the clone.
+    #[cfg(unix)]
+    #[test]
+    fn peels_a_tag_whose_peeled_target_is_still_a_tag() {
+        let tmp = TempDir::new().unwrap();
+        let outer = "1111111111111111111111111111111111111111";
+        let inner = "2222222222222222222222222222222222222222";
+        let blob = "3333333333333333333333333333333333333333";
+        // rev-parse: HEAD probe must FAIL (exit 1) so the walk skips it, but the
+        // `^{}` full peel must answer with the blob. `rev-list` lists no commits,
+        // so phase 1 contributes nothing and the OID can only arrive via phase 2.
+        let body = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  \
+             rev-parse) case \"$2\" in --verify) exit 1 ;; *) echo {blob} ;; esac ;;\n  \
+             rev-list) : ;;\n  \
+             for-each-ref) echo {outer} tag {inner} tag ;;\n  \
+             cat-file) echo blob ;;\n  \
+             *) : ;;\nesac\nexit 0\n"
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+
+        let rules = [rule("/secret/**", &[])];
+        let withheld = withheld_blob_oids_bounded(
+            tmp.path(),
+            &git_bin,
+            Duration::from_secs(10),
+            &rules,
+            true,
+            OWNER,
+            None,
+        )
+        .expect("a still-a-tag peel must be resolved, not bailed on");
+        assert!(
+            withheld.contains(blob),
+            "under a git that peels only one level, the walk must finish the peel \
+             itself and withhold the final blob"
         );
     }
 
