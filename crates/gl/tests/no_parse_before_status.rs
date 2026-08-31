@@ -154,19 +154,76 @@ fn window_is_bypass(window: &str) -> bool {
     completes && window.contains(".is_success()")
 }
 
-/// Is there a status check ABOVE this parse site — i.e. is the parse guarded at
-/// all?
+/// Is there a FULL non-success guard ABOVE this parse site — one that exits for
+/// every non-2xx status, not merely a bespoke branch for one code?
 ///
 /// `window_is_bypass` only recognises a status check that lands AFTER the parse,
 /// so it describes one specific bypass and says nothing about a parse with no
 /// status check anywhere. That shape is the more dangerous revert (it renders a
-/// denial body as a successful result with no check at all) and it went green:
-/// with nothing matching `.is_success()` after it, there was nothing to flag.
-/// Requiring positive evidence of a status check first turns the rule from
-/// "detect one bad ordering" into "require the good ordering", which also covers
-/// a check spelled `as_u16() >= 400` since that still reads `.status()`.
-fn has_status_check_above(lookback: &str) -> bool {
-    lookback.contains(".status()") || lookback.contains(".is_success()")
+/// denial body as a successful result with no check at all). Requiring positive
+/// evidence of a guard first turns the rule from "detect one bad ordering" into
+/// "require the good ordering".
+///
+/// The evidence must cover the whole non-success range. "Any `.status()`
+/// nearby" is not enough: agent.rs legitimately keeps a 404-only hint
+/// (`resp.status() == StatusCode::NOT_FOUND`) ahead of its `read_json` call,
+/// and a revert that swaps that call for `resp.json().await?` would still see
+/// the 404 check in the lookback — while a 500's JSON denial body renders as an
+/// empty agent list again. A single-status equality (or a `matches!(…, 404 |
+/// 501)` enumeration) guards its own arm and nothing else, so it does not
+/// count. What counts:
+///
+/// - `.is_success()` — the canonical spelling; sync.rs binds the status to a
+///   variable first, so this token is matched on its own rather than as a
+///   `.status()` suffix;
+/// - a RANGE comparison over `as_u16()` (`>= 400` and friends), which reads the
+///   whole class rather than enumerating codes.
+///
+/// The `special_404_hint_is_not_a_guard` mutation test below keeps this
+/// distinction honest against the real agent.rs source.
+fn has_full_status_guard_above(lookback: &str) -> bool {
+    if lookback.contains(".is_success()") {
+        return true;
+    }
+    lookback.contains("as_u16() >=")
+        || lookback.contains("as_u16() >")
+        || lookback.contains("as_u16() <=")
+        || lookback.contains("as_u16() <")
+}
+
+/// The scan shared by the gate and the mutation regression: every raw parse
+/// site in `text` is classified as an after-the-parse bypass (`offenders`) or a
+/// parse with no full status guard above it (`unguarded`). Factored out so the
+/// mutation test exercises EXACTLY the logic the gate runs, not a paraphrase of
+/// it.
+fn scan_handler(name: &str, text: &str) -> (Vec<String>, Vec<String>) {
+    let mut offenders = Vec::new();
+    let mut unguarded = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if !opens_json_parse(line) {
+            continue;
+        }
+        // Join the parse-site line with the following lines so a split-line
+        // chain's `.await` and an after-the-parse `.is_success()` are both in
+        // view. Status-first probes put `.is_success()` on an EARLIER line, so
+        // it is outside this window and stays green.
+        let window = lines[i..(i + 6).min(lines.len())].join("\n");
+        if window_is_bypass(&window) {
+            offenders.push(format!("{name}:{}", i + 1));
+            continue;
+        }
+        // A parse that never resolves is not a read; only a completed parse
+        // can render a denial body as a result.
+        if !window.contains(".await") {
+            continue;
+        }
+        let lookback = lines[i.saturating_sub(STATUS_LOOKBACK)..i].join("\n");
+        if !has_full_status_guard_above(&lookback) {
+            unguarded.push(format!("{name}:{}", i + 1));
+        }
+    }
+    (offenders, unguarded)
 }
 
 #[test]
@@ -218,30 +275,9 @@ fn converted_handlers_never_parse_before_status() {
     let mut offenders = Vec::new();
     let mut unguarded = Vec::new();
     for (name, text) in &handlers {
-        let lines: Vec<&str> = text.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
-            if !opens_json_parse(line) {
-                continue;
-            }
-            // Join the parse-site line with the following lines so a split-line
-            // chain's `.await` and an after-the-parse `.is_success()` are both in
-            // view. Status-first probes put `.is_success()` on an EARLIER line, so
-            // it is outside this window and stays green.
-            let window = lines[i..(i + 6).min(lines.len())].join("\n");
-            if window_is_bypass(&window) {
-                offenders.push(format!("{name}:{}", i + 1));
-                continue;
-            }
-            // A parse that never resolves is not a read; only a completed parse
-            // can render a denial body as a result.
-            if !window.contains(".await") {
-                continue;
-            }
-            let lookback = lines[i.saturating_sub(STATUS_LOOKBACK)..i].join("\n");
-            if !has_status_check_above(&lookback) {
-                unguarded.push(format!("{name}:{}", i + 1));
-            }
-        }
+        let (o, u) = scan_handler(name, text);
+        offenders.extend(o);
+        unguarded.extend(u);
     }
 
     assert!(
@@ -251,8 +287,69 @@ fn converted_handlers_never_parse_before_status() {
     );
     assert!(
         unguarded.is_empty(),
-        "node response parsed with NO status check above it in a converted handler — \
-         the denial body is being rendered as a result. Route the read through \
-         crate::http::read_json (status-first, capped, sanitized): {unguarded:?}"
+        "node response parsed with NO full status guard above it in a converted \
+         handler — the denial body is being rendered as a result. Route the read \
+         through crate::http::read_json (status-first, capped, sanitized): {unguarded:?}"
+    );
+}
+
+/// Mutation regression for the special-404 escape: agent.rs (and the agent-show
+/// / repo-info paths shaped like it) keeps a legitimate 404-only hint ahead of
+/// its `read_json` call. Revert that call to a raw `resp.json().await?` and the
+/// 404 equality is the only status evidence in the lookback — under the old
+/// "any `.status()` nearby" rule the fence stayed green while a 500's denial
+/// body rendered as an empty agent list. This test performs that exact revert
+/// on the REAL agent.rs source and requires the scan to flag the mutant, so the
+/// full-guard distinction in `has_full_status_guard_above` cannot regress to a
+/// mere proximity check without going red here.
+#[test]
+fn special_404_hint_is_not_a_guard() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let text = std::fs::read_to_string(src.join("agent.rs")).expect("read agent.rs");
+
+    // The mutation must stay real: it requires the idiom it reverts. If
+    // agent.rs drops the 404 hint or the read_json call, this needs re-basing
+    // on whichever handler carries the special-404 idiom then.
+    assert!(
+        text.contains("StatusCode::NOT_FOUND"),
+        "agent.rs no longer carries the special-404 hint this mutation reverts; \
+         re-anchor the mutation on the handler that does"
+    );
+    let lines: Vec<&str> = text.lines().collect();
+    let not_found_line = lines
+        .iter()
+        .position(|l| l.contains("StatusCode::NOT_FOUND"))
+        .unwrap();
+    let read_json_line = lines[not_found_line..]
+        .iter()
+        .position(|l| l.contains("read_json"))
+        .map(|off| not_found_line + off)
+        .expect(
+            "agent.rs has no read_json call after its 404 hint; re-anchor the \
+             mutation on the handler that carries the idiom",
+        );
+
+    // The revert under test: the guarded helper call becomes a raw parse.
+    let mut mutant: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    mutant[read_json_line] = "    let body: serde_json::Value = resp.json().await?;".to_string();
+    let mutant = mutant.join("\n");
+
+    let (_, unguarded) = scan_handler("agent.rs[mutant]", &mutant);
+    assert!(
+        unguarded
+            .iter()
+            .any(|hit| hit.starts_with("agent.rs[mutant]:")),
+        "the special-404 revert was not flagged: a 404-only equality upstream is \
+         being accepted as a full status guard, which reopens the escape this \
+         mutation pins (expected an unguarded hit, got {unguarded:?})"
+    );
+
+    // Positive control: the unmutated file must stay green, or the fence is
+    // flagging the legitimate hint rather than the revert.
+    let (offenders, unguarded) = scan_handler("agent.rs", &text);
+    assert!(
+        offenders.is_empty() && unguarded.is_empty(),
+        "unmutated agent.rs trips the fence; the guard classifier is wrong, not \
+         the handler: offenders={offenders:?} unguarded={unguarded:?}"
     );
 }
