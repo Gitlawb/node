@@ -31,7 +31,9 @@ crates/
 ├── gitlawb-core/       crypto primitives (DID, CID, HTTP sigs, UCAN, ref certs)
 ├── gitlawb-node/       axum HTTP server, git smart HTTP, P2P, GraphQL
 ├── gl/                 CLI — identity, repos, MCP server, Base L2 names
-└── git-remote-gitlawb/ git remote helper for gitlawb:// URLs
+├── git-remote-gitlawb/ git remote helper for gitlawb:// URLs
+├── gitlawb-attest/     provenance attestations for ref-update certificates
+└── icaptcha-client/    client for the iCaptcha proof-of-intelligence service
 docs/                   Operator guides
 scripts/                Build helpers
 ```
@@ -106,7 +108,7 @@ cargo test -p gitlawb-node
 
 - **TypeScript SDK** (`@gitlawb/sdk`) — client library for the HTTP API
 - **Python SDK** (`gitlawb`) — for ML/agent pipeline integration
-- **UCAN chain validation** — complete the auth middleware
+- **UCAN authorization** — add trusted issuer anchoring, capability checks, and authorization-aware revocation
 - **Filecoin storage tier** — wire up cold storage deals
 - **Documentation** — guides, tutorials, API examples
 - **Node operators** — run a public node and report issues

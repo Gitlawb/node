@@ -208,11 +208,15 @@ mod authz_guard {
             (issues, "create_issue", "authorize_repo_read("),
             (bounties, "create_bounty", "authorize_repo_read("),
             (repos, "fork_repo", "authorize_repo_read("),
-            // get_by_cid gates each iterated repo row directly via visibility_check
-            // (KTD2a: it must NOT route through authorize_repo_read's fuzzy re-resolve).
-            (ipfs, "get_by_cid", "visibility_check("),
-            // #94 sibling read surfaces: gate private-repo metadata on read
-            // visibility (public repos stay anonymous; private repos 404).
+            // get_by_cid resolves each candidate (provenance path + legacy scan) through
+            // the shared `gate_and_serve`; the gate markers themselves are asserted
+            // below. This row proves the delegation is real, so the gate is actually
+            // reached rather than dead code. The delegated gate still calls
+            // `visibility_check` directly and never `authorize_repo_read`, so it keeps
+            // the property the pre-merge marker enforced: no fuzzy re-resolve.
+            (ipfs, "get_by_cid", "gate_and_serve("),
+            // Sibling read surfaces: gate private-repo metadata on read visibility
+            // (public repos stay anonymous; private repos 404).
             (replicas, "list_replicas", "authorize_repo_read("),
             (protect, "list_protected_branches", "authorize_repo_read("),
             (labels, "list_labels", "authorize_repo_read("),
@@ -248,6 +252,22 @@ mod authz_guard {
         assert!(
             fn_body(visibility, "require_owner").contains("did_matches("),
             "visibility::require_owner must use did_matches for DID-safe owner matching"
+        );
+
+        // The CID read surface (#173) enforces its gate inside the shared
+        // `gate_and_serve`, which BOTH the provenance path and the legacy scan call, so
+        // the markers must live there (the get_by_cid row above only proves delegation).
+        // The repo's own "/" visibility check (KTD2a — never authorize_repo_read's fuzzy
+        // re-resolve) and the quarantine hard-drop BEFORE visibility (INV-11) are both
+        // load-bearing: removing either re-opens a leak on the provenance path.
+        let gate_body = fn_body(ipfs, "gate_and_serve");
+        assert!(
+            gate_body.contains("visibility_check("),
+            "gate_and_serve must gate the CID read surface via visibility_check (KTD2a)"
+        );
+        assert!(
+            gate_body.contains("if quarantined"),
+            "gate_and_serve must hard-drop a quarantined repo before the visibility gate (INV-11)"
         );
 
         for (src, func, marker) in rows {
