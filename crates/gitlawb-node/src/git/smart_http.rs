@@ -301,6 +301,22 @@ pub fn parse_report_status(output: &[u8]) -> Option<(bool, Vec<(String, bool)>)>
     // data starts after the first `0000` flush packet or after we
     // strip sideband bytes.
     let stripped = strip_sideband(text)?;
+    // The report is framed TWICE when the client negotiated side-band-64k,
+    // which `git push` over smart HTTP does — so this is the common case, not
+    // an exotic one. The outer frame is the side-band envelope; band 1 carries
+    // the report-status stream, which is ITSELF pkt-line encoded. Real bytes
+    // from git 2.50.1 rejecting one ref of a two-ref push:
+    //
+    //   0057\x01000eunpack ok\n0028ng refs/heads/main non-fast-forward\n...
+    //
+    // After one pass the first line reads `000eunpack ok`, which fails the
+    // `unpack ok` check below and makes this return None — i.e. "no report",
+    // which the caller treats as inconclusive and keeps every declared ref.
+    // The per-ref gate would then be inert for exactly the pushes it exists to
+    // filter. A second pass removes the inner pkt-line framing; it is a no-op
+    // on the single-framed shape, because plain report text does not begin
+    // with four hex digits.
+    let stripped = strip_sideband(&stripped).unwrap_or(stripped);
     let lines: Vec<&str> = stripped.lines().collect();
     if lines.is_empty() {
         return None;
@@ -1091,6 +1107,48 @@ mod tests {
     use super::*;
     use std::process::Command;
     use tempfile::TempDir;
+
+    /// Byte-for-byte capture from `git receive-pack` 2.50.1 rejecting one ref of
+    /// a two-ref push, with side-band-64k negotiated — what `git push` over
+    /// smart HTTP actually sends. The report is framed twice: the outer
+    /// side-band envelope, then the report-status stream's own pkt-lines.
+    ///
+    /// This fixture is the point of the test. A hand-written single-framed
+    /// string parses fine with only one strip pass, so a fixture invented to
+    /// match the parser hides the exact case the parser is for.
+    const REAL_SIDEBAND_REPORT: &[u8] =
+        b"0057\x01000eunpack ok\n0028ng refs/heads/main non-fast-forward\n0018ok refs/heads/third\n0000";
+
+    #[test]
+    fn a_real_double_framed_sideband_report_is_read_not_treated_as_absent() {
+        let (unpack_ok, refs) =
+            parse_report_status(REAL_SIDEBAND_REPORT).expect("a real git report must parse");
+        assert!(unpack_ok, "unpack line must be read through both frames");
+        assert_eq!(
+            refs,
+            vec![
+                ("refs/heads/main".to_string(), false),
+                ("refs/heads/third".to_string(), true),
+            ],
+            "the rejected ref must be distinguished from the accepted one"
+        );
+    }
+
+    /// The single-framed shape must keep working: the second pass has to be a
+    /// no-op there, not a corruption. Plain report text does not begin with
+    /// four hex digits, which is what makes that safe.
+    #[test]
+    fn a_single_framed_report_still_parses_after_the_second_pass() {
+        // Framed programmatically rather than by a hand-counted hex prefix: a
+        // wrong length makes the parser return None, which would look exactly
+        // like the regression this pair of tests exists to catch.
+        let payload = "\x01unpack ok\nok refs/heads/x\n";
+        let single = format!("{:04x}{payload}0000", payload.len() + 4);
+        let (unpack_ok, refs) =
+            parse_report_status(single.as_bytes()).expect("single-framed must parse");
+        assert!(unpack_ok);
+        assert_eq!(refs, vec![("refs/heads/x".to_string(), true)]);
+    }
 
     /// List OIDs in a pack by writing it to a temp dir and running verify-pack.
     pub(super) fn pack_object_ids(pack: &[u8]) -> std::collections::HashSet<String> {
