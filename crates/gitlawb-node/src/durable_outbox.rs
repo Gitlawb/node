@@ -28,6 +28,9 @@ use crate::state::AppState;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
+/// The git all-zeros object id — the create/delete sentinel in a ref update.
+const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
+
 /// Promote `prepared` rows whose `new_sha` matches the on-disk ref to
 /// `applied`, so the recovery drain (which only reads `state =
 /// 'applied'`) picks them up on the next pass. The reconcile runs at
@@ -62,9 +65,16 @@ use std::collections::HashMap;
 /// and the reason a `prepared` row that happens to match a current
 /// on-disk SHA does not silently turn into completed accounting.
 pub async fn reconcile_prepared_from_disk(state: AppState, limit: i64) -> anyhow::Result<usize> {
+    // P1 (reviewer-1/2 round 3): also reconcile `uncertain` rows,
+    // not just `prepared`. A receive-pack error that leaves rows
+    // `uncertain` has the same recovery need as an interrupted
+    // success path that leaves rows `prepared`: the drain's WHERE
+    // clause does not see either state, and without this step the
+    // push event, cert, and anchor handoff would be permanently lost
+    // for refs that DID land before the error.
     let rows = state
         .db
-        .list_pending_ref_transitions_prepared(limit)
+        .list_pending_ref_transitions_prepared_or_uncertain(limit)
         .await?;
     if rows.is_empty() {
         return Ok(0);
@@ -82,12 +92,6 @@ pub async fn reconcile_prepared_from_disk(state: AppState, limit: i64) -> anyhow
         let repo = match state.db.get_repo_by_id(&repo_id).await? {
             Some(r) => r,
             None => {
-                // The repo row is gone. The outbox rows must have
-                // been orphaned by a hard delete; the reviewer's
-                // invariant does not bind here, so we leave them
-                // `prepared` and let a later startup (or a
-                // human-attended recovery) resolve them. Log so the
-                // operator can act.
                 tracing::warn!(
                     repo_id = %repo_id,
                     row_count = repo_rows.len(),
@@ -100,9 +104,6 @@ pub async fn reconcile_prepared_from_disk(state: AppState, limit: i64) -> anyhow
         let refs = match crate::git::store::list_refs(disk_path) {
             Ok(v) => v,
             Err(e) => {
-                // A `list_refs` failure is not fatal: skip this
-                // repo's group, leave the rows `prepared` for a
-                // later startup.
                 tracing::warn!(
                     err = %e,
                     repo_id = %repo_id,
@@ -115,10 +116,21 @@ pub async fn reconcile_prepared_from_disk(state: AppState, limit: i64) -> anyhow
         let disk_refs: HashMap<String, String> = refs.into_iter().collect();
 
         for row in repo_rows {
-            let matches = disk_refs
-                .get(&row.ref_name)
-                .map(|sha| sha == &row.new_sha)
-                .unwrap_or(false);
+            // P2 (reviewer-1/2 round 3): handle deletions. A deletion's
+            // new_sha is ZERO_SHA and `git for-each-ref` omits deleted
+            // refs. The old equality check (disk_refs.get(ref) == row.new_sha)
+            // can never match a deletion because ZERO_SHA is never returned
+            // by `list_refs`. Instead, when new_sha is ZERO_SHA, treat a
+            // missing ref as a successful deletion match.
+            let is_deletion = row.new_sha == ZERO_SHA;
+            let matches = if is_deletion {
+                !disk_refs.contains_key(&row.ref_name)
+            } else {
+                disk_refs
+                    .get(&row.ref_name)
+                    .map(|sha| sha == &row.new_sha)
+                    .unwrap_or(false)
+            };
             if !matches {
                 let on_disk = disk_refs
                     .get(&row.ref_name)
@@ -130,27 +142,18 @@ pub async fn reconcile_prepared_from_disk(state: AppState, limit: i64) -> anyhow
                     ref_name = %row.ref_name,
                     row_new_sha = %row.new_sha,
                     on_disk_sha = %on_disk,
+                    is_deletion = is_deletion,
                     "reconcile: row's new_sha does not match on-disk ref; staying prepared"
                 );
                 continue;
             }
-            // SHA matched. Before promoting, confirm the row is
-            // recent enough to be the transition that produced the
-            // current on-disk SHA. A stale `prepared` row whose
-            // `new_sha` happens to equal the current ref value for
-            // some OTHER reason (e.g. a later push re-introduced
-            // the same SHA) would otherwise be promoted and the
-            // recovery drain would write artifacts for a transition
-            // we cannot prove happened. The `MAX_RECONCILE_AGE`
-            // window bounds the blast radius; older rows require
-            // human-attended recovery.
+            // SHA matched (or deletion confirmed by absent ref). Before
+            // promoting, confirm the row is recent enough to be the
+            // transition that produced the current on-disk state.
             let row_age = DateTime::parse_from_rfc3339(&row.created_at)
                 .ok()
                 .map(|t| Utc::now().signed_duration_since(t.with_timezone(&Utc)))
                 .unwrap_or_else(|| {
-                    // Unparseable `created_at` is a corruption
-                    // signal. Treat the row as unpromotable so a
-                    // human can look at it.
                     tracing::warn!(
                         row_id = %row.id,
                         request_id = %row.request_id,
@@ -183,10 +186,58 @@ pub async fn reconcile_prepared_from_disk(state: AppState, limit: i64) -> anyhow
     if flipped > 0 {
         tracing::info!(
             flipped,
-            "reconciled prepared -> applied via on-disk ref match"
+            "reconciled prepared/uncertain -> applied via on-disk ref match"
         );
     }
     Ok(flipped as usize)
+}
+
+/// P2 (reviewer-1/2 round 3): multi-pass reconcile for the prepared/
+/// uncertain backlog. Mirrors `drain_pending_ref_transitions_all`:
+/// runs `reconcile_prepared_from_disk` in a loop until either a pass
+/// examines fewer rows than `per_pass_limit` (backlog exhausted) or
+/// `max_passes` passes have completed. If rows remain after the last
+/// pass, a residual-backlog warning is logged and those rows wait for
+/// the next startup.
+pub async fn reconcile_prepared_from_disk_all(
+    state: AppState,
+    per_pass_limit: i64,
+    max_passes: usize,
+) -> anyhow::Result<usize> {
+    let mut total = 0;
+    for _ in 0..max_passes {
+        let n = reconcile_prepared_from_disk(state.clone(), per_pass_limit).await?;
+        total += n;
+        // The reconcile function returns the number of rows PROMOTED,
+        // not the number EXAMINED. We need to know if more rows remain.
+        // Query the count of prepared/uncertain rows to decide.
+        let remaining = state
+            .db
+            .list_pending_ref_transitions_prepared_or_uncertain(1)
+            .await?
+            .len();
+        if remaining == 0 {
+            return Ok(total);
+        }
+    }
+    // One more pass to detect residual backlog.
+    let residual = reconcile_prepared_from_disk(state.clone(), per_pass_limit).await?;
+    total += residual;
+    let remaining = state
+        .db
+        .list_pending_ref_transitions_prepared_or_uncertain(1)
+        .await?
+        .len();
+    if remaining > 0 {
+        tracing::warn!(
+            total,
+            max_passes,
+            per_pass_limit,
+            remaining,
+            "reconcile backlog exceeds startup budget; residual rows will be picked up on next restart"
+        );
+    }
+    Ok(total)
 }
 
 /// Per-pass drain budget. Each call to `drain_pending_ref_transitions`

@@ -220,6 +220,7 @@ pub fn response_served_pack(output: &[u8]) -> bool {
 ///
 /// Accepts a push. The caller MUST verify HTTP Signature auth before
 /// calling this function.
+#[allow(dead_code)] // used by tests; production uses receive_pack_raw
 pub async fn receive_pack(
     git_bin: &str,
     repo_path: &Path,
@@ -242,6 +243,139 @@ pub async fn receive_pack(
         .header("Content-Type", "application/x-git-receive-pack-result")
         .header("Cache-Control", "no-cache")
         .body(Body::from(output))?)
+}
+
+/// Run `git-receive-pack` and return the raw stdout bytes together with
+/// the process exit status. Unlike [`receive_pack`], this does NOT bail
+/// on a non-zero exit: the caller needs the stdout (which contains the
+/// report-status with per-ref ok/ng results) even when the process
+/// exits non-zero. A timeout still returns `Err`.
+pub async fn receive_pack_raw(
+    git_bin: &str,
+    repo_path: &Path,
+    request_body: Bytes,
+    timeout: Duration,
+    admission: Option<AdmissionGuard>,
+) -> Result<(Vec<u8>, bool)> {
+    let mut command = Command::new(git_bin);
+    command
+        .arg("receive-pack")
+        .arg("--stateless-rpc")
+        .arg(repo_path);
+    let (out, err, status, _admission) = drive_git_child_raw(
+        command,
+        request_body,
+        timeout,
+        "git-receive-pack",
+        admission,
+    )
+    .await?;
+    // On timeout, drive_git_child_raw returns Err — we never reach here.
+    // On success/non-zero exit, we have the stdout and exit status.
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&err);
+        tracing::warn!(stderr = %stderr, "git-receive-pack exited non-zero");
+    }
+    Ok((out, status.success()))
+}
+
+/// Parse the git-receive-pack report-status output to determine per-ref
+/// success/failure. Returns `(unpack_ok, per_ref_results)` where
+/// `per_ref_results` is a list of `(ref_name, is_ok)`.
+///
+/// The report-status format (after the sideband framing) is:
+/// ```text
+/// unpack ok\n          (or: unpack fail\n)
+/// ok <refname>\n       (per successful ref)
+/// ng <refname> <reason>\n  (per rejected ref)
+/// \n                   (empty line terminates)
+/// ```
+///
+/// Returns `None` if the output cannot be parsed (e.g. the client did
+/// not request report-status, or the output is truncated). In that
+/// case the caller should treat all refs as uncertain.
+pub fn parse_report_status(output: &[u8]) -> Option<(bool, Vec<(String, bool)>)> {
+    let text = std::str::from_utf8(output).ok()?;
+    // Strip sideband framing: each line starts with a pkt-line length
+    // prefix and a channel byte (1 = stdout, 2 = stderr). The actual
+    // data starts after the first `0000` flush packet or after we
+    // strip sideband bytes.
+    let stripped = strip_sideband(text)?;
+    let lines: Vec<&str> = stripped.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+
+    // First non-empty line is "unpack ok" or "unpack fail".
+    let unpack_line = lines.iter().find(|l| !l.is_empty())?;
+    let unpack_ok = if unpack_line.starts_with("unpack ok") {
+        true
+    } else if unpack_line.starts_with("unpack fail") {
+        false
+    } else {
+        return None;
+    };
+
+    let mut results = Vec::new();
+    for line in &lines[1..] {
+        let line = line.trim();
+        if line.is_empty() {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("ok ") {
+            results.push((rest.to_string(), true));
+        } else if let Some(rest) = line.strip_prefix("ng ") {
+            // "ng <refname> <reason>" — skip the reason
+            let ref_name = rest.split_whitespace().next()?.to_string();
+            results.push((ref_name, false));
+        }
+    }
+
+    Some((unpack_ok, results))
+}
+
+/// Strip git sideband framing from a pkt-line encoded output.
+/// Sideband-encoded lines start with a 4-hex-digit length, then a
+/// channel byte (0x01=stdout, 0x02=stderr), then payload. Returns
+/// the decoded payload lines concatenated, or `None` if the framing
+/// is malformed.
+fn strip_sideband(text: &str) -> Option<String> {
+    let mut output = String::new();
+    let mut pos = 0;
+    let bytes = text.as_bytes();
+
+    loop {
+        if pos + 4 > bytes.len() {
+            break;
+        }
+        let len_str = std::str::from_utf8(&bytes[pos..pos + 4]).ok()?;
+        let len = usize::from_str_radix(len_str, 16).ok()?;
+        if len == 0 {
+            // Flush packet — end of sideband stream
+            break;
+        }
+        if len < 4 || pos + len > bytes.len() {
+            break;
+        }
+        let pkt_data = std::str::from_utf8(&bytes[pos + 4..pos + len]).ok()?;
+        pos += len;
+
+        // Sideband: first byte is channel (1=stdout, 2=stderr)
+        if let Some(payload) = pkt_data.strip_prefix('\x01') {
+            output.push_str(payload);
+        } else if pkt_data.starts_with('\x02') {
+            // stderr — skip (git error messages)
+        } else {
+            // Not sideband encoded — pass through
+            output.push_str(pkt_data);
+        }
+    }
+
+    if output.is_empty() {
+        None
+    } else {
+        Some(output)
+    }
 }
 
 /// Sends SIGTERM to a child's whole process group on drop, unless disarmed first.
@@ -576,6 +710,98 @@ async fn drive_git_child(
     write_result.context("failed to write to git stdin")?;
 
     Ok((out, admission))
+}
+
+/// Like [`drive_git_child`], but returns stdout and stderr even on a
+/// non-zero exit status. Used by [`receive_pack_raw`] so the caller
+/// can parse the report-status output from a failed `git-receive-pack`.
+async fn drive_git_child_raw(
+    mut command: Command,
+    input: Bytes,
+    timeout: Duration,
+    _what: &str,
+    admission: Option<AdmissionGuard>,
+) -> Result<(
+    Vec<u8>,
+    Vec<u8>,
+    std::process::ExitStatus,
+    Option<AdmissionGuard>,
+)> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command.spawn()?;
+
+    let mut stdin = child.stdin.take();
+    let mut stdout = child.stdout.take().context("git stdout was not piped")?;
+    let mut stderr = child.stderr.take().context("git stderr was not piped")?;
+
+    #[cfg(unix)]
+    let pgid = child.id().map(|id| id as i32);
+    #[cfg(unix)]
+    let mut group_guard = KillGroupOnDrop {
+        child: Some(child),
+        pgid,
+        admission,
+    };
+
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+
+    let interact = async {
+        let write = async {
+            match stdin.take() {
+                Some(mut s) => s.write_all(&input).await,
+                None => Ok(()),
+            }
+        };
+        #[cfg(unix)]
+        let child_ref = group_guard.child_mut();
+        #[cfg(not(unix))]
+        let child_ref = &mut child;
+        let (write_result, r_out, r_err, status) = tokio::join!(
+            write,
+            stdout.read_to_end(&mut out),
+            stderr.read_to_end(&mut err),
+            child_ref.wait(),
+        );
+        r_out?;
+        r_err?;
+        Ok::<_, anyhow::Error>((write_result, status?))
+    };
+
+    let timed = tokio::time::timeout(timeout, interact).await;
+    let (write_result, status, admission) = match timed {
+        Ok(result) => {
+            #[cfg(unix)]
+            let admission = group_guard.disarm();
+            let (write_result, status) = result?;
+            (write_result, status, admission)
+        }
+        Err(_elapsed) => {
+            #[cfg(unix)]
+            {
+                reap_group_on_timeout(group_guard.child_mut()).await;
+                drop(group_guard.disarm());
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                drop(admission);
+            }
+            return Err(GitServiceTimeout.into());
+        }
+    };
+
+    write_result.context("failed to write to git stdin")?;
+
+    Ok((out, err, status, admission))
 }
 
 fn service_to_command(service: &str) -> &str {

@@ -166,6 +166,13 @@ pub mod pending_state {
     pub const APPLIED: &str = "applied";
     #[allow(dead_code)]
     pub const CANCELLED: &str = "cancelled";
+    /// Receive-pack returned Err but the exit was non-zero / timed out,
+    /// so it is unknown whether some refs landed. The reconcile step
+    /// checks these rows against disk at startup the same way it
+    /// checks `prepared` rows, and promotes those whose target SHA
+    /// actually landed.
+    #[allow(dead_code)]
+    pub const UNCERTAIN: &str = "uncertain";
 }
 
 /// #26 Split PR 1 — durable intent row for a single (request, ref) transition.
@@ -1366,6 +1373,29 @@ const MIGRATIONS: &[Migration] = &[
             // `first_ref_name`.
             "ALTER TABLE pending_ref_transitions ADD COLUMN IF NOT EXISTS first_ref_name TEXT NOT NULL DEFAULT ''",
             "UPDATE pending_ref_transitions SET first_ref_name = ref_name WHERE first_ref_name = ''",
+        ],
+    },
+    Migration {
+        version: 29,
+        name: "pending_ref_transitions_add_uncertain_state",
+        stmts: &[
+            // P1 (reviewer-1/2 round 3): when receive-pack returns Err
+            // (timeout, non-zero exit), it is unknown whether some refs
+            // landed before the failure. Marking every row `cancelled`
+            // permanently loses recovery for refs that did land, because
+            // both reconcile and drain exclude `cancelled` rows.
+            //
+            // A new `uncertain` state preserves recoverability: the
+            // reconcile step checks these rows against on-disk refs at
+            // startup (same as `prepared` rows) and promotes those whose
+            // target SHA actually landed to `applied`, then the drain
+            // processes them normally. Rows that did not land stay
+            // `uncertain` and require human-attended recovery (same as
+            // `prepared` rows older than MAX_RECONCILE_AGE).
+            //
+            // No ALTER TABLE is needed — the `state` column is TEXT and
+            // the new value is written by the application layer. The
+            // indexes on `state` already cover the new value.
         ],
     },
 ];
@@ -2839,13 +2869,46 @@ impl Db {
             .collect())
     }
 
-    /// Flip a set of `prepared` rows to `applied`. Called by the startup
-    /// reconcile step after the on-disk SHA matches each row's
-    /// `new_sha`. The `state = 'prepared'` guard is the second
-    /// barrier against re-promoting a row that was cancelled by
-    /// another path while the reconcile was in flight; only rows that
-    /// were still `prepared` at the moment the UPDATE runs are
-    /// flipped.
+    /// Return `prepared` and `uncertain` rows, oldest first. The
+    /// startup reconcile step checks both states against on-disk refs
+    /// and promotes those that actually landed to `applied`. A
+    /// `prepared` row that was interrupted after receive-pack returned
+    /// Ok, and an `uncertain` row from a receive-pack error, are
+    /// equally unrecoverable without this step: the drain's WHERE
+    /// clause does not see them.
+    #[allow(dead_code)]
+    pub async fn list_pending_ref_transitions_prepared_or_uncertain(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<PendingRefTransition>> {
+        let limit = limit.max(1);
+        let rows = sqlx::query(
+            r#"SELECT id, request_id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did,
+                       signature_header, signature_input, content_digest, state, created_at,
+                       applied_at, cancelled_at, first_ref_name
+               FROM pending_ref_transitions
+               WHERE state IN ($1, $2)
+               ORDER BY created_at ASC, id ASC
+               LIMIT $3"#,
+        )
+        .bind(pending_state::PREPARED)
+        .bind(pending_state::UNCERTAIN)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(row_to_pending_ref_transition)
+            .collect())
+    }
+
+    /// Flip a set of `prepared` or `uncertain` rows to `applied`. Called by the
+    /// startup reconcile step after the on-disk SHA matches each row's
+    /// `new_sha`. The `state IN ('prepared', 'uncertain')` guard is
+    /// the second barrier against re-promoting a row that was cancelled
+    /// by another path while the reconcile was in flight; only rows
+    /// that were still in one of those states at the moment the UPDATE
+    /// runs are flipped.
     #[allow(dead_code)] // wired by the startup reconcile
     pub async fn mark_pending_ref_transitions_applied_for_rows(
         &self,
@@ -2858,12 +2921,13 @@ impl Db {
         let res = sqlx::query(
             r#"UPDATE pending_ref_transitions
                SET state = $1, applied_at = $2
-               WHERE id = ANY($3) AND state = $4"#,
+               WHERE id = ANY($3) AND state IN ($4, $5)"#,
         )
         .bind(pending_state::APPLIED)
         .bind(&now)
         .bind(ids)
         .bind(pending_state::PREPARED)
+        .bind(pending_state::UNCERTAIN)
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected())
@@ -2879,6 +2943,68 @@ impl Db {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Delete every `applied` or `uncertain` row for a `request_id`.
+    /// Called by the live handler AFTER the push event, cert, and anchor
+    /// job writes have all succeeded. This removes the outbox row once
+    /// its durable effects are complete, preventing replay on restart.
+    #[allow(dead_code)]
+    pub async fn delete_pending_ref_transitions_by_request_id(
+        &self,
+        request_id: &str,
+    ) -> Result<u64> {
+        let res = sqlx::query(
+            r#"DELETE FROM pending_ref_transitions
+               WHERE request_id = $1 AND state IN ($2, $3)"#,
+        )
+        .bind(request_id)
+        .bind(pending_state::APPLIED)
+        .bind(pending_state::UNCERTAIN)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Flip every `prepared` row attached to `request_id` to `uncertain`.
+    /// Called when receive-pack returns Err but the exit was non-zero or
+    /// timed out, meaning some refs may have landed before the failure.
+    /// The reconcile step checks these rows against disk at startup.
+    #[allow(dead_code)]
+    pub async fn mark_pending_ref_transitions_uncertain(&self, request_id: &str) -> Result<u64> {
+        let now = Utc::now().to_rfc3339();
+        let res = sqlx::query(
+            r#"UPDATE pending_ref_transitions
+               SET state = $1, cancelled_at = $2
+               WHERE request_id = $3 AND state = $4"#,
+        )
+        .bind(pending_state::UNCERTAIN)
+        .bind(&now)
+        .bind(request_id)
+        .bind(pending_state::PREPARED)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Flip every `uncertain` row for a `request_id` to `cancelled`.
+    /// Called after the reconcile step has confirmed none of the refs
+    /// landed on disk (all rows still have state `uncertain`).
+    #[allow(dead_code)]
+    pub async fn mark_uncertain_rows_cancelled(&self, request_id: &str) -> Result<u64> {
+        let now = Utc::now().to_rfc3339();
+        let res = sqlx::query(
+            r#"UPDATE pending_ref_transitions
+               SET state = $1, cancelled_at = $2
+               WHERE request_id = $3 AND state = $4"#,
+        )
+        .bind(pending_state::CANCELLED)
+        .bind(&now)
+        .bind(request_id)
+        .bind(pending_state::UNCERTAIN)
+        .execute(&self.pool)
+        .await?;
         Ok(res.rows_affected())
     }
 

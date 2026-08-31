@@ -685,20 +685,30 @@ async fn main() -> Result<()> {
     // remain `applied` for the next startup to pick up.
     //
     // P1-A: the reconcile step runs FIRST and promotes any `prepared`
-    // row whose target SHA actually landed on disk. This is the path
-    // that recovers a ref when the post-receive
+    // or `uncertain` row whose target SHA actually landed on disk.
+    // This is the path that recovers a ref when the post-receive
     // `mark_pending_ref_transitions_applied` call errored or was
-    // interrupted after `receive_pack` returned Ok. Without this
-    // step, the drain (gated on `state = 'applied'`) would never see
-    // those rows.
-    match durable_outbox::reconcile_prepared_from_disk(
+    // interrupted after `receive_pack` returned Ok, or when
+    // receive-pack returned Err but some refs may have landed
+    // (the `uncertain` state). Without this step, the drain (gated
+    // on `state = 'applied'`) would never see those rows.
+    //
+    // P2 (reviewer-1/2 round 3): use the multi-pass reconcile so
+    // prepared/uncertain rows beyond the first 1000-row page are
+    // processed in the same startup, rather than waiting for the
+    // next restart (where they might age out of MAX_RECONCILE_AGE).
+    match durable_outbox::reconcile_prepared_from_disk_all(
         state.clone(),
         durable_outbox::DRAIN_PER_PASS_LIMIT,
+        durable_outbox::DRAIN_MAX_PASSES,
     )
     .await
     {
         Ok(0) => {}
-        Ok(n) => info!(n, "reconciled prepared -> applied via on-disk ref match"),
+        Ok(n) => info!(
+            n,
+            "reconciled prepared/uncertain -> applied via on-disk ref match"
+        ),
         Err(e) => warn!(
             err = %e,
             "pending ref transition reconcile failed at startup (non-fatal; will retry on next start)"

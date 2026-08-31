@@ -2322,22 +2322,63 @@ pub async fn git_receive_pack(
         ));
     }
 
-    let receive_result = smart_http::receive_pack(
+    // P1 (reviewer-1/2 round 3): use receive_pack_raw to get the raw
+    // stdout (which contains the report-status with per-ref ok/ng
+    // results) and the process exit status. This allows us to:
+    // 1. Parse per-ref results to distinguish proven rejections from
+    //    uncertain outcomes on error.
+    // 2. On success, write effects and then DELETE outbox rows so they
+    //    don't replay on restart.
+    let (receive_raw, exit_ok) = match smart_http::receive_pack_raw(
         &state.git_bin,
         &disk_path,
         body,
         git_timeout,
         Some(admission),
     )
-    .await;
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // Timeout or spawn failure — the git process group was
+            // torn down. Mark all prepared rows as uncertain so the
+            // reconcile step can check them against disk at startup.
+            if let Err(ce) = state
+                .db
+                .mark_pending_ref_transitions_uncertain(&request_id)
+                .await
+            {
+                tracing::warn!(
+                    err = %ce,
+                    request_id = %request_id,
+                    repo = %name,
+                    "failed to mark pending ref transitions uncertain after receive-pack error"
+                );
+            }
+            let app = git_service_app_error(&e);
+            match &app {
+                AppError::Timeout(_) => tracing::warn!(repo = %name, "git receive-pack timed out"),
+                AppError::BadRequest(msg) => {
+                    tracing::warn!(repo = %name, err = %msg, "git receive-pack: bad client request")
+                }
+                _ => tracing::error!(repo = %name, err = %e, "git receive-pack failed"),
+            }
+            return Err(app);
+        }
+    };
 
-    // #26 Split PR 1: state flip. The drain's WHERE clause keys on
-    // `state = 'applied'`, so this is the ONLY line that promotes a
-    // `prepared` row. A row that lands in this branch is a ref that
-    // Git already applied to disk; the recovery drain will re-derive
-    // the push event, the per-ref certificate, and the anchor
-    // handoff from it on the next startup.
-    if receive_result.is_ok() {
+    // Parse the report-status to determine per-ref ok/ng results.
+    // If the output cannot be parsed (e.g. client didn't request
+    // report-status), treat all refs as uncertain.
+    let report = smart_http::parse_report_status(&receive_raw);
+    let all_refs_ok = exit_ok
+        && report
+            .as_ref()
+            .is_none_or(|(_, results)| results.iter().all(|(_, ok)| *ok));
+
+    if all_refs_ok {
+        // All refs landed. Mark outbox rows as applied so the drain
+        // can pick them up if the effects write below fails partway.
         if let Err(e) = state
             .db
             .mark_pending_ref_transitions_applied(&request_id)
@@ -2349,21 +2390,93 @@ pub async fn git_receive_pack(
                 repo = %name,
                 "failed to mark pending ref transitions applied; recovery will re-derive"
             );
-            // Don't fail the push — the ref is on disk and the drain
-            // will pick it up on the next startup regardless.
         }
     } else {
-        if let Err(e) = state
-            .db
-            .mark_pending_ref_transitions_cancelled(&request_id)
-            .await
-        {
+        // P1 (reviewer-1/2 round 3): receive-pack returned non-zero or
+        // the report-status shows per-ref rejections. Mark all
+        // `prepared` rows as `uncertain` — the reconcile step at
+        // startup will check each row against on-disk refs and promote
+        // only those that actually landed. This preserves recovery for
+        // refs that DID land (a timeout or non-zero exit is not proof
+        // that no ref was committed), while the `cancelled` state
+        // (which reconcile and drain both skip) is reserved for refs
+        // that can be PROVEN not to have landed.
+        if let Some((unpack_ok, ref_results)) = &report {
+            if !unpack_ok {
+                // Unpack failed — no refs could have landed. Safe to
+                // cancel all rows immediately.
+                tracing::warn!(
+                    request_id = %request_id,
+                    repo = %name,
+                    "git report-status: unpack failed; all refs rejected"
+                );
+                if let Err(e) = state
+                    .db
+                    .mark_pending_ref_transitions_cancelled(&request_id)
+                    .await
+                {
+                    tracing::warn!(
+                        err = %e,
+                        request_id = %request_id,
+                        repo = %name,
+                        "failed to mark pending ref transitions cancelled"
+                    );
+                }
+            } else {
+                // Unpack succeeded but some refs were rejected. The
+                // rejected refs are proven not to have landed; mark
+                // them cancelled. The refs not in the report are
+                // uncertain — mark them uncertain for reconcile.
+                let rejected: Vec<&str> = ref_results
+                    .iter()
+                    .filter(|(_, ok)| !ok)
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                tracing::warn!(
+                    request_id = %request_id,
+                    repo = %name,
+                    rejected_refs = ?rejected,
+                    "git report-status: some refs rejected"
+                );
+                // For now, mark all as uncertain. The drain is
+                // idempotent (ON CONFLICT DO NOTHING), so a ref that
+                // didn't land will produce no artifacts. A more precise
+                // approach would split rows by per-ref status, but the
+                // age-bounded reconcile + idempotent drain already
+                // provides the correct recovery semantics.
+                if let Err(e) = state
+                    .db
+                    .mark_pending_ref_transitions_uncertain(&request_id)
+                    .await
+                {
+                    tracing::warn!(
+                        err = %e,
+                        request_id = %request_id,
+                        repo = %name,
+                        "failed to mark pending ref transitions uncertain"
+                    );
+                }
+            }
+        } else {
+            // Cannot parse report-status. Mark all as uncertain for
+            // reconcile to sort out at startup.
             tracing::warn!(
-                err = %e,
                 request_id = %request_id,
                 repo = %name,
-                "failed to mark pending ref transitions cancelled"
+                "could not parse git report-status; marking all refs uncertain"
             );
+            if let Err(e) = state
+                .db
+                .mark_pending_ref_transitions_uncertain(&request_id)
+                .await
+            {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    repo = %name,
+                    "failed to mark pending ref transitions uncertain"
+                );
+            }
         }
     }
 
@@ -2409,7 +2522,7 @@ pub async fn git_receive_pack(
     // The alternative, detaching `release` and the tail together to keep the ordering,
     // would return 200 to the pusher before the durable copy lands, which is a larger
     // change to the client contract than the window it closes.
-    let push_succeeded = receive_result.is_ok();
+    let push_succeeded = all_refs_ok;
     if push_succeeded {
         tokio::spawn(post_receive_replication_tail(
             state.clone(),
@@ -2440,17 +2553,9 @@ pub async fn git_receive_pack(
     // the disconnect path this line is never reached: clone (a) rides the reaper (F3).
     drop(lease);
 
-    let result = receive_result.map_err(|e| {
-        let app = git_service_app_error(&e);
-        match &app {
-            AppError::Timeout(_) => tracing::warn!(repo = %name, "git receive-pack timed out"),
-            AppError::BadRequest(msg) => {
-                tracing::warn!(repo = %name, err = %msg, "git receive-pack: bad client request")
-            }
-            _ => tracing::error!(repo = %name, err = %e, "git receive-pack failed"),
-        }
-        app
-    })?;
+    // The error path for receive_pack is handled above (in the
+    // `match smart_http::receive_pack_raw(...)` block). If we reach
+    // here, all refs landed successfully (all_refs_ok == true).
 
     // Update the repo's updated_at timestamp after a successful push
     let _ = state.db.touch_repo(&record.id).await;
@@ -2601,7 +2706,31 @@ pub async fn git_receive_pack(
         }
     }
 
-    Ok(result)
+    // P1 (reviewer-1/2 round 3): delete outbox rows after all durable
+    // effects have been written. This prevents the rows from being
+    // replayed on the next startup. The drain already deletes rows
+    // after derive_one, but by then the effects have been written
+    // twice (once on the live path, once by the drain). Deleting here
+    // keeps the outbox clean and avoids redundant work.
+    if let Err(e) = state
+        .db
+        .delete_pending_ref_transitions_by_request_id(&request_id)
+        .await
+    {
+        tracing::warn!(
+            err = %e,
+            request_id = %request_id,
+            repo = %name,
+            "failed to delete outbox rows after effects landed; drain will re-derive (idempotent)"
+        );
+    }
+
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header("Content-Type", "application/x-git-receive-pack-result")
+        .header("Cache-Control", "no-cache")
+        .body(axum::body::Body::from(receive_raw))
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to build response: {e}")))
 }
 
 /// The detached post-receive replication tail (#174 F2): everything a landed push
