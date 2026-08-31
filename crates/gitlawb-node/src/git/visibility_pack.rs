@@ -775,11 +775,10 @@ pub fn withheld_blob_oids_bounded(
     ))
 }
 
-/// Withheld set from an already-computed (oid, "/path") listing: a blob is
-/// withheld only when visibility denies the caller at *every* path it appears
-/// at. Split out so a caller that already walked `blob_paths` (e.g.
-/// `withheld_blob_recipients`) reuses the listing instead of walking history
-/// again.
+/// THE visibility decision for one `blob_paths` pair, for BOTH of that walk's
+/// consumers — the deny side (`withheld_from_pairs`, what the smart-http serve
+/// filter excludes) and the allow side (`allowed_blob_set_for_caller_bounded`,
+/// what the `GET /ipfs/{cid}` gate hands over).
 ///
 /// Empty-path entries (round-3 P1): produced by `blob_paths` phase 2 for
 /// non-commit-reachable blobs (annotated tag of blob, direct blobref).
@@ -795,6 +794,44 @@ pub fn withheld_blob_oids_bounded(
 /// withheld. Without this branch, the round-3 phase-2 entries would
 /// land in `allowed` (the path-based check returns `Allow` for a public
 /// repo with no matching rule), and the secret blob would be served.
+///
+/// #218 review round 8 P1 — why this is a shared function rather than a branch
+/// inside `withheld_from_pairs`: the empty-path policy lived on the deny side
+/// ONLY, while `allowed_blob_set_for_caller_bounded` consumed the same pairs and
+/// called `visibility_check(..., "")` directly. On a public repo that returns
+/// `Allow` (no glob matches ""), so the two consumers disagreed about the very
+/// same OID: the serve filter withheld the tag-only blob while `/ipfs/{cid}`
+/// admitted it and served the bytes — the leak phase 2 exists to close, reopened
+/// one layer over. A single decision function makes that divergence
+/// unrepresentable: any future change to the empty-path policy moves both gates
+/// at once.
+fn pair_decision(
+    path: &str,
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    caller: Option<&str>,
+) -> Decision {
+    if path.is_empty() {
+        // Round-3 P1: empty-path entries (non-commit-reachable
+        // blobs from `blob_paths` phase 2) cannot be classified
+        // by the path-based rules. Withhold from every caller
+        // except the owner; the owner is the only identity that
+        // could have created the ref tip.
+        match caller {
+            Some(c) if crate::api::did_matches(owner_did, c) => Decision::Allow,
+            _ => Decision::Deny,
+        }
+    } else {
+        visibility_check(rules, is_public, owner_did, caller, path)
+    }
+}
+
+/// Withheld set from an already-computed (oid, "/path") listing: a blob is
+/// withheld only when visibility denies the caller at *every* path it appears
+/// at. Split out so a caller that already walked `blob_paths` (e.g.
+/// `withheld_blob_recipients`) reuses the listing instead of walking history
+/// again. Per-pair policy is [`pair_decision`], shared with the allow side.
 fn withheld_from_pairs(
     pairs: &[(String, String)],
     rules: &[VisibilityRule],
@@ -805,25 +842,7 @@ fn withheld_from_pairs(
     let mut denied: HashSet<String> = HashSet::new();
     let mut allowed: HashSet<String> = HashSet::new();
     for (oid, path) in pairs {
-        let decision = if path.is_empty() {
-            // Round-3 P1: empty-path entries (non-commit-reachable
-            // blobs from `blob_paths` phase 2) cannot be classified
-            // by the path-based rules. Withhold from every caller
-            // except the owner; the owner is the only identity that
-            // could have created the ref tip.
-            if let Some(c) = caller {
-                if crate::api::did_matches(owner_did, c) {
-                    Decision::Allow
-                } else {
-                    Decision::Deny
-                }
-            } else {
-                Decision::Deny
-            }
-        } else {
-            visibility_check(rules, is_public, owner_did, caller, path)
-        };
-        match decision {
+        match pair_decision(path, rules, is_public, owner_did, caller) {
             Decision::Deny => {
                 denied.insert(oid.clone());
             }
@@ -913,6 +932,13 @@ pub fn allowed_blob_set_for_caller(
 
 /// [`allowed_blob_set_for_caller`] with an injectable `git_bin` and walk `timeout`,
 /// for the `GET /ipfs/{cid}` gate.
+///
+/// #218 review round 8 P1: the per-pair policy is [`pair_decision`], the SAME
+/// function the deny side runs. It previously called `visibility_check` directly,
+/// which on a `blob_paths` phase-2 empty-path entry is a check no glob can match
+/// and therefore an `Allow` on any public repo — so this gate served the exact
+/// OID the serve filter had just withheld. The two consumers of one walk must
+/// not be able to disagree; see `pair_decision`'s comment for the full argument.
 pub fn allowed_blob_set_for_caller_bounded(
     repo_path: &Path,
     git_bin: &str,
@@ -925,7 +951,7 @@ pub fn allowed_blob_set_for_caller_bounded(
     let pairs = blob_paths(repo_path, git_bin, timeout)?;
     let mut allowed = HashSet::new();
     for (oid, path) in &pairs {
-        if visibility_check(rules, is_public, owner_did, caller, path) == Decision::Allow {
+        if pair_decision(path, rules, is_public, owner_did, caller) == Decision::Allow {
             allowed.insert(oid.clone());
         }
     }
@@ -1689,7 +1715,11 @@ pub fn withheld_blob_recipients_bounded(
         let entry = out.entry(oid.clone()).or_default();
         entry.insert(owner_did.to_string());
         for did in &candidates {
-            if visibility_check(rules, is_public, owner_did, Some(did), path) == Decision::Allow {
+            // Same shared per-pair policy as the deny/allow gates (round-8 P1):
+            // an empty-path (phase-2, unclassifiable) blob grants a recovery
+            // copy to the owner only, never to a rule's named reader whose
+            // grant was written against a path this object does not have.
+            if pair_decision(path, rules, is_public, owner_did, Some(did)) == Decision::Allow {
                 entry.insert(did.clone());
             }
         }
