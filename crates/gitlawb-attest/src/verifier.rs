@@ -147,14 +147,19 @@ impl Registry {
     /// Verify a batch, then enforce `RequireAll`.
     ///
     /// Under [`Policy::RequireAll`] this never short-circuits: an attestation
-    /// that fails to verify — bad signature, cert-hash mismatch, malformed
-    /// payload, or a type with no verifier — is dropped from the result rather
-    /// than aborting the batch. Any third party can attach an attestation, so a
-    /// hard error here would let an unrelated `attacker/spam/v1` deny-of-service
-    /// the whole cert (the DoS vector the module docstring warns about). The
-    /// `required_types` check below is the real gate, and it only counts
-    /// `fully_verified` entries — so a required type represented solely by a
-    /// malformed attestation still fails with [`Error::RequiredMissing`].
+    /// that fails to verify — bad signature, cert-hash mismatch, or malformed
+    /// payload, the actual `Err` paths of [`Registry::verify`] — is dropped
+    /// from the result rather than aborting the batch. A valid attestation of
+    /// a type with NO registered verifier is not one of those: under
+    /// `RequireAll` it verifies to `Ok` with `fully_verified: false` and stays
+    /// in the result, preserving the distinction between *untrusted* and
+    /// *invalid* (see `require_all_is_lenient_on_unknown_types_in_the_batch`).
+    /// Any third party can attach an attestation, so a hard error here would
+    /// let an unrelated `attacker/spam/v1` deny-of-service the whole cert (the
+    /// DoS vector the module docstring warns about). The `required_types`
+    /// check below is the real gate, and it only counts `fully_verified`
+    /// entries — so a required type represented solely by a malformed
+    /// attestation still fails with [`Error::RequiredMissing`].
     ///
     /// Under `AcceptKnown` and `RejectUnknown` the batch stays strict: the
     /// first verification error is surfaced to the caller.
@@ -337,6 +342,38 @@ mod tests {
         assert!(verified
             .iter()
             .any(|v| v.type_ == "other/v1" && !v.fully_verified));
+    }
+
+    /// The strict policies must surface a batch member's verification error
+    /// through `verify_all`, not launder it into a partial result. This binds
+    /// the POLICY BOUNDARY itself: only the `RequireAll` arm may drop failing
+    /// entries, and an apparently harmless cleanup that applies its
+    /// `filter_map(Result::ok)` shape to the strict arms would silently turn
+    /// the fail-closed contracts into fail-open — with every per-attestation
+    /// `verify` test still green, because none of them go through the batch
+    /// path. The failing entry is a wrong-cert-hash attestation (signed over a
+    /// different hash than the batch expects), a genuine `Err` under every
+    /// policy.
+    #[test]
+    fn strict_policies_propagate_a_batch_members_error() {
+        let sk = fresh();
+        let cert_hash = sample_hash();
+        let mut wrong_hash = sample_hash();
+        wrong_hash[0] ^= 0xff;
+
+        for policy in [Policy::AcceptKnown, Policy::RejectUnknown] {
+            let mut reg = Registry::new().with_policy(policy);
+            reg.register(DemoVerifier);
+            let good = signed_demo(&sk, cert_hash, "ok");
+            let bad = signed_demo(&sk, wrong_hash, "ok");
+            let err = reg
+                .verify_all(&[good, bad], cert_hash)
+                .expect_err("a strict policy must fail the whole batch");
+            assert!(
+                matches!(err, Error::Signature(_) | Error::CertHashMismatch),
+                "expected the underlying verification error, got {err:?}"
+            );
+        }
     }
 
     /// A required type that is present but unverified (no verifier registered
