@@ -119,21 +119,90 @@ async fn cmd_list(node: String, dir: Option<PathBuf>) -> Result<()> {
     println!("IPFS pins ({count}) on {node}");
     println!();
     for pin in &pins {
-        let cid = pin["cid"].as_str().unwrap_or("?");
-        let sha = pin["sha256_hex"].as_str().unwrap_or("?");
-        let pinned_at = pin["pinned_at"].as_str().unwrap_or("?");
-        // Trim pinned_at to date+time without subseconds
-        let ts = if pinned_at.len() >= 19 {
-            &pinned_at[..19]
-        } else {
-            pinned_at
-        };
-        println!("  {cid}");
-        println!("    sha256: {sha}");
-        println!("    pinned: {ts}");
+        for line in render_pin(pin) {
+            println!("{line}");
+        }
         println!();
     }
     Ok(())
+}
+
+/// The rendered lines for one pins-listing entry.
+///
+/// #218 review round 8 P2 — why this is not just `pin["cid"]`: the wire format
+/// gained a provenance split, and `cid` is now NULLABLE. The node stopped
+/// aliasing a Pinata provider CID into `cid` (round 3) because `cid` is the
+/// key `GET /ipfs/{cid}` resolves against, and a Pinata provider CID is not
+/// resolvable there — advertising one would send clients to a guaranteed 404.
+/// The truthful representation of a Pinata-only row is therefore `cid: null`
+/// plus a `pinata_cid`. This function was reading only `cid`, so such a row
+/// printed as a bare `?` — the CLI showed nothing usable for an object that is
+/// in fact durably stored, and nothing in the client read `pinata_cid` at all.
+///
+/// So: the heading is the node-resolvable CID when there is one, and otherwise
+/// the Pinata provider CID, labelled as such so nobody feeds it back to this
+/// node's resolver. A `backends:` line names where the bytes actually are,
+/// taken from the writer-owned `local_pinned` / `pinata_pinned` booleans rather
+/// than re-inferred from CID shape (which is what the node's own comment warns
+/// against). Older nodes send neither flag; their `cid`-only rows fall back to
+/// CID presence and render exactly as they did before.
+fn render_pin(pin: &Value) -> Vec<String> {
+    let sha = pin["sha256_hex"].as_str().unwrap_or("?");
+    let pinned_at = pin["pinned_at"].as_str().unwrap_or("?");
+    // Trim pinned_at to date+time without subseconds
+    let ts = if pinned_at.len() >= 19 {
+        &pinned_at[..19]
+    } else {
+        pinned_at
+    };
+
+    // `cid` and `local_cid` carry the same raw CID; read both so a node that
+    // ships only one of them still renders.
+    let local_cid = pin["cid"]
+        .as_str()
+        .or_else(|| pin["local_cid"].as_str())
+        .filter(|s| !s.is_empty());
+    let pinata_cid = pin["pinata_cid"].as_str().filter(|s| !s.is_empty());
+
+    // Writer-owned flags when present; CID presence is the pre-split fallback.
+    let local_pinned = pin["local_pinned"]
+        .as_bool()
+        .unwrap_or_else(|| local_cid.is_some());
+    let pinata_pinned = pin["pinata_pinned"]
+        .as_bool()
+        .unwrap_or_else(|| pinata_cid.is_some());
+
+    let mut lines = Vec::new();
+    match (local_cid, pinata_cid) {
+        // Node-resolvable CID present: it leads, as it always has.
+        (Some(cid), _) => lines.push(format!("  {cid}")),
+        // Pinata-only: show the provider CID rather than "?", and say plainly
+        // that this node's resolver will not serve it.
+        (None, Some(p)) => lines.push(format!("  {p}  (pinata provider CID)")),
+        (None, None) => lines.push("  ?".to_string()),
+    }
+    lines.push(format!("    sha256: {sha}"));
+    lines.push(format!("    pinned: {ts}"));
+
+    // A dual row keeps the provider CID visible too; it differs from the local
+    // CID and is the only key that resolves on Pinata's gateway.
+    if local_cid.is_some() {
+        if let Some(p) = pinata_cid {
+            lines.push(format!("    pinata: {p}"));
+        }
+    }
+
+    let backends = match (local_pinned, pinata_pinned) {
+        (true, true) => "local ipfs, pinata",
+        (true, false) => "local ipfs",
+        (false, true) => "pinata",
+        // Neither flag set: the node filters such rows out, so this is only
+        // reachable from a hand-rolled response. Say so rather than imply
+        // durability the row does not claim.
+        (false, false) => "none recorded",
+    };
+    lines.push(format!("    backends: {backends}"));
+    lines
 }
 
 /// Automatic resumes attempted after the initial request when the node reports a
@@ -627,6 +696,84 @@ mod tests {
         )
         .unwrap();
         dir
+    }
+
+    /// #218 review round 8 P2: a Pinata-only row must render its provider CID,
+    /// not a bare `?`. The node stopped aliasing that CID into `cid` because
+    /// `cid` is the key `GET /ipfs/{cid}` resolves on and a provider CID 404s
+    /// there — so `cid` is now legitimately null for such a row, and a client
+    /// that reads only `cid` shows the user nothing for an object that IS
+    /// durably stored. The heading must carry the provider CID and label it,
+    /// and the row must not claim a local pin.
+    #[test]
+    fn render_pin_shows_provider_cid_for_a_pinata_only_row() {
+        let pin: Value = serde_json::from_str(
+            r#"{"sha256_hex":"abc123","cid":null,"local_cid":null,
+                "pinata_cid":"QmProviderOnly","local_pinned":false,
+                "pinata_pinned":true,"pinned_at":"2026-07-02T12:00:00.123456Z"}"#,
+        )
+        .unwrap();
+        let out = render_pin(&pin).join("\n");
+        assert!(
+            out.contains("QmProviderOnly"),
+            "the provider CID must be shown; got:\n{out}"
+        );
+        assert!(
+            !out.contains("  ?"),
+            "a Pinata-only row must not render as a bare `?`; got:\n{out}"
+        );
+        assert!(
+            out.contains("backends: pinata"),
+            "the row must say where the bytes are; got:\n{out}"
+        );
+        assert!(
+            out.contains("pinata provider CID"),
+            "the heading must be labelled so it is not fed back to this node's \
+             resolver, which cannot serve it; got:\n{out}"
+        );
+    }
+
+    /// A dual row leads with the node-resolvable CID (unchanged behavior) and
+    /// additionally surfaces the provider CID, which is a different key and the
+    /// only one Pinata's gateway answers for.
+    #[test]
+    fn render_pin_shows_both_cids_for_a_dual_row() {
+        let pin: Value = serde_json::from_str(
+            r#"{"sha256_hex":"abc123","cid":"bafyLocal","local_cid":"bafyLocal",
+                "pinata_cid":"QmProvider","local_pinned":true,
+                "pinata_pinned":true,"pinned_at":"2026-07-02T12:00:00.123456Z"}"#,
+        )
+        .unwrap();
+        let out = render_pin(&pin).join("\n");
+        assert!(
+            out.starts_with("  bafyLocal"),
+            "the resolver key leads; got:\n{out}"
+        );
+        assert!(
+            out.contains("pinata: QmProvider"),
+            "the provider CID must still be reachable from the listing; got:\n{out}"
+        );
+        assert!(out.contains("backends: local ipfs, pinata"), "got:\n{out}");
+    }
+
+    /// Backward compatibility: a pre-provenance node sends `cid` alone, with no
+    /// `local_pinned` / `pinata_pinned` flags. That row must render as it always
+    /// did, with the backends line inferred from CID presence.
+    #[test]
+    fn render_pin_handles_a_legacy_cid_only_row() {
+        let pin: Value = serde_json::from_str(
+            r#"{"sha256_hex":"abc123","cid":"bafyone",
+                "pinned_at":"2026-07-02T12:00:00.123456Z"}"#,
+        )
+        .unwrap();
+        let out = render_pin(&pin).join("\n");
+        assert!(out.starts_with("  bafyone"), "got:\n{out}");
+        assert!(out.contains("sha256: abc123"), "got:\n{out}");
+        assert!(
+            out.contains("pinned: 2026-07-02T12:00:00"),
+            "the timestamp is still trimmed to seconds; got:\n{out}"
+        );
+        assert!(out.contains("backends: local ipfs"), "got:\n{out}");
     }
 
     #[tokio::test]
