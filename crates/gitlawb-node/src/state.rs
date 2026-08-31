@@ -8,6 +8,19 @@ use crate::git::repo_store::RepoStore;
 use crate::p2p::P2pHandle;
 use crate::rate_limit::RateLimiter;
 
+/// HKDF salt for [`AppState::derive_scan_token_key`]. A constant, not a secret: HKDF's
+/// salt is a domain qualifier, and the confidentiality of the derived key rests entirely
+/// on the node's private seed being the input keying material.
+const SCAN_TOKEN_KEY_SALT: &[u8] = b"gitlawb/hkdf-salt/ipfs-scan-token";
+
+/// HKDF `info` for [`AppState::derive_scan_token_key`]: the domain separation AND the
+/// rotation handle in one string. Nothing else in the node derives from this label, so
+/// the token key is unrelated to the signing key it shares an input with; bumping the
+/// trailing version rotates every node's token key on its next boot, which invalidates
+/// outstanding continuations (they simply fail to open and the caller restarts at the
+/// front) and needs no migration, no config, and no change to this function.
+const SCAN_TOKEN_KEY_INFO: &[u8] = b"gitlawb/ipfs-scan-token/v1";
+
 #[derive(Clone, Debug)]
 pub struct RefUpdateBroadcast {
     pub repo: String,
@@ -66,6 +79,98 @@ pub struct AppState {
     /// brake a push flood from a DID farm (one throwaway DID per repo), so the
     /// push path throttles on the resolved client IP instead.
     pub push_rate_limiter: RateLimiter,
+    /// Per-client-IP ROUTE brake for `GET /ipfs/{cid}`: charged ONCE per request by the
+    /// `rate_limit_by_ip` middleware (server.rs), never inside the handler. It bounds
+    /// request RATE (the "requests per hour" contract of `GITLAWB_IPFS_RATE_LIMIT`) on
+    /// the non-farmable source IP, so an anonymous flood of the public route is capped.
+    /// The per-probe/per-walk WORK accounting the resolver does WITHIN a request draws
+    /// from the SEPARATE `ipfs_work_rate_limiter` below — the two cannot share one bucket
+    /// or a single request that spends a route token and then its own probe token off the
+    /// same bucket is admitted at the route and falsely shed mid-request (#173 round-10,
+    /// R6). Keyed by `push_limiter_trust`.
+    pub ipfs_rate_limiter: RateLimiter,
+    /// Per-client-IP WORK-budget limiter for the `GET /ipfs/{cid}` resolver's internal
+    /// fan-out: charged per legacy (NULL-provenance) PROBE (`acquire` + `cat-file`) and
+    /// per provenance-path WALK, and peeked non-consuming before the O(repos) legacy
+    /// preload. A legacy CID from the public pins index otherwise lets one request drive
+    /// O(repos) subprocess spawns and cold Tigris fetches, and repeat requests amplify
+    /// that across requests with zero limiter contact (INV-10, F3). Charging the work to
+    /// the non-farmable source IP bounds it. A bucket DISTINCT from the route brake above:
+    /// one request legitimately spends many work tokens (a full legacy scan is up to
+    /// `ipfs_max_legacy_probes` probes), so it must not double as the once-per-request
+    /// route bucket. Capacity is DERIVED from the route limit (`AppState::ipfs_work_budget`,
+    /// no separate operator knob), floored at the legacy-probe budget so a single default-
+    /// config deep search never self-throttles mid-scan. Keyed by `push_limiter_trust`.
+    pub ipfs_work_rate_limiter: RateLimiter,
+    /// Per-request ceiling on full-history reachability walks the CID resolver
+    /// may spawn (default `api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST`). A field,
+    /// not a bare const, so tests can shrink it to exercise the cap cheaply;
+    /// production keeps the const default.
+    pub ipfs_max_history_walks: u32,
+    /// Per-request ceiling on legacy (NULL-provenance) repo probes in the CID
+    /// resolver's scan fallback (default `api::ipfs::MAX_LEGACY_PROBES_PER_REQUEST`).
+    /// Bounds the anonymous `acquire` + `cat-file` fan-out across the node (#173,
+    /// INV-10); a field for the same test-seam reason as `ipfs_max_history_walks`.
+    pub ipfs_max_legacy_probes: u32,
+    /// How many repo rows the CID resolver's legacy scan pulls per keyset page
+    /// (default `api::ipfs::LEGACY_SCAN_PAGE_ROWS`). Bounds the DATABASE-facing half
+    /// of the same fan-out `ipfs_max_legacy_probes` bounds on the probe side: without
+    /// it the scan materialized every repo row and every matching visibility rule
+    /// before spending a single probe (#173, INV-10). A field for the same test-seam
+    /// reason as the sibling caps.
+    pub ipfs_legacy_scan_page_rows: usize,
+    /// Per-request ceiling on how many repo ROWS the CID resolver's legacy scan may
+    /// fetch (default `api::ipfs::MAX_LEGACY_SCAN_ROWS_PER_REQUEST`, operator-tunable via
+    /// `GITLAWB_IPFS_MAX_LEGACY_SCAN_ROWS`). `ipfs_max_legacy_probes` bounds the PROBE
+    /// fan-out but only starts counting once a probe runs, and quarantine plus a
+    /// root-scope visibility deny both return before a probe or a visit is spent, so an
+    /// all-denying inventory paged the whole repo table at zero probes (#173 round 13, F2).
+    /// Truncating here sheds a retryable 503 carrying a sealed continuation token.
+    pub ipfs_max_legacy_scan_rows: usize,
+    /// Per-request ceiling on the BYTES of visibility rules the CID resolver's legacy
+    /// scan may retain (default `api::ipfs::MAX_LEGACY_SCAN_RULE_BYTES_PER_REQUEST`). The
+    /// row ceiling above bounds the row count but not the memory each row drags in: the
+    /// pager keeps every fetched page's rules for the whole request, and neither the
+    /// number of rules per repo nor the length of a rule's reader list is capped, so a
+    /// rule COUNT would be the wrong unit. Enforced by the rules QUERY
+    /// (`Db::list_visibility_rules_for_repos_bounded`) rather than by a sum taken once the
+    /// page has landed, so the oversized page is never materialized at all. Deliberately
+    /// NOT an operator knob (it is a
+    /// memory guard, not a reach tradeoff); a field only for the same test-seam reason as
+    /// the sibling caps.
+    pub ipfs_max_legacy_scan_rule_bytes: usize,
+    /// Key sealing the legacy scan's continuation tokens (INV-13), derived from the
+    /// node's persistent identity by [`AppState::derive_scan_token_key`].
+    ///
+    /// The token is minted from a FETCHED row on a scan that served nothing, so by
+    /// construction that row is a private or quarantined repo the caller may not read:
+    /// its `created_at` and its `id` (which carries the owner's DID) are withheld
+    /// fields. The token is therefore AEAD-SEALED, never signed plaintext and never
+    /// base64-of-plaintext, since integrity is not confidentiality.
+    ///
+    /// DERIVED, not random per boot. This reverses an earlier revision of this design,
+    /// which argued that derivation "would make old tokens valid across restarts for no
+    /// benefit and tie a throwaway transport secret to a long-lived signing key." Both
+    /// halves were wrong. Surviving a restart IS the benefit: the token is the ONLY way
+    /// a caller resumes a ladder, an unopenable one is treated as absent, and a caller
+    /// treated as absent silently restarts at the front of the scan. A node whose
+    /// inventory needs several ladder steps and which deploys more often than a caller
+    /// can climb therefore keeps that caller from ever reaching a holder, which
+    /// contradicts the reach bound the README states. And the tie to the signing key is
+    /// what the HKDF domain separation removes: the derived key is a one-way function of
+    /// the seed under an `info` string nothing else uses, so it is not the signing key
+    /// and cannot be worked back into one.
+    ///
+    /// Persisting a random key instead would need a schema change for a value the node
+    /// already has on disk, so derivation is also the smaller mechanism. Rotation is a
+    /// bump of the version in [`SCAN_TOKEN_KEY_INFO`].
+    pub ipfs_scan_token_key: Arc<[u8; 32]>,
+    /// Hard ceiling on the byte size of an object `GET /ipfs/{cid}` will buffer and
+    /// serve (default `api::ipfs::MAX_SERVED_OBJECT_BYTES`). The serve reads via a
+    /// blocking `git cat-file` and buffers the whole object; without a bound a large
+    /// public blob could exhaust memory or block a runtime worker (#173, F6, INV-10).
+    /// A field for the same test-seam reason as the sibling caps.
+    pub ipfs_max_served_object_bytes: u64,
     /// Which forwarded header (if any) the edge is trusted to set, for
     /// resolving the push limiter's client-IP key. See `GITLAWB_TRUSTED_PROXY`.
     /// Node-wide; also keys the two peer-sync limiters below.
@@ -214,13 +319,6 @@ pub struct AppState {
     /// (`with_default_max_keys`, reject-before-insert) so a source-key farm cannot grow
     /// it (INV-15).
     pub git_ipfs_walk_per_caller: crate::rate_limit::PerCallerConcurrency,
-    /// Per-client-IP rate limiter for `GET /ipfs/{cid}`. The route is publicly
-    /// reachable and each request can drive a full-history git walk, so it carries a
-    /// per-IP flood brake in addition to the concurrency cap above — a rate limit
-    /// bounds request *rate*, the semaphore bounds concurrent slow holds (different
-    /// axes). Keyed on the resolved client IP via `push_limiter_trust`. Layered on the
-    /// `/ipfs` route via `rate_limit_by_ip`.
-    pub ipfs_rate_limiter: RateLimiter,
     /// The `git` executable the served-git withheld-blob walk spawns. Production is
     /// `"git"` (resolved via PATH); injectable so a fake `git` can drive the walk's
     /// process-group teardown in handler tests without mutating the process-global
@@ -233,6 +331,21 @@ impl AppState {
     /// initial value matches the current state.
     pub fn subscribe_shutdown(&self) -> tokio::sync::watch::Receiver<bool> {
         self.shutdown_tx.subscribe()
+    }
+
+    /// Sweep expired entries from every per-IP/DID rate limiter. Driven by the
+    /// periodic cleanup task so a bounded limiter's key map sheds stale entries
+    /// instead of sitting near its cap until an inline capacity sweep reclaims
+    /// them. Every limiter on the state is swept here; adding a new limiter means
+    /// adding it to this list.
+    pub(crate) async fn sweep_rate_limiters(&self) {
+        self.rate_limiter.cleanup().await;
+        self.create_ip_rate_limiter.cleanup().await;
+        self.push_rate_limiter.cleanup().await;
+        self.ipfs_rate_limiter.cleanup().await;
+        self.ipfs_work_rate_limiter.cleanup().await;
+        self.sync_trigger_rate_limiter.cleanup().await;
+        self.peer_write_rate_limiter.cleanup().await;
     }
 
     /// Trigger graceful shutdown. Idempotent — calling more than once
@@ -254,6 +367,130 @@ impl AppState {
     #[allow(dead_code)] // used by tests and any future handler that wants to short-circuit
     pub fn is_shutting_down(&self) -> bool {
         *self.shutdown_tx.borrow()
+    }
+
+    /// Legacy-probe budget wired from the `GITLAWB_IPFS_MAX_LEGACY_PROBES` operator
+    /// knob. The knob seeds `ipfs_max_legacy_probes` at construction so it controls the
+    /// per-request legacy (NULL-provenance) probe fan-out it advertises. It deliberately
+    /// does NOT feed the history-walk ceiling: that is governed by
+    /// `ipfs_max_repos_walked` under a `MAX_PIN_SOURCES + 1` floor, because a value
+    /// below the floor truncates a provenanced request with a full source set into a
+    /// false 503. The knob is `usize`, the field `u32`; the range cap (1_048_576) keeps
+    /// the cast lossless.
+    pub(crate) fn ipfs_legacy_probe_budget(config: &crate::config::Config) -> u32 {
+        config.ipfs_max_legacy_probes as u32
+    }
+
+    /// Legacy-scan ROW budget wired from the `GITLAWB_IPFS_MAX_LEGACY_SCAN_ROWS` knob,
+    /// the same helper shape as the probe budget above so the knob cannot become a
+    /// silent no-op if a struct literal drifts back to the bare constant.
+    pub(crate) fn ipfs_legacy_scan_row_budget(config: &crate::config::Config) -> usize {
+        config.ipfs_max_legacy_scan_rows
+    }
+
+    /// The key sealing legacy-scan continuation tokens (INV-13), DERIVED from the node's
+    /// persistent identity rather than minted per boot.
+    ///
+    /// HKDF-SHA256 over the node's Ed25519 seed, the same key material
+    /// `load_or_create_keypair` reads back from its PKCS#8 PEM on every boot, so the
+    /// derived key is byte-identical after a restart or a rolling deploy.
+    ///
+    /// Two properties the derivation has to carry, both load-bearing:
+    ///
+    ///   * DOMAIN SEPARATION. The `info` string below is unique to this use, so the
+    ///     derived key is not the signing seed and is not any other secret derived from
+    ///     it. HKDF is one-way, so a leaked token key yields nothing about the signing
+    ///     key and cannot be turned against a signature.
+    ///   * A VERSION component, carried in the same `info` string
+    ///     ([`SCAN_TOKEN_KEY_INFO`]) alongside a fixed [`SCAN_TOKEN_KEY_SALT`]. Bumping
+    ///     the version rotates every token key on the next boot without touching the
+    ///     identity, the token format, or any caller, so rotation is a constant change
+    ///     rather than a fork of this derivation.
+    pub(crate) fn derive_scan_token_key(keypair: &Keypair) -> [u8; 32] {
+        use hmac::{Hmac, Mac};
+        type HmacSha256 = Hmac<sha2::Sha256>;
+
+        let seed = keypair.to_seed();
+        // HKDF-Extract: PRK = HMAC(salt, ikm).
+        let mut extract =
+            HmacSha256::new_from_slice(SCAN_TOKEN_KEY_SALT).expect("HMAC takes a key of any size");
+        extract.update(seed.as_slice());
+        let prk = extract.finalize().into_bytes();
+        // HKDF-Expand, one block: T(1) = HMAC(PRK, info || 0x01). One 32-byte output
+        // needs exactly one block of SHA-256, so there is no counter loop to get wrong.
+        let mut expand =
+            HmacSha256::new_from_slice(prk.as_slice()).expect("HMAC takes a key of any size");
+        expand.update(SCAN_TOKEN_KEY_INFO);
+        expand.update(&[0x01]);
+        expand.finalize().into_bytes().into()
+    }
+
+    /// Work-budget capacity for [`ipfs_work_rate_limiter`](Self#structfield.ipfs_work_rate_limiter)
+    /// (R6, KTD6), DERIVED from the route limit rather than a new operator knob. The route
+    /// limiter (`ipfs_rate_limiter`) charges once per request; this separate bucket absorbs
+    /// the resolver's per-probe/per-walk work charges so both the route "requests per hour"
+    /// contract and the amplification bound hold. Floor: at least one complete COMBINED
+    /// resolution per window, the provenance phase's walks plus a full legacy search
+    /// (probes plus page tolls), so a single default-config resolution cannot
+    /// self-throttle part-way and recreate the admit-then-429 for a legitimate caller.
+    /// `GITLAWB_IPFS_RATE_LIMIT=0`
+    /// disables the route brake and this derived bucket alike (a 0-capacity limiter admits
+    /// everything).
+    ///
+    /// The floor carries a WALK term (#173 round 15, F2). The provenance visibility walk
+    /// in `gate_and_serve` debits this SAME bucket (its `!legacy_scan` charge), once per
+    /// path-scoped source, before the legacy fallback runs at all, and the walk cap is
+    /// charged per phase. A floor counting only the search therefore under-sizes the
+    /// window by up to that cap exactly when the floor binds (a route limit set below
+    /// it): the provenance phase spends from the budget the floor reserved for the
+    /// search, the fallback 429s short of its configured reach, and the retry re-pays the
+    /// same provenance charges. The term is
+    /// `min(MAX_HISTORY_WALKS_PER_REQUEST, ipfs_max_repos_walked)` because that is what
+    /// the resolver's own `walk_cap` in `gate_and_serve` evaluates to. The two
+    /// expressions are separate, not one shared value: this one reads the CONSTANT
+    /// `crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST`, while `walk_cap` reads the
+    /// `AppState` seam `state.ipfs_max_history_walks`. They agree only because every
+    /// construction seeds that seam from that constant: the production one in `main.rs`,
+    /// and the two test ones in `auth`'s test module and `test_support`. Nothing
+    /// mechanically ties the two expressions beyond this comment and its counterpart at
+    /// `walk_cap` (no shared helper, no type, no assertion outside the one fixture that
+    /// pins the seam as a precondition), so the two `min()`s have to be moved together
+    /// by hand, and a construction that seeded the seam from anything else would size
+    /// the floor for a cap the resolver does not enforce. It reads the
+    /// CONSTANT and the CONFIG knob for the same reason the page term below reads the
+    /// constant page size: `ipfs_max_history_walks` is an `AppState` test seam, and
+    /// sizing a production floor from a seam would inflate the budget by whatever a test
+    /// chose.
+    ///
+    /// The PROBE term is the LEGACY-PROBE knob, not `ipfs_max_repos_walked`. Those were
+    /// one field before the walk cap and the probe budget were split apart, and sizing
+    /// the probe term off the walk cap would silently read 64 instead of 256. That is a
+    /// statement about which knob sizes the PROBE term; it is not a claim that the walk
+    /// cap has no place in the floor, since the walk term above is added to this one
+    /// rather than substituted for it.
+    ///
+    /// The floor also carries the scan's PAGE toll (#173 round 13, F2): every page the
+    /// legacy scan buys is charged to this same bucket, so a deep scan spends
+    /// `ceil(ipfs_max_legacy_scan_rows / LEGACY_SCAN_PAGE_ROWS)` tokens on pages on top
+    /// of its probes. Leaving those out would 429 an honest caller part-way down their
+    /// own continuation-token ladder, which is the F6 admit-then-429 shape in a new
+    /// place. The page term uses the CONSTANT page size, not `AppState`'s field: the
+    /// field is a test seam that shrinks pages to make paging observable, and sizing a
+    /// production floor from it would inflate the budget by whatever a test chose.
+    pub(crate) fn ipfs_work_budget(config: &crate::config::Config) -> usize {
+        if config.ipfs_rate_limit == 0 {
+            return 0;
+        }
+        let pages = config
+            .ipfs_max_legacy_scan_rows
+            .div_ceil(crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS);
+        let walks = std::cmp::min(
+            crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST as usize,
+            config.ipfs_max_repos_walked,
+        );
+        config
+            .ipfs_rate_limit
+            .max(config.ipfs_max_legacy_probes + pages + walks)
     }
 }
 
@@ -1224,5 +1461,82 @@ mod repo_write_lease_tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod scan_token_key_tests {
+    use super::AppState;
+    use gitlawb_core::identity::Keypair;
+    use gitlawb_core::scan_token::{open_scan_token, seal_scan_token, ScanPosition};
+
+    const CID: &str = "bafkreiscantokenkeyfixtureaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn pos() -> ScanPosition {
+        ScanPosition {
+            created_at_key: "2020-01-01T12:00:00+00:00".to_string(),
+            id: "did:key:z6MkScanTokenOwner/repo".to_string(),
+            // 40 hex: the production shape, since the node's own repos are sha1.
+            sha256_hex: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678".to_string(),
+        }
+    }
+
+    /// The RESTART case. A token minted before a restart must still open after it, or a
+    /// caller laddering a deep inventory is silently returned to the front of the scan on
+    /// every rolling deploy and can never reach a holder buried past one window.
+    ///
+    /// The second key is derived from the identity RELOADED THROUGH ITS ON-DISK PEM,
+    /// which is exactly what `load_or_create_keypair` does on boot, so this exercises the
+    /// real restart path rather than a clone of the in-memory keypair.
+    #[test]
+    fn scan_token_key_survives_a_restart_of_the_same_identity() {
+        let kp = Keypair::generate();
+        let pem = kp.to_pem().expect("the identity serializes");
+        let reloaded = Keypair::from_pem(&pem).expect("the identity reloads");
+
+        let before = AppState::derive_scan_token_key(&kp);
+        let after = AppState::derive_scan_token_key(&reloaded);
+
+        let token = seal_scan_token(&before, CID, &pos(), i64::MAX - 1).expect("seal");
+        assert_eq!(
+            open_scan_token(&after, CID, &token, 0),
+            Some(pos()),
+            "a continuation minted before a restart must open after it: the node's \
+             identity is the same, so the derived sealing key must be too"
+        );
+    }
+
+    /// The must-not: a DIFFERENT node identity must derive a DIFFERENT key, so a token is
+    /// no more portable between nodes than it was when the key was random per boot.
+    #[test]
+    fn scan_token_key_does_not_open_under_a_different_identity() {
+        let mine = Keypair::generate();
+        let theirs = Keypair::generate();
+
+        let token = seal_scan_token(
+            &AppState::derive_scan_token_key(&mine),
+            CID,
+            &pos(),
+            i64::MAX - 1,
+        )
+        .expect("seal");
+        assert_eq!(
+            open_scan_token(&AppState::derive_scan_token_key(&theirs), CID, &token, 0),
+            None,
+            "a continuation sealed by one node must not open under another node's identity"
+        );
+    }
+
+    /// Domain separation, executed rather than asserted in prose: the derived token key
+    /// must not be the signing seed itself. Compromising a token key must not hand an
+    /// attacker the material that signs.
+    #[test]
+    fn scan_token_key_is_not_the_signing_seed() {
+        let kp = Keypair::generate();
+        assert_ne!(
+            AppState::derive_scan_token_key(&kp),
+            *kp.to_seed(),
+            "the token key must be a DERIVED secret, never the Ed25519 signing seed"
+        );
     }
 }
