@@ -339,22 +339,97 @@ pub async fn list_repo_events(
     ))
 }
 
-/// A caller-supplied `cursor` value, or a 400.
+/// Version prefix inside the cursor token, so a future change of shape is a
+/// refusal a client can read rather than a silent misparse.
+const PUSH_CURSOR_VERSION: &str = "1";
+
+/// The value that binds a cursor to one repository ON one node.
 ///
-/// The only legal cursor is one this surface issued: a non-negative sequence
-/// number. Anything else is refused rather than reinterpreted, because both
-/// silent readings are wrong in a way the poller cannot see. Reading it as "no
-/// cursor" replays the repo's whole history to a client that believed it was up
-/// to date; reading it as "the end" hides every event after it.
-fn parse_push_cursor(raw: &str) -> Result<i64> {
-    match raw.parse::<i64>() {
-        Ok(v) if v >= 0 => Ok(v),
-        _ => Err(crate::error::AppError::BadRequest(
-            "cursor must be a non-negative integer issued by this endpoint as \
-             `next_cursor`"
-                .into(),
-        )),
+/// A hash rather than the repository id itself, for two reasons that both
+/// matter. It is fixed width, so the token's size does not vary with the id, and
+/// it does not put an internal identifier on the wire — a cursor is a value
+/// clients log, store and paste into bug reports.
+///
+/// Not a secret and not a MAC: a caller who knows the node DID and the
+/// repository id can compute it. It is not trying to stop forgery, because there
+/// is nothing to forge — the position inside the token is a row id that is
+/// checked against this repository's own rows anyway. What it buys is that a
+/// cursor from ANOTHER repository or another node is refused by shape, with a
+/// message that says which mistake was made, instead of being silently applied
+/// to a repository it was never issued for.
+fn push_cursor_tag(node_did: &str, repo_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"gitlawb-push-cursor:v1:");
+    h.update(node_did.as_bytes());
+    h.update([0u8]);
+    h.update(repo_id.as_bytes());
+    hex::encode(&h.finalize()[..8])
+}
+
+/// Encode a poll position as the opaque token clients round-trip.
+///
+/// `after` is the id of the last event the caller has seen, or `None` for the
+/// start of history — which is a real, expressible position rather than an
+/// absent one, so `next_cursor` never has to be null and a poller that persists
+/// it never rewinds.
+///
+/// What is NOT in here is the point: the table-global `seq`. It used to be the
+/// cursor, handed to the client verbatim, and `repo_push_events` is written by
+/// every repository on the node. Its gaps are therefore a measurement of how
+/// much OTHER repositories pushed between two of this one's events, private ones
+/// included. A row id carries no such information; the id is already in every
+/// event this surface serves, so it discloses nothing new.
+fn encode_push_cursor(tag: &str, after: Option<&str>) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    URL_SAFE_NO_PAD.encode(format!(
+        "{PUSH_CURSOR_VERSION}.{tag}.{}",
+        after.unwrap_or("")
+    ))
+}
+
+/// A caller-supplied `cursor` value as a poll position, or a 400.
+///
+/// `Ok(None)` is the start of history; `Ok(Some(id))` names the last event the
+/// caller saw. The id is NOT trusted here — [`Db::push_event_seq`] resolves it
+/// against this repository's own rows, and an id that resolves to nothing is
+/// refused there.
+///
+/// Everything else is refused rather than reinterpreted, because both silent
+/// readings are wrong in a way the poller cannot see. Reading an unknown cursor
+/// as "no cursor" replays the repository's whole history to a client that
+/// believed it was up to date; reading it as "the end" hides every event after
+/// it — which is exactly what a bare `seq > $1` did with a number issued by some
+/// other repository, or retained across a restore: an empty 200, echoed back, and
+/// a subscriber permanently past events it never received.
+fn decode_push_cursor(raw: &str, tag: &str) -> Result<Option<String>> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+    let refuse = |what: &str| {
+        crate::error::AppError::BadRequest(format!(
+            "cursor {what}; use the `next_cursor` this endpoint returned for this repository"
+        ))
+    };
+    let unissued = "is not a token this endpoint issued";
+
+    let decoded = URL_SAFE_NO_PAD.decode(raw).map_err(|_| refuse(unissued))?;
+    let text = String::from_utf8(decoded).map_err(|_| refuse(unissued))?;
+    let mut parts = text.splitn(3, '.');
+    let (Some(version), Some(bound_tag), Some(after)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Err(refuse(unissued));
+    };
+    if version != PUSH_CURSOR_VERSION {
+        return Err(refuse(
+            "was issued in a format this endpoint no longer reads",
+        ));
     }
+    if bound_tag != tag {
+        return Err(refuse(
+            "was issued for a different repository or a different node",
+        ));
+    }
+    Ok((!after.is_empty()).then(|| after.to_string()))
 }
 
 /// GET /api/v1/repos/{owner}/{repo}/push-events?cursor=&limit=
@@ -364,17 +439,33 @@ fn parse_push_cursor(raw: &str) -> Result<i64> {
 /// oldest first, so a missed delivery costs a poll rather than needing retry
 /// machinery on the send side.
 ///
-/// The cursor is the `next_cursor` the previous page returned, a
-/// database-assigned sequence number, and rows are read strictly after it. It is
-/// one value rather than a timestamp pair because the timestamp is stamped by
-/// the application before the insert and cannot order these rows (see
-/// [`crate::db::Db::list_repo_push_events_keyset`]). Omitting it starts at the
-/// beginning of the repo's history.
+/// The cursor is the `next_cursor` the previous page returned: an OPAQUE token
+/// naming the last event the caller saw, scoped to this repository on this node.
+/// Rows are read strictly after it. Omitting it starts at the beginning of the
+/// repo's history.
 ///
-/// `next_cursor` is always present, never null, and never lower than the cursor
-/// the request carried: an empty page hands back the position the caller already
-/// had. A poller that persists it therefore stays where it is when there is
-/// nothing new, instead of restarting from the beginning.
+/// Opaque and scoped, rather than the raw `seq` it used to be, because that
+/// number was neither. Every non-negative integer was accepted and passed
+/// straight into a per-repo `seq > $1`, so a value issued by a DIFFERENT
+/// repository — or by this one before a restore — returned an empty 200 and was
+/// echoed back, permanently skipping this repository's history while the
+/// subscriber believed it was caught up. And the number was the table-global
+/// `BIGSERIAL`, shared by every repository on the node, so its gaps measured how
+/// much other repositories pushed, private ones included. The token now carries
+/// a repository binding that is checked before the read, and a row id that is
+/// resolved against this repository's own rows; an unknown or foreign cursor is
+/// a visible 400 instead of a silent skip.
+///
+/// Rows are still ordered by the database-assigned `seq` internally — the
+/// timestamp is stamped by the application before the insert and cannot order
+/// them (see [`crate::db::Db::list_repo_push_events_keyset`]) — but that value
+/// no longer leaves the node.
+///
+/// `next_cursor` is always present, never null, and never moves backwards: an
+/// empty page hands back the position the caller already had, and the start of
+/// history is itself an expressible position rather than an absent one. A poller
+/// that persists it therefore stays where it is when there is nothing new,
+/// instead of restarting from the beginning.
 ///
 /// `limit` is clamped to [`MIN_PUSH_EVENT_PAGE`]..=[`MAX_PUSH_EVENT_PAGE`]. A
 /// value that does not parse falls back to the default page size.
@@ -407,8 +498,31 @@ pub async fn list_repo_push_events(
     // Cursor validation runs AFTER the gate on purpose: a caller who may not read
     // this repo gets the not-found for every request shape, so a 400 can never
     // become the tell that distinguishes a private repo from a missing one.
-    let cursor = match params.get("cursor") {
-        Some(raw) => Some(parse_push_cursor(raw)?),
+    let tag = push_cursor_tag(&state.node_did.to_string(), &record.id);
+    let after = match params.get("cursor") {
+        Some(raw) => decode_push_cursor(raw, &tag)?,
+        None => None,
+    };
+
+    // Resolve the named event to its ordering key against THIS repository's
+    // rows. A cursor whose event is not here — a token kept across a restore
+    // that lost it, or one for a row that never existed — is a visible 400, not
+    // an empty page that reads to the poller as "you are up to date". The read
+    // itself still walks `seq`, which is what makes the page cheap.
+    let cursor = match &after {
+        Some(id) => Some(
+            state
+                .db
+                .push_event_seq(&record.id, id)
+                .await?
+                .ok_or_else(|| {
+                    crate::error::AppError::BadRequest(
+                        "cursor names an event this repository does not have; poll without a \
+                         cursor to restart from the beginning of its history"
+                            .into(),
+                    )
+                })?,
+        ),
         None => None,
     };
 
@@ -429,8 +543,9 @@ pub async fn list_repo_push_events(
         })
         .collect();
     // Never null and never backwards: an empty page returns the cursor the caller
-    // arrived with (or the start of history, if it arrived with none).
-    let next = rows.last().map_or(cursor.unwrap_or(0), |e| e.seq);
+    // arrived with (or the start of history, if it arrived with none), re-encoded
+    // to the same bytes it sent.
+    let next = encode_push_cursor(&tag, rows.last().map_or(after.as_deref(), |e| Some(&e.id)));
     let count = events.len();
     Ok(Json(serde_json::json!({
         "events": events,
@@ -1735,7 +1850,7 @@ mod push_events_tests {
             ids.extend(rows.into_iter().map(|r| r.0));
             query = format!(
                 "limit=1&cursor={}",
-                body["next_cursor"].as_i64().expect("next_cursor"),
+                body["next_cursor"].as_str().expect("next_cursor"),
             );
         }
         panic!("the cursor walk did not terminate within {max_steps} steps: {ids:?}");
@@ -1809,8 +1924,13 @@ mod push_events_tests {
             .unwrap();
 
         // The cursor a subscriber last polled at. The repo has never been pushed
-        // to, so that cursor is the start of history.
-        let before = 0;
+        // to, so that cursor is the start of history — which the surface hands
+        // out as a real token rather than as an absent value.
+        let before = body_json(poll(&state, Some(OWNER), &poll_uri("widget", "")).await).await
+            ["next_cursor"]
+            .as_str()
+            .expect("next_cursor")
+            .to_string();
 
         // The push happens. The webhook fires into the void.
         crate::api::repos::record_push_events(
@@ -1917,7 +2037,7 @@ mod push_events_tests {
             "page size of one must return one row, got {first}"
         );
 
-        let next_cursor = first["next_cursor"].as_i64().expect("next_cursor");
+        let next_cursor = first["next_cursor"].as_str().expect("next_cursor");
 
         let cursor = format!("cursor={next_cursor}&limit=1");
         let second = body_json(poll(&state, Some(OWNER), &poll_uri("widget", &cursor)).await).await;
@@ -1945,7 +2065,7 @@ mod push_events_tests {
 
         let cursor2 = format!(
             "cursor={}&limit=1",
-            second["next_cursor"].as_i64().expect("next_cursor"),
+            second["next_cursor"].as_str().expect("next_cursor"),
         );
         let third = body_json(poll(&state, Some(OWNER), &poll_uri("widget", &cursor2)).await).await;
         assert!(
@@ -2003,7 +2123,7 @@ mod push_events_tests {
 
     /// Seed two events and hand back the repo name plus the cursor that sits
     /// between them, for the degenerate-input cases below.
-    async fn two_event_repo(state: &crate::state::AppState) -> i64 {
+    async fn two_event_repo(state: &crate::state::AppState) -> String {
         state
             .db
             .create_repo(&repo("r-bad", "widget", true))
@@ -2029,7 +2149,10 @@ mod push_events_tests {
         .await;
 
         let first = body_json(poll(state, Some(OWNER), &poll_uri("widget", "limit=1")).await).await;
-        first["next_cursor"].as_i64().expect("next_cursor")
+        first["next_cursor"]
+            .as_str()
+            .expect("next_cursor")
+            .to_string()
     }
 
     /// A cursor the surface could not have issued is a client bug, and the only
@@ -2042,13 +2165,18 @@ mod push_events_tests {
         let mid = two_event_repo(&state).await;
 
         for bad in [
-            "notanumber",
+            "notacursor",
             "",
             "-1",
             "1.5",
             "99999999999999999999999999",
             // Percent-encoded leading space: a valid URI that decodes to " 1".
             "%201",
+            // What the surface used to issue and accept: a bare sequence
+            // number. It is no longer a cursor at all, and the poller that
+            // kept one across the change is told so rather than being served an
+            // empty page it would read as "caught up".
+            "42",
         ] {
             let resp = poll(
                 &state,
@@ -2099,10 +2227,10 @@ mod push_events_tests {
             .await,
         )
         .await;
-        let next = body["next_cursor"].as_i64().expect("next_cursor");
+        let next = body["next_cursor"].as_str().expect("next_cursor");
         assert!(
-            next >= mid,
-            "a cursor must never move backwards; asked from {mid}, got {next} in {body}"
+            !next.is_empty(),
+            "a cursor must never come back empty; asked from {mid}, got {body}"
         );
         assert_eq!(
             event_rows(&body).len(),
@@ -2164,7 +2292,19 @@ mod push_events_tests {
         )
         .await;
 
-        let resp = poll(&state, Some(OWNER), &poll_uri("widget", "cursor=999999")).await;
+        // The steady state: poll with the cursor the last page returned.
+        let caught_up = body_json(poll(&state, Some(OWNER), &poll_uri("widget", "")).await).await;
+        let tail = caught_up["next_cursor"]
+            .as_str()
+            .expect("next_cursor")
+            .to_string();
+
+        let resp = poll(
+            &state,
+            Some(OWNER),
+            &poll_uri("widget", &format!("cursor={tail}")),
+        )
+        .await;
         assert_eq!(
             resp.status(),
             StatusCode::OK,
@@ -2177,25 +2317,258 @@ mod push_events_tests {
         );
         assert_eq!(body["count"].as_u64(), Some(0));
         assert_eq!(
-            body["next_cursor"].as_i64(),
-            Some(999_999),
-            "an empty page must hand back the cursor it was given; a null (or a \
-             lower value) tells a poller that persists it to start over from the \
-             beginning of history, got {body}"
+            body["next_cursor"].as_str(),
+            Some(tail.as_str()),
+            "an empty page must hand back the cursor it was given; a null (or an \
+             earlier position) tells a poller that persists it to start over from \
+             the beginning of history, got {body}"
         );
 
         // And the same on a repo with no events at all, where there is no row to
-        // derive a cursor from: the start of history is not a rewind.
+        // derive a cursor from: the start of history is an expressible position,
+        // not an absent one, so the answer is a usable token rather than null.
         state
             .db
             .create_repo(&repo("r-empty", "quiet", true))
             .await
             .unwrap();
         let empty = body_json(poll(&state, Some(OWNER), &poll_uri("quiet", "")).await).await;
+        let start = empty["next_cursor"]
+            .as_str()
+            .expect("a first poll must still carry a cursor")
+            .to_string();
+        let again = poll(
+            &state,
+            Some(OWNER),
+            &poll_uri("quiet", &format!("cursor={start}")),
+        )
+        .await;
         assert_eq!(
-            empty["next_cursor"].as_i64(),
-            Some(0),
-            "a first poll of a repo with no events starts at zero, got {empty}"
+            again.status(),
+            StatusCode::OK,
+            "the start-of-history token must be a cursor this endpoint accepts back"
+        );
+    }
+
+    /// A cursor issued for ANOTHER repository is refused, not applied.
+    ///
+    /// This is the failure the bare sequence number could not see. `seq` is a
+    /// table-global bigserial shared by every repository on the node, so a
+    /// number issued for a busy repository is an ordinary, larger number here:
+    /// `seq > $1` matched nothing, the surface answered 200 with an empty page
+    /// and echoed the value back, and the subscriber sat permanently past
+    /// history it had never received — with nothing anywhere reading as an
+    /// error. Both repositories are readable by this caller, so the refusal is
+    /// about scope and not about access.
+    ///
+    /// The control matters as much as the refusal: the same position, expressed
+    /// as this repository's own cursor, still serves its second event.
+    #[sqlx::test]
+    async fn a_cursor_issued_for_another_repository_is_refused(pool: PgPool) {
+        let state = test_state(pool).await;
+        for (id, name) in [("r-mine", "mine"), ("r-theirs", "theirs")] {
+            state.db.create_repo(&repo(id, name, true)).await.unwrap();
+        }
+        // Interleaved, so the two repositories' rows do not occupy contiguous
+        // ranges of the shared sequence: a cursor from one really does land in
+        // the middle of the other's history.
+        for n in 0..2 {
+            for repo_id in ["r-theirs", "r-mine"] {
+                seed_event(
+                    &state,
+                    &format!("evt-{repo_id}-{n}"),
+                    repo_id,
+                    "refs/heads/main",
+                    SHA_A,
+                    "2026-08-07T12:00:00.000000Z",
+                )
+                .await;
+            }
+        }
+
+        let theirs = body_json(poll(&state, Some(OWNER), &poll_uri("theirs", "limit=1")).await)
+            .await["next_cursor"]
+            .as_str()
+            .expect("next_cursor")
+            .to_string();
+
+        let resp = poll(
+            &state,
+            Some(OWNER),
+            &poll_uri("mine", &format!("cursor={theirs}")),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "another repository's cursor must be refused visibly, not silently \
+             skip this repository's history"
+        );
+        let body = body_json(resp).await;
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("different repository")),
+            "the refusal must say WHICH mistake was made, got {body}"
+        );
+
+        // The control: this repository's own cursor, at the same position,
+        // serves the next row.
+        let mine = body_json(poll(&state, Some(OWNER), &poll_uri("mine", "limit=1")).await).await
+            ["next_cursor"]
+            .as_str()
+            .expect("next_cursor")
+            .to_string();
+        let ok = body_json(
+            poll(
+                &state,
+                Some(OWNER),
+                &poll_uri("mine", &format!("cursor={mine}")),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            event_rows(&ok).len(),
+            1,
+            "the repository's own cursor must still page it, got {ok}"
+        );
+    }
+
+    /// A cursor whose event this repository no longer has is refused, which is
+    /// the "retained across a restore" case.
+    ///
+    /// The token is well formed and correctly scoped; the row behind it is
+    /// simply gone. Answering an empty 200 would tell a poller it is up to date
+    /// about a history it has not read, and would keep telling it that forever.
+    /// The refusal names the recovery — poll without a cursor — so the client
+    /// can act on it.
+    #[sqlx::test]
+    async fn a_cursor_naming_an_event_this_repo_no_longer_has_is_refused(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        state
+            .db
+            .create_repo(&repo("r-gone", "widget", true))
+            .await
+            .unwrap();
+        for n in 0..2 {
+            seed_event(
+                &state,
+                &format!("evt-{n}"),
+                "r-gone",
+                "refs/heads/main",
+                SHA_A,
+                "2026-08-07T12:00:00.000000Z",
+            )
+            .await;
+        }
+
+        let cursor = body_json(poll(&state, Some(OWNER), &poll_uri("widget", "limit=1")).await)
+            .await["next_cursor"]
+            .as_str()
+            .expect("next_cursor")
+            .to_string();
+
+        // The row the cursor names disappears — a restore from a backup taken
+        // before it, in production.
+        sqlx::query("DELETE FROM repo_push_events WHERE id = 'evt-0'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let resp = poll(
+            &state,
+            Some(OWNER),
+            &poll_uri("widget", &format!("cursor={cursor}")),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a cursor whose event is gone must be refused, not answered with an \
+             empty page the poller reads as being up to date"
+        );
+        let body = body_json(resp).await;
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("does not have")),
+            "the refusal must name the recovery, got {body}"
+        );
+    }
+
+    /// The cursor discloses no table-global counter.
+    ///
+    /// `repo_push_events.seq` is one bigserial shared by every repository on the
+    /// node. Handing it to clients turned the gaps between one repository's
+    /// cursors into a measurement of how much OTHER repositories pushed in
+    /// between — private ones included. The token that replaced it carries a
+    /// repository binding and a row id the surface already publishes, and it
+    /// must not carry that number in any form a reader can lift back out.
+    #[sqlx::test]
+    async fn the_cursor_does_not_carry_the_table_global_sequence(pool: PgPool) {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        let state = test_state(pool.clone()).await;
+        for (id, name) in [("r-noisy", "noisy"), ("r-leak", "widget")] {
+            state.db.create_repo(&repo(id, name, true)).await.unwrap();
+        }
+        // The other repository's pushes come first, so the sequence value this
+        // repository's single row lands on is a multi-digit number that could
+        // not be confused with the token's version prefix — and is itself the
+        // measurement the old cursor handed out.
+        for n in 0..20 {
+            seed_event(
+                &state,
+                &format!("noise-{n}"),
+                "r-noisy",
+                "refs/heads/main",
+                SHA_A,
+                "2026-08-07T12:00:00.000000Z",
+            )
+            .await;
+        }
+        seed_event(
+            &state,
+            "evt-1",
+            "r-leak",
+            "refs/heads/main",
+            SHA_A,
+            "2026-08-07T12:00:00.000000Z",
+        )
+        .await;
+
+        let seq: i64 = sqlx::query_scalar("SELECT seq FROM repo_push_events WHERE id = 'evt-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            seq > 9,
+            "the scenario needs a multi-digit sequence to be meaningful, got {seq}"
+        );
+
+        let cursor = body_json(poll(&state, Some(OWNER), &poll_uri("widget", "")).await).await
+            ["next_cursor"]
+            .as_str()
+            .expect("next_cursor")
+            .to_string();
+
+        assert!(
+            !cursor.contains(&seq.to_string()),
+            "the encoded cursor must not spell the global sequence, got {cursor}"
+        );
+        let decoded = String::from_utf8(URL_SAFE_NO_PAD.decode(&cursor).expect("base64url"))
+            .expect("utf-8 token");
+        assert!(
+            !decoded.contains(&seq.to_string()),
+            "decoding the cursor must not reveal the global sequence either, got \
+             {decoded}"
+        );
+        assert_eq!(
+            decoded.splitn(3, '.').nth(2),
+            Some("evt-1"),
+            "the position must be the row id this surface already publishes, got \
+             {decoded}"
         );
     }
 

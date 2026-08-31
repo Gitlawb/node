@@ -3324,6 +3324,28 @@ impl Db {
         Ok(row.map(|r| r.get("after_sha")))
     }
 
+    /// The ordering key of one push event, looked up BY ROW ID and scoped to the
+    /// repository that owns it.
+    ///
+    /// This is what turns the poll surface's opaque cursor back into something
+    /// the keyset walk can use, and the scoping is the security half of it: a
+    /// token naming a row of some other repository resolves to `None` here, not
+    /// to that row's `seq`. `None` is also the honest answer for a row that no
+    /// longer exists, which the caller reports as a refusal rather than serving
+    /// an empty page that would read as "up to date".
+    ///
+    /// `(repo_id, id)` rather than `id` alone even though the id is the primary
+    /// key: the predicate is the point, and a lookup that found the row and then
+    /// compared afterwards would be one refactor away from dropping the compare.
+    pub async fn push_event_seq(&self, repo_id: &str, id: &str) -> Result<Option<i64>> {
+        let row = sqlx::query("SELECT seq FROM repo_push_events WHERE repo_id = $1 AND id = $2")
+            .bind(repo_id)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("seq")))
+    }
+
     /// One page of a repo's push events, OLDEST first, walked by a `seq` keyset
     /// cursor rather than an offset.
     ///
