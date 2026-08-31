@@ -19,6 +19,11 @@ class Config {
     var operatorPrivateKey: String = ""
     var tigrisBucket: String = ""
     var autoSync: Bool = false
+    /// Owner-only push. Persisted as a setting rather than read from a hand-edited
+    /// `.env`, because `writeEnvFile()` regenerates that file on every start and
+    /// would discard the edit. Matches the node's own default; set false only for a
+    /// rolling upgrade whose pushers are not yet the repo owner.
+    var enforceOwnerPush: Bool = true
     var repoPathString: String = ""
 
     // MARK: - Paths
@@ -76,6 +81,7 @@ class Config {
             "operatorPrivateKey": operatorPrivateKey,
             "tigrisBucket": tigrisBucket,
             "autoSync": autoSync,
+            "enforceOwnerPush": enforceOwnerPush,
             "repoPath": repoPathString,
         ]
 
@@ -105,6 +111,7 @@ class Config {
         operatorPrivateKey = dict["operatorPrivateKey"] as? String ?? operatorPrivateKey
         tigrisBucket = dict["tigrisBucket"] as? String ?? tigrisBucket
         autoSync = dict["autoSync"] as? Bool ?? autoSync
+        enforceOwnerPush = dict["enforceOwnerPush"] as? Bool ?? enforceOwnerPush
         repoPathString = dict["repoPath"] as? String ?? repoPathString
     }
 
@@ -121,6 +128,7 @@ class Config {
         lines.append("GITLAWB_PORT=\(httpPort)")
         lines.append("GITLAWB_P2P_PORT=\(p2pPort)")
         lines.append("GITLAWB_AUTO_SYNC=\(autoSync)")
+        lines.append("GITLAWB_ENFORCE_OWNER_PUSH=\(enforceOwnerPush)")
 
         if !chainRpcURL.isEmpty {
             lines.append("GITLAWB_CHAIN_RPC_URL=\(chainRpcURL)")

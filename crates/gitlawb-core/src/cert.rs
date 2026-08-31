@@ -6,6 +6,8 @@
 //! The schema is frozen at v1. All fields are mandatory for forward compatibility.
 //! Nodes that receive a certificate with an unknown version MUST reject it.
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -135,10 +137,14 @@ impl RefUpdateCert {
 
     /// Check if this certificate satisfies a threshold of valid signatures
     /// from the provided set of authorized maintainer DIDs.
+    ///
+    /// Counts distinct signer DIDs, not signature entries: a repeated
+    /// signature from the same maintainer counts once.
     pub fn satisfies_threshold(&self, maintainers: &[Did], threshold: usize) -> Result<bool> {
         let valid = self.verify_all()?;
-        let count = valid.iter().filter(|d| maintainers.contains(d)).count();
-        Ok(count >= threshold)
+        let distinct_signers: HashSet<&Did> =
+            valid.iter().filter(|d| maintainers.contains(d)).collect();
+        Ok(distinct_signers.len() >= threshold)
     }
 
     /// Validate the certificate structure (not signatures).
@@ -342,6 +348,33 @@ mod tests {
 
         let maintainers = vec![kp_maintainer.did()];
         assert!(!cert.satisfies_threshold(&maintainers, 1).unwrap());
+    }
+
+    #[test]
+    fn satisfies_threshold_rejects_duplicated_signature() {
+        let kp1 = Keypair::generate();
+        let kp2 = Keypair::generate();
+        let kp3 = Keypair::generate();
+        let repo_did = kp1.did();
+
+        let mut cert = RefUpdateCert::new(
+            repo_did,
+            "refs/heads/main".to_string(),
+            dummy_hash('0'),
+            dummy_hash('a'),
+            1,
+            &kp1,
+        )
+        .unwrap();
+        // Copy-paste the only real signature onto the certificate a second
+        // time. Same signer, same valid signature, still one real signer.
+        let dup = cert.signatures[0].clone();
+        cert.signatures.push(dup);
+
+        let maintainers = vec![kp1.did(), kp2.did(), kp3.did()];
+        // Two signature entries but a single distinct signer must not
+        // satisfy a 2-of-3 threshold.
+        assert!(!cert.satisfies_threshold(&maintainers, 2).unwrap());
     }
 
     #[test]

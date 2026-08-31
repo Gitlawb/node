@@ -33,6 +33,9 @@ services:
       GITLAWB_PORT: ${GITLAWB_PORT:-7545}
       GITLAWB_PUBLIC_URL: ${GITLAWB_PUBLIC_URL:-http://localhost:7545}
       GITLAWB_P2P_PORT: ${GITLAWB_P2P_PORT:-7546}
+      # Owner-only push. Matches the node's own default; forwarding it is what makes
+      # the documented rolling-upgrade opt-out reachable on the container path.
+      GITLAWB_ENFORCE_OWNER_PUSH: ${GITLAWB_ENFORCE_OWNER_PUSH:-true}
       # Sync
       GITLAWB_AUTO_SYNC: ${GITLAWB_AUTO_SYNC:-false}
       # On-chain PoS (optional — leave unset for local/dev)

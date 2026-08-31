@@ -41,12 +41,150 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
       version: ${{ steps.release.outputs.version }}
+      pr: ${{ steps.release.outputs.pr }}
     steps:
       - name: Run release-please
         id: release
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # The release PR bumps the workspace crate versions in the Cargo.tomls but
+  # release-please cannot update Cargo.lock, so without this job every release
+  # merge ships a tag whose lockfile disagrees with its manifests (a --locked
+  # build from the tag fails, and pr-checks builds --locked). Sync the lock on
+  # the release branch so the tagged tree is internally consistent.
+  #
+  # Runs on every push-triggered release run, not only when release-please
+  # reports the PR: the `pr` output is set only on runs that CREATE or UPDATE
+  # the release PR, so gating on it would leave an already-open release PR
+  # (opened before this job existed, or untouched by a non-releasable push)
+  # permanently without the sync and without check runs. The resolve step
+  # discovers any open release-please PR itself and no-ops when there is none.
+  sync-release-lock:
+    name: Sync Cargo.lock on the release PR
+    needs: release-please
+    if: ${{ !cancelled() && github.repository == 'Gitlawb/node' && github.event_name != 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+      # actions: write lets the final step dispatch pr-checks on the release
+      # branch. Note this grant is repo-wide dispatch rights (GitHub cannot
+      # scope it to one workflow); acceptable here because reaching this job's
+      # steps already requires write to main. Needed because every push to the
+      # release branch (release-please's and the lock sync below) is made with
+      # GITHUB_TOKEN, which triggers no workflow runs, so without an explicit
+      # dispatch the release PR's head carries no check runs and the --locked
+      # gate never validates it.
+      actions: write
+    steps:
+      # Prefer the fresh `pr` output when this run just created/updated the
+      # release PR; otherwise fall back to querying for an open release-please
+      # branch (prefix match: the branch carries `--components--` suffixes).
+      - name: Resolve the open release PR branch
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          BRANCH_FROM_OUTPUT: ${{ needs.release-please.outputs.pr && fromJSON(needs.release-please.outputs.pr).headBranchName || '' }}
+        run: |
+          branch="$BRANCH_FROM_OUTPUT"
+          if [ -z "$branch" ]; then
+            # The branch name alone is not a trust signal. `gh pr list` includes
+            # fork PRs, and a fork's headRefName is bare (no owner prefix), so a
+            # prefix match by itself lets any fork nominate the branch this job
+            # checks out, commits to, and dispatches checks on. Require the head
+            # repo to be THIS repository and the author to be the release-please
+            # app, so neither a fork nor a same-repo human branch named
+            # `release-please--*` can be selected. Then take the highest PR
+            # number: `[0]` depended on gh's default ordering, which is not a
+            # documented guarantee, and picking a stable one keeps a second
+            # (component) release PR from making the choice flap between runs.
+            branch=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+              --json headRefName,headRepositoryOwner,number,author \
+              --jq '[ .[]
+                      | select(.headRepositoryOwner.login == env.OWNER)
+                      | select(.author.login == "app/github-actions")
+                      | select(.headRefName | startswith("release-please--"))
+                    ] | max_by(.number).headRefName // empty')
+          fi
+          if [ -z "$branch" ]; then
+            echo "no open release PR; nothing to sync"
+          fi
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release branch
+        if: ${{ steps.resolve.outputs.branch != '' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ steps.resolve.outputs.branch }}
+
+      # Resolve on a declared toolchain instead of whatever Rust the runner
+      # image happens to ship, so the lock this job writes comes off the same
+      # stable channel the other cargo jobs use. Not a claim of identical
+      # resolution: `stable` still moves between runs, and the MSRV gate
+      # checks this same lock on 1.91 (pr-checks.yml). It only removes the
+      # runner image as an undeclared input.
+      - name: Install Rust toolchain
+        if: ${{ steps.resolve.outputs.branch != '' }}
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable
+        with:
+          toolchain: stable
+
+      - name: Sync workspace crate versions into Cargo.lock
+        if: ${{ steps.resolve.outputs.branch != '' }}
+        run: cargo update --workspace
+
+      - name: Commit and push when the lock changed
+        if: ${{ steps.resolve.outputs.branch != '' }}
+        run: |
+          if git diff --quiet Cargo.lock; then
+            echo "Cargo.lock already in sync"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "chore: sync Cargo.lock with the release version bump"
+          git push
+
+      # Every push to the release branch is made with GITHUB_TOKEN (release-
+      # please's own pushes and the lock sync above), and events created by
+      # GITHUB_TOKEN start no workflow runs. workflow_dispatch is the documented
+      # exception GITHUB_TOKEN may trigger, so dispatch pr-checks at the release
+      # branch to attach check runs to its current head. Unconditional (also on
+      # the already-in-sync path) because the branch's ORIGINAL head has the
+      # same no-runs problem. Loud on failure by design: a silent fallback
+      # would recreate the checkless-head problem, and a job rerun is safe
+      # (sync no-ops, dispatch retries). Loop-safe: pr-checks is read-only and
+      # dispatches nothing. Runs after the push ack, so the dispatched ref tip
+      # is the sync commit. Merge-queue note: this validates the branch tip;
+      # the enforced merge queue's merge_group run still re-validates the true
+      # merged result before landing.
+      - name: Dispatch PR checks on the release branch
+        if: ${{ steps.resolve.outputs.branch != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.resolve.outputs.branch }}
+        run: |
+          # Every dispatch failure fails the job, including the 422 a release
+          # branch cut before pr-checks gained its workflow_dispatch trigger
+          # returns ("does not have a workflow_dispatch trigger", reported
+          # against the dispatched ref's copy of the file). An earlier revision
+          # tolerated exactly that 422 on the theory that release-please would
+          # rewrite the branch and heal it, but a rewrite only happens when a
+          # later releasable commit lands: an open release PR nobody touches is
+          # never rewritten. Tolerating it therefore left the lock-sync commit
+          # this job had just pushed sitting on the release head with no
+          # --locked validation, which is the precise state this workflow exists
+          # to prevent. The tolerance is also no longer needed: once this lands,
+          # every release branch is cut from a main that already carries the
+          # trigger, so the only branch that could 422 is one open at merge time
+          # (there is none), and a job rerun after a manual rebase is safe (the
+          # sync no-ops, the dispatch retries).
+          gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/pr-checks.yml/dispatches" \
+            -f "ref=$BRANCH"
 
   # Each architecture builds NATIVELY (amd64 on ubuntu-latest, arm64 on
   # ubuntu-24.04-arm) and pushes by digest; docker-manifest below stitches the
@@ -78,6 +216,11 @@ jobs:
       contents: read
       packages: write
     steps:
+      - name: Check out workflow scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
       - name: Resolve release tag
         id: rel
         env:
@@ -85,13 +228,7 @@ jobs:
           RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
           set -euo pipefail
-          TAG="${DISPATCH_TAG:-$RELEASE_TAG}"
-          case "$TAG" in
-            v[0-9]*) ;;
-            *) echo "::error::'$TAG' does not look like a release tag (vX.Y.Z)"; exit 1 ;;
-          esac
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          scripts/resolve-release-tag.sh "${DISPATCH_TAG:-$RELEASE_TAG}"
           # ghcr requires a lowercase repository path, and unlike metadata-action,
           # buildx's `--output name=` does no lowercasing — a mixed-case owner
           # makes the digest push fail with "invalid reference format".
@@ -173,8 +310,14 @@ jobs:
     if: ${{ !cancelled() && needs.docker.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       packages: write
     steps:
+      - name: Check out workflow scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
       - name: Resolve release tag
         id: rel
         env:
@@ -182,13 +325,7 @@ jobs:
           RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
           set -euo pipefail
-          TAG="${DISPATCH_TAG:-$RELEASE_TAG}"
-          case "$TAG" in
-            v[0-9]*) ;;
-            *) echo "::error::'$TAG' does not look like a release tag (vX.Y.Z)"; exit 1 ;;
-          esac
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          scripts/resolve-release-tag.sh "${DISPATCH_TAG:-$RELEASE_TAG}"
 
       - name: Download digests
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -308,7 +445,7 @@ jobs:
           set -euo pipefail
           args=""
           for b in $BINS; do args="$args -p $b"; done
-          cargo build --release --target ${{ matrix.target }} $args
+          cargo build --release --locked --target ${{ matrix.target }} $args
 
       # Run each packaged binary's --version so a broken release artifact fails the
       # build instead of shipping. Every target builds on a matching-arch runner,
@@ -404,6 +541,11 @@ jobs:
       contents: read
       id-token: write # npm trusted publishing (OIDC) + provenance
     steps:
+      - name: Check out workflow scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
       - name: Resolve release tag
         id: rel
         env:
@@ -411,13 +553,7 @@ jobs:
           RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
           set -euo pipefail
-          TAG="${DISPATCH_TAG:-$RELEASE_TAG}"
-          case "$TAG" in
-            v[0-9]*) ;;
-            *) echo "::error::'$TAG' does not look like a release tag (vX.Y.Z)"; exit 1 ;;
-          esac
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          scripts/resolve-release-tag.sh "${DISPATCH_TAG:-$RELEASE_TAG}"
 
       - name: Checkout release tag
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
