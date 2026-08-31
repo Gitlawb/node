@@ -2426,10 +2426,7 @@ pub async fn git_receive_pack(
         // the next startup's reconcile will not promote them.
         if let Err(e) = state
             .db
-            .mark_pending_ref_transitions_cancelled_for_names(
-                &request_id,
-                &pending_ref_names,
-            )
+            .mark_pending_ref_transitions_cancelled_for_names(&request_id, &pending_ref_names)
             .await
         {
             tracing::warn!(
@@ -2470,10 +2467,7 @@ pub async fn git_receive_pack(
         if !ok_names.is_empty() {
             if let Err(e) = state
                 .db
-                .mark_pending_ref_transitions_applied_for_names(
-                    &request_id,
-                    &ok_names,
-                )
+                .mark_pending_ref_transitions_applied_for_names(&request_id, &ok_names)
                 .await
             {
                 tracing::error!(
@@ -2487,10 +2481,7 @@ pub async fn git_receive_pack(
         if !ng_names.is_empty() {
             if let Err(e) = state
                 .db
-                .mark_pending_ref_transitions_cancelled_for_names(
-                    &request_id,
-                    &ng_names,
-                )
+                .mark_pending_ref_transitions_cancelled_for_names(&request_id, &ng_names)
                 .await
             {
                 tracing::warn!(
@@ -2504,10 +2495,7 @@ pub async fn git_receive_pack(
         if !unmentioned.is_empty() {
             if let Err(e) = state
                 .db
-                .mark_pending_ref_transitions_uncertain_for_names(
-                    &request_id,
-                    &unmentioned,
-                )
+                .mark_pending_ref_transitions_uncertain_for_names(&request_id, &unmentioned)
                 .await
             {
                 tracing::warn!(
@@ -2806,10 +2794,7 @@ pub async fn git_receive_pack(
                 // so cleanup can target just this ref's row.
                 if let Ok(Some(row_id)) = state
                     .db
-                    .lookup_pending_ref_transition_id(
-                        &request_id,
-                        &update.ref_name,
-                    )
+                    .lookup_pending_ref_transition_id(&request_id, &update.ref_name)
                     .await
                 {
                     ok_ref_ids.push(row_id);

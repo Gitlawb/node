@@ -2455,8 +2455,7 @@ mod drain_tests {
         let b_old = a_new.clone();
         let b_new = "2".repeat(40);
         let b_pusher = "did:key:zB";
-        let b_cert_id =
-            crate::db::ref_cert_id_for(&rec.id, "refs/heads/main"); // live path's id (no request_id)
+        let b_cert_id = crate::db::ref_cert_id_for(&rec.id, "refs/heads/main"); // live path's id (no request_id)
         state
             .db
             .insert_ref_certificate(&crate::db::RefCertificate {
@@ -2477,8 +2476,9 @@ mod drain_tests {
         // created_at = now-5min) is OLDER than B's cert (now), so
         // the per-column CASE WHEN guards must NOT update B's
         // fields.
-        let (processed, examined) =
-            drain_pending_ref_transitions(state.clone(), 100).await.unwrap();
+        let (processed, examined) = drain_pending_ref_transitions(state.clone(), 100)
+            .await
+            .unwrap();
         assert_eq!(processed, 1, "A's row was drained");
         assert_eq!(examined, 1, "the loop examined A's row");
 

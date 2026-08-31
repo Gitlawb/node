@@ -54,7 +54,10 @@ pub async fn issue_ref_certificate(
     pusher_did: &str,
     cert_id: &str,
 ) -> Result<RefCertificate> {
-    issue_ref_certificate_with_issued_at(state, repo_id, ref_name, old_sha, new_sha, pusher_did, cert_id, None).await
+    issue_ref_certificate_with_issued_at(
+        state, repo_id, ref_name, old_sha, new_sha, pusher_did, cert_id, None,
+    )
+    .await
 }
 
 /// #26 Split PR 1 round 4 — variant that lets the caller stamp the

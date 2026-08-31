@@ -2739,7 +2739,8 @@ mod reflog_tests {
         let sha = seed_bare_ref(&bare, "refs/heads/main");
         // Future floor: no reflog entry can be at-or-after now+1h.
         let future = chrono::Utc::now() + chrono::Duration::hours(1);
-        let proof = has_reflog_landing(&bare, "refs/heads/main", &"0".repeat(40), &sha, future).unwrap();
+        let proof =
+            has_reflog_landing(&bare, "refs/heads/main", &"0".repeat(40), &sha, future).unwrap();
         assert!(
             !proof,
             "a reflog entry that is older than the row's `created_at` must not \

@@ -2896,12 +2896,11 @@ impl Db {
     /// left or whether the backlog was fully consumed.
     #[allow(dead_code)]
     pub async fn count_pending_ref_transitions_applied(&self) -> Result<i64> {
-        let row = sqlx::query(
-            "SELECT COUNT(*) AS cnt FROM pending_ref_transitions WHERE state = $1",
-        )
-        .bind(pending_state::APPLIED)
-        .fetch_one(&self.pool)
-        .await?;
+        let row =
+            sqlx::query("SELECT COUNT(*) AS cnt FROM pending_ref_transitions WHERE state = $1")
+                .bind(pending_state::APPLIED)
+                .fetch_one(&self.pool)
+                .await?;
         Ok(row.get::<i64, _>("cnt"))
     }
 
@@ -10099,10 +10098,7 @@ mod pending_ref_transition_tests {
         .unwrap();
         // The report rejected only `main`.
         let n = db
-            .mark_pending_ref_transitions_cancelled_for_names(
-                "req-per-ref-2",
-                &["refs/heads/main"],
-            )
+            .mark_pending_ref_transitions_cancelled_for_names("req-per-ref-2", &["refs/heads/main"])
             .await
             .unwrap();
         assert_eq!(n, 1, "only the rejected ref flips");
@@ -10124,7 +10120,11 @@ mod pending_ref_transition_tests {
             "repo-1",
             "did:key:node",
             "did:key:pusher",
-            &[ref_update("refs/heads/main", &"a".repeat(40), &"b".repeat(40))],
+            &[ref_update(
+                "refs/heads/main",
+                &"a".repeat(40),
+                &"b".repeat(40),
+            )],
             "Signature: sig=...",
             "Signature-Input: ...",
             "Content-Digest: ...",
@@ -10150,9 +10150,7 @@ mod pending_ref_transition_tests {
     }
 
     #[sqlx::test]
-    async fn lookup_pending_ref_transition_id_returns_named_ref(
-        pool: PgPool,
-    ) {
+    async fn lookup_pending_ref_transition_id_returns_named_ref(pool: PgPool) {
         // P1 (reviewer-1 round 4): the per-ref cleanup loop needs
         // to map (request_id, ref_name) → row_id. Verify the
         // lookup returns the correct id for the ref it was
@@ -10187,9 +10185,7 @@ mod pending_ref_transition_tests {
     }
 
     #[sqlx::test]
-    async fn count_pending_ref_transitions_applied_reports_zero_after_drain(
-        pool: PgPool,
-    ) {
+    async fn count_pending_ref_transitions_applied_reports_zero_after_drain(pool: PgPool) {
         // P3 (reviewer-2 round 4): the residual-backlog warning
         // key on REMAINING, not on EXAMINED. A backlog of exactly
         // `per_pass_limit * (max_passes + 1)` rows that fully
