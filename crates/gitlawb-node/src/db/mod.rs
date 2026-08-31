@@ -23,6 +23,133 @@ pub struct RepoRecord {
     pub machine_id: Option<String>,
 }
 
+/// Which side is authoritative for a continuously mirrored repository.
+///
+/// A repository without an `upstream_url` has no mirror status. Transitioning
+/// states always carry a durable job id and phase so a node restart can resume
+/// or roll back instead of guessing which side owns writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum MirrorStatus {
+    Inbound,
+    TransitioningInboundToOutbound,
+    Outbound,
+    TransitioningOutboundToInbound,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl MirrorStatus {
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "inbound" => Ok(Self::Inbound),
+            "transitioning_inbound_to_outbound" => Ok(Self::TransitioningInboundToOutbound),
+            "outbound" => Ok(Self::Outbound),
+            "transitioning_outbound_to_inbound" => Ok(Self::TransitioningOutboundToInbound),
+            _ => anyhow::bail!("invalid mirror status stored in database"),
+        }
+    }
+
+    fn is_transitioning(self) -> bool {
+        matches!(
+            self,
+            Self::TransitioningInboundToOutbound | Self::TransitioningOutboundToInbound
+        )
+    }
+}
+
+/// Durable progress marker for a mirror-authority transition job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum MirrorTransitionPhase {
+    Queued,
+    Starting,
+    InitializingMirrorFetch,
+    DrainingWrites,
+    FinalizingMirrorFetch,
+    FinalizingMirrorPush,
+    CommittingTargetStatus,
+    Completed,
+    RollingBack,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl MirrorTransitionPhase {
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "starting" => Ok(Self::Starting),
+            "initializing_mirror_fetch" => Ok(Self::InitializingMirrorFetch),
+            "draining_writes" => Ok(Self::DrainingWrites),
+            "finalizing_mirror_fetch" => Ok(Self::FinalizingMirrorFetch),
+            "finalizing_mirror_push" => Ok(Self::FinalizingMirrorPush),
+            "committing_target_status" => Ok(Self::CommittingTargetStatus),
+            "completed" => Ok(Self::Completed),
+            "rolling_back" => Ok(Self::RollingBack),
+            _ => anyhow::bail!("invalid mirror transition phase stored in database"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct RepoMirrorState {
+    pub repo_id: String,
+    pub upstream_url: String,
+    pub status: MirrorStatus,
+    pub transition_id: Option<Uuid>,
+    pub transition_phase: Option<MirrorTransitionPhase>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RepoMirrorState {
+    fn validate(&self) -> Result<()> {
+        validate_mirror_upstream_url(&self.upstream_url)?;
+
+        match (
+            self.status.is_transitioning(),
+            self.transition_id,
+            self.transition_phase,
+        ) {
+            (true, Some(_), Some(phase)) if phase != MirrorTransitionPhase::Completed => Ok(()),
+            (false, None, None) => Ok(()),
+            (false, Some(_), Some(MirrorTransitionPhase::Completed)) => Ok(()),
+            _ => anyhow::bail!("mirror status and transition metadata are inconsistent"),
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn validate_mirror_upstream_url(raw: &str) -> Result<reqwest::Url> {
+    if raw.is_empty() || raw.len() > 2048 {
+        anyhow::bail!("mirror upstream URL must contain 1 to 2048 bytes");
+    }
+    if raw.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        anyhow::bail!("mirror upstream URL contains whitespace or control characters");
+    }
+
+    let url = reqwest::Url::parse(raw).context("parsing mirror upstream URL")?;
+    if url.scheme() != "https" {
+        anyhow::bail!("mirror upstream URL must use HTTPS");
+    }
+    if !crate::api::peers::is_public_http_url(raw) {
+        anyhow::bail!("mirror upstream URL must use a public host");
+    }
+    if url.host_str().is_none() || url.path().trim_matches('/').is_empty() {
+        anyhow::bail!("mirror upstream URL must include a host and repository path");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("mirror upstream URL must not embed credentials");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        anyhow::bail!("mirror upstream URL must not contain a query or fragment");
+    }
+
+    Ok(url)
+}
+
 /// One row of a keyset page from [`Db::list_repos_page_for_scan`].
 ///
 /// Carries the row's quarantine flag inline (so the IPFS scan needs no separate
@@ -1123,6 +1250,79 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE pin_repair_sweep ADD COLUMN IF NOT EXISTS discovery_cursor_id TEXT NOT NULL DEFAULT ''",
         ],
     },
+    // Reservation: open branches currently claim migration versions through
+    // v29. Gaps are valid, while reusing a version can silently skip one
+    // branch's schema when both eventually land. v30 and v31 are intentionally
+    // separate so validation does not inherit v30's stronger table lock.
+    Migration {
+        version: 30,
+        name: "repo_upstream_mirror_state",
+        stmts: &[
+            // Nullable, default-free columns keep this migration metadata-only
+            // for every existing non-mirror repository.
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS upstream_url TEXT",
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS mirror_status TEXT",
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS mirror_transition_id UUID",
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS mirror_transition_phase TEXT",
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS mirror_updated_at TEXT",
+            // A constraint name does not prove its definition. Replace any
+            // same-named manual or partial-recovery artifact before installing
+            // the exact invariant this migration promises.
+            "ALTER TABLE repos DROP CONSTRAINT IF EXISTS repos_mirror_state_valid",
+            // PostgreSQL accepts a CHECK whose result is NULL. Wrap the complete
+            // invariant in IS TRUE so a missing status or phase cannot slip
+            // through three-valued logic.
+            r#"ALTER TABLE repos ADD CONSTRAINT repos_mirror_state_valid CHECK ((
+                           (
+                               upstream_url IS NULL
+                               AND mirror_status IS NULL
+                               AND mirror_transition_id IS NULL
+                               AND mirror_transition_phase IS NULL
+                               AND mirror_updated_at IS NULL
+                           )
+                           OR
+                           (
+                               upstream_url IS NOT NULL
+                               AND upstream_url LIKE 'https://%'
+                               AND upstream_url <> 'https://'
+                               AND mirror_updated_at IS NOT NULL
+                               AND (
+                                   (
+                                       mirror_status IN ('inbound', 'outbound')
+                                       AND (
+                                           (mirror_transition_id IS NULL AND mirror_transition_phase IS NULL)
+                                           OR
+                                           (mirror_transition_id IS NOT NULL AND mirror_transition_phase = 'completed')
+                                       )
+                                   )
+                                   OR
+                                   (
+                                       mirror_status IN (
+                                           'transitioning_inbound_to_outbound',
+                                           'transitioning_outbound_to_inbound'
+                                       )
+                                       AND mirror_transition_id IS NOT NULL
+                                       AND mirror_transition_phase IN (
+                                           'queued',
+                                           'starting',
+                                           'initializing_mirror_fetch',
+                                           'draining_writes',
+                                           'finalizing_mirror_fetch',
+                                           'finalizing_mirror_push',
+                                           'committing_target_status',
+                                           'rolling_back'
+                                       )
+                                   )
+                               )
+                           )
+                       ) IS TRUE) NOT VALID"#,
+        ],
+    },
+    Migration {
+        version: 31,
+        name: "validate_repo_upstream_mirror_state",
+        stmts: &["ALTER TABLE repos VALIDATE CONSTRAINT repos_mirror_state_valid"],
+    },
 ];
 
 /// Max distinct source repos recorded per pinned object (F1, #173 jatmn round 8).
@@ -1237,6 +1437,72 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Attach an external HTTPS upstream to a canonical repository in inbound
+    /// mode. This is deliberately idempotent only for the same untouched
+    /// inbound configuration; it never overwrites an existing upstream or
+    /// resets a transition that may be in progress.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn configure_inbound_mirror(
+        &self,
+        repo_id: &str,
+        upstream_url: &str,
+    ) -> Result<RepoMirrorState> {
+        Uuid::parse_str(repo_id)
+            .context("continuous mirrors require a canonical UUID repository id")?;
+        let upstream_url = validate_mirror_upstream_url(upstream_url)?.to_string();
+        let updated_at = Utc::now().to_rfc3339();
+
+        let row = sqlx::query(
+            "UPDATE repos
+             SET upstream_url = $2,
+                 mirror_status = 'inbound',
+                 mirror_transition_id = NULL,
+                 mirror_transition_phase = NULL,
+                 mirror_updated_at = COALESCE(mirror_updated_at, $3)
+             WHERE id = $1
+               AND (
+                   upstream_url IS NULL
+                   OR (
+                       upstream_url = $2
+                       AND mirror_status = 'inbound'
+                       AND mirror_transition_id IS NULL
+                       AND mirror_transition_phase IS NULL
+                   )
+               )
+             RETURNING id, upstream_url, mirror_status, mirror_transition_id,
+                       mirror_transition_phase, mirror_updated_at",
+        )
+        .bind(repo_id)
+        .bind(&upstream_url)
+        .bind(&updated_at)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let row = row.context(
+            "repository does not exist or already has a different/transitioning mirror configuration",
+        )?;
+        row_to_repo_mirror_state(row)
+    }
+
+    /// Return the durable mirror state, or `None` for a normal non-mirrored
+    /// repository (and for an unknown id). Callers that need to distinguish
+    /// those cases must resolve the repository first through the auth-gated
+    /// repository path.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn get_repo_mirror_state(&self, repo_id: &str) -> Result<Option<RepoMirrorState>> {
+        let row = sqlx::query(
+            "SELECT id, upstream_url, mirror_status, mirror_transition_id,
+                    mirror_transition_phase, mirror_updated_at
+             FROM repos
+             WHERE id = $1 AND upstream_url IS NOT NULL",
+        )
+        .bind(repo_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(row_to_repo_mirror_state).transpose()
     }
 
     /// Register a mirrored repo from a peer in the local DB so git smart HTTP can serve it.
@@ -3877,6 +4143,576 @@ impl Db {
 }
 
 // ── Row helpers ───────────────────────────────────────────────────────────────
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn row_to_repo_mirror_state(r: sqlx::postgres::PgRow) -> Result<RepoMirrorState> {
+    let repo_id = r
+        .try_get("id")
+        .context("reading mirror repository id from database")?;
+    let upstream_url = r
+        .try_get("upstream_url")
+        .context("reading mirror upstream URL from database")?;
+    let status = r
+        .try_get::<String, _>("mirror_status")
+        .context("reading mirror status from database")?;
+    let status = MirrorStatus::from_db(&status)?;
+    let transition_id = r
+        .try_get("mirror_transition_id")
+        .context("reading mirror transition id from database")?;
+    let transition_phase = r
+        .try_get::<Option<String>, _>("mirror_transition_phase")
+        .context("reading mirror transition phase from database")?
+        .as_deref()
+        .map(MirrorTransitionPhase::from_db)
+        .transpose()?;
+    let updated_at = r
+        .try_get::<String, _>("mirror_updated_at")
+        .context("reading mirror update timestamp from database")?
+        .parse::<DateTime<Utc>>()
+        .context("invalid mirror_updated_at stored in database")?;
+
+    let state = RepoMirrorState {
+        repo_id,
+        upstream_url,
+        status,
+        transition_id,
+        transition_phase,
+        updated_at,
+    };
+    state.validate()?;
+    Ok(state)
+}
+
+#[cfg(test)]
+mod mirror_state_tests {
+    use super::{
+        row_to_repo_mirror_state, validate_mirror_upstream_url, Db, MirrorStatus,
+        MirrorTransitionPhase, RepoMirrorState, RepoRecord,
+    };
+    use chrono::{DateTime, Utc};
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    fn ts(value: &str) -> DateTime<Utc> {
+        value.parse().unwrap()
+    }
+
+    fn repo(id: Uuid) -> RepoRecord {
+        RepoRecord {
+            id: id.to_string(),
+            name: "mirror-fixture".to_string(),
+            owner_did: "did:key:z6MkMirrorOwner".to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: ts("2026-08-14T00:00:00Z"),
+            updated_at: ts("2026-08-14T00:00:00Z"),
+            disk_path: format!("/srv/repos/{id}.git"),
+            forked_from: None,
+            machine_id: None,
+        }
+    }
+
+    async fn migrated_db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    #[test]
+    fn upstream_url_accepts_https_forges_without_credentials() {
+        for valid in [
+            "https://github.com/Gitlawb/node.git",
+            "https://gitlab.example.com/platform/subgroup/node",
+            "https://ghe.internal.example/org/repo.git",
+        ] {
+            validate_mirror_upstream_url(valid).unwrap();
+        }
+    }
+
+    #[test]
+    fn upstream_url_rejects_unsafe_or_ambiguous_forms() {
+        for invalid in [
+            "",
+            "http://github.com/Gitlawb/node.git",
+            "ssh://git@github.com/Gitlawb/node.git",
+            "file:///etc/passwd",
+            "https://user:secret@github.com/Gitlawb/node.git",
+            "https://github.com/Gitlawb/node.git?token=secret",
+            "https://github.com/Gitlawb/node.git#main",
+            "https://github.com/",
+            "https://github.com/Gitlawb/node.git\n",
+            "https://localhost/Gitlawb/node.git",
+            "https://forge.localhost/Gitlawb/node.git",
+            "https://127.0.0.1/Gitlawb/node.git",
+            "https://[::1]/Gitlawb/node.git",
+            "https://169.254.169.254/Gitlawb/node.git",
+            "https://10.0.0.5/Gitlawb/node.git",
+            "https://172.16.0.5/Gitlawb/node.git",
+            "https://192.168.1.5/Gitlawb/node.git",
+            "https://forge.internal/Gitlawb/node.git",
+            "https://[::ffff:127.0.0.1]/Gitlawb/node.git",
+            "https://[64:ff9b::7f00:1]/Gitlawb/node.git",
+        ] {
+            assert!(
+                validate_mirror_upstream_url(invalid).is_err(),
+                "unsafe mirror URL was accepted: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transition_metadata_must_match_the_status() {
+        let base = RepoMirrorState {
+            repo_id: Uuid::new_v4().to_string(),
+            upstream_url: "https://github.com/Gitlawb/node.git".to_string(),
+            status: MirrorStatus::Inbound,
+            transition_id: None,
+            transition_phase: None,
+            updated_at: Utc::now(),
+        };
+        base.validate().unwrap();
+
+        let mut invalid = base.clone();
+        invalid.status = MirrorStatus::TransitioningInboundToOutbound;
+        assert!(invalid.validate().is_err());
+
+        invalid.transition_id = Some(Uuid::new_v4());
+        invalid.transition_phase = Some(MirrorTransitionPhase::DrainingWrites);
+        invalid.validate().unwrap();
+
+        invalid.transition_phase = Some(MirrorTransitionPhase::Completed);
+        assert!(invalid.validate().is_err());
+    }
+
+    #[sqlx::test]
+    async fn migrations_v30_v31_upgrade_an_existing_repo_without_rewriting_it(pool: PgPool) {
+        let db = migrated_db(pool).await;
+
+        // Recreate the pre-v30 shape, then add data written by the old node.
+        sqlx::query("ALTER TABLE repos DROP COLUMN upstream_url CASCADE")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        for column in [
+            "mirror_status",
+            "mirror_transition_id",
+            "mirror_transition_phase",
+            "mirror_updated_at",
+        ] {
+            sqlx::query(&format!("ALTER TABLE repos DROP COLUMN {column}"))
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        sqlx::query("DELETE FROM schema_migrations WHERE version IN (30, 31)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let existing = repo(Uuid::new_v4());
+        db.create_repo(&existing).await.unwrap();
+
+        db.run_migrations().await.unwrap();
+
+        let still_there: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repos WHERE id = $1")
+            .bind(&existing.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            still_there, 1,
+            "the existing repository must survive v30/v31"
+        );
+
+        let mirror_values: (Option<String>, Option<String>, Option<Uuid>, Option<String>) =
+            sqlx::query_as(
+                "SELECT upstream_url, mirror_status, mirror_transition_id,
+                        mirror_transition_phase
+                 FROM repos WHERE id = $1",
+            )
+            .bind(&existing.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(mirror_values, (None, None, None, None));
+
+        let recorded: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT version, name FROM schema_migrations
+             WHERE version IN (30, 31) ORDER BY version",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            recorded,
+            vec![
+                (30, "repo_upstream_mirror_state".to_string()),
+                (31, "validate_repo_upstream_mirror_state".to_string()),
+            ]
+        );
+        let constraint_validated: bool = sqlx::query_scalar(
+            "SELECT convalidated FROM pg_constraint
+             WHERE conrelid = 'repos'::regclass
+               AND conname = 'repos_mirror_state_valid'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(constraint_validated, "v31 must validate the v30 constraint");
+
+        // Production entry point remains idempotent after the upgrade.
+        db.run_migrations().await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn migration_replaces_a_same_named_weaker_constraint(pool: PgPool) {
+        let db = migrated_db(pool).await;
+
+        sqlx::query("ALTER TABLE repos DROP CONSTRAINT repos_mirror_state_valid")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "ALTER TABLE repos ADD CONSTRAINT repos_mirror_state_valid CHECK (TRUE) NOT VALID",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version IN (30, 31)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        db.run_migrations().await.unwrap();
+
+        let definition: String = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(oid)
+             FROM pg_constraint
+             WHERE conrelid = 'repos'::regclass
+               AND conname = 'repos_mirror_state_valid'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(
+            definition.contains("transitioning_inbound_to_outbound")
+                && !definition.eq_ignore_ascii_case("CHECK (true)"),
+            "migration preserved an impostor constraint: {definition}"
+        );
+
+        let existing = repo(Uuid::new_v4());
+        db.create_repo(&existing).await.unwrap();
+        let malformed = sqlx::query(
+            "UPDATE repos
+             SET upstream_url = 'https://github.com/Gitlawb/node.git',
+                 mirror_status = 'transitioning_inbound_to_outbound',
+                 mirror_updated_at = '2026-08-14T00:00:00Z'
+             WHERE id = $1",
+        )
+        .bind(&existing.id)
+        .execute(db.pool())
+        .await;
+        assert!(
+            malformed.is_err(),
+            "replacement constraint accepted missing transition metadata"
+        );
+    }
+
+    #[sqlx::test]
+    async fn inbound_configuration_round_trips_without_overwriting_state(pool: PgPool) {
+        let db = migrated_db(pool).await;
+        let existing = repo(Uuid::new_v4());
+        db.create_repo(&existing).await.unwrap();
+
+        assert!(db
+            .get_repo_mirror_state(&existing.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let first = db
+            .configure_inbound_mirror(&existing.id, "https://github.com/Gitlawb/node.git")
+            .await
+            .unwrap();
+        assert_eq!(first.status, MirrorStatus::Inbound);
+        assert_eq!(first.transition_id, None);
+        assert_eq!(first.transition_phase, None);
+
+        // An exact retry is safe, but a different source cannot replace it.
+        let original_updated_at = DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        sqlx::query("UPDATE repos SET mirror_updated_at = $2 WHERE id = $1")
+            .bind(&existing.id)
+            .bind(original_updated_at.to_rfc3339())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let retry = db
+            .configure_inbound_mirror(&existing.id, "https://github.com/Gitlawb/node.git")
+            .await
+            .unwrap();
+        assert_eq!(retry.updated_at, original_updated_at);
+        assert!(db
+            .configure_inbound_mirror(&existing.id, "https://github.com/Gitlawb/other.git",)
+            .await
+            .is_err());
+
+        let stored = db
+            .get_repo_mirror_state(&existing.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.upstream_url, first.upstream_url);
+        assert_eq!(stored.status, MirrorStatus::Inbound);
+        assert_eq!(stored.updated_at, original_updated_at);
+    }
+
+    #[sqlx::test]
+    async fn malformed_mirror_row_returns_an_error_instead_of_panicking(pool: PgPool) {
+        let row = sqlx::query(
+            "SELECT 'repo-id'::text AS id,
+                    'https://github.com/Gitlawb/node.git'::text AS upstream_url,
+                    'inbound'::text AS mirror_status,
+                    NULL::uuid AS mirror_transition_id,
+                    NULL::text AS mirror_transition_phase,
+                    NULL::text AS mirror_updated_at",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let error = row_to_repo_mirror_state(row).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reading mirror update timestamp from database"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn inbound_configuration_never_resets_an_active_transition(pool: PgPool) {
+        let db = migrated_db(pool).await;
+        let existing = repo(Uuid::new_v4());
+        db.create_repo(&existing).await.unwrap();
+        db.configure_inbound_mirror(&existing.id, "https://github.com/Gitlawb/node.git")
+            .await
+            .unwrap();
+
+        let transition_id = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE repos
+             SET mirror_status = 'transitioning_inbound_to_outbound',
+                 mirror_transition_id = $2,
+                 mirror_transition_phase = 'draining_writes'
+             WHERE id = $1",
+        )
+        .bind(&existing.id)
+        .bind(transition_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let retry = db
+            .configure_inbound_mirror(&existing.id, "https://github.com/Gitlawb/node.git")
+            .await;
+        assert!(retry.is_err(), "configuration must not reset a transition");
+
+        let stored = db
+            .get_repo_mirror_state(&existing.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, MirrorStatus::TransitioningInboundToOutbound);
+        assert_eq!(stored.transition_id, Some(transition_id));
+        assert_eq!(
+            stored.transition_phase,
+            Some(MirrorTransitionPhase::DrainingWrites)
+        );
+    }
+
+    #[sqlx::test]
+    async fn database_constraint_rejects_partial_or_insecure_mirror_state(pool: PgPool) {
+        let db = migrated_db(pool).await;
+        let existing = repo(Uuid::new_v4());
+        db.create_repo(&existing).await.unwrap();
+
+        let partial = sqlx::query(
+            "UPDATE repos
+             SET upstream_url = 'https://github.com/Gitlawb/node.git',
+                 mirror_status = 'transitioning_inbound_to_outbound',
+                 mirror_updated_at = '2026-08-14T00:00:00Z'
+             WHERE id = $1",
+        )
+        .bind(&existing.id)
+        .execute(db.pool())
+        .await;
+        assert!(partial.is_err(), "transition metadata must be durable");
+
+        // PostgreSQL CHECK constraints accept NULL results. These cases pin
+        // the outer `IS TRUE` guard so SQL three-valued logic cannot admit a
+        // row that the Rust reader rejects or panics while decoding.
+        struct InvalidNullState<'a> {
+            case: &'a str,
+            status: Option<&'a str>,
+            transition_id: Option<Uuid>,
+            transition_phase: Option<&'a str>,
+        }
+        let invalid_null_states = [
+            InvalidNullState {
+                case: "missing mirror status",
+                status: None,
+                transition_id: None,
+                transition_phase: None,
+            },
+            InvalidNullState {
+                case: "stable status with job but no phase",
+                status: Some("inbound"),
+                transition_id: Some(Uuid::new_v4()),
+                transition_phase: None,
+            },
+            InvalidNullState {
+                case: "transition with job but no phase",
+                status: Some("transitioning_inbound_to_outbound"),
+                transition_id: Some(Uuid::new_v4()),
+                transition_phase: None,
+            },
+        ];
+        for invalid in invalid_null_states {
+            let result = sqlx::query(
+                "UPDATE repos
+                 SET upstream_url = 'https://github.com/Gitlawb/node.git',
+                     mirror_status = $2,
+                     mirror_transition_id = $3,
+                     mirror_transition_phase = $4,
+                     mirror_updated_at = '2026-08-14T00:00:00Z'
+                 WHERE id = $1",
+            )
+            .bind(&existing.id)
+            .bind(invalid.status)
+            .bind(invalid.transition_id)
+            .bind(invalid.transition_phase)
+            .execute(db.pool())
+            .await;
+            assert!(result.is_err(), "constraint accepted {}", invalid.case);
+        }
+
+        let insecure = sqlx::query(
+            "UPDATE repos
+             SET upstream_url = 'http://github.com/Gitlawb/node.git',
+                 mirror_status = 'inbound',
+                 mirror_updated_at = '2026-08-14T00:00:00Z'
+             WHERE id = $1",
+        )
+        .bind(&existing.id)
+        .execute(db.pool())
+        .await;
+        assert!(
+            insecure.is_err(),
+            "the database must reject non-HTTPS upstreams"
+        );
+    }
+
+    #[sqlx::test]
+    async fn database_constraint_accepts_the_complete_transition_vocabulary(pool: PgPool) {
+        let db = migrated_db(pool).await;
+        let existing = repo(Uuid::new_v4());
+        db.create_repo(&existing).await.unwrap();
+
+        let phases = [
+            "queued",
+            "starting",
+            "initializing_mirror_fetch",
+            "draining_writes",
+            "finalizing_mirror_fetch",
+            "finalizing_mirror_push",
+            "committing_target_status",
+            "rolling_back",
+        ];
+        for status in [
+            "transitioning_inbound_to_outbound",
+            "transitioning_outbound_to_inbound",
+        ] {
+            for phase in phases {
+                sqlx::query(
+                    "UPDATE repos
+                     SET upstream_url = 'https://github.com/Gitlawb/node.git',
+                         mirror_status = $2,
+                         mirror_transition_id = $3,
+                         mirror_transition_phase = $4,
+                         mirror_updated_at = '2026-08-14T00:00:00Z'
+                     WHERE id = $1",
+                )
+                .bind(&existing.id)
+                .bind(status)
+                .bind(Uuid::new_v4())
+                .bind(phase)
+                .execute(db.pool())
+                .await
+                .unwrap_or_else(|error| panic!("{status}/{phase} was rejected: {error}"));
+            }
+        }
+
+        // A completed job remains auditable after authority reaches its stable
+        // target status; the initial never-transitioned state uses two NULLs.
+        sqlx::query(
+            "UPDATE repos
+             SET mirror_status = 'outbound',
+                 mirror_transition_id = $2,
+                 mirror_transition_phase = 'completed'
+             WHERE id = $1",
+        )
+        .bind(&existing.id)
+        .bind(Uuid::new_v4())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let stored = db
+            .get_repo_mirror_state(&existing.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, MirrorStatus::Outbound);
+        assert_eq!(
+            stored.transition_phase,
+            Some(MirrorTransitionPhase::Completed)
+        );
+    }
+
+    #[sqlx::test]
+    async fn continuous_mirror_uuid_gate_leaves_peer_rows_untouched(pool: PgPool) {
+        let db = migrated_db(pool).await;
+        db.upsert_mirror_repo("z6MkPeer", "repo", "/srv/peer/repo.git", None, false)
+            .await
+            .unwrap();
+
+        let error = db
+            .configure_inbound_mirror("z6MkPeer/repo", "https://github.com/Gitlawb/node.git")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("continuous mirrors require a canonical UUID repository id"),
+            "unexpected error: {error:#}"
+        );
+
+        let unchanged: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT upstream_url, mirror_status FROM repos WHERE id = $1")
+                .bind("z6MkPeer/repo")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(unchanged, (None, None));
+        assert!(db
+            .get_repo_mirror_state("z6MkPeer/repo")
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
 
 fn row_to_repo(r: sqlx::postgres::PgRow) -> RepoRecord {
     let created_str: String = r.get("created_at");
