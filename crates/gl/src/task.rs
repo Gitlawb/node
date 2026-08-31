@@ -428,6 +428,18 @@ pub(crate) async fn fetch_tasks(
                     break TaskListStop::NoProgress;
                 }
 
+                // `want` is the remaining total, capped at the server page.
+                // A valid-shaped page larger than that can push the helper
+                // (and therefore both CLI and MCP) past `--limit`. Treat it
+                // as protocol-invalid rather than clipping, matching the
+                // hostile-node handling for duplicate rows and cursor cycles.
+                if page_tasks.len() as i64 > want {
+                    anyhow::bail!(
+                        "protocol-invalid task page: got {} tasks, asked for {want}",
+                        page_tasks.len()
+                    );
+                }
+
                 for t in page_tasks {
                     if let Some(id) = t.get("id").and_then(|v| v.as_str()) {
                         seen_task_ids.insert(id.to_string());
@@ -1001,6 +1013,39 @@ mod tests {
         assert!(
             warning.contains("node does not support pagination metadata"),
             "{warning}"
+        );
+    }
+
+    /// A hostile or misconfigured node can return a well-shaped page larger
+    /// than the remaining `--limit`. The helper must refuse it rather than
+    /// print more tasks than the caller asked for.
+    #[tokio::test]
+    async fn list_rejects_oversized_page_before_exposing_it() {
+        let mut server = mockito::Server::new_async().await;
+        let oversized = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/tasks\?limit=3$".into()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(page(&["a", "b", "c", "d", "e"], false, false, None))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = fetch_tasks(&client_for(&server), None, None, 3, None)
+            .await
+            .expect_err("an oversized page must not succeed");
+        oversized.assert_async().await;
+        let msg = err.to_string();
+        assert!(
+            msg.contains("protocol-invalid") && msg.contains("asked for 3"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("\"id\":\"d\""),
+            "the extra rows must not appear in the error: {msg}"
         );
     }
 
