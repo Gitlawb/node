@@ -60,7 +60,7 @@ pub(crate) async fn run_to_writer(args: WhoamiArgs, w: &mut impl std::io::Write)
             }
             Ok(resp) => {
                 let status = resp.status();
-                let raw = read_body_capped(resp, 8 * 1024).await;
+                let raw = read_body_capped(resp, 8 * 1024).await.text;
                 let msg = serde_json::from_str::<Value>(&raw)
                     .ok()
                     .and_then(|v| {
