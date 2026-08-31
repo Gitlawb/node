@@ -76,6 +76,14 @@ pub struct Config {
     )]
     pub require_signed_peer_writes: bool,
 
+    /// Require an RFC 9421 `nonce` parameter on signatures that authorize a
+    /// mutation. Keep false until every client signs one: nodes fall back to
+    /// keying the replay ledger on the signing-string hash without it, which
+    /// rejects a byte-identical mutation repeated inside the same second.
+    /// Enforced on write routes only, so signed reads are never affected.
+    #[arg(long, env = "GITLAWB_REQUIRE_SIGNATURE_NONCE", default_value_t = false)]
+    pub require_signature_nonce: bool,
+
     /// Require the authenticated pusher to be the repo owner on `git-receive-pack`.
     /// Authentication (a valid did:key signature) is not authorization on its own:
     /// any party can mint a did:key and sign as it, so with this off every signed
@@ -196,6 +204,19 @@ pub struct Config {
     /// draining the signed trigger caller's quota. `0` disables. Default: 600.
     #[arg(long, env = "GITLAWB_PEER_WRITE_RATE_LIMIT", default_value_t = 600)]
     pub peer_write_rate_limit: usize,
+
+    /// Per-client-IP rate limit for the signed write routes (tasks, pull-request
+    /// merge/close/review/comment, webhooks, branch protection, stars, replicas,
+    /// labels, visibility, agent deregistration, bounties, profile, issue
+    /// close/comment), in requests per hour. Every signed attempt on these routes
+    /// commits a `consumed_signatures` row before the handler runs any
+    /// authorization or existence check, and a signature proves nothing about
+    /// registration (any freshly minted `did:key` self-signs), so without a brake
+    /// an unregistered caller can force a durable write per request. Its own
+    /// bucket, so a flood here cannot drain the creation, push, or peer-sync
+    /// quotas. `0` disables. Default: 600.
+    #[arg(long, env = "GITLAWB_SIGNED_WRITE_RATE_LIMIT", default_value_t = 600)]
+    pub signed_write_rate_limit: usize,
 
     /// Optional address to bind a Prometheus `/metrics` exposition endpoint on.
     /// Example: `127.0.0.1:9091`. Leave empty (default) to disable.
@@ -768,6 +789,75 @@ mod tests {
         // 0 is a footgun (immediate-504 on every request); clap must reject it.
         assert!(
             Config::try_parse_from(["gitlawb-node", "--git-service-timeout-secs", "0"]).is_err()
+        );
+    }
+
+    #[test]
+    fn require_signature_nonce_ships_off() {
+        assert!(
+            !Config::parse_from(["gitlawb-node"]).require_signature_nonce,
+            "the staged flag must default to false"
+        );
+        assert!(
+            Config::parse_from(["gitlawb-node", "--require-signature-nonce"])
+                .require_signature_nonce
+        );
+    }
+
+    /// Child half of [`nonce_flag_env_values_never_silently_enforce`]. It runs in
+    /// a subprocess with `GITLAWB_REQUIRE_SIGNATURE_NONCE` set, because setting
+    /// that variable in-process would race every other test that parses a
+    /// `Config` and would take the whole binary down if the value were invalid.
+    #[test]
+    #[ignore = "driven as a subprocess by nonce_flag_env_values_never_silently_enforce"]
+    fn nonce_flag_env_probe() {
+        match Config::try_parse_from(["gitlawb-node"]) {
+            Ok(config) => println!("PROBE:ok:{}", config.require_signature_nonce),
+            Err(_) => println!("PROBE:err"),
+        }
+    }
+
+    /// The flag is read as a boolean, not as "is the variable present". An
+    /// operator writing `GITLAWB_REQUIRE_SIGNATURE_NONCE=0` (or leaving it
+    /// empty) must never end up enforcing.
+    #[test]
+    fn nonce_flag_env_values_never_silently_enforce() {
+        fn probe(value: &str) -> String {
+            let out = std::process::Command::new(
+                std::env::current_exe().expect("path to the test binary"),
+            )
+            .args([
+                "--exact",
+                "config::tests::nonce_flag_env_probe",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("GITLAWB_REQUIRE_SIGNATURE_NONCE", value)
+            .output()
+            .expect("run the env probe");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout
+                .lines()
+                .find(|l| l.starts_with("PROBE:"))
+                .unwrap_or("PROBE:missing")
+                .to_string()
+        }
+
+        // The probe can observe enforcement, so a "never true" assertion below
+        // is not vacuous.
+        assert_eq!(probe("true"), "PROBE:ok:true");
+
+        for value in ["false", "0", ""] {
+            let observed = probe(value);
+            assert_ne!(
+                observed, "PROBE:ok:true",
+                "GITLAWB_REQUIRE_SIGNATURE_NONCE={value:?} must not enforce, got {observed}"
+            );
+        }
+        assert_eq!(
+            probe("false"),
+            "PROBE:ok:false",
+            "the documented disable value must parse to false, not error"
         );
     }
 

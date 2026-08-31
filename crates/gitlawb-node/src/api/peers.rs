@@ -514,9 +514,32 @@ pub async fn ping_peer(
     })))
 }
 
+/// The `x-gitlawb-error` code a peer put on a rejection, if it sent one.
+///
+/// Kept verbatim: it is what separates a ledger rejection from a replay
+/// rejection on the same-ish status, and it is what an operator greps for. A
+/// peer behind a proxy that strips unknown `X-` headers returns `None`, which
+/// is why every caller logs the status too rather than relying on this alone.
+pub(crate) fn peer_error_code(headers: &reqwest::header::HeaderMap) -> Option<&str> {
+    headers.get("x-gitlawb-error")?.to_str().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_public_http_url;
+    use super::peer_error_code;
+
+    #[test]
+    fn peer_error_code_reads_the_header_when_present() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-gitlawb-error", "signature_ledger_full".parse().unwrap());
+        assert_eq!(peer_error_code(&headers), Some("signature_ledger_full"));
+    }
+
+    #[test]
+    fn peer_error_code_is_none_without_the_header() {
+        assert_eq!(peer_error_code(&reqwest::header::HeaderMap::new()), None);
+    }
 
     #[test]
     fn accepts_public_https_and_http() {
@@ -694,6 +717,7 @@ mod tests {
             .layer(Extension(IpRateLimiter {
                 limiter: RateLimiter::new(60, Duration::from_secs(3600)),
                 trust: TrustedProxy::None,
+                skip_reads: false,
             }))
             .with_state(state);
         let mut req =
@@ -742,6 +766,7 @@ mod tests {
             .layer(Extension(IpRateLimiter {
                 limiter: RateLimiter::new(1, Duration::from_secs(3600)),
                 trust: TrustedProxy::None,
+                skip_reads: false,
             }))
             .with_state(state);
         let peer = "203.0.113.5:5000".parse::<SocketAddr>().unwrap();
@@ -1427,6 +1452,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        // The brake shares 429 with the ledger's `signature_ledger_full` on
+        // this route group, so the code is what tells a client which one it
+        // hit. Asserted end-to-end here, through the real router.
+        assert_eq!(
+            resp.headers()
+                .get("x-gitlawb-error")
+                .and_then(|v| v.to_str().ok()),
+            Some("rate_limited"),
+        );
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();

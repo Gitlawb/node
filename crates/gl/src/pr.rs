@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use serde_json::Value;
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{json_or_denial, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
@@ -233,13 +233,7 @@ async fn cmd_create(
         .post(&format!("/api/v1/repos/{owner}/{repo}/pulls"), &payload)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let pr: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = pr["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("create PR failed ({status}): {msg}");
-    }
+    let pr: Value = json_or_denial("create PR", resp).await?;
 
     let number = pr["number"].as_i64().unwrap_or(0);
     println!("✓ Opened PR #{number}: {title}");
@@ -415,13 +409,7 @@ async fn cmd_merge(repo: String, number: u64, node: String, dir: Option<PathBuf>
         )
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("merge failed ({status}): {msg}");
-    }
+    let result: Value = json_or_denial("merge", resp).await?;
 
     let sha = result["merge_sha"].as_str().unwrap_or("?");
     println!("✓ Merged PR #{number}");
@@ -453,13 +441,7 @@ async fn cmd_review(
         )
         .await
         .context("failed to connect to node")?;
-    let code = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !code.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("review failed ({code}): {msg}");
-    }
+    json_or_denial::<Value>("review", resp).await?;
 
     let icon = match status.as_str() {
         "approved" => "✓",
@@ -489,13 +471,7 @@ async fn cmd_comment(
         )
         .await
         .context("failed to connect to node")?;
-    let code = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !code.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("comment failed ({code}): {msg}");
-    }
+    json_or_denial::<Value>("comment", resp).await?;
 
     println!("· Comment posted on PR #{number}");
     Ok(())

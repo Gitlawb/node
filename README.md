@@ -369,6 +369,14 @@ GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true
 
 `POST /api/v1/sync/trigger` is not part of the staged rollout: it always requires a signature in both config modes and returns 401 without one, because each call drives an O(peers) outbound fan-out.
 
+A verified signature is spent once on the write routes that require one: repo, issue, PR, task, bounty, profile, webhook, label, star, replica, visibility and agent mutations, plus git push and `POST /api/v1/sync/trigger`. A captured request to any of those cannot be replayed. The two peer-write routes are the exception. `POST /api/v1/peers/announce` and `POST /api/v1/sync/notify` reach the ledger only when `GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true`; under the default (`false`) they verify a signature when the headers are present but never spend it, so a captured signed peer write is still replayable there until the fleet upgrades and the flag is turned on. The ledger keys on the RFC 9421 `nonce` parameter when the client signs one and falls back to the signing-string hash when it does not. The fallback is correct but coarser: a client that repeats a byte-identical mutation within the same second is rejected as a replay and has to re-sign. `GITLAWB_REQUIRE_SIGNATURE_NONCE` closes that fallback once every client emits a nonce:
+
+```bash
+GITLAWB_REQUIRE_SIGNATURE_NONCE=true
+```
+
+With it on, a nonce-less signature on a write route is rejected with 400 and `X-Gitlawb-Error: signature_nonce_required`. Signed reads are never affected. Flipping it on has a federation precondition: three of the node's own outbound signed calls (peer announce, replica registration, sync-notify) are peer traffic, so a node running with both this and `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` set to true will reject peer writes from any node still on a pre-nonce binary. Upgrade the fleet before enabling it.
+
 ---
 
 ## Configuration
@@ -393,6 +401,9 @@ Important node settings:
 | `GITLAWB_P2P_BOOTSTRAP` | Comma-separated libp2p multiaddrs. |
 | `GITLAWB_BOOTSTRAP_DISABLE_SEEDS` | Disable embedded seed peers for isolated dev/test networks. |
 | `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` | Require signed peer announce/sync writes. Defaults to `false` during the staged rollout below. |
+| `GITLAWB_REQUIRE_SIGNATURE_NONCE` | Require a signed `nonce` on write routes. Default false; see the staged rollout note above. |
+| `GITLAWB_SIGNED_WRITE_RATE_LIMIT` | Per-client-IP requests per hour on the signed write routes (tasks, PR merge/close/review/comment, webhooks, branch protection, stars, replicas, labels, visibility, agent deregistration, bounties, profile, issue close/comment). Each signed attempt spends a ledger row before the handler checks anything, so the brake bounds what an unregistered caller can write. Own bucket; `0` disables. Default 600. |
+<!-- verbatim -->
 | `GITLAWB_ENFORCE_OWNER_PUSH` | Require the authenticated pusher to be the repo owner on `git-receive-pack`. **Defaults to `true`.** A `did:key` signature is authentication, not authorization — anyone can mint a key and sign — so with this off every signed caller may push to every repository, private ones included. Delegated and CI keys count as non-owners: a UCAN `git/push` capability is verified but not yet honored for authorization, so they cannot push while this is on. Set `false` only for a rolling upgrade; see [`docs/RUN-A-NODE.md`](docs/RUN-A-NODE.md). |
 | `GITLAWB_AUTO_SYNC` | Enable automatic sync from known peers. |
 | `GITLAWB_MAX_PACK_BYTES` | Max git pack body size for smart-HTTP routes. |

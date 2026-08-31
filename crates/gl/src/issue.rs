@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use uuid::Uuid;
 
-use crate::http::NodeClient;
+use crate::http::{json_or_denial, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 fn signed_client(node: &str, dir: Option<&std::path::Path>) -> NodeClient {
@@ -198,13 +198,7 @@ async fn cmd_create(
         .post(&path, &request_body)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON response")?;
-
-    if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("create issue failed ({status}): {msg}");
-    }
+    let result: Value = json_or_denial("create issue", resp).await?;
 
     let id = result["id"].as_str().unwrap_or("?");
     println!("✓ Created issue #{id}");
@@ -264,13 +258,7 @@ async fn cmd_show(repo: String, id: String, node: String, dir: Option<PathBuf>) 
         .get_authed(&path)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let issue: Value = resp.json().await.context("invalid JSON response")?;
-
-    if !status.is_success() {
-        let msg = issue["message"].as_str().unwrap_or("issue not found");
-        anyhow::bail!("show failed ({status}): {msg}");
-    }
+    let issue: Value = json_or_denial("show", resp).await?;
 
     let title = issue["title"].as_str().unwrap_or("(no title)");
     let status = issue["status"].as_str().unwrap_or("?");
@@ -301,13 +289,8 @@ async fn cmd_close(repo: String, id: String, node: String, dir: Option<PathBuf>)
         .post(&format!("{path}/close"), &body)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON response")?;
-
-    if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("close issue failed ({status}): {msg}");
-    }
+    // Parsed only to reject a denial; the success body carries nothing to print.
+    json_or_denial::<Value>("close issue", resp).await?;
 
     println!("✗ Closed issue {id}");
     Ok(())
@@ -332,13 +315,7 @@ async fn cmd_issue_comment(
         )
         .await
         .context("failed to connect to node")?;
-    let code = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !code.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("comment failed ({code}): {msg}");
-    }
+    json_or_denial::<Value>("comment", resp).await?;
 
     println!("· Comment posted on issue {id}");
     Ok(())

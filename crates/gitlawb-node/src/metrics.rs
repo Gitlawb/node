@@ -7,6 +7,8 @@
 //!   * is fetch traffic flowing? — `gitlawb_fetches_total`
 //!   * are signature checks passing or failing? —
 //!     `gitlawb_auth_successes_total` / `gitlawb_auth_failures_total`
+//!   * is the spent-signature replay ledger admitting or refusing writes? —
+//!     `gitlawb_signature_ledger_total{outcome}`
 //!   * is the sync worker making progress? —
 //!     `gitlawb_sync_queue_processed_total{status}`
 //!   * are webhooks reaching their endpoints? —
@@ -47,6 +49,7 @@ static PUSHES: OnceLock<IntCounterVec> = OnceLock::new();
 static FETCHES: OnceLock<IntCounterVec> = OnceLock::new();
 static AUTH_SUCCESSES: OnceLock<IntCounterVec> = OnceLock::new();
 static AUTH_FAILURES: OnceLock<IntCounterVec> = OnceLock::new();
+static SIGNATURE_LEDGER: OnceLock<IntCounterVec> = OnceLock::new();
 static SYNC_PROCESSED: OnceLock<IntCounterVec> = OnceLock::new();
 static WEBHOOK_DELIVERIES: OnceLock<IntCounterVec> = OnceLock::new();
 static PACK_SIZE: OnceLock<Histogram> = OnceLock::new();
@@ -57,6 +60,17 @@ static PEERS_CONNECTED: OnceLock<IntGauge> = OnceLock::new();
 /// more than once is a silent no-op. MUST be called from `main()` after
 /// the node DID is known.
 pub fn init(version: &str, node_did: &str) {
+    // `Once` rather than a bare `REGISTRY.get().is_some()` check: the registry
+    // is published last, so that check leaves a window in which a second
+    // concurrent caller walks into the `set(..).expect(..)` calls below and
+    // panics on an already-set `OnceLock`. `main` calls this once, but tests
+    // call it from several threads. `call_once` makes the later callers block
+    // and then return, which is what the `expect`s already assume.
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| init_once(version, node_did));
+}
+
+fn init_once(version: &str, node_did: &str) {
     // Guard with Once so two concurrent callers cannot both pass an unsynchronized
     // `REGISTRY.get()` check and then race on `OnceLock::set(...).expect(...)`,
     // panicking the loser (#192 F4). Once runs the body exactly once, so the
@@ -137,6 +151,21 @@ fn init_inner(version: &str, node_did: &str) {
     AUTH_FAILURES
         .set(auth_failures)
         .expect("set AUTH_FAILURES once");
+
+    let signature_ledger = IntCounterVec::new(
+        Opts::new(
+            "gitlawb_signature_ledger_total",
+            "Total requests seen by the spent-signature replay ledger, by outcome",
+        ),
+        &["outcome"],
+    )
+    .expect("gitlawb_signature_ledger_total definition");
+    registry
+        .register(Box::new(signature_ledger.clone()))
+        .expect("register gitlawb_signature_ledger_total");
+    SIGNATURE_LEDGER
+        .set(signature_ledger)
+        .expect("set SIGNATURE_LEDGER once");
 
     let sync_processed = IntCounterVec::new(
         Opts::new(
@@ -248,6 +277,25 @@ pub fn record_auth_success(route: &str) {
 pub fn record_auth_failure(route: &str, reason: &str) {
     if let Some(c) = AUTH_FAILURES.get() {
         c.with_label_values(&[route, reason]).inc();
+    }
+}
+
+/// Record one terminal outcome of the spent-signature replay ledger layer.
+///
+/// Every request that enters the layer lands on exactly one outcome, so the
+/// series sum is the layer's request count and any one outcome is a rate over
+/// it. `outcome` is a fixed set of literals chosen at the call sites in
+/// `auth::consume_signature` — never a DID, keyid, or path, which would be
+/// attacker-controlled and unbounded.
+///
+/// The sum is the LAYER's request count, not the routes' traffic. The per-client
+/// flood brake (`rate_limit`) rejects upstream of this layer, so its 429s appear
+/// in no series here even though they are served on the same routes. An operator
+/// counting refusals has to read `rate_limited` responses separately; this
+/// counter answers "what is the ledger doing", not "how many 429s went out".
+pub fn record_signature_ledger(outcome: &str) {
+    if let Some(c) = SIGNATURE_LEDGER.get() {
+        c.with_label_values(&[outcome]).inc();
     }
 }
 
@@ -363,6 +411,7 @@ mod tests {
         record_fetch("test/repo");
         record_auth_success("test/route");
         record_auth_failure("test/route", "test_reason");
+        record_signature_ledger("test_outcome");
         record_sync_processed("done");
         record_webhook_delivery("ok");
         observe_pack_size(1024.0);

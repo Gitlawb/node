@@ -165,9 +165,13 @@ impl IntoResponse for AppError {
             AppError::UnresolvableDid(msg) => {
                 (StatusCode::BAD_REQUEST, "unresolvable_did", msg.clone())
             }
-            AppError::TooManyRequests(msg) => {
-                (StatusCode::TOO_MANY_REQUESTS, "rate_limited", msg.clone())
-            }
+            // Same wire code as the flood brake's `too_many_requests`, taken
+            // from the shared enum rather than retyped so the two cannot drift.
+            AppError::TooManyRequests(msg) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                gitlawb_core::node_denial::NodeDenial::RateLimited.as_str(),
+                msg.clone(),
+            ),
             AppError::Incomplete(msg) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "incomplete", msg.clone())
             }
@@ -238,6 +242,13 @@ impl IntoResponse for AppError {
         }
 
         let mut resp = (status, Json(body)).into_response();
+        if matches!(self, AppError::TooManyRequests(_)) {
+            use axum::http::HeaderValue;
+            let code = gitlawb_core::node_denial::NodeDenial::RateLimited.as_str();
+            if let Ok(v) = HeaderValue::from_str(code) {
+                resp.headers_mut().insert("X-Gitlawb-Error", v);
+            }
+        }
         // Both retryable 503s advertise when to retry: Overloaded (capacity shed) and
         // SearchIncomplete (a bounded CID search cut short by a cap — retry may complete
         // it). They ride the shared tail above for body/status, so the header is attached
@@ -271,6 +282,17 @@ mod tests {
         assert_eq!(
             AppError::Git("x".into()).into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn too_many_requests_carries_rate_limited_header() {
+        use axum::http::HeaderValue;
+        let resp = AppError::TooManyRequests("slow down".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get("X-Gitlawb-Error"),
+            Some(&HeaderValue::from_static("rate_limited"))
         );
     }
 

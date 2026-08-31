@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{json_or_denial, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
@@ -251,13 +251,7 @@ async fn cmd_create(
         .post("/api/v1/repos", &body)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let payload: Value = resp.json().await.context("invalid JSON response")?;
-
-    if !status.is_success() {
-        let msg = payload["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("create failed ({status}): {msg}");
-    }
+    let payload: Value = json_or_denial("create", resp).await?;
 
     let clone_url = payload["clone_url"].as_str().unwrap_or("");
     let gitlawb_url = format!("gitlawb://{owner_did}/{name}");
@@ -579,13 +573,9 @@ async fn cmd_fork(
         .post(&format!("/api/v1/repos/{owner}/{repo_name}/fork"), &body)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON response")?;
-
-    if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("fork failed ({status}): {msg}");
-    }
+    // Status before body: a rate-limit brake or any other non-JSON denial must
+    // read as the denial, not as "invalid JSON response".
+    let result: Value = json_or_denial("fork", resp).await?;
 
     let fork_name = result["name"].as_str().unwrap_or(&repo_name);
     let owner_did = result["owner_did"].as_str().unwrap_or("?");
@@ -623,13 +613,7 @@ async fn cmd_label_add(
         .post(&format!("/api/v1/repos/{owner}/{name}/labels"), &body)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("add label failed ({status}): {msg}");
-    }
+    let result: Value = json_or_denial("add label", resp).await?;
 
     let added = result["added"].as_bool().unwrap_or(true);
     if added {
@@ -654,13 +638,8 @@ async fn cmd_label_remove(
         .delete(&format!("/api/v1/repos/{owner}/{name}/labels/{label}"), &[])
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("remove label failed ({status}): {msg}");
-    }
+    // Parsed only to reject a denial; the success body carries nothing to print.
+    json_or_denial::<Value>("remove label", resp).await?;
 
     println!("- Label removed: {label} from {owner}/{name}");
     Ok(())
@@ -818,6 +797,48 @@ mod tests {
         // Should be the key segment of a did:key DID — starts with 'z'
         assert!(owner.starts_with('z'));
         assert!(!owner.contains(':'));
+    }
+
+    async fn fork_against(status: usize, headers: &[(&str, &str)], body: &str) -> String {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+        let mut server = mockito::Server::new_async().await;
+        let mut m = server
+            .mock("POST", "/api/v1/repos/alice/myrepo/fork")
+            .with_status(status);
+        for (k, v) in headers {
+            m = m.with_header(*k, v);
+        }
+        let _m = m.with_body(body).create_async().await;
+        let err = cmd_fork(
+            "alice/myrepo".to_string(),
+            None,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .expect_err("a 429 must not be reported as success");
+        format!("{err:#}")
+    }
+
+    /// Same shape as `gl profile set`: the fork route gained a per-IP brake, so
+    /// a 429 with a non-JSON body has to read as a rate limit rather than as a
+    /// parse failure.
+    #[tokio::test]
+    async fn fork_surfaces_a_rate_limit_brake_not_invalid_json() {
+        let err = fork_against(
+            429,
+            &[("x-gitlawb-error", "rate_limited")],
+            r#"{"error":"rate_limited","message":"rate limit exceeded — try again later"}"#,
+        )
+        .await;
+        assert!(!err.contains("invalid JSON"), "got: {err}");
+        assert!(err.contains("rate_limited"), "got: {err}");
+
+        let err = fork_against(429, &[], "rate limit exceeded — try again later").await;
+        assert!(!err.contains("invalid JSON"), "got: {err}");
+        assert!(err.contains("429"), "got: {err}");
+        assert!(err.contains("rate limit exceeded"), "got: {err}");
     }
 
     #[tokio::test]

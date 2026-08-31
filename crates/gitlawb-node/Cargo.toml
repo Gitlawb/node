@@ -75,6 +75,7 @@ alloy = { version = "1", default-features = false, features = [
 libp2p-dns = { version = "0.44.0", features = ["tokio"] }
 
 [dev-dependencies]
+multibase = { workspace = true }
 mockito = "1"
 tempfile = "3"
 # `test-util` for `#[tokio::test(start_paused = true)]`: lets the deadline tests assert

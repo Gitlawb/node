@@ -9,7 +9,7 @@ use clap::Args;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{json_or_denial, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
@@ -33,6 +33,14 @@ pub struct InitArgs {
 
 pub async fn run(args: InitArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("cannot determine current directory")?;
+    run_in(&cwd, args).await
+}
+
+/// The body of [`run`], with the working directory passed in. Split out so the
+/// whole flow (including what it prints on a node denial) is testable without
+/// mutating the process-wide current directory.
+async fn run_in(cwd: &std::path::Path, args: InitArgs) -> Result<()> {
+    let cwd = cwd.to_path_buf();
 
     // 1. Ensure git repo exists
     let git_dir = cwd.join(".git");
@@ -87,16 +95,12 @@ pub async fn run(args: InitArgs) -> Result<()> {
         .post("/api/register", &body)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let payload: Value = resp.json().await.context("invalid JSON from register")?;
-
-    if !status.is_success() {
-        let msg = payload["message"].as_str().unwrap_or("unknown error");
-        // "already registered" is fine
-        if !msg.contains("already") {
-            anyhow::bail!("registration failed ({status}): {msg}");
-        }
-    }
+    // No tolerated failure here: `register_agent` upserts, so re-registering a
+    // known DID is a 201, not a conflict (node `api/register.rs`, and the ON
+    // CONFLICT clause in `db::register_agent`). An older check let any message
+    // containing "already" through, which included the replay denial "this
+    // signature has already been used".
+    let payload: Value = json_or_denial("registration", resp).await?;
 
     // Save UCAN if returned
     if let Some(ucan) = payload.get("ucan").and_then(|v| v.as_str()) {
@@ -139,15 +143,22 @@ pub async fn run(args: InitArgs) -> Result<()> {
         .await
         .context("failed to create repo")?;
     let repo_status = resp.status();
-    let repo_result: Value = resp.json().await.context("invalid JSON from create repo")?;
-
     if !repo_status.is_success() {
-        let msg = repo_result["message"].as_str().unwrap_or("unknown error");
-        if !msg.contains("exists") && !msg.contains("already") {
-            anyhow::bail!("create repo failed ({repo_status}): {msg}");
+        let capped = crate::http::read_body_capped(resp, crate::http::DENIAL_BODY_CAP).await;
+        let repo_result: Value = serde_json::from_str(&capped.text).unwrap_or(Value::Null);
+        if !repo_already_exists(&repo_result) {
+            let msg = repo_result["message"]
+                .as_str()
+                .or_else(|| repo_result["error"].as_str())
+                .unwrap_or("unknown error");
+            anyhow::bail!(
+                "create repo failed ({repo_status}): {}",
+                crate::http::sanitize_node_msg(msg)
+            );
         }
         println!("  Repository already exists — continuing.");
     } else {
+        let _repo_result: Value = resp.json().await.context("invalid JSON from create repo")?;
         println!("  Repository created.");
     }
 
@@ -218,6 +229,14 @@ pub async fn run(args: InitArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Is this failed create-repo reply the benign "you already own that repo" case?
+/// `AppError::RepoExists` is the only thing the node renders as `repo_exists`
+/// (node `error.rs`), and it is the only non-success reply `gl init` may treat
+/// as "keep going".
+fn repo_already_exists(payload: &Value) -> bool {
+    payload["error"].as_str() == Some("repo_exists")
 }
 
 fn generate_identity(dir: Option<&std::path::Path>) -> Result<gitlawb_core::identity::Keypair> {
@@ -332,56 +351,155 @@ mod tests {
         assert_eq!(resp["name"], "test-repo");
     }
 
-    #[tokio::test]
-    async fn test_init_handles_already_registered() {
-        let dir = TempDir::new().unwrap();
-        let kp = write_identity(&dir);
+    /// A work dir with a git repo in it, plus an identity dir, wired to `node`.
+    fn init_args(node: String, id_dir: &TempDir) -> (InitArgs, TempDir) {
+        let work = TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(work.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        let args = InitArgs {
+            name: Some("test-repo".to_string()),
+            node,
+            dir: Some(id_dir.path().to_path_buf()),
+            description: None,
+        };
+        (args, work)
+    }
 
+    fn has_gitlawb_remote(work: &TempDir) -> bool {
+        std::process::Command::new("git")
+            .args(["remote", "get-url", "gitlawb"])
+            .current_dir(work.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    async fn mock_register(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/api/register")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"status":"accepted","message":"welcome","ucan":"test.token"}"#)
+            .create_async()
+            .await
+    }
+
+    #[tokio::test]
+    async fn init_fails_on_replay_409_without_the_error_header() {
+        // The node refused the create (the signature was already spent) and a
+        // proxy stripped `x-gitlawb-error`, so the client layer cannot see the
+        // denial and hands the 409 straight back. `gl init` used to read
+        // "already" out of the prose, print "Repository already exists —
+        // continuing", add the remote, print "Ready! Push with", and exit 0 for
+        // a repo that does not exist. Comparing the structured error code is
+        // what makes it fail instead, before any of that.
+        let id_dir = TempDir::new().unwrap();
+        write_identity(&id_dir);
+        let mut server = mockito::Server::new_async().await;
+        let _reg = mock_register(&mut server).await;
+        let _repo = server
+            .mock("POST", "/api/v1/repos")
+            .with_status(409)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"error":"signature_replayed","message":"this signature has already been used - sign a fresh request"}"#,
+            )
+            .create_async()
+            .await;
+
+        let (args, work) = init_args(server.url(), &id_dir);
+        let err = run_in(work.path(), args)
+            .await
+            .expect_err("a replayed signature must fail `gl init`, not report success");
+        let err = format!("{err:#}");
+        assert!(err.contains("create repo failed"), "got: {err}");
+        assert!(err.contains("409"), "status not surfaced: {err}");
+        // The remote is added several lines after the point where the old code
+        // decided "already exists, continuing", so its absence proves we bailed
+        // before printing "Ready! Push with".
+        assert!(
+            !has_gitlawb_remote(&work),
+            "init continued past the denial and configured the remote"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_still_continues_on_a_real_repo_exists_409() {
+        // The regression guard for the fix above: a genuine repo_exists conflict
+        // must behave exactly as before (continue, add the remote, succeed).
+        let id_dir = TempDir::new().unwrap();
+        write_identity(&id_dir);
+        let mut server = mockito::Server::new_async().await;
+        let _reg = mock_register(&mut server).await;
+        let _repo = server
+            .mock("POST", "/api/v1/repos")
+            .with_status(409)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"error":"repo_exists","message":"repository 'test-repo' already exists"}"#,
+            )
+            .create_async()
+            .await;
+
+        let (args, work) = init_args(server.url(), &id_dir);
+        run_in(work.path(), args)
+            .await
+            .expect("an existing repo must still be a successful `gl init`");
+        assert!(
+            has_gitlawb_remote(&work),
+            "init must still configure the remote for an existing repo"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_fails_when_registration_is_refused() {
+        // Registration is an upsert on the node, so any non-success is a real
+        // failure. The old `contains("already")` tolerance also swallowed the
+        // replay denial here.
+        let id_dir = TempDir::new().unwrap();
+        write_identity(&id_dir);
         let mut server = mockito::Server::new_async().await;
         let _reg = server
             .mock("POST", "/api/register")
             .with_status(409)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"message":"already registered"}"#)
+            .with_body(
+                r#"{"error":"signature_replayed","message":"this signature has already been used"}"#,
+            )
             .create_async()
             .await;
 
-        let client = NodeClient::new(server.url(), Some(kp.clone()));
-        let body = serde_json::to_vec(&json!({
-            "did": kp.did().to_string(),
-            "capabilities": ["git:push"],
-        }))
-        .unwrap();
-        let resp = client.post("/api/register", &body).await.unwrap();
-        let status = resp.status();
-        let payload: Value = resp.json().await.unwrap();
-        let msg = payload["message"].as_str().unwrap_or("");
-        // Should not bail because message contains "already"
-        assert!(!status.is_success());
-        assert!(msg.contains("already"));
+        let (args, work) = init_args(server.url(), &id_dir);
+        let err = run_in(work.path(), args)
+            .await
+            .expect_err("a refused registration must fail `gl init`");
+        let err = format!("{err:#}");
+        assert!(err.contains("registration failed"), "got: {err}");
+        assert!(err.contains("409"), "status not surfaced: {err}");
+        assert!(!has_gitlawb_remote(&work));
     }
 
-    #[tokio::test]
-    async fn test_init_handles_repo_exists() {
-        let dir = TempDir::new().unwrap();
-        let kp = write_identity(&dir);
-
-        let mut server = mockito::Server::new_async().await;
-        let _repo = server
-            .mock("POST", "/api/v1/repos")
-            .with_status(409)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"message":"repository already exists"}"#)
-            .create_async()
-            .await;
-
-        let client = NodeClient::new(server.url(), Some(kp.clone()));
-        let body = serde_json::to_vec(&json!({"name": "existing", "is_public": true})).unwrap();
-        let resp = client.post("/api/v1/repos", &body).await.unwrap();
-        let status = resp.status();
-        let result: Value = resp.json().await.unwrap();
-        let msg = result["message"].as_str().unwrap_or("");
-        assert!(!status.is_success());
-        assert!(msg.contains("exists") || msg.contains("already"));
+    #[test]
+    fn repo_already_exists_matches_the_code_not_the_prose() {
+        assert!(repo_already_exists(
+            &json!({"error":"repo_exists","message":"repository 'x' already exists"})
+        ));
+        // The replay denial's message contains "already" and "exists" is one
+        // word away; only the code separates them.
+        assert!(!repo_already_exists(&json!({
+            "error": "signature_replayed",
+            "message": "this signature has already been used - sign a fresh request"
+        })));
+        assert!(!repo_already_exists(
+            &json!({"message":"repository already exists"})
+        ));
+        assert!(!repo_already_exists(&json!({})));
     }
 }
