@@ -92,7 +92,31 @@ const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 /// for every repo this node creates (bare repos default it off), so
 /// the gap is repos predating that. Deliberate trade: a stranded row
 /// an operator can see beats accounting the node cannot substantiate.
+#[allow(dead_code)] // single-page seam; startup boots through the multi-pass walk below
 pub async fn reconcile_prepared_from_disk(state: AppState, limit: i64) -> anyhow::Result<usize> {
+    reconcile_prepared_page(state, None, limit)
+        .await
+        .map(|(promoted, _cursor)| promoted)
+}
+
+/// One page of the reconcile, resuming after `after`. Returns
+/// `(promoted, next_cursor)`, where `next_cursor` is the
+/// `(created_at, id)` of the last row EXAMINED — promoted or not — and
+/// `None` once a short page says the backlog is exhausted.
+/// [`reconcile_prepared_from_disk_all`] walks with it.
+///
+/// The cursor is what makes the multi-pass loop actually advance. A
+/// pass consumes every row it looked at, including the ones it refused
+/// to promote (a SHA that does not match, a row past
+/// [`MAX_RECONCILE_AGE`], a landing with no reflog proof). Those rows
+/// stay in `prepared` / `uncertain` by design, so a cursor-less next
+/// pass would re-read the same page forever and never reach the
+/// backlog behind them.
+async fn reconcile_prepared_page(
+    state: AppState,
+    after: Option<(String, String)>,
+    limit: i64,
+) -> anyhow::Result<(usize, Option<(String, String)>)> {
     // P1 (reviewer-1/2 round 3): also reconcile `uncertain` rows,
     // not just `prepared`. A receive-pack error that leaves rows
     // `uncertain` has the same recovery need as an interrupted
@@ -102,11 +126,22 @@ pub async fn reconcile_prepared_from_disk(state: AppState, limit: i64) -> anyhow
     // for refs that DID land before the error.
     let rows = state
         .db
-        .list_pending_ref_transitions_prepared_or_uncertain(limit)
+        .list_pending_ref_transitions_prepared_or_uncertain_after(
+            after.as_ref().map(|(ts, id)| (ts.as_str(), id.as_str())),
+            limit,
+        )
         .await?;
     if rows.is_empty() {
-        return Ok(0);
+        return Ok((0, None));
     }
+    // Taken BEFORE any promotion, from the last row of the page as it
+    // was READ: the walk advances over examined rows, not over promoted
+    // ones. A short page means there is nothing behind it.
+    let next_cursor = if (rows.len() as i64) < limit.max(1) {
+        None
+    } else {
+        rows.last().map(|r| (r.created_at.clone(), r.id.clone()))
+    };
 
     // Group rows by repo so we call `list_refs` once per repo, not
     // once per row.
@@ -246,7 +281,7 @@ pub async fn reconcile_prepared_from_disk(state: AppState, limit: i64) -> anyhow
             "reconciled prepared/uncertain -> applied via on-disk ref match"
         );
     }
-    Ok(flipped as usize)
+    Ok((flipped as usize, next_cursor))
 }
 
 /// Does the ref's reflog prove that THIS row's transition landed?
@@ -309,46 +344,51 @@ pub const REFLOG_CLOCK_SKEW: chrono::Duration = chrono::Duration::seconds(60);
 
 /// P2 (reviewer-1/2 round 3): multi-pass reconcile for the prepared/
 /// uncertain backlog. Mirrors `drain_pending_ref_transitions_all`:
-/// runs `reconcile_prepared_from_disk` in a loop until either a pass
-/// examines fewer rows than `per_pass_limit` (backlog exhausted) or
-/// `max_passes` passes have completed. If rows remain after the last
-/// pass, a residual-backlog warning is logged and those rows wait for
-/// the next startup.
+/// runs a reconcile pass in a loop until either a pass examines fewer
+/// rows than `per_pass_limit` (backlog exhausted) or `max_passes`
+/// passes have completed. If rows remain after the last pass, a
+/// residual-backlog warning is logged and those rows wait for the next
+/// startup.
+///
+/// The passes WALK, on the `(created_at, id)` cursor each page returns.
+/// The drain can re-issue the same query every pass because it deletes
+/// the rows it finishes, so its next page is always new work; the
+/// reconcile deletes nothing and leaves every unpromotable row exactly
+/// where it was, so re-issuing a cursor-less query re-read page one on
+/// every pass. One unprovable row at the head of the ordering — a SHA
+/// that never landed, a row past [`MAX_RECONCILE_AGE`], or (since the
+/// reflog gate) a landing in a repo that keeps no reflog — was enough
+/// to pin the whole loop there and leave the backlog behind it
+/// unexamined, which is the finding this loop exists to close. Those
+/// rows keep ageing toward `MAX_RECONCILE_AGE` while they wait, so
+/// "next restart" can mean "never recovered".
 pub async fn reconcile_prepared_from_disk_all(
     state: AppState,
     per_pass_limit: i64,
     max_passes: usize,
 ) -> anyhow::Result<usize> {
     let mut total = 0;
+    let mut cursor: Option<(String, String)> = None;
     for _ in 0..max_passes {
-        let n = reconcile_prepared_from_disk(state.clone(), per_pass_limit).await?;
+        let (n, next) =
+            reconcile_prepared_page(state.clone(), cursor.clone(), per_pass_limit).await?;
         total += n;
-        // The reconcile function returns the number of rows PROMOTED,
-        // not the number EXAMINED. We need to know if more rows remain.
-        // Query the count of prepared/uncertain rows to decide.
-        let remaining = state
-            .db
-            .list_pending_ref_transitions_prepared_or_uncertain(1)
-            .await?
-            .len();
-        if remaining == 0 {
-            return Ok(total);
+        // A short page is the backlog-exhausted signal, keyed on rows
+        // EXAMINED rather than rows promoted: a pass that could promote
+        // nothing has still consumed its page and must move on.
+        match next {
+            Some(c) => cursor = Some(c),
+            None => return Ok(total),
         }
     }
     // One more pass to detect residual backlog.
-    let residual = reconcile_prepared_from_disk(state.clone(), per_pass_limit).await?;
+    let (residual, next) = reconcile_prepared_page(state.clone(), cursor, per_pass_limit).await?;
     total += residual;
-    let remaining = state
-        .db
-        .list_pending_ref_transitions_prepared_or_uncertain(1)
-        .await?
-        .len();
-    if remaining > 0 {
+    if next.is_some() {
         tracing::warn!(
             total,
             max_passes,
             per_pass_limit,
-            remaining,
             "reconcile backlog exceeds startup budget; residual rows will be picked up on next restart"
         );
     }
@@ -1493,6 +1533,133 @@ mod drain_tests {
             .unwrap();
         assert_eq!(applied.len(), 1, "the deletion row reaches the drain");
         assert_eq!(applied[0].id, row.id);
+    }
+
+    // ----- P2 (reviewer round 3): the multi-pass reconcile must WALK -----
+
+    /// The backlog past the first page is reconciled in the SAME
+    /// startup, not one page per restart. With a per-pass limit of ONE,
+    /// a single pass can promote at most one row, so anything above one
+    /// proves the loop advanced.
+    ///
+    /// MUTATION (RED): call the single-page `reconcile_prepared_from_disk`
+    /// and only the first row is promoted.
+    #[sqlx::test]
+    async fn reconcile_all_walks_the_backlog_past_the_first_page(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        crate::git::store::init_bare(&bare).expect("init_bare");
+        let repo_id = seed_repo_row(&state, bare.to_str().unwrap()).await;
+
+        // Three landed refs, each with reflog proof of its own creation.
+        let ref_names = ["refs/heads/one", "refs/heads/two", "refs/heads/three"];
+        for (i, ref_name) in ref_names.iter().enumerate() {
+            let sha = seed_ref_on_bare(&bare, ref_name);
+            let mut row = make_row(&repo_id, ref_name, &"0".repeat(40), &sha);
+            row.request_id = format!("req-backlog-{i}");
+            row.state = pending_state::PREPARED.to_string();
+            row.applied_at = None;
+            row.id = crate::db::deterministic_id(&[
+                "pending_ref_transition",
+                &row.request_id,
+                &row.repo_id,
+                &row.ref_name,
+                &row.old_sha,
+                &row.new_sha,
+            ]);
+            state
+                .db
+                .insert_pending_ref_transition_for_test(&row)
+                .await
+                .unwrap();
+        }
+
+        let promoted = reconcile_prepared_from_disk_all(state.clone(), 1, DRAIN_MAX_PASSES)
+            .await
+            .unwrap();
+        assert_eq!(
+            promoted,
+            ref_names.len(),
+            "every row is reconciled in ONE startup, not one page per restart"
+        );
+        let still_pending = state
+            .db
+            .list_pending_ref_transitions_prepared_or_uncertain(100)
+            .await
+            .unwrap();
+        assert!(
+            still_pending.is_empty(),
+            "no backlog is left stranded past the first page"
+        );
+    }
+
+    /// The walk must step OVER rows it cannot promote. Those rows stay
+    /// `prepared` by design, so a pass that re-queried from the start
+    /// would hand itself the same page forever and never reach the
+    /// provable rows behind them.
+    ///
+    /// The blocker here is the class the reflog gate introduces: a ref
+    /// that really is on disk at the row's `new_sha`, in a repo that
+    /// keeps no reflog for it — permanently unprovable, so it jams page
+    /// one on every startup for as long as it exists, not just once.
+    ///
+    /// MUTATION (RED): ignore the cursor when selecting the next page
+    /// and the provable row behind the blocker is never promoted.
+    #[sqlx::test]
+    async fn reconcile_all_advances_past_an_unprovable_row(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        crate::git::store::init_bare(&bare).expect("init_bare");
+        let repo_id = seed_repo_row(&state, bare.to_str().unwrap()).await;
+
+        // Row 1 (oldest, so it sorts first): the ref IS on disk at the
+        // row's new_sha, but its reflog is gone — the SHA matches, the
+        // age passes, and the landing is still unproven.
+        let legacy_sha = seed_ref_on_bare(&bare, "refs/heads/legacy");
+        std::fs::remove_file(bare.join("logs/refs/heads/legacy")).expect("drop the ref's reflog");
+        let mut blocker = make_row(&repo_id, "refs/heads/legacy", &"0".repeat(40), &legacy_sha);
+        blocker.request_id = "req-blocker".to_string();
+        blocker.state = pending_state::PREPARED.to_string();
+        blocker.applied_at = None;
+        blocker.created_at = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        blocker.id = crate::db::deterministic_id(&["pending_ref_transition", "req-blocker"]);
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&blocker)
+            .await
+            .unwrap();
+
+        // Row 2 (newer): a provable landing sitting behind it.
+        let sha = seed_ref_on_bare(&bare, "refs/heads/landed");
+        let mut good = make_row(&repo_id, "refs/heads/landed", &"0".repeat(40), &sha);
+        good.request_id = "req-good".to_string();
+        good.state = pending_state::PREPARED.to_string();
+        good.applied_at = None;
+        good.id = crate::db::deterministic_id(&["pending_ref_transition", "req-good"]);
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&good)
+            .await
+            .unwrap();
+
+        let promoted = reconcile_prepared_from_disk_all(state.clone(), 1, DRAIN_MAX_PASSES)
+            .await
+            .unwrap();
+        assert_eq!(
+            promoted, 1,
+            "the provable row behind a permanently unprovable one is still reached"
+        );
+        let still_pending = state
+            .db
+            .list_pending_ref_transitions_prepared_or_uncertain(100)
+            .await
+            .unwrap();
+        assert_eq!(still_pending.len(), 1, "the unprovable row is left alone");
+        assert_eq!(still_pending[0].id, blocker.id);
     }
 
     // ----- P2-A drain resilience tests -----

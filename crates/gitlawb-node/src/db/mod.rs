@@ -2870,18 +2870,53 @@ impl Db {
         &self,
         limit: i64,
     ) -> Result<Vec<PendingRefTransition>> {
+        self.list_pending_ref_transitions_prepared_or_uncertain_after(None, limit)
+            .await
+    }
+
+    /// The same page of `prepared` / `uncertain` rows, in the same
+    /// order, resuming strictly AFTER the `(created_at, id)` cursor.
+    ///
+    /// The multi-pass reconcile needs a cursor where the multi-pass
+    /// drain does not, and the asymmetry is the whole reason this
+    /// exists. The drain DELETES every row it finishes, so its next
+    /// `LIMIT n` page is always new work. The reconcile leaves every
+    /// row it cannot promote exactly where it was, so re-issuing the
+    /// cursor-less query hands it the same page over and over: a
+    /// single unprovable row at the head of the ordering pins page one
+    /// and the backlog behind it is never examined at all — which is
+    /// the very thing the multi-pass loop was added to fix. Rows that
+    /// wait for another restart keep ageing toward
+    /// `MAX_RECONCILE_AGE`, past which they lose automatic recovery
+    /// entirely.
+    ///
+    /// Advancing on `(created_at, id)` also stays correct while rows
+    /// leave the set underneath the walk: a promoted row is simply
+    /// absent from a later page, and it can never shift an unvisited
+    /// row into a page that was already read, the way an OFFSET would.
+    #[allow(dead_code)]
+    pub async fn list_pending_ref_transitions_prepared_or_uncertain_after(
+        &self,
+        after: Option<(&str, &str)>,
+        limit: i64,
+    ) -> Result<Vec<PendingRefTransition>> {
         let limit = limit.max(1);
+        // The empty sentinel sorts before every RFC 3339 timestamp, so
+        // the first page needs no separate query.
+        let (after_created_at, after_id) = after.unwrap_or(("", ""));
         let rows = sqlx::query(
             r#"SELECT id, request_id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did,
                        signature_header, signature_input, content_digest, state, created_at,
                        applied_at, cancelled_at, first_ref_name
                FROM pending_ref_transitions
-               WHERE state IN ($1, $2)
+               WHERE state IN ($1, $2) AND (created_at, id) > ($3, $4)
                ORDER BY created_at ASC, id ASC
-               LIMIT $3"#,
+               LIMIT $5"#,
         )
         .bind(pending_state::PREPARED)
         .bind(pending_state::UNCERTAIN)
+        .bind(after_created_at)
+        .bind(after_id)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
