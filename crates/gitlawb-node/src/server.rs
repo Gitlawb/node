@@ -42,17 +42,37 @@ async fn graphql_playground() -> impl IntoResponse {
     ))
 }
 
+/// Pre-auth body-buffer ceiling for every signed route group except the git write
+/// routes. Deliberately equal to axum's `DefaultBodyLimit` (2 MB), which is what
+/// these groups' `Bytes`/`Json` extractors already enforce: that default works
+/// through a request extension the extractors consult, and `require_signature`
+/// collects the raw body itself, so it never saw the cap. Matching the number
+/// keeps this change behavior-preserving on the response path (nothing that used
+/// to be accepted starts failing) and purely a memory fix.
+pub const SIGNED_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
 /// Applies the standard auth middleware pair to a router: HTTP Signature verification
 /// followed by UCAN chain validation. The two layers run in this order for every
 /// matched request: `require_signature` first (sets `AuthenticatedDid`), then
 /// `require_ucan_chain` (reads it).
-fn add_auth_layers(router: Router<AppState>, state: AppState) -> Router<AppState> {
+///
+/// `body_limit` bounds the request body `require_signature` buffers before it has
+/// authenticated anything (see [`auth::SignatureBodyLimit`]): `max_pack_bytes` for
+/// the git write group, [`SIGNED_BODY_LIMIT`] for every other group.
+fn add_auth_layers(
+    router: Router<AppState>,
+    state: AppState,
+    body_limit: usize,
+) -> Router<AppState> {
     router
         .layer(middleware::from_fn_with_state(
             state,
             auth::require_ucan_chain,
         ))
-        .layer(middleware::from_fn(auth::require_signature))
+        .layer(middleware::from_fn_with_state(
+            auth::SignatureBodyLimit(body_limit),
+            auth::require_signature,
+        ))
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -63,7 +83,10 @@ pub fn build_router(state: AppState) -> Router {
         // Attach the verified DID to /graphql when a signature is present. The
         // layer covers only routes added before it, so /graphql/ws (added after,
         // read-only subscriptions) stays open.
-        .layer(middleware::from_fn(auth::optional_signature))
+        .layer(middleware::from_fn_with_state(
+            auth::SignatureBodyLimit(SIGNED_BODY_LIMIT),
+            auth::optional_signature,
+        ))
         .route_service("/graphql/ws", GraphQLSubscription::new(schema));
 
     // ── Task routes (write — require HTTP Signature) ───────────────────────
@@ -74,6 +97,7 @@ pub fn build_router(state: AppState) -> Router {
             .route("/api/v1/tasks/{id}/complete", post(tasks::complete_task))
             .route("/api/v1/tasks/{id}/fail", post(tasks::fail_task)),
         state.clone(),
+        SIGNED_BODY_LIMIT,
     );
 
     // ── Task routes (read — open) ──────────────────────────────────────────
@@ -107,6 +131,7 @@ pub fn build_router(state: AppState) -> Router {
             .layer(middleware::from_fn(rate_limit::rate_limit_by_did))
             .layer(axum::Extension(limiter)),
         state.clone(),
+        SIGNED_BODY_LIMIT,
     )
     .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
     .layer(axum::Extension(create_ip_limiter));
@@ -181,6 +206,7 @@ pub fn build_router(state: AppState) -> Router {
                 axum::routing::delete(agents::deregister_agent),
             ),
         state.clone(),
+        SIGNED_BODY_LIMIT,
     );
 
     // Body limit is raised to GITLAWB_MAX_PACK_BYTES (default 2 GB) for git
@@ -205,6 +231,7 @@ pub fn build_router(state: AppState) -> Router {
             .layer(DefaultBodyLimit::disable())
             .layer(RequestBodyLimitLayer::new(pack_limit)),
         state.clone(),
+        pack_limit,
     )
     .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
     .layer(axum::Extension(push_limiter));
@@ -225,7 +252,10 @@ pub fn build_router(state: AppState) -> Router {
     };
     let ipfs_routes = Router::new()
         .route("/ipfs/{cid}", get(ipfs::get_by_cid))
-        .layer(middleware::from_fn(auth::optional_signature))
+        .layer(middleware::from_fn_with_state(
+            auth::SignatureBodyLimit(SIGNED_BODY_LIMIT),
+            auth::optional_signature,
+        ))
         .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
         .layer(axum::Extension(ipfs_limiter))
         .merge(Router::new().route("/api/v1/ipfs/pins", get(ipfs::list_pins)));
@@ -258,6 +288,7 @@ pub fn build_router(state: AppState) -> Router {
                 post(bounties::dispute_bounty),
             ),
         state.clone(),
+        SIGNED_BODY_LIMIT,
     );
 
     // ── Bounty routes (read — open) ──────────────────────────────────────
@@ -273,12 +304,16 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/agents/{did}/bounties",
             get(bounties::agent_bounty_stats),
         )
-        .layer(middleware::from_fn(auth::optional_signature));
+        .layer(middleware::from_fn_with_state(
+            auth::SignatureBodyLimit(SIGNED_BODY_LIMIT),
+            auth::optional_signature,
+        ));
 
     // ── Profile routes (write — require HTTP Signature) ─────────────────
     let profile_write_routes = add_auth_layers(
         Router::new().route("/api/v1/profile", axum::routing::put(profiles::set_profile)),
         state.clone(),
+        SIGNED_BODY_LIMIT,
     );
 
     // ── Issue routes (write — require HTTP Signature, no rate limit) ─────
@@ -293,6 +328,7 @@ pub fn build_router(state: AppState) -> Router {
                 post(issues::create_issue_comment),
             ),
         state.clone(),
+        SIGNED_BODY_LIMIT,
     );
 
     // ── Peer discovery routes ─────────────────────────────────────────────
@@ -311,6 +347,7 @@ pub fn build_router(state: AppState) -> Router {
     let sync_trigger_routes = add_auth_layers(
         Router::new().route("/api/v1/sync/trigger", post(peers::trigger_sync)),
         state.clone(),
+        SIGNED_BODY_LIMIT,
     )
     .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
     .layer(axum::Extension(rate_limit::IpRateLimiter {
@@ -327,9 +364,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/peers/announce", post(peers::announce))
         .route("/api/v1/sync/notify", post(peers::notify_sync));
     peer_write_routes = if state.config.require_signed_peer_writes {
-        add_auth_layers(peer_write_routes, state.clone())
+        add_auth_layers(peer_write_routes, state.clone(), SIGNED_BODY_LIMIT)
     } else {
-        peer_write_routes.layer(middleware::from_fn(auth::optional_signature))
+        peer_write_routes.layer(middleware::from_fn_with_state(
+            auth::SignatureBodyLimit(SIGNED_BODY_LIMIT),
+            auth::optional_signature,
+        ))
     };
     let peer_write_routes = peer_write_routes
         .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
@@ -428,7 +468,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/repos/{owner}/{repo}/replicas",
             get(replicas::list_replicas),
         )
-        .layer(middleware::from_fn(auth::optional_signature));
+        .layer(middleware::from_fn_with_state(
+            auth::SignatureBodyLimit(SIGNED_BODY_LIMIT),
+            auth::optional_signature,
+        ));
 
     // git-upload-pack (clone/fetch) — same raised body limit as receive-pack so
     // large pack responses from the server don't get truncated on the client side.
@@ -460,7 +503,13 @@ pub fn build_router(state: AppState) -> Router {
         )
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(pack_limit))
-        .layer(middleware::from_fn(auth::optional_signature));
+        // `pack_limit`, not SIGNED_BODY_LIMIT: git-upload-pack POSTs live here and
+        // the group has deliberately raised its ceiling, so the pre-auth buffer for
+        // a signed fetch negotiation must match rather than narrow it.
+        .layer(middleware::from_fn_with_state(
+            auth::SignatureBodyLimit(pack_limit),
+            auth::optional_signature,
+        ));
 
     // ── Meta ──────────────────────────────────────────────────────────────
     let meta_routes = Router::new()

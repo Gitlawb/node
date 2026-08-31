@@ -2520,7 +2520,10 @@ mod tests {
                 "/ipfs/{cid}",
                 axum::routing::get(crate::api::ipfs::get_by_cid),
             )
-            .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+            .layer(axum::middleware::from_fn_with_state(
+                crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                crate::auth::optional_signature,
+            ))
             .with_state(state)
     }
 
