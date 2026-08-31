@@ -107,6 +107,11 @@ enum ShimMode {
 struct Shim {
     base_url: String,
     posts: Arc<AtomicUsize>,
+    /// Advertisement (GET /info/refs) count. One `git fetch` performs exactly
+    /// one advertisement, so tests assert this is EXACTLY one: any fetch-level
+    /// retry that comes back re-advertises and goes red on the spot, which the
+    /// lower-bound POST assertions alone cannot see (#275 round 6).
+    gets: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -136,15 +141,17 @@ fn start_shim(repo: PathBuf, mode: ShimMode) -> Shim {
     let addr = listener.local_addr().unwrap();
     let base_url = format!("http://{addr}");
     let posts = Arc::new(AtomicUsize::new(0));
+    let gets = Arc::new(AtomicUsize::new(0));
     let stop = Arc::new(AtomicBool::new(false));
 
     let posts_t = posts.clone();
+    let gets_t = gets.clone();
     let stop_t = stop.clone();
     let handle = std::thread::spawn(move || {
         while !stop_t.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    handle_conn(stream, &repo, mode, &posts_t);
+                    handle_conn(stream, &repo, mode, &posts_t, &gets_t);
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(5));
@@ -157,6 +164,7 @@ fn start_shim(repo: PathBuf, mode: ShimMode) -> Shim {
     Shim {
         base_url,
         posts,
+        gets,
         stop,
         handle: Some(handle),
     }
@@ -182,7 +190,13 @@ fn normalize_accepted_stream(stream: &TcpStream) {
     stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
 }
 
-fn handle_conn(stream: TcpStream, repo: &Path, mode: ShimMode, posts: &AtomicUsize) {
+fn handle_conn(
+    stream: TcpStream,
+    repo: &Path,
+    mode: ShimMode,
+    posts: &AtomicUsize,
+    gets: &AtomicUsize,
+) {
     normalize_accepted_stream(&stream);
     let mut reader = BufReader::new(stream);
 
@@ -219,6 +233,7 @@ fn handle_conn(stream: TcpStream, repo: &Path, mode: ShimMode, posts: &AtomicUsi
     }
 
     let (content_type, payload) = if method == "GET" && target.contains("/info/refs") {
+        gets.fetch_add(1, Ordering::SeqCst);
         // v0 advertisement, wrapped exactly as the node's info_refs does.
         let adv = upload_pack(repo, true, b"");
         let mut wrapped = pkt(b"# service=git-upload-pack\n");
@@ -935,6 +950,7 @@ fn shim_answers_a_connection_that_arrives_non_blocking() {
 
     let server = std::thread::spawn(move || {
         let posts = AtomicUsize::new(0);
+        let gets = AtomicUsize::new(0);
         let stream = loop {
             match listener.accept() {
                 Ok((s, _)) => break s,
@@ -949,7 +965,7 @@ fn shim_answers_a_connection_that_arrives_non_blocking() {
         // the assertions below run on every platform.
         stream.set_nonblocking(true).unwrap();
         accepted_tx.send(()).unwrap();
-        handle_conn(stream, &repo, ShimMode::Normal, &posts);
+        handle_conn(stream, &repo, ShimMode::Normal, &posts, &gets);
     });
 
     let mut client = TcpStream::connect(addr).unwrap();
@@ -1012,6 +1028,17 @@ fn real_git_multi_round_fetch_completes() {
     assert!(
         posts >= 2,
         "fixture did not force multi-round negotiation (observed {posts} POST(s)); the bridging path was not exercised"
+    );
+    // Exactly one advertisement: the POST bound above is a floor, so a
+    // reintroduced fetch-level retry could satisfy it by running a second full
+    // fetch instead of multi-round negotiation. Re-advertising is what a
+    // second fetch cannot avoid, so this is the committed guard on the
+    // retry's absence.
+    let gets = shim.gets.load(Ordering::SeqCst);
+    assert_eq!(
+        gets, 1,
+        "expected exactly one advertisement GET per fetch; {gets} means a \
+         fetch-level retry is back"
     );
 
     // The fetched tip is present and the clone's object graph is intact.
@@ -1103,6 +1130,17 @@ fn real_git_withheld_shaped_first_post() {
     assert!(
         completed,
         "helper hung on a withheld-shaped response (should forward-and-terminate, not deadlock). stderr:\n{stderr}"
+    );
+
+    // Exactly one advertisement, pass or fail: the POST assertions below are
+    // floors, so a reintroduced fetch-level retry could mask the withheld
+    // shape behind a second full fetch. A retry cannot avoid re-advertising,
+    // so this is the committed guard on its absence.
+    let gets = shim.gets.load(Ordering::SeqCst);
+    assert_eq!(
+        gets, 1,
+        "expected exactly one advertisement GET per fetch; {gets} means a \
+         fetch-level retry is back"
     );
 
     if out.status.success() {
