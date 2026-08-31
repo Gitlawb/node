@@ -16,9 +16,12 @@ both configured.
 | Warm | Pinata (Filecoin-backed) | `pinata.rs` | `GITLAWB_PINATA_JWT` set | Off-node durability + public IPFS gateway reachability |
 
 If a sink's config value is empty, its **pin** paths are no-ops — so leaving
-`GITLAWB_PINATA_JWT` unset simply disables warm-tier pinning. Note this applies to
-pinning only, not reads: the hot-tier read path (`ipfs_pin::cat`) returns an error
-rather than a no-op when `GITLAWB_IPFS_API` is unset, so a node that serves the
+`GITLAWB_PINATA_JWT` unset disables warm-tier *uploads*, though not the tail's
+cost: the post-push Pinata tail still takes a global pin permit and runs the full
+object-list re-derivation walk before the upload step returns empty, since its
+gate is the announce/walk state, not the JWT. Note the no-op applies to pinning
+only, not reads: the hot-tier read path (`ipfs_pin::cat`) returns an error rather
+than a no-op when `GITLAWB_IPFS_API` is unset, so a node that serves the
 encrypted-blob read endpoint needs Kubo configured.
 
 ## Configuration
@@ -43,7 +46,13 @@ Both tiers share a single global **pin admission semaphore**
 saturated, a pin loop waits for a slot instead of dropping the pin. Each batch is
 bounded by `PIN_BATCH_BUDGET` (120s) so the pin batch itself cannot hold a slot
 indefinitely. The Pinata tail re-derives its object list only *after* acquiring a
-slot, which bounds outstanding memory to O(refs) rather than O(pushes × objects).
+slot, which bounds *its* outstanding memory to O(refs) rather than
+O(pushes × objects) — but that bound is the warm tail's alone. A **hot-tier** pin
+loop takes an owned object list materialized by its caller *before* it waits for
+a slot, so every hot loop parked on a saturated pool is holding its full list:
+the hot side of the parked-list memory is O(pushes × objects), capped per repo by
+`EncryptInflight` but not across repos. Do not size a node's memory from the
+semaphore knob (README says the same).
 Note the budget covers the pin batch, not the preceding object-list re-derivation
 walk: that walk holds the slot too, and bounds only each child git process
 individually (no aggregate deadline).
@@ -51,7 +60,11 @@ individually (no aggregate deadline).
 De-duplication is per sink and best-effort, backed by the single `pinned_cids`
 table: the hot tier keys on its `cid`/`sha256_hex` rows and the warm tier on the
 nullable `pinata_cid` column, so later pushes normally skip objects whose
-successful pin is already recorded. The check-upload-record sequence is not atomic,
+successful pin is already recorded. The isolation is one-directional: a hot-only
+pin does not suppress the warm tier (`pinata_cid` stays null), but the hot tier's
+skip check is row *presence*, and a warm-tier pin inserts the row — so an object
+warm-pinned while `GITLAWB_IPFS_API` was unset is skipped by the hot tier after
+Kubo is configured, until something re-pins it. The check-upload-record sequence is not atomic,
 so concurrent post-push tasks for the same object, or a failure to record after a
 successful upload, can still cause a repeat upload attempt.
 
