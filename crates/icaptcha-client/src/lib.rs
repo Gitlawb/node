@@ -92,9 +92,12 @@ fn sanitize_excerpt(s: &str) -> String {
 /// explicit truthy value. Does not include the raw env value (arbitrary
 /// deployment input — secrets / terminal controls).
 fn warn_icaptcha_insecure_non_truthy() {
+    // One literal line on purpose: a continuation escape here keeps emitting
+    // correct prose (Rust strips the next line's leading whitespace), but the
+    // single-line form makes that property visible without knowing the escape
+    // semantics, which is what the review asked for.
     tracing::warn!(
-        "GITLAWB_ICAPTCHA_INSECURE is set but not truthy (expected 1 or true); \
-         loopback HTTP trust relaxation remains disabled"
+        "GITLAWB_ICAPTCHA_INSECURE is set but not truthy (expected 1 or true); loopback HTTP trust relaxation remains disabled"
     );
 }
 
