@@ -42,13 +42,17 @@ pub enum CertCmd {
         #[arg(long)]
         dir: Option<PathBuf>,
         /// Exit non-zero unless the Ed25519 signature verifies AND the
-        /// issuing node matches the queried node (or --expect-node)
+        /// issuing node matches --expect-node (which --verify requires:
+        /// without a caller-supplied anchor there is no trusted issuer to
+        /// verify against)
         #[arg(long)]
         verify: bool,
         /// Expected issuing node DID for --verify. A valid signature alone
         /// only proves the cert is internally consistent — signed by whatever
         /// key it names — so --verify also anchors the issuer to a DID you
-        /// trust: this value when given, else the queried node's DID.
+        /// trust. The queried node's self-reported DID is deliberately NOT
+        /// accepted as a fallback anchor: the node that served the cert can
+        /// serve a matching self-report.
         #[arg(long, requires = "verify")]
         expect_node: Option<String>,
     },
@@ -202,12 +206,16 @@ async fn cmd_show(
         // does not know about must NOT be silently verified as v1.
         // Reviewer 2: refuse rather than guess; the client and
         // server must agree on the version.
-        Ok(1) => verify_signature(
+        // parse_cert_version admits exactly one Ok value: 1 (missing key and
+        // integer 1 both land there; 2, floats, strings, overflow and every
+        // other spelling come back Err with their own reason). A separate
+        // `Ok(v != 1)` arm existed here and was DEAD CODE — a test aimed at it
+        // could never catch drift in this match (review round 2) — so the
+        // match now mirrors the parser's real contract, which the
+        // `parse_cert_version_truth_table` test pins.
+        Ok(_) => verify_signature(
             repo_id, ref_name, old_sha, new_sha, pusher, node_did, issued_at, signature,
         ),
-        Ok(v) => Err(format!(
-            "this client supports cert version 1 only; server returned {v}; upgrade the client to verify"
-        )),
         Err(reason) => Err(format!(
             "cert declared a version this client cannot represent ({reason}); refusing to verify"
         )),
@@ -238,7 +246,10 @@ async fn cmd_show(
     };
     match current_node_did.as_deref() {
         Some(current) if current == node_did => {
-            println!("  Issuing node DID matches the node being queried.");
+            // Self-reported, so phrased as information rather than trust: the
+            // node answering `/` is the node that served the cert, and a
+            // forger controls both. Trust comes only from --expect-node.
+            println!("  Issuing node DID matches the queried node's self-reported DID.");
         }
         Some(current) => {
             println!("  WARNING: Certificate node DID ({node_did}) does not match");
@@ -257,17 +268,25 @@ async fn cmd_show(
         // A valid signature proves internal consistency only: the payload was
         // signed by whatever key the certificate itself names. A hostile
         // source can mint a keypair, put its DID in node_did, and self-sign.
-        // --verify therefore also anchors the issuer to a trusted DID:
-        // --expect-node when given, else the DID of the node being queried.
-        let expected = expect_node.as_deref().or(current_node_did.as_deref());
-        match expected {
+        // --verify therefore also anchors the issuer — and the anchor must be
+        // a DID the CALLER trusts, which is exactly what --expect-node is.
+        // The DID the queried node reports at `/` is NOT an anchor: the same
+        // node that served a forged certificate can serve a matching
+        // self-report, and with that fallback a wholly forged cert printed
+        // VALID and exited 0 (review round 2, demonstrated by execution). So
+        // --verify without --expect-node refuses to claim a trusted issuer at
+        // all, rather than laundering the server's self-assertion into one.
+        match expect_node.as_deref() {
             Some(expected) if expected == node_did => {}
             Some(expected) => anyhow::bail!(
                 "certificate is signed by {node_did}, but the expected issuer is {expected} — \
                  a valid signature alone proves internal consistency, not a trusted issuer"
             ),
             None => anyhow::bail!(
-                "cannot anchor the issuer: node info is unreachable and no --expect-node was given"
+                "--verify needs --expect-node <did> to anchor the issuer: the signature is \
+                 valid, but it only proves the cert is self-consistent with the DID it \
+                 names ({node_did}); the queried node's self-reported DID is not a trust \
+                 anchor"
             ),
         }
     }
@@ -664,26 +683,22 @@ mod tests {
         }
     }
 
-    /// #26 Split PR 3: a `version: 2` cert reaches the `Ok(v)` arm of
-    /// the verdict match in `cmd_show`, which must return Err — the
-    /// v2 payload shape is not the bytes this client signs over, so a
-    /// v1 verify call on it would silently pass any well-signed v1
-    /// signature regardless of the version mismatch. Reviewer 1: pin
-    /// the verdict branch end to end, not just the parser.
-    ///
-    /// We exercise the same match arm `cmd_show` uses (Ok(v) where
-    /// v != 1) by feeding a known-bad payload through it. The Ok(1)
-    /// and Err arms are pinned by `parse_cert_version_truth_table`
-    /// and the round-trip tests above.
-    #[test]
-    fn verdict_branch_rejects_v2_even_with_valid_v1_signature() {
+    /// #26 Split PR 3, round 2: a `version: 2` certificate must fail
+    /// `--verify` THROUGH `cmd_show` itself, not through a copy of its
+    /// match. The prior form of this test duplicated the verdict match in
+    /// the test body and aimed at an `Ok(v != 1)` arm the real parser can
+    /// never produce, so gutting `cmd_show`'s rejection kept every test
+    /// green (demonstrated by the reviewer by execution). Driving the
+    /// command end to end is what makes this a guard: the mock serves a
+    /// cert whose SIGNATURE IS VALID for v1 bytes but which declares
+    /// version 2, and the command must exit Err with the version named —
+    /// the v1 verify path must not launder it through.
+    #[tokio::test]
+    async fn cmd_show_verify_rejects_v2_even_with_valid_v1_signature() {
         let kp = gitlawb_core::identity::Keypair::generate();
         let node_did = kp.did().as_str().to_string();
 
-        // Sign a v1-shaped payload. This signature is VALID against
-        // v1 bytes — the point of this test is that the verdict
-        // must NOT verify it as v1 just because the signature would
-        // match. The version mismatch is the disqualifier.
+        // Sign a v1-shaped payload so the ONLY disqualifier is the version.
         let payload = serde_json::json!({
             "repo_id": "repo-1",
             "ref":     "refs/heads/main",
@@ -695,11 +710,8 @@ mod tests {
         });
         let sig = kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
 
-        // Build the cert JSON the way an HTTP client would receive it:
-        // an explicit version: 2. The signature is valid for v1 bytes
-        // but the response says "this is v2".
         let cert_json = serde_json::json!({
-            "id":         "test-id",
+            "id":         "0123456789abcdef0123456789abcdef0123",
             "repo_id":    "repo-1",
             "ref_name":   "refs/heads/main",
             "old_sha":    "0".repeat(40),
@@ -711,37 +723,127 @@ mod tests {
             "version":    2,
         });
 
-        let parsed = parse_cert_version(cert_json.get("version"));
-        // The match in cmd_show has three arms: Ok(1) → verify;
-        // Ok(v) → Err; Err(reason) → Err. v2 is Ok(2), so it lands
-        // in the Ok(v) arm and is rejected with a version-mismatch
-        // reason — the v1 verify path is never called.
-        let verdict = match parsed {
-            Ok(1) => verify_signature(
-                "repo-1",
-                "refs/heads/main",
-                &"0".repeat(40),
-                &"a".repeat(40),
-                "did:key:z6MkPusher",
-                &node_did,
-                "2026-07-22T00:00:00+00:00",
-                cert_json["signature"].as_str().unwrap(),
-            ),
-            Ok(v) => Err(format!(
-                "this client supports cert version 1 only; server returned {v}; upgrade the client to verify"
-            )),
-            Err(reason) => Err(format!(
-                "cert declared a version this client cannot represent ({reason}); refusing to verify"
-            )),
-        };
+        let mut server = mockito::Server::new_async().await;
+        // 36-char id short-circuits resolve_cert_id; "owner/repo" input
+        // short-circuits resolve_repo — the cert GET is the only required
+        // route. `/` may be probed for the contextual DID line; serving it
+        // keeps the test about the verdict, not about network noise.
+        let _cert = server
+            .mock(
+                "GET",
+                "/api/v1/repos/o/r/certs/0123456789abcdef0123456789abcdef0123",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(cert_json.to_string())
+            .create_async()
+            .await;
+        let _root = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!({ "did": node_did }).to_string())
+            .create_async()
+            .await;
+
+        let err = cmd_show(
+            "o/r".to_string(),
+            "0123456789abcdef0123456789abcdef0123".to_string(),
+            server.url(),
+            None,
+            true,
+            Some(node_did.clone()),
+        )
+        .await
+        .expect_err("a version-2 cert must fail --verify even with a valid v1 signature");
+        let msg = format!("{err:#}");
         assert!(
-            verdict.is_err(),
-            "version: 2 must produce Err even when the v1 signature would otherwise verify: {verdict:?}"
+            msg.contains("version"),
+            "the failure must name the version mismatch, not a generic invalid signature: {msg}"
         );
-        let reason = verdict.unwrap_err();
+    }
+
+    /// Round 2's second demonstrated escape: with no --expect-node, the old
+    /// fallback anchored the issuer to the DID the QUERIED NODE reports at
+    /// `/` — which a forger controls along with the cert, so a wholly forged
+    /// self-signed certificate passed --verify with exit 0. `cmd_show` with
+    /// --verify and no --expect-node must now refuse to claim a trusted
+    /// issuer, even when the served cert's signature is valid and the node's
+    /// self-report matches it.
+    #[tokio::test]
+    async fn cmd_show_verify_without_expect_node_refuses_self_asserted_anchor() {
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did().as_str().to_string();
+        let payload = serde_json::json!({
+            "repo_id": "repo-1",
+            "ref":     "refs/heads/main",
+            "old":     "0".repeat(40),
+            "new":     "a".repeat(40),
+            "pusher":  "did:key:z6MkPusher",
+            "node":    node_did,
+            "ts":      "2026-07-22T00:00:00+00:00",
+        });
+        let sig = kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
+        let cert_json = serde_json::json!({
+            "id":         "0123456789abcdef0123456789abcdef0123",
+            "repo_id":    "repo-1",
+            "ref_name":   "refs/heads/main",
+            "old_sha":    "0".repeat(40),
+            "new_sha":    "a".repeat(40),
+            "pusher_did": "did:key:z6MkPusher",
+            "node_did":   node_did,
+            "signature":  sig,
+            "issued_at":  "2026-07-22T00:00:00+00:00",
+        });
+
+        let mut server = mockito::Server::new_async().await;
+        let _cert = server
+            .mock(
+                "GET",
+                "/api/v1/repos/o/r/certs/0123456789abcdef0123456789abcdef0123",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(cert_json.to_string())
+            .create_async()
+            .await;
+        // The forger's matching self-report — the exact shape that used to
+        // convert into a trust anchor.
+        let _root = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!({ "did": node_did }).to_string())
+            .create_async()
+            .await;
+
+        let err = cmd_show(
+            "o/r".to_string(),
+            "0123456789abcdef0123456789abcdef0123".to_string(),
+            server.url(),
+            None,
+            true,
+            None,
+        )
+        .await
+        .expect_err("--verify without --expect-node must not mint a trust anchor from the node's self-report");
+        let msg = format!("{err:#}");
         assert!(
-            reason.contains("version 1 only") && reason.contains("returned 2"),
-            "the rejection reason must name the version mismatch, not a generic 'invalid signature': {reason}"
+            msg.contains("--expect-node"),
+            "the refusal must tell the caller how to anchor trust: {msg}"
         );
+
+        // Positive control: the same cert with the DID explicitly trusted
+        // passes, so the guard is about the anchor, not the signature.
+        cmd_show(
+            "o/r".to_string(),
+            "0123456789abcdef0123456789abcdef0123".to_string(),
+            server.url(),
+            None,
+            true,
+            Some(node_did),
+        )
+        .await
+        .expect("explicitly anchored --verify of a valid v1 cert must pass");
     }
 }
