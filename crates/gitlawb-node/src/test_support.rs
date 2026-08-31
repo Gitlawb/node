@@ -1957,6 +1957,340 @@ mod tests {
         );
     }
 
+    /// SINK GUARD (jatmn #379): a PR targeting a name that exists only as a tag
+    /// (refs/tags/{name}, no refs/heads/{name}) must fail closed. Without the
+    /// exact-ref checks, git's revision DWIM resolves the bare name to the tag,
+    /// `worktree add` checks out a detached HEAD there, the merge succeeds on
+    /// that disposable HEAD, cleanup discards the commit, and the unchecked
+    /// final rev-parse echoes "refs/heads/{name}" back as a bogus merge SHA —
+    /// so the PR is marked merged and pull_request.merged fires even though no
+    /// branch ever moved.
+    #[sqlx::test]
+    async fn merge_pr_fails_closed_when_target_is_only_a_tag(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+        let rev = |args: &[&str], cwd: &std::path::Path| {
+            String::from_utf8_lossy(&run(args, cwd).stdout)
+                .trim()
+                .to_string()
+        };
+
+        let src = std::env::temp_dir().join(format!("gl-tag-only-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("base.txt"), b"base").unwrap();
+        run(&["add", "base.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        // The tag that shadows the missing target branch: "release" resolves via
+        // DWIM but refs/heads/release never exists.
+        run(&["tag", "release"], &src);
+        run(&["checkout", "-q", "-b", "feature"], &src);
+        std::fs::write(src.join("feature.txt"), b"feature-only").unwrap();
+        run(&["add", "feature.txt"], &src);
+        run(&["commit", "-q", "-m", "on feature"], &src);
+
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("tag-only.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+        let tag_before = rev(&["rev-parse", "refs/tags/release"], &bare);
+        // Precondition of the whole scenario: the tag exists, the branch does not.
+        let no_branch = Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", "refs/heads/release"])
+            .current_dir(&bare)
+            .output()
+            .expect("git show-ref");
+        assert!(
+            !no_branch.status.success(),
+            "fixture must not have a local release branch"
+        );
+
+        let mut repo = seed_repo(&owner_did, "tag-only");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "merge into tag-shadowed name".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: "feature".into(),
+            target_branch: "release".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert pr row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                axum::routing::post(crate::api::pulls::merge_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/tag-only/pulls/1/merge");
+        let resp = router
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !resp.status().is_success(),
+            "merge must fail when the target exists only as a tag, got {}",
+            resp.status()
+        );
+
+        // The handler updates the PR row and fires pull_request.merged only
+        // after merge_branch returns Ok, so an open row proves no merged event
+        // was emitted.
+        let stored = state
+            .db
+            .get_pr(&repo.id, 1)
+            .await
+            .expect("get_pr")
+            .expect("pr row");
+        assert_eq!(
+            stored.status, "open",
+            "a failed merge must leave the PR open and emit no pull_request.merged"
+        );
+        assert!(stored.merged_by_did.is_none());
+
+        // The repo itself must be untouched: still no local release branch, and
+        // the tag did not move.
+        let still_no_branch = Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", "refs/heads/release"])
+            .current_dir(&bare)
+            .output()
+            .expect("git show-ref");
+        assert!(
+            !still_no_branch.status.success(),
+            "a failed merge must not create refs/heads/release"
+        );
+        let tag_after = rev(&["rev-parse", "refs/tags/release"], &bare);
+        assert_eq!(tag_after, tag_before, "the tag must not move");
+    }
+
+    /// Companion to the tag-only case (jatmn #379): when a same-named tag AND a
+    /// local branch coexist, the merge must attach to and advance
+    /// refs/heads/{target} while refs/tags/{target} stays where it was — the
+    /// exact-ref binding must pick the branch, not merely fail less.
+    #[sqlx::test]
+    async fn merge_pr_advances_local_branch_shadowed_by_same_named_tag(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+        let rev = |args: &[&str], cwd: &std::path::Path| {
+            String::from_utf8_lossy(&run(args, cwd).stdout)
+                .trim()
+                .to_string()
+        };
+
+        let src = std::env::temp_dir().join(format!("gl-tag-shadow-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("base.txt"), b"base").unwrap();
+        run(&["add", "base.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        // Tag "release" pinned at the seed commit; the branch of the same name
+        // moves past it. Revision DWIM prefers refs/tags/ over refs/heads/ for
+        // an ambiguous short name, so this fixture is the strongest shadowing
+        // shape: a naive resolution would merge onto the stale tag commit.
+        run(&["tag", "release"], &src);
+        run(&["checkout", "-q", "-b", "release"], &src);
+        std::fs::write(src.join("release.txt"), b"release-only").unwrap();
+        run(&["add", "release.txt"], &src);
+        run(&["commit", "-q", "-m", "on release"], &src);
+        run(&["checkout", "-q", "-b", "feature"], &src);
+        std::fs::write(src.join("feature.txt"), b"feature-only").unwrap();
+        run(&["add", "feature.txt"], &src);
+        run(&["commit", "-q", "-m", "on feature"], &src);
+        run(&["checkout", "-q", "release"], &src);
+        std::fs::write(src.join("release2.txt"), b"release-again").unwrap();
+        run(&["add", "release2.txt"], &src);
+        run(&["commit", "-q", "-m", "diverge release"], &src);
+        let feature_tip = rev(&["rev-parse", "refs/heads/feature"], &src);
+
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("tag-shadow.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+        let tag_before = rev(&["rev-parse", "refs/tags/release"], &bare);
+        let branch_before = rev(&["rev-parse", "refs/heads/release"], &bare);
+        assert_ne!(
+            tag_before, branch_before,
+            "fixture must diverge the tag from the branch"
+        );
+
+        let mut repo = seed_repo(&owner_did, "tag-shadow");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "merge feature into shadowed release".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: "feature".into(),
+            target_branch: "release".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert pr row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                axum::routing::post(crate::api::pulls::merge_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/tag-shadow/pulls/1/merge");
+        let resp = router
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "merge must succeed when the local branch exists alongside the tag, got {}",
+            resp.status()
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let merge_sha = json["merge_sha"].as_str().expect("merge_sha in response");
+        assert_eq!(json["status"].as_str(), Some("merged"));
+
+        let stored = state
+            .db
+            .get_pr(&repo.id, 1)
+            .await
+            .expect("get_pr")
+            .expect("pr row");
+        assert_eq!(stored.status, "merged");
+
+        // The LOCAL BRANCH advanced to the reported merge SHA; the tag stayed put.
+        let branch_after = rev(&["rev-parse", "refs/heads/release"], &bare);
+        assert_ne!(
+            branch_after, branch_before,
+            "refs/heads/release must advance past the merge"
+        );
+        assert_eq!(
+            branch_after, merge_sha,
+            "reported merge_sha must match refs/heads/release"
+        );
+        let tag_after = rev(&["rev-parse", "refs/tags/release"], &bare);
+        assert_eq!(tag_after, tag_before, "the tag must not move");
+        run(
+            &["merge-base", "--is-ancestor", &feature_tip, &branch_after],
+            &bare,
+        );
+        run(
+            &["cat-file", "-e", &format!("{branch_after}:feature.txt")],
+            &bare,
+        );
+    }
+
     /// SINK GUARD: a poisoned row with option-shaped source_branch must not reach
     /// git merge argv (distinct from the diff revspec injection shape).
     #[sqlx::test]

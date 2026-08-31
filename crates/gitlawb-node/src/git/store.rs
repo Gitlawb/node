@@ -935,19 +935,49 @@ pub fn merge_branch(
 ) -> Result<String> {
     guard_refs(target_branch, source_branch)?;
     let source_ref = local_branch_ref(source_branch);
+    let target_ref = local_branch_ref(target_branch);
     let worktree_path = repo_path.join("_merge_worktree");
 
-    // Clean up any leftover worktree
-    if worktree_path.exists() {
+    let remove_worktree = || {
         let _ = Command::new("git")
             .args(["worktree", "remove", "--force", "_merge_worktree"])
             .current_dir(repo_path)
             .output();
         let _ = std::fs::remove_dir_all(&worktree_path);
+    };
+
+    // Clean up any leftover worktree
+    if worktree_path.exists() {
+        remove_worktree();
     }
 
-    // Check out the local target branch in the worktree. Passing refs/heads/{name}
-    // would detach HEAD, so a successful merge would not advance refs/heads/{target}.
+    // The merge must land on the LOCAL target branch, so the worktree has to end
+    // up attached to exactly refs/heads/{target}. validate_git_ref proves
+    // branch-name grammar only: it does not prove refs/heads/{target} exists,
+    // and it cannot stop git's revision DWIM rules from resolving the same
+    // short name in another namespace (refs/tags/{name}, refs/remotes/...). If
+    // DWIM won, `worktree add` would check out a detached HEAD at the foreign
+    // ref, the merge would succeed on that disposable HEAD, and cleanup would
+    // discard the commit without ever advancing refs/heads/{target}.
+    //
+    // (1) Require the exact local ref before creating the worktree. show-ref
+    // --verify matches the full refname literally — no DWIM, no abbreviation —
+    // so a same-named tag with no local branch fails here instead of being
+    // silently resolved.
+    let target_exists = Command::new("git")
+        .args(["show-ref", "--verify", "--quiet", &target_ref])
+        .current_dir(repo_path)
+        .output()
+        .context("failed to run git show-ref")?;
+    if !target_exists.status.success() {
+        bail!("target branch {target_ref} does not exist as a local branch");
+    }
+
+    // (2) Check out the local target branch in the worktree. The bare short
+    // name is what makes git attach HEAD to the branch (passing
+    // refs/heads/{name} would detach, so a successful merge would not advance
+    // refs/heads/{target}); step (1) guarantees the branch exists, so an
+    // attached checkout is the only acceptable outcome — verified right below.
     let wt = Command::new("git")
         .args(["worktree", "add", "_merge_worktree", target_branch])
         .current_dir(repo_path)
@@ -958,6 +988,22 @@ pub fn merge_branch(
             "git worktree add failed: {}",
             String::from_utf8_lossy(&wt.stderr)
         );
+    }
+
+    // The worktree's HEAD must be a symbolic ref to exactly refs/heads/{target}.
+    // A detached or differently-attached HEAD means git resolved the name as
+    // something other than the local target branch; a merge committed on it
+    // would be thrown away by cleanup, so refuse before merging rather than
+    // relying on any denylist of symbolic shapes.
+    let head_ref = Command::new("git")
+        .args(["symbolic-ref", "--quiet", "HEAD"])
+        .current_dir(&worktree_path)
+        .output()
+        .context("failed to run git symbolic-ref")?;
+    let head_ref_name = String::from_utf8_lossy(&head_ref.stdout).trim().to_string();
+    if !head_ref.status.success() || head_ref_name != target_ref {
+        remove_worktree();
+        bail!("merge worktree is not attached to {target_ref} (HEAD is {head_ref_name:?})");
     }
 
     // Run merge in worktree
@@ -983,11 +1029,7 @@ pub fn merge_branch(
     let success = merge.status.success();
 
     // Always remove worktree
-    let _ = Command::new("git")
-        .args(["worktree", "remove", "--force", "_merge_worktree"])
-        .current_dir(repo_path)
-        .output();
-    let _ = std::fs::remove_dir_all(&worktree_path);
+    remove_worktree();
 
     if !success {
         bail!(
@@ -996,12 +1038,24 @@ pub fn merge_branch(
         );
     }
 
-    // Get new HEAD of target branch
+    // (3) The merge only counts if the exact target ref now points at a commit.
+    // Plain `rev-parse` echoes an unresolvable token back on stdout with a
+    // nonzero exit status, so an unchecked call here would hand the literal
+    // string "refs/heads/{target}" upward as an apparently valid merge SHA and
+    // the caller would mark the PR merged and fire the webhook. --verify plus
+    // ^{commit} plus an explicit status check turn "target ref missing or not a
+    // commit" into a hard failure before any of that happens.
     let head = Command::new("git")
-        .args(["rev-parse", &format!("refs/heads/{target_branch}")])
+        .args(["rev-parse", "--verify", &format!("{target_ref}^{{commit}}")])
         .current_dir(repo_path)
         .output()
         .context("failed to get merge commit")?;
+    if !head.status.success() {
+        bail!(
+            "merge completed but {target_ref} does not resolve to a commit: {}",
+            String::from_utf8_lossy(&head.stderr)
+        );
+    }
 
     Ok(String::from_utf8_lossy(&head.stdout).trim().to_string())
 }
