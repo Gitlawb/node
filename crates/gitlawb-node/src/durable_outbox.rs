@@ -31,6 +31,13 @@ use std::collections::HashMap;
 /// The git all-zeros object id — the create/delete sentinel in a ref update.
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 
+/// `git reflog` stores committer timestamps in unix seconds; the
+/// reconcile gate passes the row's `created_at` as the floor below
+/// which a reflog entry cannot be the row's own transition. Subtract
+/// this slack so clock skew between the row's INSERT and the actual
+/// `git update-ref` does not cause a real transition to look stale.
+const REFLOG_FLOOR_SLACK_SECS: i64 = 5;
+
 /// Promote `prepared` rows whose `new_sha` matches the on-disk ref to
 /// `applied`, so the recovery drain (which only reads `state =
 /// 'applied'`) picks them up on the next pass. The reconcile runs at
@@ -207,6 +214,71 @@ async fn reconcile_prepared_page(
                     on_disk_sha = %on_disk,
                     is_deletion = is_deletion,
                     "reconcile: row's new_sha does not match on-disk ref; staying prepared"
+                );
+                continue;
+            }
+            // P1 (reviewer-1/2 round 4): SHA match is necessary but not
+            // sufficient. A later push that re-introduced the same SHA on
+            // the same ref, a deletion of an already-missing ref, or two
+            // requests deleting the same ref can ALL satisfy the SHA
+            // match under the wrong request's identity. The reflog is
+            // the durable, request-specific record: a reflog entry whose
+            // (old → new) tuple matches the row and whose timestamp is
+            // at-or-after the row's `created_at` is the only way to
+            // prove this transition produced the current on-disk state.
+            //
+            // The helper fails closed: a missing reflog, a malformed
+            // entry, or any `Err` from `git reflog show` becomes
+            // `Ok(false)`. The reconcile gate treats "no proof" as
+            // "stay prepared / uncertain for human-attended recovery",
+            // never as "promote".
+            let row_created_at = match DateTime::parse_from_rfc3339(&row.created_at) {
+                Ok(t) => t.with_timezone(&Utc) - chrono::Duration::seconds(REFLOG_FLOOR_SLACK_SECS),
+                Err(e) => {
+                    tracing::warn!(
+                        err = %e,
+                        row_id = %row.id,
+                        request_id = %row.request_id,
+                        ref_name = %row.ref_name,
+                        "reconcile: unparseable row created_at; staying prepared \
+                         (cannot prove request-specific transition)"
+                    );
+                    continue;
+                }
+            };
+            let has_proof = match crate::git::store::has_reflog_landing(
+                disk_path,
+                &row.ref_name,
+                &row.old_sha,
+                &row.new_sha,
+                row_created_at,
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        err = %e,
+                        row_id = %row.id,
+                        request_id = %row.request_id,
+                        ref_name = %row.ref_name,
+                        "reconcile: reflog probe failed; staying prepared (human-attended recovery)"
+                    );
+                    continue;
+                }
+            };
+            if !has_proof {
+                tracing::warn!(
+                    row_id = %row.id,
+                    request_id = %row.request_id,
+                    repo_id = %row.repo_id,
+                    ref_name = %row.ref_name,
+                    row_old_sha = %row.old_sha,
+                    row_new_sha = %row.new_sha,
+                    is_deletion = is_deletion,
+                    "reconcile: SHA match has no reflog proof; staying prepared. \
+                     This can mean (a) core.logAllRefUpdates is not `always` on this \
+                     repo's bare directory, (b) the row's transition did not actually \
+                     land, or (c) a later request re-introduced the same SHA. \
+                     Human-attended recovery required before any cert/anchor is issued."
                 );
                 continue;
             }
@@ -527,17 +599,28 @@ pub async fn drain_pending_ref_transitions_all(
             return Ok(total);
         }
     }
-    // One more pass to detect residual backlog. If this pass is also
-    // full, log a warning and return what we have; the next startup
-    // will continue the work.
-    let (residual_processed, residual_examined) =
+    // One more pass to detect residual backlog. If rows remain
+    // after the residual pass, log a warning and return what we
+    // have; the next startup will continue the work.
+    //
+    // P3 (reviewer-2 round 4): key the warning on the REMAINING
+    // count, not the examined count. A backlog of exactly
+    // `per_pass_limit * (max_passes + 1)` rows produces a full final
+    // page that consumes everything — `examined == per_pass_limit`
+    // is true but `remaining == 0`, and the previous logic fired the
+    // warning anyway. Operators treat this warning as the signal that
+    // rows are stranded; a false positive on a clean drain costs the
+    // signal its meaning.
+    let (residual_processed, _residual_examined) =
         drain_pending_ref_transitions(state.clone(), per_pass_limit).await?;
     total += residual_processed;
-    if (residual_examined as i64) >= per_pass_limit {
+    let remaining_after_residual = state.db.count_pending_ref_transitions_applied().await?;
+    if remaining_after_residual > 0 {
         tracing::warn!(
             total,
             max_passes,
             per_pass_limit,
+            remaining_after_residual,
             "drain backlog exceeds startup budget; residual rows will be picked up on next restart"
         );
     }
@@ -606,7 +689,14 @@ pub async fn derive_one(state: &AppState, row: &PendingRefTransition) -> anyhow:
     // `(repo_id, ref_name)` because the `cert_id` from
     // `ref_cert_id_for` is the same on both paths.
     let cert_id = crate::db::ref_cert_id_for(&row.request_id, &row.ref_name);
-    let _ = cert::issue_ref_certificate(
+    // P1 (reviewer-1 round 4): stamp the recovery cert with the
+    // row's `created_at` so a replay of A after a later live cert B
+    // cannot outrank B's fields in the
+    // `EXCLUDED.issued_at > ref_certificates.issued_at` upsert guard.
+    // The live handler uses `issue_ref_certificate` (no override),
+    // which keeps `Utc::now()` — for a live push the wall-clock IS
+    // the transition time.
+    let _ = cert::issue_ref_certificate_with_issued_at(
         state,
         &row.repo_id,
         &row.ref_name,
@@ -614,6 +704,7 @@ pub async fn derive_one(state: &AppState, row: &PendingRefTransition) -> anyhow:
         &row.new_sha,
         &row.pusher_did,
         &cert_id,
+        Some(row.created_at.clone()),
     )
     .await?;
 
@@ -2293,5 +2384,122 @@ mod drain_tests {
         // populated. The monotonic `issued_at > stale_issued` is what
         // the upsert's CASE WHEN checks.
         assert!(!cert.issued_at.is_empty(), "issued_at populated");
+    }
+
+    // ----- P1 round 4: A → B → restart replay test -----
+    //
+    // The reviewer's invariant: a recovery replay of A's row after a
+    // later live cert B has been written must NOT overwrite B's
+    // fields. Without `issued_at_override`, the recovery's
+    // `Utc::now()` is later than B's live `Utc::now()` (because the
+    // replay happens after B's live write), and the
+    // `EXCLUDED.issued_at > ref_certificates.issued_at` upsert guard
+    // would let A's stale transition clobber B's fresh cert.
+    //
+    // The fix stamps the recovery cert's `issued_at` with the row's
+    // `created_at`, which carries the original transition time and
+    // is earlier than B's `Utc::now()`. This test pins that the
+    // replay does not outrank B.
+    #[sqlx::test]
+    async fn replay_of_stale_row_does_not_overwrite_live_cert_b(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let owner_did = "did:key:z6Mkreplay";
+        let rec = crate::db::RepoRecord {
+            id: "repo-replay".to_string(),
+            name: "replay".to_string(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            disk_path: "/tmp/replay".to_string(),
+            forked_from: None,
+            machine_id: None,
+        };
+        state.db.create_repo(&rec).await.unwrap();
+
+        // A: original push, recovery row still `applied`.
+        let a_old = "0".repeat(40);
+        let a_new = "1".repeat(40);
+        let a_pusher = "did:key:zA";
+        let a_request = "req-A";
+        let mut a_row = make_row(&rec.id, "refs/heads/main", &a_old, &a_new);
+        a_row.request_id = a_request.to_string();
+        a_row.pusher_did = a_pusher.to_string();
+        a_row.first_ref_name = "refs/heads/main".to_string();
+        a_row.id = crate::db::deterministic_id(&[
+            "pending_ref_transition",
+            &a_row.request_id,
+            &a_row.repo_id,
+            &a_row.ref_name,
+            &a_row.old_sha,
+            &a_row.new_sha,
+        ]);
+        // Backdate A's created_at by 5 minutes so the replay's
+        // stamped `issued_at` is provably older than B's live one.
+        a_row.created_at = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&a_row)
+            .await
+            .unwrap();
+
+        // A's cert was written live (or never — we test the case
+        // where the row was left `applied` and the cert was NOT
+        // yet written, then B's live push arrives first and writes
+        // its cert, then A's drain replays).
+        //
+        // Simulate: the live cert B has been written by a later
+        // push.
+        let b_old = a_new.clone();
+        let b_new = "2".repeat(40);
+        let b_pusher = "did:key:zB";
+        let b_cert_id =
+            crate::db::ref_cert_id_for(&rec.id, "refs/heads/main"); // live path's id (no request_id)
+        state
+            .db
+            .insert_ref_certificate(&crate::db::RefCertificate {
+                id: b_cert_id.clone(),
+                repo_id: rec.id.clone(),
+                ref_name: "refs/heads/main".to_string(),
+                old_sha: b_old.clone(),
+                new_sha: b_new.clone(),
+                pusher_did: b_pusher.to_string(),
+                node_did: state.node_did.to_string(),
+                signature: "b-live-signature".to_string(),
+                issued_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .unwrap();
+
+        // Drain A's replay. The upsert sees A's `issued_at` (A's
+        // created_at = now-5min) is OLDER than B's cert (now), so
+        // the per-column CASE WHEN guards must NOT update B's
+        // fields.
+        let (processed, examined) =
+            drain_pending_ref_transitions(state.clone(), 100).await.unwrap();
+        assert_eq!(processed, 1, "A's row was drained");
+        assert_eq!(examined, 1, "the loop examined A's row");
+
+        let certs = state.db.list_ref_certificates(&rec.id, 10).await.unwrap();
+        assert_eq!(certs.len(), 1, "exactly one cert row remains");
+        let cert = &certs[0];
+        assert_eq!(
+            cert.old_sha, b_old,
+            "old_sha stays at B's; A's replay (now-5min) must not outrank B's (now)"
+        );
+        assert_eq!(
+            cert.new_sha, b_new,
+            "new_sha stays at B's; A's replay must not outrank B's"
+        );
+        assert_eq!(
+            cert.pusher_did, b_pusher,
+            "pusher stays at B's; A's replay must not outrank B's"
+        );
+        assert_eq!(
+            cert.signature, "b-live-signature",
+            "signature stays at B's live signature; A's replay must not outrank B's"
+        );
     }
 }

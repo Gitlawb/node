@@ -2780,7 +2780,7 @@ impl Db {
     /// Flip every `prepared` row attached to `request_id` to `cancelled`.
     /// Called when the receive_pack call returns Err or the handler
     /// future is dropped. The drain does not promote `cancelled` rows.
-    #[allow(dead_code)] // wired by the handler refactor in the next slice
+    #[allow(dead_code)]
     pub async fn mark_pending_ref_transitions_cancelled(&self, request_id: &str) -> Result<u64> {
         let now = Utc::now().to_rfc3339();
         let res = sqlx::query(
@@ -2795,6 +2795,114 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected())
+    }
+
+    /// Per-ref variant of [`mark_pending_ref_transitions_applied`]:
+    /// flip to `applied` only the rows whose `ref_name` is in
+    /// `ref_names`. Used by the live handler when the report-status
+    /// confirms per-ref `ok` results — refs the report rejected or
+    /// did not mention are left alone so the next call can flip them
+    /// to `cancelled` / `uncertain` independently.
+    #[allow(dead_code)]
+    pub async fn mark_pending_ref_transitions_applied_for_names(
+        &self,
+        request_id: &str,
+        ref_names: &[&str],
+    ) -> Result<u64> {
+        if ref_names.is_empty() {
+            return Ok(0);
+        }
+        let now = Utc::now().to_rfc3339();
+        let res = sqlx::query(
+            r#"UPDATE pending_ref_transitions
+               SET state = $1, applied_at = $2
+               WHERE request_id = $3 AND state = $4 AND ref_name = ANY($5)"#,
+        )
+        .bind(pending_state::APPLIED)
+        .bind(&now)
+        .bind(request_id)
+        .bind(pending_state::PREPARED)
+        .bind(ref_names)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Per-ref variant of [`mark_pending_ref_transitions_cancelled`]:
+    /// flip to `cancelled` only the rows whose `ref_name` is in
+    /// `ref_names`. Used by the live handler to mark specifically the
+    /// refs that the report-status listed as `ng` so their durable
+    /// effects are skipped.
+    #[allow(dead_code)]
+    pub async fn mark_pending_ref_transitions_cancelled_for_names(
+        &self,
+        request_id: &str,
+        ref_names: &[&str],
+    ) -> Result<u64> {
+        if ref_names.is_empty() {
+            return Ok(0);
+        }
+        let now = Utc::now().to_rfc3339();
+        let res = sqlx::query(
+            r#"UPDATE pending_ref_transitions
+               SET state = $1, cancelled_at = $2
+               WHERE request_id = $3 AND state = $4 AND ref_name = ANY($5)"#,
+        )
+        .bind(pending_state::CANCELLED)
+        .bind(&now)
+        .bind(request_id)
+        .bind(pending_state::PREPARED)
+        .bind(ref_names)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Per-ref variant of [`mark_pending_ref_transitions_uncertain`]:
+    /// flip to `uncertain` only the rows whose `ref_name` is in
+    /// `ref_names`. Used by the live handler for refs that are not
+    /// mentioned in the report-status output and need reconcile to
+    /// sort out which actually landed.
+    #[allow(dead_code)]
+    pub async fn mark_pending_ref_transitions_uncertain_for_names(
+        &self,
+        request_id: &str,
+        ref_names: &[&str],
+    ) -> Result<u64> {
+        if ref_names.is_empty() {
+            return Ok(0);
+        }
+        // P2 (reviewer-2 round 4): `cancelled_at` is reserved for rows
+        // that were *decided* not to land. An uncertain row is by
+        // definition undecided, so leave `cancelled_at` null and let
+        // any audit reason about it from `created_at`.
+        let res = sqlx::query(
+            r#"UPDATE pending_ref_transitions
+               SET state = $1
+               WHERE request_id = $2 AND state IN ($3, $4) AND ref_name = ANY($5)"#,
+        )
+        .bind(pending_state::UNCERTAIN)
+        .bind(request_id)
+        .bind(pending_state::PREPARED)
+        .bind(pending_state::APPLIED)
+        .bind(ref_names)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Count the `applied` rows remaining in the table. Used by the
+    /// startup drain to decide whether the residual pass has work
+    /// left or whether the backlog was fully consumed.
+    #[allow(dead_code)]
+    pub async fn count_pending_ref_transitions_applied(&self) -> Result<i64> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS cnt FROM pending_ref_transitions WHERE state = $1",
+        )
+        .bind(pending_state::APPLIED)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("cnt"))
     }
 
     /// Return every `applied` row, oldest first. The startup drain calls
@@ -2970,6 +3078,29 @@ impl Db {
         Ok(res.rows_affected())
     }
 
+    /// Look up the deterministic `id` of a `pending_ref_transitions`
+    /// row by `(request_id, ref_name)`. Returns `Ok(None)` if no
+    /// such row exists (e.g. a ref that the report-status excluded
+    /// from the durable effects). The live handler uses this to
+    /// target per-ref cleanup after effects land so it can delete
+    /// only the rows whose required writes succeeded.
+    #[allow(dead_code)]
+    pub async fn lookup_pending_ref_transition_id(
+        &self,
+        request_id: &str,
+        ref_name: &str,
+    ) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT id FROM pending_ref_transitions
+             WHERE request_id = $1 AND ref_name = $2",
+        )
+        .bind(request_id)
+        .bind(ref_name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get::<String, _>("id")))
+    }
+
     /// Delete every `applied` or `uncertain` row for a `request_id`.
     /// Called by the live handler AFTER the push event, cert, and anchor
     /// job writes have all succeeded. This removes the outbox row once
@@ -2995,16 +3126,21 @@ impl Db {
     /// Called when receive-pack returns Err but the exit was non-zero or
     /// timed out, meaning some refs may have landed before the failure.
     /// The reconcile step checks these rows against disk at startup.
+    ///
+    /// P2 (reviewer-2 round 4): do NOT set `cancelled_at` on an
+    /// `uncertain` row — `cancelled_at` is reserved for transitions
+    /// that were *decided* not to land. An uncertain row is, by
+    /// definition, undecided; leaving the column null means any
+    /// future consumer filtering on `cancelled_at IS NOT NULL` sees
+    /// only the truly-cancelled rows.
     #[allow(dead_code)]
     pub async fn mark_pending_ref_transitions_uncertain(&self, request_id: &str) -> Result<u64> {
-        let now = Utc::now().to_rfc3339();
         let res = sqlx::query(
             r#"UPDATE pending_ref_transitions
-               SET state = $1, cancelled_at = $2
-               WHERE request_id = $3 AND state = $4"#,
+               SET state = $1
+               WHERE request_id = $2 AND state = $3"#,
         )
         .bind(pending_state::UNCERTAIN)
-        .bind(&now)
         .bind(request_id)
         .bind(pending_state::PREPARED)
         .execute(&self.pool)
@@ -9887,6 +10023,180 @@ mod pending_ref_transition_tests {
                 .unwrap(),
             0
         );
+    }
+
+    // ----- P1 round 4: per-ref variant tests -----
+    //
+    // The new per-ref helpers are the foundation of the
+    // ref-by-ref outcome model. A mixed push where one ref was
+    // rejected and one was accepted must:
+    //   1. flip ONLY the accepted ref to `applied`
+    //   2. flip ONLY the rejected ref to `cancelled`
+    //   3. leave any ref the report did not mention as `prepared`
+    // The bulk helpers were the bug that issued certs for the
+    // rejected ref; the per-ref helpers are the fix.
+
+    #[sqlx::test]
+    async fn per_ref_applied_only_flips_named_refs(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_pending_ref_transitions(
+            "req-per-ref-1",
+            "repo-1",
+            "did:key:node",
+            "did:key:pusher",
+            &[
+                ref_update("refs/heads/main", &"a".repeat(40), &"b".repeat(40)),
+                ref_update("refs/heads/feature", &"c".repeat(40), &"d".repeat(40)),
+                ref_update("refs/tags/v1", &"e".repeat(40), &"f".repeat(40)),
+            ],
+            "Signature: sig=...",
+            "Signature-Input: ...",
+            "Content-Digest: ...",
+            "refs/heads/main",
+        )
+        .await
+        .unwrap();
+
+        // Flip only `main` and `feature` (the OK refs); the
+        // tag stays `prepared` for the next call to handle.
+        let n = db
+            .mark_pending_ref_transitions_applied_for_names(
+                "req-per-ref-1",
+                &["refs/heads/main", "refs/heads/feature"],
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 2, "exactly the two named rows flip");
+
+        // The tag row is still `prepared`.
+        let applied = db.list_pending_ref_transitions_applied(100).await.unwrap();
+        assert_eq!(applied.len(), 2, "two rows in applied");
+        let names: std::collections::HashSet<&str> =
+            applied.iter().map(|r| r.ref_name.as_str()).collect();
+        assert!(names.contains("refs/heads/main"));
+        assert!(names.contains("refs/heads/feature"));
+        assert!(!names.contains("refs/tags/v1"));
+    }
+
+    #[sqlx::test]
+    async fn per_ref_cancelled_only_flips_named_refs(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_pending_ref_transitions(
+            "req-per-ref-2",
+            "repo-1",
+            "did:key:node",
+            "did:key:pusher",
+            &[
+                ref_update("refs/heads/main", &"a".repeat(40), &"b".repeat(40)),
+                ref_update("refs/heads/feature", &"c".repeat(40), &"d".repeat(40)),
+            ],
+            "Signature: sig=...",
+            "Signature-Input: ...",
+            "Content-Digest: ...",
+            "refs/heads/main",
+        )
+        .await
+        .unwrap();
+        // The report rejected only `main`.
+        let n = db
+            .mark_pending_ref_transitions_cancelled_for_names(
+                "req-per-ref-2",
+                &["refs/heads/main"],
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "only the rejected ref flips");
+        let still_prepared = db.list_pending_ref_transitions_prepared(100).await.unwrap();
+        assert_eq!(still_prepared.len(), 1);
+        assert_eq!(still_prepared[0].ref_name, "refs/heads/feature");
+    }
+
+    #[sqlx::test]
+    async fn per_ref_uncertain_does_not_set_cancelled_at(pool: PgPool) {
+        // P2 (reviewer-2 round 4): `mark_uncertain` must NOT set
+        // `cancelled_at`. An `uncertain` row is undecided and
+        // should leave the column null so any future consumer
+        // filtering on `cancelled_at IS NOT NULL` only sees
+        // truly-cancelled rows.
+        let db = db(pool).await;
+        db.insert_pending_ref_transitions(
+            "req-uncertain-test",
+            "repo-1",
+            "did:key:node",
+            "did:key:pusher",
+            &[ref_update("refs/heads/main", &"a".repeat(40), &"b".repeat(40))],
+            "Signature: sig=...",
+            "Signature-Input: ...",
+            "Content-Digest: ...",
+            "refs/heads/main",
+        )
+        .await
+        .unwrap();
+        let n = db
+            .mark_pending_ref_transitions_uncertain("req-uncertain-test")
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let rows = db
+            .list_pending_ref_transitions_prepared_or_uncertain(10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, pending_state::UNCERTAIN);
+        assert!(
+            rows[0].cancelled_at.is_none(),
+            "uncertain row must leave cancelled_at null"
+        );
+    }
+
+    #[sqlx::test]
+    async fn lookup_pending_ref_transition_id_returns_named_ref(
+        pool: PgPool,
+    ) {
+        // P1 (reviewer-1 round 4): the per-ref cleanup loop needs
+        // to map (request_id, ref_name) → row_id. Verify the
+        // lookup returns the correct id for the ref it was
+        // inserted with, and `None` for an absent one.
+        let db = db(pool).await;
+        db.insert_pending_ref_transitions(
+            "req-lookup",
+            "repo-1",
+            "did:key:node",
+            "did:key:pusher",
+            &[
+                ref_update("refs/heads/main", &"a".repeat(40), &"b".repeat(40)),
+                ref_update("refs/heads/feature", &"c".repeat(40), &"d".repeat(40)),
+            ],
+            "Signature: sig=...",
+            "Signature-Input: ...",
+            "Content-Digest: ...",
+            "refs/heads/main",
+        )
+        .await
+        .unwrap();
+        let main_id = db
+            .lookup_pending_ref_transition_id("req-lookup", "refs/heads/main")
+            .await
+            .unwrap();
+        assert!(main_id.is_some(), "main row id is present");
+        let absent = db
+            .lookup_pending_ref_transition_id("req-lookup", "refs/heads/never")
+            .await
+            .unwrap();
+        assert!(absent.is_none(), "absent ref returns None");
+    }
+
+    #[sqlx::test]
+    async fn count_pending_ref_transitions_applied_reports_zero_after_drain(
+        pool: PgPool,
+    ) {
+        // P3 (reviewer-2 round 4): the residual-backlog warning
+        // key on REMAINING, not on EXAMINED. A backlog of exactly
+        // `per_pass_limit * (max_passes + 1)` rows that fully
+        // drains must report `remaining == 0` so the warning does
+        // not fire on a clean drain.
+        let db = db(pool).await;
+        assert_eq!(db.count_pending_ref_transitions_applied().await.unwrap(), 0);
     }
 
     /// P2 (reviewer-2 round 2): the multi-row `insert_pending_ref_transitions`

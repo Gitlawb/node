@@ -2367,125 +2367,182 @@ pub async fn git_receive_pack(
         }
     };
 
-    // Parse the report-status to determine per-ref ok/ng results.
-    // If the output cannot be parsed (e.g. client didn't request
-    // report-status), treat all refs as uncertain.
+    // P1 (reviewer-1/2 round 4): complete the per-ref outcome
+    // model. The previous `all_refs_ok` ignored `unpack_ok` and
+    // treated an absent report as success, then ran the durable
+    // effects loop unconditionally. A mixed push where one ref is
+    // rejected still issued a signed certificate, an anchor job, a
+    // push event, a trust-score bump, and a webhook for the rejected
+    // ref. Git can report `unpack ok / ng refs/heads/main` on a
+    // zero exit (a non-fast-forward, a hook denial), and that path
+    // is exactly the one the previous logic missed.
+    //
+    // Build the set of ref names that the report-status proves
+    // landed. Every ref update the handler intended to land gets a
+    // fate:
+    //   - in `ok_set`           → row goes to `applied`, effects fire
+    //   - in `report` but ng    → row goes to `cancelled`, no effects
+    //   - not in `report` at all → row goes to `uncertain` for reconcile
+    //
+    // If `unpack_ok == false`, no ref could have landed — all rows
+    // become `cancelled` and no effects fire for any ref.
+    //
+    // If the report is unparseable (client did not request
+    // report-status, or framing was malformed), every row becomes
+    // `uncertain` so the on-disk reflog proof can sort out which
+    // ones actually landed at the next startup.
     let report = smart_http::parse_report_status(&receive_raw);
-    let all_refs_ok = exit_ok
-        && report
-            .as_ref()
-            .is_none_or(|(_, results)| results.iter().all(|(_, ok)| *ok));
 
-    if all_refs_ok {
-        // All refs landed. Mark outbox rows as applied so the drain
-        // can pick them up if the effects write below fails partway.
+    let (unpack_ok, all_in_report_ok, ok_set, request_failed) = match &report {
+        Some((unpack_ok, ref_results)) => {
+            let ok_set: std::collections::HashSet<&str> = ref_results
+                .iter()
+                .filter(|(_, ok)| *ok)
+                .map(|(name, _)| name.as_str())
+                .collect();
+            let all_in_report_ok = ref_results.iter().all(|(_, ok)| *ok);
+            (*unpack_ok, all_in_report_ok, ok_set, !exit_ok)
+        }
+        None => {
+            // No report available — every ref's fate is uncertain.
+            let ok_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            (false, true, ok_set, !exit_ok)
+        }
+    };
+
+    // Per-ref state flip. Rows go to `applied`, `cancelled`, or
+    // `uncertain` based on the report. The previous bulk helper
+    // `mark_pending_ref_transitions_applied(request_id)` marked
+    // EVERY row `applied` regardless of which refs git actually
+    // accepted — that is the bug that issued certs for rejected
+    // refs.
+    let pending_ref_names: Vec<&str> = ref_updates.iter().map(|u| u.ref_name.as_str()).collect();
+
+    if !unpack_ok && report.is_some() {
+        // Unpack failed explicitly — every row is proven not to have
+        // landed. Mark all prepared rows for this request as
+        // `cancelled` (the only state from which reconcile and drain
+        // both refuse to promote). The drain will not pick these up;
+        // the next startup's reconcile will not promote them.
         if let Err(e) = state
             .db
-            .mark_pending_ref_transitions_applied(&request_id)
+            .mark_pending_ref_transitions_cancelled_for_names(
+                &request_id,
+                &pending_ref_names,
+            )
             .await
         {
-            tracing::error!(
+            tracing::warn!(
                 err = %e,
                 request_id = %request_id,
                 repo = %name,
-                "failed to mark pending ref transitions applied; recovery will re-derive"
+                "failed to mark pending ref transitions cancelled (unpack fail)"
             );
         }
-    } else {
-        // P1 (reviewer-1/2 round 3): receive-pack returned non-zero or
-        // the report-status shows per-ref rejections. Mark all
-        // `prepared` rows as `uncertain` — the reconcile step at
-        // startup will check each row against on-disk refs and promote
-        // only those that actually landed. This preserves recovery for
-        // refs that DID land (a timeout or non-zero exit is not proof
-        // that no ref was committed), while the `cancelled` state
-        // (which reconcile and drain both skip) is reserved for refs
-        // that can be PROVEN not to have landed.
-        if let Some((unpack_ok, ref_results)) = &report {
-            if !unpack_ok {
-                // Unpack failed — no refs could have landed. Safe to
-                // cancel all rows immediately.
-                tracing::warn!(
-                    request_id = %request_id,
-                    repo = %name,
-                    "git report-status: unpack failed; all refs rejected"
-                );
-                if let Err(e) = state
-                    .db
-                    .mark_pending_ref_transitions_cancelled(&request_id)
-                    .await
-                {
-                    tracing::warn!(
-                        err = %e,
-                        request_id = %request_id,
-                        repo = %name,
-                        "failed to mark pending ref transitions cancelled"
-                    );
-                }
+    } else if report.is_some() {
+        // Report parsed. Split rows by per-ref ok/ng, with anything
+        // NOT in the report (defensive: report is a subset of the
+        // pushed refs in some edge cases) falling to `uncertain`.
+        let mut ok_names: Vec<&str> = Vec::new();
+        let mut ng_names: Vec<&str> = Vec::new();
+        let mut unmentioned: Vec<&str> = Vec::new();
+        let reported: std::collections::HashSet<&str> = report
+            .as_ref()
+            .map(|(_, rs)| rs.iter().map(|(n, _)| n.as_str()).collect())
+            .unwrap_or_default();
+        for name in &pending_ref_names {
+            if !reported.contains(name) {
+                unmentioned.push(*name);
+            } else if ok_set.contains(name) {
+                ok_names.push(*name);
             } else {
-                // Unpack succeeded but some refs were rejected. The
-                // rejected refs are proven not to have landed; mark
-                // them cancelled. The refs not in the report are
-                // uncertain — mark them uncertain for reconcile.
-                let rejected: Vec<&str> = ref_results
-                    .iter()
-                    .filter(|(_, ok)| !ok)
-                    .map(|(name, _)| name.as_str())
-                    .collect();
-                tracing::warn!(
-                    request_id = %request_id,
-                    repo = %name,
-                    rejected_refs = ?rejected,
-                    "git report-status: some refs rejected"
-                );
-                // For now, mark all as uncertain. The drain is
-                // idempotent (ON CONFLICT DO NOTHING), so a ref that
-                // didn't land will produce no artifacts. A more precise
-                // approach would split rows by per-ref status, but the
-                // age-bounded reconcile + idempotent drain already
-                // provides the correct recovery semantics.
-                if let Err(e) = state
-                    .db
-                    .mark_pending_ref_transitions_uncertain(&request_id)
-                    .await
-                {
-                    tracing::warn!(
-                        err = %e,
-                        request_id = %request_id,
-                        repo = %name,
-                        "failed to mark pending ref transitions uncertain"
-                    );
-                }
+                ng_names.push(*name);
             }
-        } else {
-            // Cannot parse report-status. Mark all as uncertain for
-            // reconcile to sort out at startup.
+        }
+        if !ng_names.is_empty() {
             tracing::warn!(
                 request_id = %request_id,
                 repo = %name,
-                "could not parse git report-status; marking all refs uncertain"
+                rejected_refs = ?ng_names,
+                "git report-status: some refs rejected; durable effects will skip them"
             );
+        }
+        if !ok_names.is_empty() {
             if let Err(e) = state
                 .db
-                .mark_pending_ref_transitions_uncertain(&request_id)
+                .mark_pending_ref_transitions_applied_for_names(
+                    &request_id,
+                    &ok_names,
+                )
+                .await
+            {
+                tracing::error!(
+                    err = %e,
+                    request_id = %request_id,
+                    repo = %name,
+                    "failed to mark pending ref transitions applied; recovery will re-derive"
+                );
+            }
+        }
+        if !ng_names.is_empty() {
+            if let Err(e) = state
+                .db
+                .mark_pending_ref_transitions_cancelled_for_names(
+                    &request_id,
+                    &ng_names,
+                )
                 .await
             {
                 tracing::warn!(
                     err = %e,
                     request_id = %request_id,
                     repo = %name,
-                    "failed to mark pending ref transitions uncertain"
+                    "failed to mark pending ref transitions cancelled (per-ref ng)"
                 );
             }
+        }
+        if !unmentioned.is_empty() {
+            if let Err(e) = state
+                .db
+                .mark_pending_ref_transitions_uncertain_for_names(
+                    &request_id,
+                    &unmentioned,
+                )
+                .await
+            {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    repo = %name,
+                    "failed to mark pending ref transitions uncertain (unmentioned in report)"
+                );
+            }
+        }
+    } else {
+        // No report at all — every ref's fate is uncertain. The
+        // next startup reconcile will use the reflog proof to
+        // promote only those whose transition actually landed.
+        if let Err(e) = state
+            .db
+            .mark_pending_ref_transitions_uncertain(&request_id)
+            .await
+        {
+            tracing::warn!(
+                err = %e,
+                request_id = %request_id,
+                repo = %name,
+                "failed to mark pending ref transitions uncertain (no report)"
+            );
         }
     }
 
     // On non-zero exit, return an error to the caller. The outbox
-    // rows have already been handled above (marked uncertain/cancelled
-    // based on report-status). This preserves backward compatibility
-    // with callers that expect an error on non-zero git exit.
-    if !exit_ok {
-        // Release the guard before returning the error.
+    // rows have already been handled above (per-ref fates applied).
+    // The client-visible body does NOT include wire-supplied ref
+    // names — ref names can carry control bytes and the previous
+    // `format!("refs rejected: {rejected:?}")` embedded them in a
+    // 500 response. Server-side the names are logged above.
+    if request_failed {
         let reclaimed = guard
             .lock()
             .expect("repo write-lock mutex poisoned")
@@ -2494,23 +2551,14 @@ pub async fn git_receive_pack(
         reclaimed.release(false).await;
         drop(lease);
 
-        let stderr_msg = if let Some((unpack_ok, ref_results)) = &report {
-            if !*unpack_ok {
-                "unpack failed".to_string()
-            } else {
-                let rejected: Vec<&str> = ref_results
-                    .iter()
-                    .filter(|(_, ok)| !ok)
-                    .map(|(name, _)| name.as_str())
-                    .collect();
-                format!("refs rejected: {rejected:?}")
-            }
+        let body_msg = if !unpack_ok {
+            "git-receive-pack failed: unpack failed"
+        } else if !all_in_report_ok {
+            "git-receive-pack failed: refs rejected"
         } else {
-            "git-receive-pack failed".to_string()
+            "git-receive-pack failed"
         };
-        return Err(AppError::Git(format!(
-            "git-receive-pack failed: {stderr_msg}"
-        )));
+        return Err(AppError::Git(body_msg.to_string()));
     }
 
     // #174 F2/U5: the post-receive replication tail runs in an independently owned
@@ -2555,15 +2603,38 @@ pub async fn git_receive_pack(
     // The alternative, detaching `release` and the tail together to keep the ordering,
     // would return 200 to the pusher before the durable copy lands, which is a larger
     // change to the client contract than the window it closes.
-    let push_succeeded = all_refs_ok;
+    // P1 (reviewer-1/2 round 4): the durable effects only fire for
+    // refs the report-status proves landed. The previous code ran
+    // them unconditionally once past the `!exit_ok` return, so a
+    // `unpack ok / ng refs/heads/main` zero-exit push still signed
+    // a cert and queued an anchor for the rejected ref.
+    //
+    // `push_succeeded` is the request-level signal for the
+    // replication tail and the lock release. `any_ref_ok` is the
+    // request-scoped effects gate (push event, trust score,
+    // metrics): at least one ref must have landed for those to be
+    // meaningful.
+    let any_ref_ok = !ok_set.is_empty();
+    let push_succeeded = exit_ok && any_ref_ok;
+
     if push_succeeded {
-        tokio::spawn(post_receive_replication_tail(
-            state.clone(),
-            record.clone(),
-            ref_updates.clone(),
-            disk_path.clone(),
-            auth.0.to_string(),
-        ));
+        // Spawn the replication tail only for refs that landed.
+        // Filtering at spawn-time keeps the tail's input accurate
+        // even for a mixed push.
+        let landed_refs: Vec<RefUpdate> = ref_updates
+            .iter()
+            .filter(|u| ok_set.contains(u.ref_name.as_str()))
+            .cloned()
+            .collect();
+        if !landed_refs.is_empty() {
+            tokio::spawn(post_receive_replication_tail(
+                state.clone(),
+                record.clone(),
+                landed_refs,
+                disk_path.clone(),
+                auth.0.to_string(),
+            ));
+        }
     }
 
     // Always release the advisory lock — even on error — to prevent stale locks
@@ -2586,15 +2657,28 @@ pub async fn git_receive_pack(
     // the disconnect path this line is never reached: clone (a) rides the reaper (F3).
     drop(lease);
 
-    // The error path for receive_pack is handled above (in the
-    // `match smart_http::receive_pack_raw(...)` block). If we reach
-    // here, all refs landed successfully (all_refs_ok == true).
+    // If no ref landed, return 200 with the receive-pack body but do
+    // NOT run any durable effects (no push event, no trust score,
+    // no metrics, no webhooks, no certs, no anchor jobs). The
+    // outbox rows have already been flipped to `cancelled` /
+    // `uncertain` for every ref above; the next startup reconcile
+    // will not promote them.
+    if !any_ref_ok {
+        return axum::response::Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .header("Content-Type", "application/x-git-receive-pack-result")
+            .header("Cache-Control", "no-cache")
+            .body(axum::body::Body::from(receive_raw))
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to build response: {e}")));
+    }
 
-    // Update the repo's updated_at timestamp after a successful push
+    // Request-scoped effects. These run when at least one ref
+    // landed; the per-ref certs and anchor jobs below gate further
+    // on `ok_set` membership. A mixed push where one ref was
+    // rejected still gets the push event and trust score (one or
+    // more refs DID land) but the rejected ref has no cert, no
+    // anchor, and no webhook.
     let _ = state.db.touch_repo(&record.id).await;
-
-    // Record the successful push for metrics. The body has already been
-    // consumed by smart_http::receive_pack so we observe size up front.
     crate::metrics::record_push(&record.id);
     crate::metrics::observe_pack_size(body_len as f64);
 
@@ -2608,26 +2692,38 @@ pub async fn git_receive_pack(
     // produces the same primary keys and the idempotent inserts collapse.
     let did = auth.0.as_str();
     {
-        // Use the first new commit hash we parsed, fall back to timestamp
-        let commit_hash = ref_updates
-            .first()
-            .map(|u| u.new_sha.clone())
-            .unwrap_or_else(|| Utc::now().timestamp().to_string());
-
-        // The push event is keyed on the FIRST ref's name so a
-        // multi-ref push collapses to one push event row, not N. The
-        // deterministic id is the same one the recovery drain
-        // derives, because the drain reads `first_ref_name` from the
-        // outbox row (persisted above on every row of this request) and
-        // uses it in the same `push_event_id_for` call. The outer
-        // `first_ref_name` local was hoisted above the
-        // `insert_pending_ref_transitions` call so this id matches
-        // the persisted value exactly.
+        // P1 (reviewer-1 round 4): the request-scoped push event
+        // uses the FIRST OK ref's `new_sha` as `commit_hash`, NOT
+        // `ref_updates.first()`. The previous code used the first
+        // requested ref regardless of whether it landed, so a
+        // mixed push with a rejected first ref recorded a
+        // `commit_hash` for a SHA that does not exist. Using the
+        // first OK ref's new_sha keeps the push event's
+        // `commit_hash` truthful; if every ref was rejected we
+        // already returned above (`any_ref_ok` is false).
+        let first_ok_update = ref_updates
+            .iter()
+            .find(|u| ok_set.contains(u.ref_name.as_str()));
+        let commit_hash = match first_ok_update {
+            Some(u) => u.new_sha.clone(),
+            None => Utc::now().timestamp().to_string(),
+        };
+        // `first_ref_name` for the deterministic push event id
+        // stays the request's first ref name (the same key the
+        // drain uses); the commit_hash is what changes.
         let push_event_id = crate::db::push_event_id_for(&request_id, &first_ref_name);
-        let _ = state
+        if let Err(e) = state
             .db
             .record_push_with_id(&push_event_id, did, &record.id, &commit_hash, 0)
-            .await;
+            .await
+        {
+            tracing::warn!(
+                err = %e,
+                request_id = %request_id,
+                repo = %name,
+                "failed to record push event; recovery will re-derive (idempotent)"
+            );
+        }
         if let Ok(push_count) = state.db.get_push_count(did).await {
             // 0.05 base (from registration) + 0.05 per push, capped at 1.0
             // 1 push → 0.10, 5 pushes → 0.30, 19 pushes → 1.0
@@ -2635,28 +2731,22 @@ pub async fn git_receive_pack(
             let _ = state.db.update_trust_score(did, new_score).await;
         }
 
-        // Issue a signed certificate for every ref this push advanced, each
-        // carrying that ref's real old→new transition. A multi-ref push must
-        // not collapse to a single cert covering only the first ref.
-        //
-        // P1-B: this routes through `issue_ref_certificate` (the
-        // upsert, `ON CONFLICT (repo_id, ref_name) DO UPDATE`) so a
-        // re-push to the same ref updates the row's
-        // `old_sha` / `new_sha` / `pusher_did` / `issued_at` /
-        // `signature` to the new transition while preserving the
-        // original `id` (the `insert_ref_certificate` upsert's
-        // `EXCLUDED.issued_at > ref_certificates.issued_at` guard).
-        // The previous `issue_ref_certificate_idempotent` call
-        // (DO NOTHING) left the first cert's fields frozen on every
-        // later push. The deterministic `cert_id` makes a recovery
-        // re-pass safe: the recovery's `insert_ref_certificate_idempotent`
-        // (DO NOTHING) is a no-op when the live handler has already
-        // written a row, and the live handler's upsert preserves the
-        // original `id` so the deterministic id survives across the
-        // push / recovery / re-push cycle.
+        // Per-ref durable effects. Each ref's cert + anchor writes
+        // are gated on `ok_set` membership — the rejected ref gets
+        // neither. Track per-ref success so the cleanup at the end
+        // only deletes outbox rows whose required writes all
+        // succeeded; a transient cert failure leaves the row in
+        // `applied` for the startup drain to recover.
+        let mut ok_ref_ids: Vec<String> = Vec::new();
         for update in &ref_updates {
+            // Skip refs the report-status rejected. Their rows are
+            // already `cancelled` from the per-ref state flip
+            // above.
+            if !ok_set.contains(update.ref_name.as_str()) {
+                continue;
+            }
             let cert_id = crate::db::ref_cert_id_for(&request_id, &update.ref_name);
-            match cert::issue_ref_certificate(
+            let cert_result = cert::issue_ref_certificate(
                 &state,
                 &record.id,
                 &update.ref_name,
@@ -2665,20 +2755,23 @@ pub async fn git_receive_pack(
                 did,
                 &cert_id,
             )
-            .await
-            {
+            .await;
+            let cert_ok = match &cert_result {
                 Ok(c) => {
-                    tracing::info!(cert_id = %c.id, repo = %record.name, ref_name = %update.ref_name, pusher = %did, "issued ref certificate")
+                    tracing::info!(cert_id = %c.id, repo = %record.name, ref_name = %update.ref_name, pusher = %did, "issued ref certificate");
+                    true
                 }
                 Err(e) => {
-                    tracing::warn!(err = %e, ref_name = %update.ref_name, "failed to issue ref certificate")
+                    tracing::warn!(
+                        err = %e,
+                        request_id = %request_id,
+                        ref_name = %update.ref_name,
+                        "failed to issue ref certificate; outbox row will be left for the drain to retry"
+                    );
+                    false
                 }
-            }
+            };
 
-            // Anchor handoff: insert an anchor_jobs row keyed on the
-            // per-transition tuple. PR 2 reads this row and uploads
-            // to the bundler. The deterministic id makes a recovery
-            // re-pass a no-op.
             let anchor_id = crate::db::anchor_job_id_for(
                 &record.id,
                 &update.ref_name,
@@ -2695,14 +2788,54 @@ pub async fn git_receive_pack(
                 created_at: Utc::now().to_rfc3339(),
                 claimed_at: None,
             };
-            if let Err(e) = state.db.insert_anchor_job_idempotent(&job).await {
-                tracing::warn!(err = %e, ref_name = %update.ref_name, "failed to enqueue anchor job")
+            let anchor_ok = match state.db.insert_anchor_job_idempotent(&job).await {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        err = %e,
+                        request_id = %request_id,
+                        ref_name = %update.ref_name,
+                        "failed to enqueue anchor job; outbox row will be left for the drain to retry"
+                    );
+                    false
+                }
+            };
+
+            if cert_ok && anchor_ok {
+                // The row id is the deterministic id; look it up
+                // so cleanup can target just this ref's row.
+                if let Ok(Some(row_id)) = state
+                    .db
+                    .lookup_pending_ref_transition_id(
+                        &request_id,
+                        &update.ref_name,
+                    )
+                    .await
+                {
+                    ok_ref_ids.push(row_id);
+                }
+            }
+        }
+        // Delete the per-ref rows whose required writes succeeded.
+        // A failed-write row stays `applied` and the next startup
+        // drain re-derives it (the artifacts are idempotent).
+        for row_id in &ok_ref_ids {
+            if let Err(e) = state.db.delete_pending_ref_transition(row_id).await {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    row_id = %row_id,
+                    "failed to delete outbox row after effects landed; drain will re-derive (idempotent)"
+                );
             }
         }
     }
 
-    // Fire push webhooks — one per ref update
-    if !ref_updates.is_empty() {
+    // Fire push webhooks — one per LANDED ref update only. The
+    // rejected ref is not announced because it did not change
+    // state. Webhook delivery is best-effort and never blocks
+    // outbox cleanup.
+    if !ok_set.is_empty() {
         let base_url = state
             .config
             .public_url
@@ -2713,6 +2846,9 @@ pub async fn git_receive_pack(
         let clone_url = format!("{}/{}/{}.git", base_url, owner_short, record.name);
 
         for update in &ref_updates {
+            if !ok_set.contains(update.ref_name.as_str()) {
+                continue;
+            }
             let payload = serde_json::json!({
                 "ref": update.ref_name,
                 "before": update.old_sha,
@@ -2737,25 +2873,6 @@ pub async fn git_receive_pack(
                 payload,
             );
         }
-    }
-
-    // P1 (reviewer-1/2 round 3): delete outbox rows after all durable
-    // effects have been written. This prevents the rows from being
-    // replayed on the next startup. The drain already deletes rows
-    // after derive_one, but by then the effects have been written
-    // twice (once on the live path, once by the drain). Deleting here
-    // keeps the outbox clean and avoids redundant work.
-    if let Err(e) = state
-        .db
-        .delete_pending_ref_transitions_by_request_id(&request_id)
-        .await
-    {
-        tracing::warn!(
-            err = %e,
-            request_id = %request_id,
-            repo = %name,
-            "failed to delete outbox rows after effects landed; drain will re-derive (idempotent)"
-        );
     }
 
     axum::response::Response::builder()

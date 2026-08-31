@@ -54,6 +54,46 @@ pub async fn issue_ref_certificate(
     pusher_did: &str,
     cert_id: &str,
 ) -> Result<RefCertificate> {
+    issue_ref_certificate_with_issued_at(state, repo_id, ref_name, old_sha, new_sha, pusher_did, cert_id, None).await
+}
+
+/// #26 Split PR 1 round 4 — variant that lets the caller stamp the
+/// cert's `issued_at` with a transition-time timestamp instead of
+/// `Utc::now()`. The recovery drain passes the persisted
+/// `row.created_at` so a replay after a later live cert does not
+/// outrank the live cert in the `EXCLUDED.issued_at >
+/// ref_certificates.issued_at` upsert guard.
+///
+/// The live handler uses the default `issue_ref_certificate` (no
+/// override), which keeps `Utc::now()` — the reviewer's invariant
+/// is that `issued_at` reflects the transition time, and for a
+/// live push the transition time and the wall-clock are the same.
+///
+/// `issued_at_override` is honored verbatim; passing a value not in
+/// RFC 3339 form is a logic bug (the upsert will mis-order), so
+/// callers must use the row's persisted `created_at`.
+///
+/// # Clippy allow — too many arguments
+/// This is the explicit "stamp a transition-time `issued_at`"
+/// variant of `issue_ref_certificate`. The drain
+/// (`durable_outbox::derive_one`) is the in-crate caller; the
+/// test `replay_of_stale_row_does_not_overwrite_live_cert_b` pins
+/// the contract that a recovery replay's `issued_at` does NOT
+/// outrank a later live cert. Adding a struct-arg would be a
+/// larger refactor for two callers (live + drain) and obscure the
+/// parallel to `issue_ref_certificate` (which is `#[allow]`'d for
+/// the same reason historically).
+#[allow(clippy::too_many_arguments)]
+pub async fn issue_ref_certificate_with_issued_at(
+    state: &AppState,
+    repo_id: &str,
+    ref_name: &str,
+    old_sha: &str,
+    new_sha: &str,
+    pusher_did: &str,
+    cert_id: &str,
+    issued_at_override: Option<String>,
+) -> Result<RefCertificate> {
     let cert = build_ref_certificate(
         state,
         repo_id,
@@ -62,6 +102,7 @@ pub async fn issue_ref_certificate(
         new_sha,
         pusher_did,
         Some(cert_id.to_string()),
+        issued_at_override,
     )
     .await?;
     state.db.insert_ref_certificate(&cert).await
@@ -100,6 +141,7 @@ pub async fn issue_ref_certificate_idempotent(
         new_sha,
         pusher_did,
         Some(cert_id.to_string()),
+        None,
     )
     .await?;
     state.db.insert_ref_certificate_idempotent(&cert).await
@@ -108,7 +150,11 @@ pub async fn issue_ref_certificate_idempotent(
 /// Shared cert construction: build the JSON payload, sign it with the
 /// node key, and assemble the `RefCertificate` row. `cert_id_override`
 /// lets the recovery path plug in a deterministic id; the live path
-/// passes `None` and gets a fresh UUID.
+/// passes `None` and gets a fresh UUID. `issued_at_override` lets
+/// the recovery path stamp the cert with the original transition
+/// time so the upsert's `issued_at > issued_at` guard correctly
+/// orders transitions regardless of write order.
+#[allow(clippy::too_many_arguments)]
 async fn build_ref_certificate(
     state: &AppState,
     repo_id: &str,
@@ -117,9 +163,17 @@ async fn build_ref_certificate(
     new_sha: &str,
     pusher_did: &str,
     cert_id_override: Option<String>,
+    issued_at_override: Option<String>,
 ) -> Result<RefCertificate> {
     let node_did = state.node_did.to_string();
-    let issued_at = Utc::now().to_rfc3339();
+    // P1 (reviewer-1 round 4): when the caller passes a transition-
+    // time `issued_at` (the recovery drain passes `row.created_at`),
+    // use it verbatim so the upsert's per-column guard
+    // `EXCLUDED.issued_at > ref_certificates.issued_at` correctly
+    // orders transitions regardless of write order. The live handler
+    // passes `None` and gets `Utc::now()` — for a live push the
+    // transition time and the wall-clock are the same.
+    let issued_at = issued_at_override.unwrap_or_else(|| Utc::now().to_rfc3339());
 
     // Build the canonical signing payload.
     let payload = serde_json::json!({
