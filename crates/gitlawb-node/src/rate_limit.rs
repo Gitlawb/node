@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, Request};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -361,6 +361,18 @@ pub fn client_key(
 pub struct IpRateLimiter {
     pub limiter: RateLimiter,
     pub trust: TrustedProxy,
+    /// Exempt GET/HEAD from this bucket. The signed-write brake classifies
+    /// whole routers, but `write_routes` chains PUT/DELETE/GET on one path
+    /// (`/api/v1/repos/{owner}/{repo}/visibility`, `server.rs`), and `gl
+    /// visibility list` deliberately signs that owner-only GET — so without
+    /// this the read spends the write quota and a normal listing 429s after a
+    /// few writes from the same IP (one NAT egress makes the coupling vivid).
+    /// The method check is the same general form `consume_signature` uses for
+    /// its ledger skip: a read has no write side effect for the brake to
+    /// protect. Leave this `false` on any limiter whose job IS braking reads —
+    /// the `/ipfs/{cid}` brake exists precisely to cap GET-driven history
+    /// walks, so a blanket skip inside `rate_limit_by_ip` would delete it.
+    pub skip_reads: bool,
 }
 
 /// Infallible extractor for the socket peer address from `ConnectInfo`. Yields
@@ -418,10 +430,16 @@ pub async fn rate_limit_by_ip(request: Request, next: Next) -> Response {
         .map(|c| c.0);
 
     if let Some(limiter) = limiter {
-        if let Some(key) = client_key(request.headers(), peer, limiter.trust) {
-            if !limiter.limiter.check(&key).await {
-                tracing::warn!(key = %key, path = %request.uri().path(), "per-IP rate limit exceeded");
-                return too_many_requests();
+        // Opt-in read exemption (see `IpRateLimiter::skip_reads`): only a
+        // limiter that declares itself write-only skips GET/HEAD, so the /ipfs
+        // read brake and every other read-facing bucket keep braking reads.
+        let is_read = matches!(*request.method(), Method::GET | Method::HEAD);
+        if !(limiter.skip_reads && is_read) {
+            if let Some(key) = client_key(request.headers(), peer, limiter.trust) {
+                if !limiter.limiter.check(&key).await {
+                    tracing::warn!(key = %key, path = %request.uri().path(), "per-IP rate limit exceeded");
+                    return too_many_requests();
+                }
             }
         }
     }
@@ -757,6 +775,7 @@ mod tests {
         let router = ip_limited_router(IpRateLimiter {
             limiter: RateLimiter::new(2, Duration::from_secs(60)),
             trust: TrustedProxy::None,
+            skip_reads: false,
         });
         let peer: SocketAddr = "203.0.113.7:5000".parse().unwrap();
         // Two requests inside the budget, the third over it (shared Arc state).
@@ -773,12 +792,77 @@ mod tests {
         let router = ip_limited_router(IpRateLimiter {
             limiter: RateLimiter::new(1, Duration::from_secs(60)),
             trust: TrustedProxy::None,
+            skip_reads: false,
         });
         let a: SocketAddr = "203.0.113.1:1".parse().unwrap();
         let b: SocketAddr = "203.0.113.2:1".parse().unwrap();
         assert_eq!(post_from(&router, a).await, StatusCode::OK);
         assert_eq!(post_from(&router, b).await, StatusCode::OK); // independent bucket
         assert_eq!(post_from(&router, a).await, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// `skip_reads` mechanics, isolated from the production router: on a
+    /// limiter that declares itself write-only, GET and HEAD never touch the
+    /// bucket — they pass an already-exhausted one AND never debit it — while
+    /// a mutation from the same peer stays braked. On a limiter that does not
+    /// opt in (the /ipfs read brake), GET is braked exactly as before. The
+    /// production wiring (the signed-write brake on `write_routes`, whose one
+    /// GET is the signed visibility listing) is proven end-to-end by
+    /// `signed_write_brake_rejects_writes_but_serves_visibility_get` in
+    /// `test_support`; this pins the middleware seam it rides on.
+    #[tokio::test]
+    async fn skip_reads_exempts_get_and_head_but_still_brakes_writes() {
+        use tower::ServiceExt;
+        let router = |skip_reads: bool| {
+            axum::Router::new()
+                .route(
+                    "/thing",
+                    axum::routing::get(|| async { StatusCode::OK })
+                        .head(|| async { StatusCode::OK })
+                        .put(|| async { StatusCode::OK }),
+                )
+                .layer(axum::middleware::from_fn(rate_limit_by_ip))
+                .layer(axum::Extension(IpRateLimiter {
+                    limiter: RateLimiter::new(1, Duration::from_secs(60)),
+                    trust: TrustedProxy::None,
+                    skip_reads,
+                }))
+        };
+        let peer: SocketAddr = "203.0.113.9:5000".parse().unwrap();
+        let send = |router: &axum::Router, method: axum::http::Method| {
+            let mut req = axum::http::Request::builder()
+                .method(method)
+                .uri("/thing")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            let router = router.clone();
+            async move { router.oneshot(req).await.unwrap().status() }
+        };
+
+        // Opted-in limiter: the PUT spends the single slot...
+        let r = router(true);
+        assert_eq!(send(&r, axum::http::Method::PUT).await, StatusCode::OK);
+        // ...reads from the same peer still pass the exhausted bucket...
+        assert_eq!(send(&r, axum::http::Method::GET).await, StatusCode::OK);
+        assert_eq!(send(&r, axum::http::Method::HEAD).await, StatusCode::OK);
+        // ...and did not debit it behind the scenes some other way — the next
+        // mutation is still the one that gets braked.
+        assert_eq!(
+            send(&r, axum::http::Method::PUT).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the write brake must keep braking writes while exempting reads"
+        );
+
+        // Non-opted-in limiter: GET is braked like any other method, so the
+        // exemption cannot silently spread to read-braking buckets like /ipfs.
+        let r = router(false);
+        assert_eq!(send(&r, axum::http::Method::GET).await, StatusCode::OK);
+        assert_eq!(
+            send(&r, axum::http::Method::GET).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a limiter that did not opt in must keep braking reads"
+        );
     }
 
     // ── creation-route layering: IP brake runs BEFORE auth ──────────────
@@ -826,6 +910,7 @@ mod tests {
         let router = ip_limited_over_auth_router(IpRateLimiter {
             limiter: RateLimiter::new(1, Duration::from_secs(60)),
             trust: TrustedProxy::None,
+            skip_reads: false,
         });
         let peer: SocketAddr = "203.0.113.42:7000".parse().unwrap();
 

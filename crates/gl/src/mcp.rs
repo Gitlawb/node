@@ -807,10 +807,34 @@ async fn call_tool(
                 let _ = crate::http::read_body_capped(resp, crate::http::DENIAL_BODY_CAP).await;
                 anyhow::bail!("git_refs failed ({status})");
             }
-            let capped = crate::http::read_body_capped(resp, crate::http::GIT_REFS_BODY_CAP).await;
-            let bytes = capped.text.as_bytes();
-            validate_git_advertisement(bytes)?;
-            let refs = parse_info_refs(bytes);
+            // Raw bytes end-to-end: git ref names need not be UTF-8, so the
+            // advertisement stays bytes through the read, the validation, and
+            // the pkt-line parse. Text appears only at the JSON output boundary
+            // inside parse_info_refs, where the decode is a deliberate choice.
+            let capped =
+                crate::http::read_body_capped_bytes(resp, crate::http::GIT_REFS_BODY_CAP).await;
+            // Completeness is part of the protocol boundary, checked BEFORE
+            // validation: a large valid advertisement can end exactly at the
+            // cap (or die mid-transit after a whole pkt-line), and the received
+            // prefix then validates and parses as a complete ref list. Agents
+            // treat git_refs as the full truth of the repo — branch, merge, and
+            // release decisions assume an omitted ref does not exist — so a
+            // bounded or failed read must fail the tool, never shrink the repo.
+            if capped.read_failed {
+                anyhow::bail!(
+                    "git_refs failed: the ref advertisement ended mid-read — the refs received \
+                     so far are not the full list; retry, or clone the repo to list refs locally"
+                );
+            }
+            if capped.truncated {
+                anyhow::bail!(
+                    "git_refs failed: the ref advertisement exceeded the {} KiB response cap, \
+                     so the ref list would be incomplete — clone the repo to list refs locally",
+                    crate::http::GIT_REFS_BODY_CAP / 1024
+                );
+            }
+            validate_git_advertisement(&capped.bytes)?;
+            let refs = parse_info_refs(&capped.bytes);
             Ok(serde_json::to_string_pretty(&refs)?)
         }
 
@@ -1336,6 +1360,15 @@ async fn resolve_owner(args: &Value, client: &NodeClient) -> Result<String> {
 /// Reject JSON/HTML bodies masquerading as git advertisements, and pkt-line
 /// garbage that would parse as an empty ref list.
 fn validate_git_advertisement(bytes: &[u8]) -> Result<()> {
+    // Reject an empty body before the loop, whose zero-iteration path would
+    // otherwise accept it implicitly. Even an initialized empty bare repository
+    // advertises a non-empty upload-pack response (the service announcement,
+    // capabilities, and pkt-line framing), so a 200 with no data is a proxy or
+    // broken node making an unavailable ref set look empty — not an empty ref
+    // set, which stays valid because it still arrives inside real pkt-lines.
+    if bytes.is_empty() {
+        anyhow::bail!("git_refs failed (200): empty response is not a git ref advertisement");
+    }
     if matches!(bytes.first(), Some(b'{') | Some(b'<')) {
         anyhow::bail!("git_refs failed (200): response was not a git ref advertisement");
     }
@@ -1394,7 +1427,13 @@ fn parse_info_refs(bytes: &[u8]) -> Value {
             break;
         }
 
-        let line = std::str::from_utf8(&bytes[pos + 4..pos + len]).unwrap_or("");
+        // This is the byte→text boundary, and the decode is deliberate: the
+        // output is JSON, whose strings cannot carry raw bytes, so a non-UTF-8
+        // ref name surfaces with U+FFFD marking the undecodable bytes rather
+        // than the ref silently vanishing from the list (an omitted ref reads
+        // as a ref that does not exist). Everything before this point — read,
+        // completeness check, validation, pkt-line framing — ran on raw bytes.
+        let line = String::from_utf8_lossy(&bytes[pos + 4..pos + len]);
         let line = line.trim_end_matches('\n');
 
         // First line has capabilities after NUL: "<sha> <ref>\0<caps>"
@@ -2373,6 +2412,213 @@ mod tests {
         assert!(
             err.to_string().contains("not a git ref advertisement"),
             "got: {err}"
+        );
+    }
+
+    /// A 200 with an EMPTY body must error, not become a successful empty ref
+    /// list. Even an initialized empty bare repository advertises a non-empty
+    /// upload-pack response (service announcement + capabilities in pkt-line
+    /// framing), so no data at all is a proxy or broken node hiding the ref
+    /// set, not a repo with no refs. MUTATION (RED): drop the `is_empty` check
+    /// in `validate_git_advertisement` and the zero-iteration pkt-line loop
+    /// accepts the body, returning `{"refs": []}`.
+    #[tokio::test]
+    async fn test_git_refs_empty_200_body_errors_not_empty_refs() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/alice/secret/info/refs?service=git-upload-pack")
+            .with_status(200)
+            .with_body("")
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "git_refs",
+            json!({"owner": "alice", "name": "secret"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect_err("an empty 200 body must not parse as an empty ref list");
+        assert!(
+            err.to_string().contains("empty response"),
+            "the refusal must name the empty body, got: {err}"
+        );
+    }
+
+    /// Frame one pkt-line: 4 hex length bytes followed by the content.
+    fn pkt_line(content: &[u8]) -> Vec<u8> {
+        let mut v = format!("{:04x}", content.len() + 4).into_bytes();
+        v.extend_from_slice(content);
+        v
+    }
+
+    /// Build a syntactically valid upload-pack advertisement measuring exactly
+    /// `total` bytes, every pkt-line boundary landing inside it. This is the
+    /// adversarial shape for the completeness check: a prefix of the response
+    /// that validates on its own, so only the `truncated`/`read_failed` flags
+    /// can reveal that it is not the whole answer.
+    fn advertisement_of_exactly(total: usize) -> Vec<u8> {
+        let mut body = pkt_line(b"# service=git-upload-pack\n");
+        body.extend_from_slice(b"0000");
+        let sha = "a".repeat(40);
+        let remaining = total - body.len();
+        // n-1 lines of 128 bytes plus one final line of 128 + the remainder
+        // (< 256, still 4 hex digits) lands the last boundary exactly on `total`.
+        let n = remaining / 128;
+        assert!(n >= 2, "total too small for the fixture");
+        for i in 0..n {
+            let line_len = if i == n - 1 {
+                128 + remaining % 128
+            } else {
+                128
+            };
+            // content = "<sha> refs/heads/<padded name>\n", padded to line_len - 4.
+            let name_len = line_len - 4 - 40 - 1 - 12 - 1; // sha, space, "refs/heads/b", newline
+            let content = format!("{sha} refs/heads/b{i:0name_len$}\n");
+            body.extend_from_slice(&pkt_line(content.as_bytes()));
+        }
+        assert_eq!(body.len(), total, "fixture must land exactly on total");
+        body
+    }
+
+    /// A valid advertisement cut EXACTLY at the response cap must error, not
+    /// return the prefix as the complete ref list. The prefix here validates
+    /// perfectly — every pkt-line closes on the boundary — so only the
+    /// `truncated` flag distinguishes it from a clean EOF, and agents act on
+    /// git_refs as the full truth of the repo (a ref omitted by the cap reads
+    /// as a ref that does not exist). MUTATION (RED): ignore `capped.truncated`
+    /// in the `git_refs` arm and this returns thousands of refs, successfully,
+    /// with the tail of the repo silently missing.
+    #[tokio::test]
+    async fn test_git_refs_valid_prefix_at_cap_errors_not_partial_refs() {
+        let mut server = mockito::Server::new_async().await;
+        // The full body extends past the cap; its first GIT_REFS_BODY_CAP bytes
+        // are themselves a well-formed advertisement ending on a pkt boundary.
+        let mut body = advertisement_of_exactly(crate::http::GIT_REFS_BODY_CAP);
+        let sha = "b".repeat(40);
+        body.extend_from_slice(&pkt_line(format!("{sha} refs/heads/omitted\n").as_bytes()));
+        body.extend_from_slice(b"0000");
+        let _m = server
+            .mock("GET", "/alice/big/info/refs?service=git-upload-pack")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "git_refs",
+            json!({"owner": "alice", "name": "big"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect_err("a capped advertisement must error, not return a partial ref list");
+        assert!(
+            err.to_string().contains("response cap"),
+            "the refusal must name the cap so the caller knows the list was bounded, got: {err}"
+        );
+    }
+
+    /// A body that FAILS mid-read after a syntactically complete prefix must
+    /// error too — the transport, not the cap, is what cut this one. The
+    /// fixture is a raw listener that promises more body than it writes, then
+    /// closes; mockito cannot express that (it always completes the response it
+    /// advertises). The bytes that did arrive are whole pkt-lines, so without
+    /// the `read_failed` flag they validate and parse as a short-but-successful
+    /// ref list. MUTATION (RED): ignore `capped.read_failed` in the `git_refs`
+    /// arm and this returns one ref as if the repo held nothing else.
+    #[tokio::test]
+    async fn test_git_refs_read_failure_after_valid_prefix_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 2048];
+            let _ = sock.read(&mut scratch).await;
+            let mut prefix = pkt_line(b"# service=git-upload-pack\n");
+            prefix.extend_from_slice(b"0000");
+            let sha = "c".repeat(40);
+            prefix.extend_from_slice(&pkt_line(format!("{sha} refs/heads/main\n").as_bytes()));
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                // Promise more than gets written, so the close is a mid-body
+                // failure rather than a clean end of stream.
+                prefix.len() + 64
+            );
+            let _ = sock.write_all(header.as_bytes()).await;
+            let _ = sock.write_all(&prefix).await;
+            let _ = sock.flush().await;
+            // Drop closes the socket with 64 promised bytes never sent.
+        });
+
+        let err = call_tool(
+            "git_refs",
+            json!({"owner": "alice", "name": "cut"}),
+            &format!("http://{addr}"),
+            None,
+        )
+        .await
+        .expect_err("a mid-read failure must error, not return the refs that made it through");
+        assert!(
+            err.to_string().contains("mid-read"),
+            "the refusal must say the read failed, not blame the advertisement, got: {err}"
+        );
+    }
+
+    /// Git ref names are byte strings that need not be UTF-8. The advertisement
+    /// must stay raw bytes through the read, validation, and pkt-line parse: a
+    /// lossy decode turns each invalid byte into the 3-byte U+FFFD, which both
+    /// corrupts the name and breaks the pkt-line length accounting, so a valid
+    /// repository fails validation. Text appears only at the JSON boundary,
+    /// where the replacement character is a deliberate rendering choice (JSON
+    /// strings cannot carry raw bytes) rather than silent data loss. MUTATION
+    /// (RED): route the body back through `read_body_capped(...).text.as_bytes()`
+    /// and this advertisement's second pkt-line length no longer matches, so
+    /// the whole call fails "truncated pkt-line".
+    #[tokio::test]
+    async fn test_git_refs_non_utf8_ref_name_survives_validation_and_parse() {
+        let mut server = mockito::Server::new_async().await;
+        let sha_a = "a".repeat(40);
+        let sha_b = "b".repeat(40);
+        let mut body = pkt_line(b"# service=git-upload-pack\n");
+        body.extend_from_slice(b"0000");
+        body.extend_from_slice(&pkt_line(format!("{sha_a} refs/heads/main\n").as_bytes()));
+        // 0xFF is not valid UTF-8 anywhere in a sequence; latin-1 branch names
+        // like this exist in the wild.
+        let mut raw_line = format!("{sha_b} refs/heads/caf").into_bytes();
+        raw_line.push(0xFF);
+        raw_line.push(b'\n');
+        body.extend_from_slice(&pkt_line(&raw_line));
+        body.extend_from_slice(b"0000");
+        let _m = server
+            .mock("GET", "/alice/latin/info/refs?service=git-upload-pack")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let out = call_tool(
+            "git_refs",
+            json!({"owner": "alice", "name": "latin"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect("a non-UTF-8 ref name must not fail validation of a valid advertisement");
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let refs = parsed["refs"].as_array().expect("refs array");
+        assert_eq!(
+            refs.len(),
+            2,
+            "the non-UTF-8 ref must be listed, not silently dropped: {parsed}"
+        );
+        assert_eq!(refs[0]["ref"], "refs/heads/main");
+        assert_eq!(refs[1]["sha"], sha_b.as_str());
+        assert_eq!(
+            refs[1]["ref"], "refs/heads/caf\u{FFFD}",
+            "the undecodable byte surfaces as U+FFFD at the JSON boundary, marked rather than lost"
         );
     }
 

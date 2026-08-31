@@ -98,9 +98,15 @@ pub fn build_router(state: AppState) -> Router {
     // quotas. Each group layers it OUTSIDE `add_auth_layers` (axum runs the last
     // `.layer` first) so an over-limit request is rejected before signature
     // verification burns CPU and before the ledger is charged.
+    // `skip_reads`: `write_routes` chains PUT/DELETE/GET on the visibility
+    // path, and `gl visibility list` signs that owner-only GET. A write-only
+    // brake must not let reads spend the write quota (or a listing starts
+    // 429ing behind a shared NAT after a handful of writes), mirroring the
+    // method skip `consume_signature` applies to the ledger for the same GET.
     let signed_write_ip_limiter = rate_limit::IpRateLimiter {
         limiter: state.signed_write_rate_limiter.clone(),
         trust: state.push_limiter_trust,
+        skip_reads: true,
     };
 
     // ── Task routes (write — require HTTP Signature) ───────────────────────
@@ -132,6 +138,7 @@ pub fn build_router(state: AppState) -> Router {
     let create_ip_limiter = rate_limit::IpRateLimiter {
         limiter: state.create_ip_rate_limiter.clone(),
         trust: state.push_limiter_trust,
+        skip_reads: false,
     };
     let creation_routes = add_auth_layers(
         Router::new()
@@ -236,6 +243,7 @@ pub fn build_router(state: AppState) -> Router {
     let push_limiter = rate_limit::IpRateLimiter {
         limiter: state.push_rate_limiter.clone(),
         trust: state.push_limiter_trust,
+        skip_reads: false,
     };
     let git_write_routes = add_auth_layers(
         Router::new()
@@ -263,6 +271,7 @@ pub fn build_router(state: AppState) -> Router {
     let ipfs_limiter = rate_limit::IpRateLimiter {
         limiter: state.ipfs_rate_limiter.clone(),
         trust: state.push_limiter_trust,
+        skip_reads: false,
     };
     let ipfs_routes = Router::new()
         .route("/ipfs/{cid}", get(ipfs::get_by_cid))
@@ -363,6 +372,7 @@ pub fn build_router(state: AppState) -> Router {
     .layer(axum::Extension(rate_limit::IpRateLimiter {
         limiter: state.sync_trigger_rate_limiter.clone(),
         trust: state.push_limiter_trust,
+        skip_reads: false,
     }));
 
     // announce + notify keep their rolling-upgrade signature behavior (unsigned
@@ -383,6 +393,7 @@ pub fn build_router(state: AppState) -> Router {
         .layer(axum::Extension(rate_limit::IpRateLimiter {
             limiter: state.peer_write_rate_limiter.clone(),
             trust: state.push_limiter_trust,
+            skip_reads: false,
         }));
 
     // ── Read routes — open for public repos ───────────────────────────────

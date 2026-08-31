@@ -1987,6 +1987,111 @@ mod tests {
         );
     }
 
+    /// The signed-write IP brake is write-only. `write_routes` chains
+    /// PUT/DELETE/GET on the visibility path, and `gl visibility list` signs
+    /// that owner-only GET, so a brake that counted methods it does not exist
+    /// for would let ordinary reads spend the write quota — behind one NAT
+    /// egress, a few writes would start 429ing every listing. Through the
+    /// PRODUCTION router with a single-slot bucket: the first write spends the
+    /// quota, a second write (and a DELETE) is 429, and the authenticated
+    /// visibility GET from the SAME exhausted IP is still served. MUTATION
+    /// (RED): set `skip_reads: false` on `signed_write_ip_limiter` in
+    /// `server.rs` (or drop the method check in `rate_limit_by_ip`) and the
+    /// final GET comes back 429.
+    #[sqlx::test]
+    async fn signed_write_brake_rejects_writes_but_serves_visibility_get(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        // Short owner form in the URL path, as in the real-signature test above:
+        // no colons, so the signed @path matches path_and_query() byte-for-byte.
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+
+        let mut state = test_state(pool).await;
+        // Single-slot bucket: the FIRST successful write exhausts it.
+        state.signed_write_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        let repo = seed_repo(&owner_did, "brake-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let router = crate::server::build_router(state);
+
+        let peer: std::net::SocketAddr = "203.0.113.61:5000".parse().unwrap();
+        let path = format!("/api/v1/repos/{short}/brake-repo/visibility");
+        let put_body: &[u8] = br#"{"path_glob":"/","reader_dids":[]}"#;
+        // Each request is freshly signed — the brake is outermost, but a reused
+        // signature would trip the replay ledger and muddy which gate answered.
+        let signed_req = |method: &str, body: &'static [u8]| {
+            let signed = sign_request(&kp, method, &path, body);
+            let mut req = Request::builder()
+                .method(method)
+                .uri(&path)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header("content-digest", signed.content_digest)
+                .header("signature-input", signed.signature_input)
+                .header("signature", signed.signature)
+                .body(Body::from(body))
+                .unwrap();
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(peer));
+            req
+        };
+
+        // First write passes the brake, reaches the handler, and succeeds —
+        // debiting the single-slot bucket.
+        let resp = router
+            .clone()
+            .oneshot(signed_req("PUT", put_body))
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "the first signed write from an IP must pass the brake, got {}",
+            resp.status()
+        );
+
+        // Second write from the same IP: braked with 429 before auth runs.
+        let resp = router
+            .clone()
+            .oneshot(signed_req("PUT", put_body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "an exhausted signed-write bucket must reject a PUT"
+        );
+        // A DELETE is a mutation too and shares the exhausted bucket.
+        let resp = router
+            .clone()
+            .oneshot(signed_req("DELETE", put_body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "an exhausted signed-write bucket must reject a DELETE"
+        );
+
+        // The signed visibility GET from the SAME IP bypasses the write brake
+        // and is fully served: 200 with the rule the first PUT created — the
+        // read did not merely dodge a 429, it reached the handler as the owner.
+        let resp = router.oneshot(signed_req("GET", b"")).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the authenticated visibility GET must be served despite the exhausted write bucket"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("path_glob"),
+            "the owner sees the visibility rules through the exhausted-bucket IP"
+        );
+    }
+
     /// A signed request body reused by the request-target trio below. Non-empty so
     /// the content-digest the signature covers is a real hash rather than the
     /// empty-body constant, which keeps `@path` the only component under test.

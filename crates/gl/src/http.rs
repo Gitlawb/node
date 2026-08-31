@@ -429,21 +429,41 @@ pub(crate) struct CappedBody {
     pub(crate) read_failed: bool,
 }
 
-/// Read at most `cap` bytes of a response body. Bounds the allocation from a
-/// hostile or broken node returning a huge error body — the display is capped
+/// The byte twin of [`CappedBody`]: the same completion flags, but the payload is
+/// left as the exact bytes that arrived. Byte-oriented protocol consumers (the git
+/// smart-HTTP ref advertisement on the MCP `git_refs` path) must read through this
+/// one: git ref names are byte strings that need not be UTF-8, so a lossy decode
+/// followed by `as_bytes()` is not a display nicety but corruption — each invalid
+/// byte becomes the 3-byte U+FFFD, changing both the ref name and the pkt-line
+/// length accounting, and a valid repository stops validating.
+pub(crate) struct CappedBytes {
+    /// The bytes read, exactly as they arrived.
+    pub(crate) bytes: Vec<u8>,
+    /// The cap cut the body short.
+    pub(crate) truncated: bool,
+    /// A chunk read FAILED part-way through, so the body is not merely short, it is
+    /// unfinished and the node may have had more to say.
+    pub(crate) read_failed: bool,
+}
+
+/// Read at most `cap` bytes of a response body, raw. Bounds the allocation from a
+/// hostile or broken node returning a huge body — the display is capped
 /// separately, but the read itself must not be unbounded (INV-6, read half).
 ///
 /// `truncated` reports whether the cap cut the body short. A caller that CLASSIFIES
 /// on the body needs it: a cut body fails JSON parse, and a parse failure is
 /// indistinguishable from a node that sent no code at all, so without this flag an
-/// oversized body silently picks a different arm.
+/// oversized body silently picks a different arm. A protocol consumer needs it even
+/// more: a cut pkt-line stream can still be a syntactically valid *prefix*, so
+/// without the flag a bounded read is indistinguishable from a clean EOF and the
+/// prefix parses as the complete answer.
 ///
 /// `read_failed` reports the other way a body can end early. A mid-body read error
 /// used to leave through the same exit as a clean end of stream, so a 500 whose body
 /// died in transit surfaced as an empty message and the caller was told
 /// `node returned 500: ` with nothing after the colon. That is a report of what the
 /// node said, and the node never got to say it.
-pub(crate) async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> CappedBody {
+pub(crate) async fn read_body_capped_bytes(mut resp: reqwest::Response, cap: usize) -> CappedBytes {
     let mut buf: Vec<u8> = Vec::new();
     let mut truncated = false;
     let mut read_failed = false;
@@ -469,10 +489,24 @@ pub(crate) async fn read_body_capped(mut resp: reqwest::Response, cap: usize) ->
     if buf.len() >= cap {
         truncated = true;
     }
-    CappedBody {
-        text: String::from_utf8_lossy(&buf).into_owned(),
+    CappedBytes {
+        bytes: buf,
         truncated,
         read_failed,
+    }
+}
+
+/// Text view of [`read_body_capped_bytes`], for callers that go on to display or
+/// JSON-parse node-supplied *messages* (denial bodies). The decode is lossy on
+/// purpose there — a denial is prose for a terminal, and a hostile byte becomes a
+/// visible U+FFFD instead of raw output. Anything that parses a byte protocol out
+/// of the body must take the bytes variant instead; see [`CappedBytes`].
+pub(crate) async fn read_body_capped(resp: reqwest::Response, cap: usize) -> CappedBody {
+    let raw = read_body_capped_bytes(resp, cap).await;
+    CappedBody {
+        text: String::from_utf8_lossy(&raw.bytes).into_owned(),
+        truncated: raw.truncated,
+        read_failed: raw.read_failed,
     }
 }
 
