@@ -51,13 +51,30 @@ fn uri(owner: &str, repo: &str, sha: &str) -> String {
 /// `signed_request_as` plus the verified RFC 9421 material the signature
 /// middleware injects in production, so a handler mounted bare still runs the
 /// real path instead of a missing-material branch.
-fn signed_with_material(did: &str, uri: &str, body: Body) -> axum::http::Request<Body> {
-    let mut req = signed_request_as(did, Method::POST, uri, body);
-    req.extensions_mut().insert(sample_material());
+///
+/// The body is buffered here rather than handed straight to the builder because
+/// the material has to AGREE with it: the write path refuses a claim whose
+/// signing string does not cover the digest of the body being stored, so a
+/// stand-in built over some other bytes would take every bare-router test down
+/// the refusal branch instead of the path it means to exercise.
+async fn signed_with_material(did: &str, uri: &str, body: Body) -> axum::http::Request<Body> {
+    let bytes = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .expect("test body is already in memory");
+    let material = sample_material_for(&bytes);
+    let mut req = signed_request_as(did, Method::POST, uri, Body::from(bytes));
+    req.extensions_mut().insert(material);
     req
 }
 
-/// Stand-in material, well inside every bound, and DISTINCT on every call.
+/// Stand-in material over `{}`, for the cases that only need SOME well-formed
+/// material to override one field of.
+fn sample_material() -> crate::auth::SignatureMaterial {
+    sample_material_for(b"{}")
+}
+
+/// Stand-in material for `body`, well inside every bound, and DISTINCT on every
+/// call.
 ///
 /// Distinct because that is what production looks like: a real signature covers
 /// a `created` parameter and the body's own digest, so two genuine requests
@@ -66,15 +83,20 @@ fn signed_with_material(did: &str, uri: &str, body: Body) -> axum::http::Request
 /// with the row it already has. The replay tests below get their identical bytes
 /// the honest way, by signing once and putting the same headers on the wire
 /// twice through the production router.
-fn sample_material() -> crate::auth::SignatureMaterial {
+///
+/// The signing string carries a real `content-digest` line over `body`, the way
+/// `build_signing_string` emits one, because the write path checks that line
+/// against the bytes it is about to persist.
+fn sample_material_for(body: &[u8]) -> crate::auth::SignatureMaterial {
     static NTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let nth = NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let digest = gitlawb_core::http_sig::compute_content_digest(body);
     crate::auth::SignatureMaterial {
         signature: format!("sig1=:dGVzdA=={nth}:"),
         signature_input: "sig1=(\"@method\" \"@path\" \"content-digest\");alg=\"ed25519\""
             .to_string(),
-        signing_string: "\"@method\": POST".to_string(),
-        body: Some(axum::body::Bytes::from_static(b"{}")),
+        signing_string: format!("\"@method\": POST\n\"content-digest\": {digest}"),
+        body: Some(axum::body::Bytes::copy_from_slice(body)),
     }
 }
 
@@ -85,7 +107,7 @@ async fn post_as(
     body: Body,
 ) -> axum::response::Response {
     router(state.clone())
-        .oneshot(signed_with_material(did, uri, body))
+        .oneshot(signed_with_material(did, uri, body).await)
         .await
         .unwrap()
 }
@@ -137,8 +159,18 @@ async fn owner_writes_a_claim_recording_both_dids(pool: PgPool) {
     // cannot be re-verified after the request is gone is not history.
     assert!(claims[0].signature.starts_with("sig1=:dGVzdA=="));
     assert!(claims[0].signature_input.starts_with("sig1=("));
-    assert_eq!(claims[0].signing_string, "\"@method\": POST");
-    assert_eq!(claims[0].request_body, b"{}");
+    assert_eq!(
+        claims[0].request_body, br#"{"state":"success","context":"ci/build"}"#,
+        "the stored body is the one the request carried"
+    );
+    assert_eq!(
+        claims[0].signing_string,
+        format!(
+            "\"@method\": POST\n\"content-digest\": {}",
+            gitlawb_core::http_sig::compute_content_digest(&claims[0].request_body)
+        ),
+        "the stored signing string is the verified material, digest line included"
+    );
 }
 
 /// Covers AE1. Two claims for one context both survive: the history is
@@ -774,6 +806,206 @@ async fn post_signed_headers(
         .oneshot(req)
         .await
         .unwrap()
+}
+
+/// An oversized status body is refused at the transport, before the signature
+/// middleware buffers it.
+///
+/// The 8 KiB bound the module advertises used to be checked only in the
+/// handler, which runs after `require_signature` has collected and hashed the
+/// entire body: the number bounded what was STORED, never what was ALLOCATED,
+/// so a signed caller could make the node buffer a body of any size and only
+/// then be told 400.
+///
+/// The unsigned arm is the one that pins the ORDERING rather than merely the
+/// refusal. It carries no signature headers at all, so if anything ran ahead of
+/// the limit it would be the auth middleware answering 401; a 413 means the
+/// request was turned away before the layer that reads bodies ever saw it. The
+/// signed arm shows the limit is not merely rejecting unauthenticated traffic,
+/// the no-length arm shows a request that declares nothing is still bounded on
+/// the read, and the control shows a body inside the bound still writes.
+#[sqlx::test]
+async fn an_oversized_status_body_is_refused_before_the_signature_middleware_buffers_it(
+    pool: PgPool,
+) {
+    let state = test_state(pool.clone()).await;
+    let kp = gitlawb_core::identity::Keypair::generate();
+    let did = kp.did().to_string();
+    let repo = seed_repo(&did, "body-limit-repo", true);
+    let repo_id = repo.id.clone();
+    state.db.create_repo(&repo).await.unwrap();
+    let path = uri(&did, "body-limit-repo", SHA_A);
+
+    let oversized = format!(
+        r#"{{"state":"success","context":"ci/build","description":"{}"}}"#,
+        "d".repeat(super::MAX_REQUEST_BODY_BYTES)
+    );
+    let signed = gitlawb_core::http_sig::sign_request(&kp, "POST", &path, oversized.as_bytes());
+
+    // `Request::builder` does not stamp a Content-Length the way a real client
+    // does, so the declared length is set explicitly wherever the test means to
+    // exercise the declared-length branch.
+    let post = |with_signature: bool, with_length: bool| {
+        let mut b = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri(&path)
+            .header(axum::http::header::CONTENT_TYPE, "application/json");
+        if with_signature {
+            b = b
+                .header("content-digest", signed.content_digest.clone())
+                .header("signature-input", signed.signature_input.clone())
+                .header("signature", signed.signature.clone());
+        }
+        if with_length {
+            b = b.header(
+                axum::http::header::CONTENT_LENGTH,
+                oversized.len().to_string(),
+            );
+        }
+        b.body(Body::from(oversized.clone())).unwrap()
+    };
+    let send = |req| async {
+        crate::server::build_router(state.clone())
+            .oneshot(req)
+            .await
+            .unwrap()
+    };
+
+    let resp = send(post(false, true)).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "an oversized body must be refused before anything reads or authenticates it"
+    );
+
+    let resp = send(post(true, true)).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a signed oversized body must be refused by the transport bound, not by the handler"
+    );
+
+    // Nothing declared. The refusal moves to whoever reads the body — the
+    // signature middleware, which cannot tell a truncated body from an
+    // unreadable one and answers 400 — but the read still stops at the limit
+    // rather than buffering whatever arrives.
+    let resp = send(post(true, false)).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a body that declares no length must still be bounded on the read"
+    );
+
+    assert!(
+        state
+            .db
+            .list_status_claims(&repo_id, SHA_A)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a refused write must leave no row"
+    );
+
+    // The control: a body inside the bound still reaches the handler and writes.
+    let ok_body = br#"{"state":"success","context":"ci/build"}"#;
+    let (ok, _) = post_really_signed(&state, &kp, &path, ok_body).await;
+    assert_eq!(
+        ok.status(),
+        StatusCode::CREATED,
+        "the bound must not refuse an ordinary status write"
+    );
+}
+
+/// A signature that covers an EMPTY content-digest cannot write a claim, even
+/// though it is a genuine signature from the repository's own owner.
+///
+/// This is the whole attack, driven end to end through the production router.
+/// `require_signature` rebuilds the covered component values from the request,
+/// so a caller who omits the `Content-Digest` header makes the covered digest
+/// the empty string on both the signing side and the verifying side. The
+/// Ed25519 check therefore passes over method, path and nothing else, and any
+/// body at all rides in underneath it. Every downstream check the write path
+/// already had — owner, state, context, the four size bounds — passes too,
+/// because none of them looks at whether the signature reaches the body.
+///
+/// If it wrote, the row would carry a valid signature, a signing string that
+/// verifies under the owner's key, and a `request_body` that signing string
+/// says nothing about: provenance that cannot be re-verified, which is the one
+/// thing a claim is for. `re_verify` below is the procedure that would refuse
+/// it after the fact; this is the same predicate applied before the insert.
+///
+/// The control at the end is what keeps the test honest: the same owner, repo,
+/// commit and body, signed the ordinary way with the header present, writes.
+#[sqlx::test]
+async fn a_signature_over_an_empty_content_digest_cannot_write_a_claim(pool: PgPool) {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use gitlawb_core::http_sig::{build_signing_string, COVERED_COMPONENTS};
+
+    let state = test_state(pool.clone()).await;
+    let kp = gitlawb_core::identity::Keypair::generate();
+    let did = kp.did().to_string();
+    let repo = seed_repo(&did, "empty-digest-repo", true);
+    let repo_id = repo.id.clone();
+    state.db.create_repo(&repo).await.unwrap();
+
+    let path = uri(&did, "empty-digest-repo", SHA_A);
+    let created = chrono::Utc::now().timestamp();
+    let signature_input = format!(
+        r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created={created}"#
+    );
+    let sig_params_value = signature_input
+        .strip_prefix("sig1=")
+        .expect("the header is built with the prefix");
+
+    // Exactly the values the middleware derives when the header is absent.
+    let mut values: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    values.insert("@method".into(), "POST".into());
+    values.insert("@path".into(), path.clone());
+    values.insert("content-digest".into(), String::new());
+    let signing_string =
+        build_signing_string(COVERED_COMPONENTS, sig_params_value, &values).unwrap();
+    let signature = format!(
+        "sig1=:{}:",
+        STANDARD.encode(kp.sign(signing_string.as_bytes()).to_bytes())
+    );
+
+    // A body no signature covers, and no Content-Digest header to bind it.
+    let smuggled = br#"{"state":"success","context":"ci/build"}"#;
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(&path)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header("signature-input", signature_input)
+        .header("signature", signature)
+        .body(Body::from(smuggled.to_vec()))
+        .unwrap();
+    let resp = crate::server::build_router(state.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a signature that covers no digest of this body must not be accepted as provenance"
+    );
+    assert!(
+        state
+            .db
+            .list_status_claims(&repo_id, SHA_A)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a claim whose signature does not reach its body must never be stored"
+    );
+
+    // The control: the identical write, signed the ordinary way, is accepted —
+    // so what refuses above is the missing binding and not the request shape.
+    let (ok, _) = post_really_signed(&state, &kp, &path, smuggled).await;
+    assert_eq!(ok.status(), StatusCode::CREATED);
+    let claims = state.db.list_status_claims(&repo_id, SHA_A).await.unwrap();
+    assert_eq!(claims.len(), 1);
+    re_verify(&claims[0]).expect("the accepted claim must re-verify from the row alone");
 }
 
 /// Re-verify a stored claim from the row alone, the way a third party

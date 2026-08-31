@@ -197,6 +197,20 @@ pub fn build_router(state: AppState) -> Router {
             .layer(axum::Extension(state.rate_limiter.clone())),
         state.clone(),
     )
+    // The route's advertised body bound, applied at the transport. It sits
+    // OUTSIDE the auth layers because `require_signature` collects and hashes
+    // the whole body before any handler runs: the handler's own check measures
+    // an allocation that has already happened, so without this layer the 8 KiB
+    // figure bounded what gets stored and not what gets buffered, and
+    // concurrent requests multiplied exactly the cost it was written to
+    // prevent. It sits INSIDE the rate limiters so an oversized request is
+    // still counted by the per-IP brake before it is refused.
+    //
+    // A declared Content-Length over the limit is answered 413 without reading
+    // a byte; a body that declares nothing (or understates) is truncated at the
+    // limit and fails where it is read, which `require_signature` reports as an
+    // unreadable body.
+    .layer(RequestBodyLimitLayer::new(status::MAX_REQUEST_BODY_BYTES))
     // The one route that persists the signed request body, so the one route
     // whose signature material carries it. Applied OUTSIDE `add_auth_layers`
     // (outermost = runs first) because `require_signature` reads this marker to

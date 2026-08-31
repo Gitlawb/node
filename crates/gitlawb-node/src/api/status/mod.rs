@@ -61,7 +61,17 @@ const MAX_SIGNING_STRING_CHARS: usize = 4096;
 /// The body is a `CreateStatusRequest`, whose own fields are already capped at
 /// roughly 3.3 KB in total by the three limits below; this leaves room for JSON
 /// framing and nothing more.
-const MAX_REQUEST_BODY_BYTES: usize = 8192;
+///
+/// Enforced twice, at two different moments, because the handler's check alone
+/// is not the bound it advertises: `require_signature` buffers the whole body
+/// before any handler runs, so by the time [`create_status`] measures it the
+/// allocation has already happened. `build_router` applies the same number as a
+/// `RequestBodyLimitLayer` at the transport, outside the auth layers, which is
+/// what makes it a bound on what is ALLOCATED and not only on what is STORED.
+/// The handler keeps its own check regardless — it is the one that holds for a
+/// handler reached by any other route table, and it is what the material size
+/// tests drive.
+pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 8192;
 
 const MAX_CONTEXT_CHARS: usize = 255;
 const MAX_TARGET_URL_CHARS: usize = 2048;
@@ -174,6 +184,8 @@ pub async fn create_status(
         MAX_SIGNING_STRING_CHARS,
     )?;
     bound("request body", body.len(), MAX_REQUEST_BODY_BYTES)?;
+    // After the bounds, so the scan below walks a signing string of known size.
+    require_body_bound_signature(&material, &body)?;
 
     let digest = request_digest(&material, &body);
     let (signature, signature_input, signing_string, request_body) = (
@@ -229,6 +241,60 @@ pub async fn create_status(
             "claim limit reached for {which}"
         ))),
     }
+}
+
+/// Refuse a claim whose signature does not cover the body about to be stored.
+///
+/// A claim IS provenance, so the signature stored beside it has to bind the
+/// bytes stored beside it. It does not do that directly: `signing_string`
+/// reaches the body only through a `content-digest` line. And a caller can sign
+/// a content-digest the request then never carries. `require_signature` rebuilds
+/// the covered values from the request, so an ABSENT `Content-Digest` header
+/// makes the covered digest the empty string on the signing side and the
+/// verifying side alike; the Ed25519 check passes over method, path and an empty
+/// digest, and any body at all rides along. The row that write produces asserts
+/// a provenance that cannot be re-verified: the signing string covers a digest
+/// of bytes that are not the ones in `request_body`.
+///
+/// The predicate here is the write-time form of the one `re_verify` runs against
+/// a stored row in the tests — recompute the digest of the bytes about to be
+/// persisted and require the signing string to carry exactly that line — so what
+/// this route accepts and what a third party can later re-verify are the same
+/// question, asked at both ends.
+///
+/// This is a route property, checked where the claim becomes history, and it is
+/// deliberately not the only line of defence: requiring the header in
+/// `require_signature` closes the same hole one layer earlier and for every
+/// signed route, and that change belongs there rather than here because no other
+/// route's correctness should depend on the status handler. The two agree and
+/// neither substitutes for the other — without the middleware's requirement the
+/// empty digest is still accepted everywhere else, and without this one a later
+/// relaxation of the middleware would silently resume writing unverifiable
+/// history.
+///
+/// A 400, not a 500: the material is exactly what the client signed, and what
+/// they signed does not cover what they sent.
+fn require_body_bound_signature(
+    material: &crate::auth::SignatureMaterial,
+    body: &[u8],
+) -> Result<()> {
+    let covered = format!(
+        "\"content-digest\": {}",
+        gitlawb_core::http_sig::compute_content_digest(body)
+    );
+    // Line-exact rather than a substring search: `build_signing_string` emits one
+    // component per line, and a `contains` would also be satisfied by the digest
+    // appearing INSIDE some other covered component's value, which proves
+    // nothing about what the signature covered.
+    if material.signing_string.lines().any(|line| line == covered) {
+        return Ok(());
+    }
+    Err(AppError::BadRequest(
+        "the signature does not cover this request body: send a Content-Digest header \
+         computed over the body and name \"content-digest\" among the signature's covered \
+         components"
+            .into(),
+    ))
 }
 
 /// The identity of one signed write, as a hex sha-256.
