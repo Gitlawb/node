@@ -457,16 +457,37 @@ fn blob_paths(repo_path: &Path, git_bin: &str, timeout: Duration) -> Result<Vec<
     // empty paths as "withhold this exact OID", which is exactly
     // the right policy for a tag-of-blob we cannot path-match.
     //
-    // The same `git for-each-ref` invocation lives at
-    // `reachable_commit_tag_oids_bounded:1318-1324` (for the
-    // tag-chain seed), so this is reusing a primitive the file
-    // already exercises. `--format=%(objectname) %(objecttype)` is
-    // NUL-delimited by `for-each-ref` per line; the 2-column shape
-    // is enough to filter for "blob" / "tree" without a second
-    // cat-file probe.
+    // A similar `git for-each-ref` invocation lives at
+    // `reachable_commit_tag_oids_bounded` (for the tag-chain seed),
+    // so this is reusing a primitive the file already exercises.
+    //
+    // #218 review round 8 P1: the referent must be PEELED. `%(objecttype)`
+    // reports the type of the ref's OWN object, which for an annotated tag
+    // is `tag` — so a format of only `%(objectname) %(objecttype)` never
+    // shows the blob/tree the tag wraps, and a blob reachable ONLY through
+    // an annotated tag escaped the withheld set while `rev_list_keep`
+    // (`git rev-list --objects --all`, which DOES peel tags) still served
+    // it. `%(*objectname) %(*objecttype)` are for-each-ref's peeled atoms:
+    // empty for a ref whose tip is not a tag, one-level-peeled for a tag.
+    //
+    // Peel depth: measured against git 2.50, the `*` atoms peel the WHOLE
+    // chain — a tag-of-a-tag-of-a-tag-of-a-blob reports the blob, not the
+    // inner tag — so the `tag` peeled-type arm below does not fire on stock
+    // git today. It is kept, and driven by a fake-git test, because
+    // `push_delta.rs`'s ref-type guard documents `%(*objecttype)` as a
+    // ONE-level peel: if any git we run under behaves that way, resolving the
+    // rest of the chain with `rev-parse <tip>^{}` (an explicitly recursive
+    // peel) plus a `cat-file -t` type probe classifies the referent, where
+    // bailing would instead fail the whole walk closed and 500 every clone of
+    // a repo that merely carries a nested tag. Both children are bounded by
+    // the walk's shared deadline, and both are reached only for a tag whose
+    // referent is still a tag — never on the common one-line-per-ref path.
     let refs_out = run_bounded_git(
         git_bin,
-        &["for-each-ref", "--format=%(objectname) %(objecttype)"],
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(objecttype) %(*objectname) %(*objecttype)",
+        ],
         repo_path,
         b"",
         deadline,
@@ -477,18 +498,68 @@ fn blob_paths(repo_path: &Path, git_bin: &str, timeout: Duration) -> Result<Vec<
         if line.is_empty() {
             continue;
         }
-        let Some((oid, kind)) = line.split_once(' ') else {
-            // A malformed `for-each-ref` line; fail closed so the
-            // caller aborts rather than silently under-withhold.
-            anyhow::bail!("malformed for-each-ref line: {line:?}");
+        // Two tokens for a non-tag tip (the peeled atoms expand to
+        // empty and are eaten by the trim/split), four for a tag tip.
+        // Anything else is a malformed line; fail closed so the caller
+        // aborts rather than silently under-withhold.
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let (oid, kind, peeled) = match fields.as_slice() {
+            [oid, kind] => (*oid, *kind, None),
+            [oid, kind, peeled_oid, peeled_kind] => {
+                (*oid, *kind, Some((*peeled_oid, *peeled_kind)))
+            }
+            _ => anyhow::bail!("malformed for-each-ref line: {line:?}"),
         };
-        // Commits are already covered by the rev-list walk above;
-        // tags are themselves objects whose referent is captured
-        // by the next pass (or by the rev-list walk if the tag
-        // peels to a commit). We only need blobs and trees that
-        // are direct ref tips.
+        // Commit tips are already covered by the rev-list walk above.
+        // Direct blob/tree tips (lightweight tag of a blob, raw blobref)
+        // are inserted as-is.
         if kind == "blob" || kind == "tree" {
             out.insert((oid.to_string(), String::new()));
+        }
+        if let Some((peeled_oid, peeled_kind)) = peeled {
+            match peeled_kind {
+                // The annotated-tag-of-blob / -of-tree shape: the referent
+                // is what `rev-list --objects --all` serves, so it is what
+                // must enter the withheld set (round-8 P1).
+                "blob" | "tree" => {
+                    out.insert((peeled_oid.to_string(), String::new()));
+                }
+                // A tag peeling to a commit contributes nothing new:
+                // `rev-list --all` peels tag chains to their commit and the
+                // phase-1 tree walk above already classified its objects.
+                "commit" => {}
+                // A peeled type of `tag` means this git peeled only one
+                // level (see the format comment above; stock git 2.50 peels
+                // the whole chain and never lands here). Finish the peel
+                // with `^{}`, which is recursive by definition, and type the
+                // final referent. Fail closed on either child erroring — an
+                // unclassifiable ref target must abort the walk, not
+                // silently under-withhold.
+                "tag" => {
+                    let full = run_bounded_git(
+                        git_bin,
+                        &["rev-parse", &format!("{oid}^{{}}")],
+                        repo_path,
+                        b"",
+                        deadline,
+                    )?;
+                    let full_oid = String::from_utf8_lossy(&full).trim().to_string();
+                    let ty_out = run_bounded_git(
+                        git_bin,
+                        &["cat-file", "-t", &full_oid],
+                        repo_path,
+                        b"",
+                        deadline,
+                    )?;
+                    let ty = String::from_utf8_lossy(&ty_out).trim().to_string();
+                    if ty == "blob" || ty == "tree" {
+                        out.insert((full_oid, String::new()));
+                    }
+                }
+                other => {
+                    anyhow::bail!("for-each-ref peeled {oid} to unexpected object type {other:?}")
+                }
+            }
         }
     }
     Ok(out.into_iter().collect())
