@@ -254,7 +254,15 @@ fn decompress_repo(data: &[u8], local_path: &Path) -> Result<()> {
     // extractions of the same repo share one dir and clobber each other's
     // in-progress unpack. A fresh UUID also means it can't collide with a
     // leftover dir from a previously-interrupted run.
-    let tmp_dir = parent.join(format!(".{file_name}.tmp-extract.{}", uuid::Uuid::new_v4()));
+    //
+    // Built through the shared sibling barrier rather than a bare `join`: the
+    // name embeds `file_name`, which carries user-provided data from the repo
+    // name, and this path is handed straight to `create_dir_all`, `unpack` and
+    // `remove_dir_all`. See `repo_store::validated_sibling_path`.
+    let tmp_dir = crate::git::repo_store::validated_sibling_path(
+        local_path,
+        &format!(".{file_name}.tmp-extract.{}", uuid::Uuid::new_v4()),
+    )?;
 
     std::fs::create_dir_all(&tmp_dir).context("creating temp extract dir")?;
 
@@ -282,7 +290,13 @@ fn decompress_repo(data: &[u8], local_path: &Path) -> Result<()> {
         // backup so `local_path` is never left without a valid repo. (Most
         // platforms refuse to rename onto a non-empty dir, hence the move-aside.)
         let backup = if local_path.exists() {
-            let b = parent.join(format!(".{file_name}.bak-{}", uuid::Uuid::new_v4()));
+            // Same sibling barrier as the temp-extract dir above: the name
+            // embeds the user-provided repo file name, and this path is renamed
+            // onto and later removed recursively.
+            let b = crate::git::repo_store::validated_sibling_path(
+                local_path,
+                &format!(".{file_name}.bak-{}", uuid::Uuid::new_v4()),
+            )?;
             std::fs::rename(local_path, &b).context("moving existing repo to backup")?;
             Some(b)
         } else {

@@ -210,14 +210,21 @@ fn inv22_concurrency_gates_present_and_not_bypassed() {
     }
 }
 
-/// F4 (repo_store advisory-unlock cancellation safety): `RepoWriteGuard::release`
-/// must await `pg_advisory_unlock` while `self` still owns the pooled connection,
-/// and must not mark itself `released` until that await resolves. Either shape,
+/// F4 (repo_store advisory-unlock cancellation safety): the advisory unlock must
+/// be awaited while its owner still holds the pooled connection, and the owner
+/// must not mark itself `released` until that await resolves. Either shape,
 /// reintroduced, re-opens the mid-unlock cancellation leak: taking the connection
 /// early leaves `Drop` with `conn == None`, and setting `released = true` early
 /// leaves the `Drop` backstop inert — both strand the session lock on cancellation.
 ///
-/// Scoped to the `release` fn body: the `Drop` impl legitimately takes the
+/// The guarded code MOVED with the storage-abstraction layer: the unlock used to
+/// live in `RepoWriteGuard::release`, and now lives in `LockedConn::unlock`, the
+/// type that owns a lock's whole pinned-connection lifetime (the guard delegates
+/// to it, and the write-back path drives it from a detached task, which is the
+/// cancellation shape this gate exists for). The invariant is unchanged, so this
+/// gate follows the code rather than being deleted with it.
+///
+/// Scoped to the `unlock` fn body: the `Drop` impl legitimately takes the
 /// connection and unlocks, so a whole-file scan would match it and read as a false
 /// pass. Reverting either ordering turns this red (proven load-bearing).
 #[test]
@@ -225,12 +232,12 @@ fn f4_release_keeps_conn_owned_until_unlock_resolves() {
     let repo_store = src("git/repo_store.rs");
 
     let rel_start = repo_store
-        .find("pub async fn release(mut self")
-        .expect("F4 gate: repo_store.rs no longer defines RepoWriteGuard::release");
+        .find("async fn unlock(mut self")
+        .expect("F4 gate: repo_store.rs no longer defines LockedConn::unlock");
     let rel_end = repo_store[rel_start..]
-        .find("impl Drop for RepoWriteGuard")
+        .find("impl Drop for LockedConn")
         .map(|off| rel_start + off)
-        .expect("F4 gate: release fn / Drop impl markers moved — update this guard");
+        .expect("F4 gate: unlock fn / Drop impl markers moved — update this guard");
     let release_body = &repo_store[rel_start..rel_end];
 
     let unlock = release_body
@@ -241,7 +248,7 @@ fn f4_release_keeps_conn_owned_until_unlock_resolves() {
     // (a) the connection must still be owned by `self` at the unlock await.
     assert!(
         !before_unlock.contains("self.conn.take()"),
-        "F4 regression: RepoWriteGuard::release takes self.conn BEFORE awaiting \
+        "F4 regression: LockedConn::unlock takes self.conn BEFORE awaiting \
          pg_advisory_unlock. A cancellation during the unlock await then strands the \
          session advisory lock (Drop sees conn == None and skips its backstop). \
          Unlock through the still-owned connection instead."
@@ -250,7 +257,7 @@ fn f4_release_keeps_conn_owned_until_unlock_resolves() {
     // reintroduction shape a single-reorder check on (a) alone is blind to.
     assert!(
         !before_unlock.contains("released = true"),
-        "F4 regression: RepoWriteGuard::release sets `released = true` BEFORE awaiting \
+        "F4 regression: LockedConn::unlock sets `released = true` BEFORE awaiting \
          pg_advisory_unlock. A cancellation during the await then leaves the Drop \
          backstop inert (it early-returns on released). Set released only AFTER the \
          unlock await resolves."

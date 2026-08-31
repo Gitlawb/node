@@ -165,7 +165,13 @@ impl RepoStore {
             return Ok(());
         };
 
-        let marker = pending_upload_marker(local_path);
+        // The repo path arrived as a parameter, so re-establish the traversal
+        // barrier here, where the filesystem work happens, rather than relying
+        // on the caller having built it through `validated_repo_disk_path`. See
+        // `validated_repo_path_in`.
+        let local_path = &validated_repo_path_in(&self.repos_dir, local_path)?;
+
+        let marker = pending_upload_marker(local_path)?;
         // try_exists, not exists(): a transient EACCES/EIO must not read as
         // "no marker" — that path downloads and can roll back a pending local
         // write. Fail the write path closed; treat as present on the read path.
@@ -351,7 +357,11 @@ impl RepoStore {
                 // knows nothing about markers, so its upload would strand the
                 // marker with a base that no longer matches storage, wedging
                 // the repo's writes on a spurious divergence.
-                let marker_pending = pending_upload_marker(&local_path).exists();
+                // A path the barrier rejects cannot carry a marker we wrote, so
+                // it reads as "not pending" and migration proceeds under the
+                // lock exactly as it would for an unmarked repo.
+                let marker_pending =
+                    pending_upload_marker(&local_path).is_ok_and(|marker| marker.exists());
                 if !already_migrated && !marker_pending {
                     let this = self.clone();
                     let slug = owner_slug.clone();
@@ -569,11 +579,8 @@ impl RepoStore {
     /// protects the mutation from a stale-archive rollback).
     pub fn pending_marker_exists(&self, owner_did: &str, repo_name: &str) -> bool {
         self.local_path(owner_did, repo_name)
-            .map(|(_, local_path)| {
-                pending_upload_marker(&local_path)
-                    .try_exists()
-                    .unwrap_or(false)
-            })
+            .and_then(|(_, local_path)| pending_upload_marker(&local_path))
+            .map(|marker| marker.try_exists().unwrap_or(false))
             .unwrap_or(false)
     }
 
@@ -635,11 +642,23 @@ impl RepoStore {
                 let Some(repo_name) = repo_dir.strip_suffix(".git") else {
                     continue;
                 };
-                markers.push((
-                    slug.clone(),
-                    repo_name.to_string(),
-                    owner.path().join(repo_dir),
-                ));
+                // The repo dir name comes off the filesystem here rather than
+                // from a request, but it is a name this node wrote from
+                // user-provided data and the result is handed to the upload
+                // path's fs calls, so it goes through the same barrier as every
+                // other repo path. A sweep entry that fails it is litter no
+                // legitimate write could have produced: skip it rather than
+                // acting on it.
+                let repo_path =
+                    match validated_repo_path_in(&self.repos_dir, &owner.path().join(repo_dir)) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!(dir = %owner.path().display(), err = %e,
+                            "pending-upload sweep: rejecting an unsafe repo path — skipped");
+                            continue;
+                        }
+                    };
+                markers.push((slug.clone(), repo_name.to_string(), repo_path));
             }
         }
 
@@ -890,6 +909,109 @@ pub(crate) fn validated_repo_disk_path(
     }
 
     Ok(local_path)
+}
+
+/// Re-establish the traversal barrier on a repo path this function did not
+/// build itself, and return the checked value.
+///
+/// `sync_down_if_stale` and the sweep receive a `&Path` as a PARAMETER. The
+/// caller derived it from [`validated_repo_disk_path`], but a barrier the
+/// reader has to trace across a call boundary is not a barrier a static
+/// analyser will honour: to CodeQL's `rust/path-injection` the parameter is
+/// just a path with user-provided data in its history, and every `exists()`,
+/// `read_dir` and `remove_file` reached from it is a sink. Re-running the
+/// check where the filesystem work actually happens costs two string compares
+/// on a path we already hold and makes the guarantee local to the code it
+/// guards, so it survives future refactors that move a call site.
+///
+/// Same three layers as [`validated_repo_disk_path`], minus the name allowlist
+/// (the components are no longer separable once joined): containment under
+/// `repos_dir`, then the explicit `Component::Normal` walk.
+pub(crate) fn validated_repo_path_in(repos_dir: &Path, candidate: &Path) -> Result<PathBuf> {
+    if !candidate.starts_with(repos_dir) {
+        anyhow::bail!("repo path escaped repos_dir: {}", candidate.display());
+    }
+
+    // Explicit component walk — sanitisation barrier that static analysers
+    // (CodeQL `rust/path-injection`) recognise. The path must be composed
+    // entirely of Normal segments after the root prefix; any ParentDir or
+    // CurDir component is a traversal attempt.
+    for component in candidate.components() {
+        use std::path::Component;
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {}
+            Component::ParentDir => {
+                anyhow::bail!("path contains parent-directory component");
+            }
+            Component::CurDir => {
+                anyhow::bail!("path contains current-directory component");
+            }
+        }
+    }
+
+    Ok(candidate.to_path_buf())
+}
+
+/// The sibling-path counterpart to [`validated_repo_disk_path`], for the files
+/// this layer writes NEXT TO a repo directory rather than inside it: the
+/// pending-upload marker, its rename-temp, and the swap phase's `.bak-` and
+/// `.tmp-extract.` work dirs.
+///
+/// A validated repo path does not make its siblings validated. `with_file_name`
+/// and `join` build a NEW path, and a new path is a new question: nothing in
+/// the type system says the name handed in contributed no separator, no `..`,
+/// and no absolute prefix (a `join` with an absolute component silently
+/// DISCARDS everything accumulated before it). These names are assembled from
+/// the repo's own file name, which carries user-provided data all the way from
+/// the push URL, so each one is re-checked here before any filesystem call
+/// touches it.
+///
+/// Three layers, mirroring the repo-path barrier: the name must be a single
+/// ordinary path segment, the result must stay under the repo's parent
+/// directory, and the joined path must walk as `Component::Normal` throughout.
+/// The returned `PathBuf` is the only value callers hand to the filesystem.
+pub(crate) fn validated_sibling_path(local_path: &Path, file_name: &str) -> Result<PathBuf> {
+    let parent = local_path
+        .parent()
+        .context("repo path has no parent directory")?;
+
+    if file_name.is_empty() {
+        anyhow::bail!("sibling file name is empty");
+    }
+    if file_name.len() > 255 {
+        anyhow::bail!("sibling file name exceeds the 255-byte filesystem name limit");
+    }
+    if file_name == "." || file_name == ".." || file_name.contains("..") {
+        anyhow::bail!("sibling file name contains a parent-directory reference");
+    }
+    if file_name.contains('/') || file_name.contains('\\') || file_name.contains('\0') {
+        anyhow::bail!("sibling file name contains a path separator or null byte");
+    }
+
+    let candidate = parent.join(file_name);
+
+    if !candidate.starts_with(parent) {
+        anyhow::bail!("sibling path escaped the repo parent dir: {file_name}");
+    }
+
+    // Explicit component walk — sanitisation barrier that static analysers
+    // (CodeQL `rust/path-injection`) recognise. The path must be composed
+    // entirely of Normal segments after the root prefix; any ParentDir or
+    // CurDir component is a traversal attempt.
+    for component in candidate.components() {
+        use std::path::Component;
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {}
+            Component::ParentDir => {
+                anyhow::bail!("path contains parent-directory component");
+            }
+            Component::CurDir => {
+                anyhow::bail!("path contains current-directory component");
+            }
+        }
+    }
+
+    Ok(candidate)
 }
 
 /// Strict allowlist validator for `owner_did` and `repo_name`.
@@ -1147,10 +1269,20 @@ async fn close_conn_bounded(
 /// pool — and the lock pool's `after_release` hook (`pg_advisory_unlock_all`)
 /// backstops even the paths it cannot see (#173).
 struct LockedConn {
-    /// `None` once `unlock()` has run.
+    /// The connection that TOOK the advisory lock, owned until the unlock await
+    /// RESOLVES. `Option` because the unlock is not always the end of it: when
+    /// `pg_advisory_unlock` errors on a live session, `after_release` fails
+    /// identically on that same broken session (#174 F3b), so those paths
+    /// `take()` the connection and close it instead — ending the session is what
+    /// actually frees the lock. `None` only after such a disposal, or after
+    /// `Drop` has moved it into the detached unlock.
     conn: Option<PoolConnection<Postgres>>,
     lock_key: i64,
     repo_label: String,
+    /// Set once `unlock()`'s await has resolved, making the `Drop` backstop
+    /// inert. A `LockedConn` only ever exists with the lock already held, so
+    /// there is no "never locked" state to track alongside it.
+    released: bool,
 }
 
 impl LockedConn {
@@ -1198,6 +1330,7 @@ impl LockedConn {
                         conn: Some(conn),
                         lock_key,
                         repo_label: repo_label.to_string(),
+                        released: false,
                     });
                 }
                 Ok((false,)) => {
@@ -1232,17 +1365,39 @@ impl LockedConn {
     /// (#174 F3b) — so the connection is closed instead (bounded, #174 F3c):
     /// ending the session is what actually frees the lock.
     async fn unlock(mut self) {
-        if let Some(mut conn) = self.conn.take() {
-            if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
-                .bind(self.lock_key)
-                .execute(&mut *conn)
-                .await
-            {
-                warn!(repo = %self.repo_label, err = %e,
-                    "advisory unlock failed, closing the connection so the session ends and postgres drops the lock");
+        // Unlock through the connection while it is STILL owned by `self`; do
+        // NOT `take()` it first. A cancellation during this await then drops
+        // `self` with the connection in place, so `Drop`'s detached backstop
+        // runs and the pool's `after_release` hook clears whatever the
+        // interrupted unlock did not (#174 F4). Taking it early would leave
+        // `Drop` with `conn == None` and strand the session lock.
+        let unlock = match self.conn.as_deref_mut() {
+            Some(conn) => Some(
+                sqlx::query("SELECT pg_advisory_unlock($1)")
+                    .bind(self.lock_key)
+                    .execute(&mut *conn)
+                    .await,
+            ),
+            None => None,
+        };
+        // An unlock that ERRORS is a different failure from a cancellation: the
+        // await resolved, so the session is alive and still holds the lock, and
+        // returning that connection to the pool does not recover it because
+        // `after_release` runs its `pg_advisory_unlock_all()` on the same broken
+        // session and fails identically (#174 F3b). Close it: ending the session
+        // is what frees the lock.
+        if let Some(Err(e)) = unlock {
+            warn!(repo = %self.repo_label, err = %e,
+                "advisory unlock failed, closing the connection so the session ends and postgres drops the lock");
+            if let Some(conn) = self.conn.take() {
                 close_conn_bounded(&self.repo_label, conn.close()).await;
             }
         }
+        // Only now that the await has resolved: mark released so the `Drop`
+        // backstop below does not re-issue an unlock on a lock already freed.
+        // On the clean path, dropping `self` returns the connection to the lock
+        // pool, where `after_release` sweeps anything this missed.
+        self.released = true;
     }
 }
 
@@ -1262,6 +1417,9 @@ impl Drop for LockedConn {
     /// lock server-side (and detaching first avoids sqlx's return-to-pool
     /// spawn, which panics off-runtime).
     fn drop(&mut self) {
+        if self.released {
+            return;
+        }
         let Some(mut conn) = self.conn.take() else {
             return;
         };
@@ -1445,12 +1603,27 @@ impl RepoWriteGuard {
 /// from "local is ahead of storage" (never download — that would roll back an
 /// acked write). Lives next to the repo dir, not inside it, so it is never
 /// packed into the archive.
-fn pending_upload_marker(local_path: &Path) -> PathBuf {
+/// Fallible because it goes through [`validated_sibling_path`]: the marker name
+/// is built from the repo's own file name, which carries user-provided data, so
+/// the path is re-checked here rather than trusted from the repo path's own
+/// earlier validation. Callers that cannot propagate the error (the `Drop`-like
+/// cleanup paths) treat a rejected path as "no marker", which is the same
+/// conservative answer they already give for an unreadable one.
+fn pending_upload_marker(local_path: &Path) -> Result<PathBuf> {
     let name = local_path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    local_path.with_file_name(format!(".{name}.pending-upload"))
+    validated_sibling_path(local_path, &format!(".{name}.pending-upload"))
+}
+
+/// The marker's rename-temp sibling. Same barrier, same reason; the UUID is
+/// ours but the prefix is not, and one helper means the two cannot drift.
+fn pending_upload_marker_tmp(local_path: &Path) -> Result<PathBuf> {
+    validated_sibling_path(
+        local_path,
+        &format!(".pending-upload.tmp-{}", uuid::Uuid::new_v4()),
+    )
 }
 
 /// Persist the intent-to-upload marker. Fallible (write-back callers must NOT
@@ -1470,13 +1643,13 @@ fn pending_upload_marker(local_path: &Path) -> PathBuf {
 /// wedging the repo's whole write surface after two consecutive upload
 /// failures.
 fn mark_pending_upload(local_path: &Path, base_etag: Option<&str>) -> Result<()> {
-    let marker = pending_upload_marker(local_path);
+    let marker = pending_upload_marker(local_path)?;
     match marker.try_exists() {
         Ok(true) => return Ok(()), // keep the original base
         Ok(false) => {}
         Err(e) => return Err(e).context("probing pending-upload marker"),
     }
-    let tmp = marker.with_file_name(format!(".pending-upload.tmp-{}", uuid::Uuid::new_v4()));
+    let tmp = pending_upload_marker_tmp(local_path)?;
     std::fs::write(&tmp, base_etag.unwrap_or_default()).context("writing pending-upload marker")?;
     std::fs::rename(&tmp, &marker)
         .inspect_err(|_| {
@@ -1488,7 +1661,13 @@ fn mark_pending_upload(local_path: &Path, base_etag: Option<&str>) -> Result<()>
 }
 
 pub(crate) fn clear_pending_upload(local_path: &Path) {
-    if std::fs::remove_file(pending_upload_marker(local_path)).is_ok() {
+    // A path the barrier rejects is one we must never have written, so there is
+    // nothing to clear and nothing to report: the same no-op this already
+    // performs for a marker that is simply absent.
+    let Ok(marker) = pending_upload_marker(local_path) else {
+        return;
+    };
+    if std::fs::remove_file(marker).is_ok() {
         crate::metrics::add_pending_upload_markers(-1);
     }
 }
@@ -1516,7 +1695,14 @@ impl PendingMarker {
 }
 
 fn read_pending_marker(local_path: &Path) -> PendingMarker {
-    let content = std::fs::read_to_string(pending_upload_marker(local_path)).unwrap_or_default();
+    // A rejected path reads as an empty marker, which is what an absent or
+    // unreadable one already produces: an empty base matches only empty
+    // storage, so recovery stays conservative rather than claiming a base it
+    // never confirmed.
+    let content = pending_upload_marker(local_path)
+        .ok()
+        .and_then(|marker| std::fs::read_to_string(marker).ok())
+        .unwrap_or_default();
     let mut lines = content.lines();
     let base = lines.next().unwrap_or("").trim().to_string();
     let inflight = lines
@@ -1534,9 +1720,9 @@ fn read_pending_marker(local_path: &Path) -> PendingMarker {
 /// describes must not run (the caller aborts the upload), or a crash after
 /// that PUT reads as external divergence.
 fn record_inflight_upload(local_path: &Path, intended_etag: &str) -> Result<()> {
-    let marker = pending_upload_marker(local_path);
+    let marker = pending_upload_marker(local_path)?;
     let base = read_pending_marker(local_path).base;
-    let tmp = marker.with_file_name(format!(".pending-upload.tmp-{}", uuid::Uuid::new_v4()));
+    let tmp = pending_upload_marker_tmp(local_path)?;
     std::fs::write(&tmp, format!("{base}\n{intended_etag}"))
         .context("writing in-flight upload intent")?;
     std::fs::rename(&tmp, &marker)
@@ -1553,15 +1739,19 @@ fn record_inflight_upload(local_path: &Path, intended_etag: &str) -> Result<()> 
 /// would wedge the repo behind a spurious permanent divergence even though
 /// local and storage are identical.
 fn clear_pending_upload_after_success(local_path: &Path, new_etag: Option<&str>) {
-    let marker = pending_upload_marker(local_path);
+    // As in `clear_pending_upload`: a path the barrier rejects is one nothing
+    // ever wrote, so there is no marker to rewrite and none to unlink.
+    let Ok(marker) = pending_upload_marker(local_path) else {
+        return;
+    };
     if let Some(etag) = new_etag {
         if marker.exists() {
-            let tmp =
-                marker.with_file_name(format!(".pending-upload.tmp-{}", uuid::Uuid::new_v4()));
-            if std::fs::write(&tmp, etag).is_ok() {
-                let _ = std::fs::rename(&tmp, &marker);
-            } else {
-                let _ = std::fs::remove_file(&tmp);
+            if let Ok(tmp) = pending_upload_marker_tmp(local_path) {
+                if std::fs::write(&tmp, etag).is_ok() {
+                    let _ = std::fs::rename(&tmp, &marker);
+                } else {
+                    let _ = std::fs::remove_file(&tmp);
+                }
             }
         }
     }
@@ -3287,7 +3477,7 @@ mod tests {
         let guard = store.acquire_write("owner", "repo").await.unwrap();
         guard.release(true).await.unwrap();
         assert!(
-            !pending_upload_marker(&local).exists(),
+            !pending_upload_marker(&local).unwrap().exists(),
             "marker must be cleared by a successful upload"
         );
         let out = tempfile::tempdir().unwrap();
@@ -3375,7 +3565,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read(local.join("HEAD")).unwrap(), b"v1\n");
-        assert!(!pending_upload_marker(&local).exists());
+        assert!(!pending_upload_marker(&local).unwrap().exists());
     }
 
     #[tokio::test]
@@ -3544,7 +3734,7 @@ mod tests {
             .fail_put
             .store(false, std::sync::atomic::Ordering::Relaxed);
         guard.release(true).await.unwrap();
-        assert!(!pending_upload_marker(&local).exists());
+        assert!(!pending_upload_marker(&local).unwrap().exists());
     }
 
     /// jatmn P1 regression: the write-back ack window. `mark_pending` runs
@@ -3622,7 +3812,7 @@ mod tests {
             .await
             .expect("own completed upload must not read as divergence");
         assert!(
-            !pending_upload_marker(&local).exists(),
+            !pending_upload_marker(&local).unwrap().exists(),
             "marker must be cleared once storage is recognized as our upload"
         );
         assert_eq!(std::fs::read(local.join("HEAD")).unwrap(), b"uploaded\n");
@@ -3756,8 +3946,8 @@ mod tests {
 
         let (reuploaded, still_pending) = store.retry_pending_uploads().await;
         assert_eq!((reuploaded, still_pending), (1, 1));
-        assert!(!pending_upload_marker(&local_a).exists());
-        assert!(pending_upload_marker(&local_b).exists());
+        assert!(!pending_upload_marker(&local_a).unwrap().exists());
+        assert!(pending_upload_marker(&local_b).unwrap().exists());
 
         // A's local content is now durably in storage.
         let out = tempfile::tempdir().unwrap();
