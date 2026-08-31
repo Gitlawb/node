@@ -4063,9 +4063,21 @@ mod tests {
         // ref check); rev-parse resolves HEAD; rev-list lists the one commit; ls-tree
         // emits "<mode> blob <oid>\t<path>" (NUL-delimited) under secret/ and burns
         // 1.2s of the 2s budget; pack-objects is the serve's 1.2s cost.
+        //
+        // #218 review round 8 P1 (fixture, not production): the `for-each-ref` arm
+        // must answer in the COLUMN SHAPE `blob_paths` phase 2 asks for
+        // (`%(objectname) %(objecttype)`, plus the peeled `%(*objectname)
+        // %(*objecttype)` pair when the tip is a tag), not a ref NAME. A single
+        // bare token made the phase-2 parse fail closed, so the walk returned an
+        // error and the request surfaced as a generic 500 — which silently
+        // repurposed this test from "the filtered serve shares the deadline" into
+        // "the walk errors", losing the #174 guard while looking merely red. A
+        // commit tip peels to nothing, so two columns is the whole line here; the
+        // 1.2s walk cost stays on `ls-tree` so walk and serve remain independently
+        // attributable.
         let body = format!(
             "#!/bin/sh\ncase \"$1\" in\n  \
-             for-each-ref) echo refs/heads/main ;;\n  \
+             for-each-ref) echo {commit} commit ;;\n  \
              cat-file) echo commit ;;\n  \
              rev-parse) echo {commit} ;;\n  \
              rev-list) echo {commit} ;;\n  \
