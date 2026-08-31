@@ -72,6 +72,9 @@ services:
       GITLAWB_BOOTSTRAP_PEERS: $${GITLAWB_BOOTSTRAP_PEERS}
       GITLAWB_AUTO_SYNC: $${GITLAWB_AUTO_SYNC}
       GITLAWB_MAX_PACK_BYTES: $${GITLAWB_MAX_PACK_BYTES}
+      # Owner-only push. Matches the node's own default; forwarding it is what makes
+      # the documented rolling-upgrade opt-out reachable on the container path.
+      GITLAWB_ENFORCE_OWNER_PUSH: $${GITLAWB_ENFORCE_OWNER_PUSH:-true}
       # On-chain PoS (optional — empty unless set in terraform.tfvars)
       GITLAWB_CHAIN_RPC_URL: $${GITLAWB_CHAIN_RPC_URL}
       GITLAWB_CONTRACT_NODE_STAKING: $${GITLAWB_CONTRACT_NODE_STAKING}

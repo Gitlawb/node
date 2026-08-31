@@ -14,13 +14,13 @@ use tokio::process::Command;
 /// the work they admitted, so admission is released only when that work is truly
 /// done — not the instant the handler future drops on a client disconnect.
 ///
-/// A move-only wrapper: no methods beyond construction and `Drop`. The handler
-/// MOVEs its permits in and keeps no copy (a retained copy would drop early and
-/// release admission the moment the future is dropped, defeating the guard). It is
-/// threaded into `drive_git_child`, whose [`KillGroupOnDrop`] moves it into the
-/// detached reaper on disconnect, so both permits drop only after the process group
-/// is confirmed reaped (`kill(-pgid,0)==ESRCH`) rather than while the group is still
-/// alive holding PIDs past the concurrency cap (#174 P1-a, plain-spawn residual).
+/// A drop-only wrapper: nothing here inspects what it holds. The handler MOVEs its
+/// permits in and keeps no copy (a retained copy would drop early and release admission
+/// the moment the future is dropped, defeating the guard). It is threaded into
+/// `drive_git_child`, whose [`KillGroupOnDrop`] moves it into the detached reaper on
+/// disconnect, so both permits drop only after the process group is confirmed reaped
+/// (`kill(-pgid,0)==ESRCH`) rather than while the group is still alive holding PIDs past
+/// the concurrency cap (#174 P1-a, plain-spawn residual).
 ///
 /// The `be0cdd6` path-scoped upload-pack walk already applies this discipline by
 /// moving its permits into the `spawn_blocking`; this generalizes it to the plain
@@ -33,6 +33,8 @@ pub struct AdmissionGuard {
     // 'static` so the guard can move into the detached reaper task.
     _global: Option<Box<dyn Send + 'static>>,
     _caller: Option<Box<dyn Send + 'static>>,
+    // Any further work-scoped hold that must outlive the process group; see `with_hold`.
+    _hold: Option<Box<dyn Send + 'static>>,
     // Per-repo write lease (#174 U2/F3), `Some` ONLY on the receive-pack write path
     // (via [`with_lease`](Self::with_lease)); `None` on every read path and every
     // non-receive-pack write path. It rides this guard into `KillGroupOnDrop`'s detached
@@ -54,8 +56,24 @@ impl AdmissionGuard {
         Self {
             _global: Some(Box::new(global)),
             _caller: caller.map(|c| Box::new(c) as Box<dyn Send + 'static>),
+            _hold: None,
             _lease: None,
         }
+    }
+
+    /// Attach a further hold that must not be released until the process group is
+    /// reaped, and ride it through the same seam as the permits.
+    ///
+    /// The push handler uses this for the repo WRITE LOCK (#173 F2). Its
+    /// `guard.release(..)` line is only reached if `receive_pack` returns, so on a client
+    /// disconnect the lock used to be freed by the dropped future while the detached
+    /// reaper was still giving the group its SIGTERM grace, admitting a second
+    /// `receive-pack` on the same repo. Carrying the lock here holds it until the group
+    /// is ESRCH-confirmed gone, which is the same invariant the timeout path already
+    /// keeps ("a caller releasing a write lock can't race them", `reap_group_on_timeout`).
+    pub fn with_hold(mut self, hold: impl Send + 'static) -> Self {
+        self._hold = Some(Box::new(hold));
+        self
     }
 
     /// Attach the per-repo write lease (#174 U2/F3). Called ONLY on the receive-pack
@@ -92,7 +110,7 @@ pub async fn info_refs(
         .arg("--stateless-rpc")
         .arg("--advertise-refs")
         .arg(repo_path);
-    // No request body — advertise-refs does not read stdin.
+    // No request body: advertise-refs does not read stdin.
     let (stdout, admission) =
         drive_git_child(command, Bytes::new(), timeout, "advertise-refs", admission).await?;
     // Single-stage op: the advertisement's group is reaped by now; release admission
@@ -659,14 +677,15 @@ pub async fn build_filtered_pack(
     command
         .args(["pack-objects", "--stdout"])
         .current_dir(repo_path);
-    drive_git_child(
+    let (out, admission) = drive_git_child(
         command,
         Bytes::from(data),
         deadline.saturating_duration_since(Instant::now()),
         "pack-objects",
         admission,
     )
-    .await
+    .await?;
+    Ok((out, admission))
 }
 
 /// Serve a clone/fetch with the withheld blobs removed from the response pack.
@@ -1877,6 +1896,143 @@ mod tests {
         assert!(
             err.downcast_ref::<GitServiceTimeout>().is_some(),
             "a hung rev-list must abort with GitServiceTimeout, got: {err}"
+        );
+    }
+
+    // #174 U1 (R2, KTD3, RED-before/GREEN-after): the path-scoped filtered-pack serve
+    // must hold read + per-caller admission until its pack-objects process group is
+    // reaped on a client disconnect, exactly as the plain upload_pack path does. Before
+    // the fix build_filtered_pack took no AdmissionGuard and the handler's `_hold`
+    // permits dropped the instant the request future was dropped, so disconnect-spam on
+    // a path-scoped repo could hold PIDs past the concurrency cap while the permits were
+    // already free (#174 P1-a, on the filtered path the plain path had already closed).
+    //
+    // A real AdmissionGuard built from two owned semaphore permits rides
+    // rev-list -> pack-objects. We drive the future until pack-objects has forked its
+    // grandchild (the streaming pack-writer stand-in), assert the permits are still held
+    // mid-serve, then DROP the future (client disconnect) and assert the permits are
+    // released only AFTER the group is ESRCH-confirmed gone — never while it is alive.
+    // Goes RED if the guard is not threaded into the pack-objects stage (it would then
+    // drop after rev-list, freeing the permits mid-serve or on the bare future drop).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filtered_pack_holds_admission_until_group_reaped_on_disconnect() {
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pidfile = tmp.path().join("pids");
+        // rev-list returns one oid fast; pack-objects forks a grandchild (the streaming
+        // writer stand-in), records leader+grandchild pids, then hangs so the future
+        // parks mid-serve with the guard owned by the pack-objects KillGroupOnDrop. The
+        // grandchild inherits (holds open) the stdout pipe, so drive_git_child's
+        // read_to_end blocks and the future stays pending until we drop it.
+        let body = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  rev-list) echo deadbeefdeadbeefdeadbeefdeadbeefdeadbeef ;;\n  pack-objects) sleep 300 &\nprintf '%s\\n%s\\n' \"$$\" \"$!\" > \"{}\"\nwait ;;\n  *) exit 1 ;;\nesac\n",
+            pidfile.display()
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+        let withheld = HashSet::new();
+
+        // Retry the fake-git spawn race like the sibling disconnect test; each attempt
+        // gets a FRESH semaphore so a dropped losing attempt can't skew the winning
+        // attempt's permit accounting. Keep the winning attempt's future PENDING so the
+        // drop below exercises the client-disconnect teardown.
+        let (fut, sem, leader, grandchild) = {
+            let mut attempt = 0u64;
+            loop {
+                attempt += 1;
+                let _ = std::fs::remove_file(&pidfile);
+                // Semaphore(4): two owned permits model the handler's global-read +
+                // per-caller admission, leaving 2 available while the op is in flight.
+                let sem = Arc::new(Semaphore::new(4));
+                let g = sem.clone().try_acquire_owned().unwrap();
+                let c = sem.clone().try_acquire_owned().unwrap();
+                let admission = AdmissionGuard::new(g, Some(c));
+                let mut fut = Box::pin(build_filtered_pack(
+                    git_bin.to_str().unwrap(),
+                    tmp.path(),
+                    &withheld,
+                    Duration::from_secs(60),
+                    Some(admission),
+                ));
+                // Advance the future a slice at a time until the fake records its pids
+                // (i.e. pack-objects is running). `Ok(_)` means the future returned
+                // before the pidfile appeared (spawn error / early exit); stop polling
+                // then, since re-polling a completed future panics.
+                let mut pids = None;
+                for _ in 0..500 {
+                    let finished = tokio::time::timeout(Duration::from_millis(10), &mut fut)
+                        .await
+                        .is_ok();
+                    if let Some(p) = read_two_pids(&pidfile) {
+                        pids = Some(p);
+                        break;
+                    }
+                    if finished {
+                        break;
+                    }
+                }
+                match pids {
+                    Some((l, gch)) => break (fut, sem, l, gch),
+                    None => {
+                        // Transient spawn miss: drop the still-armed future so its guard
+                        // reaps anything that spawned (and returns the permits), then
+                        // back off before retrying.
+                        drop(fut);
+                        assert!(
+                            attempt < FAKE_GIT_RETRY_ATTEMPTS,
+                            "fake git failed to reach the pack-objects stage after \
+                             {FAKE_GIT_RETRY_ATTEMPTS} attempts (persistent failure, \
+                             not a transient parallel-runner miss)"
+                        );
+                        tokio::time::sleep(Duration::from_millis(
+                            FAKE_GIT_BACKOFF_STEP_MS * attempt,
+                        ))
+                        .await;
+                    }
+                }
+            }
+        };
+        let _cleanup = ReapOnPanic(vec![leader, grandchild]);
+        assert!(alive(grandchild), "grandchild must be running mid-serve");
+
+        // Mid-serve: the pack-objects stage owns the guard, so the two permits are still
+        // held. A build that dropped the guard after rev-list (unthreaded pack-objects
+        // stage) would have freed them here.
+        assert_eq!(
+            sem.available_permits(),
+            2,
+            "admission permits must be held while the filtered serve is in flight"
+        );
+
+        // Client disconnect: drop the request future. The pack-objects KillGroupOnDrop
+        // must tear the group down AND hold the permits until the group is
+        // ESRCH-confirmed gone, releasing them only then.
+        drop(fut);
+
+        let mut released_while_alive = false;
+        let mut released_after_reap = false;
+        for _ in 0..500 {
+            let released = sem.available_permits() == 4;
+            let group_alive = alive(grandchild);
+            if released && group_alive {
+                released_while_alive = true;
+            }
+            if released && !group_alive {
+                released_after_reap = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !released_while_alive,
+            "admission permits were released while the git group was still alive — the \
+             path-scoped concurrency-cap bypass (#174 P1-a) is open"
+        );
+        assert!(
+            released_after_reap,
+            "admission permits must be released once the group is reaped on disconnect"
         );
     }
 
