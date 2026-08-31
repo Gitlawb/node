@@ -10,34 +10,64 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client as S3Client;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-/// The precondition an upload is fenced on.
-///
-/// Object storage is the only place a fence can hold. Dropping the future of an
-/// in-flight PUT does not cancel the request the server is already processing,
-/// so no amount of local locking stops an abandoned writer's bytes from landing
-/// after a successor has published. A conditional PUT the store itself refuses
-/// is what actually stops it.
-#[derive(Clone, Debug)]
-pub enum UploadPrecondition {
-    /// Publish only if the stored object is still the generation we observed.
-    IfMatch(String),
-    /// Publish only if nothing is stored under the key yet.
-    IfAbsent,
-    /// No fence. Last writer wins.
-    Unconditional,
+// The publication vocabulary lives in `git::publish`, which carries no
+// object-storage types, and is re-exported here so existing `git::tigris::…`
+// imports keep resolving. #79 deletes this file; `git::publish` is what survives
+// the swap, and the only backend-aware code below is `classify_dispatch`.
+pub use super::publish::{
+    DispatchKnowledge, PublishAttemptId, PublishStage, PublishStageCell, StoredGeneration,
+    UploadError, UploadPrecondition, UploadReceipt, ATTEMPT_METADATA_KEY,
+};
+
+/// What happened to a conditional, attempt-guarded delete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttemptDelete {
+    /// The object was this attempt's and is gone.
+    Deleted,
+    /// Nothing is stored under the key.
+    Absent,
+    /// Something is stored, and it is NOT this attempt's work. Left alone.
+    NotOurs,
 }
 
-/// Why an upload failed, split so a caller can tell "someone else already
-/// published this key" (expected, and dropping our bytes is the correct
-/// outcome) from a real storage failure.
-#[derive(Debug, thiserror::Error)]
-pub enum UploadError {
-    #[error("upload precondition lost (HTTP {status})")]
-    PreconditionLost { status: u16 },
-    #[error(transparent)]
-    Other(#[from] anyhow::Error),
+/// THE ONLY BACKEND-AWARE CLASSIFIER in the publish path.
+///
+/// It answers one question: does this failure PROVE the request never committed?
+/// Anything short of proof is [`DispatchKnowledge::MaybeSent`], because the
+/// caller's next move on a definite failure is destructive (delete the object,
+/// drop the only local clone, invalidate the cache) and being wrong there
+/// destroys published state.
+///
+/// - An HTTP status means the server answered. A 4xx is a refusal it took
+///   BEFORE storing anything, so it proves non-publication. A 5xx does not: the
+///   store can commit and then fail to report it.
+/// - No status at all means no response was read. Only a construction failure
+///   proves the request never left; Smithy's timeout, dispatch and response
+///   errors all allow that the bytes arrived and committed while the answer was
+///   lost, corrupted, or never parsed.
+/// - `SdkError` is `#[non_exhaustive]`, so the fallback arm must be the CAUTIOUS
+///   one. A future variant defaulting to "definitely failed" would silently
+///   re-open exactly the class this closes.
+///
+/// #79 replaces `tigris.rs` with a `BlobStore` layer; this function is the piece
+/// each backend reimplements, and nothing above it changes.
+fn classify_put_failure<E, R>(
+    err: &aws_sdk_s3::error::SdkError<E, R>,
+    status: Option<u16>,
+) -> DispatchKnowledge {
+    if let Some(status) = status {
+        return if (400..500).contains(&status) {
+            DispatchKnowledge::NeverSent
+        } else {
+            DispatchKnowledge::MaybeSent
+        };
+    }
+    match err {
+        aws_sdk_s3::error::SdkError::ConstructionFailure(_) => DispatchKnowledge::NeverSent,
+        _ => DispatchKnowledge::MaybeSent,
+    }
 }
 
 /// Wrapper around the S3 client with the configured bucket.
@@ -45,6 +75,51 @@ pub enum UploadError {
 pub struct TigrisClient {
     s3: S3Client,
     bucket: String,
+    /// Test-only seam: when set, the blocking compression inside `upload_tracked`
+    /// parks on this barrier. That is the ONLY window in which a publish attempt
+    /// can be cancelled with `PublishStage::PreparingArchive` still holding, and
+    /// it is unreachable from outside without a seam because compression of a
+    /// test-sized repo finishes in microseconds.
+    #[cfg(test)]
+    compress_gate: Option<Arc<BlockingGate>>,
+}
+
+/// A gate a BLOCKING thread parks on until a test opens it.
+///
+/// A condvar rather than a held `MutexGuard`: the test's assertions run while the
+/// gate is shut, and holding a `std::sync::MutexGuard` across those awaits is
+/// both a lint violation and a real hazard. Here the test owns no guard at all —
+/// it flips a flag and notifies.
+#[cfg(test)]
+#[derive(Default)]
+pub struct BlockingGate {
+    open: Mutex<bool>,
+    opened: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl BlockingGate {
+    /// A gate that starts SHUT.
+    pub fn shut() -> Self {
+        Self::default()
+    }
+
+    fn wait(&self) {
+        let mut open = self.open.lock().expect("compression gate poisoned");
+        while !*open {
+            open = self
+                .opened
+                .wait(open)
+                .expect("compression gate poisoned while waiting");
+        }
+    }
+
+    /// Let every parked compression through. Call this at teardown so the
+    /// blocking thread is not stranded for the life of the process.
+    pub fn open(&self) {
+        *self.open.lock().expect("compression gate poisoned") = true;
+        self.opened.notify_all();
+    }
 }
 
 impl TigrisClient {
@@ -57,6 +132,8 @@ impl TigrisClient {
         Ok(Self {
             s3,
             bucket: bucket.to_string(),
+            #[cfg(test)]
+            compress_gate: None,
         })
     }
 
@@ -84,7 +161,17 @@ impl TigrisClient {
         Self {
             s3: S3Client::from_conf(config),
             bucket: bucket.to_string(),
+            compress_gate: None,
         }
+    }
+
+    /// Test-only: park this client's blocking compression on `gate` until the
+    /// holder releases it, so a cancellation can be aimed at
+    /// [`PublishStage::PreparingArchive`] rather than at the PUT.
+    #[cfg(test)]
+    pub fn with_compress_gate(mut self, gate: Arc<BlockingGate>) -> Self {
+        self.compress_gate = Some(gate);
+        self
     }
 
     /// S3 key for a given repo: `repos/v1/{owner_slug}/{repo_name}.tar.zst`
@@ -122,6 +209,24 @@ impl TigrisClient {
     /// that only want the boolean, and widening its return type would churn
     /// every one of them for no benefit.
     pub async fn head_etag(&self, owner_slug: &str, repo_name: &str) -> Result<Option<String>> {
+        Ok(self
+            .head_generation(owner_slug, repo_name)
+            .await?
+            .map(|g| g.etag)
+            .unwrap_or(None))
+    }
+
+    /// The full stored generation: the ETag AND the attempt that published it.
+    ///
+    /// The attempt half is what makes a lost response recoverable. An ETag alone
+    /// answers "has the generation moved", which every writer sees the same way;
+    /// the attempt id answers "are the published bytes MINE", which is the
+    /// question a client whose PUT response vanished actually needs answered.
+    pub async fn head_generation(
+        &self,
+        owner_slug: &str,
+        repo_name: &str,
+    ) -> Result<Option<StoredGeneration>> {
         let key = Self::repo_key(owner_slug, repo_name);
         match self
             .s3
@@ -131,11 +236,20 @@ impl TigrisClient {
             .send()
             .await
         {
-            Ok(out) => Ok(Some(
-                out.e_tag()
+            Ok(out) => {
+                let etag = out
+                    .e_tag()
                     .context(format!("tigris HEAD {key}: hit carried no ETag"))?
-                    .to_string(),
-            )),
+                    .to_string();
+                let attempt = out
+                    .metadata()
+                    .and_then(|m| m.get(ATTEMPT_METADATA_KEY))
+                    .cloned();
+                Ok(Some(StoredGeneration {
+                    etag: Some(etag),
+                    attempt,
+                }))
+            }
             Err(e) => {
                 if e.as_service_error().is_some_and(|e| e.is_not_found()) {
                     Ok(None)
@@ -146,26 +260,110 @@ impl TigrisClient {
         }
     }
 
+    /// Did `attempt`'s bytes land? The reconciliation an ambiguous dispatch owes
+    /// before anything downstream may treat it as confirmation.
+    ///
+    /// `Ok(false)` is deliberately NOT "the PUT failed": an abandoned request may
+    /// still be in flight, so a negative answer licenses refusing and retrying,
+    /// never deleting. Only `Ok(true)` upgrades an unresolved attempt to
+    /// published.
+    pub async fn attempt_landed(
+        &self,
+        owner_slug: &str,
+        repo_name: &str,
+        attempt: &PublishAttemptId,
+    ) -> Result<bool> {
+        Ok(self
+            .head_generation(owner_slug, repo_name)
+            .await?
+            .is_some_and(|g| g.belongs_to(attempt)))
+    }
+
     /// Upload a local bare repo directory to Tigris as a tar.zst archive,
-    /// fenced by `precondition`.
+    /// fenced by `precondition`, under a freshly minted attempt identity.
     pub async fn upload(
         &self,
         owner_slug: &str,
         repo_name: &str,
         local_path: &Path,
         precondition: UploadPrecondition,
-    ) -> std::result::Result<(), UploadError> {
-        let key = Self::repo_key(owner_slug, repo_name);
-        debug!(key = %key, path = %local_path.display(), "uploading repo to tigris");
-
-        // Create tar.zst in memory
-        let archive_bytes = tokio::task::spawn_blocking({
-            let local_path = local_path.to_path_buf();
-            move || compress_repo(&local_path)
-        })
+    ) -> std::result::Result<UploadReceipt, UploadError> {
+        self.upload_tracked(
+            owner_slug,
+            repo_name,
+            local_path,
+            precondition,
+            PublishAttemptId::new(),
+            None,
+        )
         .await
-        .context("tar task panicked")?
-        .context("compressing repo")?;
+    }
+
+    /// The full form: a caller-chosen attempt identity, and a stage cell the
+    /// upload reports its progress into.
+    ///
+    /// The stage cell is the answer to "a dropped future never returns an
+    /// outcome". Compression runs inside `spawn_blocking` and the conditional PUT
+    /// is not even constructed until it finishes, so a handler cancelled during
+    /// compression definitely never attempted publication — but nothing could
+    /// observe that, because the only report was the return value of a future
+    /// that no longer exists. Marking [`PublishStage::PreparingArchive`] before
+    /// the blocking call and [`PublishStage::PutDispatched`] immediately before
+    /// `send()` makes that boundary readable from outside.
+    pub async fn upload_tracked(
+        &self,
+        owner_slug: &str,
+        repo_name: &str,
+        local_path: &Path,
+        precondition: UploadPrecondition,
+        attempt: PublishAttemptId,
+        stage: Option<&PublishStageCell>,
+    ) -> std::result::Result<UploadReceipt, UploadError> {
+        let key = Self::repo_key(owner_slug, repo_name);
+        debug!(key = %key, path = %local_path.display(), attempt = %attempt, "uploading repo to tigris");
+
+        if let Some(stage) = stage {
+            stage.set(PublishStage::PreparingArchive);
+        }
+
+        // Create tar.zst in memory. Nothing has been sent at this point and
+        // nothing can be: the request below is not constructed until this
+        // returns. A failure or a cancellation here is a definite
+        // non-publication.
+        let compressed = {
+            let local_path = local_path.to_path_buf();
+            #[cfg(test)]
+            let gate = self.compress_gate.clone();
+            tokio::task::spawn_blocking(move || {
+                // Test-only seam: park INSIDE the blocking compression, which is
+                // the window a handler can be cancelled in while
+                // `PublishStage::PreparingArchive` still holds.
+                #[cfg(test)]
+                if let Some(gate) = gate {
+                    // Blocks until the test opens the gate.
+                    gate.wait();
+                }
+                compress_repo(&local_path)
+            })
+            .await
+        };
+        let archive_bytes = match compressed {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(e)) => {
+                if let Some(stage) = stage {
+                    stage.set(PublishStage::Refused);
+                }
+                return Err(UploadError::NotPublished(e.context("compressing repo")));
+            }
+            Err(e) => {
+                if let Some(stage) = stage {
+                    stage.set(PublishStage::Refused);
+                }
+                return Err(UploadError::NotPublished(
+                    anyhow::Error::new(e).context("tar task panicked"),
+                ));
+            }
+        };
 
         let body = aws_sdk_s3::primitives::ByteStream::from(archive_bytes);
 
@@ -174,6 +372,12 @@ impl TigrisClient {
             .put_object()
             .bucket(&self.bucket)
             .key(&key)
+            // The attempt identity travels WITH the bytes. That is what makes a
+            // lost response recoverable: the client can HEAD the key afterwards
+            // and ask whether the published object is its own work, which is
+            // decidable, instead of asking whether its request succeeded, which
+            // is not.
+            .metadata(ATTEMPT_METADATA_KEY, attempt.as_str())
             .body(body)
             .content_type("application/zstd");
         match &precondition {
@@ -182,47 +386,140 @@ impl TigrisClient {
             UploadPrecondition::Unconditional => {}
         }
 
-        if let Err(e) = req.send().await {
-            // `PutObjectError` models no PreconditionFailed variant (its arms are
-            // EncryptionTypeMismatch, InvalidRequest, InvalidWriteOffset,
-            // TooManyParts, Unhandled), so a refused precondition arrives as
-            // `Unhandled` and matching the enum would classify it as a generic
-            // failure. The raw HTTP status off the response is the only place the
-            // answer actually lives.
-            //
-            // Read it via `raw_response()`, not a `ServiceError`-only match: the
-            // SDK exposes the raw response for BOTH `ServiceError` and
-            // `ResponseError`, and a refused conditional PUT whose error body the
-            // SDK cannot parse (malformed XML, premature close) surfaces as
-            // `ResponseError`. Matching only `ServiceError` would classify that
-            // unparsable 409/412 as a generic failure, and `RepoWriteGuard::release`
-            // would log-and-succeed instead of taking the supersede retry,
-            // acknowledging a write that was definitively not published.
-            let status = e.raw_response().map(|raw| raw.status().as_u16());
-            // 412 is always a lost precondition. 409 is one only when we asked
-            // for create-only, which is how S3-compatible stores report "the key
-            // already exists". Everything else, 404 included, is a real failure:
-            // archive keys are never deleted (`delete` has no callers), so a 404
-            // here means something permanent like a missing bucket or a
-            // misrouted endpoint, and reporting that as a lost precondition
-            // would tell a caller to expect a successor that does not exist.
-            let lost = match status {
-                Some(412) => true,
-                Some(409) => matches!(precondition, UploadPrecondition::IfAbsent),
-                _ => false,
-            };
-            if lost {
-                return Err(UploadError::PreconditionLost {
-                    status: status.expect("a lost precondition came from a status"),
-                });
-            }
-            return Err(UploadError::Other(
-                anyhow::Error::new(e).context(format!("tigris PUT {key}")),
-            ));
+        // From HERE the bytes may reach the store. Everything downstream that
+        // could destroy state has to treat this stage as "maybe published".
+        if let Some(stage) = stage {
+            stage.set(PublishStage::PutDispatched {
+                attempt: attempt.clone(),
+            });
         }
 
-        info!(key = %key, "uploaded repo to tigris");
-        Ok(())
+        let sent = req.send().await;
+        let out = match sent {
+            Ok(out) => out,
+            Err(e) => {
+                // `PutObjectError` models no PreconditionFailed variant (its arms are
+                // EncryptionTypeMismatch, InvalidRequest, InvalidWriteOffset,
+                // TooManyParts, Unhandled), so a refused precondition arrives as
+                // `Unhandled` and matching the enum would classify it as a generic
+                // failure. The raw HTTP status off the response is the only place the
+                // answer actually lives.
+                //
+                // Read it via `raw_response()`, not a `ServiceError`-only match: the
+                // SDK exposes the raw response for BOTH `ServiceError` and
+                // `ResponseError`, and a refused conditional PUT whose error body the
+                // SDK cannot parse (malformed XML, premature close) surfaces as
+                // `ResponseError`. Matching only `ServiceError` would classify that
+                // unparsable 409/412 as a generic failure, and `RepoWriteGuard::release`
+                // would log-and-succeed instead of taking the supersede retry,
+                // acknowledging a write that was definitively not published.
+                let status = e.raw_response().map(|raw| raw.status().as_u16());
+                // 412 is always a lost precondition. 409 is one only when we asked
+                // for create-only, which is how S3-compatible stores report "the key
+                // already exists". Everything else, 404 included, is a real failure:
+                // archive keys are never deleted by the write path, so a 404 here
+                // means something permanent like a missing bucket or a misrouted
+                // endpoint, and reporting that as a lost precondition would tell a
+                // caller to expect a successor that does not exist.
+                let lost = match status {
+                    Some(412) => true,
+                    Some(409) => matches!(precondition, UploadPrecondition::IfAbsent),
+                    _ => false,
+                };
+                if lost {
+                    if let Some(stage) = stage {
+                        stage.set(PublishStage::Refused);
+                    }
+                    return Err(UploadError::PreconditionLost {
+                        status: status.expect("a lost precondition came from a status"),
+                    });
+                }
+                let knowledge = classify_put_failure(&e, status);
+                let ctx = anyhow::Error::new(e).context(format!("tigris PUT {key}"));
+                return Err(match knowledge {
+                    DispatchKnowledge::NeverSent => {
+                        if let Some(stage) = stage {
+                            stage.set(PublishStage::Refused);
+                        }
+                        UploadError::NotPublished(ctx)
+                    }
+                    DispatchKnowledge::MaybeSent => {
+                        warn!(
+                            key = %key,
+                            attempt = %attempt,
+                            status = ?status,
+                            "tigris PUT failed WITHOUT proving it did not commit — the outcome \
+                             is ambiguous and must be reconciled, not compensated"
+                        );
+                        if let Some(stage) = stage {
+                            stage.set(PublishStage::Ambiguous {
+                                attempt: attempt.clone(),
+                            });
+                        }
+                        UploadError::Ambiguous {
+                            attempt: attempt.clone(),
+                            source: ctx,
+                        }
+                    }
+                });
+            }
+        };
+
+        let etag = out.e_tag().map(str::to_string);
+        if let Some(stage) = stage {
+            stage.set(PublishStage::Published {
+                attempt: attempt.clone(),
+                etag: etag.clone(),
+            });
+        }
+        info!(key = %key, attempt = %attempt, "uploaded repo to tigris");
+        Ok(UploadReceipt { attempt, etag })
+    }
+
+    /// Delete a repo archive ONLY while it is still `attempt`'s work.
+    ///
+    /// The unconditional delete this replaces used the logical owner/name as its
+    /// cleanup authority, so a failed attempt compensating late could erase the
+    /// object a SUCCESSOR had already published under the same name and already
+    /// returned 201 for. A second name lookup before the delete only narrows that
+    /// window; reading the attempt id off the object and fencing the delete on
+    /// the generation it came from closes it.
+    pub async fn delete_if_attempt_matches(
+        &self,
+        owner_slug: &str,
+        repo_name: &str,
+        attempt: &PublishAttemptId,
+    ) -> Result<AttemptDelete> {
+        let Some(generation) = self.head_generation(owner_slug, repo_name).await? else {
+            return Ok(AttemptDelete::Absent);
+        };
+        if !generation.belongs_to(attempt) {
+            return Ok(AttemptDelete::NotOurs);
+        }
+        let key = Self::repo_key(owner_slug, repo_name);
+        let mut req = self.s3.delete_object().bucket(&self.bucket).key(&key);
+        // The If-Match guard is what makes this atomic rather than merely
+        // narrowed: between the HEAD above and this call a successor can publish,
+        // and the store refusing on the moved generation is the only thing that
+        // stops the delete landing on their object.
+        if let Some(etag) = generation.etag.as_deref() {
+            req = req.if_match(etag);
+        }
+        match req.send().await {
+            Ok(_) => Ok(AttemptDelete::Deleted),
+            Err(e) => {
+                // A refused conditional delete means the generation moved: the
+                // object is no longer ours, which is a successful outcome for a
+                // guard whose whole job is not to touch somebody else's bytes.
+                if e.raw_response()
+                    .map(|raw| raw.status().as_u16())
+                    .is_some_and(|s| s == 412 || s == 409)
+                {
+                    return Ok(AttemptDelete::NotOurs);
+                }
+                Err(anyhow::anyhow!("tigris conditional DELETE {key}: {e}"))
+            }
+        }
     }
 
     /// Download a repo archive from Tigris and extract to local disk.
@@ -326,19 +623,6 @@ impl TigrisClient {
 
         info!(key = %key, path = %target.as_path().display(), "downloaded repo from tigris");
         Ok(extracted)
-    }
-
-    /// Delete a repo archive from Tigris.
-    pub async fn delete(&self, owner_slug: &str, repo_name: &str) -> Result<()> {
-        let key = Self::repo_key(owner_slug, repo_name);
-        self.s3
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .send()
-            .await
-            .context(format!("tigris DELETE {key}"))?;
-        Ok(())
     }
 }
 
