@@ -1,14 +1,17 @@
-//! Centralized repo storage layer — local disk cache backed by Tigris (S3).
+//! Centralized repo storage layer — local disk cache backed by a pluggable
+//! object store (S3-compatible / filesystem / IPFS) via [`RepoArchive`].
 //!
 //! Every handler that needs access to a git repo on disk goes through `RepoStore`:
 //!
-//! - `acquire()` — ensures the repo is on local disk (downloads from Tigris on cache miss).
-//! - `release_after_write()` — uploads the updated repo to Tigris after a write operation.
-//! - `init()` — creates a new bare repo locally and uploads to Tigris.
+//! - `acquire()` — ensures the repo is on local disk (downloads on cache miss).
+//! - `acquire_write()` — write lock + ensures local matches storage (skips the
+//!   download when the cached etag already matches — the push-latency win).
+//! - `release()` — upload the updated repo to storage and free the write lock.
+//! - `init()` — creates a new bare repo locally and uploads to storage.
 //!
-//! When Tigris is disabled (bucket empty), this is a simple passthrough to local disk.
+//! When no backend is configured, this is a simple passthrough to local disk.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,45 +21,52 @@ use sqlx::pool::PoolConnection;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres};
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use super::store;
-use super::tigris::TigrisClient;
+use crate::storage::archive::RepoArchive;
 
-/// Centralized repo storage: local disk cache + optional Tigris backend.
+/// Centralized repo storage: local disk cache + optional object-storage backend
+/// (S3-compatible / filesystem / IPFS) behind the [`RepoArchive`] layer.
 #[derive(Clone)]
 pub struct RepoStore {
     repos_dir: PathBuf,
-    tigris: Option<TigrisClient>,
-    /// Dedicated Postgres pool for repo write advisory locks, built by
-    /// `build_lock_pool` (see there for why it is separate and why it carries an
-    /// `after_release` hook). Never use this for ordinary queries.
+    archive: Option<RepoArchive>,
+    /// Bounded pool dedicated to advisory-lock connections, built by
+    /// `build_lock_pool` (see there for the `after_release` cancellation
+    /// backstop and why it is separate from the handler pool). A push pins one
+    /// connection while it HOLDS the lock (across receive-pack and the
+    /// upload); WAITING for a contended lock occupies nothing — see
+    /// `LockedConn::acquire` (#173 F1). Never use this pool for ordinary
+    /// queries.
     lock_pool: PgPool,
-    /// Tracks repos already confirmed to exist in Tigris — avoids redundant
+    /// Tracks repos already confirmed to exist in storage — avoids redundant
     /// HEAD checks and background uploads for repos we've already migrated.
     migrated: Arc<Mutex<HashSet<String>>>,
-    /// Test-only stall injected at the head of `acquire_write`'s Tigris phase,
+    /// Last-known archive etag per `owner_slug/repo` key. Lets a write skip the
+    /// pre-write download when our local copy already matches storage (the
+    /// common case under sticky routing) — the main push-latency win.
+    versions: Arc<Mutex<HashMap<String, String>>>,
+    /// Test-only stall injected at the head of `acquire_write`'s storage phase,
     /// i.e. AFTER the advisory lock is taken and BEFORE the guard exists. That
     /// window is exactly where the outer `tokio::time::timeout` in
-    /// `api/repos.rs` can drop the future (#173). `TigrisClient` takes its
-    /// endpoint from process-wide AWS env vars and has no injectable seam, so
-    /// this flag is the smallest way to hold a real `acquire_write` open in that
-    /// window and cancel it there.
+    /// `api/repos.rs` can drop the future (#173). The S3 client takes its
+    /// endpoint from process-wide AWS env vars, so this flag is the smallest
+    /// way to hold a real `acquire_write` open in that window and cancel it
+    /// there.
     #[cfg(test)]
-    tigris_stall: Option<std::time::Duration>,
-    /// Test-only counter of how many times a write guard from this store REACHED the
-    /// Tigris upload site in `release` (the point past the `success` check, where a
-    /// configured client would be uploaded to). It counts the decision, not a network
-    /// call: `TigrisClient` takes its endpoint from process-wide AWS env vars and has no
-    /// injectable seam, so every test runs with `tigris: None` and a counter inside the
-    /// `Some` arm could never move. Reaching the site is the property under test anyway:
-    /// an interrupted push must not publish a half-applied repo, and the disconnect path
-    /// must therefore never get here (#173 F2).
+    storage_stall: Option<std::time::Duration>,
+    /// Test-only counter of how many times a write guard from this store REACHED
+    /// the storage upload site in `release` (the decision point past the
+    /// `success` check). It counts the decision, not a network call, so it moves
+    /// even when the store has no backend configured; reaching the site at all
+    /// is the property under test — an interrupted push must not publish a
+    /// half-applied repo (#173 F2).
     ///
-    /// Per store rather than a process global, so cases running in parallel do not see
-    /// each other's uploads, and an `Arc` rather than a `thread_local` because the guard
-    /// is released from a detached task on another worker thread. Same test-only counter
-    /// idiom as `ipfs_pin::note_legacy_repair_read`.
+    /// Per store rather than a process global, so cases running in parallel do
+    /// not see each other's uploads, and an `Arc` rather than a `thread_local`
+    /// because the guard is released from a detached task on another worker
+    /// thread. Same test-only counter idiom as `ipfs_pin::note_legacy_repair_read`.
     #[cfg(test)]
     upload_site_reached: Arc<std::sync::atomic::AtomicUsize>,
     /// Test-only seam: armed here, copied into every `RepoWriteGuard` this store
@@ -98,31 +108,34 @@ impl RepoStore {
         &self.lock_pool
     }
 
-    /// Test-only: see `tigris_stall`.
+    /// Test-only: see `storage_stall`.
     #[cfg(test)]
-    pub fn with_tigris_stall(mut self, stall: Duration) -> Self {
-        self.tigris_stall = Some(stall);
+    pub fn with_storage_stall(mut self, stall: Duration) -> Self {
+        self.storage_stall = Some(stall);
         self
     }
 
-    /// Test-only: how many write guards from this store have reached the Tigris upload
-    /// site. See [`RepoStore::upload_site_reached`].
+    /// Test-only: how many write guards from this store have reached the storage
+    /// upload site. See [`RepoStore::upload_site_reached`].
     #[cfg(test)]
-    pub fn tigris_upload_site_reached(&self) -> usize {
+    pub fn storage_upload_site_reached(&self) -> usize {
         self.upload_site_reached
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// `lock_pool` must come from `build_lock_pool`; a plain pool leaks advisory
-    /// locks on cancellation.
-    pub fn new(repos_dir: PathBuf, tigris: Option<TigrisClient>, lock_pool: PgPool) -> Self {
+    /// `lock_pool` must come from `build_lock_pool`: its `after_release` hook is
+    /// the cancellation backstop behind `LockedConn`'s connection-affinity
+    /// discipline, and a plain pool would leak advisory locks on paths that
+    /// repool a connection.
+    pub fn new(repos_dir: PathBuf, archive: Option<RepoArchive>, lock_pool: PgPool) -> Self {
         Self {
             repos_dir,
-            tigris,
+            archive,
             lock_pool,
             migrated: Arc::new(Mutex::new(HashSet::new())),
+            versions: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
-            tigris_stall: None,
+            storage_stall: None,
             #[cfg(test)]
             upload_site_reached: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -130,65 +143,269 @@ impl RepoStore {
         }
     }
 
-    /// Ensure a repo is available on local disk, downloading from Tigris if needed.
-    /// If the repo exists locally but not yet in Tigris, a background upload is
-    /// spawned to lazily migrate it (on-demand migration for pre-Tigris repos).
+    /// Ensure the local copy matches storage, skipping the download when our
+    /// cached etag already equals the current archive etag.
+    ///
+    /// `require_fresh` selects the failure policy:
+    /// - `false` (read path, `acquire_fresh`): self-heal — if a storage HEAD or
+    ///   download fails but a valid local copy exists, use it; a later upload
+    ///   re-syncs storage.
+    /// - `true` (write path, `acquire_write`): fail closed — never fall back to
+    ///   a possibly-stale local copy. The remote etag differs (remote is newer),
+    ///   so uploading our stale copy after the write would clobber it (lost
+    ///   update). Propagate the error so the write is rejected instead.
+    async fn sync_down_if_stale(
+        &self,
+        owner_slug: &str,
+        repo_name: &str,
+        local_path: &Path,
+        require_fresh: bool,
+    ) -> Result<()> {
+        let Some(ref archive) = self.archive else {
+            return Ok(());
+        };
+
+        // The repo path arrived as a parameter, so re-establish the traversal
+        // barrier here, where the filesystem work happens, rather than relying
+        // on the caller having built it through `validated_repo_disk_path`. See
+        // `validated_repo_path_in`.
+        let local_path = &validated_repo_path_in(&self.repos_dir, local_path)?;
+
+        let marker = pending_upload_marker(local_path)?;
+        // try_exists, not exists(): a transient EACCES/EIO must not read as
+        // "no marker" — that path downloads and can roll back a pending local
+        // write. Fail the write path closed; treat as present on the read path.
+        let marker_present = match marker.try_exists() {
+            Ok(present) => present,
+            Err(e) => {
+                if require_fresh {
+                    return Err(e).context("probing pending-upload marker");
+                }
+                warn!(repo = %repo_name, err = %e,
+                    "pending-upload marker probe failed — treating as present");
+                true
+            }
+        };
+        if marker_present {
+            if local_path.exists() {
+                // The local copy has a write that storage never received (its
+                // upload failed, or the node stopped first). The marker records
+                // the storage etag that write was BASED on — and, if an upload
+                // was in flight, the etag it was going to produce — so we can
+                // tell "storage unchanged — local strictly ahead" and "that's
+                // our own completed upload" apart from "another node advanced
+                // storage — genuine divergence".
+                let pm = read_pending_marker(local_path);
+                let remote = match archive.head_etag(owner_slug, repo_name).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if require_fresh {
+                            return Err(e).context("storage head while local pending upload");
+                        }
+                        warn!(repo = %repo_name, err = %e,
+                            "storage head failed while pending upload — using local copy");
+                        return Ok(());
+                    }
+                };
+                match remote.as_deref() {
+                    // Storage empty, or exactly the version our write built on:
+                    // local is strictly ahead. Serve it; the next successful
+                    // post-write upload re-syncs storage and clears the marker.
+                    None => return Ok(()),
+                    Some(r) if pm.matches_base(r) => {
+                        warn!(repo = %repo_name,
+                            "local copy ahead of storage (pending upload) — skipping download");
+                        return Ok(());
+                    }
+                    Some(r) => {
+                        // Unexplained remote: our own interrupted upload, or a
+                        // genuine external writer. Validate by CONTENT — fetch
+                        // the remote bytes and compare their MD5 to the
+                        // marker's recorded in-flight hash. Never trust the
+                        // backend etag for this: etag semantics vary (IPFS
+                        // CIDs, SSE-KMS), and the fs backend can crash between
+                        // publishing its etag and its bytes.
+                        if self
+                            .remote_matches_inflight(archive, owner_slug, repo_name, &pm)
+                            .await
+                        {
+                            debug!(repo = %repo_name,
+                                "storage content matches our own in-flight upload — marker cleared, synced");
+                            self.versions
+                                .lock()
+                                .await
+                                .insert(format!("{owner_slug}/{repo_name}"), r.to_string());
+                            clear_pending_upload_after_success(local_path, Some(r));
+                            return Ok(());
+                        }
+                        // Storage advanced past our base while this node held
+                        // un-uploaded local changes: both sides have writes
+                        // the other lacks. Overwriting either loses a push.
+                        if require_fresh {
+                            anyhow::bail!(
+                                "storage for {owner_slug}/{repo_name} advanced while local \
+                                 changes were pending upload — refusing to overwrite either \
+                                 side; reconcile manually (fetch both, merge, remove the \
+                                 pending-upload marker)"
+                            );
+                        }
+                        warn!(repo = %repo_name,
+                            "storage diverged from pending local copy — serving local for read");
+                        return Ok(());
+                    }
+                }
+            }
+            // Marker without a local copy: the repo dir was removed out from
+            // under us, so the storage copy is the best remaining state. Drop
+            // the stale marker and fall through to the normal download.
+            let _ = std::fs::remove_file(&marker);
+        }
+        let key = format!("{owner_slug}/{repo_name}");
+
+        let remote_etag = match archive.head_etag(owner_slug, repo_name).await {
+            Ok(Some(etag)) => etag,
+            Ok(None) => return Ok(()), // not in storage yet — local is authoritative
+            Err(e) => {
+                // HEAD failed. Read path: fall back to a valid local copy if we
+                // have one. Write path: fail closed (see `require_fresh`).
+                if !require_fresh && local_path.exists() {
+                    warn!(repo = %repo_name, err = %e, "storage head failed — using local copy");
+                    return Ok(());
+                }
+                return Err(e).context("storage head before access");
+            }
+        };
+
+        if local_path.exists() {
+            let known = self.versions.lock().await.get(&key).cloned();
+            if known.as_deref() == Some(remote_etag.as_str()) {
+                debug!(repo = %repo_name, "local copy current (etag match) — skipping download");
+                return Ok(());
+            }
+        }
+
+        // KNOWN LIMITATION (pre-dates this layer): read-path downloads and
+        // their swap-into-place are not serialized against the advisory write
+        // lock, so a slow in-flight download decided before a push began can
+        // swap a stale tree under a running receive-pack on the same node.
+        // Requires a cache-miss/stale read racing a same-repo write; the
+        // follow-up is to serialize download+swap with writers.
+        match archive.download(owner_slug, repo_name, local_path).await {
+            Ok(()) => {
+                self.versions.lock().await.insert(key, remote_etag);
+                Ok(())
+            }
+            Err(e) => {
+                // Read path self-heal only: a corrupt/unreadable archive must not
+                // block access when a valid local copy exists. On the write path
+                // the remote etag differs (remote is newer), so falling back and
+                // later uploading our stale copy would clobber it — fail closed.
+                if !require_fresh && local_path.exists() {
+                    warn!(repo = %repo_name, err = %e,
+                        "archive download failed — falling back to local copy");
+                    Ok(())
+                } else {
+                    Err(e).context("downloading repo archive")
+                }
+            }
+        }
+    }
+
+    /// Validate a heal candidate by CONTENT: does storage hold exactly the
+    /// bytes this node's interrupted upload was sending? Fetches the remote
+    /// object and compares its MD5 to the marker's recorded in-flight hash.
+    /// Deliberately never compares against the backend etag — etag semantics
+    /// vary (IPFS CIDs, SSE-KMS etags are not content MD5s) and the fs
+    /// backend can crash between publishing its etag and its bytes. A full
+    /// GET on this recovery-only path is an acceptable price for a check
+    /// that cannot false-positive on stale bytes.
+    async fn remote_matches_inflight(
+        &self,
+        archive: &RepoArchive,
+        owner_slug: &str,
+        repo_name: &str,
+        pm: &PendingMarker,
+    ) -> bool {
+        let Some(ref inflight) = pm.inflight else {
+            return false;
+        };
+        match archive.fetch_raw(owner_slug, repo_name).await {
+            Ok(Some(bytes)) => {
+                norm_etag(&crate::storage::archive::content_md5_hex(&bytes)) == norm_etag(inflight)
+            }
+            _ => false,
+        }
+    }
+
+    /// Ensure a repo is available on local disk, downloading from storage if needed.
+    /// If the repo exists locally but not yet in storage, a background upload is
+    /// spawned to lazily migrate it (on-demand migration for pre-storage repos).
     /// Returns the local path to the bare repo.
     pub async fn acquire(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
 
         // Fast path: repo exists locally
         if local_path.exists() {
-            // Lazy migration: if Tigris is enabled and we haven't confirmed this
-            // repo is in Tigris yet, check and upload in the background.
-            if let Some(ref tigris) = self.tigris {
+            // Lazy migration: if storage is enabled and we haven't confirmed this
+            // repo is in storage yet, check and upload in the background.
+            if self.archive.is_some() {
                 let key = format!("{owner_slug}/{repo_name}");
                 let already_migrated = self.migrated.lock().await.contains(&key);
-                if !already_migrated {
-                    let tigris = tigris.clone();
+                // A pending-upload marker means the marker machinery already
+                // owns this repo's next upload (next write, or the startup
+                // retry). Migration must not steal it: `upload_under_lock`
+                // knows nothing about markers, so its upload would strand the
+                // marker with a base that no longer matches storage, wedging
+                // the repo's writes on a spurious divergence.
+                // A path the barrier rejects cannot carry a marker we wrote, so
+                // it reads as "not pending" and migration proceeds under the
+                // lock exactly as it would for an unmarked repo.
+                let marker_pending =
+                    pending_upload_marker(&local_path).is_ok_and(|marker| marker.exists());
+                if !already_migrated && !marker_pending {
+                    let this = self.clone();
                     let slug = owner_slug.clone();
                     let name = repo_name.to_string();
                     let path = local_path.clone();
-                    let migrated = Arc::clone(&self.migrated);
+                    let key = key.clone();
                     tokio::spawn(async move {
-                        // Check if already in Tigris before uploading
-                        match tigris.exists(&slug, &name).await {
-                            Ok(true) => {
-                                debug!(repo = %name, "repo already in tigris — skipping migration");
-                            }
-                            Ok(false) => {
-                                info!(repo = %name, "migrating local repo to tigris");
-                                if let Err(e) = tigris.upload(&slug, &name, &path).await {
-                                    warn!(repo = %name, err = %e, "lazy migration to tigris failed");
-                                    return;
-                                }
-                                info!(repo = %name, "lazy migration to tigris complete");
+                        // Upload under the advisory lock (skip if already present)
+                        // so this opportunistic migration can't clobber a
+                        // concurrent locked push by landing a stale snapshot.
+                        match this.upload_under_lock(&slug, &name, &path, true).await {
+                            Ok(()) => {
+                                this.migrated.lock().await.insert(key);
+                                debug!(repo = %name, "lazy migration to storage complete (or already present)");
                             }
                             Err(e) => {
-                                warn!(repo = %name, err = %e, "tigris existence check failed");
-                                return;
+                                warn!(repo = %name, err = %e, "lazy migration to storage failed");
                             }
                         }
-                        migrated.lock().await.insert(format!("{slug}/{name}"));
                     });
                 }
             }
             return Ok(local_path);
         }
 
-        // Try downloading from Tigris
-        if let Some(ref tigris) = self.tigris {
-            if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
-                debug!(repo = %repo_name, "cache miss — downloading from tigris");
-                tigris
+        // Try downloading from storage
+        if let Some(ref archive) = self.archive {
+            if let Some(remote_etag) = archive
+                .head_etag(&owner_slug, repo_name)
+                .await
+                .context("checking storage for repo")?
+            {
+                debug!(repo = %repo_name, "cache miss — downloading from storage");
+                archive
                     .download(&owner_slug, repo_name, &local_path)
                     .await
-                    .context("downloading repo from tigris")?;
-                // Mark as migrated since we just downloaded it
-                self.migrated
-                    .lock()
-                    .await
-                    .insert(format!("{owner_slug}/{repo_name}"));
+                    .context("downloading repo from storage")?;
+                // The local copy didn't exist, so any pending-upload marker
+                // here is stale litter — clear it or it would wrongly pin the
+                // just-downloaded copy as "ahead of storage".
+                clear_pending_upload(&local_path);
+                let key = format!("{owner_slug}/{repo_name}");
+                self.migrated.lock().await.insert(key.clone());
+                self.versions.lock().await.insert(key, remote_etag);
                 return Ok(local_path);
             }
         }
@@ -198,34 +415,14 @@ impl RepoStore {
         Ok(local_path)
     }
 
-    /// Ensure a repo is available on local disk with the **latest** Tigris state.
+    /// Ensure a repo is available on local disk with the **latest** storage state.
     /// Use this for operations that precede a write (e.g. `info/refs` for
     /// `git-receive-pack`) so the client sees the same refs that `acquire_write()`
     /// will operate on.
     pub async fn acquire_fresh(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
-
-        if let Some(ref tigris) = self.tigris {
-            if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
-                debug!(repo = %repo_name, "acquire_fresh: downloading latest from tigris");
-                if let Err(e) = tigris.download(&owner_slug, repo_name, &local_path).await {
-                    // The Tigris archive is present (HEAD ok) but unreadable — a
-                    // corrupt/partial upload, or a transient GET failure. If we have a
-                    // valid local copy, proceed with it rather than blocking the write;
-                    // the post-write upload re-syncs (self-heals) Tigris. Only hard-fail
-                    // when there is no local copy to fall back to.
-                    if local_path.exists() {
-                        warn!(repo = %repo_name, err = %e,
-                            "acquire_fresh: tigris download failed — falling back to local copy");
-                        return Ok(local_path);
-                    }
-                    return Err(e).context("downloading repo from tigris (fresh)");
-                }
-                return Ok(local_path);
-            }
-        }
-
-        // Tigris disabled or repo not in Tigris — fall back to local
+        self.sync_down_if_stale(&owner_slug, repo_name, &local_path, false)
+            .await?;
         Ok(local_path)
     }
 
@@ -260,97 +457,41 @@ impl RepoStore {
     /// accepted-window path.
     pub async fn acquire_write(&self, owner_did: &str, repo_name: &str) -> Result<RepoWriteGuard> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
-        let lock_key = advisory_lock_key(&owner_slug, repo_name);
-
-        // Acquire the Postgres advisory lock with retry, using pg_try_advisory_lock so a
-        // stale lock from a crashed connection can't block us indefinitely.
-        //
-        // The connection is checked out INSIDE the loop and RETURNED before each sleep.
-        // Only the connection that actually took the lock is retained. Two constraints
-        // pull in opposite directions here, and this is what satisfies both:
-        //
-        //   * Session ownership. A session-level advisory lock belongs to the CONNECTION
-        //     that took it, so the lock and its `pg_advisory_unlock` must run on the same
-        //     one. Running them through the pool (`fetch_one(&self.pool)`) lets them land
-        //     on different connections: the unlock silently returns false and the lock
-        //     leaks, while a competing acquire that happens to draw the holding
-        //     connection re-enters the lock and two pushes to one repo run concurrently.
-        //     Hence: keep the connection that WON.
-        //   * Occupancy. Holding a connection across the ~60 one-second sleeps would let
-        //     one spinning acquire park a lock-pool connection for a minute. That is not
-        //     just a push-path concern: `api/issues.rs` and `api/pulls.rs` reach
-        //     acquire_write holding no concurrency permit at all, so a caller could park
-        //     the whole pool and starve authenticated pushes on every repo (#173 F1).
-        //     Hence: return the connection when we LOSE, before sleeping.
-        //
-        // Returning a losing connection is safe with respect to the cancellation design:
-        // `after_release` runs `pg_advisory_unlock_all()`, a no-op on a connection that
-        // took nothing, so it cannot disturb a lock held by any other connection
-        // (proven by `returning_an_unlocked_connection_does_not_clear_another_connections_lock`).
-        //
-        // Cancellation safety is unchanged: the future can only be dropped while a
-        // connection is checked out, and dropping it runs the same `after_release` hook,
-        // which clears whatever lock it had just taken (#173 U1).
-        let mut lock_conn = None;
-        for attempt in 0..60 {
-            let mut conn = self.lock_pool.acquire().await.map_err(|e| {
-                anyhow::Error::new(LockPoolBusy)
-                    .context(format!("checking out a lock-pool connection: {e}"))
-            })?;
-            let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
-                .bind(lock_key)
-                .fetch_one(&mut *conn)
-                .await
-                .context("trying advisory lock")?;
-            if row.0 {
-                lock_conn = Some(conn);
-                break;
-            }
-            // Lost the race: give the connection back so a spinning acquire occupies
-            // nothing while it waits.
-            drop(conn);
-            if attempt < 59 {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-        }
-        let Some(lock_conn) = lock_conn else {
-            anyhow::bail!("could not acquire advisory lock after 60s — possible stale lock for {owner_slug}/{repo_name}");
-        };
+        let label = format!("{owner_slug}/{repo_name}");
+        let lock = LockedConn::acquire(
+            &self.lock_pool,
+            advisory_lock_key(&owner_slug, repo_name),
+            &label,
+        )
+        .await?;
 
         #[cfg(test)]
-        if let Some(stall) = self.tigris_stall {
+        if let Some(stall) = self.storage_stall {
             tokio::time::sleep(stall).await;
         }
 
-        // Always download the latest from Tigris before writing. Local disk may be
-        // stale if another machine pushed since our last access. The lock connection
-        // is already held, so a cancellation here returns it through `after_release`,
-        // which clears the lock.
-        if let Some(ref tigris) = self.tigris {
-            if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
-                debug!(repo = %repo_name, "write acquire: downloading latest from tigris");
-                if let Err(e) = tigris.download(&owner_slug, repo_name, &local_path).await {
-                    // Same self-healing fallback as acquire_fresh: a corrupt/unreadable
-                    // Tigris archive must not block a write when a valid local copy
-                    // exists — release(success) will re-upload a good archive.
-                    if local_path.exists() {
-                        warn!(repo = %repo_name, err = %e,
-                            "write acquire: tigris download failed — falling back to local copy");
-                    } else {
-                        return Err(e).context("downloading repo from tigris for write");
-                    }
-                }
-            }
+        // Ensure local matches the latest in storage before writing. The etag
+        // cache skips the full download when our copy is already current (the
+        // common single-machine case under sticky routing); a stale copy (another
+        // machine pushed since) still triggers a download. The advisory lock above
+        // serializes this so the post-write upload can't race a concurrent writer.
+        // A cancellation anywhere in here drops `lock`, whose backstop frees the
+        // advisory lock (see `LockedConn`).
+        if let Err(e) = self
+            .sync_down_if_stale(&owner_slug, repo_name, &local_path, true)
+            .await
+        {
+            lock.unlock().await;
+            return Err(e);
         }
 
         Ok(RepoWriteGuard {
             owner_slug,
             repo_name: repo_name.to_string(),
             local_path,
-            lock_key,
-            lock_conn: Some(lock_conn),
-            released: false,
-            tigris: self.tigris.clone(),
+            lock,
+            archive: self.archive.clone(),
+            versions: Arc::clone(&self.versions),
             #[cfg(test)]
             upload_site_reached: Arc::clone(&self.upload_site_reached),
             #[cfg(test)]
@@ -358,42 +499,347 @@ impl RepoStore {
         })
     }
 
-    /// Initialize a new bare repo on local disk and upload to Tigris.
+    /// Initialize a new bare repo on local disk and publish it to storage.
     pub async fn init(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
+        self.create_published(owner_did, repo_name, |path| {
+            store::init_bare(path).context("initializing bare repo")
+        })
+        .await
+    }
+
+    /// Create a new repo's on-disk content via `build` and publish its archive
+    /// to storage, holding the per-repo advisory lock for the WHOLE
+    /// claim-to-publication lifecycle.
+    ///
+    /// Callers insert the DB row (the claim) BEFORE calling this. Because
+    /// pushes serialize on the same advisory lock, no push can execute in the
+    /// window between the row becoming visible and publication finishing — so
+    /// a failure here, compensated by the caller deleting its own row, can
+    /// never destroy a concurrently accepted push. On failure the created
+    /// local dir is removed so a retry doesn't hit an existing destination.
+    ///
+    /// `build` runs inline while the lock is held (matching the pre-existing
+    /// pattern of running git plumbing on the handler task).
+    pub async fn create_published(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+        build: impl FnOnce(&Path) -> Result<()> + Send,
+    ) -> Result<PathBuf> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
+        let label = format!("{owner_slug}/{repo_name}");
+        let lock = LockedConn::acquire(
+            &self.lock_pool,
+            advisory_lock_key(&owner_slug, repo_name),
+            &label,
+        )
+        .await?;
 
-        store::init_bare(&local_path).context("initializing bare repo")?;
-
-        // Upload to Tigris in background
-        if let Some(ref tigris) = self.tigris {
-            let tigris = tigris.clone();
-            let owner_slug = owner_slug.clone();
-            let repo_name = repo_name.to_string();
-            let path = local_path.clone();
-            tokio::spawn(async move {
-                if let Err(e) = tigris.upload(&owner_slug, &repo_name, &path).await {
-                    warn!(repo = %repo_name, err = %e, "failed to upload new repo to tigris");
+        let outcome: Result<()> = async {
+            build(&local_path)?;
+            // A marker left by a previous same-name repo (failed creation,
+            // deleted repo) describes THAT repo's history, not this fresh one
+            // — once this repo's archive exists, a stale marker would read as
+            // divergence and wedge its writes.
+            clear_pending_upload(&local_path);
+            if let Some(ref archive) = self.archive {
+                // Fail closed: a silent upload failure would leave the repo
+                // absent from storage while its row is live.
+                let etag = archive
+                    .upload(&owner_slug, repo_name, &local_path)
+                    .await
+                    .context("uploading new repo to storage")?;
+                if let Some(etag) = etag {
+                    self.versions.lock().await.insert(label.clone(), etag);
                 }
-            });
+            }
+            Ok(())
         }
+        .await;
 
+        if let Err(e) = outcome {
+            if local_path.exists() {
+                if let Err(cleanup_err) = std::fs::remove_dir_all(&local_path) {
+                    warn!(repo = %repo_name, err = %cleanup_err,
+                        "failed to remove local repo dir after creation failure");
+                }
+            }
+            clear_pending_upload(&local_path);
+            lock.unlock().await;
+            return Err(e);
+        }
+        lock.unlock().await;
         Ok(local_path)
     }
 
-    /// Upload a repo to Tigris after a write operation (push, merge, fork, etc.).
-    /// Call this after any operation that modifies the git repo on disk.
-    pub async fn release_after_write(&self, owner_did: &str, repo_name: &str) {
-        if let Some(ref tigris) = self.tigris {
-            let (owner_slug, local_path) = match self.local_path(owner_did, repo_name) {
-                Ok(p) => p,
+    /// Whether a pending-upload marker currently protects this repo's local
+    /// copy. Handlers use this after a failed `release()` to decide whether an
+    /// already-committed git mutation is recoverable (marker present: the next
+    /// upload re-syncs storage) or must fail the request (no marker: nothing
+    /// protects the mutation from a stale-archive rollback).
+    pub fn pending_marker_exists(&self, owner_did: &str, repo_name: &str) -> bool {
+        self.local_path(owner_did, repo_name)
+            .and_then(|(_, local_path)| pending_upload_marker(&local_path))
+            .map(|marker| marker.try_exists().unwrap_or(false))
+            .unwrap_or(false)
+    }
+
+    /// Startup sweep re-attempting the durable upload for every repo whose
+    /// pending-upload marker survived a crash or a failed upload. Without this,
+    /// a repo that receives no further writes stays divergent from storage
+    /// indefinitely, visible only as one log line at failure time.
+    ///
+    /// Applies the same base-etag rule as `sync_down_if_stale`: a repo whose
+    /// storage advanced past the marker's base is left marked (its writes stay
+    /// wedged pending manual reconciliation) and only logged. Returns
+    /// `(reuploaded, still_pending)`.
+    pub async fn retry_pending_uploads(&self) -> (usize, usize) {
+        if self.archive.is_none() {
+            return (0, 0);
+        }
+        let mut reuploaded = 0usize;
+        let mut still_pending = 0usize;
+
+        let mut markers: Vec<(String, String, PathBuf)> = Vec::new(); // (slug, repo, local)
+                                                                      // Scan failures are logged loudly: a sweep that scanned nothing must
+                                                                      // not look identical to a node with no pending markers — especially
+                                                                      // since the gauge below is seeded from this same scan.
+        let owners = match std::fs::read_dir(&self.repos_dir) {
+            Ok(owners) => owners,
+            Err(e) => {
+                warn!(dir = %self.repos_dir.display(), err = %e,
+                    "pending-upload sweep: cannot read repos dir — sweep skipped");
+                return (0, 0);
+            }
+        };
+        for owner in owners.flatten() {
+            if !owner.path().is_dir() {
+                continue;
+            }
+            let slug = owner.file_name().to_string_lossy().into_owned();
+            let entries = match std::fs::read_dir(owner.path()) {
+                Ok(entries) => entries,
                 Err(e) => {
-                    warn!(repo = %repo_name, err = %e, "rejected unsafe path in release_after_write");
-                    return;
+                    warn!(dir = %owner.path().display(), err = %e,
+                        "pending-upload sweep: cannot read owner dir — skipped");
+                    continue;
                 }
             };
-            if let Err(e) = tigris.upload(&owner_slug, repo_name, &local_path).await {
-                warn!(repo = %repo_name, err = %e, "failed to upload repo to tigris after write");
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                // Marker-write temp litter (crash mid-rename): collect it.
+                if name.starts_with(".pending-upload.tmp-") {
+                    let _ = std::fs::remove_file(entry.path());
+                    continue;
+                }
+                // Marker layout: `.{repo}.git.pending-upload`
+                let Some(repo_dir) = name
+                    .strip_prefix('.')
+                    .and_then(|n| n.strip_suffix(".pending-upload"))
+                else {
+                    continue;
+                };
+                let Some(repo_name) = repo_dir.strip_suffix(".git") else {
+                    continue;
+                };
+                // The repo dir name comes off the filesystem here rather than
+                // from a request, but it is a name this node wrote from
+                // user-provided data and the result is handed to the upload
+                // path's fs calls, so it goes through the same barrier as every
+                // other repo path. A sweep entry that fails it is litter no
+                // legitimate write could have produced: skip it rather than
+                // acting on it.
+                let repo_path =
+                    match validated_repo_path_in(&self.repos_dir, &owner.path().join(repo_dir)) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!(dir = %owner.path().display(), err = %e,
+                            "pending-upload sweep: rejecting an unsafe repo path — skipped");
+                            continue;
+                        }
+                    };
+                markers.push((slug.clone(), repo_name.to_string(), repo_path));
             }
+        }
+
+        // Seed the gauge with the surviving-marker count before processing;
+        // the clears below (and all runtime marker churn) then keep it
+        // current via deltas.
+        crate::metrics::set_pending_upload_markers(markers.len() as i64);
+
+        for (slug, repo_name, local_path) in markers {
+            if !local_path.exists() {
+                // Stale litter (repo dir gone) — storage is the best remaining
+                // state; drop the marker.
+                clear_pending_upload(&local_path);
+                continue;
+            }
+            let pm = read_pending_marker(&local_path);
+            // The marker-vs-remote decision and the upload both happen inside
+            // `upload_locked_with_marker`, UNDER the advisory lock: an
+            // unlocked pre-check here could pass, then block on a concurrent
+            // push's lock for that push's whole duration, and the stale
+            // decision would clobber the push's freshly-uploaded archive.
+            match self
+                .upload_locked_with_marker(&slug, &repo_name, &local_path, &pm)
+                .await
+            {
+                Ok(PendingUploadOutcome::Uploaded) => {
+                    debug!(repo = %repo_name, "pending-upload retry: re-synced storage");
+                    reuploaded += 1;
+                }
+                Ok(PendingUploadOutcome::Diverged) => {
+                    warn!(repo = %repo_name,
+                        "pending-upload retry: storage diverged from marker base — \
+                         leaving marked; writes stay blocked pending manual reconciliation");
+                    still_pending += 1;
+                }
+                Err(e) => {
+                    warn!(repo = %repo_name, err = %e,
+                        "pending-upload retry: upload failed — will retry on next write");
+                    still_pending += 1;
+                }
+            }
+        }
+        (reuploaded, still_pending)
+    }
+
+    /// Marker-protected upload: takes the per-repo advisory lock, re-checks
+    /// that storage still matches `base` UNDER the lock, and only then uploads,
+    /// updates the versions cache, and clears the marker — all before the lock
+    /// is released.
+    ///
+    /// Both halves of that ordering are load-bearing:
+    /// - The divergence check must run under the lock. An unlocked check can
+    ///   pass just before a concurrent locked push advances storage (the check
+    ///   then blocks on that push's lock), and blindly uploading afterwards
+    ///   would clobber the acked push it lost the race to.
+    /// - The marker must be cleared before the lock is released, or a writer
+    ///   queued on the lock could observe marker + fresh etag and fail with a
+    ///   spurious "diverged — reconcile manually" on a consistent repo.
+    async fn upload_locked_with_marker(
+        &self,
+        owner_slug: &str,
+        repo_name: &str,
+        local_path: &Path,
+        marker: &PendingMarker,
+    ) -> Result<PendingUploadOutcome> {
+        let Some(ref archive) = self.archive else {
+            anyhow::bail!("upload_locked_with_marker called without a storage backend");
+        };
+        let label = format!("{owner_slug}/{repo_name}");
+        let lock = LockedConn::acquire(
+            &self.lock_pool,
+            advisory_lock_key(owner_slug, repo_name),
+            &label,
+        )
+        .await?;
+
+        let outcome: Result<PendingUploadOutcome> = async {
+            let remote = archive
+                .head_etag(owner_slug, repo_name)
+                .await
+                .context("storage head under lock before pending upload")?;
+            match remote.as_deref() {
+                Some(r) if !marker.matches_base(r) => {
+                    // Unexplained remote: validate by content whether it is
+                    // exactly what this node was uploading when it died —
+                    // synced, no PUT needed. Otherwise: divergence.
+                    if self
+                        .remote_matches_inflight(archive, owner_slug, repo_name, marker)
+                        .await
+                    {
+                        self.versions
+                            .lock()
+                            .await
+                            .insert(label.clone(), r.to_string());
+                        clear_pending_upload_after_success(local_path, Some(r));
+                        return Ok(PendingUploadOutcome::Uploaded);
+                    }
+                    return Ok(PendingUploadOutcome::Diverged);
+                }
+                None if !marker.matches_base("") => {
+                    return Ok(PendingUploadOutcome::Diverged);
+                }
+                _ => {}
+            }
+            // Record the intended etag in the marker before the PUT: a crash
+            // after the PUT lands is then recognizable (above) as our own
+            // completed upload instead of wedging on false divergence.
+            let etag = archive
+                .upload_with_intent(owner_slug, repo_name, local_path, |intended| {
+                    record_inflight_upload(local_path, intended)
+                })
+                .await
+                .context("uploading repo to storage under lock")?;
+            if let Some(ref etag) = etag {
+                self.versions
+                    .lock()
+                    .await
+                    .insert(label.clone(), etag.clone());
+            }
+            clear_pending_upload_after_success(local_path, etag.as_deref());
+            Ok(PendingUploadOutcome::Uploaded)
+        }
+        .await;
+
+        lock.unlock().await;
+        outcome
+    }
+
+    /// Upload `local_path` to storage while holding the per-repo advisory lock,
+    /// so a background or init-time upload can't clobber a concurrent locked
+    /// write by landing an older snapshot after it. With `skip_if_exists`, skips
+    /// the upload when the archive is already present (used by lazy migration).
+    async fn upload_under_lock(
+        &self,
+        owner_slug: &str,
+        repo_name: &str,
+        local_path: &Path,
+        skip_if_exists: bool,
+    ) -> Result<()> {
+        let Some(ref archive) = self.archive else {
+            return Ok(());
+        };
+        let label = format!("{owner_slug}/{repo_name}");
+        let lock = LockedConn::acquire(
+            &self.lock_pool,
+            advisory_lock_key(owner_slug, repo_name),
+            &label,
+        )
+        .await?;
+
+        let outcome: Result<Option<String>> = async {
+            if skip_if_exists {
+                // Propagate a failed existence check instead of treating it as
+                // "absent": HEAD failing transiently while PUT would succeed
+                // must not let this node's cache overwrite a newer shared
+                // archive. The lazy-migration caller just retries later.
+                let exists = archive
+                    .exists(owner_slug, repo_name)
+                    .await
+                    .context("checking storage before migration upload")?;
+                if exists {
+                    return Ok(None); // already present — nothing to upload
+                }
+            }
+            archive.upload(owner_slug, repo_name, local_path).await
+        }
+        .await;
+
+        // Release the lock on the same connection regardless of outcome.
+        lock.unlock().await;
+
+        match outcome {
+            Ok(Some(etag)) => {
+                self.versions
+                    .lock()
+                    .await
+                    .insert(format!("{owner_slug}/{repo_name}"), etag);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(e) => Err(e).context("uploading repo to storage under lock"),
         }
     }
 
@@ -463,6 +909,109 @@ pub(crate) fn validated_repo_disk_path(
     }
 
     Ok(local_path)
+}
+
+/// Re-establish the traversal barrier on a repo path this function did not
+/// build itself, and return the checked value.
+///
+/// `sync_down_if_stale` and the sweep receive a `&Path` as a PARAMETER. The
+/// caller derived it from [`validated_repo_disk_path`], but a barrier the
+/// reader has to trace across a call boundary is not a barrier a static
+/// analyser will honour: to CodeQL's `rust/path-injection` the parameter is
+/// just a path with user-provided data in its history, and every `exists()`,
+/// `read_dir` and `remove_file` reached from it is a sink. Re-running the
+/// check where the filesystem work actually happens costs two string compares
+/// on a path we already hold and makes the guarantee local to the code it
+/// guards, so it survives future refactors that move a call site.
+///
+/// Same three layers as [`validated_repo_disk_path`], minus the name allowlist
+/// (the components are no longer separable once joined): containment under
+/// `repos_dir`, then the explicit `Component::Normal` walk.
+pub(crate) fn validated_repo_path_in(repos_dir: &Path, candidate: &Path) -> Result<PathBuf> {
+    if !candidate.starts_with(repos_dir) {
+        anyhow::bail!("repo path escaped repos_dir: {}", candidate.display());
+    }
+
+    // Explicit component walk — sanitisation barrier that static analysers
+    // (CodeQL `rust/path-injection`) recognise. The path must be composed
+    // entirely of Normal segments after the root prefix; any ParentDir or
+    // CurDir component is a traversal attempt.
+    for component in candidate.components() {
+        use std::path::Component;
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {}
+            Component::ParentDir => {
+                anyhow::bail!("path contains parent-directory component");
+            }
+            Component::CurDir => {
+                anyhow::bail!("path contains current-directory component");
+            }
+        }
+    }
+
+    Ok(candidate.to_path_buf())
+}
+
+/// The sibling-path counterpart to [`validated_repo_disk_path`], for the files
+/// this layer writes NEXT TO a repo directory rather than inside it: the
+/// pending-upload marker, its rename-temp, and the swap phase's `.bak-` and
+/// `.tmp-extract.` work dirs.
+///
+/// A validated repo path does not make its siblings validated. `with_file_name`
+/// and `join` build a NEW path, and a new path is a new question: nothing in
+/// the type system says the name handed in contributed no separator, no `..`,
+/// and no absolute prefix (a `join` with an absolute component silently
+/// DISCARDS everything accumulated before it). These names are assembled from
+/// the repo's own file name, which carries user-provided data all the way from
+/// the push URL, so each one is re-checked here before any filesystem call
+/// touches it.
+///
+/// Three layers, mirroring the repo-path barrier: the name must be a single
+/// ordinary path segment, the result must stay under the repo's parent
+/// directory, and the joined path must walk as `Component::Normal` throughout.
+/// The returned `PathBuf` is the only value callers hand to the filesystem.
+pub(crate) fn validated_sibling_path(local_path: &Path, file_name: &str) -> Result<PathBuf> {
+    let parent = local_path
+        .parent()
+        .context("repo path has no parent directory")?;
+
+    if file_name.is_empty() {
+        anyhow::bail!("sibling file name is empty");
+    }
+    if file_name.len() > 255 {
+        anyhow::bail!("sibling file name exceeds the 255-byte filesystem name limit");
+    }
+    if file_name == "." || file_name == ".." || file_name.contains("..") {
+        anyhow::bail!("sibling file name contains a parent-directory reference");
+    }
+    if file_name.contains('/') || file_name.contains('\\') || file_name.contains('\0') {
+        anyhow::bail!("sibling file name contains a path separator or null byte");
+    }
+
+    let candidate = parent.join(file_name);
+
+    if !candidate.starts_with(parent) {
+        anyhow::bail!("sibling path escaped the repo parent dir: {file_name}");
+    }
+
+    // Explicit component walk — sanitisation barrier that static analysers
+    // (CodeQL `rust/path-injection`) recognise. The path must be composed
+    // entirely of Normal segments after the root prefix; any ParentDir or
+    // CurDir component is a traversal attempt.
+    for component in candidate.components() {
+        use std::path::Component;
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {}
+            Component::ParentDir => {
+                anyhow::bail!("path contains parent-directory component");
+            }
+            Component::CurDir => {
+                anyhow::bail!("path contains current-directory component");
+            }
+        }
+    }
+
+    Ok(candidate)
 }
 
 /// Strict allowlist validator for `owner_did` and `repo_name`.
@@ -657,46 +1206,12 @@ fn validate_repo_name(repo_name: &str) -> Result<()> {
 #[error("no lock-pool connection available")]
 pub struct LockPoolBusy;
 
-/// Guard returned by `acquire_write()`. Holds the Postgres advisory lock and
-/// uploads to Tigris + releases the lock on `release()`.
-pub struct RepoWriteGuard {
-    owner_slug: String,
-    repo_name: String,
-    pub local_path: PathBuf,
-    lock_key: i64,
-    /// The lock-pool connection that TOOK the advisory lock. It must be the one
-    /// that releases it (session locks are owned by their connection), and
-    /// holding it here is also what makes a guard dropped without `release`
-    /// safe: the drop returns the connection through the pool's `after_release`
-    /// hook, which runs `pg_advisory_unlock_all()`.
-    ///
-    /// `Option` because that hook is not a complete answer. When the unlock ERRORS
-    /// on a live session (a statement timeout, an admin cancel, an aborted
-    /// transaction), `after_release` issues its `pg_advisory_unlock_all()` on the
-    /// SAME broken session and it fails too, so the connection goes back to the pool
-    /// still holding the lock and nothing ever clears it (measured: never freed in
-    /// 15s, #174 F3b). Those paths `take()` the connection and close it instead;
-    /// ending the session is what actually frees the lock. `None` only after such a
-    /// disposal, or after `Drop` has moved it into the detached unlock.
-    lock_conn: Option<PoolConnection<Postgres>>,
-    /// Set once `release` has run its unlock, making the `Drop` backstop inert. A
-    /// guard is only ever constructed with the lock already held, so there is no
-    /// "never locked" state to track alongside it.
-    released: bool,
-    tigris: Option<TigrisClient>,
-    /// Shared with the store that handed this guard out; see
-    /// [`RepoStore::upload_site_reached`].
-    #[cfg(test)]
-    upload_site_reached: Arc<std::sync::atomic::AtomicUsize>,
-    /// Test-only seam: when set, `release` parks on this gate at the exact point it
-    /// is about to await `pg_advisory_unlock` (connection still owned, not yet
-    /// returned to the lock pool). Dropping the `release` future while it is parked
-    /// reproduces a mid-unlock cancellation, so a test can assert the lock is still
-    /// freed: the drop returns the connection through the pool's `after_release`
-    /// hook, which runs `pg_advisory_unlock_all()`. Never set outside tests.
-    #[cfg(test)]
-    test_pre_unlock_gate: Option<Arc<tokio::sync::Notify>>,
-}
+/// How long to retry acquiring the per-repo advisory lock before giving up.
+/// Matches the storage backends' total operation timeout (300s in `s3.rs` and
+/// `ipfs.rs`): the writer holding the lock may legitimately be mid-upload of a
+/// large archive, so a concurrent push must be willing to outwait the longest
+/// possible upload rather than failing while the lock holder is still healthy.
+pub(crate) const LOCK_ACQUIRE_TIMEOUT_SECS: u64 = 300;
 
 /// Deadline for tearing down the connection that saw a failing `pg_advisory_unlock`.
 /// Long enough that a healthy socket always finishes well inside it, short enough that
@@ -734,54 +1249,129 @@ async fn close_conn_bounded(
     }
 }
 
-impl RepoWriteGuard {
-    /// Path to the bare repo on local disk.
-    pub fn path(&self) -> &Path {
-        &self.local_path
-    }
+/// A pool connection pinned for the lifetime of a session-scoped advisory lock.
+///
+/// Postgres advisory locks bind to one backend connection and only release on
+/// that same connection; with a pool, acquiring and releasing on different
+/// checked-out connections means the unlock silently no-ops while the lock
+/// lingers on the original. So the lock's whole HELD lifetime — the winning
+/// try-lock, use, unlock — runs on this single pinned connection.
+///
+/// `unlock()` is the graceful path: it releases the lock and returns the
+/// connection to the pool (closing it instead when the unlock errors, since a
+/// session whose unlock failed may still hold the lock). If the holder is
+/// *dropped* while the lock is held — a cancelled `acquire_write`, a detached
+/// write-back task cancelled by runtime shutdown mid upload — `Drop` runs a
+/// detached unlock on the same session, disposing of the connection if that
+/// errors; off a Tokio runtime it detaches and closes the connection, which
+/// ends the Postgres session and frees the lock server-side. The one thing
+/// this type never does is knowingly return a still-locked connection to the
+/// pool — and the lock pool's `after_release` hook (`pg_advisory_unlock_all`)
+/// backstops even the paths it cannot see (#173).
+struct LockedConn {
+    /// The connection that TOOK the advisory lock, owned until the unlock await
+    /// RESOLVES. `Option` because the unlock is not always the end of it: when
+    /// `pg_advisory_unlock` errors on a live session, `after_release` fails
+    /// identically on that same broken session (#174 F3b), so those paths
+    /// `take()` the connection and close it instead — ending the session is what
+    /// actually frees the lock. `None` only after such a disposal, or after
+    /// `Drop` has moved it into the detached unlock.
+    conn: Option<PoolConnection<Postgres>>,
+    lock_key: i64,
+    repo_label: String,
+    /// Set once `unlock()`'s await has resolved, making the `Drop` backstop
+    /// inert. A `LockedConn` only ever exists with the lock already held, so
+    /// there is no "never locked" state to track alongside it.
+    released: bool,
+}
 
-    /// Upload to Tigris (only when the write succeeded) and release the advisory
-    /// lock. Pass `success = false` when the write operation failed — uploading a
-    /// half-applied or otherwise inconsistent repo would propagate corruption to
-    /// Tigris (and to every node that later downloads it). The lock is always
-    /// released regardless, to avoid stale locks blocking future writes.
-    pub async fn release(mut self, success: bool) {
-        // Upload to Tigris only on success.
-        if success {
-            // The upload site, recorded for tests before the client is consulted: with
-            // no injectable seam on `TigrisClient` a counter inside the arm below could
-            // never move, and it is reaching this point at all that an interrupted push
-            // must not do (#173 F2).
-            #[cfg(test)]
-            self.upload_site_reached
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if let Some(ref tigris) = self.tigris {
-                if let Err(e) = tigris
-                    .upload(&self.owner_slug, &self.repo_name, &self.local_path)
-                    .await
-                {
-                    warn!(repo = %self.repo_name, err = %e, "failed to upload repo to tigris after write");
+impl LockedConn {
+    /// Acquire `lock_key` on a pinned connection, polling `pg_try_advisory_lock`
+    /// once per second up to [`LOCK_ACQUIRE_TIMEOUT_SECS`]. Polling (rather than
+    /// the blocking `pg_advisory_lock`) keeps a stale lock from a crashed
+    /// session from wedging writers indefinitely.
+    ///
+    /// The connection is checked out INSIDE the loop and RETURNED before each
+    /// sleep; only the connection that actually took the lock is retained. Two
+    /// constraints pull in opposite directions here, and this is what satisfies
+    /// both (#173 F1):
+    ///
+    ///   * Session ownership. A session-level advisory lock belongs to the
+    ///     CONNECTION that took it, so the lock and its `pg_advisory_unlock`
+    ///     must run on the same one. Hence: keep the connection that WON.
+    ///   * Occupancy. Holding a connection across the ~300 one-second sleeps
+    ///     would let one spinning acquire park a lock-pool connection for
+    ///     minutes. `api/issues.rs` and `api/pulls.rs` reach `acquire_write`
+    ///     holding no concurrency permit at all, so a caller could park the
+    ///     whole pool and starve authenticated pushes on every repo. Hence:
+    ///     return the connection when we LOSE, before sleeping.
+    ///
+    /// Returning a losing connection is safe with respect to the cancellation
+    /// design: `after_release` runs `pg_advisory_unlock_all()`, a no-op on a
+    /// connection that took nothing, so it cannot disturb a lock held by any
+    /// other connection.
+    ///
+    /// Pool exhaustion (no connection free within the pool's acquire timeout)
+    /// surfaces as a downcastable [`LockPoolBusy`] so the HTTP layer can shed a
+    /// 503 + Retry-After instead of a generic 500.
+    async fn acquire(pool: &PgPool, lock_key: i64, repo_label: &str) -> Result<Self> {
+        for attempt in 0..LOCK_ACQUIRE_TIMEOUT_SECS {
+            let mut conn = pool.acquire().await.map_err(|e| {
+                anyhow::Error::new(LockPoolBusy)
+                    .context(format!("checking out a lock-pool connection: {e}"))
+            })?;
+            match sqlx::query_as::<_, (bool,)>("SELECT pg_try_advisory_lock($1)")
+                .bind(lock_key)
+                .fetch_one(&mut *conn)
+                .await
+            {
+                Ok((true,)) => {
+                    return Ok(Self {
+                        conn: Some(conn),
+                        lock_key,
+                        repo_label: repo_label.to_string(),
+                        released: false,
+                    });
+                }
+                Ok((false,)) => {
+                    // Lost the race: give the connection back so a spinning
+                    // acquire occupies nothing while it waits.
+                    drop(conn);
+                }
+                Err(e) => {
+                    // The poll itself failing leaves the lock's server-side
+                    // state unknown: if the query executed but the response was
+                    // lost, this session HOLDS the lock, and repooling the
+                    // connection would strand it behind `after_release`'s best
+                    // effort. Close it deliberately; ending the session frees
+                    // anything it took.
+                    drop(conn.detach());
+                    return Err(e).context("trying advisory lock");
                 }
             }
-        } else {
-            warn!(repo = %self.repo_name, "write failed — skipping tigris upload to avoid propagating an inconsistent repo");
+            if attempt < LOCK_ACQUIRE_TIMEOUT_SECS - 1 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
         }
+        anyhow::bail!(
+            "could not acquire advisory lock for {repo_label} after {LOCK_ACQUIRE_TIMEOUT_SECS}s — \
+             possible stale lock or a long-running upload"
+        );
+    }
 
-        // Test-only: park right before the unlock await so a test can drop this
-        // future mid-unlock, with the connection still owned.
-        #[cfg(test)]
-        if let Some(gate) = self.test_pre_unlock_gate.clone() {
-            gate.notified().await;
-        }
-        // Release the advisory lock on the connection that took it. Anything else
-        // (a fresh `&pool` checkout) is a no-op that returns false: Postgres
-        // scopes a session lock to its owning connection.
-        //
-        // Unlock through the connection while it is STILL owned by `self`; do not
-        // `take()` it first. A cancellation during this await then drops `self` with
-        // the connection still in place, so it returns to the lock pool and
-        // `after_release` clears the lock (#174 F4).
-        let unlock = match self.lock_conn.as_deref_mut() {
+    /// Release the held lock on the pinned connection and return it to the
+    /// pool. An unlock that ERRORS is a live session that may still hold the
+    /// lock — `after_release` would fail identically on the same broken session
+    /// (#174 F3b) — so the connection is closed instead (bounded, #174 F3c):
+    /// ending the session is what actually frees the lock.
+    async fn unlock(mut self) {
+        // Unlock through the connection while it is STILL owned by `self`; do
+        // NOT `take()` it first. A cancellation during this await then drops
+        // `self` with the connection in place, so `Drop`'s detached backstop
+        // runs and the pool's `after_release` hook clears whatever the
+        // interrupted unlock did not (#174 F4). Taking it early would leave
+        // `Drop` with `conn == None` and strand the session lock.
+        let unlock = match self.conn.as_deref_mut() {
             Some(conn) => Some(
                 sqlx::query("SELECT pg_advisory_unlock($1)")
                     .bind(self.lock_key)
@@ -790,45 +1380,51 @@ impl RepoWriteGuard {
             ),
             None => None,
         };
-        // An unlock that ERRORS is a different failure from a cancellation: the await
-        // resolved, so the session is alive and still holds the lock. Returning that
-        // connection to the pool does NOT recover it, because `after_release` runs its
-        // `pg_advisory_unlock_all()` on the same broken session and fails identically
-        // (#174 F3b). Close it: ending the session is what frees the lock.
+        // An unlock that ERRORS is a different failure from a cancellation: the
+        // await resolved, so the session is alive and still holds the lock, and
+        // returning that connection to the pool does not recover it because
+        // `after_release` runs its `pg_advisory_unlock_all()` on the same broken
+        // session and fails identically (#174 F3b). Close it: ending the session
+        // is what frees the lock.
         if let Some(Err(e)) = unlock {
-            warn!(repo = %self.repo_name, err = %e,
+            warn!(repo = %self.repo_label, err = %e,
                 "advisory unlock failed, closing the connection so the session ends and postgres drops the lock");
-            if let Some(conn) = self.lock_conn.take() {
-                close_conn_bounded(&self.repo_name, conn.close()).await;
+            if let Some(conn) = self.conn.take() {
+                close_conn_bounded(&self.repo_label, conn.close()).await;
             }
         }
-        // On the clean path, dropping `self` returns the connection to the lock pool,
-        // where `after_release` sweeps anything the unlock above missed.
+        // Only now that the await has resolved: mark released so the `Drop`
+        // backstop below does not re-issue an unlock on a lock already freed.
+        // On the clean path, dropping `self` returns the connection to the lock
+        // pool, where `after_release` sweeps anything this missed.
         self.released = true;
     }
 }
 
-impl Drop for RepoWriteGuard {
-    /// Backstop for a guard dropped WITHOUT `release` (a cancelled `acquire_write`, a
-    /// handler future dropped before the release call). The pool's `after_release`
-    /// hook covers the ordinary case on its own, but not one: if the detached unlock
-    /// ERRORS on a live session, the hook's `pg_advisory_unlock_all()` fails the same
-    /// way and the connection returns to the pool still holding the lock (#174 F3b).
+impl Drop for LockedConn {
+    /// Backstop for a holder dropped WITHOUT `unlock` (a cancelled
+    /// `acquire_write`, a handler future dropped before release, a cancelled
+    /// write-back task). The pool's `after_release` hook covers the ordinary
+    /// case on its own, but not one: if the detached unlock ERRORS on a live
+    /// session, the hook's `pg_advisory_unlock_all()` fails the same way and
+    /// the connection returns to the pool still holding the lock (#174 F3b).
     /// So the unlock runs here and disposes of the connection when it errors.
     ///
-    /// `Drop` cannot await, so the unlock is spawned; it runs on the same session,
-    /// which is what makes it effective. With no runtime to spawn onto there is
-    /// nothing that can unlock, so the connection is detached and dropped instead:
-    /// closing the socket ends the session, and that frees the lock server-side.
+    /// `Drop` cannot await, so the unlock is spawned; it runs on the same
+    /// session, which is what makes it effective. With no runtime to spawn onto
+    /// there is nothing that can unlock, so the connection is detached and
+    /// dropped instead: closing the socket ends the session, and that frees the
+    /// lock server-side (and detaching first avoids sqlx's return-to-pool
+    /// spawn, which panics off-runtime).
     fn drop(&mut self) {
         if self.released {
             return;
         }
-        let Some(mut conn) = self.lock_conn.take() else {
+        let Some(mut conn) = self.conn.take() else {
             return;
         };
         let lock_key = self.lock_key;
-        let repo_name = self.repo_name.clone();
+        let repo_label = self.repo_label.clone();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
@@ -836,31 +1432,341 @@ impl Drop for RepoWriteGuard {
                         .bind(lock_key)
                         .execute(&mut *conn)
                         .await;
-                    // Same failure as `release`'s, one level down: the await RESOLVED
-                    // with an error, so the session is alive and still holds the lock.
-                    // Ending this block would drop `conn` and RETURN it to the pool,
-                    // where `after_release` fails identically. Close it instead.
                     if let Err(e) = unlock {
-                        warn!(repo = %repo_name, err = %e, "detached advisory-unlock on write-guard drop failed, closing the connection so the session ends and postgres drops the lock");
-                        close_conn_bounded(&repo_name, conn.close()).await;
+                        warn!(repo = %repo_label, err = %e,
+                            "detached advisory-unlock on lock-holder drop failed, closing the connection so the session ends and postgres drops the lock");
+                        close_conn_bounded(&repo_label, conn.close()).await;
                     }
                 });
             }
             Err(_) => {
-                // `PoolConnection`'s own drop spawns its return-to-pool task, which
-                // panics with no runtime. `detach` gives up the pool slot and yields a
-                // plain `PgConnection`; dropping that closes the socket, which ends the
-                // session and is what frees the lock.
                 drop(conn.detach());
                 warn!(
-                    repo = %repo_name,
-                    "RepoWriteGuard dropped off a Tokio runtime; no detached unlock is \
-                     possible, so the pinned connection is disposed of instead: ending \
-                     the session is what releases the advisory lock"
+                    repo = %repo_label,
+                    "advisory-lock holder dropped off a Tokio runtime; no detached unlock is \
+                     possible, so the pinned connection is disposed of instead: ending the \
+                     session is what releases the advisory lock"
                 );
             }
         }
     }
+}
+
+/// Guard returned by `acquire_write()`. Holds the Postgres advisory lock and
+/// uploads to storage + releases the lock on `release()`.
+///
+/// `#[must_use]`: dropping the guard without calling `release()` skips the
+/// storage upload and force-closes the pinned lock connection to free the
+/// advisory lock (see [`LockedConn`]) — safe, but never what a caller wants.
+#[must_use = "call release() — dropping the guard skips the upload and force-closes the lock connection"]
+pub struct RepoWriteGuard {
+    owner_slug: String,
+    repo_name: String,
+    pub local_path: PathBuf,
+    /// The pinned advisory-lock connection; freed on `release()`, or by
+    /// `LockedConn::drop` if the guard (or a write-back task driving it) is
+    /// dropped or cancelled mid-flight.
+    lock: LockedConn,
+    archive: Option<RepoArchive>,
+    versions: Arc<Mutex<HashMap<String, String>>>,
+    /// Shared with the store that handed this guard out; see
+    /// [`RepoStore::upload_site_reached`].
+    #[cfg(test)]
+    upload_site_reached: Arc<std::sync::atomic::AtomicUsize>,
+    /// Test-only seam: when set, `release` parks on this gate at the exact point it
+    /// is about to await the advisory unlock (connection still owned by the guard's
+    /// `LockedConn`). Dropping the `release` future while it is parked reproduces a
+    /// mid-unlock cancellation; the guard then drops with the lock connection still
+    /// pinned, and `LockedConn`'s backstop frees the lock. Never set outside tests.
+    #[cfg(test)]
+    test_pre_unlock_gate: Option<Arc<tokio::sync::Notify>>,
+}
+
+impl RepoWriteGuard {
+    /// Path to the bare repo on local disk.
+    pub fn path(&self) -> &Path {
+        &self.local_path
+    }
+
+    /// Durably record intent-to-upload NOW, before the caller acks the client.
+    /// Write-back callers must call this before spawning `release()` — the
+    /// spawned task may never be polled if the process stops right after the
+    /// ack, and without the marker already on disk a restart would treat the
+    /// stale storage archive as newer and roll the acked write back. On `Err`
+    /// the caller must NOT ack early; fall back to strict upload-before-ack.
+    /// Idempotent with the marker `release()` writes itself. No-op without a
+    /// storage backend (markers would be inert until a backend appears, then
+    /// wedge repos whose archives predate them).
+    pub async fn mark_pending(&self) -> Result<()> {
+        if self.archive.is_none() {
+            return Ok(());
+        }
+        let key = format!("{}/{}", self.owner_slug, self.repo_name);
+        let base = self.versions.lock().await.get(&key).cloned();
+        mark_pending_upload(&self.local_path, base.as_deref())
+    }
+
+    /// Upload to storage (only when the write succeeded) and release the advisory
+    /// lock. Pass `success = false` when the write operation failed — uploading a
+    /// half-applied or otherwise inconsistent repo would propagate corruption to
+    /// storage (and to every node that later downloads it). The lock is always
+    /// released regardless, to avoid stale locks blocking future writes.
+    ///
+    /// IMPORTANT: the advisory lock is held until the upload finishes, so a
+    /// concurrent writer on another machine cannot read a stale archive. When
+    /// callers want a fast client ack, they spawn this future as a background
+    /// task (write-back) — the lock + etag-cache update still complete in order.
+    pub async fn release(self, success: bool) -> Result<()> {
+        let key = format!("{}/{}", self.owner_slug, self.repo_name);
+
+        // Upload to storage only on success. Capture the outcome so we can both
+        // release the lock unconditionally and propagate a durable-upload
+        // failure to the caller (a synchronous caller turns it into a client
+        // error; a write-back caller logs it).
+        let upload_result: Result<()> = if success {
+            // The upload site, recorded for tests before the backend is consulted: it
+            // counts the DECISION to upload, so it moves even with no backend
+            // configured, and reaching this point at all is what an interrupted push
+            // must never do (#173 F2).
+            #[cfg(test)]
+            self.upload_site_reached
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(ref archive) = self.archive {
+                let base = self.versions.lock().await.get(&key).cloned();
+                if let Err(e) = mark_pending_upload(&self.local_path, base.as_deref()) {
+                    // Proceed with the upload anyway: if it succeeds, no marker
+                    // is needed; if both fail, the error below reaches the
+                    // caller (double-failure corner, same exposure as
+                    // pre-marker behavior).
+                    warn!(repo = %self.repo_name, err = %e, "failed to write pending-upload marker");
+                }
+                match archive
+                    .upload_with_intent(
+                        &self.owner_slug,
+                        &self.repo_name,
+                        &self.local_path,
+                        |intended| record_inflight_upload(&self.local_path, intended),
+                    )
+                    .await
+                {
+                    Ok(Some(etag)) => {
+                        self.versions.lock().await.insert(key.clone(), etag.clone());
+                        clear_pending_upload_after_success(&self.local_path, Some(&etag));
+                        Ok(())
+                    }
+                    Ok(None) => {
+                        clear_pending_upload(&self.local_path);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // Storage is now behind local (this holds even for an
+                        // already-acked write-back push). Drop the cached etag,
+                        // and leave the pending-upload marker so the next
+                        // access serves the local copy instead of rolling it
+                        // back to the stale archive; the next successful
+                        // upload re-syncs storage and clears the marker.
+                        self.versions.lock().await.remove(&key);
+                        Err(e).context("uploading repo to storage after write")
+                    }
+                }
+            } else {
+                Ok(())
+            }
+        } else {
+            // Write failed: skip the upload (a half-applied repo must not reach
+            // storage) and invalidate the cached etag — the local copy may be
+            // dirty, so the next write must re-download instead of skipping on a
+            // now-misleading etag match.
+            warn!(repo = %self.repo_name, "write failed — skipping storage upload and invalidating etag cache");
+            self.versions.lock().await.remove(&key);
+            Ok(())
+        };
+
+        // Test-only: park right before the unlock await so a test can drop this
+        // future mid-unlock, with the connection still owned.
+        #[cfg(test)]
+        if let Some(gate) = self.test_pre_unlock_gate.clone() {
+            gate.notified().await;
+        }
+        // Release the advisory lock on the same connection it was taken on
+        // regardless of the upload outcome, then return it to the pool.
+        self.lock.unlock().await;
+
+        upload_result
+    }
+}
+
+/// Sibling marker file recording that `local_path` holds writes storage has
+/// not received yet ("local is ahead"). Written before every post-write upload
+/// and removed only when the upload succeeds, so it survives process death and
+/// lets `sync_down_if_stale` distinguish "storage is ahead of local" (download)
+/// from "local is ahead of storage" (never download — that would roll back an
+/// acked write). Lives next to the repo dir, not inside it, so it is never
+/// packed into the archive.
+/// Fallible because it goes through [`validated_sibling_path`]: the marker name
+/// is built from the repo's own file name, which carries user-provided data, so
+/// the path is re-checked here rather than trusted from the repo path's own
+/// earlier validation. Callers that cannot propagate the error (the `Drop`-like
+/// cleanup paths) treat a rejected path as "no marker", which is the same
+/// conservative answer they already give for an unreadable one.
+fn pending_upload_marker(local_path: &Path) -> Result<PathBuf> {
+    let name = local_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    validated_sibling_path(local_path, &format!(".{name}.pending-upload"))
+}
+
+/// The marker's rename-temp sibling. Same barrier, same reason; the UUID is
+/// ours but the prefix is not, and one helper means the two cannot drift.
+fn pending_upload_marker_tmp(local_path: &Path) -> Result<PathBuf> {
+    validated_sibling_path(
+        local_path,
+        &format!(".pending-upload.tmp-{}", uuid::Uuid::new_v4()),
+    )
+}
+
+/// Persist the intent-to-upload marker. Fallible (write-back callers must NOT
+/// ack the client if this fails) and atomic (tmp + rename, so a crash cannot
+/// leave a torn marker).
+///
+/// `base_etag` is the storage etag the local write was built on (empty when
+/// storage held nothing). `sync_down_if_stale` compares it against the current
+/// remote etag to distinguish "local strictly ahead" from cross-node
+/// divergence.
+///
+/// An existing marker is preserved untouched: its base is the last storage
+/// etag this node confirmed, which stays correct for every further write
+/// stacked on the same undiverged local copy. Re-marking would record the
+/// CURRENT cache — emptied by the preceding upload failure — and a corrupted
+/// (empty) base makes the next sync read unchanged storage as divergence,
+/// wedging the repo's whole write surface after two consecutive upload
+/// failures.
+fn mark_pending_upload(local_path: &Path, base_etag: Option<&str>) -> Result<()> {
+    let marker = pending_upload_marker(local_path)?;
+    match marker.try_exists() {
+        Ok(true) => return Ok(()), // keep the original base
+        Ok(false) => {}
+        Err(e) => return Err(e).context("probing pending-upload marker"),
+    }
+    let tmp = pending_upload_marker_tmp(local_path)?;
+    std::fs::write(&tmp, base_etag.unwrap_or_default()).context("writing pending-upload marker")?;
+    std::fs::rename(&tmp, &marker)
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+        .context("publishing pending-upload marker")?;
+    crate::metrics::add_pending_upload_markers(1);
+    Ok(())
+}
+
+pub(crate) fn clear_pending_upload(local_path: &Path) {
+    // A path the barrier rejects is one we must never have written, so there is
+    // nothing to clear and nothing to report: the same no-op this already
+    // performs for a marker that is simply absent.
+    let Ok(marker) = pending_upload_marker(local_path) else {
+        return;
+    };
+    if std::fs::remove_file(marker).is_ok() {
+        crate::metrics::add_pending_upload_markers(-1);
+    }
+}
+
+/// Etags compared structurally: S3 returns them quoted, our recorded values
+/// are bare, and whitespace can differ across the marker round-trip.
+fn norm_etag(e: &str) -> &str {
+    e.trim().trim_matches('"')
+}
+
+/// Parsed pending-upload marker. Line 1 is the storage etag the local write
+/// was BASED on; optional line 2 is the etag the in-flight upload was going to
+/// produce (the archive's content MD5, recorded just before the PUT).
+struct PendingMarker {
+    base: String,
+    inflight: Option<String>,
+}
+
+impl PendingMarker {
+    /// Storage still holds exactly what the local write was based on: local
+    /// is strictly ahead.
+    fn matches_base(&self, remote: &str) -> bool {
+        norm_etag(remote) == norm_etag(&self.base)
+    }
+}
+
+fn read_pending_marker(local_path: &Path) -> PendingMarker {
+    // A rejected path reads as an empty marker, which is what an absent or
+    // unreadable one already produces: an empty base matches only empty
+    // storage, so recovery stays conservative rather than claiming a base it
+    // never confirmed.
+    let content = pending_upload_marker(local_path)
+        .ok()
+        .and_then(|marker| std::fs::read_to_string(marker).ok())
+        .unwrap_or_default();
+    let mut lines = content.lines();
+    let base = lines.next().unwrap_or("").trim().to_string();
+    let inflight = lines
+        .next()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty());
+    PendingMarker { base, inflight }
+}
+
+/// Atomically rewrite the marker as `base\nintended` just before the PUT, so
+/// a crash anywhere between the PUT landing and the post-upload clear leaves a
+/// marker that names the uploaded content — recovery then recognizes storage
+/// as this node's own completed upload instead of wedging on false divergence.
+/// MUST be fallible: if the intent cannot be durably recorded, the PUT it
+/// describes must not run (the caller aborts the upload), or a crash after
+/// that PUT reads as external divergence.
+fn record_inflight_upload(local_path: &Path, intended_etag: &str) -> Result<()> {
+    let marker = pending_upload_marker(local_path)?;
+    let base = read_pending_marker(local_path).base;
+    let tmp = pending_upload_marker_tmp(local_path)?;
+    std::fs::write(&tmp, format!("{base}\n{intended_etag}"))
+        .context("writing in-flight upload intent")?;
+    std::fs::rename(&tmp, &marker)
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+        .context("publishing in-flight upload intent")
+}
+
+/// Remove the marker after a *successful* upload, first atomically rewriting
+/// its base to the just-uploaded etag. A crash between the rewrite and the
+/// unlink then reads as "local ahead, base matches" — which self-heals on the
+/// next write or startup retry — instead of "base predates storage", which
+/// would wedge the repo behind a spurious permanent divergence even though
+/// local and storage are identical.
+fn clear_pending_upload_after_success(local_path: &Path, new_etag: Option<&str>) {
+    // As in `clear_pending_upload`: a path the barrier rejects is one nothing
+    // ever wrote, so there is no marker to rewrite and none to unlink.
+    let Ok(marker) = pending_upload_marker(local_path) else {
+        return;
+    };
+    if let Some(etag) = new_etag {
+        if marker.exists() {
+            if let Ok(tmp) = pending_upload_marker_tmp(local_path) {
+                if std::fs::write(&tmp, etag).is_ok() {
+                    let _ = std::fs::rename(&tmp, &marker);
+                } else {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            }
+        }
+    }
+    if std::fs::remove_file(&marker).is_ok() {
+        crate::metrics::add_pending_upload_markers(-1);
+    }
+}
+
+/// Outcome of a marker-protected upload attempt.
+enum PendingUploadOutcome {
+    /// Uploaded, versions cache updated, marker cleared — all under the lock.
+    Uploaded,
+    /// Storage no longer matches the marker's base: another writer advanced it.
+    /// Nothing was uploaded and the marker was left in place.
+    Diverged,
 }
 
 /// Build the dedicated advisory-lock pool a `RepoStore` runs its write locks on.
@@ -1037,19 +1943,19 @@ mod tests {
     // ── acquire_write cancellation safety (#173 U1) ────────────────────────
 
     /// The reviewer's named regression. `api/repos.rs` wraps `acquire_write` in a
-    /// `tokio::time::timeout`; when that fires during the Tigris phase the future
+    /// `tokio::time::timeout`; when that fires during the storage phase the future
     /// is dropped after the advisory lock was taken and before `RepoWriteGuard`
     /// (the only thing that unlocks) exists. The lock then leaks and every later
     /// push to the same repo spins the 60-attempt / 60s ceiling and fails.
     #[sqlx::test]
-    async fn cancelled_acquire_write_mid_tigris_does_not_leak_the_lock(pool: PgPool) {
+    async fn cancelled_acquire_write_mid_storage_does_not_leak_the_lock(pool: PgPool) {
         let repos_dir = PathBuf::from("/tmp/gitlawb-test-repos");
         let owner = "did:key:z6MkCancelMidTigris";
         let repo = "cancel-mid-tigris";
 
         let store_pool = sibling_pool(&pool, 8);
         let stalling = RepoStore::for_testing(repos_dir.clone(), store_pool.clone())
-            .with_tigris_stall(Duration::from_secs(30));
+            .with_storage_stall(Duration::from_secs(30));
         let cancelled = tokio::time::timeout(
             Duration::from_millis(500),
             stalling.acquire_write(owner, repo),
@@ -1057,7 +1963,7 @@ mod tests {
         .await;
         assert!(
             cancelled.is_err(),
-            "the acquire must still be inside the Tigris phase when the timeout fires"
+            "the acquire must still be inside the storage phase when the timeout fires"
         );
 
         // Observed from an independent session, so the check cannot be satisfied
@@ -1076,7 +1982,7 @@ mod tests {
             .await
             .expect("second acquire_write must not block on a leaked lock")
             .expect("second acquire_write must succeed");
-        guard.release(false).await;
+        guard.release(false).await.ok();
     }
 
     /// Cancellation BEFORE the lock is taken must leave nothing behind: no lock,
@@ -1114,7 +2020,7 @@ mod tests {
             .await
             .expect("the lock-pool connection must have been returned")
             .expect("acquire after cancellation");
-        guard.release(false).await;
+        guard.release(false).await.ok();
     }
 
     /// Lock-pool exhaustion is a bounded wait and a clean error, never a panic and
@@ -1155,7 +2061,7 @@ mod tests {
             "the error must name the lock-pool checkout, got: {err}"
         );
 
-        held.release(false).await;
+        held.release(false).await.ok();
     }
 
     /// #173 F1 (RED-before/GREEN-after). A contended `acquire_write` spins for up to
@@ -1221,7 +2127,7 @@ mod tests {
             "the uncontended acquire must not queue behind the spinners for the pool \
              acquire timeout; took {elapsed:?}"
         );
-        free_guard.release(false).await;
+        free_guard.release(false).await.ok();
 
         // The drop-and-retake cycle must still END in a real, exclusive lock: free
         // spin-a's key and the spinner that was cycling connections must take it.
@@ -1240,7 +2146,7 @@ mod tests {
             !lock_is_free_elsewhere(&probe, advisory_lock_key(&owner_slug, "spin-a")).await,
             "the lock a spinner finally took must be observably held from another session"
         );
-        winner.release(false).await;
+        winner.release(false).await.ok();
 
         for s in spinners {
             s.abort();
@@ -1290,7 +2196,7 @@ mod tests {
             !lock_is_free_elsewhere(&probe, key).await,
             "a held write lock must survive other lock-pool connections being returned"
         );
-        guard.release(true).await;
+        guard.release(true).await.ok();
         assert!(
             lock_is_free_elsewhere(&probe, key).await,
             "release must still free the lock after the churn"
@@ -1332,7 +2238,7 @@ mod tests {
             "a validation failure must not masquerade as lock-pool capacity, got: {other}"
         );
 
-        held.release(false).await;
+        held.release(false).await.ok();
     }
 
     /// Round trip: the lock is observably HELD between acquire and release, and
@@ -1360,7 +2266,7 @@ mod tests {
         // session and return false. The `after_release` hook is a net for the
         // cancellation path and fires from a spawned task well after this point, so
         // it must not be what makes this assertion pass.
-        guard.release(true).await;
+        guard.release(true).await.ok();
         assert!(
             lock_is_free_elsewhere(&probe, key).await,
             "release must free the lock as seen from another session"
@@ -1378,7 +2284,7 @@ mod tests {
 
         let store = RepoStore::for_testing(PathBuf::from("/tmp/gitlawb-test-repos"), pool.clone());
         let guard = store.acquire_write(owner, repo).await.expect("acquire");
-        guard.release(false).await;
+        guard.release(false).await.ok();
 
         assert!(
             wait_until_free(&probe, key, Duration::from_secs(5)).await,
@@ -1407,7 +2313,7 @@ mod tests {
         .await
         .expect("a different repo must not wait on this lock")
         .expect("acquire other repo");
-        other.release(false).await;
+        other.release(false).await.ok();
 
         // Same repo: must not acquire while `first` is alive.
         let contender = tokio::spawn({
@@ -1420,13 +2326,13 @@ mod tests {
             "a second acquire for the same repo must block while the first guard lives"
         );
 
-        first.release(false).await;
+        first.release(false).await.ok();
         let second = tokio::time::timeout(Duration::from_secs(10), contender)
             .await
             .expect("contender must finish once the lock is free")
             .expect("contender task")
             .expect("contender acquire");
-        second.release(false).await;
+        second.release(false).await.ok();
     }
 
     // ── sync slug validation (#272) ────────────────────────────────────────
@@ -1934,7 +2840,7 @@ mod tests {
 
         let mut checker = pool.acquire().await.expect("checker connection");
         let guard = store.acquire_write(owner, name).await.expect("acquire");
-        guard.release(false).await;
+        guard.release(false).await.ok();
 
         let (free,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
             .bind(key)
@@ -2027,7 +2933,7 @@ mod tests {
             .acquire_write(owner, name)
             .await
             .expect("first acquire");
-        guard.release(true).await;
+        guard.release(true).await.ok();
 
         let again = tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -2036,7 +2942,7 @@ mod tests {
         .await
         .expect("second acquire_write must not hit the ~60s stale-lock retry loop")
         .expect("second acquire");
-        again.release(true).await;
+        again.release(true).await.ok();
     }
 
     // ── unlock error disposes the connection (#174 F3b, RED-before/GREEN-after) ─
@@ -2050,7 +2956,8 @@ mod tests {
     /// in this module and can reach `conn` directly.
     async fn poison_guard_connection(guard: &mut RepoWriteGuard) {
         let conn = guard
-            .lock_conn
+            .lock
+            .conn
             .as_deref_mut()
             .expect("guard holds its connection before release");
         sqlx::query("BEGIN")
@@ -2264,7 +3171,7 @@ mod tests {
             "the poisoned session must still hold the lock before release"
         );
 
-        guard.release(false).await;
+        guard.release(false).await.ok();
 
         // Postgres drops the lock when the disposed session's backend exits, which is
         // asynchronous to our socket close: poll for it rather than sleeping a
@@ -2303,7 +3210,7 @@ mod tests {
         let size_before = lock_pool.size();
         assert!(size_before > 0, "the lock pool owns the guard's connection");
 
-        guard.release(false).await;
+        guard.release(false).await.ok();
 
         // The pool's size drops when the closed connection's slot is given up, which
         // is not synchronous with `release` returning: poll rather than sleep.
@@ -2333,7 +3240,7 @@ mod tests {
         let guard = store.acquire_write(owner, name).await.expect("acquire");
         let size_before = pool.size();
 
-        guard.release(false).await;
+        guard.release(false).await.ok();
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
         assert_eq!(
@@ -2454,5 +3361,601 @@ mod tests {
             .bind(key)
             .execute(&mut *checker)
             .await;
+    }
+
+    // ── sync_down_if_stale (fs-backed archive, lazy pool) ──────────────────
+
+    /// A RepoStore over an fs-backed archive. `sync_down_if_stale` never touches
+    /// the pool, so a lazy (never-connected) pool is fine.
+    fn store_with_fs_archive(repos_dir: PathBuf, store_root: &Path) -> RepoStore {
+        let blob: Arc<dyn crate::storage::BlobStore> =
+            Arc::new(crate::storage::fs::FsBlobStore::new(store_root).unwrap());
+        let archive = crate::storage::archive::RepoArchive::new(blob);
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid").unwrap();
+        RepoStore::new(repos_dir, Some(archive), pool)
+    }
+
+    #[tokio::test]
+    async fn sync_down_if_stale_downloads_then_skips_on_etag_match() {
+        let store_root = tempfile::tempdir().unwrap();
+        let repos_dir = tempfile::tempdir().unwrap();
+        let store = store_with_fs_archive(repos_dir.path().to_path_buf(), store_root.path());
+
+        // Seed the archive with a repo.
+        let seed = tempfile::tempdir().unwrap();
+        std::fs::write(seed.path().join("HEAD"), b"v1\n").unwrap();
+        store
+            .archive
+            .as_ref()
+            .unwrap()
+            .upload("owner", "repo", seed.path())
+            .await
+            .unwrap();
+
+        let local = repos_dir.path().join("owner").join("repo.git");
+
+        // First call downloads.
+        store
+            .sync_down_if_stale("owner", "repo", &local, false)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(local.join("HEAD")).unwrap(), b"v1\n");
+
+        // Locally mutate, then sync again: the cached etag still matches the
+        // remote, so the download is skipped and our local edit survives.
+        std::fs::write(local.join("HEAD"), b"LOCAL-EDIT\n").unwrap();
+        store
+            .sync_down_if_stale("owner", "repo", &local, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(local.join("HEAD")).unwrap(),
+            b"LOCAL-EDIT\n",
+            "etag match must skip the download (local copy preserved)"
+        );
+    }
+
+    // Needs a real pool: `release_after_write` uploads under the advisory lock.
+    #[sqlx::test]
+    async fn pending_marker_prevents_rollback_and_clears_on_next_upload(pool: PgPool) {
+        let store_root = tempfile::tempdir().unwrap();
+        let repos_dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn crate::storage::BlobStore> =
+            Arc::new(crate::storage::fs::FsBlobStore::new(store_root.path()).unwrap());
+        let store = RepoStore::new(
+            repos_dir.path().to_path_buf(),
+            Some(crate::storage::archive::RepoArchive::new(blob)),
+            pool,
+        );
+
+        // Storage holds v1; local downloads it.
+        let seed = tempfile::tempdir().unwrap();
+        std::fs::write(seed.path().join("HEAD"), b"v1\n").unwrap();
+        store
+            .archive
+            .as_ref()
+            .unwrap()
+            .upload("owner", "repo", seed.path())
+            .await
+            .unwrap();
+        let local = repos_dir.path().join("owner").join("repo.git");
+        store
+            .sync_down_if_stale("owner", "repo", &local, true)
+            .await
+            .unwrap();
+
+        // Simulate an acked write whose upload failed: local advances, the
+        // pending marker (recording the storage etag the write was based on)
+        // persists, and the in-memory cache was invalidated on failure.
+        let base = store
+            .archive
+            .as_ref()
+            .unwrap()
+            .head_etag("owner", "repo")
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::write(local.join("HEAD"), b"ACKED-WRITE\n").unwrap();
+        mark_pending_upload(&local, Some(&base)).unwrap();
+        store.versions.lock().await.clear();
+
+        // Both the read and the write path must serve local, not roll it back.
+        for require_fresh in [false, true] {
+            store
+                .sync_down_if_stale("owner", "repo", &local, require_fresh)
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read(local.join("HEAD")).unwrap(),
+                b"ACKED-WRITE\n",
+                "pending marker must prevent rollback (require_fresh={require_fresh})"
+            );
+        }
+
+        // The next successful write-path upload re-syncs storage and clears
+        // the marker.
+        let guard = store.acquire_write("owner", "repo").await.unwrap();
+        guard.release(true).await.unwrap();
+        assert!(
+            !pending_upload_marker(&local).unwrap().exists(),
+            "marker must be cleared by a successful upload"
+        );
+        let out = tempfile::tempdir().unwrap();
+        let restored = out.path().join("restored.git");
+        store
+            .archive
+            .as_ref()
+            .unwrap()
+            .download("owner", "repo", &restored)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(restored.join("HEAD")).unwrap(),
+            b"ACKED-WRITE\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_marker_detects_cross_node_divergence() {
+        let store_root = tempfile::tempdir().unwrap();
+        let repos_dir = tempfile::tempdir().unwrap();
+        let store = store_with_fs_archive(repos_dir.path().to_path_buf(), store_root.path());
+
+        // Storage v1; local synced, then advanced with a failed upload (marker
+        // records v1's etag as its base).
+        let seed = tempfile::tempdir().unwrap();
+        std::fs::write(seed.path().join("HEAD"), b"v1\n").unwrap();
+        let archive = store.archive.as_ref().unwrap();
+        archive.upload("owner", "repo", seed.path()).await.unwrap();
+        let local = repos_dir.path().join("owner").join("repo.git");
+        store
+            .sync_down_if_stale("owner", "repo", &local, true)
+            .await
+            .unwrap();
+        let base = archive.head_etag("owner", "repo").await.unwrap().unwrap();
+        std::fs::write(local.join("HEAD"), b"LOCAL-AHEAD\n").unwrap();
+        mark_pending_upload(&local, Some(&base)).unwrap();
+        store.versions.lock().await.clear();
+
+        // Another node advances storage past our base.
+        let seed2 = tempfile::tempdir().unwrap();
+        std::fs::write(seed2.path().join("HEAD"), b"OTHER-NODE\n").unwrap();
+        archive.upload("owner", "repo", seed2.path()).await.unwrap();
+
+        // Write path: refuse — proceeding would clobber one side or the other.
+        assert!(
+            store
+                .sync_down_if_stale("owner", "repo", &local, true)
+                .await
+                .is_err(),
+            "diverged marker must fail the write path closed"
+        );
+        // Read path: serve local (read-only cannot propagate damage), and the
+        // local copy must be untouched either way.
+        store
+            .sync_down_if_stale("owner", "repo", &local, false)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(local.join("HEAD")).unwrap(), b"LOCAL-AHEAD\n");
+    }
+
+    #[tokio::test]
+    async fn stale_pending_marker_without_local_copy_is_dropped() {
+        let store_root = tempfile::tempdir().unwrap();
+        let repos_dir = tempfile::tempdir().unwrap();
+        let store = store_with_fs_archive(repos_dir.path().to_path_buf(), store_root.path());
+
+        let seed = tempfile::tempdir().unwrap();
+        std::fs::write(seed.path().join("HEAD"), b"v1\n").unwrap();
+        store
+            .archive
+            .as_ref()
+            .unwrap()
+            .upload("owner", "repo", seed.path())
+            .await
+            .unwrap();
+
+        // Marker exists but the repo dir does not (removed out from under us):
+        // the marker is stale — drop it and download normally.
+        let local = repos_dir.path().join("owner").join("repo.git");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        mark_pending_upload(&local, Some("whatever")).unwrap();
+        store
+            .sync_down_if_stale("owner", "repo", &local, true)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(local.join("HEAD")).unwrap(), b"v1\n");
+        assert!(!pending_upload_marker(&local).unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn sync_down_if_stale_require_fresh_fails_closed_on_bad_remote() {
+        let store_root = tempfile::tempdir().unwrap();
+        let repos_dir = tempfile::tempdir().unwrap();
+        let store = store_with_fs_archive(repos_dir.path().to_path_buf(), store_root.path());
+
+        let seed = tempfile::tempdir().unwrap();
+        std::fs::write(seed.path().join("HEAD"), b"v1\n").unwrap();
+        store
+            .archive
+            .as_ref()
+            .unwrap()
+            .upload("owner", "repo", seed.path())
+            .await
+            .unwrap();
+
+        let local = repos_dir.path().join("owner").join("repo.git");
+        store
+            .sync_down_if_stale("owner", "repo", &local, false)
+            .await
+            .unwrap();
+
+        // Corrupt the stored archive: HEAD now succeeds with a *new* etag (so the
+        // cache no longer matches and a download is forced), but the download
+        // decompresses garbage and fails.
+        let blob_path = store_root.path().join("repos/v1/owner/repo.tar.zst");
+        std::fs::write(&blob_path, b"corrupted not-a-tar-zst").unwrap();
+        // The fs backend's etag lives in a sidecar, so a direct file overwrite
+        // must also bump it for the change to be visible (as any real writer's
+        // put() would).
+        std::fs::write(
+            store_root.path().join("repos/v1/owner/repo.tar.zst.etag"),
+            "corrupted-generation",
+        )
+        .unwrap();
+
+        // Write path: must fail closed rather than fall back to the stale local
+        // copy (which a later upload would use to clobber the newer remote).
+        assert!(
+            store
+                .sync_down_if_stale("owner", "repo", &local, true)
+                .await
+                .is_err(),
+            "require_fresh=true must propagate the download error"
+        );
+
+        // Read path: self-heals — falls back to the valid local copy.
+        store
+            .sync_down_if_stale("owner", "repo", &local, false)
+            .await
+            .expect("require_fresh=false must fall back to the local copy");
+        assert_eq!(std::fs::read(local.join("HEAD")).unwrap(), b"v1\n");
+    }
+
+    // ── failing-store double: exercises error branches no real backend can ──
+
+    /// BlobStore wrapper whose `put`/`head` can be flipped to fail, unlocking
+    /// deterministic coverage of the upload-failure and head-failure branches.
+    struct FlakyStore {
+        inner: crate::storage::fs::FsBlobStore,
+        fail_put: std::sync::atomic::AtomicBool,
+        fail_head: std::sync::atomic::AtomicBool,
+    }
+
+    impl FlakyStore {
+        fn new(root: &Path) -> Arc<Self> {
+            Arc::new(Self {
+                inner: crate::storage::fs::FsBlobStore::new(root).unwrap(),
+                fail_put: std::sync::atomic::AtomicBool::new(false),
+                fail_head: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::BlobStore for FlakyStore {
+        fn backend_name(&self) -> &'static str {
+            "flaky"
+        }
+        async fn get(&self, key: &str) -> Result<Option<bytes::Bytes>> {
+            self.inner.get(key).await
+        }
+        async fn put(&self, key: &str, body: bytes::Bytes) -> Result<crate::storage::ObjectMeta> {
+            if self.fail_put.load(std::sync::atomic::Ordering::Relaxed) {
+                anyhow::bail!("injected put failure");
+            }
+            self.inner.put(key, body).await
+        }
+        async fn head(&self, key: &str) -> Result<Option<crate::storage::ObjectMeta>> {
+            if self.fail_head.load(std::sync::atomic::Ordering::Relaxed) {
+                anyhow::bail!("injected head failure");
+            }
+            self.inner.head(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+    }
+
+    fn store_with_flaky(repos_dir: PathBuf, flaky: Arc<FlakyStore>, pool: PgPool) -> RepoStore {
+        let blob: Arc<dyn crate::storage::BlobStore> = flaky;
+        let archive = crate::storage::archive::RepoArchive::new(blob);
+        RepoStore::new(repos_dir, Some(archive), pool)
+    }
+
+    /// beardthelion P1 regression: two consecutive failed uploads must not
+    /// corrupt the marker's base — the second `release` re-marks while the
+    /// versions cache is empty, and overwriting the base with "" would make
+    /// the third write read unchanged storage as divergence and wedge the
+    /// repo's entire write surface.
+    #[sqlx::test]
+    async fn two_consecutive_failed_uploads_preserve_marker_base(pool: PgPool) {
+        let store_root = tempfile::tempdir().unwrap();
+        let repos_dir = tempfile::tempdir().unwrap();
+        let flaky = FlakyStore::new(store_root.path());
+        let store = store_with_flaky(repos_dir.path().to_path_buf(), Arc::clone(&flaky), pool);
+
+        // Storage v1, synced down.
+        let seed = tempfile::tempdir().unwrap();
+        std::fs::write(seed.path().join("HEAD"), b"v1\n").unwrap();
+        store
+            .archive
+            .as_ref()
+            .unwrap()
+            .upload("owner", "repo", seed.path())
+            .await
+            .unwrap();
+        let local = repos_dir.path().join("owner").join("repo.git");
+        store
+            .sync_down_if_stale("owner", "repo", &local, true)
+            .await
+            .unwrap();
+
+        // Write 1: mutate, upload fails.
+        flaky
+            .fail_put
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(local.join("HEAD"), b"write-1\n").unwrap();
+        let guard = store.acquire_write("owner", "repo").await.unwrap();
+        assert!(guard.release(true).await.is_err(), "injected put must fail");
+        let base_after_first = read_pending_marker(&local).base;
+        assert!(!base_after_first.is_empty(), "base must be recorded");
+
+        // Write 2: acquire must succeed (storage unchanged == local-ahead),
+        // and the second failed release must NOT re-mark with an empty base.
+        // (The in-flight line legitimately changes per attempt; the BASE is
+        // the invariant.)
+        let guard = store.acquire_write("owner", "repo").await.unwrap();
+        std::fs::write(local.join("HEAD"), b"write-2\n").unwrap();
+        assert!(guard.release(true).await.is_err());
+        assert_eq!(
+            read_pending_marker(&local).base,
+            base_after_first,
+            "an existing marker's base must be preserved on re-mark"
+        );
+
+        // Write 3: still not wedged — and once the store heals, everything
+        // re-syncs and the marker clears.
+        let guard = store
+            .acquire_write("owner", "repo")
+            .await
+            .expect("repeated upload failures must not wedge the write surface");
+        flaky
+            .fail_put
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        guard.release(true).await.unwrap();
+        assert!(!pending_upload_marker(&local).unwrap().exists());
+    }
+
+    /// jatmn P1 regression: the write-back ack window. `mark_pending` runs
+    /// before the ack; if the process dies before the spawned release is ever
+    /// polled (simulated by dropping the guard), the marker alone must keep
+    /// the next sync from rolling the acked write back.
+    #[sqlx::test]
+    async fn mark_pending_alone_protects_the_ack_window(pool: PgPool) {
+        let store_root = tempfile::tempdir().unwrap();
+        let repos_dir = tempfile::tempdir().unwrap();
+        let flaky = FlakyStore::new(store_root.path());
+        let store = store_with_flaky(repos_dir.path().to_path_buf(), Arc::clone(&flaky), pool);
+
+        let seed = tempfile::tempdir().unwrap();
+        std::fs::write(seed.path().join("HEAD"), b"v1\n").unwrap();
+        store
+            .archive
+            .as_ref()
+            .unwrap()
+            .upload("owner", "repo", seed.path())
+            .await
+            .unwrap();
+        let local = repos_dir.path().join("owner").join("repo.git");
+
+        let guard = store.acquire_write("owner", "repo").await.unwrap();
+        std::fs::write(local.join("HEAD"), b"ACKED\n").unwrap();
+        guard.mark_pending().await.unwrap();
+        drop(guard); // crash before release() is ever polled
+                     // A real restart loses the in-memory etag cache; without this the
+                     // cache-hit skip masks the marker and the test passes with
+                     // mark_pending gutted.
+        store.versions.lock().await.clear();
+
+        store
+            .sync_down_if_stale("owner", "repo", &local, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(local.join("HEAD")).unwrap(),
+            b"ACKED\n",
+            "the pre-ack marker alone must prevent rollback"
+        );
+    }
+
+    /// beardthelion P1 regression: a crash between a successful upload and
+    /// the marker clear must NOT read as divergence. The marker records the
+    /// upload's intended etag (content MD5) before the PUT; recovery finding
+    /// storage at exactly that etag recognizes its own completed upload and
+    /// heals instead of wedging a byte-identical repo behind "reconcile
+    /// manually".
+    #[tokio::test]
+    async fn crash_after_upload_before_clear_heals_via_inflight_etag() {
+        let store_root = tempfile::tempdir().unwrap();
+        let repos_dir = tempfile::tempdir().unwrap();
+        let store = store_with_fs_archive(repos_dir.path().to_path_buf(), store_root.path());
+        let archive = store.archive.as_ref().unwrap();
+
+        // Simulate the crash state: storage holds the content this node was
+        // uploading (etag E), while the marker still names the pre-upload
+        // base B plus the in-flight etag E.
+        let seed = tempfile::tempdir().unwrap();
+        std::fs::write(seed.path().join("HEAD"), b"uploaded\n").unwrap();
+        archive.upload("owner", "repo", seed.path()).await.unwrap();
+        let remote = archive.head_etag("owner", "repo").await.unwrap().unwrap();
+
+        let local = repos_dir.path().join("owner").join("repo.git");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("HEAD"), b"uploaded\n").unwrap();
+        mark_pending_upload(&local, Some("pre-upload-base")).unwrap();
+        record_inflight_upload(&local, &remote).unwrap();
+
+        // Write path must heal, not wedge: marker cleared, cache adopted.
+        store
+            .sync_down_if_stale("owner", "repo", &local, true)
+            .await
+            .expect("own completed upload must not read as divergence");
+        assert!(
+            !pending_upload_marker(&local).unwrap().exists(),
+            "marker must be cleared once storage is recognized as our upload"
+        );
+        assert_eq!(std::fs::read(local.join("HEAD")).unwrap(), b"uploaded\n");
+        // And subsequent syncs skip on the adopted etag.
+        store
+            .sync_down_if_stale("owner", "repo", &local, true)
+            .await
+            .unwrap();
+    }
+
+    /// The lazy-migration existence check must propagate failure instead of
+    /// reading it as "absent" and uploading over a possibly-newer archive.
+    #[sqlx::test]
+    async fn upload_under_lock_propagates_failed_existence_check(pool: PgPool) {
+        let store_root = tempfile::tempdir().unwrap();
+        let repos_dir = tempfile::tempdir().unwrap();
+        let flaky = FlakyStore::new(store_root.path());
+        let store = store_with_flaky(repos_dir.path().to_path_buf(), Arc::clone(&flaky), pool);
+
+        let local = repos_dir.path().join("owner").join("repo.git");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("HEAD"), b"local\n").unwrap();
+
+        flaky
+            .fail_head
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            store
+                .upload_under_lock("owner", "repo", &local, true)
+                .await
+                .is_err(),
+            "a failed existence check must not read as absent"
+        );
+        assert!(
+            store
+                .archive
+                .as_ref()
+                .unwrap()
+                .head_etag("owner", "repo")
+                .await
+                .is_err(),
+            "sanity: head still failing"
+        );
+    }
+
+    /// init() must remove its local dir when the initial upload fails, so a
+    /// retry of the same name doesn't hit an existing destination.
+    #[sqlx::test]
+    async fn init_removes_local_dir_when_upload_fails(pool: PgPool) {
+        let store_root = tempfile::tempdir().unwrap();
+        let repos_dir = tempfile::tempdir().unwrap();
+        let flaky = FlakyStore::new(store_root.path());
+        let store = store_with_flaky(repos_dir.path().to_path_buf(), Arc::clone(&flaky), pool);
+
+        flaky
+            .fail_put
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(store.init("did:key:z6MkOwner", "newrepo").await.is_err());
+        let local = repos_dir
+            .path()
+            .join("did_key_z6MkOwner")
+            .join("newrepo.git");
+        assert!(
+            !local.exists(),
+            "failed init must not leave a local dir behind"
+        );
+    }
+
+    /// Marker + head failure: the write path fails closed, the read path
+    /// serves the local copy.
+    #[tokio::test]
+    async fn marker_with_failing_head_fails_write_closed_serves_read() {
+        let store_root = tempfile::tempdir().unwrap();
+        let repos_dir = tempfile::tempdir().unwrap();
+        let flaky = FlakyStore::new(store_root.path());
+        // sync_down never touches the pool — lazy is fine here.
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid").unwrap();
+        let store = store_with_flaky(repos_dir.path().to_path_buf(), Arc::clone(&flaky), pool);
+
+        let local = repos_dir.path().join("owner").join("repo.git");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("HEAD"), b"pending\n").unwrap();
+        mark_pending_upload(&local, Some("base-etag")).unwrap();
+
+        flaky
+            .fail_head
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            store
+                .sync_down_if_stale("owner", "repo", &local, true)
+                .await
+                .is_err(),
+            "write path must fail closed when freshness is unknowable"
+        );
+        store
+            .sync_down_if_stale("owner", "repo", &local, false)
+            .await
+            .expect("read path serves the local copy");
+        assert_eq!(std::fs::read(local.join("HEAD")).unwrap(), b"pending\n");
+    }
+
+    /// Startup sweep: re-uploads marked repos whose storage didn't move, and
+    /// leaves diverged ones marked.
+    #[sqlx::test]
+    async fn retry_pending_uploads_heals_and_respects_divergence(pool: PgPool) {
+        let store_root = tempfile::tempdir().unwrap();
+        let repos_dir = tempfile::tempdir().unwrap();
+        let flaky = FlakyStore::new(store_root.path());
+        let store = store_with_flaky(repos_dir.path().to_path_buf(), Arc::clone(&flaky), pool);
+        let archive = store.archive.as_ref().unwrap();
+
+        // Repo A: storage v1, local ahead with matching base — heals.
+        let seed = tempfile::tempdir().unwrap();
+        std::fs::write(seed.path().join("HEAD"), b"v1\n").unwrap();
+        archive.upload("owner", "heals", seed.path()).await.unwrap();
+        let base_a = archive.head_etag("owner", "heals").await.unwrap().unwrap();
+        let local_a = repos_dir.path().join("owner").join("heals.git");
+        std::fs::create_dir_all(&local_a).unwrap();
+        std::fs::write(local_a.join("HEAD"), b"local-ahead\n").unwrap();
+        mark_pending_upload(&local_a, Some(&base_a)).unwrap();
+
+        // Repo B: marker base predates current storage — stays marked.
+        archive
+            .upload("owner", "diverged", seed.path())
+            .await
+            .unwrap();
+        let local_b = repos_dir.path().join("owner").join("diverged.git");
+        std::fs::create_dir_all(&local_b).unwrap();
+        std::fs::write(local_b.join("HEAD"), b"local-b\n").unwrap();
+        mark_pending_upload(&local_b, Some("stale-base")).unwrap();
+
+        let (reuploaded, still_pending) = store.retry_pending_uploads().await;
+        assert_eq!((reuploaded, still_pending), (1, 1));
+        assert!(!pending_upload_marker(&local_a).unwrap().exists());
+        assert!(pending_upload_marker(&local_b).unwrap().exists());
+
+        // A's local content is now durably in storage.
+        let out = tempfile::tempdir().unwrap();
+        let restored = out.path().join("restored.git");
+        archive.download("owner", "heals", &restored).await.unwrap();
+        assert_eq!(
+            std::fs::read(restored.join("HEAD")).unwrap(),
+            b"local-ahead\n"
+        );
     }
 }

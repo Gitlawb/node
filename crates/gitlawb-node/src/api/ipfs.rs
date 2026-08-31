@@ -2333,7 +2333,7 @@ pub(crate) enum MarkerQuery {
 
 // Test-only fault-injection seam for the `needs_scan` marker pair
 // (`pin_sources_at_cap`, `pin_sources_incomplete`), same idea as
-// `RepoStore::tigris_stall`: hold one specific await open so the clamp around it is
+// `RepoStore::storage_stall`: hold one specific await open so the clamp around it is
 // the one observed to fire.
 //
 // A `LOCK TABLE` fixture cannot isolate these two. `pin_sources_at_cap` reads
@@ -3757,10 +3757,12 @@ mod tests {
         // parallel test run); the silent local endpoint stalls the HEAD
         // deterministically.
         let endpoint = crate::test_support::silent_http_endpoint().await;
-        let tigris =
-            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
-                .await;
-        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
+        let blob: std::sync::Arc<dyn crate::storage::BlobStore> = std::sync::Arc::new(
+            crate::storage::s3::S3BlobStore::for_testing_with_endpoint("test-bucket", &endpoint)
+                .await,
+        );
+        let archive = crate::storage::archive::RepoArchive::new(blob);
+        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(archive), pool);
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
         let mut cfg = (*state.config).clone();
         cfg.git_acquire_timeout_secs = 1;
@@ -3830,10 +3832,12 @@ mod tests {
         // consults the silent local endpoint and stalls to the 1s timeout
         // (endpoint-pinned test client, no AWS_* env reads).
         let endpoint = crate::test_support::silent_http_endpoint().await;
-        let tigris =
-            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
-                .await;
-        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
+        let blob: std::sync::Arc<dyn crate::storage::BlobStore> = std::sync::Arc::new(
+            crate::storage::s3::S3BlobStore::for_testing_with_endpoint("test-bucket", &endpoint)
+                .await,
+        );
+        let archive = crate::storage::archive::RepoArchive::new(blob);
+        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(archive), pool);
         let mut cfg = (*state.config).clone();
         cfg.git_acquire_timeout_secs = 1;
         state.config = Arc::new(cfg);
@@ -7955,10 +7959,12 @@ mod tests {
         // consults the silent local endpoint and stalls past the budget
         // (endpoint-pinned test client, no AWS_* env reads).
         let endpoint = crate::test_support::silent_http_endpoint().await;
-        let tigris =
-            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
-                .await;
-        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
+        let blob: std::sync::Arc<dyn crate::storage::BlobStore> = std::sync::Arc::new(
+            crate::storage::s3::S3BlobStore::for_testing_with_endpoint("test-bucket", &endpoint)
+                .await,
+        );
+        let archive = crate::storage::archive::RepoArchive::new(blob);
+        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(archive), pool);
         let mut cfg = (*state.config).clone();
         cfg.ipfs_request_budget_secs = 1;
         cfg.git_acquire_timeout_secs = 2;

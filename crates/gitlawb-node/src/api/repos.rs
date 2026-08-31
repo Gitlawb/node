@@ -253,17 +253,17 @@ pub async fn create_repo(
     // Request is admissible — spend the proof now, immediately before the write.
     let verified_proof = proof.consume(&state.db).await?;
 
-    let disk_path = state
-        .repo_store
-        .init(&owner_did, &req.name)
-        .await
-        .map_err(|e| {
-            // `{:#}` walks the anyhow chain to the leaf cause; the other git
-            // handlers log their failures, this one didn't.
-            tracing::error!(owner = %owner_did, repo = %req.name, err = %format!("{e:#}"), "repo create failed");
-            AppError::Git(e.to_string())
-        })?;
-
+    // Claim-first ordering: insert the DB row before creating anything durable.
+    // Within one node's database the row is the claim on (owner, name) — a
+    // concurrent same-name create loses at the insert with nothing on disk or
+    // in storage yet. Across nodes (each fly app has its own Postgres) the
+    // insert arbitrates nothing; the cross-node safety property is that
+    // failure compensation below only ever touches state THIS attempt created
+    // (its own row by id, its own local dir) and never deletes a storage key.
+    // init() publishes under the per-repo advisory lock, so a push arriving
+    // through the just-visible row serializes behind publication and can
+    // never be destroyed by this compensation.
+    let disk_path = store::repo_disk_path(&state.config.repos_dir, &owner_did, &req.name);
     let now = Utc::now();
     let record = crate::db::RepoRecord {
         id: Uuid::new_v4().to_string(),
@@ -278,8 +278,22 @@ pub async fn create_repo(
         forked_from: None,
         machine_id: state.machine_id.clone(),
     };
-
     state.db.create_repo(&record).await?;
+
+    // Create the bare repo locally and publish the initial archive (under the
+    // advisory lock). On failure, compensate by removing our own just-inserted
+    // row (keyed by our id) so a retry starts clean; create_published removes
+    // its local dir itself.
+    if let Err(e) = state.repo_store.init(&owner_did, &req.name).await {
+        // `{:#}` walks the anyhow chain to the leaf cause; the other git
+        // handlers log their failures, this one didn't.
+        tracing::error!(owner = %owner_did, repo = %req.name, err = %format!("{e:#}"), "repo create failed");
+        if let Err(db_err) = state.db.delete_repo_by_id(&record.id).await {
+            tracing::warn!(repo = %req.name, err = %db_err,
+                "failed to remove repo row after init failure");
+        }
+        return Err(AppError::Git(e.to_string()));
+    }
 
     // Persist the proof so it can travel with the repo and a mirroring peer can
     // re-verify it (enforce-mode origins only; off/shadow yield no proof here).
@@ -631,10 +645,10 @@ pub async fn git_info_refs(
     }
 
     // Push flood brake on the advertisement phase. A push always hits this
-    // GET first, and for receive-pack it forces a fresh Tigris download below;
+    // GET first, and for receive-pack it forces a fresh storage download below;
     // throttling only the receive-pack POST would leave the expensive
     // fresh-acquire reachable unauthenticated and unlimited. Applied before the
-    // acquire so a rejected request does no Tigris work. Same per-IP limiter and
+    // acquire so a rejected request does no storage work. Same per-IP limiter and
     // trusted-proxy policy as the POST middleware (shared buckets).
     if service == "git-receive-pack" {
         if let Some(key) = crate::rate_limit::client_key(&headers, peer, state.push_limiter_trust) {
@@ -692,7 +706,7 @@ pub async fn git_info_refs(
         git_permit(&state.git_read_semaphore)?
     };
 
-    // For receive-pack (push), download the latest from Tigris so the client
+    // For receive-pack (push), download the latest from storage so the client
     // sees the same refs that acquire_write() will operate on.
     //
     // Bound the acquire under `git_acquire_timeout_secs`: the concurrency permit is
@@ -2308,7 +2322,7 @@ pub async fn git_receive_pack(
     }
 
     // Always release the advisory lock — even on error — to prevent stale locks
-    // from blocking subsequent pushes. Only upload to Tigris when the push
+    // from blocking subsequent pushes. Only upload to storage when the push
     // succeeded; uploading a half-applied repo would propagate corruption.
     // Reclaim the write lock from the shared cell (#173 F2). This is only reachable
     // once `receive_pack` has returned, so the admission guard's copy can only ever
@@ -2319,12 +2333,74 @@ pub async fn git_receive_pack(
         .expect("repo write-lock mutex poisoned")
         .take()
         .expect("the write lock is only taken here, and only once");
-    reclaimed.release(push_succeeded).await;
+    // `Some` = the guard still needs a synchronous (strict) release; taken by
+    // the write-back path only once its intent marker is durably on disk.
+    let mut strict_guard = Some(reclaimed);
+    if push_succeeded && state.config.async_upload {
+        let guard = strict_guard.take().expect("guard present before release");
+        // Write-back: ack the client now; the durable upload to object storage
+        // and the advisory-lock release run in the background. The lock is held
+        // until the upload finishes, so a concurrent writer on another machine
+        // can't observe a stale archive. If this detached task is cancelled by
+        // runtime shutdown mid-upload, the guard's lock connection is closed
+        // rather than repooled, so Postgres frees the advisory lock (see
+        // `LockedConn`). Durability tradeoff: if the upload fails (or the node
+        // stops first), storage stays stale until this repo's next successful
+        // upload. The persisted pending-upload marker keeps the local copy
+        // authoritative on THIS node in that window — no access rolls it back
+        // to the stale archive — but other nodes still serve the stale archive
+        // until the re-upload lands. Hence async_upload is opt-in.
+        //
+        // The intent marker must be on disk BEFORE the ack: the spawned task
+        // may never be polled if the process stops right after the response,
+        // and without the marker a restart would treat the stale storage
+        // archive as newer and roll the acked push back. If the marker itself
+        // cannot be persisted, do NOT ack early — fall back to the strict
+        // upload-before-ack path below.
+        match guard.mark_pending().await {
+            Ok(()) => {
+                let repo_label = name.to_string();
+                tokio::spawn(async move {
+                    if let Err(e) = guard.release(true).await {
+                        tracing::error!(repo = %repo_label, err = %e,
+                            "write-back durable upload failed after push was acked");
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::warn!(repo = %name, err = %e,
+                    "pending-upload marker write failed — falling back to strict upload-before-ack");
+                strict_guard = Some(guard);
+            }
+        }
+    }
+    if let Some(guard) = strict_guard {
+        // Strict path (failed push, async_upload off, or marker write failure):
+        // upload-before-ack.
+        if let Err(e) = guard.release(push_succeeded).await {
+            if push_succeeded {
+                // A successful push whose durable upload then failed — the
+                // client must know the push is not durably stored. The lease
+                // drops on this return, and the advisory lock was already
+                // released inside `release`.
+                tracing::error!(repo = %name, err = %e, "durable upload failed after push");
+                return Err(AppError::Git(format!(
+                    "push applied locally but durable upload to storage failed: {e}"
+                )));
+            }
+            // The push itself failed; log the release error but fall through
+            // so the real git failure (below) is what the client sees.
+            tracing::error!(repo = %name, err = %e, "lock release failed after failed push");
+        }
+    }
     // Clean path: clone (a) already dropped inside run_git_service when the receive-pack
-    // group was reaped; clone (b) held here spanned the success-only Tigris upload that
-    // ran inside release() above. Drop it now so a second same-repo push proceeds the
-    // moment this write is durable, rather than at end of the (longer) handler tail. On
-    // the disconnect path this line is never reached: clone (a) rides the reaper (F3).
+    // group was reaped; clone (b) held here spanned the success-only storage upload that
+    // ran inside release() above (or, under async_upload, only the marker write — the
+    // upload continues under the advisory lock, which is what keeps a second push from
+    // reading a stale archive). Drop it now so a second same-repo push proceeds the
+    // moment this write is durable (or acked), rather than at end of the (longer)
+    // handler tail. On the disconnect path this line is never reached: clone (a) rides
+    // the reaper (F3).
     drop(lease);
 
     let result = receive_result.map_err(|e| {
@@ -3057,7 +3133,7 @@ pub async fn fork_repo(
     // Request is admissible — spend the proof now, immediately before the write.
     let verified_proof = proof.consume(&state.db).await?;
 
-    // Ensure source repo is on local disk (downloads from Tigris on cache miss)
+    // Ensure source repo is on local disk (downloads from storage on cache miss)
     let source_path = state
         .repo_store
         .acquire(&source.owner_did, &source.name)
@@ -3066,30 +3142,14 @@ pub async fn fork_repo(
 
     let disk_path = store::repo_disk_path(&state.config.repos_dir, &forker_did, &fork_name);
 
-    // Clone the source repo as a mirror
-    let output = std::process::Command::new("git")
-        .args([
-            "clone",
-            "--mirror",
-            source_path.to_str().unwrap_or(""),
-            disk_path.to_str().unwrap_or(""),
-        ])
-        .output()
-        .map_err(|e| AppError::Git(format!("git clone --mirror failed: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::Git(format!(
-            "git clone --mirror failed: {stderr}"
-        )));
-    }
-
-    // Upload fork to Tigris
-    state
-        .repo_store
-        .release_after_write(&forker_did, &fork_name)
-        .await;
-
+    // Claim-first ordering: insert the DB row before cloning or uploading
+    // anything. Within one node's database the row is the claim on (owner,
+    // name) — a concurrent same-name fork loses at the insert with nothing on
+    // disk or in storage. Across nodes (per-node Postgres) the insert
+    // arbitrates nothing; the cross-node safety properties are that
+    // publication runs under the per-repo advisory lock (below) and that the
+    // failure compensation only ever removes state THIS attempt created (its
+    // own row by id, its own clone dir) — never a storage archive.
     let now = Utc::now();
     let record = crate::db::RepoRecord {
         id: Uuid::new_v4().to_string(),
@@ -3104,8 +3164,41 @@ pub async fn fork_repo(
         forked_from: Some(source.id.clone()),
         machine_id: state.machine_id.clone(),
     };
-
     state.db.create_repo(&record).await?;
+
+    // The whole clone-and-publish lifecycle runs under the per-repo advisory
+    // lock inside `create_published`: pushes to the just-visible row serialize
+    // on the same lock, so none can execute (let alone be destroyed by the
+    // compensation below) until publication has succeeded or been unwound.
+    // On failure, compensation removes only what THIS attempt created: its
+    // clone dir (inside create_published) and its own row, keyed by our
+    // generated id.
+    let clone_result = state
+        .repo_store
+        .create_published(&forker_did, &fork_name, |dest| {
+            let output = std::process::Command::new("git")
+                .args([
+                    "clone",
+                    "--mirror",
+                    source_path.to_str().unwrap_or(""),
+                    dest.to_str().unwrap_or(""),
+                ])
+                .output()
+                .map_err(|e| anyhow::anyhow!("git clone --mirror failed: {e}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("git clone --mirror failed: {stderr}");
+            }
+            Ok(())
+        })
+        .await;
+    if let Err(e) = clone_result {
+        if let Err(db_err) = state.db.delete_repo_by_id(&record.id).await {
+            tracing::warn!(record_id = %record.id, err = %db_err,
+                "failed to remove fork row after fork error");
+        }
+        return Err(AppError::Git(format!("fork failed: {e}")));
+    }
 
     // Persist the proof so the fork carries it when it propagates to peers.
     if let Some(p) = verified_proof {
@@ -4693,7 +4786,7 @@ mod tests {
 
     /// The receive-pack *advertisement* (`GET info/refs?service=git-receive-pack`)
     /// must be throttled by the per-IP push limiter BEFORE it does the fresh
-    /// Tigris acquire — otherwise the flood brake on the POST is bypassable via
+    /// storage acquire — otherwise the flood brake on the POST is bypassable via
     /// the cheaper unauthenticated GET (PR #152 review P1). Pre-filling the
     /// bucket makes the assertion deterministic and keeps the test off the
     /// acquire path entirely.
@@ -4732,7 +4825,7 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::TOO_MANY_REQUESTS,
-            "receive-pack advertisement must be throttled before the Tigris acquire"
+            "receive-pack advertisement must be throttled before the storage acquire"
         );
     }
 
@@ -6395,7 +6488,7 @@ mod tests {
         // observes the same counter at 1: without it, a zero here would pass on any build
         // where an upload is simply impossible.
         assert_eq!(
-            state.repo_store.tigris_upload_site_reached(),
+            state.repo_store.storage_upload_site_reached(),
             0,
             "a push interrupted by a client disconnect must not reach the Tigris upload \
              site: publishing a half-applied repo propagates it to every node that later \
@@ -6500,7 +6593,7 @@ mod tests {
         // not at least once: a retried exec race releases with success = false and must
         // not count.
         assert_eq!(
-            state.repo_store.tigris_upload_site_reached(),
+            state.repo_store.storage_upload_site_reached(),
             1,
             "a completed push must reach the Tigris upload site once"
         );
@@ -6565,7 +6658,7 @@ mod tests {
 
         // MUST-NOT: with the pool free again, the push is not shed as capacity (it fails
         // later on the nonexistent on-disk repo, which is a git error, not Overloaded).
-        held.release(false).await;
+        held.release(false).await.ok();
         let admitted = git_receive_pack(
             State(state.clone()),
             Path((owner.to_string(), name.to_string())),

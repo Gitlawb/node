@@ -73,10 +73,32 @@ pub async fn create_issue(
 
     let create_result = git_issues::create_issue(&disk_path, &issue_id, &json_str);
 
-    // Always release the advisory lock — even on error; upload to Tigris only on success.
-    guard.release(create_result.is_ok()).await;
+    // Always release the advisory lock — even on error; upload to storage only on success.
+    let release_result = guard.release(create_result.is_ok()).await;
 
     create_result.map_err(|e| AppError::Git(e.to_string()))?;
+    // A durable-upload failure is recoverable ONLY while the pending-upload
+    // marker protects the committed mutation (the next successful upload
+    // re-syncs storage). Verify the marker actually exists before choosing to
+    // succeed: if the marker write itself also failed, nothing protects the
+    // mutation from a stale-archive rollback, and the request must fail.
+    // (Succeeding here avoids non-idempotent retries: a retried create mints
+    // a second issue UUID and both eventually publish.)
+    if let Err(e) = release_result {
+        if state
+            .repo_store
+            .pending_marker_exists(&record.owner_did, &record.name)
+        {
+            tracing::error!(repo = %record.name, issue = %issue_id, err = %e,
+                "issue committed locally but durable upload failed — storage re-syncs on next upload");
+        } else {
+            tracing::error!(repo = %record.name, issue = %issue_id, err = %e,
+                "issue committed locally with NO durable protection — failing the request");
+            return Err(AppError::Git(format!(
+                "issue stored locally but durability could not be guaranteed: {e}"
+            )));
+        }
+    }
 
     // Bump trust score for the issue author — increment current score by 0.05
     // (avoids the push_count=0 stuck-at-0.05 bug for agents who only file issues)
@@ -249,11 +271,11 @@ pub async fn close_issue(
             .ok()
             .and_then(|i| i.author),
         Ok(None) => {
-            guard.release(false).await;
+            let _ = guard.release(false).await;
             return Err(AppError::NotFound(format!("issue {issue_id} not found")));
         }
         Err(e) => {
-            guard.release(false).await;
+            let _ = guard.release(false).await;
             return Err(AppError::Git(e.to_string()));
         }
     };
@@ -262,7 +284,7 @@ pub async fn close_issue(
         .as_deref()
         .is_some_and(|a| crate::api::did_matches(&auth.0, a));
     if !is_owner && !is_author {
-        guard.release(false).await;
+        let _ = guard.release(false).await;
         return Err(AppError::Forbidden(
             "only the repo owner or the issue author can close this issue".into(),
         ));
@@ -270,12 +292,29 @@ pub async fn close_issue(
 
     let close_result = git_issues::close_issue(&disk_path, &issue_id);
 
-    // Always release the advisory lock — even on error; upload to Tigris only on success.
-    guard.release(close_result.is_ok()).await;
+    // Always release the advisory lock — even on error; upload to storage only on success.
+    let release_result = guard.release(close_result.is_ok()).await;
 
     let updated = close_result
         .map_err(|e| AppError::Git(e.to_string()))?
         .ok_or_else(|| AppError::RepoNotFound(format!("issue {issue_id} not found")))?;
+    // Recoverable only while the marker protects the committed mutation
+    // (see create_issue).
+    if let Err(e) = release_result {
+        if state
+            .repo_store
+            .pending_marker_exists(&record.owner_did, &record.name)
+        {
+            tracing::error!(repo = %repo, issue = %issue_id, err = %e,
+                "issue close committed locally but durable upload failed — storage re-syncs on next upload");
+        } else {
+            tracing::error!(repo = %repo, issue = %issue_id, err = %e,
+                "issue close committed locally with NO durable protection — failing the request");
+            return Err(AppError::Git(format!(
+                "issue close stored locally but durability could not be guaranteed: {e}"
+            )));
+        }
+    }
 
     let issue: serde_json::Value = serde_json::from_str(&updated)
         .map_err(|e| AppError::BadRequest(format!("invalid issue data: {e}")))?;
@@ -382,7 +421,7 @@ mod lock_pool_shed_tests {
 
         // MUST-NOT: with the pool free again the call is not shed as capacity (it
         // fails later on the nonexistent on-disk repo, which is a git 500).
-        held.release(false).await;
+        held.release(false).await.ok();
         let admitted = create_issue(
             State(state.clone()),
             Extension(AuthenticatedDid(owner.to_string())),
@@ -431,7 +470,7 @@ mod lock_pool_shed_tests {
         let err = shed.expect_err("an exhausted lock pool must fail the call");
         assert_sheds_503_with_retry_after(err, "close_issue");
 
-        held.release(false).await;
+        held.release(false).await.ok();
         let admitted = close_issue(
             State(state.clone()),
             Extension(AuthenticatedDid(owner.to_string())),

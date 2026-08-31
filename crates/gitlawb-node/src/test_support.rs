@@ -10687,6 +10687,9 @@ mod tests {
             "TigrisClient",
             ".download(",
             "tigris",
+            "RepoArchive",
+            "BlobStore",
+            "fetch_raw",
         ] {
             assert!(
                 !code.contains(shape),

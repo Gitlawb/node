@@ -33,9 +33,15 @@ sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chron
 clap = { version = "4", features = ["derive", "env"] }
 bytes = "1"
 libc = "0.2"
+async-trait = "0.1"
 cid = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
+# Content etags for repo archives: S3 single-part ETags are the body MD5, so a
+# client-side MD5 lets the uploader record its *intended* etag before the PUT
+# (crash-recovery provenance for the pending-upload marker). Not used for
+# anything security-sensitive.
+md-5 = "0.10"
 hmac = { workspace = true }
 http-body-util = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
@@ -57,7 +63,7 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "d
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 async-compression = { version = "0.4", features = ["tokio", "zstd"] }
 tar = "0.4"
-zstd = "0.13"
+zstd = { version = "0.13", features = ["zstdmt"] }
 # Prometheus metrics. Used to expose a /metrics endpoint for ops/observability
 # on the opt-in GITLAWB_METRICS_ADDR listener. The crate is also the de-facto
 # exposition format encoder in the Rust ecosystem.
