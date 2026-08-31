@@ -1487,6 +1487,18 @@ impl PolicyFence {
         }
     }
 
+    /// The epoch value captured at `capture` time. Exposed so the
+    /// pinner can pass it to
+    /// `Db::record_pinned_cid_with_source_fenced` — the third
+    /// fence in the same transaction as the row insert.
+    /// Returning the field directly (rather than a `Option`)
+    /// matches the contract: a `PolicyFence` always has a
+    /// captured epoch; `is_current()` reports whether it still
+    /// matches.
+    pub fn captured_epoch(&self) -> i64 {
+        self.epoch
+    }
+
     /// The repo this fence guards, for log correlation.
     pub fn repo_id(&self) -> &str {
         &self.repo_id
@@ -2122,7 +2134,31 @@ pub async fn pin_new_objects(
                 // per-object failure.
                 match db_bounded(
                     db_record_deadline(deadline),
-                    retry_db_record(|| db.record_pinned_cid_with_source(&sha, &raw_cid, repo_id)),
+                    retry_db_record(|| {
+                        // #218 review round 9 (guidance #3 —
+                        // linearization): always go through the
+                        // fenced form. The fence is either
+                        // captured (sweep / public-pin path: the
+                        // third fence is the linearization point
+                        // that closes the rule-write /
+                        // record-write race) or absent
+                        // (push-side admission where the
+                        // decision is made at request time —
+                        // we pass `i64::MAX` as a sentinel that
+                        // the fenced form treats as "no fence
+                        // check"). The 3-arg
+                        // `record_pinned_cid_with_source` is
+                        // still available for tests that don't
+                        // own a fence, but the production
+                        // pinner routes through here.
+                        let fence_epoch = fence.map(|f| f.captured_epoch()).unwrap_or(i64::MAX);
+                        db.record_pinned_cid_with_source_fenced(
+                            &sha,
+                            &raw_cid,
+                            repo_id,
+                            fence_epoch,
+                        )
+                    }),
                 )
                 .await
                 {

@@ -59,6 +59,49 @@ const ENCRYPTED_MANIFEST_ANCHOR_FAILED_MSG: &str =
      when the recipients tag is stable). A subsequent withheld \
      change forces a new seal and re-anchors the manifest.";
 
+/// Per-backend continuation-cursor progress, expressed as an
+/// effect-side state machine (#218 review round 9, guidance #4).
+/// The tri-state `Option<Option<String>>` is the wire form; this
+/// enum is the documented shape the closure maps from.
+///
+/// The contract: a cursor must reflect EFFECT, not plan. A
+/// pre-dispatch failure (fence capture failed, refilter returned
+/// `None`, dispatch produced an empty `to_pin`) cannot look like
+/// work completed — the unattempted prefix must retry at the
+/// head of the next pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProgressState {
+    /// No work was attempted this pass (fence capture failed,
+    /// refilter returned `None`, dispatch produced an empty
+    /// `to_pin`). The cursor is preserved — the unattempted
+    /// prefix retries at the head of the next pass.
+    Idle,
+    /// A subset of the cap was dispatched. The next pass
+    /// rotates past `last_dispatched`, retrying everything
+    /// beyond.
+    Advanced { last_dispatched: String },
+    /// The missing set was empty. The cursor is cleared
+    /// (a future pass sees a fresh start).
+    Drained,
+}
+
+impl ProgressState {
+    /// Map the three states to the wire form: `Some(value)` for
+    /// a write, `None` for "leave the row alone".
+    ///
+    /// The closure `next_offset_write(scan_ok, had_work, dispatched)`
+    /// in `run_pass` is the same logic in closure form; this
+    /// method exists for tests and for any future caller that
+    /// wants the type rather than the wire tuple.
+    pub(crate) fn to_wire(&self) -> Option<Option<String>> {
+        match self {
+            ProgressState::Idle => None,
+            ProgressState::Advanced { last_dispatched } => Some(Some(last_dispatched.clone())),
+            ProgressState::Drained => Some(None),
+        }
+    }
+}
+
 /// Whether the sweep should spawn given the current configuration.
 /// Extracted for testing — test both directions independently.
 fn should_spawn(config: &Config) -> bool {
@@ -984,6 +1027,26 @@ async fn run_pass(
         //
         // `next_offset_write` returns `Some(value_to_write)` or `None` for
         // "leave the row alone", so the two backends cannot drift apart.
+        //
+        // #218 review round 9 (guidance #4 — model the states
+        // explicitly): the tri-state `Option<Option<String>>` is
+        // the wire form; `ProgressState` is the documented shape
+        // the closure maps from. Three states:
+        //   - `Idle`: no work was attempted this pass (fence
+        //     capture failed, refilter returned `None`, dispatch
+        //     produced an empty `to_pin`). The cursor is
+        //     preserved — the unattempted prefix retries at the
+        //     head of the next pass.
+        //   - `Advanced { last_dispatched }`: a subset of the cap
+        //     was dispatched. The next pass rotates past
+        //     `last_dispatched`, retrying everything beyond.
+        //   - `Drained`: the missing set was empty. The cursor is
+        //     cleared (a future pass sees a fresh start).
+        //
+        // The two backends' cursors are independent: a drained
+        // IPFS missing set clears the IPFS offset but does NOT
+        // touch the Pinata offset, and vice versa. The write
+        // site persists each backend's state without sharing.
         let next_offset_write =
             |scan_ok: bool, had_work: bool, dispatched: Option<String>| -> Option<Option<String>> {
                 if !scan_ok {

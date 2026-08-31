@@ -181,6 +181,54 @@ pub(crate) async fn silent_http_endpoint() -> String {
     endpoint
 }
 
+/// Body of the `for-each-ref` arm of a fake-git fixture in the
+/// COLUMN SHAPE `blob_paths` phase 2 parses. The caller is
+/// responsible for wrapping this in a full `case "$1" in ... esac`
+/// shell script and writing it to a tempdir; this is the form
+/// used when a fixture has OTHER arms (e.g. `rev-list`,
+/// `pack-objects`) that the visibility-pipeline tests also need
+/// to fake.
+///
+/// Two output shapes:
+/// - `tag` tip (`peeled_oid` and `peeled_kind` empty) →
+///   `echo '<oid> <kind>'` (two tokens).
+/// - Annotated tag tip → `echo '<oid> tag <peeled_oid> <peeled_kind>'`
+///   (four tokens; the literal `tag` in slot 2 is the parser's
+///   "peeled type is `tag`" trigger for the recursive peel).
+///
+/// An empty `refs` slice emits a single `:` so phase 2 sees no
+/// lines (the same as a bare default `*) : ;;` arm).
+pub(crate) fn fake_git_for_ref_body(refs: &[(&str, &str, &str, &str)]) -> String {
+    let mut body = String::new();
+    if refs.is_empty() {
+        body.push_str("    : ;;\n");
+    } else {
+        for (oid, kind, peeled_oid, peeled_kind) in refs {
+            if peeled_oid.is_empty() && peeled_kind.is_empty() {
+                body.push_str(&format!("    echo '{oid} {kind}' ;;\n"));
+            } else {
+                body.push_str(&format!(
+                    "    echo '{oid} tag {peeled_oid} {peeled_kind}' ;;\n"
+                ));
+            }
+        }
+    }
+    body
+}
+
+/// Full fake-git script body for a fixture whose ONLY fake arm is
+/// `for-each-ref`. All other `git` subcommands are answered by
+/// the default `*) : ;;` no-op, so a real-git repo with matching
+/// refs is needed to drive the rest of the walk. Used by tests
+/// that want the parser contract enforced without committing to
+/// the other arms the smart-HTTP fixture cares about.
+pub(crate) fn fake_git_with_refs(refs: &[(&str, &str, &str, &str)]) -> String {
+    let mut body = String::from("#!/bin/sh\ncase \"$1\" in\n  for-each-ref)\n");
+    body.push_str(&fake_git_for_ref_body(refs));
+    body.push_str("    *) : ;;\nesac\nexit 0\n");
+    body
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

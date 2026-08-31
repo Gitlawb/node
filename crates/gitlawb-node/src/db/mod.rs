@@ -3521,6 +3521,15 @@ impl Db {
         repo_id: &str,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        // #218 review round 9 (guidance #3 — linearization point):
+        // no `fence_epoch` is passed in this 3-arg form. The
+        // 4-arg overload below is the IPFS pin flow's third
+        // fence: it re-reads the epoch under a row lock that
+        // `set_visibility_rule` must also take, and aborts the
+        // record if the epoch has advanced. Callers that don't
+        // own a policy fence (push-side pin records, where
+        // admission time IS the decision time) use this overload.
+
         // `local_ipfs_provenance = TRUE` here is the durable contract
         // (#218 review P1): the only path that calls this method
         // (`ipfs_pin.rs` `pin_git_object` after a successful `add`) has
@@ -3572,6 +3581,112 @@ impl Db {
             // Clears THIS repo's failure only (#173 round 12). A boolean per object meant
             // repo C's genuine record wiped the marker repo B's failure set, and the
             // resolver then dropped the scan fallback while B's copy was still unrecorded.
+            sqlx::query("DELETE FROM pin_source_failures WHERE sha256_hex = $1 AND repo_id = $2")
+                .bind(sha256_hex)
+                .bind(repo_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// #218 review round 9 (guidance #3 — linearization point):
+    /// [`record_pinned_cid_with_source`] with a third fence check
+    /// INSIDE the record transaction. Reads the repo's policy
+    /// epoch under `FOR UPDATE`; the same row lock that
+    /// `set_visibility_rule` and `remove_visibility_rule` take
+    /// when they bump `policy_epoch`. A narrowing rule that
+    /// commits between the irreversible POST and this record
+    /// either blocks on us (we see the post-narrow epoch and
+    /// abort) or has already released (we see the post-narrow
+    /// epoch and abort). Either way the record never lands
+    /// under a stale-allow decision.
+    ///
+    /// `fence_epoch` is the value `PolicyFence::capture` read
+    /// BEFORE the POST (the per-batch captured epoch). A
+    /// mismatch means the decision we wrote bytes against is no
+    /// longer the decision the database would write the row
+    /// under, and we abort.
+    ///
+    /// This is the third fence of three: top-of-iteration
+    /// (`pin_new_objects` 1803-1812), pre-POST
+    /// (`pin_new_objects` 2058-2074), and pre-record (here, in
+    /// the same transaction as the row insert). The HTTP POST is
+    /// irreducible — it cannot run inside a Postgres
+    /// transaction — so the linearization has to be at the
+    /// rule-write / record-write race. The pre-record fence
+    /// closes that race; a narrowing rule that lands between
+    /// the POST and the record is observed here and the record
+    /// is aborted.
+    pub async fn record_pinned_cid_with_source_fenced(
+        &self,
+        sha256_hex: &str,
+        cid: &str,
+        repo_id: &str,
+        fence_epoch: i64,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        // Take the row lock on `repos` first, then read the
+        // epoch. `set_visibility_rule` takes the same lock when
+        // it updates `policy_epoch`, so a rule write that
+        // committed between the POST and now is already visible
+        // (the rule write's commit released the lock; we acquire
+        // it now and read the new value). A rule write in
+        // flight blocks on our lock; the record is aborted.
+        //
+        // `i64::MAX` is the "no fence" sentinel used by
+        // push-side admission (where the decision is made at
+        // request time, not pin time). The row lock is still
+        // acquired — every record goes through the lock — but
+        // the comparison is skipped so push-side callers don't
+        // have to fabricate a fake fence epoch.
+        let current_epoch = self.repo_policy_epoch_locked(&mut tx, repo_id).await?;
+        if fence_epoch != i64::MAX && current_epoch != fence_epoch {
+            // The decision the pinner acted under is no longer
+            // the decision the database would land the row
+            // under. Roll back; no row, no source, no
+            // failure-marker delete.
+            tx.rollback().await.ok();
+            anyhow::bail!(
+                "policy epoch changed during pin dispatch \
+                 (captured={fence_epoch}, current={current_epoch}); \
+                 pin record aborted, no row landed"
+            );
+        }
+        // The remainder is the same INSERT / COALESCE /
+        // pin_repo_sources logic as the 3-arg form. Kept inline
+        // (rather than factored into a private helper) so the
+        // two forms can drift independently if a future change
+        // needs them to — drift is the very class of bug this
+        // third fence is here to catch.
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id, local_ipfs_provenance)
+             VALUES ($1, $2, $3, $4, TRUE)
+             ON CONFLICT(sha256_hex) DO UPDATE SET
+                 cid = COALESCE(pinned_cids.cid, EXCLUDED.cid),
+                 repo_id = COALESCE(pinned_cids.repo_id, EXCLUDED.repo_id),
+                 local_ipfs_provenance = TRUE",
+        )
+        .bind(sha256_hex)
+        .bind(cid)
+        .bind(Utc::now().to_rfc3339())
+        .bind(repo_id)
+        .execute(&mut *tx)
+        .await?;
+        let inserted = sqlx::query(
+            "INSERT INTO pin_repo_sources (sha256_hex, repo_id)
+             SELECT $1, $2
+             WHERE (SELECT count(*) FROM pin_repo_sources WHERE sha256_hex = $1) < $3
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(sha256_hex)
+        .bind(repo_id)
+        .bind(MAX_PIN_SOURCES)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if inserted > 0 {
             sqlx::query("DELETE FROM pin_source_failures WHERE sha256_hex = $1 AND repo_id = $2")
                 .bind(sha256_hex)
                 .bind(repo_id)
@@ -4680,6 +4795,31 @@ impl Db {
         let row = sqlx::query("SELECT policy_epoch FROM repos WHERE id = $1")
             .bind(repo_id)
             .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get::<i64, _>("policy_epoch")).unwrap_or(0))
+    }
+
+    /// #218 review round 9 (guidance #3 — linearization point):
+    /// read the repo's policy epoch under a row lock that a
+    /// narrowing rule write must also acquire. Caller must hold
+    /// an open transaction and pass it in. The lock is released
+    /// when the transaction commits or rolls back.
+    ///
+    /// This is the third fence check: between the irreversible
+    /// HTTP POST and the DB record, a rule write can still
+    /// commit. Reading the epoch under `FOR UPDATE` here means
+    /// either (a) the rule write blocks on us — we get the
+    /// post-narrow epoch and abort the record, or (b) we block
+    /// on the rule write — we get the post-narrow epoch and
+    /// abort the record. Either way no stale record lands.
+    pub async fn repo_policy_epoch_locked(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        repo_id: &str,
+    ) -> Result<i64> {
+        let row = sqlx::query("SELECT policy_epoch FROM repos WHERE id = $1 FOR UPDATE")
+            .bind(repo_id)
+            .fetch_optional(&mut **tx)
             .await?;
         Ok(row.map(|r| r.get::<i64, _>("policy_epoch")).unwrap_or(0))
     }

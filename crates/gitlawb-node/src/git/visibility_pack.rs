@@ -1297,9 +1297,14 @@ pub fn allowed_tree_set_for_caller_bounded(
     };
     let mut admitted: HashSet<String> = HashSet::new();
     for (oid, path) in &tree_pairs {
-        if !path.is_empty()
-            && visibility_check(rules, is_public, owner_did, caller, path) == Decision::Allow
-        {
+        // #218 review round 9 (guidance #1): route through
+        // `pair_decision` so this caller-aware tree allow-set and
+        // the blob allow-set (`allowed_blob_set_for_caller_bounded`)
+        // share the empty-path policy. With `caller = Some(owner)`,
+        // an unclassifiable empty-path tree is Allow (the owner is
+        // the only identity that could have pushed the ref tip);
+        // with `caller = None` / `caller = Some(reader)`, it is Deny.
+        if pair_decision(path, rules, is_public, owner_did, caller) == Decision::Allow {
             tree_structurally_safe(&ctx, oid, path, &mut admitted, deadline)?;
         }
     }
@@ -1579,13 +1584,17 @@ pub fn allowed_blob_tree_sets_bounded(
     let all_tree_oids: HashSet<String> = tree_pairs.iter().map(|(oid, _)| oid.clone()).collect();
     let mut allowed_blobs = HashSet::new();
     for (oid, path) in &blob_pairs {
-        // Empty path means unknown provenance (cat-file catch-all with no
-        // ls-tree match). Deny rather than letting it fall through to the
-        // repo-wide default — an unclassified object must not enter a public
-        // pin backend.
-        if !path.is_empty()
-            && visibility_check(rules, is_public, owner_did, None, path) == Decision::Allow
-        {
+        // #218 review round 9 (guidance #1): the empty-path
+        // decision is now in `pair_decision` so this consumer and
+        // `withheld_from_pairs` / `allowed_blob_set_for_caller_bounded`
+        // cannot disagree. For this caller (the sweep's anonymous
+        // allow-set), `pair_decision("", ..., None)` is Deny —
+        // identical to the previous `!path.is_empty()` skip, but
+        // the path is now annotated with the explicit
+        // "unclassifiable → deny" reasoning rather than a silent
+        // skip. If the policy is ever relaxed (e.g. to allow
+        // owner-only paths), it lands in one place.
+        if pair_decision(path, rules, is_public, owner_did, None) == Decision::Allow {
             allowed_blobs.insert(oid.clone());
         }
     }
@@ -1610,10 +1619,14 @@ pub fn allowed_blob_tree_sets_bounded(
     };
     let mut allowed_trees: HashSet<String> = HashSet::new();
     for (oid, path) in &tree_pairs {
-        if path.is_empty() {
-            continue;
-        }
-        if visibility_check(rules, is_public, owner_did, None, path) != Decision::Allow {
+        // #218 review round 9 (guidance #1): route through
+        // `pair_decision` so this tree allow-set and the blob
+        // allow-set above share the empty-path policy. The
+        // structural check (`tree_structurally_safe`) only runs
+        // for trees the path-based decision admits; an
+        // unclassifiable empty-path tree is not in `allowed_trees`
+        // for an anonymous caller (the sweep's policy).
+        if pair_decision(path, rules, is_public, owner_did, None) != Decision::Allow {
             continue;
         }
         if tree_structurally_safe(&ctx, oid, path, &mut allowed_trees, deadline)? {
@@ -3580,6 +3593,183 @@ esac\n";
         );
     }
 
+    /// #218 review round 9 (guidance #2 — preserve Git path bytes):
+    /// a path with a TRAILING SPACE is a real, valid Git shape
+    /// (`git` stores raw bytes, no POSIX/NTFS rule applies). The
+    /// visibility pipeline must see the bytes verbatim: a `/secret/**`
+    /// rule has to match a path of `secret /f.txt` (the parent
+    /// directory is `secret ` with one trailing space, not the
+    /// directory `secret` followed by `/f.txt`).
+    ///
+    /// Pre-fix regression: any `record.trim()` on the `ls-tree -z`
+    /// field would have stripped the trailing space and let the blob
+    /// leak. The current parser at `blob_paths` does NOT `.trim()`
+    /// the path — the test pins that invariant at the cargo-test
+    /// level so a future refactor that reintroduces a trim fails
+    /// the suite, not the production walk.
+    #[cfg(unix)]
+    #[test]
+    fn withholds_secret_blob_at_path_with_trailing_space() {
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        // Create a parent directory whose name has a trailing space.
+        // `git` permits this; some filesystems do too on Linux.
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(work.join("secret ")).unwrap();
+        std::fs::write(work.join("public.txt"), b"public\n").unwrap();
+        std::fs::write(
+            work.join("secret /f.txt"),
+            b"TOP SECRET (trailing-space path)\n",
+        )
+        .unwrap();
+        let run = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-q"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        run(&["add", "."], &work);
+        run(&["commit", "-qm", "init"], &work);
+        let oid = |path: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", &format!("HEAD:{path}")])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let secret_oid = oid("secret /f.txt");
+        let public_oid = oid("public.txt");
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        // The rule matches the trailing-space parent (a normal
+        // /secret/** won't catch it). Use the explicit pattern
+        // that includes the space.
+        let rules = [rule("/secret /**", &[])];
+        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            withheld.contains(&secret_oid),
+            "secret blob at a path with a trailing-space parent directory must be withheld \
+             (the rule was /secret /** with the literal trailing space)"
+        );
+        assert!(
+            !withheld.contains(&public_oid),
+            "public blob must NOT be withheld"
+        );
+    }
+
+    /// #218 review round 9 (guidance #2 — preserve Git path bytes):
+    /// `ls-tree -z` is NUL-delimited, and the record's
+    /// `<metadata>\t<path>\0` shape has no leading whitespace
+    /// outside the field separator. If a future parser
+    /// inadvertently eats leading whitespace from the field
+    /// (e.g. a `path.trim_start()`), a path beginning with a space
+    /// would be re-shaped into the same one with the space gone
+    /// — a quiet leak class symmetric with the trailing-space
+    /// case above.
+    ///
+    /// The contract: leading whitespace in the field is part of
+    /// the filename (rare but possible; the field is bytes, not a
+    /// POSIX path) and must be preserved.
+    ///
+    /// The test creates a *directory* whose name has a leading
+    /// space (` secret/`), then a file at ` secret/f.txt`. The
+    /// leading space is inside a directory name, not at the
+    /// top-level (where the `git update-index --cacheinfo`
+    /// path-separator would eat it). The full path is
+    /// `/ secret/f.txt` and the rule is `/ secret/**` with a
+    /// literal leading space. A `path.trim_start()` on the
+    /// post-`/` portion would collapse this to `/secret/**`
+    /// and the rule would no longer match.
+    #[cfg(unix)]
+    #[test]
+    fn withholds_secret_blob_at_path_with_leading_space() {
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        let run = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        std::fs::create_dir_all(&work).unwrap();
+        // A directory with a leading space in its name. The
+        // working tree on Linux permits this; some shells don't,
+        // so we materialise via `std::fs` not via a shell glob.
+        std::fs::create_dir_all(work.join(" secret")).unwrap();
+        std::fs::write(work.join("public.txt"), b"public\n").unwrap();
+        std::fs::write(
+            work.join(" secret").join("f.txt"),
+            b"TOP SECRET (leading-space dir)\n",
+        )
+        .unwrap();
+        run(&["init", "-q"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        run(&["add", "."], &work);
+        run(&["commit", "-qm", "init"], &work);
+        let oid = |path: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", &format!("HEAD:{path}")])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let secret_oid = oid(" secret/f.txt");
+        let public_oid = oid("public.txt");
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        // The rule matches the leading-space directory (a normal
+        // /secret/** won't catch it). Use the explicit pattern
+        // that includes the space.
+        let rules = [rule("/ secret/**", &[])];
+        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            withheld.contains(&secret_oid),
+            "secret blob at a path inside a LEADING-SPACE directory must be withheld \
+             (the rule was / secret/** with the literal leading space); a trim_start() on the \
+             post-/ portion would leak it"
+        );
+        assert!(
+            !withheld.contains(&public_oid),
+            "public blob must NOT be withheld"
+        );
+    }
+
     /// Write a blob into `bare`'s object store that NO commit reaches, and
     /// return its OID.
     ///
@@ -3972,5 +4162,243 @@ esac\n";
             !withheld.contains(&shared_oid),
             "a blob also reachable via an allowed path must not be withheld"
         );
+    }
+
+    /// #218 review round 9 (guidance #1 — single fail-closed
+    /// classification contract): for every non-commit ref shape the
+    /// parser can produce, the FOUR consumers of `(oid, path)` —
+    /// smart-HTTP deny set (`withheld_blob_oids_bounded`),
+    /// `/ipfs/{cid}` allow set
+    /// (`allowed_blob_set_for_caller_bounded`), reconciliation
+    /// object set (`allowed_blob_tree_sets_bounded`), and encrypted
+    /// recovery (`withheld_blob_recipients_bounded`) — must agree
+    /// on the OID's classification for every caller identity.
+    /// Drift between consumers is a leak.
+    ///
+    /// The matrix is the canonical record: a regression in
+    /// `pair_decision`, a re-introduced `!path.is_empty()` skip
+    /// guard, or a wire-shape mismatch between the consumers fails
+    /// one row of the table at the cargo-test level, with a name
+    /// that points at the offending consumer.
+    #[test]
+    fn ref_classification_is_consistent_across_consumers() {
+        // Build a single bare repo with one secret blob reachable
+        // through every non-commit ref shape the parser produces:
+        //   * direct blob ref (lightweight tag of a blob)
+        //   * direct tree ref (lightweight tag of a tree)
+        //   * annotated tag of a blob
+        //   * annotated tag of a tree
+        //   * nested tag (tag-of-tag-of-blob)
+        // The blob OID and tree OID are distinct so the consumers
+        // can disambiguate. The blob is NOT committed anywhere, so
+        // phase 1 (`rev-list --all` + `ls-tree`) does not see it —
+        // every entry in the `(oid, path)` set arrives through
+        // phase 2 (`for-each-ref`) with an empty path.
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        let run = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        std::fs::create_dir_all(&work).unwrap();
+        // Init the bare first so the orphaned blobs can be written
+        // into its object store before any commit exists.
+        run(&["init", "-q", "--bare", bare.to_str().unwrap()], td.path());
+        run(&["init", "-q"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+
+        // Direct blob ref: hash-object, then update-ref to a ref
+        // tip that points at the loose blob (not a commit).
+        // `withheld_blob_oids` walks the BARE repo, so the ref
+        // must be created on the bare — `update-ref` on the work
+        // tree would put it in a refs file the walk never reads.
+        let blob_oid = {
+            use std::io::Write;
+            use std::process::Stdio;
+            let out = Command::new("git")
+                .args(["hash-object", "-w", "--stdin"])
+                .current_dir(&bare)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .and_then(|mut c| {
+                    c.stdin.take().unwrap().write_all(b"DIRECT BLOB\n")?;
+                    c.wait_with_output()
+                })
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["update-ref", "refs/tags/direct-blob", &blob_oid], &bare);
+
+        // Direct tree ref: a tree object, then a ref tip pointing
+        // at the tree. `git mktree` materialises the tree.
+        let tree_oid = {
+            use std::io::Write;
+            use std::process::Stdio;
+            let out = Command::new("git")
+                .args(["mktree"])
+                .current_dir(&bare)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .and_then(|mut c| {
+                    c.stdin
+                        .take()
+                        .unwrap()
+                        .write_all(format!("100644 blob {blob_oid}\ttree-blob\n").as_bytes())?;
+                    c.wait_with_output()
+                })
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["update-ref", "refs/tags/direct-tree", &tree_oid], &bare);
+
+        // Annotated tag of a blob: `git tag -a -m ... <name> <blob-oid>`.
+        run(
+            &[
+                "tag",
+                "-a",
+                "-m",
+                "annotated-blob",
+                "tagged-blob",
+                &blob_oid,
+            ],
+            &bare,
+        );
+
+        // Annotated tag of a tree: same, but referent is the tree.
+        run(
+            &[
+                "tag",
+                "-a",
+                "-m",
+                "annotated-tree",
+                "tagged-tree",
+                &tree_oid,
+            ],
+            &bare,
+        );
+
+        // Nested tag (tag-of-tag-of-blob): a tag of a tag. Stock
+        // git peels through the whole chain, so the referent the
+        // parser sees is the blob. The fixture proves the chain
+        // resolves.
+        run(&["tag", "-a", "-m", "outer", "outer", "tagged-blob"], &bare);
+
+        // Sanity: at least one path-scoped rule so the visibility
+        // decision is non-trivial.
+        let rules = [rule("/secret/**", &[])];
+
+        // Run all four consumers. None of the OIDs are committed
+        // anywhere reachable from a commit path, so an empty path
+        // is the ONLY shape phase 2 can give them. The classification
+        // contract is: empty path + caller != owner → Deny; empty
+        // path + caller = owner → Allow.
+        for caller in [None, Some("did:key:zReader"), Some(OWNER)] {
+            let label = format!("caller={caller:?}");
+
+            // 1. Smart-HTTP deny set: the OID must be withheld iff
+            //    the caller is not the owner.
+            let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, caller).unwrap();
+            for (label_inner, oid) in [
+                ("direct-blob", &blob_oid),
+                ("annotated-blob", &blob_oid),
+                ("nested-tag-blob", &blob_oid),
+            ] {
+                let in_withheld = withheld.contains(oid);
+                let expected = !matches!(caller, Some(c) if c == OWNER);
+                assert_eq!(
+                    in_withheld, expected,
+                    "[{label}] smart-HTP deny for {label_inner}: expected withheld={expected}, got {in_withheld}"
+                );
+            }
+            // Direct tree and annotated tree: the smart-HTP deny
+            // set names this function "blob OIDs" but in fact
+            // `blob_paths` enumerates ANY non-commit ref target,
+            // so a tree is in the set the same way a blob is. The
+            // `pair_decision` empty-path policy applies uniformly:
+            // withheld for non-owners, Allow for the owner. The
+            // structural consumer `allowed_blob_tree_sets_bounded`
+            // is the one that splits blobs and trees — the smart
+            // HTP gate treats both as opaque withheld OIDs.
+            let expected = !matches!(caller, Some(c) if c == OWNER);
+            assert_eq!(
+                withheld.contains(&tree_oid),
+                expected,
+                "[{label}] smart-HTP deny for the unclassifiable tree: expected withheld={expected}"
+            );
+
+            // 2. /ipfs/{cid} allow set: the OID must be in the
+            //    allow set iff the caller is the owner (owner-only
+            //    carve-out for unclassifiable ref targets).
+            let allowed = allowed_blob_set_for_caller(&bare, &rules, true, OWNER, caller).unwrap();
+            let expected = matches!(caller, Some(c) if c == OWNER);
+            assert_eq!(
+                allowed.contains(&blob_oid),
+                expected,
+                "[{label}] /ipfs/{{cid}} allow set for the unclassifiable blob: \
+                 expected in set = {expected}"
+            );
+
+            // 3. Reconciliation object set: same allow-set shape as
+            //    /ipfs/{cid} (with caller = None baked in), so the
+            //    unclassifiable blob is DENIED — the sweep never
+            //    pins it. This is the cross-consumer assertion:
+            //    the /ipfs/{cid} gate and the sweep agree on what
+            //    the anonymous allow set contains.
+            use std::time::Instant;
+            let (rec_allowed_blobs, _rec_allowed_trees, _, _) = allowed_blob_tree_sets_bounded(
+                &bare,
+                "git",
+                Instant::now() + WALK_TIMEOUT,
+                &rules,
+                true,
+                OWNER,
+            )
+            .unwrap();
+            assert!(
+                !rec_allowed_blobs.contains(&blob_oid),
+                "[{label}] reconciliation allow-set (caller = None) must NOT include \
+                 the unclassifiable blob; the sweep never pins an empty-path blob to anon"
+            );
+
+            // 4. Encrypted-recovery walk: the unclassifiable blob
+            //    is in the withheld set for the owner (the owner
+            //    encrypts+pins for self + listed readers) and not
+            //    for anon/listed reader (the seal must not run
+            //    against an empty path for an identity that
+            //    shouldn't be able to read the blob).
+            let recipients = withheld_blob_recipients(&bare, &rules, true, OWNER).unwrap();
+            let recips_for_blob = recipients.get(&blob_oid);
+            match caller {
+                Some(c) if c == OWNER => {
+                    assert!(
+                        recips_for_blob.is_some_and(|r| r.contains(OWNER)),
+                        "[{label}] encrypted-recovery recipients must include the owner \
+                         for the unclassifiable blob"
+                    );
+                }
+                _ => {
+                    assert!(
+                        recips_for_blob.is_none()
+                            || !recips_for_blob
+                                .unwrap()
+                                .iter()
+                                .any(|d| d == caller.unwrap_or("??")),
+                        "[{label}] encrypted-recovery recipients must not include a non-owner \
+                         for the unclassifiable blob (got {recips_for_blob:?})"
+                    );
+                }
+            }
+        }
     }
 }
