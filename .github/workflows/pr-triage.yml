@@ -76,9 +76,106 @@ jobs:
             // line after horizontal whitespace, covering bare, cfg(test), namespaced,
             // optional leading ::, and raw-identifier (r#test) forms. No head-file fetch
             // or lexer: needs-tests is advisory, not a merge gate.
-            const addsInlineTest = files.some(f =>
-              f.filename.endsWith(".rs") && f.patch &&
-              /^\+[ \t]*#\[[ \t]*(?:cfg[ \t]*\([ \t]*test[ \t]*\)|(?:::[ \t]*)?(?:[\w-]+[ \t]*::[ \t]*)*(?:r#)?test\b)/m.test(f.patch));
+            //
+            // The final path component may also carry `test` as an underscore-delimited
+            // segment, so third-party harnesses land without enumerating them one by one
+            // (#[test_case(1)], #[wasm_bindgen_test]). It is deliberately a segment and
+            // not a substring: a substring would also match #[contest] / #[latest], and a
+            // false positive here SUPPRESSES needs-tests rather than adding it. This
+            // heuristic has to fail loud, because a wrongly labeled PR gets corrected by
+            // the author while a wrongly cleared one is invisible. That trade costs the
+            // no-underscore harness names (#[rstest]), which stay unmatched on purpose.
+            //
+            // The segment classes are [A-Za-z0-9]+ rather than \w+ on purpose, so that `_`
+            // is only ever the literal delimiter. \w+ contains `_`, which makes the repeat
+            // ambiguous and backtracks exponentially: on this workflow's pull_request_target
+            // trigger f.patch is fork-controlled, so `#[test` followed by a long `_a` run is
+            // a permissionless stall of the triage job.
+            // Rust allows whitespace, line breaks, and comments between the
+            // attribute path and ] or (. A flat regex cannot decide that
+            // boundary: `//` runs to end of line, and block comments NEST, which
+            // is beyond regular languages — every enumeration of comment
+            // spellings so far has either dropped a legal separator (regressing
+            // real tests into needs-tests) or let unrelated patch records
+            // complete each other (clearing needs-tests from a testless PR, the
+            // invisible direction). So the closer is found by a token-aware
+            // scan instead: it consumes horizontal whitespace, `//`-to-newline,
+            // and depth-counted `/* */` runs, and accepts only when the first
+            // real token after the attribute path is `]` or `(`.
+            //
+            // Association is positional: the scan starts on the attribute's own
+            // added line and may continue ONLY through the immediately following
+            // added lines (a context line, hunk header, or removal breaks the
+            // chain). Unrelated `]`/`(` lines elsewhere in the patch can never
+            // complete a path they do not adjoin. The continuation is bounded;
+            // past the bound the scan gives up and reports NO inline test, which
+            // fails toward the loud label rather than the silent clearance.
+            //
+            // The detector body is fenced by the TRIAGE_DETECTOR markers so
+            // scripts/test-pr-triage-detect.mjs can extract and run it against
+            // the committed case matrix. Keep the fenced block self-contained.
+            // TRIAGE_DETECTOR_BEGIN
+            const TEST_ATTR_PATH =
+              "(?:cfg[ \\t]*\\([ \\t]*test[ \\t]*\\)|(?:::[ \\t]*)?(?:[\\w-]+[ \\t]*::[ \\t]*)*(?:r#)?(?:[A-Za-z0-9]+_)*test(?:_[A-Za-z0-9]+)*)";
+            // Anchored to the start of one added line; group 1 is whatever
+            // follows the path on that line, handed to the separator scan.
+            const TEST_ATTR_LINE = new RegExp(
+              "^[ \\t]*#\\[[ \\t]*" + TEST_ATTR_PATH + "([\\s\\S]*)$"
+            );
+            // An attribute split across more added lines than this is not a
+            // spelling anyone writes; refusing to scan further keeps the walk
+            // linear in the patch and fails toward the loud label.
+            const MAX_ATTR_CONTINUATION_LINES = 16;
+            // segs[0] is the remainder of the attribute's own line; each later
+            // entry is the text of one immediately following added line. True
+            // only when the first non-separator token across them is ] or (.
+            // Single forward pass, no backtracking: fork-controlled input.
+            function attrCloserFollows(segs) {
+              let depth = 0; // open block-comment nesting carried across lines
+              for (const seg of segs) {
+                let i = 0;
+                while (i < seg.length) {
+                  if (depth > 0) {
+                    if (seg.startsWith("/*", i)) { depth += 1; i += 2; }
+                    else if (seg.startsWith("*/", i)) { depth -= 1; i += 2; }
+                    else { i += 1; }
+                    continue;
+                  }
+                  const c = seg[i];
+                  if (c === " " || c === "\t") { i += 1; continue; }
+                  if (seg.startsWith("//", i)) break; // comment to end of line
+                  if (seg.startsWith("/*", i)) { depth = 1; i += 2; continue; }
+                  return c === "]" || c === "(";
+                }
+                // Line exhausted inside separators; the newline is itself a
+                // separator, so continue on the next added line.
+              }
+              return false; // out of adjoined lines (or bound hit): stay loud
+            }
+            function patchAddsInlineTest(patch) {
+              const lines = patch.split("\n");
+              for (let i = 0; i < lines.length; i++) {
+                if (lines[i][0] !== "+") continue;
+                const m = TEST_ATTR_LINE.exec(lines[i].slice(1));
+                if (m === null) continue;
+                const segs = [m[1]];
+                for (
+                  let j = i + 1;
+                  j < lines.length &&
+                  lines[j][0] === "+" &&
+                  segs.length <= MAX_ATTR_CONTINUATION_LINES;
+                  j++
+                ) {
+                  segs.push(lines[j].slice(1));
+                }
+                if (attrCloserFollows(segs)) return true;
+              }
+              return false;
+            }
+            // TRIAGE_DETECTOR_END
+            const addsInlineTest = files.some(
+              f => f.filename.endsWith(".rs") && !!f.patch && patchAddsInlineTest(f.patch)
+            );
             const touchedTests =
               names.some(n => n.includes("/tests/") || n.endsWith("_test.rs")) || addsInlineTest;
             if (changedRust && !touchedTests) want.add("needs-tests");
