@@ -313,4 +313,41 @@ mod tests {
         parse_seed_list(EMBEDDED_PEERS_JSON)
             .expect("embedded bootstrap-peers.json must always parse");
     }
+
+    #[test]
+    fn embedded_seed_list_merges_a_dialable_p2p_entry() {
+        // Parsing alone is not the load-bearing property for a dialable seed:
+        // `merge_into_vecs` silently SKIPS a p2p_multiaddr that fails
+        // `Multiaddr::from_str` (by design — one bad entry must not poison the
+        // rest), so a corrupted embedded address would pass the parse
+        // regression above while every shipped binary quietly lost its
+        // compile-time dial target. Drive the embedded JSON through the real
+        // merge and pin both the count and the specific pocketlawb address, so
+        // corruption fails HERE instead of degrading in the field.
+        let list = parse_seed_list(EMBEDDED_PEERS_JSON)
+            .expect("embedded bootstrap-peers.json must always parse");
+        let pocketlawb_addr = list
+            .peers
+            .iter()
+            .find(|p| p.name == "pocketlawb")
+            .expect("pocketlawb entry present in embedded seed list")
+            .p2p_multiaddr
+            .clone()
+            .expect("pocketlawb entry carries a p2p_multiaddr");
+
+        let mut http_peers = Vec::new();
+        let mut p2p_bootstrap = Vec::new();
+        let counts = merge_into_vecs(list, &mut http_peers, &mut p2p_bootstrap);
+
+        assert!(
+            counts.p2p >= 1,
+            "embedded seed list merged zero dialable p2p entries; a \
+             p2p_multiaddr in bootstrap-peers.json no longer survives \
+             Multiaddr::from_str"
+        );
+        assert!(
+            p2p_bootstrap.contains(&pocketlawb_addr),
+            "pocketlawb's multiaddr was skipped by the merge path"
+        );
+    }
 }
