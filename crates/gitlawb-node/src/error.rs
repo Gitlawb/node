@@ -50,6 +50,16 @@ pub enum AppError {
     #[error("incomplete: {0}")]
     Incomplete(String),
 
+    /// A bounded search that could not complete. `continuation`, when present, is the
+    /// sealed scan position the caller echoes as `?scan=` to resume where the search
+    /// stopped (#173 round 13, F2). It is AEAD-sealed at the mint site, never plaintext:
+    /// the row it names is by construction one the caller was denied (INV-13).
+    #[error("search incomplete: {message}")]
+    SearchIncomplete {
+        message: String,
+        continuation: Option<String>,
+    },
+
     #[error("git error: {0}")]
     Git(String),
 
@@ -161,6 +171,15 @@ impl IntoResponse for AppError {
             AppError::Incomplete(msg) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "incomplete", msg.clone())
             }
+            // A bounded search that could not complete (the CID resolver hit its
+            // legacy-probe or walk ceiling), distinct from the 404 that asserts a
+            // definitive not-found: absence was NOT proven, so the caller should
+            // retry rather than treat it as gone (#173, F2). 503, retryable.
+            AppError::SearchIncomplete { message, .. } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "search_incomplete",
+                message.clone(),
+            ),
             AppError::Git(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "git_error", msg.clone()),
             // 504, distinct from the 500 git_error and from the read-gate's 404 /
             // the auth 401, so the client can tell a deadline from a failure.
@@ -201,16 +220,32 @@ impl IntoResponse for AppError {
             }
         };
 
-        let body = Json(json!({
+        let mut body = json!({
             "error": code,
             "message": message,
-        }));
+        });
+        // A truncated CID search may carry the sealed position the caller echoes as
+        // `?scan=` to resume. Rendered as a third body field, present only when the
+        // shed actually left something to resume: a wrapped scan and a throttled
+        // request both omit it, and its ABSENCE is what tells a caller the ladder is
+        // over. It is opaque ciphertext; see `gitlawb_core::scan_token`.
+        if let AppError::SearchIncomplete {
+            continuation: Some(token),
+            ..
+        } = &self
+        {
+            body["continuation"] = json!(token);
+        }
 
-        let mut resp = (status, body).into_response();
-        // Overloaded advertises when to retry. It rides the shared tail above for
-        // its body/status, so the header is attached here rather than in a bespoke
-        // early return — keeping the variant handled in exactly one place.
-        if matches!(self, AppError::Overloaded(_)) {
+        let mut resp = (status, Json(body)).into_response();
+        // Both retryable 503s advertise when to retry: Overloaded (capacity shed) and
+        // SearchIncomplete (a bounded CID search cut short by a cap — retry may complete
+        // it). They ride the shared tail above for body/status, so the header is attached
+        // here rather than in bespoke early returns, keeping each variant handled once.
+        if matches!(
+            self,
+            AppError::Overloaded(_) | AppError::SearchIncomplete { .. }
+        ) {
             resp.headers_mut().insert(
                 axum::http::header::RETRY_AFTER,
                 axum::http::HeaderValue::from_static("1"),
@@ -317,5 +352,14 @@ mod tests {
                 "message": DB_UNAVAILABLE_MESSAGE,
             })
         );
+    }
+
+    /// #251: bare `?` on anyhow-wrapped sqlx relies on this downcast so a
+    /// closed pool becomes 503 `db_unavailable`, not 500 `internal_error`.
+    #[test]
+    fn pool_closed_via_anyhow_from_is_503_db_unavailable() {
+        let err: AppError = anyhow::Error::from(sqlx::Error::PoolClosed).into();
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

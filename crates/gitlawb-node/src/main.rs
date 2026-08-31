@@ -59,6 +59,32 @@ struct DbStartupStatus {
     next_retry_secs: AtomicU64,
 }
 
+/// Hard ceiling on the advisory-lock pool's `max_connections`.
+///
+/// `max_concurrent_git_pushes` is validated all the way up to 1_048_576, and the lock
+/// pool used to derive its size straight from that knob, so raising the push cap
+/// silently raised the node's Postgres connection ceiling with no CLI error and no
+/// relation to the server's own `max_connections` (#173 F4). The node's total budget is
+/// now bounded: `db_max_connections` (default 48) + at most this.
+const LOCK_POOL_MAX_CONNECTIONS: u32 = 64;
+
+/// Connections the lock pool keeps above the push cap. Covers the three non-push
+/// `acquire_write` callers (`api/issues.rs` x2, `api/pulls.rs`), which hold no
+/// concurrency permit, so a push never queues here for a connection where it did not
+/// before.
+const LOCK_POOL_PUSH_HEADROOM: u8 = 8;
+
+/// Size the advisory-lock pool for a given push cap: the cap plus
+/// [`LOCK_POOL_PUSH_HEADROOM`], clamped to [`LOCK_POOL_MAX_CONNECTIONS`]. Past the
+/// clamp a push may wait for a lock-pool connection, which is a bounded wait that sheds
+/// a clean 503 (see `LockPoolBusy`), not an unbounded hang.
+fn lock_pool_size(max_concurrent_git_pushes: usize) -> u32 {
+    u32::try_from(max_concurrent_git_pushes)
+        .unwrap_or(u32::MAX)
+        .saturating_add(u32::from(LOCK_POOL_PUSH_HEADROOM))
+        .min(LOCK_POOL_MAX_CONNECTIONS)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -90,6 +116,9 @@ async fn main() -> Result<()> {
 
     // Load or generate the node's identity keypair
     let keypair = load_or_create_keypair(&config)?;
+    // Sealing key for the legacy-scan continuation tokens, DERIVED from the identity
+    // just loaded so it is the same key after a restart (see `derive_scan_token_key`).
+    let scan_token_key = AppState::derive_scan_token_key(&keypair);
     let node_did = keypair.did();
 
     // One-time metrics init. Must run before any handler that calls into
@@ -287,8 +316,20 @@ async fn main() -> Result<()> {
         None
     };
 
-    let repo_store =
-        git::repo_store::RepoStore::new(config.repos_dir.clone(), tigris, db.pool().clone());
+    // Repo write locks run on their own pool, never the main query pool: each push
+    // holds its connection for the whole receive-pack, so a burst of concurrent
+    // pushes drawing from the main pool would park that many connections for the
+    // duration of their receive-packs and starve every other query. That holds
+    // whatever the two pools are sized at, which is why the separation is
+    // structural rather than a consequence of the defaults; config validate()
+    // separately requires db_max_connections >= max_concurrent_git_pushes + 8. See
+    // build_lock_pool for the cancellation semantics (#173).
+    let lock_pool = git::repo_store::build_lock_pool(
+        db.pool(),
+        lock_pool_size(config.max_concurrent_git_pushes),
+        std::time::Duration::from_secs(config.db_acquire_timeout_secs),
+    );
+    let repo_store = git::repo_store::RepoStore::new(config.repos_dir.clone(), tigris, lock_pool);
 
     // Per-DID limiter for the creation endpoints. Keyed on the authenticated
     // DID (attacker-varied), so bound its key set to cap memory.
@@ -382,6 +423,22 @@ async fn main() -> Result<()> {
         rate_limiter,
         create_ip_rate_limiter,
         push_rate_limiter,
+        ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
+        // The legacy-probe budget is operator-tunable via GITLAWB_IPFS_MAX_LEGACY_PROBES
+        // (R5), which is what `ipfs_legacy_probe_budget` reads. NOT
+        // GITLAWB_IPFS_MAX_REPOS_WALKED, which this comment used to name: that is the
+        // separate cap on expensive visibility walks, so an operator following the old
+        // text tuned the walk cap and left this fan-out unchanged. The history-walk
+        // ceiling above stays constant (a smaller value false-503s a provenanced
+        // request). Default 256 preserves the shipped behaviour.
+        ipfs_max_legacy_probes: AppState::ipfs_legacy_probe_budget(&config),
+        ipfs_legacy_scan_page_rows: crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS,
+        // Operator-tunable via GITLAWB_IPFS_MAX_LEGACY_SCAN_ROWS, read through the same
+        // helper shape as the probe budget so the knob cannot be a silent no-op.
+        ipfs_max_legacy_scan_rows: AppState::ipfs_legacy_scan_row_budget(&config),
+        ipfs_max_legacy_scan_rule_bytes: crate::api::ipfs::MAX_LEGACY_SCAN_RULE_BYTES_PER_REQUEST,
+        ipfs_scan_token_key: Arc::new(scan_token_key),
+        ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust,
         sync_trigger_rate_limiter,
         peer_write_rate_limiter,
@@ -456,6 +513,15 @@ async fn main() -> Result<()> {
             std::time::Duration::from_secs(3600),
             200_000,
         ),
+        // Separate WORK-budget bucket for the resolver's per-probe/per-walk charges (R6).
+        // Its capacity is DERIVED from the route limit (no new knob) and floored at the
+        // legacy-probe budget, so one full default-config legacy scan never self-throttles
+        // mid-request while the route brake above stays the pure once-per-request cap.
+        ipfs_work_rate_limiter: rate_limit::RateLimiter::new_bounded(
+            AppState::ipfs_work_budget(&config),
+            std::time::Duration::from_secs(3600),
+            200_000,
+        ),
         git_bin: "git".to_string(),
     };
     if config.ipfs_rate_limit == 0 {
@@ -490,14 +556,16 @@ async fn main() -> Result<()> {
 
     // Periodic cleanup of expired rate limit entries + consumed-proof ledger
     {
-        let sweep_state = state.clone();
+        let cleanup_state = state.clone();
         let db = state.db.clone();
         let mut shutdown_rx = state.subscribe_shutdown();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                        sweep_rate_limiters(&sweep_state).await;
+                        // Sweep every per-IP/DID limiter (incl. the ipfs walk brake)
+                        // so bounded maps shed stale keys instead of sitting at cap.
+                        cleanup_state.sweep_rate_limiters().await;
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs() as i64)
@@ -515,6 +583,8 @@ async fn main() -> Result<()> {
             }
         });
     }
+
+    let _legacy_cid_sweep = spawn_legacy_cid_sweep(&state, &config);
 
     let router = server::build_router(state.clone());
     // Re-register the socket bound at startup — same fd, so there was never a
@@ -636,6 +706,44 @@ async fn main() -> Result<()> {
     serve_result?;
     info!("clean exit");
     Ok(())
+}
+
+/// U4 (#173): spawn the periodic legacy provider-CID repair sweep. Releases before this
+/// version stored the PROVIDER CID (Kubo dag-pb / Pinata CIDv0) in `pinned_cids.cid`,
+/// and this version's `/ipfs/{cid}` resolver withholds any row whose stored key is not
+/// the raw-content CID. The opportunistic repair on the pin path only fires when a push
+/// re-carries the object, which normal git negotiation makes it not do, so those rows
+/// need a walk. DETACHED, never on the boot path: the caller keeps serving while this
+/// runs, and the sweep's own batch bound plus inter-batch delay keep it off the DB's
+/// critical path. Its cursor is durable, so a restart mid-walk resumes instead of
+/// rewinding. It re-arms after every run, including a failed one, so it never returns
+/// and there is no awaited value to log here; the shutdown watcher below is what ends
+/// it.
+///
+/// A named function rather than an inline block in `main` so the WIRING has a seam a
+/// test can call: that the task is spawned at all, that it reads its batch and delay
+/// from the config knobs rather than some other field, that the caller is not blocked
+/// on it, and that the shutdown watcher actually ends it mid-walk. The sweep's own
+/// behavior is covered elsewhere; this is the boot-path half.
+fn spawn_legacy_cid_sweep(state: &AppState, config: &Config) -> tokio::task::JoinHandle<()> {
+    let db = state.db.clone();
+    let repos_dir = config.repos_dir.clone();
+    let git_bin = state.git_bin.clone();
+    let git_timeout = std::time::Duration::from_secs(config.git_service_timeout_secs);
+    let batch = config.pin_repair_sweep_batch;
+    let delay = std::time::Duration::from_secs(config.pin_repair_sweep_delay_secs);
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = ipfs_pin::run_sweep_rearmed(
+                &repos_dir, &git_bin, git_timeout, batch, delay,
+                ipfs_pin::SWEEP_REARM_DELAY, &db,
+            ) => {}
+            // Shutdown mid-walk simply drops the run; the persisted cursor means the
+            // next boot picks up where this one stopped.
+            _ = shutdown_rx.changed() => {}
+        }
+    })
 }
 
 fn spawn_shutdown_signal(tx: watch::Sender<bool>) {
@@ -1082,6 +1190,7 @@ mod rate_limiter_sweep_tests {
         state.sync_trigger_rate_limiter = RateLimiter::new(10, window);
         state.peer_write_rate_limiter = RateLimiter::new(10, window);
         state.ipfs_rate_limiter = RateLimiter::new(10, window);
+        state.ipfs_work_rate_limiter = RateLimiter::new(10, window);
 
         let limiters = |s: &crate::state::AppState| {
             [
@@ -1091,6 +1200,7 @@ mod rate_limiter_sweep_tests {
                 s.sync_trigger_rate_limiter.clone(),
                 s.peer_write_rate_limiter.clone(),
                 s.ipfs_rate_limiter.clone(),
+                s.ipfs_work_rate_limiter.clone(),
             ]
         };
         for l in limiters(&state) {
@@ -1099,27 +1209,12 @@ mod rate_limiter_sweep_tests {
         }
 
         tokio::time::sleep(window * 3).await;
-        super::sweep_rate_limiters(&state).await;
+        state.sweep_rate_limiters().await;
 
         for (i, l) in limiters(&state).into_iter().enumerate() {
             assert_eq!(l.tracked_keys().await, 0, "limiter {i} was not swept");
         }
     }
-}
-
-/// Evict expired entries from every per-key rate limiter on the state.
-///
-/// Named and driven off `AppState` so the periodic sweeper stays in step with
-/// the limiters the router actually mounts: adding a limiter field and
-/// forgetting it here leaves its keys pinned until the map hits `max_keys` and
-/// the inline capacity sweep runs (the `/ipfs` limiter was missed this way).
-async fn sweep_rate_limiters(state: &AppState) {
-    state.rate_limiter.cleanup().await;
-    state.create_ip_rate_limiter.cleanup().await;
-    state.push_rate_limiter.cleanup().await;
-    state.sync_trigger_rate_limiter.cleanup().await;
-    state.peer_write_rate_limiter.cleanup().await;
-    state.ipfs_rate_limiter.cleanup().await;
 }
 
 async fn gossip_ping_round(
@@ -1295,6 +1390,140 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
 
         info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
         Ok(kp)
+    }
+}
+
+#[cfg(test)]
+mod legacy_cid_sweep_wiring_tests {
+    use super::spawn_legacy_cid_sweep;
+    use sqlx::PgPool;
+    use std::time::Duration;
+
+    /// Seed `count` `pinned_cids` rows whose keys are already canonical raw CIDv1, in a
+    /// known `sha256_hex` order. The sweep's own cost gate skips a raw-CIDv1 row without
+    /// reading bytes or resolving a repo, so each row is SCANNED (it advances the cursor)
+    /// and nothing else. That is what makes the cursor a clean readout of how far the
+    /// walk got, with no dependency on repos on disk.
+    async fn seed_scannable_rows(pool: &PgPool, count: usize) -> Vec<String> {
+        let mut shas = Vec::new();
+        for i in 1..=count {
+            let sha = format!("wire{i:02}");
+            let cid = gitlawb_core::cid::Cid::from_git_object_bytes(sha.as_bytes()).to_string();
+            assert!(
+                gitlawb_core::cid::is_raw_cidv1(&cid),
+                "the seeded key must hit the sweep's raw-CIDv1 skip, not a repair attempt"
+            );
+            sqlx::query("INSERT INTO pinned_cids (sha256_hex, cid, pinned_at) VALUES ($1, $2, $3)")
+                .bind(&sha)
+                .bind(&cid)
+                .bind("2020-01-01T00:00:00Z")
+                .execute(pool)
+                .await
+                .unwrap();
+            shas.push(sha);
+        }
+        shas
+    }
+
+    /// Poll the persisted sweep cursor until it reaches `want`, or give up.
+    async fn cursor_reaches(db: &crate::db::Db, want: &str, within: Duration) -> String {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            let c = db.pin_repair_cursor().await.unwrap();
+            if c == want || std::time::Instant::now() >= deadline {
+                return c;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// #173 U4, the BOOT-PATH half. The sweep's own logic (batching, cursor resumption,
+    /// terminal vs retryable skips) is covered in `test_support`; what this covers is the
+    /// wiring `main` performs, which nothing else executes: the task is spawned at all,
+    /// it takes its batch and delay from the two `pin_repair_sweep_*` knobs rather than
+    /// some other config field, the caller is not blocked on the walk, and the shutdown
+    /// watcher ends the run mid-walk.
+    ///
+    /// Six scannable rows, batch 2, delay 30s. One pass must land the cursor on exactly
+    /// the second row and the task must then still be alive in its inter-batch sleep,
+    /// which pins both knobs at once: a different batch stops at a different row, and a
+    /// delay that did not come from the knob either finishes the table or leaves the task
+    /// gone. Shutdown must then end it while four rows are still unwalked.
+    #[sqlx::test]
+    async fn the_boot_path_spawns_the_sweep_detached_with_its_configured_knobs(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let shas = seed_scannable_rows(&pool, 6).await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+
+        let mut config = (*state.config).clone();
+        config.repos_dir = repos_dir.path().to_path_buf();
+        config.pin_repair_sweep_batch = 2;
+        // Far longer than this test runs, so a task still alive after the first pass can
+        // only be one that is honoring the configured inter-batch delay.
+        config.pin_repair_sweep_delay_secs = 30;
+
+        let started = std::time::Instant::now();
+        let handle = spawn_legacy_cid_sweep(&state, &config);
+        let spawn_cost = started.elapsed();
+
+        let cursor = cursor_reaches(&state.db, &shas[1], Duration::from_secs(10)).await;
+        assert_eq!(
+            cursor, shas[1],
+            "the spawned sweep must run and stop its first pass at the CONFIGURED batch \
+             bound (2), leaving the cursor on the second row"
+        );
+        assert!(
+            spawn_cost < Duration::from_secs(1),
+            "the sweep must be detached, not awaited on the boot path; the spawn took \
+             {spawn_cost:?}"
+        );
+        assert!(
+            !handle.is_finished(),
+            "with a 30s inter-batch delay the task must still be sleeping between passes, \
+             not finished: a finished task means the delay was not the configured one"
+        );
+
+        state.shutdown();
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("the shutdown watcher must end the sweep, and not after its 30s delay")
+            .expect("the sweep task must not panic");
+
+        assert_eq!(
+            state.db.pin_repair_cursor().await.unwrap(),
+            shas[1],
+            "shutdown must have ended the run MID-walk, with the remaining rows unwalked"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lock_pool_sizing_tests {
+    use super::{lock_pool_size, LOCK_POOL_MAX_CONNECTIONS, LOCK_POOL_PUSH_HEADROOM};
+
+    /// The default push cap gets its cap plus headroom, so no push ever queues for a
+    /// lock-pool connection where it did not before.
+    #[test]
+    fn default_push_cap_gets_headroom_over_the_cap() {
+        assert_eq!(lock_pool_size(32), 32 + u32::from(LOCK_POOL_PUSH_HEADROOM));
+        assert_eq!(lock_pool_size(1), 1 + u32::from(LOCK_POOL_PUSH_HEADROOM));
+    }
+
+    /// #173 F4: `max_concurrent_git_pushes` is validated all the way to 1_048_576, so an
+    /// operator raising it used to raise the node's Postgres connection ceiling with it,
+    /// silently and without bound. The lock pool is CLAMPED instead.
+    #[test]
+    fn an_oversized_push_cap_is_clamped_not_propagated() {
+        assert_eq!(lock_pool_size(1_048_576), LOCK_POOL_MAX_CONNECTIONS);
+        assert_eq!(lock_pool_size(usize::MAX), LOCK_POOL_MAX_CONNECTIONS);
+        // The largest cap that still fits under the clamp keeps its full headroom.
+        let widest = (LOCK_POOL_MAX_CONNECTIONS - u32::from(LOCK_POOL_PUSH_HEADROOM)) as usize;
+        assert_eq!(lock_pool_size(widest), LOCK_POOL_MAX_CONNECTIONS);
+        assert_eq!(
+            lock_pool_size(widest - 1),
+            LOCK_POOL_MAX_CONNECTIONS - 1,
+            "values below the clamp must not be rounded up to it"
+        );
     }
 }
 
