@@ -29,6 +29,7 @@ fn inv22_concurrency_gates_present_and_not_bypassed() {
     let repos = src("api/repos.rs");
     let smart_http = src("git/smart_http.rs");
     let vis = src("git/visibility_pack.rs");
+    let ipfs = src("api/ipfs.rs");
 
     // U1 / P1-a: run_bounded_git stands the watchdog down only after confirming the
     // child actually terminated (WNOWAIT), not on the raw stdout-drain EOF — otherwise
@@ -68,6 +69,57 @@ fn inv22_concurrency_gates_present_and_not_bypassed() {
          withheld_recipients_gated, which acquires git_encrypt_semaphore"
     );
 
+    // U1 / R2 (#173 round-10): the path-scoped filtered-pack serve must thread the
+    // caller's AdmissionGuard through BOTH git stages so read + per-caller admission is
+    // held until the pack-objects group is reaped on disconnect, closing the cap bypass
+    // the plain upload_pack path already fixed. Two load-bearing markers: rev-list hands
+    // the disarmed guard back (its tuple return type), and build_filtered_pack forwards
+    // that guard into the pack-objects stage (the `admission` arg after the
+    // "pack-objects" label). Reverting either — dropping the guard between stages, or
+    // passing `None` to pack-objects — trips this.
+    assert!(
+        smart_http.contains("Result<(Vec<String>, Option<AdmissionGuard>)>")
+            && smart_http.contains("\"pack-objects\",\n        admission,"),
+        "U1/R2 gate missing: build_filtered_pack must thread the AdmissionGuard through \
+         rev-list -> pack-objects so the permits are held until the pack-objects group \
+         is reaped on disconnect (the path-scoped half of #174 P1-a)"
+    );
+
+    // U2 / R1: a cancelled or timed-out `GET /ipfs/{cid}` must release admission only
+    // after the blocking work it admitted has finished, not the instant the handler
+    // future drops (the /ipfs half of #174 P1-a). The mechanism is the shared
+    // `Arc<WalkAdmission>`: both walk permits are moved into it once per request and a
+    // clone rides every `spawn_blocking`, so the permits release when the LAST holder
+    // drops. Reverting to handler-local permits trips this; the per-site clones are
+    // bound separately by `inv22_ipfs_walk_admission_reaches_every_blocking_site`.
+    //
+    // This previously required the permits to be owned by a detached `tokio::spawn`
+    // running the whole pipeline. That closed the same bypass but kept an abandoned
+    // request's full legacy scan running against a held slot, so the merge of #173 and
+    // #174 kept the Arc and dropped the detached task.
+    assert!(
+        ipfs.contains("struct WalkAdmission")
+            && ipfs.contains("let admission = std::sync::Arc::new(WalkAdmission {"),
+        "U2/R1 gate missing: get_by_cid must move both /ipfs admission permits into a \
+         shared Arc<WalkAdmission> whose clones ride the blocking work, so admission is \
+         released only once that work completes (the /ipfs half of #174 P1-a)"
+    );
+
+    // U2 / KTD2 (#173 round-10): the probe/read children on the /ipfs path must be the
+    // duration-bounded twins (process-group teardown via run_bounded_git), not the bare
+    // `store::object_type` / `read_object_content` (or an unbounded `cat-file -s`) a tokio
+    // timeout cannot cancel — otherwise a wedged cat-file lingers and pins the held
+    // admission past the deadline. Reverting any twin call site back to a bare read trips
+    // this.
+    assert!(
+        ipfs.contains("object_type_bounded(")
+            && ipfs.contains("object_size_bounded(")
+            && ipfs.contains("read_object_content_bounded("),
+        "U2/KTD2 gate missing: the /ipfs probe+read must call the run_bounded_git-backed \
+         *_bounded twins so a wedged cat-file is reaped at the deadline, not left to pin \
+         the held /ipfs walk admission"
+    );
+
     // P1-e non-bypass tripwire: the bounded recipients walk is spawn_blocking'd nowhere
     // but inside withheld_recipients_gated. A second call site (count > 1) is a new
     // detached git walk that skips the admission gate — exactly the class U5 closed.
@@ -95,8 +147,12 @@ fn inv22_concurrency_gates_present_and_not_bypassed() {
     // recovery copies are absent until an unrelated later push. Scan only the
     // production half of the file — the u5 tests in its `mod tests` also name the
     // drain call, and matching them would make this check vacuous.
+    // Split at the TEST MODULE, not at the first `#[cfg(test)]`. api/repos.rs carries
+    // test-only items (the drain fault seam, the task entry point) ABOVE the production
+    // code these gates scan for, so splitting on the attribute truncated the production
+    // half above every line being checked and the gate went vacuously blind.
     let repos_production = repos
-        .split("#[cfg(test)]")
+        .split("\nmod tests {")
         .next()
         .expect("split always yields a first chunk");
     assert!(
@@ -201,10 +257,10 @@ fn f4_release_keeps_conn_owned_until_unlock_resolves() {
     );
 }
 
-/// F6/KTD-5 (initial IPFS metadata queries deadline-wrapped): `get_by_cid` acquires
-/// the scarce walk permits (RAII, held for the whole request) BEFORE its two initial
-/// metadata queries, and the per-repo loop's first budget gate runs only later. So
-/// both `list_all_repos` and `list_visibility_rules_for_repos` must be clamped to the
+/// F6/KTD-5 (IPFS metadata queries deadline-wrapped): `get_by_cid` acquires
+/// the scarce walk permits (RAII, held for the whole request) BEFORE its metadata
+/// queries, and the per-repo loop's first budget gate runs only later. So
+/// both `list_repos_page_for_scan` and `list_visibility_rules_for_repos` must be clamped to the
 /// remaining request budget — otherwise a query blocked in Postgres pins the walk slot
 /// for the whole stall, past the budget. This scans the PRODUCTION half of `api/ipfs.rs`
 /// (the `mod tests` half names the same calls in its own harness and would make the
@@ -214,31 +270,44 @@ fn f4_release_keeps_conn_owned_until_unlock_resolves() {
 #[test]
 fn f6_ipfs_metadata_queries_are_deadline_wrapped() {
     let ipfs = src("api/ipfs.rs");
+    // Split at the TEST MODULE, not at the first `#[cfg(test)]`: the handler carries
+    // in-line `#[cfg(test)]` query counters, so splitting on the attribute cut the
+    // production half off above the calls this guard exists to check and the scan went
+    // vacuously quiet (found 0 of each rather than failing on a missing wrapper).
     let production = ipfs
-        .split("#[cfg(test)]")
+        .split("\nmod tests {")
         .next()
         .expect("split always yields a first chunk");
 
-    for call in [".list_all_repos()", ".list_visibility_rules_for_repos("] {
-        assert_eq!(
-            production.matches(call).count(),
-            1,
-            "F6 guard stale: `{call}` must appear exactly once in the production half \
-             of api/ipfs.rs (the deadline-wrapped handler call) — update this guard"
-        );
-        let idx = production
-            .find(call)
-            .unwrap_or_else(|| panic!("F6 gate: api/ipfs.rs no longer calls `{call}`"));
-        // The wrapper opens a few lines above the call (match tokio::time::timeout( ...
-        // remaining budget ..., <query> )); a 240-char lookback covers it without
-        // reaching the previous statement.
-        let window = &production[idx.saturating_sub(240)..idx];
+    // EVERY occurrence must be wrapped, not just the first. The handler now reaches
+    // these queries from two places (the provenance fast path, one repo at a time, and
+    // the legacy scan's preload), and an exact-count check would have to be relaxed
+    // every time a call site is added, which is how a guard quietly stops covering the
+    // site that matters. Requiring all of them scales with the code instead.
+    for call in [
+        ".list_repos_page_for_scan(",
+        ".list_visibility_rules_for_repos(",
+        ".get_repo_by_id(",
+        ".is_repo_quarantined(",
+    ] {
+        let occurrences = production.matches(call).count();
         assert!(
-            window.contains("tokio::time::timeout("),
-            "F6 gate missing: `{call}` must be wrapped in tokio::time::timeout(...) \
-             clamped to the remaining request budget. An unwrapped await pins the held \
-             walk permit for the whole DB stall, past GITLAWB_IPFS_REQUEST_BUDGET_SECS."
+            occurrences >= 1,
+            "F6 guard stale: api/ipfs.rs no longer calls `{call}` — update this guard"
         );
+        for (n, (idx, _)) in production.match_indices(call).enumerate() {
+            // The wrapper opens a few lines above the call (match tokio::time::timeout(
+            // ... remaining budget ..., <query> )); a 240-char lookback covers it
+            // without reaching the previous statement.
+            let window = &production[idx.saturating_sub(240)..idx];
+            assert!(
+                window.contains("tokio::time::timeout("),
+                "F6 gate missing: occurrence {n} of `{call}` (of {occurrences}) is not \
+                 wrapped in tokio::time::timeout(...) clamped to the remaining request \
+                 budget. An unwrapped await pins the held walk permit for the whole DB \
+                 stall, past GITLAWB_IPFS_REQUEST_BUDGET_SECS."
+            );
+        }
     }
 }
 
@@ -261,8 +330,12 @@ fn f6_ipfs_metadata_queries_are_deadline_wrapped() {
 #[test]
 fn f2_pinata_enqueues_refs_not_retained_object_lists() {
     let repos = src("api/repos.rs");
+    // Split at the TEST MODULE, not at the first `#[cfg(test)]`. api/repos.rs carries
+    // test-only items (the drain fault seam, the task entry point) ABOVE the production
+    // code these gates scan for, so splitting on the attribute truncated the production
+    // half above every line being checked and the gate went vacuously blind.
     let production = repos
-        .split("#[cfg(test)]")
+        .split("\nmod tests {")
         .next()
         .expect("split always yields a first chunk");
 
@@ -321,8 +394,12 @@ fn f2_pinata_enqueues_refs_not_retained_object_lists() {
 fn f3_second_writer_leased_until_reap() {
     let repos = src("api/repos.rs");
     let smart_http = src("git/smart_http.rs");
+    // Split at the TEST MODULE, not at the first `#[cfg(test)]`. api/repos.rs carries
+    // test-only items (the drain fault seam, the task entry point) ABOVE the production
+    // code these gates scan for, so splitting on the attribute truncated the production
+    // half above every line being checked and the gate went vacuously blind.
     let repos_production = repos
-        .split("#[cfg(test)]")
+        .split("\nmod tests {")
         .next()
         .expect("split always yields a first chunk");
 
@@ -372,7 +449,7 @@ fn f3_second_writer_leased_until_reap() {
 /// exists: it binds all three sites, and any blocking site added to this loop
 /// later, without reversing that deliberate independence.
 ///
-/// MUTATION (RED): delete any one `Arc::clone(&admission)` binding, or drop the
+/// MUTATION (RED): delete any one `Arc::clone(ctx.admission)` binding, or drop the
 /// clone from inside its closure, and the count falls below three.
 #[test]
 fn inv22_ipfs_walk_admission_reaches_every_blocking_site() {
@@ -386,7 +463,10 @@ fn inv22_ipfs_walk_admission_reaches_every_blocking_site() {
     );
 
     // Every blocking site in the scan takes its own clone...
-    let clones = ipfs.matches("Arc::clone(&admission)").count();
+    // `Arc::clone(ctx.admission)` in the gate, `Arc::clone(&admission)` if a site is
+    // ever added back in the handler body itself; count both spellings.
+    let clones = ipfs.matches("Arc::clone(ctx.admission)").count()
+        + ipfs.matches("Arc::clone(&admission)").count();
     assert!(
         clones >= 3,
         "U1 gate bypassed: expected an admission clone for each of the three \
@@ -443,8 +523,12 @@ fn inv22_ipfs_walk_admission_reaches_every_blocking_site() {
 fn inv22_replication_tail_spawns_at_the_durability_boundary() {
     let repos = src("api/repos.rs");
     // Production half only — the tests below name these identifiers too.
+    // Split at the TEST MODULE, not at the first `#[cfg(test)]`. api/repos.rs carries
+    // test-only items (the drain fault seam, the task entry point) ABOVE the production
+    // code these gates scan for, so splitting on the attribute truncated the production
+    // half above every line being checked and the gate went vacuously blind.
     let production = repos
-        .split("#[cfg(test)]")
+        .split("\nmod tests {")
         .next()
         .expect("split always yields a first chunk");
 
@@ -460,7 +544,7 @@ fn inv22_replication_tail_spawns_at_the_durability_boundary() {
         .find("tokio::spawn(post_receive_replication_tail(")
         .expect("U5 gate missing: the replication tail must be spawned by git_receive_pack");
     let release = production
-        .find("guard.release(push_succeeded)")
+        .find(".release(push_succeeded)")
         .expect("U5 gate stale: release must consume the same success flag as the tail gate");
     let touch = production
         .find("state.db.touch_repo(")
