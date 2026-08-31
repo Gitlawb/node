@@ -661,11 +661,11 @@ pub(crate) async fn ingest_ref_update(
     // Deliberately a READ, not the charge. `check` inserts a window for a key it
     // has never seen, so probing with it here would let a flood of self-minted
     // signed DIDs occupy the bounded author map before `peer_exists` had a chance
-    // to refuse them, turning a brake into a memory-fill surface. `is_over_budget`
+    // to refuse them, turning a brake into a memory-fill surface. `is_throttled`
     // allocates nothing and an unseen DID reads as within budget, so the only
     // behaviour that changes is WHEN an already-over-budget author is refused.
     // The charge itself stays below the lookup, unmoved.
-    if verified && limiters.author.is_over_budget(&event.node_did).await {
+    if verified && limiters.author.is_throttled(&event.node_did).await {
         return IngestOutcome::AuthorRateLimited(event.node_did.clone());
     }
 
