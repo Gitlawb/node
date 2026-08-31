@@ -170,7 +170,7 @@ pub async fn encrypt_and_pin(
                 continue;
             }
         };
-        let cid = match crate::ipfs_pin::pin_git_object(ipfs_api, oid, &envelope).await {
+        let cid = match crate::ipfs_pin::pin_git_object(ipfs_api, oid, &envelope, None).await {
             Ok(c) if !c.is_empty() => c,
             Ok(_) => {
                 tracing::warn!(oid = %oid, "pin_git_object returned no cid; skipping");

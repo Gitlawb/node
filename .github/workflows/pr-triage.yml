@@ -70,9 +70,15 @@ jobs:
             const changedRust = names.some(n => n.startsWith("crates/") && n.endsWith(".rs"));
             // A test can live in a tests/ dir, a *_test.rs file, or (the common Rust
             // pattern) an inline #[test] / #[cfg(test)] block added inside the source file.
+            // Async tests use a namespaced attribute (#[tokio::test], #[async_std::test],
+            // possibly with args like #[tokio::test(flavor = ...)]) rather than the bare
+            // #[test]. Match only on added lines, with the attribute at the start of the
+            // line after horizontal whitespace, covering bare, cfg(test), namespaced,
+            // optional leading ::, and raw-identifier (r#test) forms. No head-file fetch
+            // or lexer: needs-tests is advisory, not a merge gate.
             const addsInlineTest = files.some(f =>
               f.filename.endsWith(".rs") && f.patch &&
-              /^\+.*#\[(test\]|cfg\(test\))/m.test(f.patch));
+              /^\+[ \t]*#\[[ \t]*(?:cfg[ \t]*\([ \t]*test[ \t]*\)|(?:::[ \t]*)?(?:[\w-]+[ \t]*::[ \t]*)*(?:r#)?test\b)/m.test(f.patch));
             const touchedTests =
               names.some(n => n.includes("/tests/") || n.endsWith("_test.rs")) || addsInlineTest;
             if (changedRust && !touchedTests) want.add("needs-tests");

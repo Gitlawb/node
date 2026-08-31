@@ -1,7 +1,7 @@
 [package]
 name = "gitlawb-core"
 description = "Core cryptographic primitives for the gitlawb network: DIDs, CIDs, UCAN, HTTP Signatures, ref-update certificates"
-version = "0.7.0" # x-release-please-version
+version = "0.7.1" # x-release-please-version
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -22,6 +22,7 @@ multihash-codetable = { workspace = true }
 cid = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+url = { workspace = true, optional = true }
 zeroize = { version = "1", features = ["derive"] }
 pkcs8 = { version = "0.10", features = ["pem", "std"] }
 curve25519-dalek = "4"
@@ -30,3 +31,9 @@ chacha20poly1305 = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true }
+# Not optional here: the redirect matrix must run under a bare
+# `cargo test -p gitlawb-core`, with no feature selected.
+url = { workspace = true }
+
+[features]
+redirect = ["dep:url"]
