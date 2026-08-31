@@ -175,6 +175,8 @@ async fn cmd_create(
         .post("/api/v1/tasks", &body)
         .await
         .context("failed to create task")?
+        .error_for_status()
+        .context("failed to create task")?
         .json()
         .await
         .context("invalid JSON response")?;
@@ -374,8 +376,7 @@ mod tests {
             .create_async()
             .await;
 
-        // Should still succeed (prints JSON, doesn't check status code)
-        cmd_create(
+        let err = cmd_create(
             "deploy".to_string(),
             "agent:task".to_string(),
             None,
@@ -387,7 +388,8 @@ mod tests {
             Some(dir.path().to_path_buf()),
         )
         .await
-        .unwrap();
+        .unwrap_err();
+        assert!(err.to_string().contains("failed to create task"));
     }
 
     // ── list ─────────────────────────────────────────────────────────
