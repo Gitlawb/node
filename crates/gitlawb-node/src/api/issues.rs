@@ -61,11 +61,14 @@ pub async fn create_issue(
     let json_str = serde_json::to_string(&issue)
         .map_err(|e| AppError::BadRequest(format!("serialization error: {e}")))?;
 
+    // Shed 503 + Retry-After on an exhausted write-lock POOL instead of a generic
+    // git 500 (#173 F1). This path holds no admission permit, so it reaches the pool
+    // unthrottled; reuse the push handler's mapping so the two cannot drift.
     let guard = state
         .repo_store
         .acquire_write(&record.owner_did, &record.name)
         .await
-        .map_err(|e| AppError::Git(e.to_string()))?;
+        .map_err(|e| crate::api::repos::acquire_write_app_error(&e, &repo))?;
     let disk_path = guard.path().to_path_buf();
 
     let create_result = git_issues::create_issue(&disk_path, &issue_id, &json_str);
@@ -251,11 +254,13 @@ pub async fn close_issue(
         .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
 
+    // Same capacity shed as create_issue above (#173 F1): an exhausted write-lock
+    // pool is a 503 + Retry-After, not a 500 git error.
     let guard = state
         .repo_store
         .acquire_write(&record.owner_did, &record.name)
         .await
-        .map_err(|e| AppError::Git(e.to_string()))?;
+        .map_err(|e| crate::api::repos::acquire_write_app_error(&e, &repo))?;
     let disk_path = guard.path().to_path_buf();
 
     // Owner OR issue author may close. The author lives in the issue's git-JSON
@@ -317,4 +322,169 @@ pub async fn close_issue(
     tracing::info!(repo = %repo, issue = %issue_id, "issue closed");
 
     Ok(Json(issue))
+}
+
+/// #173 F1 follow-up: the two issue write paths reach `acquire_write` holding NO
+/// admission permit (unlike the push handler, which is capped by the git-push
+/// semaphore), so they are the callers most likely to meet an exhausted write-lock
+/// POOL under load. An exhausted pool is a capacity signal, so both must shed
+/// 503 + Retry-After (`AppError::Overloaded`) the way the push handler does, not
+/// report the generic 500 git error that says nothing about retrying.
+#[cfg(test)]
+mod lock_pool_shed_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use sqlx::PgPool;
+
+    fn seed_repo(owner_did: &str, name: &str) -> crate::db::RepoRecord {
+        let now = Utc::now();
+        crate::db::RepoRecord {
+            id: Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: format!("/tmp/{name}"),
+            forked_from: None,
+            machine_id: None,
+        }
+    }
+
+    /// State whose repo store draws write locks from a ONE-connection pool with a
+    /// short checkout timeout, so a single held guard exhausts it promptly rather
+    /// than at the pool default.
+    async fn one_connection_lock_pool_state(pool: &PgPool) -> AppState {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            std::path::PathBuf::from("/tmp/gitlawb-issues-lockpool"),
+            None,
+            crate::git::repo_store::build_lock_pool(pool, 1, std::time::Duration::from_secs(1)),
+        );
+        state
+    }
+
+    /// The shed must be a real 503 carrying Retry-After, not just an internal enum
+    /// variant: assert on the rendered response so a remapping of `Overloaded` is
+    /// caught here too.
+    fn assert_sheds_503_with_retry_after(err: AppError, what: &str) {
+        let resp = err.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{what}: an exhausted write-lock pool must shed 503, not a 500 git error"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .map(|v| v.to_str().unwrap()),
+            Some("1"),
+            "{what}: a capacity shed must tell the client when to retry"
+        );
+    }
+
+    /// RED-before/GREEN-after for `create_issue`. Both directions: the shed while the
+    /// only lock-pool connection is held by a guard on a DIFFERENT repo (so this is
+    /// pool capacity, not advisory-lock contention on this repo), and the must-not
+    /// case once that connection is back.
+    #[sqlx::test]
+    async fn create_issue_lock_pool_exhaustion_sheds_503_not_500(pool: PgPool) {
+        let owner = "did:key:zISSUECREATELOCKPOOLAAAAAAAAAAAAAAAAAAAA";
+        let state = one_connection_lock_pool_state(&pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "lp-create"))
+            .await
+            .expect("seed repo");
+
+        let held = state
+            .repo_store
+            .acquire_write(owner, "other-repo")
+            .await
+            .expect("the first write takes the only lock-pool connection");
+
+        let shed = create_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), "lp-create".to_string())),
+            Json(CreateIssueRequest {
+                title: "t".to_string(),
+                body: None,
+                signed_payload: None,
+            }),
+        )
+        .await;
+        let err = shed.expect_err("an exhausted lock pool must fail the call");
+        assert_sheds_503_with_retry_after(err, "create_issue");
+
+        // MUST-NOT: with the pool free again the call is not shed as capacity (it
+        // fails later on the nonexistent on-disk repo, which is a git 500).
+        held.release(false).await.ok();
+        let admitted = create_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), "lp-create".to_string())),
+            Json(CreateIssueRequest {
+                title: "t".to_string(),
+                body: None,
+                signed_payload: None,
+            }),
+        )
+        .await;
+        assert!(
+            !matches!(admitted, Err(AppError::Overloaded(_))),
+            "with the lock pool free, create_issue must not be shed as capacity; got {:?}",
+            admitted.err()
+        );
+    }
+
+    /// RED-before/GREEN-after for `close_issue`, same two directions.
+    #[sqlx::test]
+    async fn close_issue_lock_pool_exhaustion_sheds_503_not_500(pool: PgPool) {
+        let owner = "did:key:zISSUECLOSELOCKPOOLBBBBBBBBBBBBBBBBBBBBB";
+        let state = one_connection_lock_pool_state(&pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "lp-close"))
+            .await
+            .expect("seed repo");
+
+        let held = state
+            .repo_store
+            .acquire_write(owner, "other-repo")
+            .await
+            .expect("the first write takes the only lock-pool connection");
+
+        let shed = close_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((
+                owner.to_string(),
+                "lp-close".to_string(),
+                "deadbeef".to_string(),
+            )),
+        )
+        .await;
+        let err = shed.expect_err("an exhausted lock pool must fail the call");
+        assert_sheds_503_with_retry_after(err, "close_issue");
+
+        held.release(false).await.ok();
+        let admitted = close_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((
+                owner.to_string(),
+                "lp-close".to_string(),
+                "deadbeef".to_string(),
+            )),
+        )
+        .await;
+        assert!(
+            !matches!(admitted, Err(AppError::Overloaded(_))),
+            "with the lock pool free, close_issue must not be shed as capacity; got {:?}",
+            admitted.err()
+        );
+    }
 }

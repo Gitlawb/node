@@ -44,6 +44,10 @@ services:
       GITLAWB_BOOTSTRAP_PEERS: ${GITLAWB_BOOTSTRAP_PEERS:-}
       GITLAWB_BOOTSTRAP_DISABLE_SEEDS: ${GITLAWB_BOOTSTRAP_DISABLE_SEEDS:-false}
       GITLAWB_REQUIRE_SIGNED_PEER_WRITES: ${GITLAWB_REQUIRE_SIGNED_PEER_WRITES:-false}
+      # Owner-only push. The default matches the node's own, so the container path
+      # behaves like a source build; forwarding it is what makes the documented
+      # rolling-upgrade opt-out reachable for an operator running compose.
+      GITLAWB_ENFORCE_OWNER_PUSH: ${GITLAWB_ENFORCE_OWNER_PUSH:-true}
       GITLAWB_P2P_BOOTSTRAP: ${GITLAWB_P2P_BOOTSTRAP:-}
       GITLAWB_PUBLIC_READ: ${GITLAWB_PUBLIC_READ:-true}
       GITLAWB_MAX_PACK_BYTES: ${GITLAWB_MAX_PACK_BYTES:-2147483648}

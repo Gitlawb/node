@@ -1,7 +1,7 @@
 [package]
 name = "gitlawb-node"
 description = "The gitlawb node daemon — git hosting over HTTP with DID auth"
-version = "0.7.0" # x-release-please-version
+version = "0.7.1" # x-release-please-version
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -83,3 +83,6 @@ libp2p-dns = { version = "0.44.0", features = ["tokio"] }
 [dev-dependencies]
 mockito = "1"
 tempfile = "3"
+# `test-util` for `#[tokio::test(start_paused = true)]`: lets the deadline tests assert
+# on which timer fired instead of on wall clock.
+tokio = { workspace = true, features = ["test-util"] }
