@@ -23,6 +23,21 @@ pub struct RepoRecord {
     pub machine_id: Option<String>,
 }
 
+/// One row of a keyset page from [`Db::list_repos_page_for_scan`].
+///
+/// Carries the row's quarantine flag inline (so the IPFS scan needs no separate
+/// whole-node quarantine query) and the RAW stored `created_at` text, which is
+/// the first half of the keyset cursor. The raw text is kept because the keyset
+/// comparison is a text comparison and re-serializing the parsed `DateTime` is
+/// not guaranteed to reproduce the stored bytes — a cursor that differs from the
+/// stored value by one character skips or repeats rows.
+#[derive(Debug, Clone)]
+pub struct ScanRepoRow {
+    pub repo: RepoRecord,
+    pub quarantined: bool,
+    pub created_at_key: String,
+}
+
 /// Per-rule replication mode for a visibility rule.
 /// `A` hides existence entirely (only valid at whole-repo scope `/`).
 /// `B` keeps object SHAs and the path visible but withholds content
@@ -879,18 +894,17 @@ const MIGRATIONS: &[Migration] = &[
         version: 11,
         name: "ref_update_owner_did",
         stmts: &[
-            // Index deferred — the feed gate (#144) does not read owner_did yet.
+            // Index deferred: the feed gate (#144) does not read owner_did yet.
             "ALTER TABLE received_ref_updates ADD COLUMN IF NOT EXISTS owner_did TEXT",
         ],
     },
-    // Reservation: v17, deliberately not main's current_max + 1 (which is 12).
-    // The runner keys the applied set on the integer alone, so a version another
-    // in-flight branch also claims is skipped in full on whichever side merges
-    // second — no error, no warning, and schema_migrations still reads healthy
-    // while the column is simply absent. Two open branches already claim into
-    // this range: #135/#173 holds through 14 (15 once it rebases past v11), and
-    // #253 took 16. 17 clears both. Gaps are harmless: the runner iterates the
-    // array and never requires contiguity.
+    // Reservation: v17 is deliberately not main's current_max + 1. The runner keys the
+    // applied set on the integer alone, so a version another in-flight branch also
+    // claims is skipped in full on whichever side merges second: no error, no warning,
+    // and schema_migrations still reads healthy while the column is simply absent.
+    // #253 took 16, and the pin-provenance work below took 18-23 when it merged, so 17
+    // sits between them. Gaps are harmless: the runner iterates the array and never
+    // requires contiguity.
     Migration {
         version: 17,
         name: "sync_queue_attempted_at",
@@ -901,7 +915,221 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE sync_queue ADD COLUMN IF NOT EXISTS attempted_at TEXT",
         ],
     },
+    // The six pin-provenance migrations below were numbered 11-16 while this work was
+    // in flight and moved to 18-23 on merge, because 11 and 16 were claimed elsewhere.
+    // A database that ran an earlier commit of this branch therefore has schema_migrations
+    // rows for the old numbers. Those rows are orphans: the runner skips on `version`
+    // alone and never reads `name`, so nothing detects them, and the DDL below re-runs
+    // as a no-op against objects that already exist. Recreate any such database rather
+    // than upgrading it in place.
+    Migration {
+        version: 18,
+        name: "pinned_cids_cid_index",
+        stmts: &[
+            // GET /ipfs/{cid} resolves an incoming CID -> git oid via pinned_cids.cid
+            // (#173); index it so the per-request lookup is not a table scan. This is
+            // a NEW versioned migration (not appended to the applied v1 bundle) so a
+            // node already past v1 actually gets the index. Non-unique on purpose: cid
+            // is a function of raw content, so a UNIQUE index could reject a legitimate
+            // record_pinned_cid insert, and colliding rows serve byte-identical content.
+            "CREATE INDEX IF NOT EXISTS idx_pinned_cids_cid ON pinned_cids(cid)",
+        ],
+    },
+    Migration {
+        version: 19,
+        name: "pinned_cids_repo_provenance",
+        stmts: &[
+            // Record the repository a pin came from so GET /ipfs/{cid} resolves a
+            // provenanced pin straight to its ONE source repo instead of scanning every
+            // repo (#173, jatmn round 2 — bounds the anonymous fan-out and removes the
+            // updated_at-ordering false-404). NEW versioned migration (never appended to
+            // the applied v1 pinned_cids table) so a node past v1 gets the column.
+            // Nullable: pins recorded before this migration have no provenance and fall
+            // back to the legacy repo scan; new pins carry repo_id and resolve to one
+            // repo. Indexed for the resolver's oid -> repo_id lookup.
+            "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS repo_id TEXT",
+            "CREATE INDEX IF NOT EXISTS idx_pinned_cids_repo_id ON pinned_cids(repo_id)",
+        ],
+    },
+    Migration {
+        version: 20,
+        name: "pin_repo_sources",
+        stmts: &[
+            // F1 (#173, jatmn round 8): a shared object (a blob/tree/commit common to
+            // forks and mirrors) can be pinned from more than one repo. `pinned_cids`
+            // keeps only the FIRST pinner's `repo_id`, so a shared object first pinned
+            // from a private/quarantined repo 404s by CID even when a later PUBLIC repo
+            // also pinned it. Record EVERY pin-path source so `GET /ipfs/{cid}` can try
+            // each. NEW versioned migration (never appended to an applied block, INV-7).
+            // Bounded per object at insert time (MAX_PIN_SOURCES) so an adversary pushing
+            // one object from N repos cannot make resolution O(repos) (R2, INV-10).
+            "CREATE TABLE IF NOT EXISTS pin_repo_sources (
+                 sha256_hex TEXT NOT NULL,
+                 repo_id    TEXT NOT NULL,
+                 PRIMARY KEY (sha256_hex, repo_id)
+             )",
+            "CREATE INDEX IF NOT EXISTS idx_pin_repo_sources_sha ON pin_repo_sources(sha256_hex)",
+        ],
+    },
+    Migration {
+        version: 21,
+        name: "pinned_cids_legacy_provider_cid",
+        stmts: &[
+            // R8 (#173, jatmn round 10): the opportunistic legacy provider-CID repair
+            // rewrites `pinned_cids.cid` from a stored PROVIDER CID (Kubo dag-pb /
+            // Pinata CIDv0) to the raw-content resolver key and stashes the OLD value
+            // here, so the rewrite is auditable and the row's legacy origin survives.
+            // Distinct from `pinata_cid` on purpose: `has_pinata_cid` gates the Pinata
+            // pin-skip, so parking a Kubo-legacy CID there would make Pinata forever
+            // skip re-pinning that object. NEW versioned migration (never appended to an
+            // applied block, INV-7) so a node past v13 actually gets the column.
+            // Nullable: only a repaired row sets it.
+            "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS legacy_provider_cid TEXT",
+        ],
+    },
+    Migration {
+        version: 22,
+        name: "pinned_cids_sources_incomplete",
+        stmts: &[
+            // U3 (#173): `record_pin_source` is BEST EFFORT at every call site, so a
+            // non-empty, below-cap source set is not proof that every source was
+            // recorded. An object first pinned from a private repo and later pushed
+            // from a PUBLIC repo whose record failed keeps a set naming only the
+            // private source, and the resolver used to call that set complete and 404
+            // an object the public repo would serve. Record the miss DURABLY here so
+            // `GET /ipfs/{cid}` keeps the bounded scan fallback for exactly those
+            // objects. Not inferable from row counts or timestamps: neither can tell
+            // "no other source exists" from "a source failed to record", which is the
+            // whole distinction. NEW versioned migration (never appended to an applied
+            // block, INV-7). NOT NULL DEFAULT FALSE so every pre-existing row reads as
+            // complete and ordinary denials stay off the O(repos) path (INV-10).
+            "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS pin_sources_incomplete BOOLEAN NOT NULL DEFAULT FALSE",
+        ],
+    },
+    Migration {
+        version: 23,
+        name: "pin_repair_sweep_cursor",
+        stmts: &[
+            // U4 (#173): the legacy provider-CID repair sweep walks `pinned_cids` in
+            // bounded batches over an ordered `sha256_hex` cursor. The cursor has to be
+            // DURABLE, or a restart rewinds the walk to the start of the table and an
+            // upgraded node with a large pin set never finishes repairing it. One row
+            // (`id = 1`, enforced by the CHECK) rather than a key-value table: there is
+            // exactly one sweep and no second consumer, and a real constraint beats a
+            // convention nobody can enforce. NEW versioned migration (never appended to
+            // an applied block, INV-7). No default row is inserted: an absent row is the
+            // "never swept" state, which the empty-string cursor start already means, so
+            // there is no first-run special case to get wrong.
+            "CREATE TABLE IF NOT EXISTS pin_repair_sweep (
+                 id     INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+                 cursor TEXT NOT NULL
+             )",
+        ],
+    },
+    Migration {
+        version: 24,
+        name: "pin_source_failures",
+        stmts: &[
+            // #173 round 12 (jatmn): v22's `pin_sources_incomplete` is one boolean per
+            // OBJECT, so any successful source record cleared it, including one from a
+            // repo unrelated to the failure. The resolver then read the set as fully
+            // enumerated, dropped the scan fallback, and 404'd an anonymous caller whose
+            // only servable copy was the unrecorded public one. The missing source is a
+            // property of an (object, repo) PAIR, so it is stored as one.
+            //
+            // NEW versioned migration (never appended to an applied block, INV-7). A new
+            // table rather than a column on `pinned_cids`: the relation is many-per-object
+            // and `CREATE TABLE` takes no lock on the pin table a live node is reading.
+            "CREATE TABLE IF NOT EXISTS pin_source_failures (
+                 sha256_hex TEXT NOT NULL,
+                 repo_id    TEXT NOT NULL,
+                 PRIMARY KEY (sha256_hex, repo_id)
+             )",
+            // Carry the pre-upgrade markers over. Which repo failed was never recorded,
+            // so they get the empty sentinel, which no real `repo_id` equals: those
+            // objects keep the scan fallback until something repairs them, rather than
+            // being cleared by the next unrelated record the way they would have been
+            // before. Strictly safer than the behavior being replaced, and bounded by how
+            // rare an exhausted record is.
+            "INSERT INTO pin_source_failures (sha256_hex, repo_id)
+                  SELECT sha256_hex, '' FROM pinned_cids WHERE pin_sources_incomplete
+                  ON CONFLICT DO NOTHING",
+            // `pinned_cids.pin_sources_incomplete` is deliberately NOT dropped. Nothing
+            // reads it after this migration, and leaving it costs one unused boolean,
+            // whereas dropping it makes a rollback to the previous release lose the
+            // markers it still reads.
+        ],
+    },
+    Migration {
+        version: 25,
+        name: "repos_created_at_id_index",
+        stmts: &[
+            // #173 (jatmn): backs the keyset order of the paged legacy CID scan
+            // (`list_repos_page_for_scan`, `ORDER BY created_at ASC, id ASC` with a
+            // `(created_at, id) > (...)` cursor). The scan replaced a whole-table
+            // preload precisely to stop one anonymous `GET /ipfs/{cid}` from costing
+            // work proportional to the node's repo inventory (INV-10), and without this
+            // index that bound is only half real: `repos` carries no index on
+            // `(created_at, id)`, so Postgres seq-scans the whole table and top-N sorts
+            // it to return EVERY page, while the scarce IPFS walk admission is held.
+            // Measured on a 50k-row fixture: 954 shared buffers and ~47ms per page
+            // without it, versus an Index Only Scan at 4-5 buffers, ~0.08ms, and
+            // `Heap Fetches: 0` with it — and the keyset predicate is pushed down as an
+            // `Index Cond` instead of filtering after a scan.
+            //
+            // Column order and direction are load-bearing and must match the query
+            // exactly; `idx_repos_updated_at` (the order the scan used to use) cannot
+            // serve this one. NOTHING NAMES THIS INDEX IN ANY QUERY TEXT, so a
+            // grep-driven "unused index" cleanup will not see its consumer: it is
+            // reachable from an unauthenticated route and dropping it reopens the
+            // amplification, so treat it as part of the resolver, not as tuning.
+            //
+            // NEW versioned migration (never appended to an applied block, INV-7).
+            "CREATE INDEX IF NOT EXISTS idx_repos_created_at_id ON repos (created_at ASC, id ASC)",
+        ],
+    },
+    Migration {
+        version: 26,
+        name: "pin_repair_sweep_discovery_cursor",
+        stmts: &[
+            // #173 round 13 (F5): discovery probes at most
+            // `MAX_LEGACY_DISCOVERY_PROBES` warm candidates per source-less row, taken
+            // from a list ordered `(created_at, id)`. That order is stable, so without a
+            // continuation every traversal probed the same oldest sixteen and a holder
+            // at position seventeen was never reached by anything, on any node, ever.
+            // These two columns are the boundary the next traversal's window starts
+            // after, so coverage becomes a bounded number of traversals rather than
+            // unreachable.
+            //
+            // STEERABILITY is why this is a keyset KEY and not an offset into the list.
+            // `repo_id` derives from a grindable owner DID, so the one thing an attacker
+            // must not be able to do is move the window off the true holder. Candidates
+            // enter and leave the warm list between traversals (a cold repo warming on a
+            // Tigris-backed node, a fresh registration, a deletion), and every such
+            // change silently renumbers an offset while leaving a key's boundary exactly
+            // where it was. Fresh registrations sort LAST under `created_at` and cannot
+            // be backdated, so they can only ever be appended behind the window.
+            //
+            // RESIDUAL, stated rather than implied: an operator who can insert repos
+            // with an arbitrary `created_at` can still place candidates between the
+            // continuation and the holder and delay it by a traversal per sixteen rows
+            // inserted. That is a privileged write, it costs a real repo row each, and
+            // it delays rather than prevents, since the window keeps advancing.
+            //
+            // NEW versioned migration (never appended to an applied block, INV-7). NOT
+            // NULL DEFAULT '' so an existing `pin_repair_sweep` row reads as "start at
+            // the head of the list", which is the same thing a never-swept node reads.
+            "ALTER TABLE pin_repair_sweep ADD COLUMN IF NOT EXISTS discovery_cursor_created_at TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE pin_repair_sweep ADD COLUMN IF NOT EXISTS discovery_cursor_id TEXT NOT NULL DEFAULT ''",
+        ],
+    },
 ];
+
+/// Max distinct source repos recorded per pinned object (F1, #173 jatmn round 8).
+/// Bounds both the resolver's per-OID source loop and the `pin_repo_sources` growth,
+/// so an adversary re-pushing one object from many repos cannot make resolution
+/// O(repos) (R2, INV-10).
+pub const MAX_PIN_SOURCES: i64 = 16;
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
 
@@ -916,6 +1144,10 @@ pub(crate) fn normalize_owner_key(did: &str) -> &str {
 /// filter or group by owner key use this const so the Rust and SQL sides cannot
 /// drift apart. If you change `normalize_owner_key`, update this const too.
 const OWNER_KEY_CASE_SQL: &str = "CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END";
+
+/// SQL CASE expression byte-identical to `normalize_owner_key`, but for columns
+/// named `did` (like in agent_profiles) instead of `owner_did`.
+const PROFILE_DID_CASE_SQL: &str = "CASE WHEN did LIKE 'did:key:%' AND position(':' in substr(did, 9)) = 0 THEN substr(did, 9) ELSE did END";
 
 #[cfg(test)]
 mod normalize_owner_key_tests {
@@ -1075,6 +1307,22 @@ impl Db {
         Ok(row.map(row_to_repo))
     }
 
+    /// Fetch a repo by its stable `id`. Used by the `/ipfs/{cid}` provenance path,
+    /// which resolves a pin straight to its ONE source repo (#173) instead of
+    /// paging the whole repo table. `id` is exact, so unlike `get_repo`'s fuzzy
+    /// owner/name match there is no mirror-vs-canonical disambiguation.
+    pub async fn get_repo_by_id(&self, id: &str) -> Result<Option<RepoRecord>> {
+        let row = sqlx::query(
+            "SELECT id, name, owner_did, description, is_public, default_branch,
+                    created_at, updated_at, disk_path, forked_from, machine_id
+             FROM repos WHERE id = $1 LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(row_to_repo))
+    }
+
     #[allow(dead_code)]
     pub async fn list_repos(&self, owner_did: &str) -> Result<Vec<RepoRecord>> {
         let rows = sqlx::query(
@@ -1089,21 +1337,68 @@ impl Db {
         Ok(rows.into_iter().map(row_to_repo).collect())
     }
 
-    /// Raw list of every repo row — NOT deduped (a mirror row and its canonical
-    /// row both appear) and without stars. For enumeration callers that must see
-    /// every physical row (e.g. the IPFS object scan in `api::ipfs`), not for
-    /// listing surfaces. Listing surfaces dedupe via `list_all_repos_deduped` or
-    /// `list_all_repos_with_stars` + `dedupe_canonical_repos`.
-    pub async fn list_all_repos(&self) -> Result<Vec<RepoRecord>> {
+    /// One keyset page of raw repo rows for the IPFS object scan (`api::ipfs`) —
+    /// NOT deduped (a mirror row and its canonical row both appear), since that
+    /// scan must see every physical row. Listing surfaces dedupe via
+    /// `list_all_repos_deduped` or `list_all_repos_with_stars` +
+    /// `dedupe_canonical_repos` and must not use this.
+    ///
+    /// Paged rather than whole-table because the scan runs on an anonymously
+    /// reachable route while holding scarce walk admission: materializing the
+    /// node's entire repo inventory (plus its rules) before the per-probe budget
+    /// has spent a single probe is an amplification sink (INV-10). The caller
+    /// stops asking for pages once its budgets are spent.
+    ///
+    /// Ordered on `(created_at, id)` ASC, both IMMUTABLE, so keyset paging is
+    /// exact: no row is visited twice and none is skipped. `updated_at` would be
+    /// wrong twice over — a repo touched mid-scan can cross a page boundary and go
+    /// unvisited (a servable public object misreported as a 404), and it is
+    /// attacker-bumpable, which would let a caller sort their own repos ahead of
+    /// the true holder and bury it past the probe budget.
+    ///
+    /// `after` is the raw `(created_at, id)` of the last row of the previous page,
+    /// `None` for the first page. It carries the STORED `created_at` text, not a
+    /// re-serialized `DateTime`: the comparison is a text comparison and a
+    /// round-trip through `to_rfc3339` is not guaranteed to reproduce the stored
+    /// bytes.
+    ///
+    /// Each row carries its own `quarantined` flag so the scan needs no separate
+    /// whole-node quarantine query (INV-11's hard drop stays per row).
+    pub async fn list_repos_page_for_scan(
+        &self,
+        after: Option<(&str, &str)>,
+        limit: i64,
+    ) -> Result<Vec<ScanRepoRow>> {
+        let (after_created, after_id) = match after {
+            Some((created_at, id)) => (Some(created_at), Some(id)),
+            None => (None, None),
+        };
         let rows = sqlx::query(
             "SELECT id, name, owner_did, description, is_public, default_branch,
-                    created_at, updated_at, disk_path, forked_from, machine_id
-             FROM repos ORDER BY updated_at DESC",
+                    created_at, updated_at, disk_path, forked_from, machine_id, quarantined
+             FROM repos
+             WHERE $1::text IS NULL OR (created_at, id) > ($1::text, $2::text)
+             ORDER BY created_at ASC, id ASC
+             LIMIT $3",
         )
+        .bind(after_created)
+        .bind(after_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.into_iter().map(row_to_repo).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let quarantined: bool = r.get("quarantined");
+                let created_at_key: String = r.get("created_at");
+                ScanRepoRow {
+                    quarantined,
+                    created_at_key,
+                    repo: row_to_repo(r),
+                }
+            })
+            .collect())
     }
 
     pub async fn list_all_repos_with_stars(&self) -> Result<Vec<(RepoRecord, i64)>> {
@@ -2102,10 +2397,26 @@ impl Db {
         limit: i64,
     ) -> Result<Vec<RefCertificate>> {
         let limit = limit.max(1);
-        let pattern = format!("{}%", prefix);
+
+        // `!` is the LIKE escape character rather than the backslash default: a
+        // backslash in the SQL text would be an escape inside the string literal
+        // when the session runs with the legacy `standard_conforming_strings=off`,
+        // leaving `ESCAPE '\'` unterminated and failing every prefix lookup. The
+        // pool is opened from externally supplied connection settings, so that
+        // mode can arrive from a database- or role-level setting. `!` keeps the
+        // statement free of backslashes and parses the same either way.
+        let mut escaped_prefix = String::with_capacity(prefix.len() + 4);
+        for c in prefix.chars() {
+            if c == '%' || c == '_' || c == '!' {
+                escaped_prefix.push('!');
+            }
+            escaped_prefix.push(c);
+        }
+        let pattern = format!("{}%", escaped_prefix);
+
         let rows = sqlx::query(
             "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
-             FROM ref_certificates WHERE repo_id = $1 AND id LIKE $2 ORDER BY issued_at DESC LIMIT $3",
+             FROM ref_certificates WHERE repo_id = $1 AND id LIKE $2 ESCAPE '!' ORDER BY issued_at DESC LIMIT $3",
         )
         .bind(repo_id)
         .bind(&pattern)
@@ -2129,8 +2440,85 @@ impl Db {
 
 // ── Peers ─────────────────────────────────────────────────────────────────────
 
+/// What a caller of [`Db::upsert_peer`] can prove about the DID it is writing.
+///
+/// An enum rather than a bool, and the proven variant carries a payload rather
+/// than being a bare unit, for two separate reasons.
+///
+/// It is not a bool because a bool at a call site reads as `true`/`false` with
+/// nothing at the call site saying what was proven, and because the default a
+/// bool invites (`false` meaning "no proof") is exactly the permissive value
+/// this gate exists to withhold. Passed as a real parameter with no default, so
+/// a new writer of the peers table cannot reach the update path by omission.
+///
+/// It carries the DID because "something was proven" is not the question. The
+/// boundary needs to know WHICH DID was proven, and compare it against the row
+/// being written. A bare proven/unproven flag leaves that comparison in the
+/// handler, which is the shape of RUSTSEC-2022-0009 (libp2p-core accepted a
+/// valid signature without checking it derived the claimed peer id) and leaves
+/// the second writer, the bootstrap announce-back in main.rs, outside the gate
+/// entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerWriteAuthority<'a> {
+    /// The caller has no proof of control over the DID it is writing. May
+    /// insert an unseen `did:key` row; may never change an existing row's
+    /// `http_url`.
+    Unproven,
+    /// The caller verified a signature, and the DID carried here is the one
+    /// that signature proved control of. `upsert_peer` checks it against the
+    /// row being written; a mismatch is a denial, not a warning.
+    Proven(&'a str),
+}
+
+/// A write refused by [`Db::upsert_peer`]'s authority gate.
+///
+/// A distinct type rather than a bare `anyhow::bail!` because `upsert_peer`
+/// returns `anyhow::Result` and `From<anyhow::Error> for AppError` routes
+/// anything it cannot downcast to `AppError::Internal`, so an untyped rejection
+/// would reach the client as a 500. The announce handler downcasts this out of
+/// the anyhow chain the same way the error module already recovers sqlx errors.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PeerWriteDenied {
+    /// An unproven write tried to change an existing row's `http_url`.
+    #[error("unproven announce cannot change an existing peer's http_url: {did}")]
+    UnprovenRepoint { did: String },
+
+    /// The signature proved control of one DID and the write targeted another.
+    #[error("signature proves control of {proven}, but the write targets {target}")]
+    ProofDidMismatch { proven: String, target: String },
+
+    /// An unproven write named a DID method that can never authenticate, so the
+    /// row it would create could never be corrected by anyone.
+    #[error(
+        "methodNotSupported: only did:key peers can be registered without a proof of control: {did}"
+    )]
+    UnsupportedDidMethod { did: String },
+
+    /// The value is a did:key (or never parsed as a DID at all), but no
+    /// verifying key can be resolved from it. Distinct from
+    /// `UnsupportedDidMethod`, which is a true statement about a foreign
+    /// method; this one carries the underlying resolution failure instead of
+    /// claiming did:key is unsupported. The wording mirrors the signed path in
+    /// auth/mod.rs, and peer_write_error maps it to the same `unresolvable_did`
+    /// code that path returns, so the two surfaces that judge the same input
+    /// answer with the same sentence under the same name.
+    #[error("cannot resolve DID '{did}': {reason}")]
+    UnresolvableDid { did: String, reason: String },
+}
+
 impl Db {
-    pub async fn upsert_peer(&self, did: &str, http_url: &str) -> Result<()> {
+    /// Insert or refresh a peer row, bounded by what the caller can prove.
+    ///
+    /// See [`PeerWriteAuthority`] for why the authority is a parameter with no
+    /// default. The rule: an unproven caller may INSERT an unseen `did:key`
+    /// row, but may never UPDATE an existing row's `http_url`. Changing an
+    /// existing row requires a verified signature from that row's own DID.
+    pub async fn upsert_peer(
+        &self,
+        did: &str,
+        http_url: &str,
+        authority: PeerWriteAuthority<'_>,
+    ) -> Result<()> {
         // Defense-in-depth at the DB boundary: both writers funnel through here
         // — the announce handler and the bootstrap announce-back in main.rs.
         // The latter has no announce-time check, so validating here is what
@@ -2138,6 +2526,89 @@ impl Db {
         // right after prune_non_public_peers cleaned it.
         if !crate::api::peers::is_public_http_url(http_url) {
             anyhow::bail!("refusing to register non-public peer http_url: {http_url}");
+        }
+        match authority {
+            // The proof has to name the row being written. Checking it here and
+            // not only in the announce handler is the whole point of putting
+            // the gate at this boundary: a caller could otherwise hold a valid
+            // signature for its own DID and spend it on someone else's row,
+            // which is RUSTSEC-2022-0009 exactly.
+            PeerWriteAuthority::Proven(proven) if proven != did => {
+                return Err(PeerWriteDenied::ProofDidMismatch {
+                    proven: proven.to_string(),
+                    target: did.to_string(),
+                }
+                .into());
+            }
+            // Only a DID whose verifying key resolves can ever authenticate:
+            // auth/mod.rs resolves the key from the keyid DID itself and
+            // rejects everything else. A row seeded here that cannot yield a
+            // key would therefore be unwritable by anyone forever, since no
+            // proof could ever satisfy the branch above, while still steering
+            // the sync origin resolve, the notify fan-out, and the public
+            // resolve route.
+            //
+            // The check is key derivability, NOT the method label. `Did`'s
+            // FromStr only runs validate(), which accepts key/web/gitlawb and
+            // never looks at the key material, so `did:key:notarealkey` passes
+            // is_did_key() and creates exactly the permanently uncorrectable
+            // row this gate exists to prevent. to_verifying_key() is the same
+            // resolution auth/mod.rs performs on the keyid.
+            //
+            // The refusal is split by cause, because methodNotSupported is only
+            // a true statement about a foreign method: a did:key whose key
+            // material does not resolve gets the resolution failure instead.
+            // Scoped to the INSERT, not to the DID. The check exists to stop a
+            // permanently uncorrectable row being CREATED; applied to a row that
+            // already exists it prevents nothing and freezes it instead. Before
+            // this gate, upsert_peer validated nothing and the handler accepted
+            // any parseable DID, so deployed tables hold did:web rows and
+            // did:key rows whose key never resolved. Judging the DID first made
+            // every one of those permanently unrefreshable: the unsigned
+            // announce is refused, and a signed one cannot exist because no key
+            // resolves. The row stays and keeps steering fan-out either way.
+            //
+            // The read-then-write race is benign: if a row appears in between,
+            // this write becomes an UPDATE and the UnprovenRepoint guard below
+            // still refuses any http_url change.
+            PeerWriteAuthority::Unproven
+                if !sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM peers WHERE did = $1)",
+                )
+                .bind(did)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(false) =>
+            {
+                match did.parse::<gitlawb_core::did::Did>() {
+                    // Only reachable from the bootstrap announce-back in main.rs,
+                    // which passes the contacted peer's raw JSON string; the
+                    // announce handler parses req.did before calling here.
+                    Err(e) => {
+                        return Err(PeerWriteDenied::UnresolvableDid {
+                            did: did.to_string(),
+                            reason: e.to_string(),
+                        }
+                        .into());
+                    }
+                    Ok(d) if !d.is_did_key() => {
+                        return Err(PeerWriteDenied::UnsupportedDidMethod {
+                            did: did.to_string(),
+                        }
+                        .into());
+                    }
+                    Ok(d) => {
+                        if let Err(e) = d.to_verifying_key() {
+                            return Err(PeerWriteDenied::UnresolvableDid {
+                                did: did.to_string(),
+                                reason: e.to_string(),
+                            }
+                            .into());
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
         let now = Utc::now().to_rfc3339();
         // A changed URL drops the reachability gate, so a repointed peer does
@@ -2170,22 +2641,61 @@ impl Db {
         // becomes externally visible. So this bounds the automatic inheritance
         // rather than closing the rewrite. Binding a DID to its first-seen
         // announcing key is what closes it: #273.
-        sqlx::query(
-            "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
-             VALUES ($1, $2, $3, FALSE, $3)
-             ON CONFLICT(did) DO UPDATE SET
-               http_url = $2,
-               last_seen = $3,
-               last_ping_ok = CASE
-                 WHEN peers.http_url IS DISTINCT FROM $2 THEN FALSE
-                 ELSE peers.last_ping_ok
-               END",
-        )
-        .bind(did)
-        .bind(http_url)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
+        //
+        // The two statements below differ only in what the conflict branch may
+        // touch. The proven one keeps the form above verbatim. The unproven one
+        // never assigns http_url at all and guards the whole DO UPDATE on the
+        // stored URL being byte-identical, so an unproven caller can refresh
+        // liveness and nothing else. last_ping_ok needs no CASE there, because
+        // the guard already restricts the branch to the URL-unchanged case the
+        // CASE would have preserved.
+        match authority {
+            PeerWriteAuthority::Proven(_) => {
+                sqlx::query(
+                    "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
+                     VALUES ($1, $2, $3, FALSE, $3)
+                     ON CONFLICT(did) DO UPDATE SET
+                       http_url = $2,
+                       last_seen = $3,
+                       last_ping_ok = CASE
+                         WHEN peers.http_url IS DISTINCT FROM $2 THEN FALSE
+                         ELSE peers.last_ping_ok
+                       END",
+                )
+                .bind(did)
+                .bind(http_url)
+                .bind(&now)
+                .execute(&self.pool)
+                .await?;
+            }
+            PeerWriteAuthority::Unproven => {
+                let rows = sqlx::query(
+                    "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
+                     VALUES ($1, $2, $3, FALSE, $3)
+                     ON CONFLICT(did) DO UPDATE SET
+                       last_seen = $3
+                     WHERE peers.http_url IS NOT DISTINCT FROM $2",
+                )
+                .bind(did)
+                .bind(http_url)
+                .bind(&now)
+                .execute(&self.pool)
+                .await?;
+                // A guarded ON CONFLICT DO UPDATE whose WHERE fails reports
+                // zero rows affected; it does NOT raise. So the refusal has to
+                // be derived from rows_affected, or the "an unproven repoint is
+                // an error, not a silent no-op" decision quietly becomes the
+                // no-op it was chosen to avoid. Zero rows here means exactly
+                // one thing, since the insert branch always affects a row: the
+                // DID exists and the announced URL is not the stored one.
+                if rows.rows_affected() == 0 {
+                    return Err(PeerWriteDenied::UnprovenRepoint {
+                        did: did.to_string(),
+                    }
+                    .into());
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2264,18 +2774,530 @@ impl Db {
         Ok(row.get::<i64, _>("cnt") > 0)
     }
 
-    pub async fn record_pinned_cid(&self, sha256_hex: &str, cid: &str) -> Result<()> {
+    /// Every git oid a pinned CID maps to (`pinned_cids.cid` -> `sha256_hex`).
+    /// `GET /ipfs/{cid}` resolves the content-addressed CID a client sends back to
+    /// the object's git oid this way: a real pin CID digests the raw object
+    /// content, not the git oid, so the digest cannot be `git cat-file`d directly
+    /// (#173). The index is unique on the git oid but NON-unique on cid, so two
+    /// distinct oids can share one content-CID (a tree and a blob whose raw bytes
+    /// collide, or byte-identical content pinned under two oids). Returning every
+    /// candidate lets the handler try each rather than pick one arbitrarily and
+    /// false-404 when the chosen one is withheld or absent while another is
+    /// readable (#173). Empty when the CID was never pinned on this node.
+    ///
+    /// ORDERED, for the same reason `pin_sources_for_oid` orders its union: the handler
+    /// walks these candidates under ONE shared probe budget, visit budget and pager, so
+    /// whichever comes back first is the one that spends the request's budget. Left
+    /// unordered this is a bare sequential scan returning heap order, which an unpin and
+    /// re-pin of any one object rewrites, so two nodes holding identical data could
+    /// resolve the same CID differently and one could 503 where the other serves.
+    pub async fn oids_for_cid(&self, cid: &str) -> Result<Vec<String>> {
+        let rows =
+            sqlx::query("SELECT sha256_hex FROM pinned_cids WHERE cid = $1 ORDER BY sha256_hex")
+                .bind(cid)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("sha256_hex"))
+            .collect())
+    }
+
+    /// Record a pinned object's CID and the repository it was pinned from
+    /// (`repo_id`, #173). On conflict the `COALESCE` backfills a NULL provenance
+    /// from a known source while keeping first-pinner-owns: an existing non-NULL
+    /// `repo_id` is never rewritten by a later push of the same oid, but a legacy
+    /// pin (or a pin recorded before provenance existed) whose `repo_id` is NULL
+    /// gets it filled the next time the object is re-pinned with a known source.
+    /// `cid`/`pinned_at` are left untouched on conflict. `repo_id` is `None` only
+    /// for a legacy pin with no known source; those fall back to the resolver's scan.
+    ///
+    /// The production first-pin path now goes through [`Self::record_pinned_cid_with_source`]
+    /// (U3, #173) so the pin and its source land atomically; this remains the seam for
+    /// seeding legacy, source-less rows in tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn record_pinned_cid(
+        &self,
+        sha256_hex: &str,
+        cid: &str,
+        repo_id: Option<&str>,
+    ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at)
-             VALUES ($1, $2, $3)
-             ON CONFLICT(sha256_hex) DO NOTHING",
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT(sha256_hex) DO UPDATE SET
+                 repo_id = COALESCE(pinned_cids.repo_id, EXCLUDED.repo_id)",
         )
         .bind(sha256_hex)
         .bind(cid)
         .bind(Utc::now().to_rfc3339())
+        .bind(repo_id)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// The resolver key currently stored for a pinned object (`pinned_cids.cid`),
+    /// or `None` for an unpinned oid. The opportunistic legacy-repair path reads
+    /// it to decide candidacy from the codec of the string alone (no object bytes)
+    /// before it recomputes anything.
+    pub async fn cid_for_oid(&self, sha256_hex: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT cid FROM pinned_cids WHERE sha256_hex = $1")
+            .bind(sha256_hex)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get::<String, _>("cid")))
+    }
+
+    /// Rewrite a legacy provider-CID row to the raw-content resolver key, stashing
+    /// the old provider value in `legacy_provider_cid` (#173 R8, KTD8). Before this
+    /// branch the pin path stored the PROVIDER CID (Kubo dag-pb / Pinata CIDv0) in
+    /// `cid`; the `/ipfs` resolver recomputes the raw CID and 404s a mismatched key
+    /// even though `list_pinned_cids` still advertises it. The `WHERE cid =
+    /// $old_provider_cid` guard makes a concurrent double-repair a no-op (the second
+    /// writer sees the already-rewritten key and matches nothing) and never touches
+    /// a row keyed on a different value. Stashed in `legacy_provider_cid`, NOT
+    /// `pinata_cid`: the latter gates the Pinata pin-skip (`has_pinata_cid`), so a
+    /// Kubo-legacy CID parked there would make Pinata permanently skip the object.
+    pub async fn repair_legacy_provider_cid(
+        &self,
+        sha256_hex: &str,
+        raw_cid: &str,
+        old_provider_cid: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE pinned_cids
+                SET cid = $2, legacy_provider_cid = $3
+              WHERE sha256_hex = $1 AND cid = $3",
+        )
+        .bind(sha256_hex)
+        .bind(raw_cid)
+        .bind(old_provider_cid)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// One ordered batch of `pinned_cids` rows strictly after `cursor`, for the U4
+    /// legacy provider-CID repair sweep. Returns `(sha256_hex, cid)` ordered by
+    /// `sha256_hex` (the table's primary key, so the walk rides the PK index) and
+    /// capped at `limit` rows, which is what BOUNDS the sweep: one pass can never read
+    /// more than a batch, however large the pin set is.
+    ///
+    /// Deliberately NOT filtered to legacy rows in SQL. "Is this a raw CIDv1" is a
+    /// multibase+codec decode (`is_raw_cidv1`), which Postgres cannot express, and a
+    /// prefix-match approximation would silently mis-classify keys under a different
+    /// multihash. The caller applies the real predicate, so `limit` bounds rows READ
+    /// (the DB cost), not rows repaired.
+    pub async fn pinned_cids_after(
+        &self,
+        cursor: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query(
+            "SELECT sha256_hex, cid FROM pinned_cids
+              WHERE sha256_hex > $1
+              ORDER BY sha256_hex
+              LIMIT $2",
+        )
+        .bind(cursor)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>("sha256_hex"), r.get::<String, _>("cid")))
+            .collect())
+    }
+
+    /// Where the U4 repair sweep's walk left off, or `""` before it has ever run.
+    /// Empty string sorts below every hex oid, so a first run and a rewound run are
+    /// the same code path (`sha256_hex > ''` is the whole table).
+    pub async fn pin_repair_cursor(&self) -> Result<String> {
+        let row = sqlx::query("SELECT cursor FROM pin_repair_sweep WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row
+            .map(|r| r.get::<String, _>("cursor"))
+            .unwrap_or_default())
+    }
+
+    /// Persist the sweep's walk position. Written after every batch, so a restart
+    /// resumes rather than re-walking the table from the beginning. A rewrite is a
+    /// plain upsert: the sweep is the single writer, and re-repairing an
+    /// already-repaired row is a no-op anyway (the codec cost gate spares it).
+    pub async fn set_pin_repair_cursor(&self, cursor: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO pin_repair_sweep (id, cursor) VALUES (1, $1)
+             ON CONFLICT (id) DO UPDATE SET cursor = EXCLUDED.cursor",
+        )
+        .bind(cursor)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Where the sweep's DISCOVERY window left off, as a `(created_at, id)` keyset
+    /// key, or `("", "")` before any traversal has completed one.
+    ///
+    /// A second, independent position from [`Db::pin_repair_cursor`]: that one walks
+    /// `pinned_cids` rows, this one walks the warm CANDIDATE list a source-less row is
+    /// probed against. Both are per-TRAVERSAL, and the candidate one only ever moves
+    /// at the end of a completed traversal, so every pass of one traversal reads the
+    /// same value and every source-less row in it shares one window.
+    ///
+    /// A key rather than an offset. Repos enter and leave the warm candidate list
+    /// between traversals (a cold repo warming on a Tigris-backed node, a fresh
+    /// registration, a deletion), and an offset silently means a different candidate
+    /// once anything below it moves, which slides the window off the row it was about
+    /// to reach. A key names the boundary itself, so an insert below it is invisible.
+    /// The key is the RAW stored `created_at` text (`ScanRepoRow::created_at_key`),
+    /// never a re-serialized `DateTime`, for the reason that struct's own doc gives.
+    pub async fn discovery_continuation(&self) -> Result<(String, String)> {
+        let row = sqlx::query(
+            "SELECT discovery_cursor_created_at, discovery_cursor_id
+               FROM pin_repair_sweep WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row
+            .map(|r| {
+                (
+                    r.get::<String, _>("discovery_cursor_created_at"),
+                    r.get::<String, _>("discovery_cursor_id"),
+                )
+            })
+            .unwrap_or_default())
+    }
+
+    /// Persist the discovery window's continuation at the end of a completed traversal.
+    ///
+    /// The INSERT arm names `cursor` explicitly with `''`. v23 declares that column
+    /// `NOT NULL` and seeds NO row, so a never-swept node has nothing to update and an
+    /// upsert naming only the continuation columns would fail its NOT NULL check.
+    /// Every caller treats a failed persist as warn-only, so that failure would be
+    /// SILENT and the window would never rotate on exactly the nodes this sweep exists
+    /// for. `''` is the same value `pin_repair_cursor` reads as "never swept", so
+    /// seeding it here starts no walk anywhere but the top of the table.
+    ///
+    /// The UPDATE arm touches ONLY the two continuation columns. Writing `cursor` there
+    /// too would clobber a live row-walk position with `''` every time the window
+    /// rotated, rewinding the `pinned_cids` walk to the start of the table.
+    pub async fn set_discovery_continuation(&self, created_at_key: &str, id: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO pin_repair_sweep (id, cursor, discovery_cursor_created_at, discovery_cursor_id)
+             VALUES (1, '', $1, $2)
+             ON CONFLICT (id) DO UPDATE SET
+                 discovery_cursor_created_at = EXCLUDED.discovery_cursor_created_at,
+                 discovery_cursor_id = EXCLUDED.discovery_cursor_id",
+        )
+        .bind(created_at_key)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The repository a pinned object was recorded from (`pinned_cids.repo_id`),
+    /// or `None` for a legacy pin (recorded before provenance existed) or an
+    /// unpinned oid. `GET /ipfs/{cid}` uses this to gate+serve the ONE source
+    /// repo instead of scanning every repo (#173).
+    pub async fn provenance_for_oid(&self, sha256_hex: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT repo_id FROM pinned_cids WHERE sha256_hex = $1")
+            .bind(sha256_hex)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("repo_id")))
+    }
+
+    /// Backfill the source repo on an already-pinned object whose provenance is
+    /// NULL (a legacy pin recorded before provenance existed, #173, jatmn). The
+    /// `AND repo_id IS NULL` guard keeps first-pinner-owns: an existing non-NULL
+    /// provenance is left untouched. Touches only `repo_id` and never re-pins the
+    /// object's bytes, so it is safe to call on the already-pinned skip path.
+    pub async fn backfill_pin_provenance(&self, sha256_hex: &str, repo_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE pinned_cids SET repo_id = $2 WHERE sha256_hex = $1 AND repo_id IS NULL",
+        )
+        .bind(sha256_hex)
+        .bind(repo_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record a repository as a source for a pinned object (F1, #173 jatmn round 8),
+    /// bounded to about `MAX_PIN_SOURCES` distinct repos per object. The count guard
+    /// lives inside the INSERT (a single statement), which suppresses a re-push of the
+    /// SAME `(oid, repo)` via `ON CONFLICT DO NOTHING`. It does NOT hard-serialize
+    /// concurrent inserts of DIFFERENT repos for the same object: under Postgres READ
+    /// COMMITTED each concurrent writer's count subquery reads a snapshot that omits the
+    /// others' uncommitted rows, so N concurrent pushers can each see `count < cap` and
+    /// overshoot by up to N-1 rows. The overshoot is a small constant (bounded by
+    /// concurrent-pusher count, never O(repos)), and the RESOLVER read side
+    /// (`pin_sources_for_oid`) caps the ADDITIONAL sources at `MAX_PIN_SOURCES` (always
+    /// keeping the first-pinner), so the INV-10 bound on serve-time work holds at
+    /// `O(MAX_PIN_SOURCES + 1)` regardless of a table overshoot.
+    ///
+    /// A record that ACTUALLY ADDS a source row also CLEARS the
+    /// `pin_sources_incomplete` marker for the object, in the SAME transaction as the
+    /// insert (U3, #173), so the clear cannot drift across the four call sites or land
+    /// without the row it describes.
+    ///
+    /// The clear is gated on `rows_affected() > 0` because the INSERT is a no-op in two
+    /// ordinary cases: the `(oid, repo)` pair already exists (`ON CONFLICT DO NOTHING`)
+    /// and the source set is at cap (the count guard). The skip path calls this for
+    /// EVERY already-pinned object, and on a requeue pass that list is the whole-repo
+    /// enumeration, so an unconditional clear meant the next coalesced push from a repo
+    /// already in the set wiped the marker for every object in the repo without
+    /// recording anything (round 11 regression). The residual, which the gate does not
+    /// close: the marker is per-object, not per-(object, repo), so a GENUINE record from
+    /// a third repo C still clears a marker that repo A's failed record set. That is the
+    /// deliberate cost of a single boolean; closing it needs a per-(oid, repo) marker
+    /// table, and it fails in the safe direction (the marker only ever ADDS the scan
+    /// fallback, never removes a source the resolver already tries).
+    pub async fn record_pin_source(&self, sha256_hex: &str, repo_id: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query(
+            "INSERT INTO pin_repo_sources (sha256_hex, repo_id)
+             SELECT $1, $2
+             WHERE (SELECT count(*) FROM pin_repo_sources WHERE sha256_hex = $1) < $3
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(sha256_hex)
+        .bind(repo_id)
+        .bind(MAX_PIN_SOURCES)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if inserted > 0 {
+            // Clears THIS repo's failure only (#173 round 12). A boolean per object meant
+            // repo C's genuine record wiped the marker repo B's failure set, and the
+            // resolver then dropped the scan fallback while B's copy was still unrecorded.
+            sqlx::query("DELETE FROM pin_source_failures WHERE sha256_hex = $1 AND repo_id = $2")
+                .bind(sha256_hex)
+                .bind(repo_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record a first pin and its source ATOMICALLY (U3, #173). The first-pin path
+    /// used to run `record_pinned_cid` and `record_pin_source` as two independent
+    /// best-effort calls, so the pin could land while its source did not, leaving a
+    /// source set that is silently missing its own first pinner. One transaction
+    /// removes that window entirely: either both rows land or neither does, and a
+    /// total failure leaves the object unpinned so the next push retries it.
+    ///
+    /// The marker clear carries the same `rows_affected` gate as `record_pin_source`.
+    /// It is not load-bearing here: this path runs only when `is_pinned` said no row
+    /// exists, and `mark_pin_sources_incomplete` is a no-op without a `pinned_cids` row,
+    /// so there is no marker to wrongly clear. The gate is kept for the one window that
+    /// is not covered by that argument, a concurrent pinner landing the row between the
+    /// `is_pinned` check and this upsert, and so the two clears cannot drift apart.
+    pub async fn record_pinned_cid_with_source(
+        &self,
+        sha256_hex: &str,
+        cid: &str,
+        repo_id: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT(sha256_hex) DO UPDATE SET
+                 repo_id = COALESCE(pinned_cids.repo_id, EXCLUDED.repo_id)",
+        )
+        .bind(sha256_hex)
+        .bind(cid)
+        .bind(Utc::now().to_rfc3339())
+        .bind(repo_id)
+        .execute(&mut *tx)
+        .await?;
+        let inserted = sqlx::query(
+            "INSERT INTO pin_repo_sources (sha256_hex, repo_id)
+             SELECT $1, $2
+             WHERE (SELECT count(*) FROM pin_repo_sources WHERE sha256_hex = $1) < $3
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(sha256_hex)
+        .bind(repo_id)
+        .bind(MAX_PIN_SOURCES)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if inserted > 0 {
+            // Clears THIS repo's failure only (#173 round 12). A boolean per object meant
+            // repo C's genuine record wiped the marker repo B's failure set, and the
+            // resolver then dropped the scan fallback while B's copy was still unrecorded.
+            sqlx::query("DELETE FROM pin_source_failures WHERE sha256_hex = $1 AND repo_id = $2")
+                .bind(sha256_hex)
+                .bind(repo_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record a DISCOVERED holder and arm the resolver's fallback ATOMICALLY (U5, #173).
+    /// The sweep's discovery arm used to call `record_pin_source` and then, separately,
+    /// `mark_pin_sources_incomplete`. Two best-effort writes, so a transient failure of
+    /// the second one left the row with a nonempty, below-cap, UNMARKED source set: the
+    /// resolver's `needs_scan` is `sources.is_empty() || at_cap || incomplete`, so all
+    /// three signals were off, the bounded legacy scan was dropped, and an unrecorded
+    /// public duplicate stayed 404'd for good once the DB error cleared (no later sweep
+    /// revisits a raw-CIDv1 row). One transaction removes that state entirely: either the
+    /// source row and the sentinel both land or neither does, and neither-lands is the
+    /// benign end (an empty set is itself a `needs_scan` signal).
+    ///
+    /// The sentinel insert is UNCONDITIONAL, unlike the marker clear's `rows_affected`
+    /// gate: discovery probes a bounded, warm-only candidate set and stops at the first
+    /// holder, so finding one holder is never evidence the set is complete, whether or
+    /// not this particular call added a row. It names the empty-string UNKNOWN-repo
+    /// sentinel (the same one the v24 migration carries pre-upgrade markers under), so no
+    /// real per-repo record can clear it, and it carries the same
+    /// `WHERE EXISTS (pinned_cids row)` guard as [`Self::mark_pin_sources_incomplete`]
+    /// so a marker never sits in the table for an object this node never pinned.
+    ///
+    /// Commit-terminated, like [`Self::record_pin_source`], so a caller that wraps this
+    /// in `db_bounded` may read `BoundedDbError::Elapsed` as "definitely did not land":
+    /// the cancelled future never reaches `tx.commit()`, no COMMIT is sent, and Postgres
+    /// discards the transaction when the connection resets.
+    pub async fn record_discovered_pin_source(
+        &self,
+        sha256_hex: &str,
+        repo_id: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query(
+            "INSERT INTO pin_repo_sources (sha256_hex, repo_id)
+             SELECT $1, $2
+             WHERE (SELECT count(*) FROM pin_repo_sources WHERE sha256_hex = $1) < $3
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(sha256_hex)
+        .bind(repo_id)
+        .bind(MAX_PIN_SOURCES)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if inserted > 0 {
+            // Clears THIS repo's failure only, the same gate and reason as
+            // `record_pin_source`: a per-object clear let one repo's genuine record wipe
+            // a marker another repo's failure set.
+            sqlx::query("DELETE FROM pin_source_failures WHERE sha256_hex = $1 AND repo_id = $2")
+                .bind(sha256_hex)
+                .bind(repo_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query(
+            "INSERT INTO pin_source_failures (sha256_hex, repo_id)
+                  SELECT $1, '' WHERE EXISTS (SELECT 1 FROM pinned_cids WHERE sha256_hex = $1)
+                  ON CONFLICT DO NOTHING",
+        )
+        .bind(sha256_hex)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Mark this object's pin-source set as KNOWN INCOMPLETE for `repo_id` (U3, #173).
+    /// Called when a `record_pin_source` exhausts its retries, which is the only moment
+    /// the node knows a source it meant to record is missing. `GET /ipfs/{cid}` reads it
+    /// to keep the bounded scan fallback for that object, so a public copy that would
+    /// serve is no longer 404'd.
+    ///
+    /// The marker names the PAIR, so only a later successful record from the same repo
+    /// clears it (#173 round 12). A no-op when no `pinned_cids` row exists: the first-pin
+    /// path is transactional, so there is no half-recorded pin to describe, and without
+    /// the guard a marker for an object this node never pinned would sit in the table
+    /// arming a fallback for nothing.
+    pub async fn mark_pin_sources_incomplete(&self, sha256_hex: &str, repo_id: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO pin_source_failures (sha256_hex, repo_id)
+                  SELECT $1, $2 WHERE EXISTS (SELECT 1 FROM pinned_cids WHERE sha256_hex = $1)
+                  ON CONFLICT DO NOTHING",
+        )
+        .bind(sha256_hex)
+        .bind(repo_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Whether this object's pin-source set is KNOWN INCOMPLETE (U3, #173): a
+    /// `record_pin_source` for it failed outright and no later record from the same repo
+    /// has repaired it. `false` for an unpinned oid and for every object with no recorded
+    /// failure, so the common path is unchanged and an ordinary denial never fans out
+    /// (INV-10).
+    pub async fn pin_sources_incomplete(&self, sha256_hex: &str) -> Result<bool> {
+        let found: Option<i32> =
+            sqlx::query_scalar("SELECT 1 FROM pin_source_failures WHERE sha256_hex = $1 LIMIT 1")
+                .bind(sha256_hex)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(found.is_some())
+    }
+
+    /// Every source repository recorded for a pinned object (F1, #173 jatmn round 8):
+    /// the union of the first-pinner `pinned_cids.repo_id` and the `pin_repo_sources`
+    /// rows, deduped and ordered for a deterministic resolver walk.
+    ///
+    /// The first-pinner (a single row by `pinned_cids`' PK on `sha256_hex`) is ALWAYS
+    /// included; the `LIMIT MAX_PIN_SOURCES` caps only the ADDITIONAL `pin_repo_sources`
+    /// rows. This keeps the resolver's per-source work a bounded `O(MAX_PIN_SOURCES + 1)`
+    /// ceiling (INV-10) while never letting the cap evict the original source. A prior
+    /// version applied the `LIMIT` to the whole UNION with a lexicographic `ORDER BY`,
+    /// which let an attacker 404 a legacy public CID (first-pinner in `pinned_cids` but
+    /// not yet in `pin_repo_sources`) by pushing the same object from `MAX_PIN_SOURCES`
+    /// repos whose grindable ids sort before it, evicting the public source from the
+    /// window. Empty for a legacy pin with no known source (it falls back to the repo
+    /// scan) or an unpinned oid.
+    pub async fn pin_sources_for_oid(&self, sha256_hex: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT repo_id FROM pinned_cids
+                 WHERE sha256_hex = $1 AND repo_id IS NOT NULL
+             UNION
+             SELECT repo_id FROM (
+                 SELECT repo_id FROM pin_repo_sources
+                     WHERE sha256_hex = $1
+                 ORDER BY repo_id
+                 LIMIT $2
+             ) capped
+             ORDER BY repo_id",
+        )
+        .bind(sha256_hex)
+        .bind(MAX_PIN_SOURCES)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("repo_id"))
+            .collect())
+    }
+
+    /// Whether `pin_repo_sources` is at the `MAX_PIN_SOURCES` cap for this oid, i.e.
+    /// the provenance source set returned by [`Self::pin_sources_for_oid`] may be
+    /// INCOMPLETE. `record_pin_source` stops inserting at exactly `MAX_PIN_SOURCES`
+    /// rows and drops later sources silently, so a full table is the only observable
+    /// signal that a servable source (e.g. a later public pinner) may have been
+    /// dropped. `get_by_cid` uses this to decide whether a provenance miss should fall
+    /// back to the bounded legacy scan (which gates every repo through the real
+    /// visibility gate and so finds a dropped public source) rather than 404 — closing
+    /// the pin-source griefing hole where 16 attacker sources bury a public one. `>=`
+    /// (not `==`) is defensive against any future overshoot.
+    pub async fn pin_sources_at_cap(&self, sha256_hex: &str) -> Result<bool> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM pin_repo_sources WHERE sha256_hex = $1")
+                .bind(sha256_hex)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count >= MAX_PIN_SOURCES)
     }
 
     pub async fn record_encrypted_blob(
@@ -2348,6 +3370,17 @@ impl Db {
         Ok(row.map(|r| r.get("recipients_tag")))
     }
 
+    /// Every pinned object this node ADVERTISES (`GET /api/v1/ipfs/pins`).
+    ///
+    /// U4 (#173): rows still keyed on a legacy PROVIDER CID (Kubo dag-pb / Pinata
+    /// CIDv0, written by releases before this branch) are withheld from the listing.
+    /// The `/ipfs/{cid}` resolver recomputes the raw-content CID from the object bytes
+    /// and refuses any row whose stored key does not match, so advertising the legacy
+    /// key hands a client a CID this node deliberately will not serve. The background
+    /// repair sweep rewrites those rows to the raw key, and each one reappears here the
+    /// moment it is repaired. Filtering is done in Rust because the raw-CIDv1 test is a
+    /// multibase+codec decode (`is_raw_cidv1`), not something SQL can express; it is the
+    /// SAME predicate the repair path uses as its cost gate, so the two cannot drift.
     pub async fn list_pinned_cids(&self) -> Result<Vec<PinnedCidRecord>> {
         let rows = sqlx::query(
             "SELECT sha256_hex, cid, pinned_at, pinata_cid FROM pinned_cids ORDER BY pinned_at DESC",
@@ -2356,6 +3389,7 @@ impl Db {
         .await?;
         Ok(rows
             .into_iter()
+            .filter(|r| gitlawb_core::cid::is_raw_cidv1(r.get::<&str, _>("cid")))
             .map(|r| PinnedCidRecord {
                 sha256_hex: r.get("sha256_hex"),
                 cid: r.get("cid"),
@@ -2377,18 +3411,34 @@ impl Db {
     }
 
     /// Record the Pinata CID for a git object.
-    /// Inserts the row if it doesn't exist (objects pinned directly to Pinata
-    /// without a prior local IPFS pin get cid = pinata_cid).
-    pub async fn record_pinata_cid(&self, sha256_hex: &str, pinata_cid: &str) -> Result<()> {
+    ///
+    /// `raw_cid` is the locally-computed raw-content CID (`Cid::from_git_object_bytes`,
+    /// CIDv1/raw/sha2-256), the resolver key `GET /ipfs/{cid}` looks up; `pinata_cid`
+    /// is the provider CID Pinata returned (a dag-pb/UnixFS CID for gateway retrieval).
+    /// Inserts the row if it doesn't exist (an object pinned directly to Pinata with
+    /// no prior local IPFS pin gets `cid = raw_cid`, never the provider CID — a dag-pb
+    /// provider CID must never become an alias that serves raw bytes that do not hash
+    /// to it, #173). On conflict `cid` is left untouched: a prior local pin already
+    /// stored the correct raw CID, and the COALESCE backfills a NULL provenance from a
+    /// known source while keeping first-pinner-owns.
+    pub async fn record_pinata_cid(
+        &self,
+        sha256_hex: &str,
+        raw_cid: &str,
+        pinata_cid: &str,
+        repo_id: Option<&str>,
+    ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT(sha256_hex) DO UPDATE SET pinata_cid = EXCLUDED.pinata_cid",
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid, repo_id)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT(sha256_hex) DO UPDATE SET pinata_cid = EXCLUDED.pinata_cid,
+                 repo_id = COALESCE(pinned_cids.repo_id, EXCLUDED.repo_id)",
         )
         .bind(sha256_hex)
-        .bind(pinata_cid) // fallback local cid if row is new
+        .bind(raw_cid) // resolver-key cid: locally-computed raw CID, never the provider CID
         .bind(Utc::now().to_rfc3339())
         .bind(pinata_cid)
+        .bind(repo_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -3102,6 +4152,113 @@ impl Db {
         }
         Ok(out)
     }
+
+    /// Visibility rules for one scan page, bounded IN THE QUERY by a byte budget.
+    ///
+    /// The unbounded sibling above is right for the listing surfaces: they read a page
+    /// the caller is already authorized for. It is wrong for the resolver's legacy scan,
+    /// which runs on an anonymously reachable route while holding scarce walk admission.
+    /// A repo owner controls both how many rules their repos carry and how long each
+    /// `reader_dids` list is, so summing the bytes AFTER the rows arrive truncates the
+    /// request without bounding the work: the oversized page has already been transferred
+    /// and allocated by the time the sum is taken (INV-10 bounds work done, never results
+    /// measured afterwards).
+    ///
+    /// The cut lands on a REPO boundary, never inside one. A partially loaded rule set is
+    /// indistinguishable at the gate from a repo with no rules at all, so a mid-repo cut
+    /// would FAIL OPEN and serve a path-scoped object the missing rules would have
+    /// denied. Every repo this returns is therefore complete, and the caller drops the
+    /// page's tail from the cut onward rather than gating it against rules it does not
+    /// have.
+    ///
+    /// `repo_ids` must be in the page's `(created_at, id)` order; the returned cut is the
+    /// 0-based index into that slice of the first repo whose rules did NOT fit, or `None`
+    /// when the whole page fit. Repos carrying no rules never cut.
+    ///
+    /// The FIRST rule-carrying repo of a page is admitted whatever its size, so a page
+    /// always makes progress. Without that a repo whose rules alone exceed the remaining
+    /// budget would put the cut at the cursor, the caller's next request would reproduce
+    /// it exactly, and the ladder would be wedged on a permanent 503. One repo's rule set
+    /// is the residual bound this leaves; the whole page's was the bound before.
+    pub async fn list_visibility_rules_for_repos_bounded(
+        &self,
+        repo_ids: &[String],
+        byte_budget: usize,
+    ) -> Result<(
+        std::collections::HashMap<String, Vec<VisibilityRule>>,
+        Option<usize>,
+    )> {
+        use std::collections::HashMap;
+        if repo_ids.is_empty() {
+            return Ok((HashMap::new(), None));
+        }
+        // `running` is a sum of non-negative per-repo sizes over the page order, so it is
+        // monotonic: once it passes the budget every later repo is excluded too, which is
+        // what makes "the kept set is a prefix" true and the single cut index meaningful.
+        // `rn = 1` is the always-admit escape for the first rule-carrying repo.
+        let rows = sqlx::query(
+            "WITH sized AS (
+                 SELECT v.id, v.repo_id, v.path_glob, v.mode, v.reader_dids, v.created_by,
+                        v.created_at,
+                        octet_length(v.id) + octet_length(v.repo_id)
+                          + octet_length(v.path_glob) + octet_length(v.created_by)
+                          + octet_length(v.reader_dids) AS b,
+                        array_position($1::text[], v.repo_id) AS pos
+                 FROM visibility_rules v
+                 WHERE v.repo_id = ANY($1::text[])
+             ),
+             per_repo AS (
+                 SELECT repo_id, pos, SUM(b) AS repo_bytes FROM sized GROUP BY repo_id, pos
+             ),
+             cum AS (
+                 SELECT repo_id, pos,
+                        SUM(repo_bytes) OVER (ORDER BY pos ROWS UNBOUNDED PRECEDING) AS running,
+                        ROW_NUMBER() OVER (ORDER BY pos) AS rn
+                 FROM per_repo
+             ),
+             kept AS (
+                 SELECT repo_id, pos FROM cum WHERE running <= $2::bigint OR rn = 1
+             ),
+             cut AS (
+                 SELECT MIN(pos) AS cut_pos FROM cum WHERE running > $2::bigint AND rn > 1
+             )
+             SELECT s.id, s.repo_id, s.path_glob, s.mode, s.reader_dids, s.created_by,
+                    s.created_at, cut.cut_pos
+             FROM sized s
+             JOIN kept k ON k.repo_id = s.repo_id
+             CROSS JOIN cut
+             ORDER BY k.pos, s.path_glob",
+        )
+        .bind(repo_ids)
+        .bind(byte_budget.min(i64::MAX as usize) as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // `array_position` is 1-based and the caller indexes a slice. No rows means no
+        // rules matched the page at all, which is also no cut.
+        let cut_at = rows
+            .first()
+            .and_then(|r| r.get::<Option<i32>, _>("cut_pos"))
+            .map(|pos| (pos as usize).saturating_sub(1));
+        let mut out: HashMap<String, Vec<VisibilityRule>> = HashMap::new();
+        for r in rows {
+            let readers: String = r.get("reader_dids");
+            let created_at: String = r.get("created_at");
+            let rule = VisibilityRule {
+                id: r.get("id"),
+                repo_id: r.get("repo_id"),
+                path_glob: r.get("path_glob"),
+                mode: VisibilityMode::from_db(&r.get::<String, _>("mode")),
+                reader_dids: serde_json::from_str(&readers).unwrap_or_default(),
+                created_by: r.get("created_by"),
+                created_at: created_at
+                    .parse::<DateTime<Utc>>()
+                    .unwrap_or_else(|_| Utc::now()),
+            };
+            out.entry(rule.repo_id.clone()).or_default().push(rule);
+        }
+        Ok((out, cut_at))
+    }
 }
 
 // ── Repo Stars ────────────────────────────────────────────────────────────────
@@ -3454,6 +4611,9 @@ impl Db {
             let new_website = website.or(existing.website.as_deref());
             let new_socials = socials.or(existing.socials.as_deref());
 
+            // get_profile equates bare short ids with did:key:<id>. UPDATE must target
+            // the stored row identity (existing.did), not the caller's raw input form,
+            // or a did:key: alias against a bare-stored profile updates zero rows.
             sqlx::query(
                 "UPDATE agent_profiles
                  SET display_name=$1, bio=$2, avatar_url=$3, website=$4, socials=$5, updated_at=$6
@@ -3465,12 +4625,12 @@ impl Db {
             .bind(new_website)
             .bind(new_socials)
             .bind(&now)
-            .bind(did)
+            .bind(&existing.did)
             .execute(&self.pool)
             .await?;
 
             Ok(ProfileRecord {
-                did: did.to_string(),
+                did: existing.did,
                 display_name: new_name.map(String::from),
                 bio: new_bio.map(String::from),
                 avatar_url: new_avatar.map(String::from),
@@ -3511,14 +4671,20 @@ impl Db {
     }
 
     pub async fn get_profile(&self, did: &str) -> Result<Option<ProfileRecord>> {
-        let row = sqlx::query(
+        // Same owner-key contract as get_repo: strip `did:key:` only when the
+        // remainder is a bare key id. The old `LIKE '%:' || $1` matched any DID
+        // method that shared a suffix and could resolve the wrong profile.
+        let did_key = normalize_owner_key(did);
+        let sql = format!(
             "SELECT did, display_name, bio, avatar_url, website, socials, profile_cid, created_at, updated_at
              FROM agent_profiles
-             WHERE did = $1 OR did LIKE '%:' || $1",
-        )
-        .bind(did)
-        .fetch_optional(&self.pool)
-        .await?;
+             WHERE ({key}) = $1",
+            key = PROFILE_DID_CASE_SQL
+        );
+        let row = sqlx::query(&sql)
+            .bind(did_key)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(row.map(|r| ProfileRecord {
             did: r.get("did"),
@@ -3534,10 +4700,17 @@ impl Db {
     }
 
     pub async fn set_profile_cid(&self, did: &str, cid: &str) -> Result<()> {
-        sqlx::query("UPDATE agent_profiles SET profile_cid = $1, updated_at = $2 WHERE did = $3")
+        // Same did:key / bare equivalence as get_profile so a full did:key: form
+        // updates a profile stored under the bare short id.
+        let did_key = normalize_owner_key(did);
+        let sql = format!(
+            "UPDATE agent_profiles SET profile_cid = $1, updated_at = $2 WHERE ({key}) = $3",
+            key = PROFILE_DID_CASE_SQL
+        );
+        sqlx::query(&sql)
             .bind(cid)
             .bind(Utc::now().to_rfc3339())
-            .bind(did)
+            .bind(did_key)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -4671,6 +5844,103 @@ mod dedup_db_tests {
         assert!(!got.is_public, "non-key row's is_public must be preserved");
     }
 
+    /// get_profile must not resolve a non-key DID (e.g. did:gitlawb:) when
+    /// queried with the bare short id. The old `LIKE '%:' || $1` clause was too
+    /// broad and could return the wrong profile row.
+    #[sqlx::test]
+    async fn get_profile_does_not_match_non_key_did(pool: PgPool) {
+        let db = db(pool).await;
+        let short = "z6Mkprof1";
+
+        // Seed only a non-key DID row first. When queried with the bare short ID,
+        // get_profile must return None (lone non-key fixture test).
+        db.upsert_profile(
+            &format!("did:gitlawb:{short}"),
+            Some("other-method"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let got = db.get_profile(short).await.unwrap();
+        assert!(
+            got.is_none(),
+            "bare short id must not resolve a lone non-key DID profile"
+        );
+
+        // Now seed the canonical bare key profile row as well.
+        db.upsert_profile(short, Some("canonical"), None, None, None, None)
+            .await
+            .unwrap();
+
+        let got = db
+            .get_profile(short)
+            .await
+            .unwrap()
+            .expect("bare short id should resolve the key-form profile");
+        assert_eq!(got.did, short);
+        assert_eq!(got.display_name.as_deref(), Some("canonical"));
+
+        let got = db
+            .get_profile(&format!("did:key:{short}"))
+            .await
+            .unwrap()
+            .expect("did:key form should also resolve the key-form profile");
+        assert_eq!(got.did, short);
+
+        let got = db
+            .get_profile(&format!("did:gitlawb:{short}"))
+            .await
+            .unwrap()
+            .expect("full non-key DID should resolve its own profile");
+        assert_eq!(got.did, format!("did:gitlawb:{short}"));
+        assert_eq!(got.display_name.as_deref(), Some("other-method"));
+    }
+
+    /// upsert_profile must update a bare-stored profile when called with the
+    /// full did:key: form. get_profile equates the two, so the UPDATE has to
+    /// target existing.did rather than the raw input.
+    #[sqlx::test]
+    async fn upsert_profile_updates_via_did_key_alias(pool: PgPool) {
+        let db = db(pool).await;
+        let short = "z6Mkprof2";
+
+        db.upsert_profile(short, Some("before"), None, None, None, None)
+            .await
+            .unwrap();
+
+        let updated = db
+            .upsert_profile(
+                &format!("did:key:{short}"),
+                Some("after"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.did, short, "preserve the stored did form on update");
+        assert_eq!(updated.display_name.as_deref(), Some("after"));
+
+        let got = db
+            .get_profile(short)
+            .await
+            .unwrap()
+            .expect("profile should still resolve by bare short id");
+        assert_eq!(got.did, short);
+        assert_eq!(got.display_name.as_deref(), Some("after"));
+
+        db.set_profile_cid(&format!("did:key:{short}"), "bafytestcid")
+            .await
+            .unwrap();
+        let got = db.get_profile(short).await.unwrap().unwrap();
+        assert_eq!(got.profile_cid.as_deref(), Some("bafytestcid"));
+    }
+
     /// Verify that the Rust `normalize_owner_key` and the `OWNER_KEY_CASE_SQL`
     /// expression agree on every boundary value in the owner-key normalization
     /// set. A mismatch would let the Rust code bind a different key than the SQL
@@ -4717,6 +5987,49 @@ mod dedup_db_tests {
             assert_eq!(
                 sql_result, rust_result,
                 "normalize_owner_key(\"{val}\") mismatch: Rust = \"{rust_result}\", SQL CASE = \"{sql_result}\""
+            );
+        }
+    }
+
+    /// Verify that `PROFILE_DID_CASE_SQL` (which aliases the column `did`) also
+    /// agrees with Rust `normalize_owner_key` across the full boundary matrix.
+    #[sqlx::test]
+    async fn profile_did_case_sql_matches_normalize_owner_key(pool: PgPool) {
+        let boundary_values = [
+            "did:key:z6Mkfoo",
+            "z6Mkfoo",
+            "did:gitlawb:z6Mkfoo",
+            "did:web:example.com:alice",
+            "did:key:did:gitlawb:z6Mkfoo",
+            "",
+            "did:key:",
+            "DID:KEY:z6Mkfoo",
+        ];
+
+        let values_sql: String = boundary_values
+            .iter()
+            .map(|v| format!("('{}'::text)", v))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "WITH data(did) AS (VALUES {values_sql})
+             SELECT did, ({key}) AS normalized FROM data ORDER BY did",
+            key = super::PROFILE_DID_CASE_SQL
+        );
+
+        let rows: Vec<(String, String)> = sqlx::query_as(&sql).fetch_all(&pool).await.unwrap();
+
+        assert_eq!(
+            rows.len(),
+            boundary_values.len(),
+            "every boundary value must produce a row"
+        );
+
+        for (val, sql_result) in &rows {
+            let rust_result = super::normalize_owner_key(val);
+            assert_eq!(
+                sql_result, rust_result,
+                "PROFILE_DID_CASE_SQL(\"{val}\") mismatch: Rust = \"{rust_result}\", SQL CASE = \"{sql_result}\""
             );
         }
     }
@@ -5234,6 +6547,7 @@ mod ref_update_keyset_same_timestamp_tests {
 mod ref_certificate_tests {
     use super::{Db, RefCertificate, RepoRecord};
     use chrono::Utc;
+    use sqlx::postgres::PgPoolOptions;
     use sqlx::PgPool;
 
     async fn db(pool: PgPool) -> Db {
@@ -5453,6 +6767,158 @@ mod ref_certificate_tests {
         assert!(certs.is_empty());
     }
 
+    /// Certificate ids covering every character the prefix search has to treat
+    /// literally: the two LIKE wildcards, the escape character itself, and a
+    /// backslash (the default escape, which must stay an ordinary character).
+    const PREFIX_CERT_IDS: [&str; 5] = ["cert-a", "cert%b", "cert_c", "cert\\d", "cert!e"];
+
+    /// Seed one repo holding `PREFIX_CERT_IDS` and return the repo id.
+    async fn seed_prefix_certs(db: &Db) -> String {
+        let repo_id = uuid::Uuid::new_v4().to_string();
+
+        db.create_repo(&RepoRecord {
+            id: repo_id.clone(),
+            name: "prefix-test".into(),
+            owner_did: "did:key:zOWNER".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: "/tmp/prefix-test".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+
+        for (i, id) in PREFIX_CERT_IDS.iter().enumerate() {
+            db.insert_ref_certificate(&make_cert(
+                id,
+                &repo_id,
+                &format!("refs/heads/branch-{i}"),
+                "0000",
+                "1111",
+                &format!("2026-07-03T20:0{i}:00Z"),
+            ))
+            .await
+            .unwrap();
+        }
+
+        repo_id
+    }
+
+    #[sqlx::test]
+    async fn list_ref_certificates_by_prefix_treats_wildcards_literally(pool: PgPool) {
+        let db = db(pool).await;
+        let repo_id = seed_prefix_certs(&db).await;
+
+        // A plain prefix still matches every id that starts with it.
+        let all = db
+            .list_ref_certificates_by_prefix(&repo_id, "cert", 10)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 5, "plain prefix matches all five certs");
+
+        // `%` in the prefix must match a literal percent sign, not act as a
+        // wildcard that would also return every other seeded id.
+        let pct = db
+            .list_ref_certificates_by_prefix(&repo_id, "cert%", 10)
+            .await
+            .unwrap();
+        assert_eq!(pct.len(), 1, "percent prefix matches only literal id");
+        assert_eq!(pct[0].id, "cert%b");
+
+        // `_` must match a literal underscore, not any single character.
+        let under = db
+            .list_ref_certificates_by_prefix(&repo_id, "cert_", 10)
+            .await
+            .unwrap();
+        assert_eq!(under.len(), 1, "underscore prefix matches only literal id");
+        assert_eq!(under[0].id, "cert_c");
+
+        // `!` carries the escape role, so a caller-supplied `!` must itself be
+        // escaped and match a literal exclamation mark.
+        let bang = db
+            .list_ref_certificates_by_prefix(&repo_id, "cert!", 10)
+            .await
+            .unwrap();
+        assert_eq!(bang.len(), 1, "escape-char prefix matches only literal id");
+        assert_eq!(bang[0].id, "cert!e");
+
+        // A backslash is an ordinary character once `!` is the escape, so it must
+        // match a literal backslash rather than escaping the character after it.
+        let bs = db
+            .list_ref_certificates_by_prefix(&repo_id, "cert\\", 10)
+            .await
+            .unwrap();
+        assert_eq!(bs.len(), 1, "backslash prefix matches only literal id");
+        assert_eq!(bs[0].id, "cert\\d");
+    }
+
+    /// The prefix query must parse under either `standard_conforming_strings`
+    /// mode. Spelling the LIKE escape as a backslash SQL literal (`ESCAPE '\'`)
+    /// leaves the statement unterminated when a session runs with the legacy
+    /// `off` value, which breaks *every* prefix lookup, not only the ones that
+    /// contain a metacharacter. Connection settings come from outside the
+    /// process, so that mode can arrive from database- or role-level config.
+    #[sqlx::test]
+    async fn list_ref_certificates_by_prefix_parses_under_legacy_string_mode(pool: PgPool) {
+        let db = db(pool.clone()).await;
+        let repo_id = seed_prefix_certs(&db).await;
+
+        // Request the legacy parser mode at connection startup, the same way
+        // `PGOPTIONS` or a `ALTER ROLE ... SET` would deliver it.
+        let legacy_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                (*pool.connect_options())
+                    .clone()
+                    .options([("standard_conforming_strings", "off")]),
+            )
+            .await
+            .unwrap();
+
+        let mode: String = sqlx::query_scalar("SHOW standard_conforming_strings")
+            .fetch_one(&legacy_pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            mode, "off",
+            "test session must be in the legacy parser mode"
+        );
+
+        let legacy_db = Db::for_testing(legacy_pool.clone());
+
+        // A prefix with no metacharacters at all: this is what a backslash
+        // literal would break first, since the parse fails before the bound
+        // parameters are ever considered.
+        let all = legacy_db
+            .list_ref_certificates_by_prefix(&repo_id, "cert", 10)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 5, "plain prefix still resolves in legacy mode");
+
+        // Escaping still holds under the legacy mode.
+        let pct = legacy_db
+            .list_ref_certificates_by_prefix(&repo_id, "cert%", 10)
+            .await
+            .unwrap();
+        assert_eq!(pct.len(), 1, "percent prefix matches only literal id");
+        assert_eq!(pct[0].id, "cert%b");
+
+        let bs = legacy_db
+            .list_ref_certificates_by_prefix(&repo_id, "cert\\", 10)
+            .await
+            .unwrap();
+        assert_eq!(bs.len(), 1, "backslash prefix matches only literal id");
+        assert_eq!(bs[0].id, "cert\\d");
+
+        // Release the extra session so it can't hold the per-test database open
+        // against the harness's cleanup.
+        legacy_pool.close().await;
+    }
+
     /// NOTE: this test hand-copies the migration SQL as string literals and will
     /// silently drift if the v10 migration block changes.  The load-bearing
     /// upgrade-path test is `v10_upgrade_dedup_via_migration`, which fires the
@@ -5552,6 +7018,232 @@ mod ref_certificate_tests {
         assert_eq!(
             certs[0].id, "keep-id",
             "dedup keeps the most recent (later issued_at)"
+        );
+    }
+
+    /// INV-7: upgrade-path test — an existing node already past v1 must still get
+    /// the `pinned_cids.cid` index. It ships as its OWN v11 migration (not appended
+    /// to the applied v1 bundle), so dropping the index + its `schema_migrations`
+    /// row and re-running migrations must recreate it, exercising the real code
+    /// path rather than hand-copying the SQL.
+    #[sqlx::test]
+    async fn v18_pinned_cids_cid_index_applies_on_upgrade(pool: PgPool) {
+        async fn index_exists(pool: &PgPool) -> bool {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE indexname = 'idx_pinned_cids_cid')",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+        assert!(
+            index_exists(&pool).await,
+            "fresh migration chain creates the index"
+        );
+
+        // Simulate a node at pre-v18: drop the index and its migration record.
+        sqlx::query("DROP INDEX IF EXISTS idx_pinned_cids_cid")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 18")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !index_exists(&pool).await,
+            "precondition: index and its migration record removed"
+        );
+
+        // Re-run migrations: v11 re-applies and recreates the index on the upgrade.
+        db.run_migrations().await.unwrap();
+        assert!(
+            index_exists(&pool).await,
+            "v11 must recreate idx_pinned_cids_cid on an upgrading node"
+        );
+    }
+
+    /// #173 (jatmn), INV-7 + INV-10: the paged legacy CID scan orders on
+    /// `(created_at, id)` ASC, and `repos` had no index in that order — only
+    /// `idx_repos_updated_at`, which backed the order the paging REPLACED. Without a
+    /// matching index Postgres seq-scans `repos` and top-N sorts it to return every
+    /// page (measured: 954 shared buffers, ~47ms per page on 50k rows) while the
+    /// scarce IPFS walk admission is held, so the application-side bound the paging
+    /// buys is cancelled by an O(rows) database cost on an anonymously reachable
+    /// route. With the index each page is an Index Only Scan at 4-5 buffers with the
+    /// keyset predicate pushed down as an `Index Cond`.
+    ///
+    /// PRESENCE is the whole property, so this asserts it structurally rather than by
+    /// name: some index on `repos` must lead with `created_at` then `id`, in that
+    /// order and ascending. A rename is fine; a reorder, a direction flip, or a drop
+    /// is not. Nothing names this index in any query text, so nothing else would
+    /// notice its removal.
+    ///
+    /// Also the INV-7 upgrade path, in the shape of the v18 test above: an existing
+    /// node past v1 gets the index from its OWN v25 entry, proven by dropping the
+    /// index plus its `schema_migrations` row and re-running the real migration code.
+    /// MUTATION (RED): delete the v25 entry from `MIGRATIONS` and the fresh-chain
+    /// assertion fails.
+    #[sqlx::test]
+    async fn v25_repos_created_at_id_index_applies_on_upgrade(pool: PgPool) {
+        // Structural, not by name: the leading two columns must be `created_at` then
+        // `id`, ascending (ASC is the default, so it renders with no DESC).
+        async fn keyset_index_exists(pool: &PgPool) -> bool {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM pg_index i
+                     JOIN pg_class t ON t.oid = i.indrelid
+                     WHERE t.relname = 'repos'
+                       AND i.indnatts >= 2
+                       AND (SELECT a.attname FROM pg_attribute a
+                            WHERE a.attrelid = t.oid AND a.attnum = i.indkey[0]) = 'created_at'
+                       AND (SELECT a.attname FROM pg_attribute a
+                            WHERE a.attrelid = t.oid AND a.attnum = i.indkey[1]) = 'id'
+                       AND pg_get_indexdef(i.indexrelid) NOT LIKE '%DESC%'
+                 )",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+        assert!(
+            keyset_index_exists(&pool).await,
+            "the paged legacy CID scan's ORDER BY created_at ASC, id ASC must be \
+             index-backed, or every page seq-scans and sorts the whole repos table \
+             while the IPFS walk admission is held (INV-10)"
+        );
+
+        // Simulate a node at pre-v25: drop the index and its migration record.
+        sqlx::query("DROP INDEX IF EXISTS idx_repos_created_at_id")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 25")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !keyset_index_exists(&pool).await,
+            "precondition: index and its migration record removed"
+        );
+
+        db.run_migrations().await.unwrap();
+        assert!(
+            keyset_index_exists(&pool).await,
+            "v25 must recreate the keyset index on an upgrading node"
+        );
+    }
+
+    /// U4 (#173 round 13, F5, INV-7 upgrade path): an existing node past v1 gets the
+    /// discovery-continuation columns from its OWN v26 entry, proven by dropping the
+    /// columns plus their `schema_migrations` row and re-running the real migration
+    /// code.
+    ///
+    /// The round-trip runs on a NEVER-SWEPT database, with no `pin_repair_sweep` row at
+    /// all, because that is the state the setter's insert arm is written for. v23
+    /// declares `cursor` NOT NULL and seeds no row, so an upsert naming only the two new
+    /// columns fails its NOT NULL check on exactly the nodes this sweep exists for, and
+    /// every caller of the setter treats a failure as warn-only, so the window would
+    /// simply never rotate and nothing would say so. Asserting the read-back is what
+    /// makes that failure visible here.
+    ///
+    /// MUTATION (RED): delete the v26 entry from `MIGRATIONS` and the fresh-chain
+    /// round-trip fails on the missing columns.
+    #[sqlx::test]
+    async fn v26_discovery_continuation_applies_on_upgrade(pool: PgPool) {
+        async fn continuation_columns_exist(pool: &PgPool) -> bool {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM information_schema.columns
+                  WHERE table_name = 'pin_repair_sweep'
+                    AND column_name IN ('discovery_cursor_created_at', 'discovery_cursor_id')",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap()
+                == 2
+        }
+
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+        assert!(
+            continuation_columns_exist(&pool).await,
+            "the fresh migration chain must carry the discovery continuation columns"
+        );
+
+        // Simulate a node at pre-v26: drop the columns and their migration record.
+        sqlx::query(
+            "ALTER TABLE pin_repair_sweep
+                 DROP COLUMN IF EXISTS discovery_cursor_created_at,
+                 DROP COLUMN IF EXISTS discovery_cursor_id",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 26")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !continuation_columns_exist(&pool).await,
+            "precondition: columns and their migration record removed"
+        );
+
+        db.run_migrations().await.unwrap();
+        assert!(
+            continuation_columns_exist(&pool).await,
+            "v26 must add the continuation columns on an upgrading node"
+        );
+
+        // NEVER SWEPT: no `pin_repair_sweep` row exists, so the setter has to INSERT and
+        // its insert arm has to satisfy v23's NOT NULL `cursor`.
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM pin_repair_sweep")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0,
+            "precondition: the sweep has never run on this node"
+        );
+        assert_eq!(
+            db.discovery_continuation().await.unwrap(),
+            (String::new(), String::new()),
+            "an unswept node reads the empty continuation, which means the head of the list"
+        );
+        db.set_discovery_continuation("2020-01-01T00:00:00+00:00", "repo-42")
+            .await
+            .expect("the continuation persists on a never-swept node");
+        assert_eq!(
+            db.discovery_continuation().await.unwrap(),
+            (
+                "2020-01-01T00:00:00+00:00".to_string(),
+                "repo-42".to_string()
+            ),
+            "the continuation round-trips"
+        );
+        assert_eq!(
+            db.pin_repair_cursor().await.unwrap(),
+            "",
+            "the insert arm seeds the row-walk cursor at the head of the table"
+        );
+
+        // A rotation must never move the row walk. Park the row cursor, rotate again,
+        // and read it back.
+        db.set_pin_repair_cursor("ff00").await.unwrap();
+        db.set_discovery_continuation("2021-06-01T00:00:00+00:00", "repo-99")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.pin_repair_cursor().await.unwrap(),
+            "ff00",
+            "the update arm touches only the continuation columns, so an in-progress \
+             table walk is never rewound by a window rotation"
         );
     }
 
@@ -5951,10 +7643,12 @@ mod ref_update_db_tests {
 
 #[cfg(test)]
 mod peer_reachability_tests {
-    use super::Db;
+    use super::{Db, PeerWriteAuthority};
     use sqlx::PgPool;
 
-    const VICTIM_DID: &str = "did:key:z6MkvictimPeerFixture";
+    // Real derivable did:key fixtures. The unproven arm resolves the verifying
+    // key, so a made-up method-id is refused before any SQL runs.
+    const VICTIM_DID: &str = "did:key:z6Mkrmsd28nDTPBjk55EJCSjtJLVJDZffyczjBEHvywhutM4";
     const HONEST_URL: &str = "https://honest-peer.example.com";
     const ATTACKER_URL: &str = "https://attacker.example.com";
 
@@ -5995,7 +7689,9 @@ mod peer_reachability_tests {
     /// Seed a peer that has earned reachability, asserting the seed took so a
     /// later case cannot pass vacuously on a row that was never written.
     async fn seed_reachable(db: &Db) {
-        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
         db.mark_peer_ping(VICTIM_DID, true).await.unwrap();
         assert_eq!(
             peer(db, VICTIM_DID).await,
@@ -6012,7 +7708,16 @@ mod peer_reachability_tests {
         let db = db(pool).await;
         seed_reachable(&db).await;
 
-        db.upsert_peer(VICTIM_DID, ATTACKER_URL).await.unwrap();
+        // Proven: the repoint is the row's own key announcing a new host, which
+        // is the case #270's reset is about. An unproven repoint is refused
+        // outright now, so it cannot express this property.
+        db.upsert_peer(
+            VICTIM_DID,
+            ATTACKER_URL,
+            PeerWriteAuthority::Proven(VICTIM_DID),
+        )
+        .await
+        .unwrap();
 
         let (url, reachable) = peer(&db, VICTIM_DID).await;
         assert_eq!(url, ATTACKER_URL, "the URL should still be rewritten");
@@ -6030,7 +7735,9 @@ mod peer_reachability_tests {
         let db = db(pool).await;
         seed_reachable(&db).await;
 
-        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
 
         let (url, reachable) = peer(&db, VICTIM_DID).await;
         assert_eq!(url, HONEST_URL);
@@ -6048,10 +7755,14 @@ mod peer_reachability_tests {
     #[sqlx::test]
     async fn same_url_reannounce_does_not_grant_reachability(pool: PgPool) {
         let db = db(pool).await;
-        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
         assert_eq!(peer(&db, VICTIM_DID).await, (HONEST_URL.to_string(), false));
 
-        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
 
         let (_, reachable) = peer(&db, VICTIM_DID).await;
         assert!(
@@ -6066,11 +7777,19 @@ mod peer_reachability_tests {
     async fn fresh_peer_inserts_unreachable(pool: PgPool) {
         let db = db(pool).await;
 
-        db.upsert_peer("did:key:z6MkfreshPeerFixture", HONEST_URL)
-            .await
-            .unwrap();
+        db.upsert_peer(
+            "did:key:z6MkfGVENKztfeXa631WYVqyAGaXeP8AnN6nTkfogHn9vaaQ",
+            HONEST_URL,
+            PeerWriteAuthority::Unproven,
+        )
+        .await
+        .unwrap();
 
-        let (_, reachable) = peer(&db, "did:key:z6MkfreshPeerFixture").await;
+        let (_, reachable) = peer(
+            &db,
+            "did:key:z6MkfGVENKztfeXa631WYVqyAGaXeP8AnN6nTkfogHn9vaaQ",
+        )
+        .await;
         assert!(!reachable, "a never-probed peer must insert unreachable");
     }
 
@@ -6085,7 +7804,13 @@ mod peer_reachability_tests {
         seed_reachable(&db).await;
 
         let with_slash = format!("{HONEST_URL}/");
-        db.upsert_peer(VICTIM_DID, &with_slash).await.unwrap();
+        db.upsert_peer(
+            VICTIM_DID,
+            &with_slash,
+            PeerWriteAuthority::Proven(VICTIM_DID),
+        )
+        .await
+        .unwrap();
 
         let (url, reachable) = peer(&db, VICTIM_DID).await;
         assert_eq!(url, with_slash);
@@ -6102,16 +7827,728 @@ mod peer_reachability_tests {
     #[sqlx::test]
     async fn same_url_reannounce_still_advances_last_seen(pool: PgPool) {
         let db = db(pool).await;
-        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
         let first = last_seen(&db, VICTIM_DID).await;
 
-        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
 
         let second = last_seen(&db, VICTIM_DID).await;
         assert!(
             second > first,
             "a same-URL re-announce is a liveness signal and must still \
              advance last_seen: {first} then {second}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod peer_authority_tests {
+    use super::{Db, PeerWriteAuthority, PeerWriteDenied};
+    use sqlx::PgPool;
+
+    // Real derivable did:key fixtures. The unproven arm resolves the verifying
+    // key, so a made-up method-id is refused before any SQL runs.
+    const VICTIM_DID: &str = "did:key:z6MkuMqUm4i228K9qXidJ57zqSWAcQLgrcbMxB8RKVLuqitj";
+    const OTHER_DID: &str = "did:key:z6MkuzEVwHSWSCLq6xAkgTAJxHMa24KuBtgozce77TEihnWD";
+    const WEB_DID: &str = "did:web:squatter.example.com";
+    const HONEST_URL: &str = "https://honest-peer.example.com";
+    const ATTACKER_URL: &str = "https://attacker.example.com";
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    /// The whole row, read back through `list_peers` rather than raw SQL, so a
+    /// case that claims "unchanged" is comparing every column a consumer sees.
+    async fn row(db: &Db, did: &str) -> Option<(String, String, Option<String>, bool, String)> {
+        db.list_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.did == did)
+            .map(|p| {
+                (
+                    p.did,
+                    p.http_url,
+                    p.last_seen,
+                    p.last_ping_ok,
+                    p.announced_at,
+                )
+            })
+    }
+
+    /// Seed a row and assert the seed took, so no case below can pass
+    /// vacuously against a row that was never written.
+    async fn seed(db: &Db) -> (String, String, Option<String>, bool, String) {
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
+        db.mark_peer_ping(VICTIM_DID, true).await.unwrap();
+        let seeded = row(db, VICTIM_DID).await.expect("seed did not take");
+        assert_eq!(seeded.1, HONEST_URL, "seed did not take");
+        assert!(seeded.3, "seed did not earn reachability");
+        seeded
+    }
+
+    fn denial(err: anyhow::Error) -> PeerWriteDenied {
+        err.downcast::<PeerWriteDenied>()
+            .expect("rejection must be the typed denial, or the handler renders it as a 500")
+    }
+
+    /// A row a deployed database ALREADY holds must keep refreshing its
+    /// liveness. Before this gate existed `upsert_peer` did no DID validation
+    /// at all and the handler accepted any parseable DID, so live peer tables
+    /// carry did:web rows and did:key rows whose key never resolved. Judging
+    /// the DID before looking at whether the row exists freezes those forever:
+    /// the unsigned refresh is refused, and a signed one is impossible because
+    /// no key resolves. Nothing is protected by that, since the row is already
+    /// there and an identical-URL refresh changes no authority. Kills a gate
+    /// scoped to the DID instead of to the INSERT.
+    #[sqlx::test]
+    async fn a_legacy_row_can_still_refresh_its_liveness(pool: PgPool) {
+        let db = db(pool).await;
+
+        for legacy in [WEB_DID, "did:key:znotarealkeymaterial"] {
+            sqlx::query(
+                "INSERT INTO peers (did, http_url, last_seen, announced_at) \
+                 VALUES ($1, $2, $3, $3)",
+            )
+            .bind(legacy)
+            .bind(HONEST_URL)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&db.pool)
+            .await
+            .expect("seeding a pre-gate row must succeed");
+
+            db.upsert_peer(legacy, HONEST_URL, PeerWriteAuthority::Unproven)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("a legacy row must keep refreshing its liveness: {legacy} -> {e}")
+                });
+        }
+    }
+
+    /// The other half: the gate still refuses to CREATE such a row. Without
+    /// this, scoping the check to the insert path could be satisfied by
+    /// dropping the check altogether.
+    #[sqlx::test]
+    async fn a_legacy_did_still_cannot_be_created_fresh(pool: PgPool) {
+        let db = db(pool).await;
+
+        let err = db
+            .upsert_peer(WEB_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .expect_err("an unseen non-did:key must still be refused at insert");
+        assert!(
+            matches!(denial(err), PeerWriteDenied::UnsupportedDidMethod { .. }),
+            "the insert refusal must survive the insert-scoping"
+        );
+    }
+
+    /// Discovery stays open: an unproven caller may still seed an unseen
+    /// did:key row. Kills a gate widened until it rejects inserts too.
+    #[sqlx::test]
+    async fn unproven_insert_of_an_unseen_did_key_is_allowed(pool: PgPool) {
+        let db = db(pool).await;
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
+
+        let (_, url, last_seen, reachable, _) = row(&db, VICTIM_DID).await.expect("row missing");
+        assert_eq!(url, HONEST_URL);
+        assert!(last_seen.is_some());
+        assert!(!reachable, "a never-probed peer must insert unreachable");
+    }
+
+    /// The defect this change exists to close. Kills the unconditional
+    /// `ON CONFLICT(did) DO UPDATE SET http_url = $2`.
+    #[sqlx::test]
+    async fn unproven_repoint_of_an_existing_row_is_rejected(pool: PgPool) {
+        let db = db(pool).await;
+        let before = seed(&db).await;
+
+        let err = db
+            .upsert_peer(VICTIM_DID, ATTACKER_URL, PeerWriteAuthority::Unproven)
+            .await
+            .expect_err("an unproven repoint must be an error, never a silent no-op");
+
+        assert!(
+            matches!(denial(err), PeerWriteDenied::UnprovenRepoint { .. }),
+            "the denial must be the typed repoint refusal"
+        );
+        assert_eq!(
+            row(&db, VICTIM_DID).await.expect("row vanished"),
+            before,
+            "the stored row must be byte-identical after a refused repoint"
+        );
+    }
+
+    /// Honest peers re-announce, so the identical-URL case is a liveness
+    /// refresh, not a denial. The URL string is reused byte for byte: the
+    /// comparison inherited from #270 is exact, so a trailing slash would make
+    /// this pass as a repoint rejection instead. Kills a too-wide gate.
+    #[sqlx::test]
+    async fn unproven_reannounce_of_the_identical_url_refreshes_last_seen(pool: PgPool) {
+        let db = db(pool).await;
+        let before = seed(&db).await;
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .expect("an identical-URL re-announce cannot change the URL, so it is allowed");
+
+        let after = row(&db, VICTIM_DID).await.expect("row vanished");
+        assert_eq!(after.1, HONEST_URL, "URL untouched");
+        assert_eq!(after.3, before.3, "reachability untouched");
+        assert_eq!(after.4, before.4, "announced_at untouched");
+        let parse = |s: &Option<String>| {
+            chrono::DateTime::parse_from_rfc3339(s.as_deref().expect("last_seen is set")).unwrap()
+        };
+        assert!(
+            parse(&after.2) > parse(&before.2),
+            "a same-URL re-announce is a liveness signal and must advance last_seen"
+        );
+    }
+
+    /// A signed repoint from the row's own key is the allowed case, and it must
+    /// still clear reachability per #270: a proven repoint is still an unprobed
+    /// URL. Kills a gate that rejects proven writes, and kills dropping the
+    /// #270 CASE.
+    #[sqlx::test]
+    async fn proven_repoint_by_the_rows_own_did_updates_and_clears_reachability(pool: PgPool) {
+        let db = db(pool).await;
+        seed(&db).await;
+
+        db.upsert_peer(
+            VICTIM_DID,
+            ATTACKER_URL,
+            PeerWriteAuthority::Proven(VICTIM_DID),
+        )
+        .await
+        .unwrap();
+
+        let (_, url, _, reachable, _) = row(&db, VICTIM_DID).await.expect("row missing");
+        assert_eq!(url, ATTACKER_URL, "a proven repoint must land");
+        assert!(
+            !reachable,
+            "a repointed peer must re-earn reachability, even when the repoint is signed"
+        );
+    }
+
+    /// The RUSTSEC-2022-0009 shape at the boundary: a valid proof of control
+    /// over one DID must not authorize a write to a different DID's row. Kills
+    /// a bare proven/unproven flag that never checks WHICH DID was proven, and
+    /// kills neutralizing the boundary's comparison.
+    #[sqlx::test]
+    async fn proof_of_another_did_cannot_write_this_row(pool: PgPool) {
+        let db = db(pool).await;
+        let before = seed(&db).await;
+
+        let err = db
+            .upsert_peer(
+                VICTIM_DID,
+                ATTACKER_URL,
+                PeerWriteAuthority::Proven(OTHER_DID),
+            )
+            .await
+            .expect_err("a proof naming another DID must not authorize this row");
+
+        assert!(
+            matches!(denial(err), PeerWriteDenied::ProofDidMismatch { .. }),
+            "the denial must name the proof/target mismatch"
+        );
+        assert_eq!(
+            row(&db, VICTIM_DID).await.expect("row vanished"),
+            before,
+            "the stored row must be byte-identical after a mismatched proof"
+        );
+    }
+
+    /// Signed first contact must not regress: a proven write for an unseen DID
+    /// still inserts.
+    #[sqlx::test]
+    async fn proven_insert_of_an_unseen_did_is_allowed(pool: PgPool) {
+        let db = db(pool).await;
+
+        db.upsert_peer(
+            VICTIM_DID,
+            HONEST_URL,
+            PeerWriteAuthority::Proven(VICTIM_DID),
+        )
+        .await
+        .unwrap();
+
+        let (_, url, _, reachable, _) = row(&db, VICTIM_DID).await.expect("row missing");
+        assert_eq!(url, HONEST_URL);
+        assert!(!reachable, "a never-probed peer must insert unreachable");
+    }
+
+    /// R8. A DID whose method can never authenticate is refused in the
+    /// validation class, with nothing written. Kills a method gate applied only
+    /// to the update path. This case is about the METHOD LABEL alone, which is
+    /// the one thing methodNotSupported can truthfully say; a did:key whose key
+    /// material does not resolve is a different refusal and is covered by the
+    /// unresolvable tests below, so it is deliberately not in this loop.
+    #[sqlx::test]
+    async fn unproven_insert_of_a_non_did_key_is_rejected(pool: PgPool) {
+        let db = db(pool).await;
+
+        for did in [WEB_DID, "did:gitlawb:z6MkSomeKey"] {
+            let err = db
+                .upsert_peer(did, HONEST_URL, PeerWriteAuthority::Unproven)
+                .await
+                .expect_err("a DID method that can never authenticate must not be insertable");
+
+            let denied = denial(err);
+            assert!(
+                matches!(denied, PeerWriteDenied::UnsupportedDidMethod { .. }),
+                "the denial must be the typed method refusal: {did}"
+            );
+            assert!(
+                denied
+                    .to_string()
+                    .contains("methodNotSupported: only did:key peers"),
+                "the denial must name the unsupported method"
+            );
+            assert!(
+                row(&db, did).await.is_none(),
+                "a rejected announce must leave no row behind: {did}"
+            );
+        }
+    }
+
+    /// The oversized method-id is refused ahead of the quadratic base58 decode,
+    /// and the caller is told THAT, not that did:key is unsupported. Kills
+    /// folding the key-resolution failure back into the method class.
+    #[sqlx::test]
+    async fn unproven_insert_of_an_oversized_did_key_reports_the_cause(pool: PgPool) {
+        let db = db(pool).await;
+        let did = format!("did:key:z{}", "a".repeat(70));
+
+        let err = db
+            .upsert_peer(&did, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .expect_err("a did:key whose key cannot be resolved must not be insertable");
+
+        let denied = denial(err);
+        assert!(
+            matches!(denied, PeerWriteDenied::UnresolvableDid { .. }),
+            "the denial must be the typed resolution refusal"
+        );
+        let denied = denied.to_string();
+        assert!(
+            denied.contains("cannot resolve DID"),
+            "an unresolvable did:key must report resolution, not method support, got {denied:?}"
+        );
+        assert!(
+            denied.contains("method-specific id too long"),
+            "the denial must carry the underlying cause, got {denied:?}"
+        );
+        assert!(
+            row(&db, &did).await.is_none(),
+            "a rejected announce must leave no row behind: {did}"
+        );
+    }
+
+    /// The remaining resolution failures, one input class per entry, each
+    /// pinned to its own cause. The multibase entry asserts only the class
+    /// message: its sub-reason is multibase's own Display and a dependency bump
+    /// can reword it.
+    #[sqlx::test]
+    async fn unproven_insert_of_an_unresolvable_did_key_reports_the_cause(pool: PgPool) {
+        let db = db(pool).await;
+
+        // "0" is not in the base58btc alphabet, so the decode itself fails.
+        // "notarealkey" carries the right method label and no decodable key,
+        // which is the permanently uncorrectable row this gate prevents.
+        // The secp256k1 vector is the W3C did:key test vector: it decodes
+        // cleanly and is simply not an ed25519 key.
+        // The wrong-length vector is base58btc(0xed 0x01 || sixteen bytes
+        // 0x00..0x0f) with the multibase 'z' prefix: the right multicodec, half
+        // the key.
+        for (did, cause) in [
+            ("did:key:z0", None),
+            ("did:key:notarealkey", None),
+            (
+                "did:key:zQ3shokFTS3brHcDQrn82RUDfCZESWL1ZdCEJwekUDPQiYBme",
+                Some("not an ed25519 multicodec key"),
+            ),
+            (
+                "did:key:zAq9r99PUfP1Xyitb5n8V9sxht",
+                Some("ed25519 key must be 32 bytes"),
+            ),
+        ] {
+            let err = db
+                .upsert_peer(did, HONEST_URL, PeerWriteAuthority::Unproven)
+                .await
+                .expect_err("a did:key whose key cannot be resolved must not be insertable");
+
+            let denied = denial(err);
+            assert!(
+                matches!(denied, PeerWriteDenied::UnresolvableDid { .. }),
+                "the denial must be the typed resolution refusal: {did}"
+            );
+            let denied = denied.to_string();
+            assert!(
+                denied.contains("cannot resolve DID"),
+                "an unresolvable did:key must report resolution, not method support: \
+                 {did} got {denied:?}"
+            );
+            if let Some(cause) = cause {
+                assert!(
+                    denied.contains(cause),
+                    "the denial must carry the underlying cause {cause:?}: {did} got {denied:?}"
+                );
+            }
+            assert!(
+                row(&db, did).await.is_none(),
+                "a rejected announce must leave no row behind: {did}"
+            );
+        }
+    }
+
+    /// The bootstrap announce-back in main.rs hands this boundary the contacted
+    /// peer's raw JSON string, so a value that never parses as a DID reaches
+    /// here; the announce handler cannot produce it, since it parses req.did
+    /// first. The parse error is what an operator reading that loop's warning
+    /// needs, and methodNotSupported would be a false claim about a string that
+    /// names no method at all.
+    #[sqlx::test]
+    async fn unproven_insert_of_an_unparseable_string_reports_the_parse_failure(pool: PgPool) {
+        let db = db(pool).await;
+
+        for (did, cause) in [
+            ("not-a-did", "does not start with 'did:'"),
+            ("did:foo:x", "unsupported DID method: foo"),
+        ] {
+            let err = db
+                .upsert_peer(did, HONEST_URL, PeerWriteAuthority::Unproven)
+                .await
+                .expect_err("a string that is not a DID must not be insertable");
+
+            let denied = denial(err);
+            assert!(
+                matches!(denied, PeerWriteDenied::UnresolvableDid { .. }),
+                "the denial must be the typed resolution refusal: {did}"
+            );
+            let denied = denied.to_string();
+            assert!(
+                denied.contains("cannot resolve DID"),
+                "an unparseable DID must report resolution, not method support: \
+                 {did} got {denied:?}"
+            );
+            assert!(
+                denied.contains(cause),
+                "the denial must carry the parse failure {cause:?}: {did} got {denied:?}"
+            );
+            assert!(
+                row(&db, did).await.is_none(),
+                "a rejected announce must leave no row behind: {did}"
+            );
+        }
+    }
+}
+
+/// #273 completeness ledger: every writer of the `peers` table.
+///
+/// The required set is derived from the authority that DEFINES membership, the
+/// write statements themselves, not from the set of `upsert_peer` callers. A
+/// caller scan is structurally blind to a future writer that issues its own SQL
+/// and bypasses `upsert_peer`, which is precisely the case the type system
+/// cannot see.
+///
+/// The type system carries the real weight: `upsert_peer`'s authority parameter
+/// has no default, so a new caller cannot omit its declaration, compile-enforced
+/// and exhaustive by construction. This scan is the backstop for the bypass case
+/// alone, which is why it is one equality assertion rather than a framework.
+///
+/// The ledger, one row per function that writes the table:
+///
+/// | Writer | Disposition |
+/// | --- | --- |
+/// | `upsert_peer` (db/mod.rs) | guarded by the authority parameter |
+/// | `mark_peer_ping` (db/mod.rs) | benign for `http_url`: it writes only `last_seen` and `last_ping_ok`. It IS the table's other production writer, and its unauthenticated reachability is tracked separately as issue #269 |
+/// | `prune_self_peers` (db/mod.rs) | a delete keyed on `http_url`; cannot repoint; boot-only caller in main.rs |
+/// | `prune_non_public_peers` (db/mod.rs) | a delete keyed on a computed bad-DID array; cannot repoint; boot-only caller in main.rs |
+/// | `seed_local_peer` (sync.rs) | excluded by test-module location: a deliberate `upsert_peer` bypass for `file://` fixtures, which the public-URL gate rejects |
+/// | `a_legacy_row_can_still_refresh_its_liveness` (db/mod.rs) | test-only. Seeds a PRE-GATE row by raw SQL on purpose: `upsert_peer` cannot create one, since the gate it is testing refuses exactly that DID. The fixture models what a deployed table already holds |
+/// | `gossip_ping_round_requires_two_failures_before_persisting_unreachable` (main.rs) | test-only fixture seed. Raw SQL because the test drives the readiness HYSTERESIS, which needs a row already at `last_ping_ok = TRUE` before the round runs; it never exercises the announce gate |
+/// | `manual_ping_uses_readiness_without_mutating_federation_gate` (api/peers.rs) | test-only fixture seed, same shape and same reason: the row under test must pre-exist so the assertion is about what the ping does NOT rewrite |
+///
+/// And the `upsert_peer` CALL-SITE authority table, which the ledger above
+/// structurally cannot hold, because the bootstrap site issues no SQL of its own
+/// and therefore can never appear in a scan of write statements:
+///
+/// | Call site | Authority declared |
+/// | --- | --- |
+/// | api/peers.rs (announce) | proven if and only if the `AuthenticatedDid` extension is present, carrying that extension's DID |
+/// | main.rs (bootstrap announce-back) | unproven, unconditionally. Reasoned-not-run: no runtime test reaches that site in this change |
+#[cfg(test)]
+mod peers_table_writer_guard {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    /// The per-file scan, split out so the multi-line-SQL property can be
+    /// asserted against a synthetic source rather than only against the real
+    /// tree, which happens to contain no multi-line peers write today. A guard
+    /// whose blind spot is invisible because the tree does not currently
+    /// exercise it is one that fails the moment somebody writes normal code.
+    fn scan_source(src: &str) -> BTreeMap<String, usize> {
+        let needles: Vec<String> = needles().iter().map(|n| n.to_lowercase()).collect();
+        let mut found: BTreeMap<String, usize> = BTreeMap::new();
+        // Normalize the WHOLE file before matching, not each line on its
+        // own. Per-line `contains` is whitespace- and case-sensitive, so
+        // `sqlx::query(r#"UPDATE\n  peers SET ..."#)` walked straight past
+        // it, and that multi-line form is how the longer queries in this
+        // file are already written. Verified both ways: the single-line
+        // bypass went RED, the identical statement split across lines
+        // stayed GREEN. Offsets are mapped back to line numbers so each
+        // statement is still attributed to the function that issues it.
+        let mut flat = String::with_capacity(src.len());
+        let mut starts: Vec<(usize, usize)> = Vec::new(); // (offset, line index)
+        for (idx, line) in src.lines().enumerate() {
+            starts.push((flat.len(), idx));
+            flat.push_str(&line.trim().to_lowercase());
+            flat.push(' ');
+        }
+        let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // Re-derive offsets against the collapsed text by walking it once.
+        let mut collapsed = String::with_capacity(flat.len());
+        let mut owners: Vec<usize> = Vec::new(); // line index per byte
+        for (idx, line) in src.lines().enumerate() {
+            for tok in line.trim().to_lowercase().split_whitespace() {
+                if !collapsed.is_empty() {
+                    collapsed.push(' ');
+                    owners.push(idx);
+                }
+                for _ in 0..tok.len() {
+                    owners.push(idx);
+                }
+                collapsed.push_str(tok);
+            }
+        }
+
+        let fn_at: Vec<&str> = {
+            let mut current = "<module level>";
+            src.lines()
+                .map(|line| {
+                    if let Some(name) = declared_fn(line) {
+                        current = name;
+                    }
+                    current
+                })
+                .collect()
+        };
+
+        for needle in &needles {
+            let mut from = 0usize;
+            while let Some(rel) = collapsed[from..].find(needle.as_str()) {
+                let at = from + rel;
+                let line_idx = owners.get(at).copied().unwrap_or(0);
+                let owner = fn_at.get(line_idx).copied().unwrap_or("<module level>");
+                *found.entry(owner.to_string()).or_default() += 1;
+                from = at + needle.len();
+            }
+        }
+        found
+    }
+
+    /// Each dispositioned writer and the number of statements it issues against
+    /// the table. Bidirectional: an undispositioned hit fails, and so does a
+    /// listed function that no longer has one.
+    const LEDGER: &[(&str, usize)] = &[
+        ("a_legacy_row_can_still_refresh_its_liveness", 1),
+        (
+            "gossip_ping_round_requires_two_failures_before_persisting_unreachable",
+            1,
+        ),
+        (
+            "manual_ping_uses_readiness_without_mutating_federation_gate",
+            1,
+        ),
+        ("mark_peer_ping", 1),
+        ("prune_non_public_peers", 1),
+        ("prune_self_peers", 1),
+        ("seed_local_peer", 1),
+        ("upsert_peer", 2),
+    ];
+
+    /// Assembled at runtime rather than written as literals, so this module's
+    /// own source does not match the scan it performs.
+    fn needles() -> Vec<String> {
+        ["INSERT INTO ", "UPDATE ", "DELETE FROM "]
+            .iter()
+            .map(|verb| format!("{verb}peers"))
+            .collect()
+    }
+
+    fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("the crate source tree must be readable") {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The function a line declares, if it declares one.
+    fn declared_fn(line: &str) -> Option<&str> {
+        let trimmed = line.trim_start();
+        let rest = [
+            "pub(crate) async fn ",
+            "pub(crate) fn ",
+            "pub async fn ",
+            "pub fn ",
+            "async fn ",
+            "fn ",
+        ]
+        .iter()
+        .find_map(|p| trimmed.strip_prefix(p))?;
+        rest.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .next()
+            .filter(|name| !name.is_empty())
+    }
+
+    /// The backstop the authority parameter cannot provide: a new raw write
+    /// against the table from outside `upsert_peer` is invisible to the type
+    /// system, so it is caught here or not at all.
+    /// The blind spot this guard shipped with: matching a verb-plus-table needle
+    /// per line is whitespace- and case-sensitive, so the identical statement split
+    /// across lines walked past it. That form is how the longer queries in this
+    /// file are already written, so it is the shape a future writer most likely
+    /// takes. Both directions asserted, plus lowercase.
+    ///
+    /// The fixtures are DERIVED from `needles()` at runtime for the same reason
+    /// the needles themselves are: a literal here would be found by the scan of
+    /// this very file and counted against this test function. Deriving them
+    /// also means the test follows if the needle set ever changes.
+    #[test]
+    fn the_scan_sees_a_write_whose_verb_and_table_are_on_different_lines() {
+        for needle in needles() {
+            let (verb, table) = needle.rsplit_once(' ').expect("a needle is '<VERB> peers'");
+            let cases = [
+                ("single-line", format!("{verb} {table} SET x = $1")),
+                (
+                    "split across lines",
+                    format!("{verb}\n             {table}\n             SET x = $1"),
+                ),
+                (
+                    "lowercase, double-spaced",
+                    format!("{}  {} set x = $1", verb.to_lowercase(), table),
+                ),
+            ];
+            for (label, sql) in cases {
+                let src = format!("fn sneaky() {{\n    sqlx::query(\"{sql}\");\n}}\n");
+                let found = scan_source(&src);
+                assert_eq!(
+                    found.get("sneaky").copied(),
+                    Some(1),
+                    "the scan missed a peers write written {label} with needle {needle:?}: {found:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_peers_table_write_is_dispositioned() {
+        let mut files = Vec::new();
+        rust_sources(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        // Anti-vacuity: a scrape that walked nothing would report a clean tree.
+        assert!(
+            files.len() > 10,
+            "the scan found only {} source files, so a clean result proves nothing",
+            files.len()
+        );
+
+        let mut found: BTreeMap<String, usize> = BTreeMap::new();
+        for file in &files {
+            let src = std::fs::read_to_string(file).expect("source file must be readable");
+
+            for (owner, n) in scan_source(&src) {
+                *found.entry(owner).or_default() += n;
+            }
+        }
+
+        let expected: BTreeMap<String, usize> =
+            LEDGER.iter().map(|(f, n)| ((*f).to_string(), *n)).collect();
+        assert_eq!(
+            found, expected,
+            "the peers-table writers no longer match the ledger. A new writer must \
+             be dispositioned in the table above (and gated), and a removed one \
+             dropped from LEDGER"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cid_candidate_order_tests {
+    use super::Db;
+    use sqlx::PgPool;
+
+    /// The candidate order `oids_for_cid` returns must not depend on the physical
+    /// row order in `pinned_cids`.
+    ///
+    /// `get_by_cid` walks the candidates under ONE shared probe budget, visit budget
+    /// and pager, so whichever candidate comes back first is the one that spends the
+    /// request's budget. Without an `ORDER BY` the query is a bare sequential scan and
+    /// Postgres is free to return heap order, which any UPDATE to any row rewrites: two
+    /// nodes holding identical data, or one node before and after an unrelated write,
+    /// resolve the same CID by trying candidates in a different order, so one serves the
+    /// object and the other sheds a 503.
+    ///
+    /// The sibling `pin_sources_for_oid` already orders its union for exactly this
+    /// reason, and the handler's own comment leans on that determinism.
+    ///
+    /// MUTATION (RED): drop the `ORDER BY` and the post-UPDATE read comes back rotated.
+    #[sqlx::test]
+    async fn oids_for_cid_is_ordered_independently_of_physical_row_order(pool: PgPool) {
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+
+        let cid = "bafkreiorderingfixtureaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let oids = ["aa".repeat(32), "bb".repeat(32), "cc".repeat(32)];
+        for oid in &oids {
+            db.record_pinned_cid(oid, cid, None).await.unwrap();
+        }
+
+        let before = db.oids_for_cid(cid).await.unwrap();
+        assert_eq!(before.len(), 3, "fixture must seed three candidates");
+
+        // Move the first candidate to the end of the heap the way production does it:
+        // an unpin followed by a re-pin of the same object. An in-place UPDATE is not
+        // enough, since a HOT update leaves the row reachable from its original item
+        // pointer and a sequential scan still returns it in its old position.
+        sqlx::query("DELETE FROM pinned_cids WHERE sha256_hex = $1")
+            .bind(&oids[0])
+            .execute(&pool)
+            .await
+            .expect("unpin one candidate");
+        db.record_pinned_cid(&oids[0], cid, None).await.unwrap();
+
+        let after = db.oids_for_cid(cid).await.unwrap();
+        assert_eq!(
+            before, after,
+            "an unrelated write to one candidate must not reorder the candidate list; \
+             the order decides which oid spends the request's shared budget"
+        );
+
+        let mut sorted = after.clone();
+        sorted.sort();
+        assert_eq!(
+            after, sorted,
+            "the order must be a stated one (ascending oid), not whatever the heap holds"
         );
     }
 }

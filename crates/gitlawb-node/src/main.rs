@@ -31,6 +31,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use clap::Parser;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -58,6 +59,32 @@ struct DbStartupStatus {
     next_retry_secs: AtomicU64,
 }
 
+/// Hard ceiling on the advisory-lock pool's `max_connections`.
+///
+/// `max_concurrent_git_pushes` is validated all the way up to 1_048_576, and the lock
+/// pool used to derive its size straight from that knob, so raising the push cap
+/// silently raised the node's Postgres connection ceiling with no CLI error and no
+/// relation to the server's own `max_connections` (#173 F4). The node's total budget is
+/// now bounded: `db_max_connections` (default 48) + at most this.
+const LOCK_POOL_MAX_CONNECTIONS: u32 = 64;
+
+/// Connections the lock pool keeps above the push cap. Covers the three non-push
+/// `acquire_write` callers (`api/issues.rs` x2, `api/pulls.rs`), which hold no
+/// concurrency permit, so a push never queues here for a connection where it did not
+/// before.
+const LOCK_POOL_PUSH_HEADROOM: u8 = 8;
+
+/// Size the advisory-lock pool for a given push cap: the cap plus
+/// [`LOCK_POOL_PUSH_HEADROOM`], clamped to [`LOCK_POOL_MAX_CONNECTIONS`]. Past the
+/// clamp a push may wait for a lock-pool connection, which is a bounded wait that sheds
+/// a clean 503 (see `LockPoolBusy`), not an unbounded hang.
+fn lock_pool_size(max_concurrent_git_pushes: usize) -> u32 {
+    u32::try_from(max_concurrent_git_pushes)
+        .unwrap_or(u32::MAX)
+        .saturating_add(u32::from(LOCK_POOL_PUSH_HEADROOM))
+        .min(LOCK_POOL_MAX_CONNECTIONS)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -74,6 +101,13 @@ async fn main() -> Result<()> {
     // bootstrap peers. Operators can opt out via GITLAWB_BOOTSTRAP_DISABLE_SEEDS.
     bootstrap::merge_seeds(&mut config);
 
+    // Fail fast on config combinations that are individually in-range but jointly
+    // unsafe — notably a DB pool too small for the concurrent-write cap, which
+    // would let a push burst starve every other DB path (#174 F1).
+    config
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid configuration: {e}"))?;
+
     if !config.public_read {
         warn!(
             "GITLAWB_PUBLIC_READ=false is reserved; per-repository private-read enforcement is not wired in alpha"
@@ -82,6 +116,9 @@ async fn main() -> Result<()> {
 
     // Load or generate the node's identity keypair
     let keypair = load_or_create_keypair(&config)?;
+    // Sealing key for the legacy-scan continuation tokens, DERIVED from the identity
+    // just loaded so it is the same key after a restart (see `derive_scan_token_key`).
+    let scan_token_key = AppState::derive_scan_token_key(&keypair);
     let node_did = keypair.did();
 
     // One-time metrics init. Must run before any handler that calls into
@@ -279,8 +316,20 @@ async fn main() -> Result<()> {
         None
     };
 
-    let repo_store =
-        git::repo_store::RepoStore::new(config.repos_dir.clone(), tigris, db.pool().clone());
+    // Repo write locks run on their own pool, never the main query pool: each push
+    // holds its connection for the whole receive-pack, so a burst of concurrent
+    // pushes drawing from the main pool would park that many connections for the
+    // duration of their receive-packs and starve every other query. That holds
+    // whatever the two pools are sized at, which is why the separation is
+    // structural rather than a consequence of the defaults; config validate()
+    // separately requires db_max_connections >= max_concurrent_git_pushes + 8. See
+    // build_lock_pool for the cancellation semantics (#173).
+    let lock_pool = git::repo_store::build_lock_pool(
+        db.pool(),
+        lock_pool_size(config.max_concurrent_git_pushes),
+        std::time::Duration::from_secs(config.db_acquire_timeout_secs),
+    );
+    let repo_store = git::repo_store::RepoStore::new(config.repos_dir.clone(), tigris, lock_pool);
 
     // Per-DID limiter for the creation endpoints. Keyed on the authenticated
     // DID (attacker-varied), so bound its key set to cap memory.
@@ -374,11 +423,110 @@ async fn main() -> Result<()> {
         rate_limiter,
         create_ip_rate_limiter,
         push_rate_limiter,
+        ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
+        // The legacy-probe budget is operator-tunable via GITLAWB_IPFS_MAX_LEGACY_PROBES
+        // (R5), which is what `ipfs_legacy_probe_budget` reads. NOT
+        // GITLAWB_IPFS_MAX_REPOS_WALKED, which this comment used to name: that is the
+        // separate cap on expensive visibility walks, so an operator following the old
+        // text tuned the walk cap and left this fan-out unchanged. The history-walk
+        // ceiling above stays constant (a smaller value false-503s a provenanced
+        // request). Default 256 preserves the shipped behaviour.
+        ipfs_max_legacy_probes: AppState::ipfs_legacy_probe_budget(&config),
+        ipfs_legacy_scan_page_rows: crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS,
+        // Operator-tunable via GITLAWB_IPFS_MAX_LEGACY_SCAN_ROWS, read through the same
+        // helper shape as the probe budget so the knob cannot be a silent no-op.
+        ipfs_max_legacy_scan_rows: AppState::ipfs_legacy_scan_row_budget(&config),
+        ipfs_max_legacy_scan_rule_bytes: crate::api::ipfs::MAX_LEGACY_SCAN_RULE_BYTES_PER_REQUEST,
+        ipfs_scan_token_key: Arc::new(scan_token_key),
+        ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust,
         sync_trigger_rate_limiter,
         peer_write_rate_limiter,
         shutdown_tx: shutdown_tx.clone(),
+        git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_git_ops)),
+        git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_git_pushes,
+        )),
+        // Anon receive-pack advertisements get their OWN pool, same size as the
+        // write pool but disjoint, so filling it (which takes many source IPs, each
+        // capped by git_push_advert_per_caller) never occupies a permit the
+        // authenticated POST needs (#174).
+        git_push_advert_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_git_pushes,
+        )),
+        // Bounds concurrent detached post-push encryption walks, sized from the push
+        // pool (no separate knob — Q1): completed pushes cannot outnumber active
+        // encryption walks past this (#174 P1-e).
+        git_encrypt_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_git_pushes,
+        )),
+        // Bounds how many post-push pin loops run concurrently across all repos (#174 F6),
+        // independent of the per-repo encrypt-task coalescing below. Not a bound on the
+        // MB-scale object-id lists themselves: parked tasks still hold theirs (see the
+        // field doc on AppState::pin_semaphore).
+        pin_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_pin_tasks)),
+        // Coalesces the DETACHED post-push encryption tasks per repo so a rapid pusher
+        // cannot grow the outstanding parked-waiter set past one task per repo (#174
+        // P2-2). No knob: it is a natural cap (one entry per distinct repo), not a
+        // sized pool.
+        encrypt_inflight: crate::state::EncryptInflight::new(),
+        // Per-repo in-process write-lease serializer (#174 U2/F3): supplements the pg
+        // advisory lock so a disconnected push's still-reaping git group can't be raced
+        // by a second same-node push. The map is naturally capped (one entry per contended
+        // repo, freed when unreferenced); the sized knob is how many pushes may PARK on
+        // one repo, since each parked push holds a fully buffered pack.
+        repo_write_leases: crate::state::RepoWriteLeases::new(config.repo_lease_max_waiters),
+        git_read_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            config.max_concurrent_reads_per_caller,
+        ),
+        // Per-source cap on the receive-pack advertisement, sized to an eighth of the
+        // write pool (min 1): one resolved client key (rate_limit::client_key) can hold
+        // at most this many slots in the DEDICATED advert pool (git_push_advert_semaphore,
+        // disjoint from the write pool), so saturating that pool takes ~8 distinct keys
+        // (#174). That bounds an IPv4 or single-address caller; a caller controlling many
+        // addresses (an IPv6 /64 is 2^64 keys) still gets one cap per address, since
+        // client_key uses the full IP with no prefix folding. Narrowing the keying is a
+        // deferred design call, not something these caps claim to solve. Sized off the
+        // write pool only because the advert pool is created at the same size; an advert
+        // flood cannot touch a write permit.
+        git_push_advert_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            rate_limit::per_source_push_cap(config.max_concurrent_git_pushes),
+        ),
+        // Per-source cap on the authenticated receive-pack POST, sized like the advert
+        // cap: one resolved client key can hold at most this many write-pool slots, so
+        // monopolizing the pool takes ~8 distinct keys (#174 P1-d). Same residual as
+        // above: keys are full IPs, so a caller with many addresses has many caps.
+        git_write_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            rate_limit::per_source_push_cap(config.max_concurrent_git_pushes),
+        ),
+        // Bounds concurrent /ipfs visibility walks — a distinct public cost center, so
+        // its own pool + per-source sub-cap + per-IP rate limiter, never a git pool
+        // (#174 P1-3). The per-source map is bounded (reject-before-insert, INV-15).
+        git_ipfs_walk_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_ipfs_walks,
+        )),
+        git_ipfs_walk_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            config.ipfs_walk_per_source,
+        ),
+        ipfs_rate_limiter: rate_limit::RateLimiter::new_bounded(
+            config.ipfs_rate_limit,
+            std::time::Duration::from_secs(3600),
+            200_000,
+        ),
+        // Separate WORK-budget bucket for the resolver's per-probe/per-walk charges (R6).
+        // Its capacity is DERIVED from the route limit (no new knob) and floored at the
+        // legacy-probe budget, so one full default-config legacy scan never self-throttles
+        // mid-request while the route brake above stays the pure once-per-request cap.
+        ipfs_work_rate_limiter: rate_limit::RateLimiter::new_bounded(
+            AppState::ipfs_work_budget(&config),
+            std::time::Duration::from_secs(3600),
+            200_000,
+        ),
+        git_bin: "git".to_string(),
     };
+    if config.ipfs_rate_limit == 0 {
+        tracing::warn!("GITLAWB_IPFS_RATE_LIMIT=0 — per-IP /ipfs rate limiting disabled");
+    }
 
     // Periodic peer-count poll for the metrics gauge. If p2p is disabled
     // we still set the gauge to 0 so dashboards don't show "no data".
@@ -408,22 +556,16 @@ async fn main() -> Result<()> {
 
     // Periodic cleanup of expired rate limit entries + consumed-proof ledger
     {
-        let rl = state.rate_limiter.clone();
-        let create_ip_rl = state.create_ip_rate_limiter.clone();
-        let push_rl = state.push_rate_limiter.clone();
-        let sync_trigger_rl = state.sync_trigger_rate_limiter.clone();
-        let peer_write_rl = state.peer_write_rate_limiter.clone();
+        let cleanup_state = state.clone();
         let db = state.db.clone();
         let mut shutdown_rx = state.subscribe_shutdown();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                        rl.cleanup().await;
-                        create_ip_rl.cleanup().await;
-                        push_rl.cleanup().await;
-                        sync_trigger_rl.cleanup().await;
-                        peer_write_rl.cleanup().await;
+                        // Sweep every per-IP/DID limiter (incl. the ipfs walk brake)
+                        // so bounded maps shed stale keys instead of sitting at cap.
+                        cleanup_state.sweep_rate_limiters().await;
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs() as i64)
@@ -441,6 +583,8 @@ async fn main() -> Result<()> {
             }
         });
     }
+
+    let _legacy_cid_sweep = spawn_legacy_cid_sweep(&state, &config);
 
     let router = server::build_router(state.clone());
     // Re-register the socket bound at startup — same fd, so there was never a
@@ -562,6 +706,44 @@ async fn main() -> Result<()> {
     serve_result?;
     info!("clean exit");
     Ok(())
+}
+
+/// U4 (#173): spawn the periodic legacy provider-CID repair sweep. Releases before this
+/// version stored the PROVIDER CID (Kubo dag-pb / Pinata CIDv0) in `pinned_cids.cid`,
+/// and this version's `/ipfs/{cid}` resolver withholds any row whose stored key is not
+/// the raw-content CID. The opportunistic repair on the pin path only fires when a push
+/// re-carries the object, which normal git negotiation makes it not do, so those rows
+/// need a walk. DETACHED, never on the boot path: the caller keeps serving while this
+/// runs, and the sweep's own batch bound plus inter-batch delay keep it off the DB's
+/// critical path. Its cursor is durable, so a restart mid-walk resumes instead of
+/// rewinding. It re-arms after every run, including a failed one, so it never returns
+/// and there is no awaited value to log here; the shutdown watcher below is what ends
+/// it.
+///
+/// A named function rather than an inline block in `main` so the WIRING has a seam a
+/// test can call: that the task is spawned at all, that it reads its batch and delay
+/// from the config knobs rather than some other field, that the caller is not blocked
+/// on it, and that the shutdown watcher actually ends it mid-walk. The sweep's own
+/// behavior is covered elsewhere; this is the boot-path half.
+fn spawn_legacy_cid_sweep(state: &AppState, config: &Config) -> tokio::task::JoinHandle<()> {
+    let db = state.db.clone();
+    let repos_dir = config.repos_dir.clone();
+    let git_bin = state.git_bin.clone();
+    let git_timeout = std::time::Duration::from_secs(config.git_service_timeout_secs);
+    let batch = config.pin_repair_sweep_batch;
+    let delay = std::time::Duration::from_secs(config.pin_repair_sweep_delay_secs);
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = ipfs_pin::run_sweep_rearmed(
+                &repos_dir, &git_bin, git_timeout, batch, delay,
+                ipfs_pin::SWEEP_REARM_DELAY, &db,
+            ) => {}
+            // Shutdown mid-walk simply drops the run; the persisted cursor means the
+            // next boot picks up where this one stopped.
+            _ = shutdown_rx.changed() => {}
+        }
+    })
 }
 
 fn spawn_shutdown_signal(tx: watch::Sender<bool>) {
@@ -733,8 +915,8 @@ fn build_degraded_router(node_did: String, db_startup: Arc<DbStartupStatus>) -> 
         db_startup,
     };
     // Everything answers 503 with the same body — including /health and
-    // /ready, so peer pings (which treat any 2xx /health as alive) and
-    // uptime monitors correctly see a node that cannot serve traffic.
+    // /ready, so peer readiness probes and uptime monitors correctly see a
+    // node that cannot serve traffic.
     // `/` additionally carries the node identity for probing peers.
     Router::new()
         .route("/", get(degraded_node_info))
@@ -866,7 +1048,7 @@ async fn gossip_task(
     }
 
     // Reuse the shared no-redirect client for every gossip outbound call (the
-    // bootstrap announce POST and the periodic peer /health ping). Peer URLs are
+    // bootstrap announce POST and the periodic peer /ready ping). Peer URLs are
     // attacker-influenceable, so a 3xx to a private address must not be followed.
     // Do NOT fall back to reqwest::Client::new(): its default follows redirects
     // and would reintroduce the SSRF closed here (#93).
@@ -921,8 +1103,33 @@ async fn gossip_task(
                             json.get("node_url").and_then(|v| v.as_str()),
                         ) {
                             if !their_url.is_empty() {
-                                let _ = state.db.upsert_peer(their_did, their_url).await;
-                                tracing::info!(did = %their_did, url = %their_url, "bootstrap peer added");
+                                // Unproven, unconditionally: their_did and
+                                // their_url come straight out of the contacted
+                                // peer's JSON response body, with no signature
+                                // and no proof the claimed DID belongs to the
+                                // peer we reached. This path therefore seeds
+                                // new peers and can never repoint an existing
+                                // row. The upsert's result is matched rather
+                                // than discarded, because "bootstrap peer
+                                // added" printed over a refused write is a
+                                // denial rendering as success. Non-fatal to the
+                                // loop either way.
+                                match state
+                                    .db
+                                    .upsert_peer(
+                                        their_did,
+                                        their_url,
+                                        db::PeerWriteAuthority::Unproven,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        tracing::info!(did = %their_did, url = %their_url, "bootstrap peer added")
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(did = %their_did, url = %their_url, err = %e, "bootstrap peer announce-back rejected")
+                                    }
+                                }
                             }
                         }
                     }
@@ -937,6 +1144,8 @@ async fn gossip_task(
 
     // Periodic ping every 5 minutes — exit on shutdown.
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut failed_once: HashSet<String> = HashSet::new();
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -944,10 +1153,13 @@ async fn gossip_task(
                     Ok(p) => p,
                     Err(_) => continue,
                 };
-                for peer in peers {
-                    let ok = ping_peer_health(&client, &peer.http_url).await;
-                    let _ = state.db.mark_peer_ping(&peer.did, ok).await;
-                }
+                gossip_ping_round(
+                    state.db.as_ref(),
+                    client.as_ref(),
+                    &mut failed_once,
+                    peers,
+                )
+                .await;
             }
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
@@ -956,6 +1168,93 @@ async fn gossip_task(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod rate_limiter_sweep_tests {
+    use crate::rate_limit::RateLimiter;
+    use std::time::Duration;
+
+    // Every per-key limiter the router mounts must be swept by the periodic
+    // task, the `/ipfs` one included: a limiter left out keeps expired keys
+    // until its map fills and the inline capacity sweep fires. Fails on the
+    // pre-fix sweeper, which skipped `ipfs_rate_limiter`.
+    #[tokio::test]
+    async fn sweep_evicts_expired_keys_from_every_limiter() {
+        let window = Duration::from_millis(30);
+        let mut state = crate::test_support::test_state_lazy();
+        state.rate_limiter = RateLimiter::new(10, window);
+        state.create_ip_rate_limiter = RateLimiter::new(10, window);
+        state.push_rate_limiter = RateLimiter::new(10, window);
+        state.sync_trigger_rate_limiter = RateLimiter::new(10, window);
+        state.peer_write_rate_limiter = RateLimiter::new(10, window);
+        state.ipfs_rate_limiter = RateLimiter::new(10, window);
+        state.ipfs_work_rate_limiter = RateLimiter::new(10, window);
+
+        let limiters = |s: &crate::state::AppState| {
+            [
+                s.rate_limiter.clone(),
+                s.create_ip_rate_limiter.clone(),
+                s.push_rate_limiter.clone(),
+                s.sync_trigger_rate_limiter.clone(),
+                s.peer_write_rate_limiter.clone(),
+                s.ipfs_rate_limiter.clone(),
+                s.ipfs_work_rate_limiter.clone(),
+            ]
+        };
+        for l in limiters(&state) {
+            assert!(l.check("1.2.3.4").await);
+            assert_eq!(l.tracked_keys().await, 1);
+        }
+
+        tokio::time::sleep(window * 3).await;
+        state.sweep_rate_limiters().await;
+
+        for (i, l) in limiters(&state).into_iter().enumerate() {
+            assert_eq!(l.tracked_keys().await, 0, "limiter {i} was not swept");
+        }
+    }
+}
+
+async fn gossip_ping_round(
+    db: &Db,
+    client: &reqwest::Client,
+    failed_once: &mut HashSet<String>,
+    peers: Vec<db::PeerRecord>,
+) {
+    {
+        let current_dids: HashSet<&str> = peers.iter().map(|peer| peer.did.as_str()).collect();
+        failed_once.retain(|did| current_dids.contains(did.as_str()));
+    }
+    for peer in peers {
+        let ok = ping_peer_readiness(client, &peer.http_url).await;
+        match peer_ping_db_update(failed_once, &peer.did, ok) {
+            Some(reachable) => {
+                if let Err(error) = db.mark_peer_ping(&peer.did, reachable).await {
+                    warn!(did = %peer.did, err = %error, "failed to persist peer readiness");
+                }
+            }
+            None => warn!(
+                did = %peer.did,
+                "peer readiness probe failed once; preserving previous federation status"
+            ),
+        }
+    }
+}
+
+/// Decide whether one readiness sample should update the persisted federation
+/// gate. A success is authoritative immediately. A failure must repeat on the
+/// next gossip tick before it can mark a peer unreachable, so one transient
+/// database hiccup does not hide the peer's repositories for five minutes.
+fn peer_ping_db_update(failed_once: &mut HashSet<String>, did: &str, ready: bool) -> Option<bool> {
+    if ready {
+        failed_once.remove(did);
+        Some(true)
+    } else if failed_once.insert(did.to_owned()) {
+        None
+    } else {
+        Some(false)
     }
 }
 
@@ -969,26 +1268,96 @@ async fn gossip_task(
 /// runs, not a hand-rolled equivalent.
 fn build_http_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(OUTBOUND_HTTP_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()
 }
 
-/// Ping a peer's `/health` endpoint and report whether it answered 2xx.
+const OUTBOUND_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ping a peer's DB-aware `/ready` endpoint and report whether it answered 2xx.
+///
+/// A 404 falls back to `/health` for compatibility with nodes released before
+/// `/ready` existed. Other readiness failures, including 503 during a database
+/// outage, fail closed and must not use the liveness-only endpoint. The complete
+/// `/ready`-then-`/health` probe shares one timeout budget.
 ///
 /// Takes the client by reference so callers supply the shared, no-redirect
 /// `state.http_client`. Peer URLs are attacker-influenceable, so a `3xx` to a
 /// private address must not be followed. Do NOT call this with a bare
 /// `reqwest::Client::new()`: its default follows redirects and would
 /// reintroduce the SSRF this guards against (#93).
-async fn ping_peer_health(client: &reqwest::Client, http_url: &str) -> bool {
-    let url = format!("{}/health", http_url.trim_end_matches('/'));
-    client
-        .get(&url)
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
+pub(crate) async fn ping_peer_readiness(client: &reqwest::Client, http_url: &str) -> bool {
+    ping_peer_readiness_with_timeout(client, http_url, OUTBOUND_HTTP_TIMEOUT).await
+}
+
+async fn ping_peer_readiness_with_timeout(
+    client: &reqwest::Client,
+    http_url: &str,
+    timeout: std::time::Duration,
+) -> bool {
+    let base_url = http_url.trim_end_matches('/');
+    let result = tokio::time::timeout(timeout, async {
+        let readiness = client.get(format!("{base_url}/ready")).send().await;
+
+        match readiness {
+            Ok(response) if response.status().is_success() => true,
+            Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
+                info!(
+                    peer_url = %http_url,
+                    "peer has no readiness endpoint; falling back to legacy health probe"
+                );
+                match client.get(format!("{base_url}/health")).send().await {
+                    Ok(response) if response.status().is_success() => true,
+                    Ok(response) => {
+                        warn!(
+                            peer_url = %http_url,
+                            status = %response.status(),
+                            "legacy peer health probe reported unhealthy"
+                        );
+                        false
+                    }
+                    Err(error) => {
+                        warn!(
+                            peer_url = %http_url,
+                            err = %error,
+                            "legacy peer health probe failed"
+                        );
+                        false
+                    }
+                }
+            }
+            Ok(response) => {
+                warn!(
+                    peer_url = %http_url,
+                    status = %response.status(),
+                    "peer readiness probe reported unready"
+                );
+                false
+            }
+            Err(error) => {
+                warn!(
+                    peer_url = %http_url,
+                    err = %error,
+                    "peer readiness probe failed"
+                );
+                false
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(ready) => ready,
+        Err(_) => {
+            warn!(
+                peer_url = %http_url,
+                timeout_ms = timeout.as_millis(),
+                "peer readiness probe timed out"
+            );
+            false
+        }
+    }
 }
 
 fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
@@ -1025,26 +1394,418 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
 }
 
 #[cfg(test)]
+mod legacy_cid_sweep_wiring_tests {
+    use super::spawn_legacy_cid_sweep;
+    use sqlx::PgPool;
+    use std::time::Duration;
+
+    /// Seed `count` `pinned_cids` rows whose keys are already canonical raw CIDv1, in a
+    /// known `sha256_hex` order. The sweep's own cost gate skips a raw-CIDv1 row without
+    /// reading bytes or resolving a repo, so each row is SCANNED (it advances the cursor)
+    /// and nothing else. That is what makes the cursor a clean readout of how far the
+    /// walk got, with no dependency on repos on disk.
+    async fn seed_scannable_rows(pool: &PgPool, count: usize) -> Vec<String> {
+        let mut shas = Vec::new();
+        for i in 1..=count {
+            let sha = format!("wire{i:02}");
+            let cid = gitlawb_core::cid::Cid::from_git_object_bytes(sha.as_bytes()).to_string();
+            assert!(
+                gitlawb_core::cid::is_raw_cidv1(&cid),
+                "the seeded key must hit the sweep's raw-CIDv1 skip, not a repair attempt"
+            );
+            sqlx::query("INSERT INTO pinned_cids (sha256_hex, cid, pinned_at) VALUES ($1, $2, $3)")
+                .bind(&sha)
+                .bind(&cid)
+                .bind("2020-01-01T00:00:00Z")
+                .execute(pool)
+                .await
+                .unwrap();
+            shas.push(sha);
+        }
+        shas
+    }
+
+    /// Poll the persisted sweep cursor until it reaches `want`, or give up.
+    async fn cursor_reaches(db: &crate::db::Db, want: &str, within: Duration) -> String {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            let c = db.pin_repair_cursor().await.unwrap();
+            if c == want || std::time::Instant::now() >= deadline {
+                return c;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// #173 U4, the BOOT-PATH half. The sweep's own logic (batching, cursor resumption,
+    /// terminal vs retryable skips) is covered in `test_support`; what this covers is the
+    /// wiring `main` performs, which nothing else executes: the task is spawned at all,
+    /// it takes its batch and delay from the two `pin_repair_sweep_*` knobs rather than
+    /// some other config field, the caller is not blocked on the walk, and the shutdown
+    /// watcher ends the run mid-walk.
+    ///
+    /// Six scannable rows, batch 2, delay 30s. One pass must land the cursor on exactly
+    /// the second row and the task must then still be alive in its inter-batch sleep,
+    /// which pins both knobs at once: a different batch stops at a different row, and a
+    /// delay that did not come from the knob either finishes the table or leaves the task
+    /// gone. Shutdown must then end it while four rows are still unwalked.
+    #[sqlx::test]
+    async fn the_boot_path_spawns_the_sweep_detached_with_its_configured_knobs(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let shas = seed_scannable_rows(&pool, 6).await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+
+        let mut config = (*state.config).clone();
+        config.repos_dir = repos_dir.path().to_path_buf();
+        config.pin_repair_sweep_batch = 2;
+        // Far longer than this test runs, so a task still alive after the first pass can
+        // only be one that is honoring the configured inter-batch delay.
+        config.pin_repair_sweep_delay_secs = 30;
+
+        let started = std::time::Instant::now();
+        let handle = spawn_legacy_cid_sweep(&state, &config);
+        let spawn_cost = started.elapsed();
+
+        let cursor = cursor_reaches(&state.db, &shas[1], Duration::from_secs(10)).await;
+        assert_eq!(
+            cursor, shas[1],
+            "the spawned sweep must run and stop its first pass at the CONFIGURED batch \
+             bound (2), leaving the cursor on the second row"
+        );
+        assert!(
+            spawn_cost < Duration::from_secs(1),
+            "the sweep must be detached, not awaited on the boot path; the spawn took \
+             {spawn_cost:?}"
+        );
+        assert!(
+            !handle.is_finished(),
+            "with a 30s inter-batch delay the task must still be sleeping between passes, \
+             not finished: a finished task means the delay was not the configured one"
+        );
+
+        state.shutdown();
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("the shutdown watcher must end the sweep, and not after its 30s delay")
+            .expect("the sweep task must not panic");
+
+        assert_eq!(
+            state.db.pin_repair_cursor().await.unwrap(),
+            shas[1],
+            "shutdown must have ended the run MID-walk, with the remaining rows unwalked"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lock_pool_sizing_tests {
+    use super::{lock_pool_size, LOCK_POOL_MAX_CONNECTIONS, LOCK_POOL_PUSH_HEADROOM};
+
+    /// The default push cap gets its cap plus headroom, so no push ever queues for a
+    /// lock-pool connection where it did not before.
+    #[test]
+    fn default_push_cap_gets_headroom_over_the_cap() {
+        assert_eq!(lock_pool_size(32), 32 + u32::from(LOCK_POOL_PUSH_HEADROOM));
+        assert_eq!(lock_pool_size(1), 1 + u32::from(LOCK_POOL_PUSH_HEADROOM));
+    }
+
+    /// #173 F4: `max_concurrent_git_pushes` is validated all the way to 1_048_576, so an
+    /// operator raising it used to raise the node's Postgres connection ceiling with it,
+    /// silently and without bound. The lock pool is CLAMPED instead.
+    #[test]
+    fn an_oversized_push_cap_is_clamped_not_propagated() {
+        assert_eq!(lock_pool_size(1_048_576), LOCK_POOL_MAX_CONNECTIONS);
+        assert_eq!(lock_pool_size(usize::MAX), LOCK_POOL_MAX_CONNECTIONS);
+        // The largest cap that still fits under the clamp keeps its full headroom.
+        let widest = (LOCK_POOL_MAX_CONNECTIONS - u32::from(LOCK_POOL_PUSH_HEADROOM)) as usize;
+        assert_eq!(lock_pool_size(widest), LOCK_POOL_MAX_CONNECTIONS);
+        assert_eq!(
+            lock_pool_size(widest - 1),
+            LOCK_POOL_MAX_CONNECTIONS - 1,
+            "values below the clamp must not be rounded up to it"
+        );
+    }
+}
+
+#[cfg(test)]
 mod gossip_ssrf_tests {
-    use super::ping_peer_health;
+    use super::{
+        gossip_ping_round, peer_ping_db_update, ping_peer_readiness,
+        ping_peer_readiness_with_timeout,
+    };
+    use axum::{http::StatusCode, routing::get, Router};
+    use sqlx::PgPool;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     // Build the client exactly as production does (super::build_http_client) so
     // these tests bind the redirect guarantee to the real shared client the
     // node runs. A regression that makes build_http_client follow redirects
-    // fails ping_peer_health_does_not_follow_redirect.
+    // fails ping_peer_readiness_does_not_follow_redirect.
     fn production_http_client() -> reqwest::Client {
         super::build_http_client().expect("failed to build production http client")
     }
 
-    // A peer answering `/health` with a 302 toward an internal address must not
+    #[test]
+    fn peer_ping_requires_two_failures_before_marking_unreachable() {
+        let mut failed_once = HashSet::new();
+        let did = "did:key:z6MkPeer";
+
+        assert_eq!(
+            peer_ping_db_update(&mut failed_once, did, false),
+            None,
+            "one transient failure must preserve the persisted federation gate"
+        );
+        assert_eq!(
+            peer_ping_db_update(&mut failed_once, did, false),
+            Some(false),
+            "a sustained failure must mark the peer unreachable"
+        );
+        assert_eq!(
+            peer_ping_db_update(&mut failed_once, did, true),
+            Some(true),
+            "a success must restore reachability immediately"
+        );
+        assert_eq!(
+            peer_ping_db_update(&mut failed_once, did, false),
+            None,
+            "a success must reset the consecutive-failure state"
+        );
+    }
+
+    #[sqlx::test]
+    async fn gossip_ping_round_requires_two_failures_before_persisting_unreachable(pool: PgPool) {
+        let mut server = mockito::Server::new_async().await;
+        let ready = server
+            .mock("GET", "/ready")
+            .with_status(503)
+            .expect(2)
+            .create_async()
+            .await;
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let did = "did:key:z6MkGossipHysteresis";
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
+             VALUES ($1, $2, $3, TRUE, $3)",
+        )
+        .bind(did)
+        .bind(server.url())
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut failed_once = HashSet::from(["did:key:z6MkRemovedPeer".to_owned()]);
+        gossip_ping_round(
+            state.db.as_ref(),
+            &production_http_client(),
+            &mut failed_once,
+            state.db.list_peers().await.unwrap(),
+        )
+        .await;
+        assert!(
+            !failed_once.contains("did:key:z6MkRemovedPeer"),
+            "failure tracking must prune peers outside the current snapshot"
+        );
+        assert!(
+            failed_once.contains(did),
+            "the first failed sample must be retained for the next round"
+        );
+        assert!(
+            state
+                .db
+                .list_peers()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|peer| peer.did == did)
+                .unwrap()
+                .last_ping_ok,
+            "one transient failure must preserve the persisted federation gate"
+        );
+
+        gossip_ping_round(
+            state.db.as_ref(),
+            &production_http_client(),
+            &mut failed_once,
+            state.db.list_peers().await.unwrap(),
+        )
+        .await;
+        assert!(
+            !state
+                .db
+                .list_peers()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|peer| peer.did == did)
+                .unwrap()
+                .last_ping_ok,
+            "two consecutive failed rounds must persist the peer as unreachable"
+        );
+        ready.assert_async().await;
+    }
+
+    // A peer answering `/ready` with a 302 toward an internal address must not
     // be followed: the redirect target must never be requested (#93).
     #[tokio::test]
-    async fn ping_peer_health_does_not_follow_redirect() {
+    async fn ping_peer_readiness_does_not_follow_redirect() {
         let mut server = mockito::Server::new_async().await;
         let internal = server
             .mock("GET", "/internal-metadata")
             .with_status(200)
             .expect(0)
+            .create_async()
+            .await;
+        let _ready = server
+            .mock("GET", "/ready")
+            .with_status(302)
+            .with_header("location", &format!("{}/internal-metadata", server.url()))
+            .create_async()
+            .await;
+
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
+
+        assert!(!ok, "a 302 must not count as a healthy peer");
+        // expect(0) is enforced only at assert time; this fails if the redirect
+        // was followed to the internal target.
+        internal.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_reports_success_on_200() {
+        let mut server = mockito::Server::new_async().await;
+        let _ready = server
+            .mock("GET", "/ready")
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
+
+        assert!(ok, "a 200 /ready must count as a ready peer");
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_ignores_liveness_only_health() {
+        let mut server = mockito::Server::new_async().await;
+        let health = server
+            .mock("GET", "/health")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let ready = server
+            .mock("GET", "/ready")
+            .with_status(503)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
+
+        assert!(!ok, "a peer with an unavailable database must not be ready");
+        health.assert_async().await;
+        ready.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_falls_back_for_legacy_peer() {
+        let mut server = mockito::Server::new_async().await;
+        let ready = server
+            .mock("GET", "/ready")
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        let health = server
+            .mock("GET", "/health")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
+
+        assert!(
+            ok,
+            "a legacy peer with a healthy /health must remain reachable"
+        );
+        ready.assert_async().await;
+        health.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_legacy_fallback_shares_deadline() {
+        let health_requests = Arc::new(AtomicUsize::new(0));
+        let health_requests_for_route = Arc::clone(&health_requests);
+        let app = Router::new()
+            .route(
+                "/ready",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    StatusCode::NOT_FOUND
+                }),
+            )
+            .route(
+                "/health",
+                get(move || {
+                    let health_requests = Arc::clone(&health_requests_for_route);
+                    async move {
+                        health_requests.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        StatusCode::OK
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind delayed legacy peer");
+        let peer_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("delayed legacy peer has no local address")
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("delayed legacy peer failed");
+        });
+
+        let ok = ping_peer_readiness_with_timeout(
+            &production_http_client(),
+            &peer_url,
+            // Each response arrives within 350 ms, but the two serial requests
+            // cannot both finish within one 350 ms probe budget.
+            Duration::from_millis(350),
+        )
+        .await;
+
+        assert!(!ok, "the fallback must not start a fresh timeout budget");
+        assert_eq!(
+            health_requests.load(Ordering::Relaxed),
+            1,
+            "the delayed 404 should reach the legacy fallback"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_legacy_fallback_does_not_follow_redirect() {
+        let mut server = mockito::Server::new_async().await;
+        let internal = server
+            .mock("GET", "/internal-metadata")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let _ready = server
+            .mock("GET", "/ready")
+            .with_status(404)
             .create_async()
             .await;
         let _health = server
@@ -1054,33 +1815,17 @@ mod gossip_ssrf_tests {
             .create_async()
             .await;
 
-        let ok = ping_peer_health(&production_http_client(), &server.url()).await;
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
 
-        assert!(!ok, "a 302 must not count as a healthy peer");
-        // expect(0) is enforced only at assert time; this fails if the redirect
-        // was followed to the internal target.
+        assert!(!ok, "the legacy fallback must not follow redirects");
         internal.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn ping_peer_health_reports_success_on_200() {
-        let mut server = mockito::Server::new_async().await;
-        let _health = server
-            .mock("GET", "/health")
-            .with_status(200)
-            .create_async()
-            .await;
-
-        let ok = ping_peer_health(&production_http_client(), &server.url()).await;
-
-        assert!(ok, "a 200 /health must count as a healthy peer");
     }
 
     // A transport error (nothing listening) must map to unhealthy, never a
     // spurious healthy — the .unwrap_or(false) arm.
     #[tokio::test]
-    async fn ping_peer_health_reports_unhealthy_on_connection_error() {
-        let ok = ping_peer_health(&production_http_client(), "http://127.0.0.1:1").await;
-        assert!(!ok, "a connection error must count as an unhealthy peer");
+    async fn ping_peer_readiness_reports_unready_on_connection_error() {
+        let ok = ping_peer_readiness(&production_http_client(), "http://127.0.0.1:1").await;
+        assert!(!ok, "a connection error must count as an unready peer");
     }
 }

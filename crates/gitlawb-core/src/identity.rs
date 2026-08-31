@@ -78,10 +78,9 @@ impl Keypair {
 
 /// Verify an Ed25519 signature.
 pub fn verify(verifying_key: &VerifyingKey, msg: &[u8], sig_bytes: &[u8; 64]) -> Result<()> {
-    use ed25519_dalek::Verifier;
     let sig = Signature::from_bytes(sig_bytes);
     verifying_key
-        .verify(msg, &sig)
+        .verify_strict(msg, &sig)
         .map_err(|_| Error::SignatureInvalid)
 }
 
@@ -206,6 +205,28 @@ mod tests {
         assert!(
             result.is_err(),
             "signature from kp1 must not verify under kp2"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_weak_key_signature() {
+        // Regression guard for strict verification: a signature forged under a
+        // weak (small-order) public key satisfies the verification equation
+        // but must be rejected. The identity point is such a key: with R the
+        // identity and S = 0, [S]B - [k]A is the identity for any message.
+        let mut weak_key_bytes = [0u8; 32];
+        weak_key_bytes[0] = 1; // compressed identity point (y = 1, x = 0)
+        let weak_vk = VerifyingKey::from_bytes(&weak_key_bytes).unwrap();
+        assert!(weak_vk.is_weak(), "identity point must be a weak key");
+
+        let msg = b"forged message";
+        let mut forged = [0u8; 64];
+        forged[0] = 1; // R = identity point, S = 0
+
+        let result = verify(&weak_vk, msg, &forged);
+        assert!(
+            result.is_err(),
+            "signature under a weak (small-order) public key must be rejected"
         );
     }
 

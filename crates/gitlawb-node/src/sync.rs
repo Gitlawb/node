@@ -605,7 +605,7 @@ async fn replicate_encrypted_blobs(
                 continue;
             }
         };
-        match crate::ipfs_pin::pin_git_object(ipfs_api, &blob.oid, &envelope).await {
+        match crate::ipfs_pin::pin_git_object(ipfs_api, &blob.oid, &envelope, None).await {
             Ok(cid) if !cid.is_empty() => {
                 if cid != blob.cid {
                     warn!(oid = %blob.oid, expected = %blob.cid, got = %cid, "replicated envelope CID mismatch; skipping record");
@@ -1406,6 +1406,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(unix)]
     #[sqlx::test]
     async fn process_batch_rejects_a_symlinked_owner_directory(pool: PgPool) {
         // The slug is textually valid, so U1's character rules pass it. The
@@ -1438,6 +1439,7 @@ mod tests {
         assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "failed");
     }
 
+    #[cfg(unix)]
     #[sqlx::test]
     async fn process_batch_rejects_a_symlinked_mirror_path(pool: PgPool) {
         // The leaf case a parent-only canonicalize misses: the owner directory
@@ -1561,6 +1563,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[sqlx::test]
     async fn process_batch_leaves_the_row_pending_when_the_mirror_cannot_be_inspected(
         pool: PgPool,
@@ -1604,6 +1607,7 @@ mod tests {
         assert!(owner_dir.join("hello.git").is_dir());
     }
 
+    #[cfg(unix)]
     #[sqlx::test]
     async fn process_batch_leaves_the_row_pending_when_the_owner_dir_cannot_be_created(
         pool: PgPool,
@@ -1680,6 +1684,7 @@ mod tests {
         assert!(mirrors_under(home.path()).is_empty());
     }
 
+    #[cfg(unix)]
     #[sqlx::test]
     async fn process_batch_terminally_fails_when_a_dangling_symlink_occupies_the_owner_path(
         pool: PgPool,
@@ -1732,6 +1737,7 @@ mod tests {
     /// only needs +x on repos_dir), so this defers at `path_within_root`
     /// instead — the stall path that survives the AlreadyExists
     /// classification, which is what keeps the starvation tests load-bearing.
+    #[cfg(unix)]
     fn make_stuck_owner(repos_dir: &Path, owner: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let dir = repos_dir.join(owner);
@@ -1752,11 +1758,13 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     fn unstick(dir: &Path) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    #[cfg(unix)]
     #[sqlx::test]
     async fn a_full_batch_of_stuck_rows_does_not_starve_a_healthy_one(pool: PgPool) {
         // Ten rows that defer forever, exactly filling the batch, with one
@@ -1811,6 +1819,7 @@ mod tests {
         unstick(&stuck);
     }
 
+    #[cfg(unix)]
     #[sqlx::test]
     async fn a_stuck_set_larger_than_the_batch_still_yields(pool: PgPool) {
         // 25 stuck rows against a batch size of 10. The healthy row lands

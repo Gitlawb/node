@@ -12,7 +12,8 @@
         { "type": "generic", "path": "crates/gitlawb-node/Cargo.toml" },
         { "type": "generic", "path": "crates/gl/Cargo.toml" },
         { "type": "generic", "path": "crates/git-remote-gitlawb/Cargo.toml" },
-        { "type": "generic", "path": "crates/gitlawb-attest/Cargo.toml" }
+        { "type": "generic", "path": "crates/gitlawb-attest/Cargo.toml" },
+        { "type": "generic", "path": "crates/icaptcha-client/Cargo.toml" }
       ]
     }
   }
