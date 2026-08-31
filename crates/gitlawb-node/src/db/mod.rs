@@ -1136,7 +1136,16 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
     Migration {
-        version: 27,
+        // #218 review round 3 (P2 reviewer 2): renumber v27 → v32.
+        // The runner keys the applied set on the integer alone, so
+        // open PRs #327/#333/#347/#384/#386 that also claim v27-v31
+        // are silently skipped on whichever side merges second. v17's
+        // reservation comment (above) describes the failure mode in
+        // detail. v32-v36 are picked to land in a clear gap after
+        // this branch's last entry so the collision risk is removed.
+        // Gaps are harmless: the runner iterates the array and never
+        // requires contiguity.
+        version: 32,
         name: "pinata_only_clear_legacy_equal_cid",
         stmts: &[
             // #218 (R2-P2): earlier releases wrote `cid = pinata_cid` as a
@@ -1156,7 +1165,8 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
     Migration {
-        version: 28,
+        // v28 → v33 (round-3 renumber, see v32 above).
+        version: 33,
         name: "node_state_key_value",
         stmts: &[
             // #218 (R2-P1): the reconciliation sweep persists its keyset
@@ -1174,7 +1184,8 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
     Migration {
-        version: 29,
+        // v29 → v34 (round-3 renumber, see v32 above).
+        version: 34,
         name: "repos_policy_epoch",
         stmts: &[
             // #218 (R2-P1): the PolicyFence records the policy epoch the
@@ -1192,7 +1203,8 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
     Migration {
-        version: 30,
+        // v30 → v35 (round-3 renumber, see v32 above).
+        version: 35,
         name: "pinned_cids_local_ipfs_provenance",
         stmts: &[
             // #218 review (P1): the Pinata-only state was inferred from
@@ -1253,7 +1265,8 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
     Migration {
-        version: 31,
+        // v31 → v36 (round-3 renumber, see v32 above).
+        version: 36,
         name: "reconciliation_offset_per_backend",
         stmts: &[
             // #218 review (P2): the per-repo cursor advanced between
@@ -3224,12 +3237,20 @@ impl Db {
     /// or `None` for an unpinned oid. The opportunistic legacy-repair path reads
     /// it to decide candidacy from the codec of the string alone (no object bytes)
     /// before it recomputes anything.
+    /// Round-3 P1 (reviewer): v32 leaves `pinned_cids.cid` nullable (Pinata-only
+    /// rows store the resolver key in `pinata_cid` and leave `cid = NULL`).
+    /// `cid_for_oid` used `r.get::<String, _>("cid")`, which in sqlx 0.8 is
+    /// `try_get().unwrap()`: an unexpected NULL panicked rather than erroring.
+    /// The pin loop at `ipfs_pin.rs:235` calls this on every batch; the
+    /// first batch after a v32 migration would have walked straight into
+    /// the panic for any node with a Pinata-only row. Decode as `Option<String>`
+    /// so the caller can short-circuit on NULL.
     pub async fn cid_for_oid(&self, sha256_hex: &str) -> Result<Option<String>> {
         let row = sqlx::query("SELECT cid FROM pinned_cids WHERE sha256_hex = $1")
             .bind(sha256_hex)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row.map(|r| r.get::<String, _>("cid")))
+        Ok(row.and_then(|r| r.try_get::<Option<String>, _>("cid").ok().flatten()))
     }
 
     /// Rewrite a legacy provider-CID row to the raw-content resolver key, stashing
@@ -3272,11 +3293,19 @@ impl Db {
     /// prefix-match approximation would silently mis-classify keys under a different
     /// multihash. The caller applies the real predicate, so `limit` bounds rows READ
     /// (the DB cost), not rows repaired.
+    /// Round-3 P1 (reviewer): the cid column is now nullable (Pinata-only rows
+    /// store the resolver key in `pinata_cid` and leave `cid = NULL`). The
+    /// legacy repair sweep at `ipfs_pin.rs:896` re-keys the cid to the
+    /// raw-content resolver CID; rows with NULL cid have no string to
+    /// re-key and skip the re-key naturally if returned as
+    /// `(sha, Option<String>)`. The caller filters NULL rows at the
+    /// call site (they are Pinata-only and have nothing to re-key on
+    /// the legacy provider path).
     pub async fn pinned_cids_after(
         &self,
         cursor: &str,
         limit: i64,
-    ) -> Result<Vec<(String, String)>> {
+    ) -> Result<Vec<(String, Option<String>)>> {
         let rows = sqlx::query(
             "SELECT sha256_hex, cid FROM pinned_cids
               WHERE sha256_hex > $1
@@ -3289,7 +3318,12 @@ impl Db {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|r| (r.get::<String, _>("sha256_hex"), r.get::<String, _>("cid")))
+            .map(|r| {
+                (
+                    r.try_get::<String, _>("sha256_hex").unwrap_or_default(),
+                    r.try_get::<Option<String>, _>("cid").ok().flatten(),
+                )
+            })
             .collect())
     }
 
@@ -5820,17 +5854,24 @@ mod migration_tests {
         db.migrate().await.unwrap();
     }
 
-    /// Migration v27 clears legacy rows where cid was set to pinata_cid as a
-    /// fallback, so `has_ipfs_cid` no longer has to infer provenance from CID
-    /// inequality (R2-P2). Rows where the CIDs genuinely differ are untouched.
+    /// Migration v32 (round-3 renumber from v27) clears legacy rows where cid
+    /// was set to pinata_cid as a fallback, so `has_ipfs_cid` no longer has to
+    /// infer provenance from CID inequality (R2-P2). Rows where the CIDs genuinely
+    /// differ are untouched.
+    ///
+    /// Round-3 P3: the previous assertions all went through `has_ipfs_cid` /
+    /// `has_pinata_cid` — a v30 backfill that flipped `local_ipfs_provenance`
+    /// to FALSE on the distinct row would make the test still GREEN even
+    /// if v32's `cid = NULL` backfill never ran. Read the `cid` and
+    /// `pinata_cid` columns DIRECTLY so the test cannot pass on a no-op.
     #[sqlx::test]
-    async fn migration_v27_clears_legacy_equal_cid(pool: sqlx::PgPool) {
+    async fn migration_v32_clears_legacy_equal_cid(pool: sqlx::PgPool) {
         let db = super::Db::for_testing(pool);
         db.migrate().await.unwrap();
         let now = "2026-07-01T12:00:00Z";
 
         // Seed one legacy equal-cid row and one distinct-cid row, then mark
-        // v27 (and v28, applied after it) as not yet run so re-running
+        // v32 (and v33-v36, applied after it) as not yet run so re-running
         // migrate() exercises the backfill in isolation.
         sqlx::query(
             "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid)
@@ -5841,46 +5882,77 @@ mod migration_tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        sqlx::query("DELETE FROM schema_migrations WHERE version >= 27")
+        sqlx::query("DELETE FROM schema_migrations WHERE version >= 32")
             .execute(&db.pool)
             .await
             .unwrap();
 
         db.migrate().await.unwrap();
 
-        // Backfilled row now has no local CID. The "distinct" row
-        // (cid set, pinata_cid set, cid != pinata_cid) is ambiguous
-        // pre-v30: it could be a real local pin followed by Pinata, or
-        // a Pinata-first upload that the writer happened to set
-        // cid=raw on. Under the v30 strict backfill (cid set AND no
-        // Pinata) it stays out of the IPFS-pinned set; the next sweep
-        // pass re-derives by re-pinning. The v27-era "cid IS NOT
-        // NULL AND cid != pinata_cid" rule that previously classified
-        // this row as IPFS-pinned is no longer authoritative.
-        assert!(
-            !db.has_ipfs_cid("sha_equal").await.unwrap(),
-            "legacy equal-cid row must be cleared to NULL by v27"
+        // Read cid / pinata_cid directly. The previous assertions went
+        // through `has_ipfs_cid` and `has_pinata_cid`, which would
+        // still return false / true if a future refactor flipped
+        // `local_ipfs_provenance` without touching cid / pinata_cid —
+        // a v32 no-op would then hide behind a green test.
+        let equal_cid: Option<String> =
+            sqlx::query_scalar("SELECT cid FROM pinned_cids WHERE sha256_hex = 'sha_equal'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let equal_pinata: Option<String> =
+            sqlx::query_scalar("SELECT pinata_cid FROM pinned_cids WHERE sha256_hex = 'sha_equal'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let distinct_cid: Option<String> =
+            sqlx::query_scalar("SELECT cid FROM pinned_cids WHERE sha256_hex = 'sha_distinct'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let distinct_pinata: Option<String> = sqlx::query_scalar(
+            "SELECT pinata_cid FROM pinned_cids WHERE sha256_hex = 'sha_distinct'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            equal_cid, None,
+            "v32 must clear the legacy equal-cid row to NULL; \
+             cid is still {equal_cid:?}"
         );
-        assert!(
-            !db.has_ipfs_cid("sha_distinct").await.unwrap(),
-            "ambiguous pre-v30 dual row stays out of the IPFS-pinned set under the v30 strict backfill"
+        assert_eq!(
+            equal_pinata.as_deref(),
+            Some("QmSame"),
+            "v32 must preserve pinata_cid on the legacy row"
         );
-        assert!(db.has_pinata_cid("sha_equal").await.unwrap());
+        assert_eq!(
+            distinct_cid.as_deref(),
+            Some("QmLocal"),
+            "v32 must NOT touch the distinct-cid row's cid"
+        );
+        assert_eq!(
+            distinct_pinata.as_deref(),
+            Some("QmPinata"),
+            "v32 must preserve pinata_cid on the distinct row"
+        );
     }
 
     /// #218 review P1: the local-IPFS provenance predicate moved from
     /// `cid IS NOT NULL` to a dedicated `local_ipfs_provenance` column set
     /// by the writer (#218 review P1 — provenance is now established at
-    /// the writer boundary, never inferred from CID shape). Migration v30
-    /// backfills the column for existing rows under the same heuristic v27
-    /// uses to identify "real local pin" rows, and `has_ipfs_cid` /
-    /// `filter_ipfs_pinned_oids` key on the new column. This test
-    /// exercises the full chain: pre-v30 schema, the four row shapes,
-    /// the v30 migration, the post-migration column values, and the
+    /// the writer boundary, never inferred from CID shape). Migration v35
+    /// (round-3 renumber from v30) backfills the column for existing rows
+    /// under the same heuristic v32 uses to identify "real local pin"
+    /// rows, and `has_ipfs_cid` / `filter_ipfs_pinned_oids` key on the
+    /// new column. This test exercises the full chain: pre-v35 schema,
+    /// the four row shapes, the v35 migration, the post-migration
+    /// column values, and the post-migration `has_ipfs_cid` /
+    /// `filter_ipfs_pinned_oids` classification.
     /// post-migration `has_ipfs_cid` / `filter_ipfs_pinned_oids`
     /// classification.
     #[sqlx::test]
-    async fn migration_v30_backfills_local_ipfs_provenance_heuristically(pool: sqlx::PgPool) {
+    async fn migration_v35_backfills_local_ipfs_provenance_heuristically(pool: sqlx::PgPool) {
         let db = super::Db::for_testing(pool.clone());
 
         // Build a pre-v30 schema: every migration through v29 applied.
@@ -5890,8 +5962,8 @@ mod migration_tests {
         // below uses the same pattern.
         db.migrate().await.unwrap();
 
-        // Reset to a pre-v30 schema: drop the v30 column and the
-        // partial index, and forget the v30 migration record.
+        // Reset to a pre-v35 schema: drop the v35 column and the
+        // partial index, and forget the v35 migration record.
         sqlx::query("ALTER TABLE pinned_cids DROP COLUMN IF EXISTS local_ipfs_provenance")
             .execute(&db.pool)
             .await
@@ -5900,7 +5972,7 @@ mod migration_tests {
             .execute(&db.pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM schema_migrations WHERE version = 30")
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 35")
             .execute(&db.pool)
             .await
             .unwrap();
@@ -6107,6 +6179,63 @@ mod migration_tests {
             .find(|p| p.sha256_hex == "sha_pinata_only")
             .expect("Pinata-only row must be listed");
         assert_eq!(pinata_only.cid, None, "NULL cid must map to None");
+    }
+
+    /// Round-3 P1: `cid_for_oid` must return `None` for a row with
+    /// `cid = NULL` (Pinata-only row), not panic. Pre-fix the column
+    /// decode used `r.get::<String, _>("cid")` which `try_get().unwrap()`s
+    /// on an unexpected NULL, and the pin loop at `ipfs_pin.rs:235`
+    /// calls this on every batch — the first batch after v32 on a
+    /// node with any Pinata-only row would have walked straight into
+    /// the panic.
+    #[sqlx::test]
+    async fn cid_for_oid_returns_none_when_cid_is_null(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid)
+             VALUES ('sha_pinata_only', NULL, '2026-07-01T12:00:00Z', 'QmPinata')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let got = db
+            .cid_for_oid("sha_pinata_only")
+            .await
+            .expect("cid_for_oid must not panic on NULL cid");
+        assert_eq!(got, None, "NULL cid must return None, not panic or error");
+    }
+
+    /// Round-3 P1: `pinned_cids_after` must surface NULL `cid` as
+    /// `None` in the tuple, not panic. The legacy repair loop
+    /// (`ipfs_pin.rs:896`) iterates the rows and skips NULL-cid
+    /// entries — the re-key has no string to operate on.
+    #[sqlx::test]
+    async fn pinned_cids_after_skips_rows_with_null_cid(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid)
+             VALUES ('sha_real', 'QmReal', '2026-07-01T12:00:00Z', NULL),
+                    ('sha_pinata', NULL, '2026-07-01T12:00:00Z', 'QmPinata')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let rows = db.pinned_cids_after("", 10).await.unwrap();
+        let real = rows
+            .iter()
+            .find(|(sha, _)| sha == "sha_real")
+            .expect("real-cid row must be returned");
+        assert_eq!(real.1.as_deref(), Some("QmReal"));
+        let pinata = rows
+            .iter()
+            .find(|(sha, _)| sha == "sha_pinata")
+            .expect("Pinata-only row must be returned");
+        assert_eq!(
+            pinata.1, None,
+            "NULL cid must return as None in the tuple, not panic"
+        );
     }
 
     /// A corrupt `cid` value must surface as a decode error, not a silent

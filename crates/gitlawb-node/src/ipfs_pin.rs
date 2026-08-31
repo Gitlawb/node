@@ -909,6 +909,12 @@ async fn sweep_pass(
         // Advance FIRST: every path below this line may skip the row, and none of them
         // may wedge the walk (scenario 7).
         last = sha.clone();
+        // Round-3 P1: skip Pinata-only rows whose local cid is NULL.
+        // The legacy repair walk re-keys `cid` from a provider CID to
+        // the raw resolver CID; a row with no local cid has no string
+        // to re-key, and skipping is the natural behavior. The cursor
+        // still advances so the walk does not loop on this row.
+        let Some(stored) = stored else { continue };
         // Same cost gate as the skip-path repair: a canonical raw CIDv1 key is already
         // the resolver key, so it reads no bytes and resolves no repo.
         if gitlawb_core::cid::is_raw_cidv1(&stored) {

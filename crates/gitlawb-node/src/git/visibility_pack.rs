@@ -351,15 +351,23 @@ pub(crate) fn run_bounded_git(
 /// de-duplicated across commits. Paths carry a leading "/" to match the glob form
 /// used by visibility rules ("/secret/**").
 ///
-/// Fails closed: if commit enumeration or any tree walk fails, returns an error so
-/// the caller aborts the serve/pin rather than producing a partial (under-withheld)
-/// set.
+/// Fails closed: if commit enumeration, the non-commit ref walk, or any tree walk
+/// fails, returns an error so the caller aborts the serve/pin rather than producing
+/// a partial (under-withheld) set. Two phases:
+///   1. `git rev-list --all` over commits + per-commit `ls-tree -rz` — captures every
+///      commit-reachable blob with its path.
+///   2. `git for-each-ref` over non-commit ref targets — captures every direct
+///      ref-to-blob / ref-to-tree with an EMPTY path (the deny-side caller
+///      `withheld_from_pairs` withholds empty-path entries by OID).
+///
+/// Phase 2 closes the round-3 fail-open leak where a blob only reachable via an
+/// annotated tag was served but not withheld.
 fn blob_paths(repo_path: &Path, git_bin: &str, timeout: Duration) -> Result<Vec<(String, String)>> {
-    // One deadline spans the whole walk (the HEAD probe, rev-list, and every
-    // per-commit ls-tree), so a slow or hung walk is bounded as a unit rather
-    // than granting each git child a fresh timeout.
+    // One deadline spans the whole walk (the HEAD probe, rev-list, every
+    // per-commit ls-tree, and the for-each-ref phase 2), so a slow or hung walk
+    // is bounded as a unit rather than granting each git child a fresh timeout.
     //
-    // #218 review P1 (non-commit ref acceptance): the previous code
+    // #218 review round 2 (non-commit ref acceptance): the previous code
     // called `assert_all_refs_are_commits` here, which bailed on
     // any ref that didn't peel to a commit (tag-of-tree,
     // tag-of-blob). The encrypted recovery path also needs to
@@ -432,6 +440,55 @@ fn blob_paths(repo_path: &Path, git_bin: &str, timeout: Duration) -> Result<Vec<
                     out.insert((oid.to_string(), format!("/{path}")));
                 }
             }
+        }
+    }
+
+    // Phase 2: enumerate non-commit ref targets. `git rev-list --all`
+    // above SILENTLY SKIPS refs whose tip is not a commit (annotated
+    // tag-of-blob, tag-of-tree, raw blobref) — a real Git shape that
+    // `git push` allows through `receive-pack`. The deny-set caller
+    // (`smart_http.rs:611-635` `rev_list_keep`) enumerates with
+    // `git rev-list --objects --all`, which DOES include those
+    // non-commit targets, so without this phase the served set and
+    // the withheld set disagree: a blob only reachable via an
+    // annotated tag is served, not withheld. Insert each
+    // non-commit-reachable blob/tree with an EMPTY path — the
+    // deny-side caller (`withheld_from_pairs`, see below) treats
+    // empty paths as "withhold this exact OID", which is exactly
+    // the right policy for a tag-of-blob we cannot path-match.
+    //
+    // The same `git for-each-ref` invocation lives at
+    // `reachable_commit_tag_oids_bounded:1318-1324` (for the
+    // tag-chain seed), so this is reusing a primitive the file
+    // already exercises. `--format=%(objectname) %(objecttype)` is
+    // NUL-delimited by `for-each-ref` per line; the 2-column shape
+    // is enough to filter for "blob" / "tree" without a second
+    // cat-file probe.
+    let refs_out = run_bounded_git(
+        git_bin,
+        &["for-each-ref", "--format=%(objectname) %(objecttype)"],
+        repo_path,
+        b"",
+        deadline,
+    )?;
+    let refs_stdout = String::from_utf8_lossy(&refs_out);
+    for line in refs_stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((oid, kind)) = line.split_once(' ') else {
+            // A malformed `for-each-ref` line; fail closed so the
+            // caller aborts rather than silently under-withhold.
+            anyhow::bail!("malformed for-each-ref line: {line:?}");
+        };
+        // Commits are already covered by the rev-list walk above;
+        // tags are themselves objects whose referent is captured
+        // by the next pass (or by the rev-list walk if the tag
+        // peels to a commit). We only need blobs and trees that
+        // are direct ref tips.
+        if kind == "blob" || kind == "tree" {
+            out.insert((oid.to_string(), String::new()));
         }
     }
     Ok(out.into_iter().collect())
@@ -652,6 +709,21 @@ pub fn withheld_blob_oids_bounded(
 /// at. Split out so a caller that already walked `blob_paths` (e.g.
 /// `withheld_blob_recipients`) reuses the listing instead of walking history
 /// again.
+///
+/// Empty-path entries (round-3 P1): produced by `blob_paths` phase 2 for
+/// non-commit-reachable blobs (annotated tag of blob, direct blobref).
+/// The object is reachable in the repo graph but has NO commit path, so
+/// the path-based visibility check `visibility_check(rules, ..., "")` is
+/// meaningless — no rule's glob can match the empty path. The safe
+/// policy: empty-path entries are withheld from every caller except the
+/// owner. The owner is the only identity that intentionally creates
+/// such refs (an annotated-tag-of-blob is a deliberate push through
+/// receive-pack, not a clone artifact), so the owner is the only reader
+/// the system can meaningfully bind a privacy decision to. Everyone
+/// else — anonymous, named non-owner, or any non-owner DID — is
+/// withheld. Without this branch, the round-3 phase-2 entries would
+/// land in `allowed` (the path-based check returns `Allow` for a public
+/// repo with no matching rule), and the secret blob would be served.
 fn withheld_from_pairs(
     pairs: &[(String, String)],
     rules: &[VisibilityRule],
@@ -662,7 +734,25 @@ fn withheld_from_pairs(
     let mut denied: HashSet<String> = HashSet::new();
     let mut allowed: HashSet<String> = HashSet::new();
     for (oid, path) in pairs {
-        match visibility_check(rules, is_public, owner_did, caller, path) {
+        let decision = if path.is_empty() {
+            // Round-3 P1: empty-path entries (non-commit-reachable
+            // blobs from `blob_paths` phase 2) cannot be classified
+            // by the path-based rules. Withhold from every caller
+            // except the owner; the owner is the only identity that
+            // could have created the ref tip.
+            if let Some(c) = caller {
+                if crate::api::did_matches(owner_did, c) {
+                    Decision::Allow
+                } else {
+                    Decision::Deny
+                }
+            } else {
+                Decision::Deny
+            }
+        } else {
+            visibility_check(rules, is_public, owner_did, caller, path)
+        };
+        match decision {
             Decision::Deny => {
                 denied.insert(oid.clone());
             }
@@ -784,7 +874,10 @@ pub fn allowed_blob_set_for_caller_bounded(
 /// Safe ONLY for a caller whose output feeds a fail-closed allow-list where absence
 /// = withhold: a tolerant walk there over-withholds, never leaks. NOT safe for a
 /// serve/replication filter, where a missed reachable object under-withholds —
-/// those go through `blob_paths`, which runs the guard first.
+/// those go through `blob_paths`, which now runs a `for-each-ref` phase 2 that
+/// enumerates non-commit ref targets and inserts them with empty path
+/// (round-3 fix for the annotated-tag-of-blob leak; the previous `assert_all_refs_are_commits`
+/// guard was removed in commit 91d0578, leaving that path fail-open).
 fn reachable_commit_oids(
     repo_path: &Path,
     git_bin: &str,
@@ -3388,22 +3481,33 @@ esac\n";
 
     #[test]
     fn skips_a_ref_pointing_at_a_blob() {
-        // #218 review P1: a ref pointing at a blob is a valid Git shape
-        // (tag-of-blob, blobref). The pre-fix `assert_all_refs_are_commits`
-        // guard bailed on this and failed the whole walk closed; the
-        // fix drops the guard. `git rev-list --all` skips a ref whose
-        // target is a blob (it doesn't peel to a commit), so the
-        // commit-reachable object set is unaffected. The blob is
-        // commit-unreachable and falls out of the gap set, so the
-        // walk completes successfully without under-withholding.
-        let (_td, bare, _secret, _public) = fixture();
-        std::fs::write(bare.join("refs/heads/blobref"), format!("{_secret}\n")).unwrap();
+        // #218 review round 1: a ref pointing at a blob is a valid Git
+        // shape (tag-of-blob, blobref). The pre-fix
+        // `assert_all_refs_are_commits` guard bailed on this and
+        // failed the whole walk closed; round 1 drops the guard.
+        // #218 review round 3 P1: the round-1 fix was correct for
+        // the allow-list sweep (empty paths dropped at
+        // visibility_pack.rs:1396, :1423) but it left the deny-set
+        // path fail-OPEN — a blob only reachable via a non-commit
+        // ref tip would be served (the `git rev-list --objects --all`
+        // enumeration in `smart_http::rev_list_keep` includes
+        // non-commit targets) but NOT withheld (the deny set comes
+        // from `blob_paths`, which only walks commits). Round 3
+        // adds a `for-each-ref` phase 2 to `blob_paths` that
+        // enumerates non-commit ref targets and inserts them with
+        // empty path; the deny-side caller withholds empty-path
+        // entries by OID. This test now asserts the secret blob is
+        // actually withheld.
+        let (_td, bare, secret, _public) = fixture();
+        std::fs::write(bare.join("refs/heads/blobref"), format!("{secret}\n")).unwrap();
         let rules = [rule("/secret/**", &[])];
-        let result = withheld_blob_oids(&bare, &rules, true, OWNER, None);
+        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None)
+            .expect("a ref pointing at a non-commit object no longer fails the whole walk");
         assert!(
-            result.is_ok(),
-            "a ref pointing at a non-commit object no longer fails the whole walk; \
-             the blob is commit-unreachable and falls out cleanly"
+            withheld.contains(&secret),
+            "the secret blob's OID must be withheld when reachable only via a direct \
+             ref-to-blob — otherwise the smart-http serve filter would advertise it \
+             via `git rev-list --objects --all` and the cloned pack would carry the bytes"
         );
     }
 
@@ -3440,13 +3544,18 @@ esac\n";
 
     #[test]
     fn skips_an_annotated_tag_of_a_blob() {
-        // #218 review P1: an annotated tag of a blob is a valid Git
-        // shape (pushable through receive-pack). The pre-fix
-        // `assert_all_refs_are_commits` guard bailed on this and failed
-        // the whole walk closed; the fix drops the guard. The
-        // tag-of-blob peels to a blob, not a commit, so `rev-list
-        // --all` skips it; the blob is commit-unreachable and falls
-        // out of the gap set. The walk completes successfully.
+        // #218 review round 1: an annotated tag of a blob is a
+        // valid Git shape (pushable through receive-pack). The
+        // pre-fix `assert_all_refs_are_commits` guard bailed on
+        // this and failed the whole walk closed; round 1 drops
+        // the guard. #218 review round 3 P1: same shape as
+        // `skips_a_ref_pointing_at_a_blob` — the deny set must
+        // include the secret blob. The annotated tag
+        // `blobtag` peels to `secret`, not a commit; `git
+        // rev-list --all` skips the tag; the round-3 phase-2
+        // `for-each-ref` in `blob_paths` enumerates the tag and
+        // inserts `secret` with empty path; the deny-side caller
+        // withholds by OID.
         let (_td, bare, secret, _public) = fixture();
         let run = |args: &[&str]| {
             assert!(
@@ -3464,11 +3573,14 @@ esac\n";
         run(&["tag", "-a", "-m", "blobtag", "blobtag", &secret]);
 
         let rules = [rule("/secret/**", &[])];
-        let result = withheld_blob_oids(&bare, &rules, true, OWNER, None);
+        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None)
+            .expect("an annotated tag of a blob no longer fails the whole walk");
         assert!(
-            result.is_ok(),
-            "an annotated tag of a blob no longer fails the whole walk; the blob is \
-             commit-unreachable and falls out cleanly"
+            withheld.contains(&secret),
+            "the secret blob's OID must be withheld when reachable only via an \
+             annotated tag — otherwise the smart-http serve filter would advertise it \
+             via `git rev-list --objects --all` (which DOES peel tags) and the cloned \
+             pack would carry the bytes"
         );
     }
 

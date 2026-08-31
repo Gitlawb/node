@@ -10087,11 +10087,19 @@ mod tests {
     /// appears after the disconnect (RED). With it above, gated on
     /// `receive_result.is_ok()`, it does (GREEN).
     ///
-    /// `#[ignore]`d until the open bug (spawn the tail above `release`) is fixed —
-    /// see the assert message below. The test is here to keep the design
-    /// intent visible in the code, not to fail CI on every push.
+    /// Round-3 P1: a successful receive-pack followed by a disconnect during
+    /// `guard.release()` must still see its replication tail run. The tail is
+    /// spawned above `release` (gated on `receive_result.is_ok()`), and the marker
+    /// polls for `rev-list` (the new tail's primary walk command) — the previous
+    /// `for-each-ref` marker is dead because commit 91d0578 removed the last
+    /// tail-path use of that command (it lived in `assert_all_refs_are_commits`,
+    /// which is now gone). The new marker points at a real command the tail still
+    /// executes, so a future reorder that drops the tail will be caught.
+    ///
+    /// Load-bearing: with the spawn below `release` the walk's `rev-list` never
+    /// appears after the disconnect (RED). With it above, gated on
+    /// `receive_result.is_ok()`, it does (GREEN).
     #[cfg(unix)]
-    #[ignore = "RED test for open bug: replication tail must be spawned above release (see assert message)"]
     #[sqlx::test]
     async fn receive_pack_tail_survives_a_disconnect_during_release(pool: sqlx::PgPool) {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -10124,8 +10132,14 @@ mod tests {
         // The disconnect: drop the handler future while `release` is still awaiting.
         drop(fut);
 
+        // Round-3 P1: marker is `rev-list`, not `for-each-ref` — the
+        // tail's primary walk is `git rev-list --objects --all` (the
+        // same call as `smart_http::rev_list_keep`); a successful
+        // re-key on the cloned path emits it from the post-receive
+        // tail. Polling for `for-each-ref` was vacuous after 91d0578
+        // removed the last tail-path use of that command.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !p2_logged(&log, "for-each-ref") {
+        while !p2_logged(&log, "rev-list") {
             assert!(
                 std::time::Instant::now() < deadline,
                 "RED: the pack landed but its replication tail never ran. A disconnect \
@@ -10194,8 +10208,14 @@ mod tests {
         drop(fut);
 
         tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        // Round-3 P1: the must-not twin also runs the `rev-list`
+        // command (the actual tail walk). `for-each-ref` is dead in
+        // the tail path; the previous marker made the assertion
+        // vacuous. The new marker pins the same command the
+        // positive-control sibling above uses, so a future change
+        // that drops the tail leaves both tests red together.
         assert!(
-            !p2_logged(&log, "for-each-ref"),
+            !p2_logged(&log, "rev-list"),
             "a failed receive-pack must spawn no replication tail: pinning and \
              announcing a half-applied repo is exactly what release(false) refuses \
              to upload"

@@ -36,15 +36,19 @@ ignore = [
     # the build, at which point it becomes a real reachable advisory.
     "RUSTSEC-2023-0071", # rsa Marvin attack (no fix; not linked in our build)
 
-    # h2 0.4.13 (unbounded empty DATA frames DoS). Present in Cargo.lock because
-    # reqwest/hyper transitively depend on h2. The fix requires h2 >=0.4.16.
-    # REMOVE once #368 lands with a compatible h2 update.
-    "RUSTSEC-2026-0258", # h2 unbounded empty DATA frames
-
-    # lru 0.16.4 (use-after-free in pop()). Reachable via alloy -> alloy-provider.
-    # No fix available: alloy 1.7.3 pins alloy-provider which uses lru 0.16.4.
-    # The lru 0.12.5 advisory (RUSTSEC-2026-0253) is also present (via aws-sdk-s3)
-    # but that was fixed by reverting aws-sdk-s3 upgrade (we kept the older version
-    # to avoid the h2 issue). REMOVE once alloy updates its lru dependency.
-    "RUSTSEC-2026-0253", # lru use-after-free (both 0.12.5 and 0.16.4)
-]
+    # lru 0.12.5 (use-after-free in pop()). Reachable via aws-sdk-s3
+    # (reverted from the upgrade that pulled in lru 0.12.5). The
+    # lockfile currently has 0.12.5 (via aws-sdk-s3) AND 0.16.3 (via
+    # alloy). The RUSTSEC-2026-0253 advisory covers both ranges, and
+    # this ignore is still load-bearing for 0.12.5 — a future alloy
+    # release that bumps 0.16.x to a fixed version would let this
+    # ignore retire for the 0.16 range. REMOVE only when BOTH
+    # lockfile versions are fixed (or removed).
+    "RUSTSEC-2026-0253", # lru use-after-free (covers 0.12.5 and 0.16.x)
+    #
+    # Round-3 P2 (reviewer 2): the previous version of this file
+    # ignored RUSTSEC-2026-0258 for h2 0.4.13, but the lockfile
+    # already has h2 0.4.18 (verified 2026-08-31: cargo tree -p h2
+    # shows 0.4.18) — the fix is in. The ignore was stale and would
+    # have silently re-accepted the advisory if h2 dropped back to
+    # 0.4.13. Removed.

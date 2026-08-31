@@ -2163,18 +2163,25 @@ pub async fn list_pins(State(state): State<AppState>) -> Result<Json<serde_json:
         .into_iter()
         .filter(|p| p.cid.is_some() || p.pinata_cid.is_some())
         .map(|p| {
-            // Backward compatibility: `cid` is the local CID when present,
-            // falling back to the Pinata CID for remote-only rows. Clients
-            // like `gl ipfs list` read only `pin["cid"]`; a NULL here
-            // would render as "?". The new `local_pinned` and
-            // `pinata_pinned` fields are the writer-owned signals
-            // consumers should use to distinguish a real local pin
-            // from a Pinata-only row whose `cid` is just the raw
-            // resolver key.
-            let effective_cid = p.cid.as_deref().or(p.pinata_cid.as_deref());
+            // Round-3 P2 (reviewer 2): do not advertise a Pinata-only
+            // provider CID as the node-local resolver key. The
+            // listing's `cid` field is what the `gl ipfs list` CLI
+            // (and similar clients) feeds into `GET /ipfs/{cid}`,
+            // and that endpoint is keyed on the local raw-CID
+            // resolver (not the Pinata provider CID). Returning the
+            // provider CID in `cid` would make the listing promise a
+            // CID the node itself cannot serve — clients would
+            // follow the advertised CID and get a 404. The
+            // provenance split is exposed via `local_cid` /
+            // `pinata_cid` (the raw local CID and the Pinata provider
+            // CID respectively); consumers that need a Pinata-
+            // resolvable CID read `pinata_cid` directly, and the
+            // boolean `local_pinned` / `pinata_pinned` flags tell
+            // them which side has the bytes. A NULL `cid` is the
+            // truthful Pinata-only state.
             serde_json::json!({
                 "sha256_hex": p.sha256_hex,
-                "cid": effective_cid,
+                "cid": p.cid,
                 "local_cid": p.cid,
                 "pinata_cid": p.pinata_cid,
                 "local_pinned": p.local_ipfs_provenance,
@@ -2648,12 +2655,21 @@ mod closed_pool_tests {
                 pinata_cid,
                 "{sha}: pinata_cid mismatch",
             );
-            // `cid` is the resolver key: local CID when set, falling
-            // back to Pinata CID. For all four shapes at least one is
-            // set, so `cid` is always non-null.
-            let cid_str = pin.get("cid").and_then(|v| v.as_str()).unwrap_or("");
-            let expected_cid = local_cid.or(pinata_cid).unwrap();
-            assert_eq!(cid_str, expected_cid, "{sha}: cid mismatch");
+            // Round-3 P2: `cid` is the LOCAL resolver key, full
+            // stop. It is the raw CID when the row has a local pin
+            // (local-only or dual shape) and `None` for Pinata-only
+            // rows. The previous contract aliased the Pinata provider
+            // CID into `cid` for Pinata-only rows, which made
+            // `gl ipfs list` advertise a CID the node's own
+            // `/ipfs/{cid}` resolver cannot serve (404). The
+            // provenance split is exposed via `local_cid`,
+            // `pinata_cid`, and the boolean `local_pinned` /
+            // `pinata_pinned` flags.
+            let cid_value = pin.get("cid").cloned().unwrap_or(serde_json::Value::Null);
+            let expected_cid = local_cid
+                .map(|s| serde_json::Value::String(s.to_string()))
+                .unwrap_or(serde_json::Value::Null);
+            assert_eq!(cid_value, expected_cid, "{sha}: cid mismatch");
         };
 
         // (1) local-only
