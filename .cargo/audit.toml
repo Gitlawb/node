@@ -44,7 +44,7 @@ ignore = [
     # release that bumps 0.16.x to a fixed version would let this
     # ignore retire for the 0.16 range. REMOVE only when BOTH
     # lockfile versions are fixed (or removed).
-    "RUSTSEC-2026-0253", # lru use-after-free (covers 0.12.5 and 0.16.x)
+    "RUSTSEC-2026-0253",
     #
     # Round-3 P2 (reviewer 2): the previous version of this file
     # ignored RUSTSEC-2026-0258 for h2 0.4.13, but the lockfile
@@ -52,3 +52,4 @@ ignore = [
     # shows 0.4.18) — the fix is in. The ignore was stale and would
     # have silently re-accepted the advisory if h2 dropped back to
     # 0.4.13. Removed.
+]
