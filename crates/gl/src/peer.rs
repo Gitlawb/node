@@ -196,7 +196,7 @@ async fn cmd_add(peer_url: String, node: String, dir: Option<PathBuf>) -> Result
     // in the command: bound the read, and defang the message before it reaches
     // the terminal through the error return. An announce reply is a DID, a URL
     // and a count, so 8 KiB is well past what the shape needs.
-    let raw = read_body_capped(resp, 8 * 1024).await;
+    let raw = read_body_capped(resp, 8 * 1024).await.text;
 
     if let Some(failure) = remote_announce_failure(status, &raw) {
         anyhow::bail!("{failure}");
@@ -234,7 +234,7 @@ async fn cmd_add(peer_url: String, node: String, dir: Option<PathBuf>) -> Result
                 // node (or a MITM on plain http) must not force an unbounded
                 // read. A body that does not parse stays `Null`, which still
                 // routes a non-success status to the warning.
-                let raw = read_body_capped(resp, 8 * 1024).await;
+                let raw = read_body_capped(resp, 8 * 1024).await.text;
                 let result: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
                 let (is_warning, line) = local_add_report(status, &result);
                 if is_warning {

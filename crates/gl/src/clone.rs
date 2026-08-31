@@ -12,8 +12,57 @@ use serde::Deserialize;
 use std::path::Path;
 use std::process::Command;
 
-use crate::http::NodeClient;
+use crate::http::{sanitize_node_msg, NodeClient};
 use crate::identity::load_keypair_from_dir;
+
+/// Report why one candidate blob could not be recovered, in the register of the
+/// recovery loop's other warnings.
+///
+/// Both halves are gateway-supplied text on their way to a terminal: the oid comes
+/// out of a manifest fetched from a caller-chosen Arweave gateway, and a transport
+/// error carries the URL the same manifest chose. So the whole line is defanged and
+/// length-capped, like every other node/gateway string this crate prints.
+///
+/// Under `cfg(test)` the line is also mirrored into a per-thread buffer, so a test
+/// can assert the loop actually says what it skipped rather than only that it
+/// returned nothing.
+fn warn_skip(oid: &str, why: &str) {
+    emit_warning(&format!(
+        "warning: could not fetch encrypted blob {oid}: {why}; skipping"
+    ));
+}
+
+/// The same report for a manifest rather than a blob. The manifest is one step
+/// earlier in the same recovery: losing it silently means every blob it would have
+/// named is missing with no reason given anywhere.
+fn warn_skip_manifest(id: &str, why: &str) {
+    emit_warning(&format!(
+        "warning: could not fetch blob manifest {id}: {why}; skipping"
+    ));
+}
+
+/// Sanitize a warning and write it, once.
+///
+/// The write goes to [`warn_sink`], which is stderr in a normal build and the tests'
+/// per-thread mirror under `cfg(test)`. That indirection is the point: the mirror
+/// used to sit BESIDE an `eprintln!`, so deleting the user-visible write left every
+/// assertion on the mirror green and the shipped behaviour could be removed with the
+/// tests unchanged. There is one write now, and the tests observe it.
+fn emit_warning(line: &str) {
+    use std::io::Write;
+    let line = sanitize_node_msg(line);
+    let _ = writeln!(warn_sink(), "{line}");
+}
+
+#[cfg(not(test))]
+fn warn_sink() -> impl std::io::Write {
+    std::io::stderr()
+}
+
+#[cfg(test)]
+fn warn_sink() -> impl std::io::Write {
+    tests::WarnMirror
+}
 
 #[derive(Args)]
 pub struct CloneArgs {
@@ -312,10 +361,25 @@ async fn recover_encrypted_blobs(
             .await
         {
             Ok(r) if r.status().is_success() => r,
-            _ => continue,
+            // The node path has the same silent exit the gateway path had: a 403, a
+            // 404, or a dead connection all reached the caller as "blob not
+            // recoverable" with no reason attached. One unreachable blob still must
+            // not end the recovery of the rest, so it warns and moves on.
+            Ok(r) => {
+                warn_skip(oid, &format!("node returned {}", r.status()));
+                continue;
+            }
+            Err(e) => {
+                warn_skip(oid, &format!("node request failed: {e}"));
+                continue;
+            }
         };
-        let Ok(envelope) = env_resp.bytes().await else {
-            continue;
+        let envelope = match env_resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn_skip(oid, &format!("reading the envelope failed: {e}"));
+                continue;
+            }
         };
         let plaintext = match open_blob(&envelope, keypair) {
             Ok(p) => p,
@@ -642,7 +706,14 @@ async fn recover_from_arweave(
     for r in refs {
         let m = match client.get(format!("{ag}/{}", r.id)).send().await {
             Ok(resp) if resp.status().is_success() => resp,
-            _ => continue,
+            Ok(resp) => {
+                warn_skip_manifest(&r.id, &format!("gateway returned {}", resp.status()));
+                continue;
+            }
+            Err(e) => {
+                warn_skip_manifest(&r.id, &format!("gateway request failed: {e}"));
+                continue;
+            }
         };
         if let Ok(parsed) = m.json::<Manifest>().await {
             manifests.push((parsed, r.height));
@@ -684,10 +755,31 @@ async fn recover_from_arweave(
         }
         let env_resp = match client.get(format!("{ig}/ipfs/{cid}")).send().await {
             Ok(r) if r.status().is_success() => r,
-            _ => continue,
+            // Every other outcome used to leave through a bare `continue`, so a
+            // gateway that answered 503, 404, or nothing at all was reported to the
+            // caller as "blob not recoverable" with no reason attached. This is the
+            // second in-repo client of GET /ipfs/{cid} and it has no resume ladder,
+            // so saying what happened is all the recourse there is. It still skips to
+            // the next candidate either way: one unreachable blob must not end the
+            // recovery of the rest.
+            Ok(r) => {
+                warn_skip(&oid, &format!("gateway returned {}", r.status()));
+                continue;
+            }
+            Err(e) => {
+                warn_skip(&oid, &format!("gateway request failed: {e}"));
+                continue;
+            }
         };
-        let Ok(envelope) = env_resp.bytes().await else {
-            continue;
+        // A body that dies part-way through is the same mid-read failure the capped
+        // read exists to stop rendering as silence, and it sits INSIDE the loop whose
+        // status arms were already fixed.
+        let envelope = match env_resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn_skip(&oid, &format!("reading the envelope failed: {e}"));
+                continue;
+            }
         };
         // open_blob succeeds only if this caller is a recipient: this is the
         // authorization gate (no node, no DID check needed).
@@ -801,8 +893,41 @@ pub async fn run(args: CloneArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::process::Command;
     use tempfile::TempDir;
+
+    thread_local! {
+        /// Test-visible copy of the stderr warnings `warn_skip` emits.
+        /// `#[tokio::test]` runs the future on the test's own thread, so a
+        /// thread-local is enough.
+        static WARNINGS: RefCell<String> = const { RefCell::new(String::new()) };
+    }
+
+    /// The `cfg(test)` warning sink. `emit_warning` writes here instead of to
+    /// stderr, so the assertions below observe the shipped write rather than a copy
+    /// made beside it: delete that write and they go red.
+    pub(super) struct WarnMirror;
+
+    impl std::io::Write for WarnMirror {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let text = String::from_utf8_lossy(buf).into_owned();
+            WARNINGS.with(|w| w.borrow_mut().push_str(&text));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn reset_warnings() {
+        WARNINGS.with(|w| w.borrow_mut().clear());
+    }
+
+    fn warnings() -> String {
+        WARNINGS.with(|w| w.borrow().clone())
+    }
 
     fn g(args: &[&str], dir: &Path) {
         assert!(Command::new("git")
@@ -1253,6 +1378,132 @@ mod tests {
         let timestamped = manifest_with("2026-06-11T00:00:00Z", "o1", "cidTS");
         let a = merge_manifests(vec![(untimestamped, Some(50)), (timestamped, Some(1))]);
         assert_eq!(a.get("o1").map(String::as_str), Some("cidTS"));
+    }
+
+    /// A gateway that refuses one blob must SAY so, and must not take the rest of the
+    /// recovery down with it.
+    ///
+    /// The IPFS fetch used to leave through a bare `_ => continue` on every
+    /// non-success, so a 503 (the truncation status a tuned node makes more likely),
+    /// a 404, and a dead connection all reached the caller as the same silent "blob
+    /// not recoverable". Two withheld blobs here: the gateway answers 503 for the
+    /// first and serves the second. The recovered path proves the loop continued; the
+    /// warning proves the skip was reported and names both the object and the status.
+    #[tokio::test]
+    async fn recover_from_arweave_reports_a_refusing_gateway_and_continues() {
+        use gitlawb_core::encrypt::seal_blob;
+        use gitlawb_core::identity::Keypair;
+
+        reset_warnings();
+        let (td, url) = bare_remote(&[
+            ("public/a.txt", b"pub\n"),
+            ("secret/b.txt", b"SECRET B\n"),
+            ("secret/c.txt", b"SECRET C\n"),
+        ]);
+        let dest = td.path().join("dest");
+        let bare = url.strip_prefix("file://").unwrap();
+        assert!(Command::new("git")
+            .args(["-C", bare, "config", "uploadpack.allowFilter", "true"])
+            .status()
+            .unwrap()
+            .success());
+        setup_partial_clone(&dest, &url, &["/secret/**".to_string()], &[], None).unwrap();
+
+        let oid_of = |path: &str| {
+            let out = Command::new("git")
+                .args([
+                    "-C",
+                    dest.to_str().unwrap(),
+                    "rev-parse",
+                    &format!("HEAD:{path}"),
+                ])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let refused_oid = oid_of("secret/b.txt");
+        let served_oid = oid_of("secret/c.txt");
+
+        // Origin death, so recovery has to go through the gateways.
+        std::fs::remove_dir_all(bare).unwrap();
+
+        let reader = Keypair::generate();
+        let envelope = seal_blob(b"SECRET C\n", &[reader.verifying_key()]).unwrap();
+
+        let refused_cid = "cidrefused";
+        let served_cid = "cidserved";
+        let mut server = mockito::Server::new_async().await;
+        let _gql = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":{"transactions":{"edges":[{"node":{"id":"TX1"}}]}}}"#)
+            .create_async()
+            .await;
+        let manifest_body = serde_json::json!({
+            "timestamp": "2026-06-11T00:00:00Z",
+            "blobs": [
+                { "oid": refused_oid, "cid": refused_cid },
+                { "oid": served_oid, "cid": served_cid },
+            ],
+        })
+        .to_string();
+        let _tx = server
+            .mock("GET", "/TX1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(manifest_body)
+            .create_async()
+            .await;
+        let refusal = server
+            .mock("GET", format!("/ipfs/{refused_cid}").as_str())
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"search_incomplete","message":"scan truncated"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let ok = server
+            .mock("GET", format!("/ipfs/{served_cid}").as_str())
+            .with_status(200)
+            .with_body(envelope)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let paths = recover_from_arweave(
+            &server.url(),
+            &server.url(),
+            "alice",
+            "myrepo",
+            &dest,
+            &reader,
+        )
+        .await
+        .unwrap();
+
+        refusal.assert_async().await;
+        ok.assert_async().await;
+        assert_eq!(
+            paths,
+            vec!["secret/c.txt".to_string()],
+            "a refused candidate must not stop the loop reaching the next one"
+        );
+
+        let warnings = warnings();
+        assert!(
+            warnings.contains(&refused_oid),
+            "the skip must name the object it could not fetch, got: {warnings}"
+        );
+        assert!(
+            warnings.contains("503"),
+            "the skip must name the gateway's status rather than failing silently, \
+             got: {warnings}"
+        );
+        assert!(
+            !warnings.contains(&served_oid),
+            "the blob that was served must not be reported as skipped, got: {warnings}"
+        );
     }
 
     /// Read-path end-to-end over a mocked Arweave + IPFS gateway: discover the
