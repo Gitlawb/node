@@ -240,6 +240,50 @@ async fn refilter_public_objects(
         }
     }
 }
+// Test-only fault injection for the PIN-BOUNDARY re-derivation (#218 review
+// round 8 P2). The "nothing was dispatched" branch of the continuation write is
+// reached when a stage between the missing-set query and the backend call
+// declines — a `PolicyFence` capture that fails, a quarantine recheck that says
+// skip, a re-derivation that errors. Every one of those is a DB or git failure
+// on a repo the test has just built healthy, and no fixture can produce one from
+// the outside: the mid-scan re-filter runs first on the same rules and the same
+// budget, so anything that would starve the pin-boundary call has already made
+// the sweep `continue` well before the offset write. Rather than assert the
+// contract at a lower layer than the one that owns it (the sweep loop's call
+// site), the boundary gets an explicit seam.
+//
+// Thread-local because `#[sqlx::test]` drives each test on its own
+// current-thread runtime, so the flag cannot race across tests.
+#[cfg(test)]
+thread_local! {
+    static FAIL_PIN_BOUNDARY_REDERIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Force (or release) the pin-boundary re-derivation failure. Test-only.
+#[cfg(test)]
+fn set_fail_pin_boundary_rederive(on: bool) {
+    FAIL_PIN_BOUNDARY_REDERIVE.with(|c| c.set(on));
+}
+
+/// [`refilter_public_objects`] at the pin boundary — the last authorization
+/// stage before an irreversible public pin, and the one stage whose failure the
+/// continuation write has to distinguish from "nothing to do". Identical to the
+/// mid-scan call except for the test seam above.
+async fn pin_boundary_refilter(
+    disk: &std::path::Path,
+    rules: &[crate::db::VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    object_list: Vec<String>,
+    deadline: Instant,
+) -> Option<Vec<String>> {
+    #[cfg(test)]
+    if FAIL_PIN_BOUNDARY_REDERIVE.with(|c| c.get()) {
+        return None;
+    }
+    refilter_public_objects(disk, rules, is_public, owner_did, object_list, deadline).await
+}
+
 /// Re-check quarantine AND root visibility immediately before an irreversible
 /// public pin (R1-P1). Returns the fresh repo row plus fresh rules, or `None`
 /// when the pin must be skipped. DB failures are treated as skip (never pin on
@@ -633,6 +677,15 @@ async fn run_pass(
 
         // IPFS-missing set.  A filter DB error skips only the IPFS gap-fill and
         // lets the Pinata path still run (R1-P3), instead of dropping the repo.
+        //
+        // `*_scan_ok` records whether the missing set is a TRUTHFUL answer
+        // (#218 review round 8 P2). An empty set means two opposite things: "every
+        // object is already pinned" (the happy path, which should mark the
+        // continuation done) or "the filter query failed and we know nothing"
+        // (which must leave the stored continuation exactly where it was). Writing
+        // a done marker for the second case discards a resume point that a capped
+        // pass paid for, so the two are tracked apart.
+        let mut ipfs_scan_ok = ipfs_enabled;
         let ipfs_missing: Vec<String> = if ipfs_enabled {
             match db.filter_ipfs_pinned_oids(&object_list).await {
                 Ok(already) => cap_missing(
@@ -642,6 +695,7 @@ async fn run_pass(
                 ),
                 Err(e) => {
                     tracing::warn!(repo = %repo_slug, err = %e, "filter_ipfs_pinned_oids failed, IPFS gap-fill skipped this pass");
+                    ipfs_scan_ok = false;
                     Vec::new()
                 }
             }
@@ -649,6 +703,7 @@ async fn run_pass(
             Vec::new()
         };
 
+        let mut pinata_scan_ok = pinata_enabled;
         let pinata_missing: Vec<String> = if pinata_enabled {
             match db.filter_pinata_pinned_oids(&object_list).await {
                 Ok(already) => cap_missing(
@@ -658,6 +713,7 @@ async fn run_pass(
                 ),
                 Err(e) => {
                     tracing::warn!(repo = %repo_slug, err = %e, "filter_pinata_pinned_oids failed, Pinata gap-fill skipped this pass");
+                    pinata_scan_ok = false;
                     Vec::new()
                 }
             }
@@ -665,18 +721,32 @@ async fn run_pass(
             Vec::new()
         };
 
-        // Capture the last attempted OID per backend BEFORE the missing
-        // set is moved into the pin loops below (#218 review P2). The
-        // offset is the LAST OID in the capped attempt set, which is
-        // also the cap edge for a truncated pass; the next pass's
-        // `missing_oids` rotates the sorted set so the first OID is
-        // strictly greater than this value, and the previously
-        // attempted tail retries at the end. The value is captured
-        // here (rather than re-read after the pin loops) so a future
-        // change that consumes `ipfs_missing` / `pinata_missing` does
-        // not silently drop the offset write.
-        let ipfs_last = ipfs_missing.last().cloned();
-        let pinata_last = pinata_missing.last().cloned();
+        // Whether this pass had gap-fill work to do at all, captured before the
+        // missing sets are moved into the pin loops below. This is NOT the
+        // continuation value — see `ipfs_dispatched` / `pinata_dispatched`.
+        let ipfs_had_work = !ipfs_missing.is_empty();
+        let pinata_had_work = !pinata_missing.is_empty();
+
+        // The last OID each backend actually DISPATCHED — handed to
+        // `pin_new_objects` — or `None` if this pass dispatched nothing.
+        //
+        // #218 review round 8 P2: the continuation used to be captured here, from
+        // `missing.last()`, BEFORE the pin permit, both `PolicyFence` captures and
+        // both pin loops, and was then written unconditionally. Every stage between
+        // capture and dispatch can legitimately produce nothing — a fence capture
+        // that fails, a quarantine/visibility recheck that says skip, a
+        // pin-boundary re-derivation that errors — and each of those is a
+        // TRANSIENT failure. Advancing the continuation past OIDs that were never
+        // attempted rotates that whole unattempted prefix to the BACK of the next
+        // pass's order, behind the entire backlog. For an at-cap repo (the only
+        // kind the continuation exists for) the backlog never drains inside one
+        // cap window, so those objects are not merely retried later — they are
+        // starved indefinitely, which is exactly the durability hole this sweep is
+        // the backstop for. The offset therefore moves only for work that was
+        // really dispatched; a pass that dispatched nothing leaves the stored
+        // resume point untouched and retries the same prefix next tick.
+        let mut ipfs_dispatched: Option<String> = None;
+        let mut pinata_dispatched: Option<String> = None;
 
         // Count UNIQUE missing objects across both backends (R1-P3): an object
         // absent from both must not be counted twice.
@@ -732,7 +802,7 @@ async fn run_pass(
                 Some(fence) => match recheck_public_pin(db, &repo.id, &repo_slug).await {
                     None => Vec::new(),
                     Some((fresh_repo, fresh_rules)) => {
-                        let to_pin = match refilter_public_objects(
+                        let to_pin = match pin_boundary_refilter(
                             &disk,
                             &fresh_rules,
                             fresh_repo.is_public,
@@ -751,6 +821,18 @@ async fn run_pass(
                         if to_pin.is_empty() {
                             Vec::new()
                         } else {
+                            // Dispatch boundary (round-8 P2): from here the OIDs
+                            // in `to_pin` really are handed to the backend, so
+                            // the continuation may advance to the last of them.
+                            // Recorded BEFORE the call so a pin phase that times
+                            // out mid-batch still counts as dispatched — those
+                            // objects were attempted, and re-attempting them
+                            // ahead of the rest of the backlog is the starvation
+                            // the rotation exists to avoid. It is `to_pin`'s last
+                            // element, not the missing set's: an OID the
+                            // pin-boundary re-derivation dropped was never
+                            // offered to the backend.
+                            ipfs_dispatched = to_pin.last().cloned();
                             match tokio::time::timeout(
                                 PIN_PHASE_DEADLINE,
                                 crate::ipfs_pin::pin_new_objects(
@@ -795,7 +877,7 @@ async fn run_pass(
                         // spent deadline here would silently skip Pinata every
                         // pass for exactly the large repos this sweep exists
                         // for.
-                        let to_pin = match refilter_public_objects(
+                        let to_pin = match pin_boundary_refilter(
                             &disk,
                             &fresh_rules,
                             fresh_repo.is_public,
@@ -814,6 +896,10 @@ async fn run_pass(
                         if to_pin.is_empty() {
                             Vec::new()
                         } else {
+                            // Dispatch boundary (round-8 P2); see the IPFS arm
+                            // above for why this is recorded here rather than
+                            // from the missing set before the fence.
+                            pinata_dispatched = to_pin.last().cloned();
                             match tokio::time::timeout(
                                 PIN_PHASE_DEADLINE,
                                 crate::pinata::pin_new_objects(
@@ -869,7 +955,7 @@ async fn run_pass(
         }
 
         // Persist the per-(repo, backend) continuation offset (#218 review
-        // P2). The offset is the LAST attempted OID per backend — for a
+        // P2). The offset is the last DISPATCHED OID per backend — for a
         // non-truncated pass this is the OID at the tail of the missing
         // set, for a truncated pass it is the OID at the cap edge. The
         // next pass's `missing_oids` rotates the sorted set so the first
@@ -877,25 +963,64 @@ async fn run_pass(
         // attempted tail is retried at the end of the next pass — so a
         // persistent early failure does not monopolise the cap window.
         //
-        // A missing set that drained to empty clears the offset: the next
-        // pass starts at the head of whatever the new missing set is.
-        // A DB error here is logged but does NOT abort the pass: a
+        // Three outcomes, and the round-8 P2 fix is that they are three
+        // rather than two (see `ipfs_dispatched` above for the starvation
+        // this prevents):
+        //   * work dispatched      -> advance to the last dispatched OID.
+        //   * nothing missing, and the missing-set query SUCCEEDED
+        //                          -> `None`, which marks the row done and
+        //                             starts the next pass at the head.
+        //   * nothing dispatched from a non-empty missing set, or a failed
+        //     missing-set query
+        //                          -> write NOTHING. The stored resume
+        //                             point is the only record of how far a
+        //                             capped pass got; a transient fence,
+        //                             recheck or re-derivation failure must
+        //                             not be allowed to erase or advance it.
+        //
+        // A DB error on the write is logged but does NOT abort the pass: a
         // missed offset write means the next pass starts at the head
         // (the worst case is one pass at the old sort order).
+        //
+        // `next_offset_write` returns `Some(value_to_write)` or `None` for
+        // "leave the row alone", so the two backends cannot drift apart.
+        let next_offset_write =
+            |scan_ok: bool, had_work: bool, dispatched: Option<String>| -> Option<Option<String>> {
+                if !scan_ok {
+                    None
+                } else if dispatched.is_some() {
+                    Some(dispatched)
+                } else if !had_work {
+                    Some(None)
+                } else {
+                    None
+                }
+            };
+
         if ipfs_enabled {
-            if let Err(e) = db
-                .save_reconciliation_offset(&repo.id, "IPFS", ipfs_last.as_deref())
-                .await
-            {
-                tracing::warn!(repo = %repo_slug, err = %e, "save_reconciliation_offset(IPFS) failed, next pass will start from head");
+            if let Some(next) = next_offset_write(ipfs_scan_ok, ipfs_had_work, ipfs_dispatched) {
+                if let Err(e) = db
+                    .save_reconciliation_offset(&repo.id, "IPFS", next.as_deref())
+                    .await
+                {
+                    tracing::warn!(repo = %repo_slug, err = %e, "save_reconciliation_offset(IPFS) failed, next pass will start from head");
+                }
+            } else {
+                tracing::debug!(repo = %repo_slug, "IPFS dispatched nothing this pass, continuation offset left unchanged");
             }
         }
         if pinata_enabled {
-            if let Err(e) = db
-                .save_reconciliation_offset(&repo.id, "PINATA", pinata_last.as_deref())
-                .await
+            if let Some(next) =
+                next_offset_write(pinata_scan_ok, pinata_had_work, pinata_dispatched)
             {
-                tracing::warn!(repo = %repo_slug, err = %e, "save_reconciliation_offset(PINATA) failed, next pass will start from head");
+                if let Err(e) = db
+                    .save_reconciliation_offset(&repo.id, "PINATA", next.as_deref())
+                    .await
+                {
+                    tracing::warn!(repo = %repo_slug, err = %e, "save_reconciliation_offset(PINATA) failed, next pass will start from head");
+                }
+            } else {
+                tracing::debug!(repo = %repo_slug, "Pinata dispatched nothing this pass, continuation offset left unchanged");
             }
         }
 
@@ -2335,6 +2460,139 @@ mod tests {
         assert!(
             stored2.is_none(),
             "a no-missing pass must mark the offset done (load returns None)"
+        );
+    }
+
+    /// #218 review round 8 P2: the continuation offset advances only for
+    /// work that was actually DISPATCHED to a backend.
+    ///
+    /// The failure it guards: `ipfs_last` used to be captured from the missing
+    /// set before the pin permit, both `PolicyFence` captures and both pin loops,
+    /// and written afterwards under nothing but `if ipfs_enabled`. So a pass whose
+    /// missing set was non-empty but whose pin boundary declined — a transient
+    /// fence, recheck or re-derivation failure — still moved the offset to the end
+    /// of a set it never attempted. `missing_oids` rotates strictly past the
+    /// stored offset, so on the next pass that whole unattempted prefix lands
+    /// BEHIND the entire backlog. For an at-cap repo the backlog never drains in
+    /// one window, so those objects are starved indefinitely rather than retried
+    /// — a durability hole in the durability backstop.
+    ///
+    /// The test seeds a resume point, then runs a pass whose pin boundary fails
+    /// (the `set_fail_pin_boundary_rederive` seam; see its comment for why the
+    /// stage cannot be starved from the outside). The stored offset must come back
+    /// BYTE-IDENTICAL: not advanced, and not cleared to a done marker either.
+    /// Then the seam is released and the same repo, unchanged, advances it — so
+    /// the assertion cannot pass merely because the write site is dead.
+    #[sqlx::test]
+    async fn sweep_leaves_offset_untouched_when_nothing_was_dispatched(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        let repo_on_disk = Repo::new();
+        repo_on_disk.commit_file("a.txt", "public blob\n");
+        let rec = seed_repo(
+            "did:key:zNoDispatchOwner",
+            "no-dispatch-repo",
+            &repo_on_disk.path.display().to_string(),
+        );
+        db.create_repo(&rec).await.unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
+            .with_status(200)
+            .with_body(r#"{"Hash":"QmNoDispatchMockCid"}"#)
+            .create_async()
+            .await;
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            &server.url(),
+        ]);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let (_tx, mut rx) = watch::channel(false);
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        // A resume point a previous capped pass would have paid for. Chosen
+        // below every real OID so it does not rotate the missing set empty.
+        let seeded = "0".repeat(64);
+        db.save_reconciliation_offset(&rec.id, "IPFS", Some(&seeded))
+            .await
+            .unwrap();
+
+        // Pass 1: the missing set is non-empty (there is a real gap), but the
+        // pin boundary declines, so nothing reaches the backend.
+        super::set_fail_pin_boundary_rederive(true);
+        let mut cursor = None;
+        let (_scanned, gaps, filled) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        super::set_fail_pin_boundary_rederive(false);
+
+        assert!(gaps >= 1, "the pass must have found real gap-fill work");
+        assert_eq!(
+            filled, 0,
+            "the pin boundary declined, so nothing was filled"
+        );
+        assert!(
+            db.list_pinned_cids().await.unwrap().is_empty(),
+            "nothing may have been dispatched to the backend"
+        );
+
+        let after_fail = db
+            .load_reconciliation_offset(&rec.id, "IPFS")
+            .await
+            .unwrap();
+        assert_eq!(
+            after_fail.as_deref(),
+            Some(seeded.as_str()),
+            "a pass that dispatched NOTHING must leave the continuation exactly \
+             where it was — advancing it rotates the unattempted prefix behind the \
+             whole backlog, and clearing it discards the resume point a capped pass \
+             already paid for"
+        );
+
+        // Pass 2, same repo, seam released: real dispatch happens and the offset
+        // does move. Without this the assertion above would also pass if the
+        // write site were simply dead.
+        let mut cursor2 = None;
+        let (_s2, gaps2, filled2) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor2,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(gaps2 >= 1, "the gap is still there to be filled");
+        assert!(filled2 >= 1, "a dispatched pass fills the gap");
+        let after_ok = db
+            .load_reconciliation_offset(&rec.id, "IPFS")
+            .await
+            .unwrap();
+        assert_ne!(
+            after_ok.as_deref(),
+            Some(seeded.as_str()),
+            "a pass that DID dispatch must advance the continuation past the seed"
         );
     }
 
