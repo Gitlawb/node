@@ -50,6 +50,17 @@ pub async fn create_pr(
     let target_branch = req
         .target_branch
         .unwrap_or_else(|| record.default_branch.clone());
+
+    // Validate both refs before they are stored, since both are later
+    // interpolated into git argv (git diff / worktree add / merge). Validate the
+    // RESOLVED target, not just a caller-supplied one: create_repo also gates
+    // default_branch, but validating here as well means a PR can never feed the
+    // git sink an unchecked ref even if a default was poisoned by an older row
+    // or a future path that skips create_repo's gate.
+    crate::api::validate_git_ref_with_git(&state.git_bin, &req.source_branch)
+        .map_err(crate::api::map_git_ref_validation_error)?;
+    crate::api::validate_git_ref_with_git(&state.git_bin, &target_branch)
+        .map_err(crate::api::map_git_ref_validation_error)?;
     let number = state.db.next_pr_number(&record.id).await?;
     let now = Utc::now().to_rfc3339();
 

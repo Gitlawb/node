@@ -188,7 +188,6 @@ mod tests {
     use axum::http::StatusCode;
     use chrono::Utc;
     use tower::ServiceExt;
-
     fn seed_repo(owner_did: &str, name: &str) -> RepoRecord {
         let now = Utc::now();
         RepoRecord {
@@ -783,6 +782,1667 @@ mod tests {
             resp.status().is_success(),
             "the owner should be able to open a PR, got {}",
             resp.status()
+        );
+    }
+
+    /// SINK GUARD (defense in depth): a poisoned PR row that bypassed the create_pr
+    /// (a pre-fix row, or any writer create_pr does not gate) still reach the git
+    /// sink? Inserts the row directly via db.create_pr and drives get_pr_diff
+    /// anonymously. If the attacker-named file appears, the storage-boundary fix
+    /// does not cover legacy/other-writer rows and the sink itself needs a guard.
+    #[sqlx::test]
+    async fn poisoned_pr_row_cannot_write_a_file_through_the_diff_sink(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let src = std::env::temp_dir().join(format!("gl-probe-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("f.txt"), b"hi").unwrap();
+        run(&["add", "f.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("probe.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+
+        let mut repo = seed_repo(&owner_did, "probe");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pwn = std::env::temp_dir().join(format!("gl-PROBE-{short}"));
+        let _ = std::fs::remove_file(&pwn);
+        let pwn_glued: std::path::PathBuf = format!("{}...main", pwn.to_str().unwrap()).into();
+        let _pg1 = DirGuard(pwn.clone());
+        let _pg2 = DirGuard(pwn_glued.clone());
+
+        // Insert the poisoned row DIRECTLY, as a pre-fix row or an ungated writer would.
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "x".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: "main".into(),
+            target_branch: format!("--output={}", pwn.to_str().unwrap()),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert poisoned row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/diff",
+                axum::routing::get(crate::api::pulls::get_pr_diff),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/probe/pulls/1/diff");
+        let resp = router.oneshot(anon_get(&uri)).await.unwrap();
+        let st = resp.status();
+        assert!(
+            !st.is_success(),
+            "get_pr_diff must not succeed for a poisoned row (got {st})"
+        );
+
+        let written = pwn.exists() || pwn_glued.exists();
+        assert!(
+            !written,
+            "the sink must not write a file even for a poisoned row that bypassed the \
+             create_pr boundary (get_pr_diff status {st})"
+        );
+    }
+
+    /// SECURITY (option injection, source arm): create_pr must reject an
+    /// option-shaped source_branch too. merge_branch interpolates source as its
+    /// own argv element (git merge {source}), so this is the merge-shaped twin of
+    /// the target test above.
+    #[sqlx::test]
+    async fn create_pr_rejects_option_injecting_source_branch(pool: PgPool) {
+        let owner = "did:key:zPRSRCINJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        let repo = seed_repo(owner, "pub-src-inj-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls",
+                axum::routing::post(crate::api::pulls::create_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner}/pub-src-inj-repo/pulls");
+        let body = Body::from(
+            r#"{"title":"x","source_branch":"--output=/tmp/gl-should-not-exist-src","target_branch":"main"}"#,
+        );
+        let resp = router
+            .oneshot(signed_request_as(owner, Method::POST, &uri, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an option-shaped source_branch must be rejected, got {}",
+            resp.status()
+        );
+        let prs = state.db.list_prs(&repo.id).await.expect("list_prs");
+        assert!(prs.is_empty(), "no PR row when source_branch is rejected");
+    }
+
+    /// SECURITY (option injection, second entry point): create_repo must reject a
+    /// default_branch that git would parse as an option. Otherwise an owner sets
+    /// default_branch = "--output=...", opens a PR omitting target_branch so the
+    /// stored target falls back to that default, and the diff/merge sink injects.
+    #[sqlx::test]
+    async fn create_repo_rejects_option_injecting_default_branch(pool: PgPool) {
+        let owner = "did:key:zRepoDEFINJAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos",
+                axum::routing::post(crate::api::repos::create_repo),
+            )
+            .with_state(state.clone());
+        let body = Body::from(
+            r#"{"name":"inj-default","default_branch":"--output=/tmp/gl-should-not-exist-def"}"#,
+        );
+        let resp = router
+            .oneshot(signed_request_as(
+                owner,
+                Method::POST,
+                "/api/v1/repos",
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an option-shaped default_branch must be rejected, got {}",
+            resp.status()
+        );
+
+        // Nothing stored: the boundary rejects before init/create_repo.
+        assert!(
+            state
+                .db
+                .get_repo(owner, "inj-default")
+                .await
+                .unwrap()
+                .is_none(),
+            "no repo row must be created when default_branch is rejected"
+        );
+    }
+
+    /// SECURITY (option injection): create_pr must reject a branch ref that git
+    /// would parse as an option, so a stored `--output=...` target cannot later
+    /// turn get_pr_diff / merge into an arbitrary file write. The caller here is
+    /// the owner (a reader) of a PUBLIC repo, i.e. the minimum access needed to
+    /// plant a PR, and the request must be refused before any row is written.
+    #[sqlx::test]
+    async fn create_pr_rejects_option_injecting_branch_ref(pool: PgPool) {
+        let owner = "did:key:zPRINJOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        let repo = seed_repo(owner, "pub-inj-repo"); // is_public = true
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls",
+                axum::routing::post(crate::api::pulls::create_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner}/pub-inj-repo/pulls");
+        let body = Body::from(
+            r#"{"title":"x","source_branch":"main","target_branch":"--output=/tmp/gl-should-not-exist-inj"}"#,
+        );
+
+        let resp = router
+            .oneshot(signed_request_as(owner, Method::POST, &uri, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an option-shaped branch ref must be rejected, got {}",
+            resp.status()
+        );
+
+        // And nothing was stored: the boundary rejects before the write.
+        let prs = state.db.list_prs(&repo.id).await.expect("list_prs");
+        assert!(
+            prs.is_empty(),
+            "no PR row must be created when the branch ref is rejected"
+        );
+    }
+
+    /// Branch-name contract (jatmn #379): create_pr must reject symbolic revision
+    /// names and trailing-dot components that `git check-ref-format --branch` refuses.
+    #[sqlx::test]
+    async fn create_pr_rejects_non_branch_ref_names(pool: PgPool) {
+        let owner = "did:key:zPRBRANCHREFAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        let repo = seed_repo(owner, "branch-ref-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/pulls",
+                    axum::routing::post(crate::api::pulls::create_pr),
+                )
+                .with_state(state.clone())
+        };
+        let uri = format!("/api/v1/repos/{owner}/branch-ref-repo/pulls");
+
+        for (field, bad) in [
+            ("source_branch", "HEAD"),
+            ("source_branch", "@"),
+            ("source_branch", "@{-1}"),
+            ("source_branch", "FETCH_HEAD"),
+            ("source_branch", "ORIG_HEAD"),
+            ("source_branch", "MERGE_HEAD"),
+            ("source_branch", "CHERRY_PICK_HEAD"),
+            ("source_branch", "RERERE_MERGE_HEAD"),
+            ("source_branch", "feature."),
+            ("source_branch", "feature/x."),
+            ("source_branch", "refs/tags/v1"),
+            ("source_branch", "heads/main"),
+            ("source_branch", "tags/v1"),
+            ("target_branch", "HEAD"),
+            ("target_branch", "@"),
+            ("target_branch", "@{-1}"),
+            ("target_branch", "FETCH_HEAD"),
+            ("target_branch", "ORIG_HEAD"),
+            ("target_branch", "feature."),
+            ("target_branch", "feature/x."),
+            ("target_branch", "refs/heads/main"),
+            ("target_branch", "heads/main"),
+            ("target_branch", "tags/v1"),
+        ] {
+            let body_json = if field == "source_branch" {
+                format!(r#"{{"title":"x","source_branch":"{bad}","target_branch":"main"}}"#)
+            } else {
+                format!(r#"{{"title":"x","source_branch":"main","target_branch":"{bad}"}}"#)
+            };
+            let body = Body::from(body_json);
+            let resp = router()
+                .oneshot(signed_request_as(owner, Method::POST, &uri, body))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{field}={bad:?} must be rejected, got {}",
+                resp.status()
+            );
+            let prs = state.db.list_prs(&repo.id).await.expect("list_prs");
+            assert!(prs.is_empty(), "no PR row when {field}={bad:?} is rejected");
+        }
+    }
+
+    /// Branch-name contract (jatmn #379): create_repo must reject a default_branch
+    /// that is not a real branch name.
+    #[sqlx::test]
+    async fn create_repo_rejects_non_branch_default_branch(pool: PgPool) {
+        let owner = "did:key:zREPOBRANCHREFAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos",
+                    axum::routing::post(crate::api::repos::create_repo),
+                )
+                .with_state(state.clone())
+        };
+
+        for (name_suffix, bad) in [
+            ("head", "HEAD"),
+            ("at-shorthand", "@"),
+            ("reflog-shorthand", "@{-1}"),
+            ("fetch-head", "FETCH_HEAD"),
+            ("orig-head", "ORIG_HEAD"),
+            ("merge-head", "MERGE_HEAD"),
+            ("cherry-head", "CHERRY_PICK_HEAD"),
+            ("rerere-head", "RERERE_MERGE_HEAD"),
+            ("trail-dot", "feature."),
+            ("trail-dot-comp", "feature/x."),
+            ("tag-ref", "refs/tags/v1"),
+            ("qualified-head", "refs/heads/main"),
+            ("heads-shorthand", "heads/main"),
+            ("tags-shorthand", "tags/v1"),
+            ("remotes-shorthand", "remotes/origin/main"),
+        ] {
+            let repo_name = format!("bad-def-{name_suffix}");
+            let body = Body::from(format!(
+                r#"{{"name":"{repo_name}","default_branch":"{bad}"}}"#
+            ));
+            let resp = router()
+                .oneshot(signed_request_as(
+                    owner,
+                    Method::POST,
+                    "/api/v1/repos",
+                    body,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "default_branch={bad:?} must be rejected, got {}",
+                resp.status()
+            );
+            assert!(
+                state
+                    .db
+                    .get_repo(owner, &repo_name)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "no repo row when default_branch={bad:?} is rejected"
+            );
+        }
+    }
+
+    /// SINK GUARD: a legacy row with source_branch=HEAD must be rejected before
+    /// merge_branch runs git. Without the sink guard, git merge HEAD succeeds on
+    /// the checked-out target and the PR is recorded as merged without merging
+    /// the submitted source branch.
+    #[sqlx::test]
+    async fn legacy_pr_row_with_head_source_is_rejected_at_merge_sink(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let src = std::env::temp_dir().join(format!("gl-head-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("f.txt"), b"hi").unwrap();
+        run(&["add", "f.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        run(&["branch", "feature"], &src);
+        std::fs::write(src.join("f.txt"), b"changed").unwrap();
+        run(&["add", "f.txt"], &src);
+        run(&["commit", "-q", "-m", "on feature"], &src);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("head-probe.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+
+        let mut repo = seed_repo(&owner_did, "head-probe");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "x".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: "HEAD".into(),
+            target_branch: "main".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert legacy row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                axum::routing::post(crate::api::pulls::merge_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/head-probe/pulls/1/merge");
+        let resp = router
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !resp.status().is_success(),
+            "merge must not succeed for source_branch=HEAD, got {}",
+            resp.status()
+        );
+
+        let stored = state
+            .db
+            .get_pr(&repo.id, 1)
+            .await
+            .expect("get_pr")
+            .expect("pr row");
+        assert_eq!(
+            stored.status, "open",
+            "a rejected merge must not record pull_request.merged"
+        );
+    }
+
+    /// SINK GUARD: a legacy row with source_branch=@ must be rejected before
+    /// merge_branch runs git. Without the sink guard, git merge @ is a no-op on
+    /// the checked-out target and the PR is recorded as merged without merging
+    /// the submitted source branch.
+    #[sqlx::test]
+    async fn legacy_pr_row_with_at_shorthand_source_is_rejected_at_merge_sink(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let src = std::env::temp_dir().join(format!("gl-at-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("f.txt"), b"hi").unwrap();
+        run(&["add", "f.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        run(&["branch", "feature"], &src);
+        std::fs::write(src.join("f.txt"), b"changed").unwrap();
+        run(&["add", "f.txt"], &src);
+        run(&["commit", "-q", "-m", "on feature"], &src);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("at-probe.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+
+        let mut repo = seed_repo(&owner_did, "at-probe");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "x".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: "@".into(),
+            target_branch: "main".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert legacy row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                axum::routing::post(crate::api::pulls::merge_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/at-probe/pulls/1/merge");
+        let resp = router
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !resp.status().is_success(),
+            "merge must not succeed for source_branch=@, got {}",
+            resp.status()
+        );
+
+        let stored = state
+            .db
+            .get_pr(&repo.id, 1)
+            .await
+            .expect("get_pr")
+            .expect("pr row");
+        assert_eq!(
+            stored.status, "open",
+            "a rejected merge must not record pull_request.merged"
+        );
+    }
+
+    /// SINK GUARD: legacy rows with reflog shorthands or pseudoref source branches
+    /// must be rejected at merge before git runs.
+    #[sqlx::test]
+    async fn legacy_pr_rows_with_shorthand_or_pseudoref_source_rejected_at_merge_sink(
+        pool: PgPool,
+    ) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        for (label, bad_source) in [
+            ("reflog", "@{-1}"),
+            ("fetch-head", "FETCH_HEAD"),
+            ("merge-head", "MERGE_HEAD"),
+        ] {
+            let kp = Keypair::generate();
+            let owner_did = kp.did().to_string();
+            let short = owner_did.split(':').next_back().unwrap().to_string();
+            let slug = owner_did.replace([':', '/'], "_");
+            let state = test_state(pool.clone()).await;
+            let run = |args: &[&str], cwd: &std::path::Path| {
+                let out = Command::new("git")
+                    .args(args)
+                    .current_dir(cwd)
+                    .output()
+                    .expect("git");
+                assert!(
+                    out.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            };
+            let src = std::env::temp_dir().join(format!("gl-{label}-src-{short}"));
+            let _ = std::fs::remove_dir_all(&src);
+            std::fs::create_dir_all(&src).unwrap();
+            let _sg = DirGuard(src.clone());
+            run(&["init", "-q", "-b", "main"], &src);
+            run(&["config", "user.email", "t@t"], &src);
+            run(&["config", "user.name", "t"], &src);
+            std::fs::write(src.join("f.txt"), b"hi").unwrap();
+            run(&["add", "f.txt"], &src);
+            run(&["commit", "-q", "-m", "seed"], &src);
+            run(&["branch", "feature"], &src);
+            std::fs::write(src.join("f.txt"), b"changed").unwrap();
+            run(&["add", "f.txt"], &src);
+            run(&["commit", "-q", "-m", "on feature"], &src);
+            let bare = std::path::PathBuf::from("/tmp")
+                .join(&slug)
+                .join(format!("{label}-probe.git"));
+            let _ = std::fs::remove_dir_all(&bare);
+            std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+            let _bg = DirGuard(bare.clone());
+            run(
+                &[
+                    "clone",
+                    "--bare",
+                    "-q",
+                    src.to_str().unwrap(),
+                    bare.to_str().unwrap(),
+                ],
+                &std::env::temp_dir(),
+            );
+
+            let repo_name = format!("{label}-probe");
+            let mut repo = seed_repo(&owner_did, &repo_name);
+            repo.is_public = true;
+            state.db.create_repo(&repo).await.expect("seed repo");
+
+            let pr = crate::db::PullRequest {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: repo.id.clone(),
+                number: 1,
+                title: "x".into(),
+                body: None,
+                author_did: owner_did.clone(),
+                source_branch: bad_source.into(),
+                target_branch: "main".into(),
+                status: "open".into(),
+                merged_by_did: None,
+                merged_at: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            };
+            state.db.create_pr(&pr).await.expect("insert legacy row");
+
+            let router = Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                    axum::routing::post(crate::api::pulls::merge_pr),
+                )
+                .with_state(state.clone());
+            let uri = format!("/api/v1/repos/{owner_did}/{repo_name}/pulls/1/merge");
+            let resp = router
+                .oneshot(signed_request_as(
+                    &owner_did,
+                    Method::POST,
+                    &uri,
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "merge must return git_error for source_branch={bad_source:?}, got {}",
+                resp.status()
+            );
+
+            let stored = state
+                .db
+                .get_pr(&repo.id, 1)
+                .await
+                .expect("get_pr")
+                .expect("pr row");
+            assert_eq!(
+                stored.status, "open",
+                "merge must not record pull_request.merged for source_branch={bad_source:?}"
+            );
+        }
+    }
+
+    /// SINK GUARD: legacy rows with reflog/pseudoref refs must be rejected at diff
+    /// before git argv is built.
+    #[sqlx::test]
+    async fn legacy_pr_rows_with_shorthand_or_pseudoref_rejected_at_diff_sink(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        for (label, bad_source) in [("reflog", "@{-1}"), ("fetch-head", "FETCH_HEAD")] {
+            let kp = Keypair::generate();
+            let owner_did = kp.did().to_string();
+            let short = owner_did.split(':').next_back().unwrap().to_string();
+            let slug = owner_did.replace([':', '/'], "_");
+            let state = test_state(pool.clone()).await;
+            let run = |args: &[&str], cwd: &std::path::Path| {
+                let out = Command::new("git")
+                    .args(args)
+                    .current_dir(cwd)
+                    .output()
+                    .expect("git");
+                assert!(
+                    out.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            };
+            let src = std::env::temp_dir().join(format!("gl-diff-{label}-src-{short}"));
+            let _ = std::fs::remove_dir_all(&src);
+            std::fs::create_dir_all(&src).unwrap();
+            let _sg = DirGuard(src.clone());
+            run(&["init", "-q", "-b", "main"], &src);
+            run(&["config", "user.email", "t@t"], &src);
+            run(&["config", "user.name", "t"], &src);
+            std::fs::write(src.join("f.txt"), b"hi").unwrap();
+            run(&["add", "f.txt"], &src);
+            run(&["commit", "-q", "-m", "seed"], &src);
+            let bare = std::path::PathBuf::from("/tmp")
+                .join(&slug)
+                .join(format!("diff-{label}.git"));
+            let _ = std::fs::remove_dir_all(&bare);
+            std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+            let _bg = DirGuard(bare.clone());
+            run(
+                &[
+                    "clone",
+                    "--bare",
+                    "-q",
+                    src.to_str().unwrap(),
+                    bare.to_str().unwrap(),
+                ],
+                &std::env::temp_dir(),
+            );
+
+            let repo_name = format!("diff-{label}");
+            let mut repo = seed_repo(&owner_did, &repo_name);
+            repo.is_public = true;
+            state.db.create_repo(&repo).await.expect("seed repo");
+
+            let pr = crate::db::PullRequest {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: repo.id.clone(),
+                number: 1,
+                title: "x".into(),
+                body: None,
+                author_did: owner_did.clone(),
+                source_branch: bad_source.into(),
+                target_branch: "main".into(),
+                status: "open".into(),
+                merged_by_did: None,
+                merged_at: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            };
+            state.db.create_pr(&pr).await.expect("insert legacy row");
+
+            let router = Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/pulls/{number}/diff",
+                    axum::routing::get(crate::api::pulls::get_pr_diff),
+                )
+                .with_state(state.clone());
+            let uri = format!("/api/v1/repos/{owner_did}/{repo_name}/pulls/1/diff");
+            let resp = router.oneshot(anon_get(&uri)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "get_pr_diff must return git_error for source_branch={bad_source:?}, got {}",
+                resp.status()
+            );
+        }
+    }
+
+    /// When git cannot be spawned for check-ref-format, storage boundaries must
+    /// return git_error (500), not bad_request (400).
+    #[sqlx::test]
+    async fn create_pr_returns_git_error_when_validate_git_ref_cannot_spawn_git(pool: PgPool) {
+        let owner = "did:key:zPRGITSPAWNAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut state = test_state(pool).await;
+        state.git_bin = "/nonexistent/gitlawb-validate-git".into();
+        let repo = seed_repo(owner, "git-spawn-pr");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls",
+                axum::routing::post(crate::api::pulls::create_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner}/git-spawn-pr/pulls");
+        let body = Body::from(r#"{"title":"x","source_branch":"main","target_branch":"main"}"#);
+        let resp = router
+            .oneshot(signed_request_as(owner, Method::POST, &uri, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "spawn failure must not surface as 400, got {}",
+            resp.status()
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(
+            v.get("error").and_then(|e| e.as_str()),
+            Some("git_error"),
+            "spawn failure must use git_error code, got {v}"
+        );
+        let prs = state.db.list_prs(&repo.id).await.expect("list_prs");
+        assert!(prs.is_empty(), "no PR row when git is unavailable");
+    }
+
+    #[sqlx::test]
+    async fn create_repo_returns_git_error_when_validate_git_ref_cannot_spawn_git(pool: PgPool) {
+        let mut state = test_state(pool).await;
+        state.git_bin = "/nonexistent/gitlawb-validate-git".into();
+        let owner = "did:key:zREPOGITSPAWNAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos",
+                axum::routing::post(crate::api::repos::create_repo),
+            )
+            .with_state(state.clone());
+        let body = Body::from(r#"{"name":"git-spawn-repo","default_branch":"main"}"#);
+        let resp = router
+            .oneshot(signed_request_as(
+                owner,
+                Method::POST,
+                "/api/v1/repos",
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "spawn failure must not surface as 400, got {}",
+            resp.status()
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(
+            v.get("error").and_then(|e| e.as_str()),
+            Some("git_error"),
+            "spawn failure must use git_error code, got {v}"
+        );
+        assert!(
+            state
+                .db
+                .get_repo(owner, "git-spawn-repo")
+                .await
+                .unwrap()
+                .is_none(),
+            "no repo row when git is unavailable"
+        );
+    }
+
+    /// SINK GUARD: legacy target_branch=HEAD must be rejected before worktree add.
+    #[sqlx::test]
+    async fn legacy_pr_row_with_head_target_is_rejected_at_merge_sink(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let src = std::env::temp_dir().join(format!("gl-head-tgt-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("f.txt"), b"hi").unwrap();
+        run(&["add", "f.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        run(&["branch", "feature"], &src);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("head-tgt-probe.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+
+        let mut repo = seed_repo(&owner_did, "head-tgt-probe");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "x".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: "feature".into(),
+            target_branch: "HEAD".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert legacy row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                axum::routing::post(crate::api::pulls::merge_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/head-tgt-probe/pulls/1/merge");
+        let resp = router
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !resp.status().is_success(),
+            "merge must not succeed for target_branch=HEAD, got {}",
+            resp.status()
+        );
+        let stored = state
+            .db
+            .get_pr(&repo.id, 1)
+            .await
+            .expect("get_pr")
+            .expect("pr row");
+        assert_eq!(stored.status, "open");
+    }
+
+    /// Successful merge path (jatmn #379): diverged branches must produce a merge
+    /// commit on refs/heads/{target}, not only on a detached worktree HEAD.
+    #[sqlx::test]
+    async fn merge_pr_advances_target_ref_with_diverged_branches(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+        let rev = |args: &[&str], cwd: &std::path::Path| {
+            String::from_utf8_lossy(&run(args, cwd).stdout)
+                .trim()
+                .to_string()
+        };
+
+        let src = std::env::temp_dir().join(format!("gl-merge-ok-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("base.txt"), b"base").unwrap();
+        run(&["add", "base.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        run(&["checkout", "-b", "feature"], &src);
+        std::fs::write(src.join("feature.txt"), b"feature-only").unwrap();
+        run(&["add", "feature.txt"], &src);
+        run(&["commit", "-q", "-m", "on feature"], &src);
+        run(&["checkout", "main"], &src);
+        std::fs::write(src.join("main.txt"), b"main-only").unwrap();
+        run(&["add", "main.txt"], &src);
+        run(&["commit", "-q", "-m", "on main"], &src);
+        let feature_tip = rev(&["rev-parse", "feature"], &src);
+
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("merge-success.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+        let main_before = rev(&["rev-parse", "refs/heads/main"], &bare);
+
+        let mut repo = seed_repo(&owner_did, "merge-success");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "merge feature".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: "feature".into(),
+            target_branch: "main".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert pr row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                axum::routing::post(crate::api::pulls::merge_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/merge-success/pulls/1/merge");
+        let resp = router
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "merge must succeed for diverged branches, got {}",
+            resp.status()
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let merge_sha = json["merge_sha"].as_str().expect("merge_sha in response");
+        assert_eq!(json["status"].as_str(), Some("merged"));
+
+        let stored = state
+            .db
+            .get_pr(&repo.id, 1)
+            .await
+            .expect("get_pr")
+            .expect("pr row");
+        assert_eq!(stored.status, "merged");
+        assert!(stored.merged_by_did.is_some());
+
+        let main_after = rev(&["rev-parse", "refs/heads/main"], &bare);
+        assert_ne!(
+            main_after, main_before,
+            "refs/heads/main must advance after a successful merge"
+        );
+        assert_eq!(
+            main_after, merge_sha,
+            "reported merge_sha must match refs/heads/main"
+        );
+        run(
+            &["merge-base", "--is-ancestor", &feature_tip, &main_after],
+            &bare,
+        );
+        run(
+            &["cat-file", "-e", &format!("{main_after}:feature.txt")],
+            &bare,
+        );
+    }
+
+    /// SINK GUARD (jatmn #379): a PR targeting a name that exists only as a tag
+    /// (refs/tags/{name}, no refs/heads/{name}) must fail closed. Without the
+    /// exact-ref checks, git's revision DWIM resolves the bare name to the tag,
+    /// `worktree add` checks out a detached HEAD there, the merge succeeds on
+    /// that disposable HEAD, cleanup discards the commit, and the unchecked
+    /// final rev-parse echoes "refs/heads/{name}" back as a bogus merge SHA —
+    /// so the PR is marked merged and pull_request.merged fires even though no
+    /// branch ever moved.
+    #[sqlx::test]
+    async fn merge_pr_fails_closed_when_target_is_only_a_tag(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+        let rev = |args: &[&str], cwd: &std::path::Path| {
+            String::from_utf8_lossy(&run(args, cwd).stdout)
+                .trim()
+                .to_string()
+        };
+
+        let src = std::env::temp_dir().join(format!("gl-tag-only-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("base.txt"), b"base").unwrap();
+        run(&["add", "base.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        // The tag that shadows the missing target branch: "release" resolves via
+        // DWIM but refs/heads/release never exists.
+        run(&["tag", "release"], &src);
+        run(&["checkout", "-q", "-b", "feature"], &src);
+        std::fs::write(src.join("feature.txt"), b"feature-only").unwrap();
+        run(&["add", "feature.txt"], &src);
+        run(&["commit", "-q", "-m", "on feature"], &src);
+
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("tag-only.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+        let tag_before = rev(&["rev-parse", "refs/tags/release"], &bare);
+        // Precondition of the whole scenario: the tag exists, the branch does not.
+        let no_branch = Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", "refs/heads/release"])
+            .current_dir(&bare)
+            .output()
+            .expect("git show-ref");
+        assert!(
+            !no_branch.status.success(),
+            "fixture must not have a local release branch"
+        );
+
+        let mut repo = seed_repo(&owner_did, "tag-only");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "merge into tag-shadowed name".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: "feature".into(),
+            target_branch: "release".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert pr row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                axum::routing::post(crate::api::pulls::merge_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/tag-only/pulls/1/merge");
+        let resp = router
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !resp.status().is_success(),
+            "merge must fail when the target exists only as a tag, got {}",
+            resp.status()
+        );
+
+        // The handler updates the PR row and fires pull_request.merged only
+        // after merge_branch returns Ok, so an open row proves no merged event
+        // was emitted.
+        let stored = state
+            .db
+            .get_pr(&repo.id, 1)
+            .await
+            .expect("get_pr")
+            .expect("pr row");
+        assert_eq!(
+            stored.status, "open",
+            "a failed merge must leave the PR open and emit no pull_request.merged"
+        );
+        assert!(stored.merged_by_did.is_none());
+
+        // The repo itself must be untouched: still no local release branch, and
+        // the tag did not move.
+        let still_no_branch = Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", "refs/heads/release"])
+            .current_dir(&bare)
+            .output()
+            .expect("git show-ref");
+        assert!(
+            !still_no_branch.status.success(),
+            "a failed merge must not create refs/heads/release"
+        );
+        let tag_after = rev(&["rev-parse", "refs/tags/release"], &bare);
+        assert_eq!(tag_after, tag_before, "the tag must not move");
+    }
+
+    /// Companion to the tag-only case (jatmn #379): when a same-named tag AND a
+    /// local branch coexist, the merge must attach to and advance
+    /// refs/heads/{target} while refs/tags/{target} stays where it was — the
+    /// exact-ref binding must pick the branch, not merely fail less.
+    #[sqlx::test]
+    async fn merge_pr_advances_local_branch_shadowed_by_same_named_tag(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+        let rev = |args: &[&str], cwd: &std::path::Path| {
+            String::from_utf8_lossy(&run(args, cwd).stdout)
+                .trim()
+                .to_string()
+        };
+
+        let src = std::env::temp_dir().join(format!("gl-tag-shadow-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("base.txt"), b"base").unwrap();
+        run(&["add", "base.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        // Tag "release" pinned at the seed commit; the branch of the same name
+        // moves past it. Revision DWIM prefers refs/tags/ over refs/heads/ for
+        // an ambiguous short name, so this fixture is the strongest shadowing
+        // shape: a naive resolution would merge onto the stale tag commit.
+        run(&["tag", "release"], &src);
+        run(&["checkout", "-q", "-b", "release"], &src);
+        std::fs::write(src.join("release.txt"), b"release-only").unwrap();
+        run(&["add", "release.txt"], &src);
+        run(&["commit", "-q", "-m", "on release"], &src);
+        run(&["checkout", "-q", "-b", "feature"], &src);
+        std::fs::write(src.join("feature.txt"), b"feature-only").unwrap();
+        run(&["add", "feature.txt"], &src);
+        run(&["commit", "-q", "-m", "on feature"], &src);
+        run(&["checkout", "-q", "release"], &src);
+        std::fs::write(src.join("release2.txt"), b"release-again").unwrap();
+        run(&["add", "release2.txt"], &src);
+        run(&["commit", "-q", "-m", "diverge release"], &src);
+        let feature_tip = rev(&["rev-parse", "refs/heads/feature"], &src);
+
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("tag-shadow.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+        let tag_before = rev(&["rev-parse", "refs/tags/release"], &bare);
+        let branch_before = rev(&["rev-parse", "refs/heads/release"], &bare);
+        assert_ne!(
+            tag_before, branch_before,
+            "fixture must diverge the tag from the branch"
+        );
+
+        let mut repo = seed_repo(&owner_did, "tag-shadow");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "merge feature into shadowed release".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: "feature".into(),
+            target_branch: "release".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert pr row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                axum::routing::post(crate::api::pulls::merge_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/tag-shadow/pulls/1/merge");
+        let resp = router
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "merge must succeed when the local branch exists alongside the tag, got {}",
+            resp.status()
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let merge_sha = json["merge_sha"].as_str().expect("merge_sha in response");
+        assert_eq!(json["status"].as_str(), Some("merged"));
+
+        let stored = state
+            .db
+            .get_pr(&repo.id, 1)
+            .await
+            .expect("get_pr")
+            .expect("pr row");
+        assert_eq!(stored.status, "merged");
+
+        // The LOCAL BRANCH advanced to the reported merge SHA; the tag stayed put.
+        let branch_after = rev(&["rev-parse", "refs/heads/release"], &bare);
+        assert_ne!(
+            branch_after, branch_before,
+            "refs/heads/release must advance past the merge"
+        );
+        assert_eq!(
+            branch_after, merge_sha,
+            "reported merge_sha must match refs/heads/release"
+        );
+        let tag_after = rev(&["rev-parse", "refs/tags/release"], &bare);
+        assert_eq!(tag_after, tag_before, "the tag must not move");
+        run(
+            &["merge-base", "--is-ancestor", &feature_tip, &branch_after],
+            &bare,
+        );
+        run(
+            &["cat-file", "-e", &format!("{branch_after}:feature.txt")],
+            &bare,
+        );
+    }
+
+    /// SINK GUARD: a poisoned row with option-shaped source_branch must not reach
+    /// git merge argv (distinct from the diff revspec injection shape).
+    #[sqlx::test]
+    async fn poisoned_pr_row_option_source_is_rejected_at_merge_sink(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let src = std::env::temp_dir().join(format!("gl-merge-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("f.txt"), b"hi").unwrap();
+        run(&["add", "f.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("merge-probe.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+
+        let mut repo = seed_repo(&owner_did, "merge-probe");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pwn = std::env::temp_dir().join(format!("gl-MERGE-{short}"));
+        let _ = std::fs::remove_file(&pwn);
+
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "x".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: format!("--output={}", pwn.to_str().unwrap()),
+            target_branch: "main".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert poisoned row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                axum::routing::post(crate::api::pulls::merge_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/merge-probe/pulls/1/merge");
+        let resp = router
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !resp.status().is_success(),
+            "merge must not succeed for option-shaped source_branch, got {}",
+            resp.status()
+        );
+        assert!(
+            !pwn.exists(),
+            "merge sink must not write via option-shaped source_branch"
+        );
+        let stored = state
+            .db
+            .get_pr(&repo.id, 1)
+            .await
+            .expect("get_pr")
+            .expect("pr row");
+        assert_eq!(stored.status, "open");
+    }
+
+    /// create_pr must validate the resolved target_branch even when the caller
+    /// omits target_branch and the repo row carries a poisoned default_branch.
+    #[sqlx::test]
+    async fn create_pr_rejects_resolved_target_from_poisoned_default_branch(pool: PgPool) {
+        let owner = "did:key:zPRDEFPOISONAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        let repo = seed_repo(owner, "def-poison-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        sqlx::query("UPDATE repos SET default_branch = $1 WHERE id = $2")
+            .bind("HEAD")
+            .bind(&repo.id)
+            .execute(state.db.pool())
+            .await
+            .expect("poison default_branch");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls",
+                axum::routing::post(crate::api::pulls::create_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner}/def-poison-repo/pulls");
+        let body = Body::from(r#"{"title":"x","source_branch":"feature"}"#);
+        let resp = router
+            .oneshot(signed_request_as(owner, Method::POST, &uri, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "resolved target from poisoned default_branch must be rejected, got {}",
+            resp.status()
+        );
+        let prs = state.db.list_prs(&repo.id).await.expect("list_prs");
+        assert!(
+            prs.is_empty(),
+            "no PR row when resolved target_branch is invalid"
         );
     }
 

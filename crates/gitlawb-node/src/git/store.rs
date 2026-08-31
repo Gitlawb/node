@@ -746,13 +746,149 @@ pub fn read_object(repo_path: &Path, sha256_hex: &str) -> Result<Option<(String,
     Ok(Some((obj_type, content)))
 }
 
+/// Outcome of validating a stored branch-field value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitRefValidationError {
+    /// Caller supplied a name that is not a valid local branch name.
+    Invalid(String),
+    /// Git could not be executed to validate the name.
+    GitUnavailable(String),
+}
+
+impl std::fmt::Display for GitRefValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(msg) | Self::GitUnavailable(msg) => f.write_str(msg),
+        }
+    }
+}
+
+/// Reject revision shorthands and pseudoref names that `git check-ref-format
+/// --branch` accepts but that git later interprets as symbolic revisions rather
+/// than literal local branch names.
+fn reject_revision_shorthand(name: &str) -> Option<&'static str> {
+    if name == "@" {
+        return Some("branch ref must not be a revision shorthand");
+    }
+    if name.starts_with("@{") {
+        return Some("branch ref must not be a reflog revision expression");
+    }
+    const PSEUDOREFS: &[&str] = &[
+        "FETCH_HEAD",
+        "ORIG_HEAD",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "RERERE_MERGE_HEAD",
+        "REBASE_HEAD",
+        "REVERT_HEAD",
+        "BISECT_HEAD",
+        "AUTO_MERGE",
+    ];
+    if PSEUDOREFS.contains(&name) {
+        return Some("branch ref must not be a git pseudoref name");
+    }
+    None
+}
+
+/// Validate a git *branch name* before it is stored or passed to git subprocesses.
+/// Delegates to `git check-ref-format --branch`, then rejects fully qualified
+/// ref paths, revision-namespace shorthands (`heads/`, `tags/`, `remotes/`), and
+/// symbolic names that git would reinterpret at the sink.
+///
+/// At diff/merge sinks, validated short names are passed as `refs/heads/{name}` so
+/// grammar-valid revision shorthands cannot retarget another ref namespace. The
+/// merge worktree checks out the local branch name instead, so merge commits
+/// advance refs/heads/{target}. Symbolic revision names (`HEAD`), option-shaped
+/// trailing dots, and other invalid forms are rejected by check-ref-format itself.
+/// Revision shorthands that pass the grammar check (`@`, `@{-1}`, pseudorefs) are
+/// rejected explicitly because git treats them as symbolic revisions when bare.
+///
+/// Storage boundaries call this via [`validate_git_ref_with_git`] with the configured
+/// git binary. Sink functions call [`validate_git_ref`] (system `git`) then prefix
+/// before building argv, so the property holds for every caller and every row,
+/// including legacy rows and any writer that skipped the boundary check.
+pub fn validate_git_ref(name: &str) -> std::result::Result<(), GitRefValidationError> {
+    validate_git_ref_with_git("git", name)
+}
+
+pub(crate) fn validate_git_ref_with_git(
+    git_bin: &str,
+    name: &str,
+) -> std::result::Result<(), GitRefValidationError> {
+    if name.is_empty() {
+        return Err(GitRefValidationError::Invalid(
+            "branch ref must not be empty".into(),
+        ));
+    }
+    if name.starts_with("refs/") {
+        return Err(GitRefValidationError::Invalid(
+            "branch ref must be a local branch name, not a fully qualified ref".into(),
+        ));
+    }
+    if name.starts_with("heads/") || name.starts_with("tags/") || name.starts_with("remotes/") {
+        return Err(GitRefValidationError::Invalid(
+            "branch ref must be a local branch name, not a revision shorthand".into(),
+        ));
+    }
+    if let Some(reason) = reject_revision_shorthand(name) {
+        return Err(GitRefValidationError::Invalid(reason.into()));
+    }
+    // allow-unbounded-git: stateless check-ref-format on a user-supplied name; no repo acquire or concurrency permit
+    let output = Command::new(git_bin)
+        .args(["check-ref-format", "--branch", name])
+        .output()
+        .map_err(|e| {
+            // allow-unbounded-git: stateless check-ref-format on user-supplied name; no repo acquire
+            GitRefValidationError::GitUnavailable(format!(
+                "failed to run git check-ref-format: {e}"
+            ))
+        })?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(GitRefValidationError::Invalid(stderr.trim().to_string()))
+    }
+}
+
+/// Reject both refs at the sink, so an option-shaped ref can never reach a git
+/// argv element regardless of how it was stored.
+fn map_ref_validation_to_anyhow(which: &str, err: GitRefValidationError) -> anyhow::Error {
+    match err {
+        GitRefValidationError::Invalid(msg) => {
+            anyhow::anyhow!("invalid {which} branch ref: {msg}")
+        }
+        GitRefValidationError::GitUnavailable(msg) => anyhow::anyhow!("{msg}"),
+    }
+}
+
+fn guard_refs(target_branch: &str, source_branch: &str) -> Result<()> {
+    validate_git_ref(target_branch).map_err(|e| map_ref_validation_to_anyhow("target", e))?;
+    validate_git_ref(source_branch).map_err(|e| map_ref_validation_to_anyhow("source", e))?;
+    Ok(())
+}
+
+/// Stored short branch names are passed to git as explicit local-branch refs so a
+/// syntax-valid name cannot be reinterpreted as a revision shorthand at the sink.
+fn local_branch_ref(short_name: &str) -> String {
+    format!("refs/heads/{short_name}")
+}
+
 /// Get the diff between two branches: changes on source_branch not in target_branch.
 pub fn branch_diff(repo_path: &Path, target_branch: &str, source_branch: &str) -> Result<String> {
+    guard_refs(target_branch, source_branch)?;
+    let target = local_branch_ref(target_branch);
+    let source = local_branch_ref(source_branch);
     let output = Command::new("git")
-        .args(["diff", &format!("{target_branch}...{source_branch}")])
+        .args(["diff", &format!("{target}...{source}")])
         .current_dir(repo_path)
         .output()
         .context("failed to run git diff")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git diff failed: {stderr}");
+    }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
@@ -765,13 +901,11 @@ pub fn branch_diff_names(
     target_branch: &str,
     source_branch: &str,
 ) -> Result<Vec<String>> {
+    guard_refs(target_branch, source_branch)?;
+    let target = local_branch_ref(target_branch);
+    let source = local_branch_ref(source_branch);
     let output = Command::new("git")
-        .args([
-            "diff",
-            "--name-only",
-            "-z",
-            &format!("{target_branch}...{source_branch}"),
-        ])
+        .args(["diff", "--name-only", "-z", &format!("{target}...{source}")])
         .current_dir(repo_path)
         .output()
         .context("failed to run git diff --name-only")?;
@@ -799,18 +933,51 @@ pub fn merge_branch(
     author_did: &str,
     pr_title: &str,
 ) -> Result<String> {
+    guard_refs(target_branch, source_branch)?;
+    let source_ref = local_branch_ref(source_branch);
+    let target_ref = local_branch_ref(target_branch);
     let worktree_path = repo_path.join("_merge_worktree");
 
-    // Clean up any leftover worktree
-    if worktree_path.exists() {
+    let remove_worktree = || {
         let _ = Command::new("git")
             .args(["worktree", "remove", "--force", "_merge_worktree"])
             .current_dir(repo_path)
             .output();
         let _ = std::fs::remove_dir_all(&worktree_path);
+    };
+
+    // Clean up any leftover worktree
+    if worktree_path.exists() {
+        remove_worktree();
     }
 
-    // Create worktree on target branch
+    // The merge must land on the LOCAL target branch, so the worktree has to end
+    // up attached to exactly refs/heads/{target}. validate_git_ref proves
+    // branch-name grammar only: it does not prove refs/heads/{target} exists,
+    // and it cannot stop git's revision DWIM rules from resolving the same
+    // short name in another namespace (refs/tags/{name}, refs/remotes/...). If
+    // DWIM won, `worktree add` would check out a detached HEAD at the foreign
+    // ref, the merge would succeed on that disposable HEAD, and cleanup would
+    // discard the commit without ever advancing refs/heads/{target}.
+    //
+    // (1) Require the exact local ref before creating the worktree. show-ref
+    // --verify matches the full refname literally — no DWIM, no abbreviation —
+    // so a same-named tag with no local branch fails here instead of being
+    // silently resolved.
+    let target_exists = Command::new("git")
+        .args(["show-ref", "--verify", "--quiet", &target_ref])
+        .current_dir(repo_path)
+        .output()
+        .context("failed to run git show-ref")?;
+    if !target_exists.status.success() {
+        bail!("target branch {target_ref} does not exist as a local branch");
+    }
+
+    // (2) Check out the local target branch in the worktree. The bare short
+    // name is what makes git attach HEAD to the branch (passing
+    // refs/heads/{name} would detach, so a successful merge would not advance
+    // refs/heads/{target}); step (1) guarantees the branch exists, so an
+    // attached checkout is the only acceptable outcome — verified right below.
     let wt = Command::new("git")
         .args(["worktree", "add", "_merge_worktree", target_branch])
         .current_dir(repo_path)
@@ -823,12 +990,28 @@ pub fn merge_branch(
         );
     }
 
+    // The worktree's HEAD must be a symbolic ref to exactly refs/heads/{target}.
+    // A detached or differently-attached HEAD means git resolved the name as
+    // something other than the local target branch; a merge committed on it
+    // would be thrown away by cleanup, so refuse before merging rather than
+    // relying on any denylist of symbolic shapes.
+    let head_ref = Command::new("git")
+        .args(["symbolic-ref", "--quiet", "HEAD"])
+        .current_dir(&worktree_path)
+        .output()
+        .context("failed to run git symbolic-ref")?;
+    let head_ref_name = String::from_utf8_lossy(&head_ref.stdout).trim().to_string();
+    if !head_ref.status.success() || head_ref_name != target_ref {
+        remove_worktree();
+        bail!("merge worktree is not attached to {target_ref} (HEAD is {head_ref_name:?})");
+    }
+
     // Run merge in worktree
     let merge = Command::new("git")
         .args([
             "merge",
             "--no-ff",
-            source_branch,
+            &source_ref,
             "-m",
             &format!(
                 "Merge branch '{}' into {} ({})",
@@ -846,11 +1029,7 @@ pub fn merge_branch(
     let success = merge.status.success();
 
     // Always remove worktree
-    let _ = Command::new("git")
-        .args(["worktree", "remove", "--force", "_merge_worktree"])
-        .current_dir(repo_path)
-        .output();
-    let _ = std::fs::remove_dir_all(&worktree_path);
+    remove_worktree();
 
     if !success {
         bail!(
@@ -859,12 +1038,24 @@ pub fn merge_branch(
         );
     }
 
-    // Get new HEAD of target branch
+    // (3) The merge only counts if the exact target ref now points at a commit.
+    // Plain `rev-parse` echoes an unresolvable token back on stdout with a
+    // nonzero exit status, so an unchecked call here would hand the literal
+    // string "refs/heads/{target}" upward as an apparently valid merge SHA and
+    // the caller would mark the PR merged and fire the webhook. --verify plus
+    // ^{commit} plus an explicit status check turn "target ref missing or not a
+    // commit" into a hard failure before any of that happens.
     let head = Command::new("git")
-        .args(["rev-parse", &format!("refs/heads/{target_branch}")])
+        .args(["rev-parse", "--verify", &format!("{target_ref}^{{commit}}")])
         .current_dir(repo_path)
         .output()
         .context("failed to get merge commit")?;
+    if !head.status.success() {
+        bail!(
+            "merge completed but {target_ref} does not resolve to a commit: {}",
+            String::from_utf8_lossy(&head.stderr)
+        );
+    }
 
     Ok(String::from_utf8_lossy(&head.stdout).trim().to_string())
 }
@@ -878,6 +1069,72 @@ pub fn repo_disk_path(repos_dir: &Path, owner_did: &str, repo_name: &str) -> Pat
 
 #[cfg(test)]
 mod tests {
+    use super::{validate_git_ref, validate_git_ref_with_git, GitRefValidationError};
+
+    #[test]
+    fn validate_git_ref_accepts_normal_branch_names() {
+        for good in [
+            "main",
+            "feature/foo",
+            "release-1.2",
+            "v1.0.0",
+            "user/fix-bug",
+            "feature@",
+            "user@host",
+        ] {
+            assert!(
+                validate_git_ref(good).is_ok(),
+                "{good:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_git_ref_rejects_option_injection_and_malformed_refs() {
+        for bad in [
+            "",
+            "HEAD",
+            "@",
+            "@{-1}",
+            "FETCH_HEAD",
+            "MERGE_HEAD",
+            "feature.",
+            "feature/x.",
+            "refs/heads/main",
+            "refs/tags/v1",
+            "refs/heads/--output=/tmp/x",
+            "heads/main",
+            "tags/v1",
+            "remotes/origin/main",
+            "--output=/tmp/x",
+            "-rf",
+            "a b",
+            "a..b",
+            "a~b",
+            "refs/heads/@{x}",
+            "foo.lock",
+            "/leading",
+            "trailing/",
+            "a//b",
+        ] {
+            let err = validate_git_ref(bad).expect_err("{bad:?} should be rejected");
+            assert!(
+                matches!(err, GitRefValidationError::Invalid(_)),
+                "{bad:?} should be an invalid-name rejection, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_git_ref_spawn_failure_is_git_unavailable_not_invalid() {
+        let err = validate_git_ref_with_git("/nonexistent/gitlawb-git", "main")
+            .expect_err("missing git binary should fail");
+        assert!(
+            matches!(err, GitRefValidationError::GitUnavailable(_)),
+            "spawn failure must not be classified as invalid input, got {err:?}"
+        );
+    }
+
     use super::branch_diff_names;
     use std::path::Path;
     use std::process::Command;
