@@ -1090,7 +1090,12 @@ async fn call_tool(
                 "deadline": args.get("deadline").and_then(|v| v.as_str()),
                 "delegator_did": delegator_did,
             }))?;
-            let resp: Value = client.post("/api/v1/tasks", &body).await?.json().await?;
+            let resp: Value = client
+                .post("/api/v1/tasks", &body)
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 

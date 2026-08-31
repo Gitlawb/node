@@ -1123,6 +1123,21 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE pin_repair_sweep ADD COLUMN IF NOT EXISTS discovery_cursor_id TEXT NOT NULL DEFAULT ''",
         ],
     },
+    Migration {
+        version: 27,
+        name: "agent_tasks_assignee_key_didkey_aware",
+        stmts: &[
+            // Filtering agent_tasks by assignee normalizes did:key values via
+            // ASSIGNEE_DID_CASE_SQL, making the raw idx_agent_tasks_assignee
+            // index unusable. Swap the index: drop the raw column index and
+            // build the matching expression index so list queries use an Index Cond.
+            // The CASE must stay byte-identical to ASSIGNEE_DID_CASE_SQL so
+            // Postgres matches it.
+            "DROP INDEX IF EXISTS idx_agent_tasks_assignee",
+            // Keep byte-identical to ASSIGNEE_DID_CASE_SQL so Postgres uses the index.
+            "CREATE INDEX IF NOT EXISTS idx_agent_tasks_assignee_key ON agent_tasks ((CASE WHEN assignee_did LIKE 'did:key:%' AND position(':' in substr(assignee_did, 9)) = 0 THEN substr(assignee_did, 9) ELSE assignee_did END))",
+        ],
+    },
 ];
 
 /// Max distinct source repos recorded per pinned object (F1, #173 jatmn round 8).
@@ -1183,6 +1198,11 @@ mod normalize_owner_key_tests {
             normalize_owner_key("did:web:example.com:alice"),
             "did:web:example.com:alice"
         );
+    }
+
+    #[test]
+    fn leaves_single_residual_web_did_intact() {
+        assert_eq!(normalize_owner_key("did:web:z6Mkfoo"), "did:web:z6Mkfoo");
     }
 
     #[test]
@@ -5034,6 +5054,66 @@ mod migration_tests {
     }
 
     #[sqlx::test]
+    async fn migration_v27_creates_assignee_expression_index(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        // Roll back: drop the expression index, restore the raw index, forget v27.
+        sqlx::query("DROP INDEX IF EXISTS idx_agent_tasks_assignee_key")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_agent_tasks_assignee ON agent_tasks(assignee_did)",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 27")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Re-run migration.
+        db.migrate().await.unwrap();
+
+        let idx_exists: (bool,) = sqlx::query_as(
+            "SELECT EXISTS(
+                SELECT 1 FROM pg_indexes
+                WHERE tablename = 'agent_tasks' AND indexname = 'idx_agent_tasks_assignee_key'
+            )",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(idx_exists.0, "idx_agent_tasks_assignee_key must exist");
+
+        let old_idx_exists: (bool,) = sqlx::query_as(
+            "SELECT EXISTS(
+                SELECT 1 FROM pg_indexes
+                WHERE tablename = 'agent_tasks' AND indexname = 'idx_agent_tasks_assignee'
+            )",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            !old_idx_exists.0,
+            "idx_agent_tasks_assignee must be dropped"
+        );
+
+        let recorded: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 27")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded.0, 1, "v27 must be recorded as applied");
+
+        // Idempotent re-run.
+        db.migrate().await.unwrap();
+    }
+
+    #[sqlx::test]
     async fn dequeue_stamps_attempted_at_on_every_row_it_hands_out(pool: sqlx::PgPool) {
         // The stamp is what stops a deferred row from holding the window, and
         // it happens here rather than at the deferral branches so no call site
@@ -6024,6 +6104,7 @@ mod dedup_db_tests {
             "z6Mkfoo",
             "did:gitlawb:z6Mkfoo",
             "did:web:example.com:alice",
+            "did:web:z6Mkfoo",
             "did:key:did:gitlawb:z6Mkfoo",
             "",
             "did:key:",
@@ -6070,6 +6151,7 @@ mod dedup_db_tests {
             "z6Mkfoo",
             "did:gitlawb:z6Mkfoo",
             "did:web:example.com:alice",
+            "did:web:z6Mkfoo",
             "did:key:did:gitlawb:z6Mkfoo",
             "",
             "did:key:",
@@ -6113,6 +6195,7 @@ mod dedup_db_tests {
             "z6Mkfoo",
             "did:gitlawb:z6Mkfoo",
             "did:web:example.com:alice",
+            "did:web:z6Mkfoo",
             "did:key:did:gitlawb:z6Mkfoo",
             "",
             "did:key:",
