@@ -4212,6 +4212,13 @@ esac\n";
         // Init the bare first so the orphaned blobs can be written
         // into its object store before any commit exists.
         run(&["init", "-q", "--bare", bare.to_str().unwrap()], td.path());
+        // An annotated tag is a tag OBJECT, with a tagger header,
+        // and `git tag -a` refuses to create one without a
+        // configured user.email/user.name — even on a bare repo.
+        // The bare is where the test's refs live, so set the
+        // tagger identity there directly.
+        run(&["config", "user.email", "t@t"], &bare);
+        run(&["config", "user.name", "t"], &bare);
         run(&["init", "-q"], &work);
         run(&["config", "user.email", "t@t"], &work);
         run(&["config", "user.name", "t"], &work);

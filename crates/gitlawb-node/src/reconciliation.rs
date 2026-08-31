@@ -70,6 +70,7 @@ const ENCRYPTED_MANIFEST_ANCHOR_FAILED_MSG: &str =
 /// work completed — the unattempted prefix must retry at the
 /// head of the next pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // documented scaffolding; the closure is the live consumer
 pub(crate) enum ProgressState {
     /// No work was attempted this pass (fence capture failed,
     /// refilter returned `None`, dispatch produced an empty
@@ -93,6 +94,7 @@ impl ProgressState {
     /// in `run_pass` is the same logic in closure form; this
     /// method exists for tests and for any future caller that
     /// wants the type rather than the wire tuple.
+    #[allow(dead_code)] // the closure is the live consumer; this is the documented mapping
     pub(crate) fn to_wire(&self) -> Option<Option<String>> {
         match self {
             ProgressState::Idle => None,
@@ -1279,6 +1281,7 @@ async fn run_pass(
 
 #[cfg(test)]
 mod tests {
+    use super::ProgressState;
     use tokio::sync::watch;
 
     /// Build a minimal Config with both IPFS and Pinata fields empty so the
@@ -1298,6 +1301,40 @@ mod tests {
             "http://127.0.0.1:5001",
         ]);
         std::sync::Arc::new(cfg)
+    }
+
+    /// #218 review round 9 (guidance #4): pin the wire-form
+    /// mapping at the cargo-test level so a future change to
+    /// `ProgressState`'s variants or the closure logic in
+    /// `run_pass` has a single test to point at. The mapping
+    /// is:
+    /// - `Idle` → `None` (caller preserves the previous offset;
+    ///   the unattempted prefix retries at the head of the next
+    ///   pass).
+    /// - `Advanced { last }` → `Some(Some(last))` (caller writes
+    ///   the offset; the next pass rotates past `last`).
+    /// - `Drained` → `Some(None)` (caller clears the offset; a
+    ///   future pass sees a fresh start).
+    #[test]
+    fn progress_state_to_wire_matches_the_closure() {
+        assert_eq!(
+            ProgressState::Idle.to_wire(),
+            None,
+            "Idle must produce None (caller preserves the previous offset)"
+        );
+        assert_eq!(
+            ProgressState::Advanced {
+                last_dispatched: "Z".to_string()
+            }
+            .to_wire(),
+            Some(Some("Z".to_string())),
+            "Advanced must produce Some(Some(last_dispatched)) (caller writes the offset)"
+        );
+        assert_eq!(
+            ProgressState::Drained.to_wire(),
+            Some(None),
+            "Drained must produce Some(None) (caller clears the offset)"
+        );
     }
 
     #[test]

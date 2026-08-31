@@ -3514,6 +3514,16 @@ impl Db {
     /// so there is no marker to wrongly clear. The gate is kept for the one window that
     /// is not covered by that argument, a concurrent pinner landing the row between the
     /// `is_pinned` check and this upsert, and so the two clears cannot drift apart.
+    /// The 3-arg form. The production `pin_new_objects` path
+    /// routes through the 4-arg fenced form
+    /// ([`record_pinned_cid_with_source_fenced`]) so the third
+    /// fence closes the rule-write / record-write race. This
+    /// 3-arg form is still the helper for tests that don't own
+    /// a fence and is a documented thin-wrapper equivalent (it
+    /// takes the same row lock, just with `i64::MAX` as the
+    /// "no fence" sentinel that the fenced form treats as
+    /// skip-the-comparison).
+    #[allow(dead_code)] // call sites in ipfs_pin.rs use the fenced form; tests seed via this
     pub async fn record_pinned_cid_with_source(
         &self,
         sha256_hex: &str,

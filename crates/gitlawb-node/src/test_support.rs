@@ -198,6 +198,7 @@ pub(crate) async fn silent_http_endpoint() -> String {
 ///
 /// An empty `refs` slice emits a single `:` so phase 2 sees no
 /// lines (the same as a bare default `*) : ;;` arm).
+#[allow(dead_code)] // referenced by `fake_git_with_refs` and the round-9 fixtures
 pub(crate) fn fake_git_for_ref_body(refs: &[(&str, &str, &str, &str)]) -> String {
     let mut body = String::new();
     if refs.is_empty() {
@@ -222,11 +223,55 @@ pub(crate) fn fake_git_for_ref_body(refs: &[(&str, &str, &str, &str)]) -> String
 /// refs is needed to drive the rest of the walk. Used by tests
 /// that want the parser contract enforced without committing to
 /// the other arms the smart-HTTP fixture cares about.
+#[allow(dead_code)] // referenced by tests in the unit-test mod below
 pub(crate) fn fake_git_with_refs(refs: &[(&str, &str, &str, &str)]) -> String {
     let mut body = String::from("#!/bin/sh\ncase \"$1\" in\n  for-each-ref)\n");
     body.push_str(&fake_git_for_ref_body(refs));
     body.push_str("    *) : ;;\nesac\nexit 0\n");
     body
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    /// #218 round 9 (guidance #6): the helper emits the column
+    /// shape `blob_paths` phase 2 parses. Pin the format at the
+    /// cargo-test level so a parser regression breaks this
+    /// helper test in addition to the production tests.
+    #[test]
+    fn fake_git_with_refs_emits_the_column_shape() {
+        let script = fake_git_with_refs(&[
+            ("commit0000000000000000000000000000000", "commit", "", ""),
+            (
+                "tag0000000000000000000000000000000000",
+                "tag",
+                "peel000000000000000000000000000000",
+                "blob",
+            ),
+        ]);
+        assert!(
+            script.contains("'commit0000000000000000000000000000000 commit'"),
+            "non-tag tip must emit two tokens: got\n{script}"
+        );
+        assert!(
+            script.contains("'tag0000000000000000000000000000000000 tag peel000000000000000000000000000000 blob'"),
+            "annotated tag tip must emit four tokens: got\n{script}"
+        );
+    }
+
+    #[test]
+    fn fake_git_with_refs_empty_slice_emits_a_zero_refs_marker() {
+        let script = fake_git_with_refs(&[]);
+        assert!(
+            script.contains("for-each-ref)"),
+            "the helper still owns the for-each-ref arm: got\n{script}"
+        );
+        assert!(
+            script.contains("    : ;;\n"),
+            "an empty refs slice must emit a single `:` so phase 2 sees zero lines: got\n{script}"
+        );
+    }
 }
 
 #[cfg(test)]
