@@ -86,12 +86,35 @@ pub struct ReflogEntry {
     pub at: i64,
 }
 
-/// Read the reflog of one ref in a bare repository, newest entry LAST.
+/// How many bytes of the END of a reflog file are read. A reflog line is roughly
+/// 150 bytes, so this window holds on the order of two thousand of the most recent
+/// updates to a single ref.
+///
+/// The bound costs nothing in proving power, because of what the caller asks. The
+/// gate only ever accepts an entry stamped at or after
+/// `created_at - REFLOG_CLOCK_SKEW`, i.e. within about a minute of a row that is
+/// itself inside `MAX_RECONCILE_AGE`; reflogs are append-ordered oldest-first, so
+/// every entry that could possibly qualify is at the tail. What the window buys is
+/// a ceiling: a reflog grows one line per ref update and how often a ref is updated
+/// is PUSHER-controlled, so an unbounded read is an attacker-sized allocation taken
+/// once per stranded row, at startup, which is the moment the node can least absorb
+/// it.
+const REFLOG_TAIL_BYTES: u64 = 256 * 1024;
+
+/// Read the tail of one ref's reflog in a bare repository, newest entry LAST.
 ///
 /// Reads `logs/<ref_name>` directly rather than shelling out to `git reflog`: the
 /// file format is stable and documented, the reconcile may call this once per
 /// stranded row at startup, and a plain file read cannot be defeated by the ref's
 /// reflog having been expired out of the `git reflog show` default window.
+///
+/// Only the last [`REFLOG_TAIL_BYTES`] are read, and only whole lines within that
+/// window: when the file is longer, the bytes before the first newline inside the
+/// window are a PARTIAL record and are discarded, so a record sliced mid-SHA can
+/// never be tokenized into a bogus `old -> new` pair. An entry older than the
+/// window reads as absent, which is the safe direction — the caller treats
+/// "no matching entry" as unproven and leaves the row where it is, rather than
+/// promoting it.
 ///
 /// Returns `Ok(None)` when the repo keeps no reflog for that ref — either because
 /// `core.logAllRefUpdates` was off when the ref moved (repos created before
@@ -114,11 +137,41 @@ pub fn ref_reflog_entries(repo_path: &Path, ref_name: &str) -> Result<Option<Vec
         bail!("refusing to read a reflog for a non-refs/ ref name: {ref_name}");
     }
     let path = repo_path.join("logs").join(ref_name);
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
+    let mut file = match std::fs::File::open(&path) {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).context("failed to read reflog"),
+        Err(e) => return Err(e).context("failed to open reflog"),
     };
+    let len = file.metadata().context("failed to stat reflog")?.len();
+    let truncated = len > REFLOG_TAIL_BYTES;
+    if truncated {
+        use std::io::Seek;
+        file.seek(std::io::SeekFrom::Start(len - REFLOG_TAIL_BYTES))
+            .context("failed to seek to the reflog tail")?;
+    }
+    let mut buf = Vec::with_capacity(REFLOG_TAIL_BYTES.min(len) as usize);
+    {
+        use std::io::Read;
+        // Cap the read itself, not just the seek: the file can grow between the
+        // stat and the read, and the allocation must stay bounded either way.
+        file.take(REFLOG_TAIL_BYTES)
+            .read_to_end(&mut buf)
+            .context("failed to read reflog")?;
+    }
+    // A window into the middle of the file almost certainly starts mid-record.
+    // Drop everything before the first newline so only whole lines are parsed;
+    // a reflog is one record per line, so the first full record starts there.
+    let window: &[u8] = if truncated {
+        match buf.iter().position(|b| *b == b'\n') {
+            Some(i) => &buf[i + 1..],
+            // No newline in the whole window: every byte is part of one partial
+            // record, so there is nothing whole to parse.
+            None => &[],
+        }
+    } else {
+        &buf
+    };
+    let raw = String::from_utf8_lossy(window);
     let mut out = Vec::new();
     for line in raw.lines() {
         // The message after the TAB can contain anything, including spaces and
@@ -1047,6 +1100,161 @@ mod tests {
         assert!(
             entries[0].at > 0,
             "the entry is timestamped, so proof can be required to postdate the intent"
+        );
+    }
+
+    /// One reflog record. Fixed-width `i` and timestamp keep every filler line the
+    /// same length, so the test below can place the window boundary on an exact
+    /// byte.
+    fn reflog_line(old: &str, new: &str, at: i64, msg: &str) -> String {
+        format!("{old} {new} tester <tester@example.com> {at} +0000\tpush: {msg}\n")
+    }
+
+    fn filler_line(i: usize, pad: usize) -> String {
+        reflog_line(
+            &format!("{:040x}", i),
+            &format!("{:040x}", i + 1),
+            1_600_000_000,
+            &format!("filler {i:06}{}", "x".repeat(pad)),
+        )
+    }
+
+    /// The bound is a ceiling on the READ, not on the proof: a ref hammered with
+    /// far more updates than the tail window can hold still yields its recent
+    /// entries, which is the only region the landing gate ever accepts from. And
+    /// the record the window CUTS THROUGH must be discarded whole, never
+    /// half-parsed.
+    ///
+    /// The file is laid out so the window boundary lands 20 bytes into a record's
+    /// old SHA — the hazardous alignment, where the surviving suffix still has
+    /// enough fields to tokenize and would yield a 20-character "old SHA" as a
+    /// bogus `old -> new` pair. Landing proof is an exact pair match, so a bogus
+    /// pair is a fabricated proof.
+    ///
+    /// MUTATION (RED): read the first `REFLOG_TAIL_BYTES` instead of the last and
+    /// the recent entry disappears; keep the leading partial line instead of
+    /// discarding it and the 20-character SHA appears.
+    #[test]
+    fn ref_reflog_entries_reads_whole_records_from_the_recent_tail() {
+        let td = tempfile::TempDir::new().unwrap();
+        let bare = td.path().join("repo.git");
+        super::init_bare(&bare).unwrap();
+
+        let window = super::REFLOG_TAIL_BYTES as usize;
+        // The record the boundary will slice, and the recent one a reconcile
+        // would actually be looking for.
+        let hazard = reflog_line(&"a".repeat(40), &"b".repeat(40), 1_700_000_000, "hazard");
+        let recent = reflog_line(&"c".repeat(40), &"d".repeat(40), 1_700_009_999, "recent");
+
+        // Everything from the hazard record to EOF must measure exactly
+        // `window + 20`, so the read starts 20 bytes into the hazard's old SHA.
+        let tail_target = window + 20;
+        let needed = tail_target - hazard.len() - recent.len();
+        let base = filler_line(0, 0).len();
+        assert!(needed > 2 * base, "layout math needs room for filler");
+        let full = needed / base - 1;
+        let pad = needed - (full + 1) * base;
+        let mut tail = hazard.clone();
+        for i in 0..full {
+            tail.push_str(&filler_line(i, 0));
+        }
+        tail.push_str(&filler_line(full, pad));
+        tail.push_str(&recent);
+        assert_eq!(
+            tail.len(),
+            tail_target,
+            "the tail must measure exactly window + 20 for the boundary to land \
+             inside the hazard record's old SHA"
+        );
+
+        // Anything before the hazard record is outside the window entirely.
+        let mut body = String::new();
+        for i in 0..8 {
+            body.push_str(&filler_line(1_000 + i, 0));
+        }
+        let lead = body.len();
+        body.push_str(&tail);
+
+        let log_path = bare.join("logs/refs/heads/busy");
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        std::fs::write(&log_path, &body).unwrap();
+        assert_eq!(
+            body.len() - window,
+            lead + 20,
+            "the read must begin 20 bytes into the hazard record"
+        );
+
+        let entries = super::ref_reflog_entries(&bare, "refs/heads/busy")
+            .unwrap()
+            .expect("the reflog exists");
+
+        // The tail is what got read.
+        let last = entries.last().expect("the window holds whole records");
+        assert_eq!(
+            (last.old_sha.as_str(), last.new_sha.as_str(), last.at),
+            (
+                "c".repeat(40).as_str(),
+                "d".repeat(40).as_str(),
+                1_700_009_999
+            ),
+            "the newest entry — the only region the landing gate accepts — survives \
+             the bound intact"
+        );
+        assert!(
+            entries.len() < body.lines().count(),
+            "the read is bounded: not every record in the file is parsed"
+        );
+
+        // And the sliced record was dropped rather than half-parsed. Both halves
+        // matter: no truncated SHA may appear, and the hazard's pair must not be
+        // reconstructed from a partial line either.
+        for e in &entries {
+            assert_eq!(
+                e.old_sha.len(),
+                40,
+                "a partial record was parsed into a bogus old SHA: {e:?}"
+            );
+            assert_eq!(e.new_sha.len(), 40, "a partial record was parsed: {e:?}");
+        }
+        assert!(
+            !entries.iter().any(|e| e.new_sha == "b".repeat(40)),
+            "the record the window cut through must not contribute a pair at all"
+        );
+    }
+
+    /// The safe direction of the same bound. An entry that sits only in the
+    /// discarded older region reads as absent, and absent means UNPROVEN — the
+    /// reconcile leaves such a row where it is instead of promoting it, which is
+    /// the failure mode a bounded read is allowed to have.
+    #[test]
+    fn an_entry_older_than_the_reflog_tail_reads_as_unproven() {
+        let td = tempfile::TempDir::new().unwrap();
+        let bare = td.path().join("repo.git");
+        super::init_bare(&bare).unwrap();
+
+        // The sought pair is written FIRST, then buried under enough later
+        // updates to push it clear out of the window.
+        let buried = ("c".repeat(40), "d".repeat(40), 1_650_000_000i64);
+        let log_path = bare.join("logs/refs/heads/buried");
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        let mut body = reflog_line(&buried.0, &buried.1, buried.2, "the buried landing");
+        let mut i = 0;
+        while body.len() <= super::REFLOG_TAIL_BYTES as usize * 2 {
+            body.push_str(&filler_line(i, 0));
+            i += 1;
+        }
+        std::fs::write(&log_path, &body).unwrap();
+
+        let entries = super::ref_reflog_entries(&bare, "refs/heads/buried")
+            .unwrap()
+            .expect("the reflog exists");
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.old_sha == buried.0 && e.new_sha == buried.1),
+            "an entry outside the tail window is simply not seen — the caller then \
+             treats the landing as unproven and leaves the row alone, never the \
+             other way round"
         );
     }
 
