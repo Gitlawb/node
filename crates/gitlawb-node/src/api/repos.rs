@@ -2386,7 +2386,10 @@ pub async fn git_receive_pack(
         .take()
         .expect("the write lock is only taken here, and only once");
     if push_succeeded {
-        publish_durability.mark_release_started();
+        // Arm on the guard's OWN publish stage, so a disconnect anywhere in
+        // `release` is classified by how far the publish actually got rather
+        // than by the mere fact that release was entered.
+        publish_durability.arm_for_release(reclaimed.publish_stage());
         tokio::spawn(post_receive_replication_tail(
             state.clone(),
             record.clone(),
@@ -2523,15 +2526,26 @@ pub async fn git_receive_pack(
 /// task. Split out of `git_receive_pack` so the ordering the coalescing gate depends
 /// on is directly testable; the handler spawns it and returns.
 /// Records the release-side publish outcome for the detached post-receive tail.
-/// If the handler future is dropped after [`Self::mark_release_started`] but
-/// before [`Self::record`], the drop sets [`ReleaseOutcome::UploadUnknowable`]
-/// so the tail can proceed on local disk without waiting out the full transfer
-/// bound. A drop before release starts leaves the slot empty so the tail fails
-/// closed rather than treating an unattempted publish as unknowably durable.
+///
+/// The subtle case is the one this type exists for: the handler future is
+/// DROPPED, so `release` never returns and `record` is never called. The slot
+/// then has to classify an attempt whose outcome nobody will ever report, and
+/// the only honest source for that is the publish STAGE — how far the attempt
+/// had actually got when it was abandoned.
+///
+/// Tracking "release started" instead was the defect. `release` awaits a blocking
+/// compression before the conditional PUT is constructed, so a cancellation
+/// there is a definite "no publication was attempted", yet every cancellation
+/// after the flag was set recorded `UploadUnknowable` — which the tail accepted,
+/// and then went on to do IPFS, Pinata, P2P, GraphQL, Arweave and peer work for
+/// refs that existed only in a rejected local write.
 struct PublishDurabilitySlot {
     inner: Arc<std::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>>,
     recorded: std::sync::atomic::AtomicBool,
-    release_started: std::sync::atomic::AtomicBool,
+    /// The stage of the release this slot is armed for. `None` until the release
+    /// is about to be awaited, which is what makes a drop before that point leave
+    /// the slot empty and the tail fail closed.
+    stage: std::sync::Mutex<Option<Arc<crate::git::publish::PublishStageCell>>>,
 }
 
 impl PublishDurabilitySlot {
@@ -2539,13 +2553,14 @@ impl PublishDurabilitySlot {
         Self {
             inner: Arc::new(std::sync::Mutex::new(None)),
             recorded: std::sync::atomic::AtomicBool::new(false),
-            release_started: std::sync::atomic::AtomicBool::new(false),
+            stage: std::sync::Mutex::new(None),
         }
     }
 
-    fn mark_release_started(&self) {
-        self.release_started
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+    /// Arm the slot against the guard's publish stage, immediately before the
+    /// release is awaited.
+    fn arm_for_release(&self, stage: Arc<crate::git::publish::PublishStageCell>) {
+        *self.stage.lock().expect("publish stage slot poisoned") = Some(stage);
     }
 
     fn arc(&self) -> Arc<std::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>> {
@@ -2567,22 +2582,61 @@ impl Drop for PublishDurabilitySlot {
         if self.recorded.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        if !self
-            .release_started
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        let Some(stage) = self
+            .stage
+            .lock()
+            .expect("publish stage slot poisoned")
+            .clone()
+        else {
+            // Dropped before the release was even armed. Leave the slot empty so
+            // the tail fails closed on the wait below.
             return;
-        }
+        };
+        use crate::git::publish::PublishStage;
+        use crate::git::repo_store::ReleaseOutcome;
+        let outcome = match stage.get() {
+            // The store answered. Cancellation after that point loses the
+            // handler's response, not the write, so the tail may run.
+            //
+            // `NoBackend` joins it: with no object storage configured there is
+            // no publication to confirm and the pack on local disk is the
+            // durable copy, which is exactly what `ReleaseOutcome::Released`
+            // already means for a release that had nothing to upload.
+            PublishStage::Published { .. } | PublishStage::NoBackend => ReleaseOutcome::Released,
+            // THE FINDING. Compression was still running, so the conditional PUT
+            // was never constructed and no publication was ever attempted. This
+            // is a definite refusal, not an unknowable one, and the tail must
+            // skip every replication effect.
+            PublishStage::Idle | PublishStage::PreparingArchive | PublishStage::Refused => {
+                ReleaseOutcome::UploadFailed
+            }
+            // Genuinely in flight. Nothing here can reconcile it — a `Drop` impl
+            // cannot await a HEAD — so it stays unknowable, which the tail refuses
+            // because it requires `Released`. The write is still on local disk and
+            // the next writer's under-lock refresh resolves it.
+            PublishStage::PutDispatched { .. } | PublishStage::Ambiguous { .. } => {
+                ReleaseOutcome::UploadUnknowable
+            }
+        };
         let mut slot = self
             .inner
             .lock()
             .expect("publish durability mutex poisoned");
         if slot.is_none() {
-            *slot = Some(crate::git::repo_store::ReleaseOutcome::UploadUnknowable);
+            *slot = Some(outcome);
         }
     }
 }
 
+/// May the detached replication tail run?
+///
+/// ONLY on `Released`, which is the outcome that means the store acknowledged
+/// this attempt (directly, or through the release-side reconciliation that
+/// matched the attempt id against what the store holds). `UploadUnknowable` used
+/// to pass here, which let the tail pin, announce and publish refs whose archive
+/// may never have landed; an unresolved dispatch has to be reconciled to this
+/// attempt's own generation before it counts as confirmation, and the place that
+/// can do it is `release`, not this predicate.
 async fn publish_durability_confirmed(
     slot: &Option<Arc<std::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>>>,
     wait: std::time::Duration,
@@ -2590,25 +2644,24 @@ async fn publish_durability_confirmed(
     let Some(slot) = slot else {
         return true;
     };
+    let confirmed = |outcome: Option<crate::git::repo_store::ReleaseOutcome>| {
+        matches!(
+            outcome,
+            Some(crate::git::repo_store::ReleaseOutcome::Released)
+        )
+    };
     let start = std::time::Instant::now();
     loop {
-        if let Some(outcome) = *slot.lock().expect("publish durability mutex poisoned") {
-            return matches!(
-                outcome,
-                crate::git::repo_store::ReleaseOutcome::Released
-                    | crate::git::repo_store::ReleaseOutcome::UploadUnknowable
-            );
+        let outcome = *slot.lock().expect("publish durability mutex poisoned");
+        if outcome.is_some() {
+            return confirmed(outcome);
         }
         if start.elapsed() >= wait {
             // No outcome within the release-side transfer bound plus slack. Fail
             // closed when the slot is still empty; an abandoned handler installs
-            // UploadUnknowable via PublishDurabilitySlot::drop so the tail can
-            // proceed on local disk without waiting out the full bound.
-            return matches!(
-                *slot.lock().expect("publish durability mutex poisoned"),
-                Some(crate::git::repo_store::ReleaseOutcome::Released)
-                    | Some(crate::git::repo_store::ReleaseOutcome::UploadUnknowable)
-            );
+            // its stage's verdict via PublishDurabilitySlot::drop, so the tail
+            // resolves promptly rather than waiting out the full bound.
+            return confirmed(*slot.lock().expect("publish durability mutex poisoned"));
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
@@ -3190,23 +3243,66 @@ pub async fn list_federated_repos(
 // ── Fork ──────────────────────────────────────────────────────────────────
 
 /// Removes a fork's local mirror clone on every exit until disarmed after the
-/// database row commits.
-struct ForkCloneGuard(Option<PathBuf>);
+/// database row commits — but ONLY while that clone still belongs to the attempt
+/// the guard was built for.
+///
+/// The bare `remove_dir_all` this replaces authorized itself with the path alone.
+/// Two attempts at the same logical fork share one path, so a failed attempt
+/// unwinding late could remove the directory a successor had already published
+/// and inserted a row for.
+struct ForkCloneGuard {
+    path: Option<PathBuf>,
+    attempt: crate::git::publish::PublishAttemptId,
+}
 
 const FORK_CREATE_CONFIRM_ATTEMPTS: u32 = 5;
+
+/// Who owns the logical fork name once `create_repo` has reported an error.
+///
+/// The distinction the previous `Option<RepoRecord>` could not draw is between
+/// "my insert committed" and "somebody's insert committed". Only the first
+/// entitles this request to answer 201 with that row, and only the third
+/// entitles it to compensate.
+enum ForkRowConfirmation {
+    /// THIS attempt's row is present: the insert committed and the error was a
+    /// transport-level report of a successful write.
+    Ours(Box<crate::db::RepoRecord>),
+    /// A different attempt owns the name. This request's archive, disk path and
+    /// fork provenance do not belong to that row, so it must not be returned,
+    /// and that attempt's resources must not be compensated.
+    Foreign,
+    /// Nothing owns the name.
+    Absent,
+}
 
 /// After `create_repo` fails, re-read the row with bounded retries so a
 /// transport-level error does not skip archive compensation when the insert never
 /// landed, and so a successful insert is not mistaken for a failure.
+///
+/// Keyed on `record_id` FIRST. Owner/name identifies a namespace, not an attempt:
+/// a concurrent ordinary create, a mirror registration or a retry can insert a
+/// different row under the same logical name, and treating that as proof of our
+/// own commit returned 201 carrying somebody else's row.
 async fn confirm_fork_repo_row(
     db: &crate::db::Db,
+    record_id: &str,
     owner_short: &str,
     fork_name: &str,
-) -> anyhow::Result<Option<crate::db::RepoRecord>> {
+) -> anyhow::Result<ForkRowConfirmation> {
     let mut delay = std::time::Duration::from_millis(25);
     for attempt in 0..FORK_CREATE_CONFIRM_ATTEMPTS {
-        match db.get_repo(owner_short, fork_name).await {
-            Ok(row) => return Ok(row),
+        let looked_up = async {
+            if let Some(ours) = db.get_repo_by_id(record_id).await? {
+                return Ok::<_, anyhow::Error>(ForkRowConfirmation::Ours(Box::new(ours)));
+            }
+            Ok(match db.get_repo(owner_short, fork_name).await? {
+                Some(_) => ForkRowConfirmation::Foreign,
+                None => ForkRowConfirmation::Absent,
+            })
+        }
+        .await;
+        match looked_up {
+            Ok(confirmation) => return Ok(confirmation),
             Err(e) if attempt + 1 < FORK_CREATE_CONFIRM_ATTEMPTS => {
                 tracing::warn!(
                     fork = %fork_name,
@@ -3228,40 +3324,62 @@ async fn confirm_fork_repo_row(
 /// When the confirmation lookup stays unavailable after bounded retries, keep
 /// retrying in the background and compensate only after establishing that no row
 /// exists for this fork name.
+///
+/// The `None` observation is still racy on its own — a successor can commit
+/// between the read and the deletions, and did, which let recovery for a failed
+/// fork erase a succeeding attempt's repository. What makes it safe is that the
+/// compensation it calls is now conditional on the object and the directory still
+/// carrying THIS attempt's identity, so a successor that commits at any point
+/// after the read keeps both.
+#[allow(clippy::too_many_arguments)]
 async fn schedule_fork_create_recovery(
     db: std::sync::Arc<crate::db::Db>,
     repo_store: crate::git::repo_store::RepoStore,
+    record_id: String,
     owner_short: String,
     fork_name: String,
     owner_did: String,
     disk_path: std::path::PathBuf,
+    attempt: crate::git::publish::PublishAttemptId,
 ) {
     let mut delay = std::time::Duration::from_millis(250);
-    for attempt in 0..12 {
-        match db.get_repo(&owner_short, &fork_name).await {
-            Ok(Some(_)) => {
+    for n in 0..12 {
+        match confirm_fork_repo_row(&db, &record_id, &owner_short, &fork_name).await {
+            Ok(ForkRowConfirmation::Ours(_)) => {
                 tracing::info!(
                     fork = %fork_name,
-                    attempt,
-                    "fork create_repo recovery found a committed row — no archive compensation"
+                    attempt = n,
+                    "fork create_repo recovery found this attempt's row — no compensation"
                 );
                 return;
             }
-            Ok(None) => {
-                tracing::warn!(
+            Ok(ForkRowConfirmation::Foreign) => {
+                tracing::info!(
                     fork = %fork_name,
-                    attempt,
-                    "fork create_repo recovery confirmed no row — compensating orphan archive"
+                    attempt = n,
+                    "fork create_repo recovery found another attempt's row under this name — \
+                     compensating only what this attempt still owns"
                 );
                 repo_store
-                    .compensate_fork_archive(&owner_did, &fork_name, disk_path.as_path())
+                    .compensate_fork_archive(&owner_did, &fork_name, disk_path.as_path(), &attempt)
                     .await;
                 return;
             }
-            Err(e) if attempt + 1 < 12 => {
+            Ok(ForkRowConfirmation::Absent) => {
                 tracing::warn!(
                     fork = %fork_name,
-                    attempt,
+                    attempt = n,
+                    "fork create_repo recovery confirmed no row — compensating orphan archive"
+                );
+                repo_store
+                    .compensate_fork_archive(&owner_did, &fork_name, disk_path.as_path(), &attempt)
+                    .await;
+                return;
+            }
+            Err(e) if n + 1 < 12 => {
+                tracing::warn!(
+                    fork = %fork_name,
+                    attempt = n,
                     err = %e,
                     "fork create_repo recovery lookup failed — retrying"
                 );
@@ -3283,31 +3401,40 @@ async fn schedule_fork_create_recovery(
 }
 
 impl ForkCloneGuard {
-    fn new(path: crate::git::repo_store::ValidatedRepoDiskPath) -> Self {
-        Self(Some(path.into_path_buf()))
+    fn new(
+        path: crate::git::repo_store::ValidatedRepoDiskPath,
+        attempt: crate::git::publish::PublishAttemptId,
+    ) -> Self {
+        let path = path.into_path_buf();
+        // Stamp the directory before anything can fail, so every later cleanup
+        // (this guard's Drop, the handler's compensation, the background
+        // recovery) has an ownership answer to consult.
+        crate::git::repo_store::claim_fork_disk_path(&path, &attempt);
+        Self {
+            path: Some(path),
+            attempt,
+        }
     }
 
     fn path(&self) -> &std::path::Path {
-        self.0
+        self.path
             .as_deref()
             .expect("fork clone guard disarmed while still in use")
     }
 
     fn disarm(&mut self) {
-        self.0 = None;
+        self.path = None;
     }
 }
 
 impl Drop for ForkCloneGuard {
     fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            if let Err(e) = std::fs::remove_dir_all(&path) {
-                tracing::warn!(
-                    path = %path.display(),
-                    err = %e,
-                    "failed to remove fork clone during attempt cleanup"
-                );
-            }
+        if let Some(path) = self.path.take() {
+            crate::git::repo_store::remove_fork_clone_if_ours(
+                &path,
+                &self.attempt,
+                "fork attempt cleanup",
+            );
         }
     }
 }
@@ -3407,34 +3534,109 @@ pub async fn fork_repo(
         )));
     }
 
-    let mut clone_guard = ForkCloneGuard::new(disk_path.clone());
+    // ONE identity for the whole workflow: the DB row id this request will
+    // insert is also the attempt id stamped into the object's metadata and onto
+    // the disk clone. That is what lets confirmation ask "is my row there" rather
+    // than "is a row there", and lets every cleanup ask "is this still mine"
+    // rather than "does this name resolve".
+    let record_id = Uuid::new_v4().to_string();
+    let attempt = crate::git::publish::PublishAttemptId::from_owned(record_id.clone());
+
+    let mut clone_guard = ForkCloneGuard::new(disk_path.clone(), attempt.clone());
 
     // Upload fork to Tigris. Create-only: a refused precondition means an orphan
     // archive already sits under this key (a failed create_repo or another
     // writer), and proceeding would create a DB record whose archive is shadowed
     // by bytes that are not this fork. Refuse rather than accept a fork other
     // nodes would fetch as unrelated content. The clone guard removes the local
-    // mirror on every upload failure path.
-    state
+    // mirror on every DEFINITE upload failure path.
+    if let Err(e) = state
         .repo_store
-        .release_after_write(&forker_did, &fork_name)
+        .release_after_write(&forker_did, &fork_name, &attempt)
         .await
-        .map_err(|e| match e {
+    {
+        match e {
             crate::git::tigris::UploadError::PreconditionLost { status } => {
-                tracing::warn!(
-                    forker = %forker_did,
-                    fork = %fork_name,
-                    status,
-                    "fork refused: an archive already exists under the fork's key"
-                );
-                AppError::RepoExists(fork_name.clone())
+                // One reconciliation before refusing: an SDK-level retry, or a
+                // duplicated dispatch, can land THIS attempt's bytes and then see
+                // the create-only fence refuse the second copy. The stored object
+                // carrying our own attempt id says the publish succeeded, and
+                // refusing it would fence the fork name behind our own work.
+                if state
+                    .repo_store
+                    .fork_attempt_landed(&forker_did, &fork_name, &attempt)
+                    .await
+                    .unwrap_or(false)
+                {
+                    tracing::info!(
+                        fork = %fork_name,
+                        status,
+                        "fork create-only PUT was refused but the stored archive is this \
+                         attempt's own — continuing"
+                    );
+                } else {
+                    tracing::warn!(
+                        forker = %forker_did,
+                        fork = %fork_name,
+                        status,
+                        "fork refused: an archive already exists under the fork's key"
+                    );
+                    return Err(AppError::RepoExists(fork_name.clone()));
+                }
             }
-            other => AppError::Git(format!("fork upload failed: {other}")),
-        })?;
+            crate::git::tigris::UploadError::NotPublished(other) => {
+                // Proven not to have committed. Dropping the clone (on the
+                // guard's Drop) is safe, and the fork name is left free.
+                return Err(AppError::Git(format!("fork upload failed: {other:#}")));
+            }
+            crate::git::tigris::UploadError::Ambiguous { source, .. } => {
+                // THE DURABLE FAILURE MODE. The create-only PUT can commit and
+                // the response can still be lost or unparseable. Compensating
+                // that as a definite failure dropped the only local clone and
+                // skipped the DB insert, and every retry then saw the orphan
+                // object and returned RepoExists — the fork name unusable until
+                // an operator intervened.
+                //
+                // Ask the store instead. The attempt id travelled with the bytes,
+                // so "did MY write land" is answerable even when "did my request
+                // succeed" is not.
+                match state
+                    .repo_store
+                    .fork_attempt_landed(&forker_did, &fork_name, &attempt)
+                    .await
+                {
+                    Ok(true) => {
+                        tracing::warn!(
+                            fork = %fork_name,
+                            err = %source,
+                            "fork upload lost its response but the stored archive is this \
+                             attempt's own — recovering the committed publish"
+                        );
+                    }
+                    // Not (yet) ours, or unreachable. The request may still be in
+                    // flight, so nothing here may be destroyed: keep the clone,
+                    // keep whatever is stored, and refuse retryably. Disarming the
+                    // guard is what preserves the only local copy.
+                    Ok(false) | Err(_) => {
+                        clone_guard.disarm();
+                        tracing::warn!(
+                            forker = %forker_did,
+                            fork = %fork_name,
+                            err = %source,
+                            "fork upload outcome is unknowable — leaving the clone and any \
+                             stored object in place for reconciliation rather than \
+                             compensating a write that may have landed"
+                        );
+                        return Err(AppError::RepoUnavailable);
+                    }
+                }
+            }
+        }
+    }
 
     let now = Utc::now();
     let record = crate::db::RepoRecord {
-        id: Uuid::new_v4().to_string(),
+        id: record_id.clone(),
         name: fork_name.clone(),
         owner_did: forker_did.clone(),
         description: source.description.clone(),
@@ -3448,24 +3650,45 @@ pub async fn fork_repo(
     };
 
     if let Err(e) = state.db.create_repo(&record).await {
-        match confirm_fork_repo_row(&state.db, forker_short, &fork_name).await {
-            Ok(Some(committed)) => {
+        match confirm_fork_repo_row(&state.db, &record_id, forker_short, &fork_name).await {
+            Ok(ForkRowConfirmation::Ours(committed)) => {
                 clone_guard.disarm();
                 tracing::warn!(
                     fork = %fork_name,
                     forker = %forker_did,
-                    "fork create_repo returned an error but the row is present — treating as success"
+                    "fork create_repo returned an error but THIS attempt's row is present — treating as success"
                 );
                 return Ok((
                     StatusCode::CREATED,
                     Json(to_response(&committed, &state, 0)),
                 ));
             }
-            Ok(None) => {
+            Ok(ForkRowConfirmation::Foreign) => {
+                // A concurrent create, mirror registration or retry owns the
+                // name. Returning its row would hand this caller a repository
+                // whose archive, disk path and fork provenance are not the ones
+                // this request produced. Refuse, and compensate only what this
+                // attempt still owns — the guard and `compensate_fork_archive`
+                // both check ownership, so the successor's object and directory
+                // survive.
+                tracing::warn!(
+                    fork = %fork_name,
+                    forker = %forker_did,
+                    "fork create_repo lost the name to another attempt — refusing rather than \
+                     claiming its row"
+                );
                 clone_guard.disarm();
                 state
                     .repo_store
-                    .compensate_fork_archive(&forker_did, &fork_name, disk_path.as_path())
+                    .compensate_fork_archive(&forker_did, &fork_name, disk_path.as_path(), &attempt)
+                    .await;
+                return Err(AppError::RepoExists(fork_name.clone()));
+            }
+            Ok(ForkRowConfirmation::Absent) => {
+                clone_guard.disarm();
+                state
+                    .repo_store
+                    .compensate_fork_archive(&forker_did, &fork_name, disk_path.as_path(), &attempt)
                     .await;
                 return Err(e.into());
             }
@@ -3477,14 +3700,18 @@ pub async fn fork_repo(
                 let fork_name_cl = fork_name.clone();
                 let owner_did = forker_did.clone();
                 let disk_path_cl = disk_path.as_path().to_path_buf();
+                let record_id_cl = record_id.clone();
+                let attempt_cl = attempt.clone();
                 tokio::spawn(async move {
                     schedule_fork_create_recovery(
                         db,
                         repo_store,
+                        record_id_cl,
                         owner_short,
                         fork_name_cl,
                         owner_did,
                         disk_path_cl,
+                        attempt_cl,
                     )
                     .await;
                 });
@@ -3500,6 +3727,9 @@ pub async fn fork_repo(
     }
 
     clone_guard.disarm();
+    // The row is committed: this directory is now the repository, not an
+    // attempt's staging area, and nothing may ever compensate it away.
+    crate::git::repo_store::release_fork_disk_claim(disk_path.as_path());
 
     // Persist the proof so the fork carries it when it propagates to peers.
     if let Some(p) = verified_proof {
@@ -3737,18 +3967,88 @@ mod tests {
     const OWNER_SHORT: &str = "z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
     const STRANGER_DID: &str = "did:key:z6Mkffonly5tranger0000000000000000000000000000000";
 
-    #[tokio::test]
-    async fn publish_durability_slot_drop_installs_unknowable_when_release_started_but_unrecorded()
-    {
+    use crate::git::publish::{PublishAttemptId, PublishStage, PublishStageCell};
+    use crate::git::repo_store::ReleaseOutcome;
+
+    /// A slot armed against a stage cell the test drives directly, which is the
+    /// only way to reach the abandoned-handler arms without a live push.
+    fn armed_slot(stage: PublishStage) -> (PublishDurabilitySlot, Arc<PublishStageCell>) {
+        let cell = Arc::new(PublishStageCell::new());
+        cell.set(stage);
         let slot = PublishDurabilitySlot::new();
-        slot.mark_release_started();
+        slot.arm_for_release(Arc::clone(&cell));
+        (slot, cell)
+    }
+
+    /// P1 FINDING 1, at the type level. A handler cancelled while the archive is
+    /// still being compressed has NOT attempted publication: the conditional PUT
+    /// is not constructed until compression returns. Recording that as
+    /// `UploadUnknowable` is what let the detached tail do IPFS, Pinata, P2P,
+    /// GraphQL, Arweave and peer work for refs that exist only in a local write
+    /// the store never saw.
+    #[test]
+    fn slot_drop_during_compression_records_a_definite_non_publication() {
+        let (slot, _cell) = armed_slot(PublishStage::PreparingArchive);
         let arc = slot.arc();
         drop(slot);
-        let outcome = *arc.lock().expect("publish durability mutex poisoned");
         assert_eq!(
-            outcome,
-            Some(crate::git::repo_store::ReleaseOutcome::UploadUnknowable),
-            "dropping an unrecorded slot after release starts must publish UploadUnknowable for the tail"
+            *arc.lock().expect("publish durability mutex poisoned"),
+            Some(ReleaseOutcome::UploadFailed),
+            "a cancellation before the PUT was dispatched must be recorded as a definite \
+             non-publication, not as unknowable durability"
+        );
+    }
+
+    /// The other side of the same boundary: once the request is on the wire, the
+    /// outcome genuinely is unknowable, and a `Drop` impl cannot await a HEAD to
+    /// resolve it. Unknowable is honest here — and the tail refuses it anyway,
+    /// because the tail requires `Released`.
+    #[test]
+    fn slot_drop_after_dispatch_records_unknowable() {
+        let (slot, _cell) = armed_slot(PublishStage::PutDispatched {
+            attempt: PublishAttemptId::new(),
+        });
+        let arc = slot.arc();
+        drop(slot);
+        assert_eq!(
+            *arc.lock().expect("publish durability mutex poisoned"),
+            Some(ReleaseOutcome::UploadUnknowable),
+            "a dispatched PUT may still commit, so the drop must not claim it definitely failed"
+        );
+    }
+
+    /// A disconnect AFTER the store acknowledged the publish loses the response,
+    /// not the write. The tail must still run: this is the case the stage model
+    /// gains over the old flag, which could only ever say "unknowable" here.
+    #[test]
+    fn slot_drop_after_the_store_acknowledged_records_released() {
+        let (slot, _cell) = armed_slot(PublishStage::Published {
+            attempt: PublishAttemptId::new(),
+            etag: Some("\"e1\"".to_string()),
+        });
+        let arc = slot.arc();
+        drop(slot);
+        assert_eq!(
+            *arc.lock().expect("publish durability mutex poisoned"),
+            Some(ReleaseOutcome::Released),
+            "a confirmed publish is durable regardless of what happened to the handler"
+        );
+    }
+
+    /// A node with no object storage configured has nothing to publish, so the
+    /// pack on local disk IS the durable copy and a disconnect must not withhold
+    /// the tail. Distinct from `Idle`, where a publish was possible and never
+    /// started; collapsing the two turns every Tigris-less deployment's pushes
+    /// into un-replicated ones.
+    #[test]
+    fn slot_drop_with_no_storage_backend_records_released() {
+        let (slot, _cell) = armed_slot(PublishStage::NoBackend);
+        let arc = slot.arc();
+        drop(slot);
+        assert_eq!(
+            *arc.lock().expect("publish durability mutex poisoned"),
+            Some(ReleaseOutcome::Released),
+            "with no backend there is no publication to confirm, so the tail must run"
         );
     }
 
@@ -3766,8 +4066,9 @@ mod tests {
 
     #[test]
     fn publish_durability_slot_drop_waits_for_contended_mutex() {
-        let slot = PublishDurabilitySlot::new();
-        slot.mark_release_started();
+        let (slot, _cell) = armed_slot(PublishStage::PutDispatched {
+            attempt: PublishAttemptId::new(),
+        });
         let arc = slot.arc();
         let holder = {
             let arc = Arc::clone(&arc);
@@ -3782,24 +4083,28 @@ mod tests {
         let outcome = *arc.lock().expect("publish durability mutex poisoned");
         assert_eq!(
             outcome,
-            Some(crate::git::repo_store::ReleaseOutcome::UploadUnknowable),
-            "drop must block until it can install UploadUnknowable, not give up on try_lock"
+            Some(ReleaseOutcome::UploadUnknowable),
+            "drop must block until it can install its verdict, not give up on try_lock"
         );
     }
 
+    /// The tail must resolve promptly on an abandoned handler rather than wait
+    /// out the whole transfer bound — it just resolves to a REFUSAL now.
     #[tokio::test]
-    async fn publish_durability_confirmed_proceeds_quickly_after_unrecorded_slot_drop() {
+    async fn publish_durability_confirmed_refuses_quickly_after_unrecorded_slot_drop() {
         let start = std::time::Instant::now();
-        let slot = PublishDurabilitySlot::new();
-        slot.mark_release_started();
+        let (slot, _cell) = armed_slot(PublishStage::PreparingArchive);
         let arc = slot.arc();
         drop(slot);
         let confirmed =
             publish_durability_confirmed(&Some(arc), std::time::Duration::from_millis(50)).await;
-        assert!(confirmed);
+        assert!(
+            !confirmed,
+            "a cancellation before dispatch must not admit the replication tail"
+        );
         assert!(
             start.elapsed() < std::time::Duration::from_millis(200),
-            "the tail must not wait out the full transfer bound when the slot already carries UploadUnknowable"
+            "the tail must not wait out the full transfer bound once the slot carries a verdict"
         );
     }
 
@@ -3811,37 +4116,38 @@ mod tests {
         assert!(
             !confirmed,
             "an empty slot after the bounded wait must not admit the tail; only an installed \
-             Released or UploadUnknowable outcome may"
+             Released outcome may"
         );
     }
 
+    /// P1 FINDING 1, at the gate. The tail replicates to IPFS, Pinata, P2P,
+    /// GraphQL, Arweave and peers, all of which publish refs to other nodes. Only
+    /// a CONFIRMED publish may license that. `UploadUnknowable` used to pass here,
+    /// which is what carried an unattempted (and an unreconciled) write into the
+    /// network.
     #[tokio::test]
     async fn publish_durability_confirmed_accepts_only_released() {
-        let slot = Arc::new(std::sync::Mutex::new(Some(
-            crate::git::repo_store::ReleaseOutcome::Released,
-        )));
+        let slot = Arc::new(std::sync::Mutex::new(Some(ReleaseOutcome::Released)));
         assert!(
             publish_durability_confirmed(&Some(slot), std::time::Duration::from_millis(5)).await
         );
 
-        let slot = Arc::new(std::sync::Mutex::new(Some(
-            crate::git::repo_store::ReleaseOutcome::UploadUnknowable,
-        )));
-        assert!(
-            publish_durability_confirmed(&Some(slot), std::time::Duration::from_millis(5)).await,
-            "an unknowable upload still landed on local disk, so the tail may proceed"
-        );
-
-        let slot = Arc::new(std::sync::Mutex::new(Some(
-            crate::git::repo_store::ReleaseOutcome::UploadFailed,
-        )));
-        assert!(
-            !publish_durability_confirmed(&Some(slot), std::time::Duration::from_millis(5)).await
-        );
+        for refused in [
+            ReleaseOutcome::UploadUnknowable,
+            ReleaseOutcome::UploadFailed,
+            ReleaseOutcome::Fenced,
+        ] {
+            let slot = Arc::new(std::sync::Mutex::new(Some(refused)));
+            assert!(
+                !publish_durability_confirmed(&Some(slot), std::time::Duration::from_millis(5))
+                    .await,
+                "{refused:?} is not a confirmed publish and must not admit the tail"
+            );
+        }
     }
 
     #[test]
-    fn fork_clone_guard_removes_mirror_on_drop() {
+    fn fork_clone_guard_removes_its_own_mirror_on_drop() {
         let root = tempfile::TempDir::new().unwrap();
         let validated = crate::git::repo_store::validated_repo_disk_path(
             root.path(),
@@ -3851,12 +4157,39 @@ mod tests {
         .expect("test fork path must validate");
         std::fs::create_dir_all(validated.as_path()).unwrap();
         {
-            let _guard = ForkCloneGuard::new(validated.clone());
+            let _guard = ForkCloneGuard::new(validated.clone(), PublishAttemptId::new());
             assert!(validated.exists());
         }
         assert!(
             !validated.exists(),
-            "dropping the fork clone guard must remove the mirror directory"
+            "dropping the fork clone guard must remove the mirror directory it stamped"
+        );
+    }
+
+    /// P1 FINDING 3, the filesystem half. Two attempts at one logical fork share
+    /// a disk path. A late-unwinding attempt must not remove the directory a
+    /// SUCCESSOR now owns — the successor has already published its archive and
+    /// returned 201 for it.
+    #[test]
+    fn fork_clone_guard_leaves_a_successors_mirror_alone() {
+        let root = tempfile::TempDir::new().unwrap();
+        let validated = crate::git::repo_store::validated_repo_disk_path(
+            root.path(),
+            "did:key:testfork",
+            "fork",
+        )
+        .expect("test fork path must validate");
+        std::fs::create_dir_all(validated.as_path()).unwrap();
+
+        let loser = ForkCloneGuard::new(validated.clone(), PublishAttemptId::new());
+        // The successor claims the path while the loser is still unwinding.
+        let successor = PublishAttemptId::new();
+        crate::git::repo_store::claim_fork_disk_path(validated.as_path(), &successor);
+
+        drop(loser);
+        assert!(
+            validated.exists(),
+            "a failed attempt must not delete the directory a successor now owns"
         );
     }
 
@@ -10782,6 +11115,344 @@ mod tests {
              announcing a half-applied repo is exactly what release(false) refuses \
              to upload"
         );
+    }
+
+    // ── #285 P1 finding 1: cancellation before the PUT is dispatched ───────
+
+    /// A minimal object-store stub that COUNTS PUTs and answers every HEAD 404.
+    ///
+    /// Not a semantics mock: the whole claim of the tests below is that no PUT
+    /// ever arrives, so the only thing it has to do faithfully is notice one.
+    async fn p3_put_counting_store() -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/{*key}",
+            axum::routing::any({
+                let puts = Arc::clone(&puts);
+                move |method: axum::http::Method, _body: axum::body::Bytes| {
+                    let puts = Arc::clone(&puts);
+                    async move {
+                        if method == axum::http::Method::PUT {
+                            puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            return axum::http::StatusCode::OK;
+                        }
+                        // Nothing is stored, so the acquire-side refresh takes the
+                        // create-only arm and downloads nothing.
+                        axum::http::StatusCode::NOT_FOUND
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (endpoint, puts, server)
+    }
+
+    /// A push handler whose release-side publish parks INSIDE the blocking
+    /// compression, which is the window the finding is about: the conditional PUT
+    /// is not constructed until compression returns, so a handler cancelled here
+    /// definitely never attempted publication.
+    ///
+    /// Path-scoped for the same reason as `p2_parked_release_state`: the tail's
+    /// withheld walk is the observable, and without a path-scoped rule
+    /// `replication_withheld_set` takes the no-walk shortcut and spawns no git.
+    ///
+    /// The bare repo is created directly rather than through `repo_store.init`,
+    /// which would spawn a background create-only upload of its own and pollute
+    /// the PUT count this test reads.
+    #[cfg(unix)]
+    async fn p3_compression_gated_state(
+        pool: sqlx::PgPool,
+        tmp: &std::path::Path,
+        owner: &str,
+        name: &str,
+        gate: Arc<crate::git::tigris::BlockingGate>,
+    ) -> (
+        AppState,
+        std::path::PathBuf,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let log = tmp.join("git.log");
+        let git_bin = f2a_logging_git(tmp, &log);
+        let repos_dir = tmp.join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let (endpoint, puts, server) = p3_put_counting_store().await;
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.git_bin = git_bin;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir.clone(),
+            Some(
+                crate::git::tigris::TigrisClient::for_testing_with_endpoint(
+                    "test-bucket",
+                    &endpoint,
+                )
+                .with_compress_gate(gate),
+            ),
+            pool.clone(),
+            std::time::Duration::from_secs(300),
+        );
+        state
+            .db
+            .upsert_mirror_repo(owner, name, &format!("/unused-{owner}-{name}"), None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "/secret/**",
+                crate::db::VisibilityMode::B,
+                &["did:key:z6MkP3TailReaderAAAAAAAAAAAAAAAAAAAAAA".to_string()],
+                &rec.owner_did,
+            )
+            .await
+            .unwrap();
+        let bare =
+            crate::git::repo_store::validated_repo_disk_path(&repos_dir, &rec.owner_did, name)
+                .expect("test repo path");
+        crate::git::store::init_bare(&bare).expect("a bare repo on disk");
+        (state, log, puts, server)
+    }
+
+    /// #285 P1 FINDING 1 (RED-before/GREEN-after). A client disconnect while the
+    /// release-side archive is still being COMPRESSED must not count as publish
+    /// durability.
+    ///
+    /// `TigrisClient::upload` awaits `spawn_blocking(compress_repo)` and does not
+    /// construct, let alone send, the conditional PUT until that returns. So a
+    /// handler dropped in this window definitively never attempted publication —
+    /// and the detached tail must do NOTHING: no IPFS/Pinata pin, no P2P
+    /// announcement, no GraphQL publication, no Arweave work, no peer
+    /// notification, all for refs that exist only in a local write the store
+    /// never saw.
+    ///
+    /// Load-bearing: with the slot recording `UploadUnknowable` for every
+    /// cancellation after release starts (the pre-fix shape), the tail is
+    /// admitted and its withheld walk's `for-each-ref` appears in the git log
+    /// (RED). Reading the publish STAGE instead classifies this as a definite
+    /// non-publication and the walk never runs (GREEN).
+    ///
+    /// The existing `receive_pack_tail_survives_a_disconnect_during_release`
+    /// parks at the pre-unlock point, which is AFTER the upload, so it cannot
+    /// reach this boundary at all.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_cancelled_during_compression_publishes_nothing_and_runs_no_tail(
+        pool: sqlx::PgPool,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Shut: every compression from this store parks until the gate opens.
+        let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
+        let (state, log, puts, server) =
+            p3_compression_gated_state(pool, tmp.path(), "z6p3comp", "c1", Arc::clone(&gate)).await;
+
+        let mut fut = Box::pin(p2_push(&state, "z6p3comp", "c1"));
+        let mut ran = false;
+        for _ in 0..1000 {
+            let step = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            assert!(
+                step.is_err(),
+                "the handler must park inside the release-side compression, not return"
+            );
+            if p2_logged(&log, "receive-pack") {
+                ran = true;
+                break;
+            }
+        }
+        assert!(ran, "the push must reach receive-pack");
+        // Settle: the handler is now inside `release`, blocked on the gate with
+        // no PUT constructed.
+        for _ in 0..10 {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+        }
+        assert_eq!(
+            puts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "compression has not finished, so no PUT can have been built yet"
+        );
+
+        // THE DISCONNECT, inside the compression window.
+        drop(fut);
+
+        // Give the tail every chance to misbehave. Pre-fix it is admitted the
+        // instant the slot's Drop installs its verdict, so this window is far
+        // more than enough for the walk to show up.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        assert!(
+            !p2_logged(&log, "for-each-ref"),
+            "RED: a push cancelled before its PUT was even constructed still ran the \
+             replication tail. Nothing was published, so pinning, announcing and \
+             replicating these refs advertises a write no other node can read. git log:\n{}",
+            f2a_log(&log)
+        );
+        assert_eq!(
+            puts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no PUT may have reached the store at any point"
+        );
+
+        // Release the parked blocking task so the runtime can tear down cleanly.
+        gate.open();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        server.abort();
+    }
+
+    /// THE CONTROL, and what makes the assertion above attributable. Same setup,
+    /// same handler, but nothing holds the gate: the publish completes, the store
+    /// sees the PUT, and the tail DOES run its walk.
+    ///
+    /// Without this, a green negative would prove only that the walk never runs
+    /// in this harness, not that the CANCELLATION is what stops it.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_that_completes_its_publish_still_runs_the_tail(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Open from the start: this control must publish for real.
+        let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
+        gate.open();
+        let (state, log, puts, server) =
+            p3_compression_gated_state(pool, tmp.path(), "z6p3ctrl", "c1", gate).await;
+
+        p2_push(&state, "z6p3ctrl", "c1")
+            .await
+            .expect("an uncontended push must succeed");
+
+        assert_eq!(
+            puts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the release must have published exactly once"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !p2_logged(&log, "for-each-ref") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a confirmed publish must admit the replication tail; git log:\n{}",
+                f2a_log(&log)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        server.abort();
+    }
+
+    // ── #285 P1 finding 3: fork confirmation is bound to the attempt ───────
+
+    /// A repo row under `owner/name` owned by some OTHER attempt.
+    async fn p3_seed_foreign_row(
+        state: &AppState,
+        owner_did: &str,
+        name: &str,
+    ) -> crate::db::RepoRecord {
+        let now = Utc::now();
+        let rec = crate::db::RepoRecord {
+            id: Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: format!("/unused/{name}"),
+            forked_from: None,
+            machine_id: None,
+        };
+        state
+            .db
+            .create_repo(&rec)
+            .await
+            .expect("seed the other row");
+        rec
+    }
+
+    /// #285 P1 FINDING 3, interleaving (a): another row COMMITS UNDER THE NAME
+    /// before this attempt's confirmation runs.
+    ///
+    /// The ordering is the barrier: the successor's insert completes, and only
+    /// then does the failed attempt look up. Keyed on owner/name, that lookup
+    /// answered "a row exists" and the request returned 201 carrying the
+    /// successor's row — even though its own uploaded archive, disk path and fork
+    /// provenance belong to no row at all. Keyed on `record.id` it cannot.
+    #[sqlx::test]
+    async fn fork_confirmation_never_claims_a_concurrent_attempts_row(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let owner = "did:key:z6MkForkIdentityAAAAAAAAAAAAAAAAAAAAAAAA";
+        let short = crate::db::normalize_owner_key(owner);
+        let name = "contested-fork";
+
+        // Interleaving: the successor commits first.
+        let successor = p3_seed_foreign_row(&state, owner, name).await;
+
+        // Then this attempt, whose own insert did NOT land, confirms.
+        let mine = Uuid::new_v4().to_string();
+        let confirmation = confirm_fork_repo_row(&state.db, &mine, short, name)
+            .await
+            .expect("the lookup itself succeeds");
+        match confirmation {
+            ForkRowConfirmation::Foreign => {}
+            ForkRowConfirmation::Ours(row) => panic!(
+                "the failed attempt claimed the successor's row {} as its own commit",
+                row.id
+            ),
+            ForkRowConfirmation::Absent => {
+                panic!("a row for this name does exist, so Absent would license compensation")
+            }
+        }
+        assert_ne!(successor.id, mine);
+    }
+
+    /// The must-do direction: when this attempt's OWN insert did commit, the
+    /// confirmation has to recognize it, or a transport-level error on a
+    /// successful write would turn into a spurious failure plus compensation of
+    /// a live repository.
+    #[sqlx::test]
+    async fn fork_confirmation_recognizes_this_attempts_own_committed_row(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let owner = "did:key:z6MkForkIdentityBBBBBBBBBBBBBBBBBBBBBBBB";
+        let short = crate::db::normalize_owner_key(owner);
+        let name = "my-fork";
+
+        let mine = p3_seed_foreign_row(&state, owner, name).await;
+        match confirm_fork_repo_row(&state.db, &mine.id, short, name)
+            .await
+            .expect("lookup")
+        {
+            ForkRowConfirmation::Ours(row) => assert_eq!(row.id, mine.id),
+            other => panic!(
+                "this attempt's own row must confirm as Ours, got {}",
+                match other {
+                    ForkRowConfirmation::Foreign => "Foreign",
+                    ForkRowConfirmation::Absent => "Absent",
+                    ForkRowConfirmation::Ours(_) => unreachable!(),
+                }
+            ),
+        }
+    }
+
+    /// And the third arm: nothing owns the name, which is the only state that
+    /// licenses compensation at all.
+    #[sqlx::test]
+    async fn fork_confirmation_reports_absent_when_nothing_owns_the_name(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let short = "z6MkForkIdentityCCCCCCCCCCCCCCCCCCCCCCCC";
+        assert!(matches!(
+            confirm_fork_repo_row(&state.db, &Uuid::new_v4().to_string(), short, "nobody-here")
+                .await
+                .expect("lookup"),
+            ForkRowConfirmation::Absent
+        ));
     }
 
     /// Scenario 5 (trap 3, fail-closed). On a repo whose withheld walk is failing, a

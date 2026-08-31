@@ -21,7 +21,10 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use super::store;
-use super::tigris::{TigrisClient, UploadError, UploadPrecondition};
+use super::tigris::{
+    AttemptDelete, PublishAttemptId, PublishStage, PublishStageCell, TigrisClient, UploadError,
+    UploadPrecondition,
+};
 
 /// Centralized repo storage: local disk cache + optional Tigris backend.
 #[derive(Clone)]
@@ -135,8 +138,18 @@ impl RepoStore {
         let local_path = validated_repo_disk_path(&self.repos_dir, owner_did, repo_name)?;
         let owner_slug = owner_did.replace([':', '/'], "_");
 
-        // Fast path: repo exists locally
+        // Fast path: repo exists locally.
         if local_path.exists() {
+            // ...but existence is not the cache contract. A tree left by a write
+            // whose PUT outcome was never resolved carries this node's refs with
+            // no confirmed generation behind them, and serving it would publish a
+            // possibly-refused write to every reader for as long as the directory
+            // survives. Reconcile the quarantine FIRST, before the migration
+            // bookkeeping and before the path is handed out.
+            if let Some(marker) = read_quarantine(&local_path) {
+                self.reconcile_quarantine(&owner_slug, repo_name, &local_path, &marker)
+                    .await?;
+            }
             // Lazy migration: if Tigris is enabled and we haven't confirmed this
             // repo is in Tigris yet, check and upload in the background.
             if let Some(ref tigris) = self.tigris {
@@ -168,7 +181,7 @@ impl RepoStore {
                                     .upload(&slug, &name, &path, UploadPrecondition::IfAbsent)
                                     .await
                                 {
-                                    Ok(()) => {
+                                    Ok(_) => {
                                         info!(repo = %name, "lazy migration to tigris complete");
                                     }
                                     // Logged apart from the warn arm below so a
@@ -217,6 +230,79 @@ impl RepoStore {
         // Not found anywhere — return path anyway; caller will get a meaningful
         // error from git when the path doesn't exist.
         Ok(local_path.into_path_buf())
+    }
+
+    /// Decide whether a quarantined live tree may be served.
+    ///
+    /// The ONLY thing that lifts a quarantine is the store confirming it holds
+    /// the attempt that left it — which is decidable, because the attempt id
+    /// travelled with the bytes. Everything else refuses with a retryable
+    /// `RepoUnavailable`.
+    ///
+    /// Deleting the tree instead is NOT a safe alternative and is deliberately
+    /// not done here: the unresolved PUT may have landed, in which case this
+    /// directory can be the only local copy of it. Refusing costs a 503 that a
+    /// later write (whose under-lock refresh re-downloads the confirmed archive
+    /// and clears the marker) or a successful reconciliation resolves; deleting
+    /// costs the data.
+    async fn reconcile_quarantine(
+        &self,
+        owner_slug: &str,
+        repo_name: &str,
+        local_path: &ValidatedRepoDiskPath,
+        marker: &QuarantineMarker,
+    ) -> Result<()> {
+        let refuse = || {
+            Err(anyhow::Error::new(RepoUnavailable).context(format!(
+                "local tree for {owner_slug}/{repo_name} is quarantined: its publish outcome \
+                 is unresolved and could not be reconciled against object storage"
+            )))
+        };
+        let (Some(tigris), Some(attempt)) = (
+            self.tigris.as_ref(),
+            marker.attempt.as_deref().map(PublishAttemptId::from_owned),
+        ) else {
+            // No backend to ask, or no attempt to ask about. Either way nothing
+            // can confirm this tree, and a read that cannot be confirmed must
+            // not be served as an ordinary success.
+            warn!(
+                repo = %repo_name,
+                "refusing a quarantined read: no attempt identity to reconcile against"
+            );
+            return refuse();
+        };
+        match tigris.attempt_landed(owner_slug, repo_name, &attempt).await {
+            Ok(true) => {
+                info!(
+                    repo = %repo_name,
+                    attempt = %attempt,
+                    "quarantine lifted: object storage holds this attempt's archive"
+                );
+                clear_quarantine(local_path, repo_name);
+                Ok(())
+            }
+            Ok(false) => {
+                // The store does not hold this attempt. That is NOT proof it
+                // never will — an abandoned PUT can still be in flight — so the
+                // tree stays put and the read is refused rather than served or
+                // deleted.
+                warn!(
+                    repo = %repo_name,
+                    attempt = %attempt,
+                    "refusing a quarantined read: object storage holds a different generation \
+                     than the unresolved write on local disk"
+                );
+                refuse()
+            }
+            Err(e) => {
+                warn!(
+                    repo = %repo_name,
+                    err = %e,
+                    "refusing a quarantined read: could not reach object storage to reconcile"
+                );
+                refuse()
+            }
+        }
     }
 
     /// Non-mutating snapshot of a repo's **latest** Tigris state, for reads that
@@ -475,6 +561,13 @@ impl RepoStore {
             // configured, in which case `release` publishes nothing at all.
             publish_fence: UploadPrecondition::Unconditional,
             refresh_swap_authority: Some(refresh_swap_authority.clone()),
+            // Seeded from whether a backend exists at all, so a cancelled
+            // release can tell "there was nothing to publish" from "a publish
+            // was possible and never started".
+            publish_stage: Arc::new(PublishStageCell::seeded(match self.tigris {
+                Some(_) => PublishStage::Idle,
+                None => PublishStage::NoBackend,
+            })),
             #[cfg(test)]
             test_pre_unlock_gate: self.pre_unlock_gate.clone(),
             #[cfg(test)]
@@ -537,7 +630,14 @@ impl RepoStore {
             .await;
 
             match refreshed {
-                Some(Ok(fence)) => guard.publish_fence = fence,
+                Some(Ok(fence)) => {
+                    // The tree at the live path is now the generation this HEAD
+                    // observed (downloaded, or confirmed absent), so any
+                    // quarantine an earlier unresolved write left on this path is
+                    // answered by the refresh itself.
+                    clear_quarantine(&local_path, repo_name);
+                    guard.publish_fence = fence;
+                }
                 Some(Err(RefreshFailure::Download { err, .. })) => {
                     // HEAD established a stored generation but the GET failed, so we
                     // do not know whether the local tree matches it. Proceeding on a
@@ -623,7 +723,7 @@ impl RepoStore {
                     .upload(&owner_slug, &repo_name, &path, UploadPrecondition::IfAbsent)
                     .await
                 {
-                    Ok(()) => {}
+                    Ok(_) => {}
                     // Distinct from the warn arm: the fence refusing is the
                     // design working, not a storage failure.
                     Err(UploadError::PreconditionLost { status }) => {
@@ -648,39 +748,42 @@ impl RepoStore {
     /// former to refuse the fork rather than create a DB record shadowed by an
     /// orphan other nodes would fetch. Plain upload failures are propagated so fork
     /// creation does not insert a DB row when the archive never landed.
+    ///
+    /// `attempt` is the identity the bytes are stamped with, and fork creation
+    /// passes the `record.id` it is about to insert. That is what makes the
+    /// object, the disk clone and the database row all name ONE attempt, so a
+    /// later cleanup can be conditional on still owning the thing it is about to
+    /// destroy instead of trusting the logical owner/name.
     pub async fn release_after_write(
         &self,
         owner_did: &str,
         repo_name: &str,
+        attempt: &PublishAttemptId,
     ) -> Result<(), UploadError> {
         if let Some(ref tigris) = self.tigris {
             let (owner_slug, local_path) = match self.local_path(owner_did, repo_name) {
                 Ok(p) => p,
                 Err(e) => {
                     warn!(repo = %repo_name, err = %e, "rejected unsafe path in release_after_write");
-                    return Err(UploadError::Other(e));
+                    // A path this node refused to build is a path nothing was
+                    // ever sent to.
+                    return Err(UploadError::NotPublished(e));
                 }
             };
             // Create-only. The sole caller is fork creation, which rejects a
             // name conflict in the database before it clones anything, so the
-            // key is expected absent here (and archive keys are never deleted:
-            // `delete` has no callers). A refusal therefore means someone else
-            // already published this key.
-            match tigris
-                .upload(
+            // key is expected absent here. A refusal therefore means someone
+            // else already published this key.
+            tigris
+                .upload_tracked(
                     &owner_slug,
                     repo_name,
                     &local_path,
                     UploadPrecondition::IfAbsent,
+                    attempt.clone(),
+                    None,
                 )
-                .await
-            {
-                Ok(()) => {}
-                // Propagated, not logged as success: an orphan archive under
-                // this key shadows the fork for every other node.
-                Err(e @ UploadError::PreconditionLost { .. }) => return Err(e),
-                Err(e) => return Err(e),
-            }
+                .await?;
         }
         Ok(())
     }
@@ -705,21 +808,59 @@ impl RepoStore {
         Ok((owner_slug, local_path))
     }
 
+    /// Did `attempt`'s fork archive land? Used to recover a create-only publish
+    /// whose response was lost, instead of compensating it as a definite failure
+    /// and fencing the fork name behind its own orphan.
+    ///
+    /// `Ok(false)` with no backend configured, where there is nothing to have
+    /// landed in.
+    pub async fn fork_attempt_landed(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+        attempt: &PublishAttemptId,
+    ) -> Result<bool> {
+        let Some(ref tigris) = self.tigris else {
+            return Ok(false);
+        };
+        let (owner_slug, _) = self.local_path(owner_did, repo_name)?;
+        tigris.attempt_landed(&owner_slug, repo_name, attempt).await
+    }
+
     /// Best-effort cleanup when fork creation published an archive but failed to persist
-    /// the database row. Removes the object-store key this attempt owns and the local
-    /// mirror clone so a retry is not blocked by its own orphan. Object-store deletion
-    /// is retried asynchronously when the first attempt fails so a transient DELETE does
-    /// not tombstone the fork name.
+    /// the database row. Removes the object-store key and the local mirror clone THIS
+    /// ATTEMPT OWNS, so a retry is not blocked by its own orphan.
+    ///
+    /// Every destructive step is conditional on the resource still belonging to
+    /// `attempt`. The unconditional version this replaces authorized itself with the
+    /// logical owner/name, which identifies a namespace and not the attempt that owns a
+    /// row, an object generation or a filesystem tree: recovery for a failed fork could
+    /// observe `get_repo == None`, be overtaken by a successor that committed and
+    /// returned 201, and then delete that successor's archive and directory. A second
+    /// name lookup immediately before the delete only moves that window; the attempt
+    /// guard removes it.
     pub async fn compensate_fork_archive(
         &self,
         owner_did: &str,
         repo_name: &str,
         disk_path: &Path,
+        attempt: &PublishAttemptId,
     ) {
         if let Some(ref tigris) = self.tigris {
             if let Ok((owner_slug, _)) = self.local_path(owner_did, repo_name) {
-                match tigris.delete(&owner_slug, repo_name).await {
-                    Ok(()) => {}
+                match tigris
+                    .delete_if_attempt_matches(&owner_slug, repo_name, attempt)
+                    .await
+                {
+                    Ok(AttemptDelete::Deleted) | Ok(AttemptDelete::Absent) => {}
+                    Ok(AttemptDelete::NotOurs) => {
+                        info!(
+                            repo = %repo_name,
+                            attempt = %attempt,
+                            "fork compensation left the stored archive alone: it belongs to \
+                             another attempt"
+                        );
+                    }
                     Err(e) => {
                         warn!(
                             repo = %repo_name,
@@ -729,43 +870,141 @@ impl RepoStore {
                         let tigris = tigris.clone();
                         let slug = owner_slug.clone();
                         let name = repo_name.to_string();
+                        let attempt = attempt.clone();
                         tokio::spawn(async move {
-                            retry_fork_archive_delete(&tigris, &slug, &name).await;
+                            retry_fork_archive_delete(&tigris, &slug, &name, &attempt).await;
                         });
                     }
                 }
             }
         }
-        if let Err(e) = std::fs::remove_dir_all(disk_path) {
-            warn!(
-                path = %disk_path.display(),
-                err = %e,
-                "failed to remove fork clone during create_repo compensation"
-            );
-        }
+        remove_fork_clone_if_ours(disk_path, attempt, "create_repo compensation");
     }
 }
 
-async fn retry_fork_archive_delete(tigris: &TigrisClient, owner_slug: &str, repo_name: &str) {
+/// Sidecar naming the attempt that owns a fork's on-disk clone, beside the
+/// directory for the same reason the quarantine marker is: anything inside the
+/// bare repo would be tarred into the archive and shipped to every node.
+fn fork_attempt_path(disk_path: &Path) -> Option<PathBuf> {
+    let parent = disk_path.parent()?;
+    let file_name = disk_path.file_name()?.to_string_lossy().to_string();
+    Some(parent.join(format!(".{file_name}.fork-attempt")))
+}
+
+/// Stamp a freshly cloned fork mirror with the attempt that created it. Written
+/// before the archive upload, so every later cleanup can ask "is this still
+/// mine?" of the directory as well as of the object.
+pub(crate) fn claim_fork_disk_path(disk_path: &Path, attempt: &PublishAttemptId) {
+    let Some(path) = fork_attempt_path(disk_path) else {
+        return;
+    };
+    if let Err(e) = std::fs::write(&path, attempt.as_str()) {
+        warn!(
+            path = %disk_path.display(),
+            err = %e,
+            "failed to stamp the fork clone with its attempt id — cleanup will refuse to \
+             remove it rather than risk removing a successor's clone"
+        );
+    }
+}
+
+/// Drop the attempt stamp once the fork's row has committed and no cleanup may
+/// ever remove this directory again.
+///
+/// Leaving the stamp would be harmless but misleading; removing it also means a
+/// LATER attempt's cleanup finds no owner and therefore refuses to delete, which
+/// is the safe direction.
+pub(crate) fn release_fork_disk_claim(disk_path: &Path) {
+    if let Some(path) = fork_attempt_path(disk_path) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Does the clone at `disk_path` still belong to `attempt`?
+///
+/// A missing stamp answers NO. That is the fail-safe direction: an unstamped
+/// directory is one this attempt cannot prove it owns, and refusing to delete
+/// leaves an orphan for an operator, while deleting wrongly destroys a
+/// successor's repository after that successor has already returned success.
+fn fork_clone_is_ours(disk_path: &Path, attempt: &PublishAttemptId) -> bool {
+    fork_attempt_path(disk_path)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .is_some_and(|owner| owner.trim() == attempt.as_str())
+}
+
+/// Remove a fork's clone only while it is still this attempt's.
+pub(crate) fn remove_fork_clone_if_ours(
+    disk_path: &Path,
+    attempt: &PublishAttemptId,
+    reason: &str,
+) {
+    if !disk_path.exists() {
+        let _ = fork_attempt_path(disk_path).map(std::fs::remove_file);
+        return;
+    }
+    if !fork_clone_is_ours(disk_path, attempt) {
+        info!(
+            path = %disk_path.display(),
+            attempt = %attempt,
+            reason,
+            "left the fork clone alone: it no longer belongs to this attempt"
+        );
+        return;
+    }
+    if let Err(e) = std::fs::remove_dir_all(disk_path) {
+        warn!(
+            path = %disk_path.display(),
+            err = %e,
+            reason,
+            "failed to remove fork clone"
+        );
+        return;
+    }
+    let _ = fork_attempt_path(disk_path).map(std::fs::remove_file);
+}
+
+async fn retry_fork_archive_delete(
+    tigris: &TigrisClient,
+    owner_slug: &str,
+    repo_name: &str,
+    attempt: &PublishAttemptId,
+) {
     const MAX_ATTEMPTS: u32 = 6;
-    for attempt in 0..MAX_ATTEMPTS {
-        match tigris.delete(owner_slug, repo_name).await {
-            Ok(()) => {
+    for n in 0..MAX_ATTEMPTS {
+        // Re-evaluated on EVERY retry, not resolved once before the loop. The
+        // whole point of retrying is that time passes, and the ownership gap the
+        // unconditional version left open widened with each attempt: a successor
+        // that commits between retry 2 and retry 3 would still have had its
+        // archive deleted by retry 3.
+        match tigris
+            .delete_if_attempt_matches(owner_slug, repo_name, attempt)
+            .await
+        {
+            Ok(AttemptDelete::Deleted) => {
                 info!(
                     repo = %repo_name,
-                    attempt,
+                    attempt = n,
                     "fork archive compensation delete succeeded on retry"
                 );
                 return;
             }
-            Err(e) if attempt + 1 < MAX_ATTEMPTS => {
+            Ok(AttemptDelete::Absent) => return,
+            Ok(AttemptDelete::NotOurs) => {
+                info!(
+                    repo = %repo_name,
+                    "fork archive compensation stopped retrying: the stored archive now \
+                     belongs to another attempt"
+                );
+                return;
+            }
+            Err(e) if n + 1 < MAX_ATTEMPTS => {
                 warn!(
                     repo = %repo_name,
-                    attempt,
+                    attempt = n,
                     err = %e,
                     "fork archive compensation delete failed — retrying"
                 );
-                tokio::time::sleep(Duration::from_secs(1u64 << attempt.min(4))).await;
+                tokio::time::sleep(Duration::from_secs(1u64 << n.min(4))).await;
             }
             Err(e) => {
                 warn!(
@@ -890,12 +1129,110 @@ pub(crate) fn swap_extracted_into_validated_repo(
     Ok(())
 }
 
+/// How long the under-lock reconciliation HEAD gets. Separate from (and much
+/// smaller than) the publish bound it follows: it runs after a transfer that has
+/// already used its whole budget, with the advisory lock and a lock-pool slot
+/// still pinned, so it must be an addendum rather than a second budget.
+const RECONCILE_BOUND: Duration = Duration::from_secs(5);
+
+/// The sidecar that marks a live repo tree as QUARANTINED: present on disk, but
+/// with no confirmed object-store generation behind it.
+///
+/// A sibling dotfile rather than something inside the repo directory, for two
+/// reasons. Anything under the bare repo would be tarred into the next archive
+/// and shipped to every node that downloads it, and the marker has to survive
+/// exactly as long as the directory it describes — a swap that replaces the
+/// directory wholesale must not carry the old marker along inside it.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct QuarantineMarker {
+    /// The attempt whose PUT was left unresolved. `None` when the bound expired
+    /// with no dispatched attempt to name (a state that should compensate rather
+    /// than quarantine, kept representable so a marker is never unparseable).
+    attempt: Option<String>,
+    at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Sidecar path for a live repo directory: `.{name}.git.quarantine` beside it.
+fn quarantine_path(local_path: &Path) -> Option<PathBuf> {
+    let parent = local_path.parent()?;
+    let file_name = local_path.file_name()?.to_string_lossy().to_string();
+    Some(parent.join(format!(".{file_name}.quarantine")))
+}
+
+/// Mark the live tree as carrying an unresolved generation. Reads must reconcile
+/// it before serving; nothing may delete it, because the PUT may have landed and
+/// this can be the only local copy.
+fn quarantine_local_tree(local_path: &Path, repo_name: &str, attempt: Option<&PublishAttemptId>) {
+    let Some(path) = quarantine_path(local_path) else {
+        return;
+    };
+    let marker = QuarantineMarker {
+        attempt: attempt.map(|a| a.as_str().to_string()),
+        at: chrono::Utc::now(),
+    };
+    let body = match serde_json::to_vec(&marker) {
+        Ok(body) => body,
+        Err(e) => {
+            warn!(repo = %repo_name, err = %e, "could not serialize the quarantine marker");
+            return;
+        }
+    };
+    match std::fs::write(&path, body) {
+        Ok(()) => warn!(
+            repo = %repo_name,
+            attempt = ?marker.attempt,
+            "quarantined the local tree: its publish outcome is unresolved, so reads must \
+             reconcile it against the store before serving it"
+        ),
+        Err(e) => warn!(
+            repo = %repo_name,
+            err = %e,
+            "failed to write the quarantine marker — reads may serve an unconfirmed tree"
+        ),
+    }
+}
+
+/// Lift a quarantine. Called wherever the live tree becomes a CONFIRMED
+/// generation again: a publish the store acknowledged, an under-lock refresh
+/// that overwrote the tree from the stored archive, a reconciliation that found
+/// the attempt did land, or an invalidation that removed the tree entirely.
+fn clear_quarantine(local_path: &Path, repo_name: &str) {
+    let Some(path) = quarantine_path(local_path) else {
+        return;
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => debug!(repo = %repo_name, "cleared the local tree's quarantine"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!(
+            repo = %repo_name,
+            err = %e,
+            "failed to clear the quarantine marker — reads will keep refusing this repo"
+        ),
+    }
+}
+
+/// The quarantine on a live tree, when there is one.
+fn read_quarantine(local_path: &Path) -> Option<QuarantineMarker> {
+    let path = quarantine_path(local_path)?;
+    let body = std::fs::read(&path).ok()?;
+    // An unparseable marker still means quarantined. Failing open on a corrupt
+    // sidecar would serve exactly the tree the sidecar exists to withhold.
+    Some(serde_json::from_slice(&body).unwrap_or(QuarantineMarker {
+        attempt: None,
+        at: chrono::Utc::now(),
+    }))
+}
+
 /// Remove a refused write from the unlocked read cache so `acquire` cannot serve
 /// a tree that never landed in object storage.
 fn invalidate_local_write_cache(local_path: &Path, repo_name: &str, reason: &str) {
     if !local_path.exists() {
+        clear_quarantine(local_path, repo_name);
         return;
     }
+    // Order matters: drop the marker only after the tree it describes is gone,
+    // so a failed removal leaves the quarantine standing rather than clearing
+    // the way for the tree it could not delete.
     if let Err(e) = std::fs::remove_dir_all(local_path) {
         warn!(
             repo = %repo_name,
@@ -905,6 +1242,7 @@ fn invalidate_local_write_cache(local_path: &Path, repo_name: &str, reason: &str
             "failed to invalidate local write cache after a refused publish"
         );
     } else {
+        clear_quarantine(local_path, repo_name);
         debug!(
             repo = %repo_name,
             reason,
@@ -1235,6 +1573,11 @@ pub struct RepoWriteGuard {
     /// guard drops so a detached `spawn_blocking` extraction cannot swap into the live
     /// tree after its advisory-lock ownership ends.
     refresh_swap_authority: Option<Arc<AtomicBool>>,
+    /// How far THIS guard's publish attempt got, readable from outside the
+    /// `release` future. A cancelled handler never returns a `ReleaseOutcome`, so
+    /// this is the only thing that can tell "the PUT was never constructed" from
+    /// "the PUT is on the wire and may commit" after the future is gone.
+    publish_stage: Arc<PublishStageCell>,
     /// Test-only seam: when set, `release` parks on this gate at the exact point
     /// it is about to await `pg_advisory_unlock` (connection still owned, not yet
     /// released). Dropping the `release` future while it is parked reproduces a
@@ -1275,15 +1618,25 @@ impl RepoWriteGuard {
     /// third attempt would have no more reason to terminate than the second.
     async fn publish(&self, tigris: &TigrisClient) -> std::result::Result<(), PublishRefusal> {
         match tigris
-            .upload(
+            .upload_tracked(
                 &self.owner_slug,
                 &self.repo_name,
                 &self.local_path,
                 self.publish_fence.clone(),
+                PublishAttemptId::new(),
+                Some(&self.publish_stage),
             )
             .await
         {
-            Ok(()) => return Ok(()),
+            Ok(receipt) => {
+                debug!(
+                    repo = %self.repo_name,
+                    attempt = %receipt.attempt,
+                    etag = ?receipt.etag,
+                    "release published the writer's tree"
+                );
+                return Ok(());
+            }
             Err(UploadError::PreconditionLost { status }) => {
                 // EPISTEMIC ASYMMETRY, and it is why one retry is sound here
                 // while the timeout arm in `release` deliberately does nothing.
@@ -1320,13 +1673,31 @@ impl RepoWriteGuard {
             // Nothing is stored now, so create-only is the fence that matches
             // what was just observed.
             Ok(None) => UploadPrecondition::IfAbsent,
-            Err(e) => return Err(PublishRefusal::Failed(UploadError::Other(e))),
+            // A HEAD is a read. It cannot have published anything, so failing it
+            // is a definite non-publication for THIS attempt — the first PUT was
+            // already refused outright above.
+            Err(e) => return Err(PublishRefusal::Failed(UploadError::NotPublished(e))),
         };
         match tigris
-            .upload(&self.owner_slug, &self.repo_name, &self.local_path, fresh)
+            .upload_tracked(
+                &self.owner_slug,
+                &self.repo_name,
+                &self.local_path,
+                fresh,
+                PublishAttemptId::new(),
+                Some(&self.publish_stage),
+            )
             .await
         {
-            Ok(()) => Ok(()),
+            Ok(receipt) => {
+                debug!(
+                    repo = %self.repo_name,
+                    attempt = %receipt.attempt,
+                    etag = ?receipt.etag,
+                    "the supersede-retry published the writer's tree"
+                );
+                Ok(())
+            }
             Err(UploadError::PreconditionLost { status }) => {
                 // Two definite losses in a row: something is publishing this key
                 // without the lock faster than we can fence on it. Refuse rather
@@ -1342,6 +1713,76 @@ impl RepoWriteGuard {
                 Err(PublishRefusal::Fenced)
             }
             Err(e) => Err(PublishRefusal::Failed(e)),
+        }
+    }
+
+    /// The publish stage of this guard's attempt, shared with whoever needs to
+    /// classify a CANCELLED release. See [`PublishStageCell`].
+    pub fn publish_stage(&self) -> Arc<PublishStageCell> {
+        Arc::clone(&self.publish_stage)
+    }
+
+    /// Decide what a publish that ran out its bound actually left behind.
+    ///
+    /// "The bounded transfer returned `None`" is not one state. `publish` awaits
+    /// a blocking compression before it constructs the request, so the bound can
+    /// expire with nothing on the wire at all. Only the stage distinguishes them,
+    /// and only a dispatched attempt is genuinely unknowable.
+    ///
+    /// For a dispatched attempt this spends one short, separately bounded HEAD
+    /// asking the store whether THIS attempt's bytes are what it holds. A `true`
+    /// there is a real confirmation — the attempt id travelled with the bytes —
+    /// and upgrades the outcome to `Released`. A `false` is NOT a refutation: the
+    /// request may still be in flight, so it stays unknowable and the tree is
+    /// quarantined rather than deleted.
+    async fn resolve_unfinished_publish(&self, tigris: &TigrisClient) -> ReleaseOutcome {
+        let stage = self.publish_stage.get();
+        if !stage.may_have_published() {
+            warn!(
+                repo = %self.repo_name,
+                ?stage,
+                "release upload exceeded its bound before any PUT was dispatched — the write \
+                 definitively did not publish"
+            );
+            return ReleaseOutcome::UploadFailed;
+        }
+        warn!(
+            repo = %self.repo_name,
+            "release upload exceeded its bound; the PUT may still land, so the outcome is \
+             unknowable and the conditional upload is what keeps a late publish from \
+             overwriting a successor's archive"
+        );
+        let Some(attempt) = stage.unresolved_attempt().cloned() else {
+            // `Published` reaches here only if the bound expired between the
+            // acknowledged PUT and the outer future resuming. The store already
+            // answered, so this is durable.
+            return ReleaseOutcome::Released;
+        };
+        // A separate, deliberately small slice rather than a share of the
+        // already-exhausted publish budget: this runs with the lock still held,
+        // and a store that just stalled for the whole bound must not be able to
+        // hold it for a second one.
+        match bounded_transfer(
+            "release-reconcile",
+            &self.repo_name,
+            RECONCILE_BOUND,
+            tigris.attempt_landed(&self.owner_slug, &self.repo_name, &attempt),
+        )
+        .await
+        {
+            Some(Ok(true)) => {
+                info!(
+                    repo = %self.repo_name,
+                    attempt = %attempt,
+                    "reconciled an abandoned publish: the store holds this attempt's archive"
+                );
+                self.publish_stage.set(PublishStage::Published {
+                    attempt,
+                    etag: None,
+                });
+                ReleaseOutcome::Released
+            }
+            _ => ReleaseOutcome::UploadUnknowable,
         }
     }
 
@@ -1401,8 +1842,25 @@ impl RepoWriteGuard {
                     // the refusal out to the caller.
                     Some(Err(PublishRefusal::Fenced)) => outcome = ReleaseOutcome::Fenced,
                     Some(Err(PublishRefusal::Failed(e))) => {
-                        warn!(repo = %self.repo_name, err = %e, "failed to upload repo to tigris after write");
-                        outcome = ReleaseOutcome::UploadFailed;
+                        // SPLIT BY WHAT THE FAILURE PROVES, not by "it was an
+                        // error". `UploadFailed` runs destructive compensation
+                        // below, and a response-loss error does not license it:
+                        // the store can accept a complete conditional PUT and
+                        // lose the response before the client reads it, so
+                        // invalidating the cache and undoing the write would
+                        // discard state that IS published.
+                        if e.proves_not_published() {
+                            warn!(repo = %self.repo_name, err = %e, "failed to upload repo to tigris after write");
+                            outcome = ReleaseOutcome::UploadFailed;
+                        } else {
+                            warn!(
+                                repo = %self.repo_name,
+                                err = %e,
+                                "release upload failed WITHOUT proving it did not commit; \
+                                 quarantining the local tree rather than compensating"
+                            );
+                            outcome = ReleaseOutcome::UploadUnknowable;
+                        }
                     }
                     None => {
                         // Timed out is UNKNOWABLE, not failed: the PUT may well
@@ -1417,13 +1875,15 @@ impl RepoWriteGuard {
                         // the lifetime of this lock. The caller still must not
                         // report success: `into_result` maps this to a retryable
                         // refusal.
-                        warn!(
-                            repo = %self.repo_name,
-                            "release upload exceeded its bound; the PUT may still land, so the \
-                             outcome is unknowable and the conditional upload is what keeps a \
-                             late publish from overwriting a successor's archive"
-                        );
-                        outcome = ReleaseOutcome::UploadUnknowable;
+                        //
+                        // But "timed out" is not one state, it is two, and only
+                        // the STAGE can tell them apart. The publish awaits a
+                        // blocking compression before it constructs the request
+                        // at all, so a bound that expires there means no PUT was
+                        // ever dispatched — a definite non-publication, safe to
+                        // compensate. A bound that expires after dispatch is the
+                        // genuinely unknowable case.
+                        outcome = self.resolve_unfinished_publish(&tigris).await;
                     }
                 }
             }
@@ -1449,7 +1909,30 @@ impl RepoWriteGuard {
                         }
                     }
                 }
-                ReleaseOutcome::Released | ReleaseOutcome::UploadUnknowable => {}
+                ReleaseOutcome::Released => {
+                    // Publication confirmed: the live tree IS the stored
+                    // generation, so any quarantine an earlier attempt left on
+                    // this path is answered and must be lifted, or reads would
+                    // stay refused forever after a single unresolved write.
+                    clear_quarantine(&self.local_path, &self.repo_name);
+                }
+                ReleaseOutcome::UploadUnknowable => {
+                    // THE CACHE CONTRACT. The local tree carries this writer's
+                    // refs but nothing ties it to a confirmed object-store
+                    // generation, and deleting it is not safe either — the PUT
+                    // may have landed and this could be the only local copy.
+                    //
+                    // So mark it, and make `acquire` reconcile before it serves.
+                    // Without the marker the existing-path fast path hands the
+                    // tree to every subsequent read on filesystem existence
+                    // alone, and a refused write is served indefinitely while
+                    // durable storage still holds the previous generation.
+                    quarantine_local_tree(
+                        &self.local_path,
+                        &self.repo_name,
+                        self.publish_stage.get().unresolved_attempt(),
+                    );
+                }
             }
         }
 
@@ -1798,6 +2281,8 @@ pub(crate) fn advisory_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::tigris::ATTEMPT_METADATA_KEY;
+    use std::collections::HashMap;
 
     #[test]
     fn non_durable_release_outcomes_do_not_report_success() {
@@ -2849,6 +3334,7 @@ mod tests {
             lock_held_transfer_timeout: Duration::from_secs(300),
             publish_fence: UploadPrecondition::Unconditional,
             refresh_swap_authority: None,
+            publish_stage: Arc::new(PublishStageCell::new()),
             #[cfg(test)]
             test_pre_unlock_gate: None,
             #[cfg(test)]
@@ -3216,6 +3702,7 @@ mod tests {
             // No backend, so nothing is ever published and the fence is unread.
             publish_fence: UploadPrecondition::Unconditional,
             refresh_swap_authority: None,
+            publish_stage: Arc::new(PublishStageCell::new()),
             #[cfg(test)]
             test_pre_unlock_gate: None,
             #[cfg(test)]
@@ -4054,9 +4541,22 @@ mod tests {
     /// decided later) with no timing in it.
     #[derive(Clone, Debug)]
     struct CapturedPut {
+        key: String,
         body: Vec<u8>,
         if_match: Option<String>,
         if_none_match: Option<String>,
+        attempt: Option<String>,
+    }
+
+    /// One stored object.
+    #[derive(Clone, Debug)]
+    struct MockObject {
+        body: Vec<u8>,
+        etag: String,
+        /// The `x-amz-meta-gitlawb-attempt` it was written with. This is what
+        /// makes "are the published bytes MINE" answerable, and the mock has to
+        /// model it or no reconciliation test proves anything.
+        attempt: Option<String>,
     }
 
     /// One PUT as the mock judged it, for tests that assert on attempt counts.
@@ -4071,15 +4571,29 @@ mod tests {
 
     #[derive(Default)]
     struct MockState {
-        object: Option<Vec<u8>>,
-        etag: Option<String>,
+        /// Keyed by request path. A single-slot store was enough while every test
+        /// drove one repo; fork creation touches the SOURCE key and the FORK key
+        /// in one request, and collapsing them would make an assertion about one
+        /// silently read the other.
+        objects: HashMap<String, MockObject>,
+        /// The key the last successful PUT wrote, so the single-key accessors
+        /// below keep meaning what they meant when this mock served one key.
+        last_key: Option<String>,
         next_etag: u64,
         puts: Vec<PutAttempt>,
         /// Set by `park_next_put`, consumed by the next arriving PUT.
         park_next_put: bool,
+        /// The response-loss arm, set by `commit_then_lose_next_put_response` /
+        /// `fail_next_put_after_delivery`. The request is fully delivered and the
+        /// client is told it failed; `Some(true)` also COMMITS it first, which is
+        /// the state that makes the failure a lie rather than a truth.
+        lose_next_response: Option<bool>,
         /// Set by `roll_generation_after_next_heads`, decremented per HEAD.
         roll_after_heads: u32,
         captured: Option<CapturedPut>,
+        /// Conditional DELETEs the mock accepted, so a compensation test can
+        /// assert that a guarded delete did NOT run.
+        deletes: u32,
     }
 
     /// An in-process S3-compatible server with REAL conditional semantics.
@@ -4106,9 +4620,11 @@ mod tests {
     /// always the state as of the CALL, never as of capture.
     fn evaluate_put(
         st: &mut MockState,
+        key: &str,
         body: Vec<u8>,
         if_match: Option<&str>,
         if_none_match: Option<&str>,
+        attempt: Option<&str>,
     ) -> (u16, Option<String>) {
         let refuse = |st: &mut MockState| {
             st.puts.push(PutAttempt {
@@ -4121,12 +4637,12 @@ mod tests {
 
         if let Some(want) = if_match {
             // An absent object matches nothing, so If-Match cannot pass.
-            match st.etag.as_deref() {
+            match st.objects.get(key).map(|o| o.etag.as_str()) {
                 Some(have) if unquote_etag(have) == unquote_etag(want) => {}
                 _ => return refuse(st),
             }
         }
-        if if_none_match.map(str::trim) == Some("*") && st.object.is_some() {
+        if if_none_match.map(str::trim) == Some("*") && st.objects.contains_key(key) {
             return refuse(st);
         }
 
@@ -4136,8 +4652,15 @@ mod tests {
         // never observed.
         st.next_etag += 1;
         let etag = format!("\"mock-etag-{}\"", st.next_etag);
-        st.object = Some(body);
-        st.etag = Some(etag.clone());
+        st.objects.insert(
+            key.to_string(),
+            MockObject {
+                body,
+                etag: etag.clone(),
+                attempt: attempt.map(str::to_string),
+            },
+        );
+        st.last_key = Some(key.to_string());
         st.puts.push(PutAttempt {
             if_match: if_match.map(str::to_string),
             if_none_match: if_none_match.map(str::to_string),
@@ -4159,11 +4682,13 @@ mod tests {
                     let state = state.clone();
                     let gate = gate.clone();
                     move |method: axum::http::Method,
+                          uri: axum::http::Uri,
                           headers: axum::http::HeaderMap,
                           body: axum::body::Bytes| {
                         let state = state.clone();
                         let gate = gate.clone();
                         async move {
+                            let key = uri.path().trim_start_matches('/').to_string();
                             let header = |name: &str| {
                                 headers
                                     .get(name)
@@ -4174,6 +4699,8 @@ mod tests {
                                 axum::http::Method::PUT => {
                                     let if_match = header("if-match");
                                     let if_none_match = header("if-none-match");
+                                    let attempt =
+                                        header(&format!("x-amz-meta-{ATTEMPT_METADATA_KEY}"));
 
                                     // A parked PUT records what arrived and then
                                     // waits. The client will usually be gone by
@@ -4189,9 +4716,11 @@ mod tests {
                                                 status: None,
                                             });
                                             st.captured = Some(CapturedPut {
+                                                key: key.clone(),
                                                 body: body.to_vec(),
                                                 if_match: if_match.clone(),
                                                 if_none_match: if_none_match.clone(),
+                                                attempt: attempt.clone(),
                                             });
                                             true
                                         } else {
@@ -4203,15 +4732,38 @@ mod tests {
                                         return axum::http::StatusCode::OK.into_response();
                                     }
 
-                                    let (status, etag) = {
+                                    let (status, etag, lost_response) = {
+                                        #[allow(clippy::needless_late_init)]
                                         let mut st = state.lock().unwrap();
-                                        evaluate_put(
+                                        let lost_response = st.lose_next_response.take();
+                                        if lost_response == Some(false) {
+                                            st.puts.push(PutAttempt {
+                                                if_match: if_match.clone(),
+                                                if_none_match: if_none_match.clone(),
+                                                status: Some(500),
+                                            });
+                                            return axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                                                .into_response();
+                                        }
+                                        let (status, etag) = evaluate_put(
                                             &mut st,
+                                            &key,
                                             body.to_vec(),
                                             if_match.as_deref(),
                                             if_none_match.as_deref(),
-                                        )
+                                            attempt.as_deref(),
+                                        );
+                                        (status, etag, lost_response)
                                     };
+                                    // The response-loss arm: the write is COMMITTED
+                                    // above and the client is told it failed. This
+                                    // is the state an S3-compatible store reaches
+                                    // when it durably records a conditional PUT and
+                                    // then loses or corrupts the response.
+                                    if lost_response == Some(true) && status == 200 {
+                                        return axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                                            .into_response();
+                                    }
                                     match etag {
                                         Some(etag) => (
                                             axum::http::StatusCode::OK,
@@ -4223,9 +4775,26 @@ mod tests {
                                             .into_response(),
                                     }
                                 }
+                                axum::http::Method::DELETE => {
+                                    let if_match = header("if-match");
+                                    let mut st = state.lock().unwrap();
+                                    let Some(existing) = st.objects.get(&key).cloned() else {
+                                        return axum::http::StatusCode::NO_CONTENT.into_response();
+                                    };
+                                    let stale = if_match.as_deref().is_some_and(|want| {
+                                        unquote_etag(&existing.etag) != unquote_etag(want)
+                                    });
+                                    if stale {
+                                        return axum::http::StatusCode::PRECONDITION_FAILED
+                                            .into_response();
+                                    }
+                                    st.objects.remove(&key);
+                                    st.deletes += 1;
+                                    axum::http::StatusCode::NO_CONTENT.into_response()
+                                }
                                 axum::http::Method::HEAD | axum::http::Method::GET => {
                                     let mut st = state.lock().unwrap();
-                                    let answered = (st.object.clone(), st.etag.clone());
+                                    let answered = st.objects.get(&key).cloned();
                                     // Fault injection for the two-consecutive-
                                     // losses arm, and the only deterministic way
                                     // to sit BETWEEN a caller's HEAD and the
@@ -4244,20 +4813,35 @@ mod tests {
                                     // count only the caller's own PUTs.
                                     if method == axum::http::Method::HEAD
                                         && st.roll_after_heads > 0
-                                        && st.object.is_some()
+                                        && st.objects.contains_key(&key)
                                     {
                                         st.roll_after_heads -= 1;
                                         st.next_etag += 1;
-                                        st.etag = Some(format!("\"mock-etag-{}\"", st.next_etag));
+                                        let rolled = format!("\"mock-etag-{}\"", st.next_etag);
+                                        if let Some(obj) = st.objects.get_mut(&key) {
+                                            obj.etag = rolled;
+                                        }
                                     }
                                     match answered {
-                                        (Some(bytes), Some(etag)) => (
-                                            axum::http::StatusCode::OK,
-                                            [(axum::http::header::ETAG, etag)],
-                                            axum::body::Body::from(bytes),
-                                        )
-                                            .into_response(),
-                                        _ => axum::http::StatusCode::NOT_FOUND.into_response(),
+                                        Some(obj) => {
+                                            let mut resp = (
+                                                axum::http::StatusCode::OK,
+                                                [(axum::http::header::ETAG, obj.etag)],
+                                                axum::body::Body::from(obj.body),
+                                            )
+                                                .into_response();
+                                            if let Some(attempt) = obj.attempt {
+                                                resp.headers_mut().insert(
+                                                    axum::http::HeaderName::from_static(
+                                                        "x-amz-meta-gitlawb-attempt",
+                                                    ),
+                                                    axum::http::HeaderValue::from_str(&attempt)
+                                                        .expect("attempt id is ascii"),
+                                                );
+                                            }
+                                            resp
+                                        }
+                                        None => axum::http::StatusCode::NOT_FOUND.into_response(),
                                     }
                                 }
                                 _ => axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response(),
@@ -4285,12 +4869,26 @@ mod tests {
             &self.endpoint
         }
 
+        /// The object the last successful PUT wrote. Every test that uses this
+        /// drives a single key; a test touching two keys reads them by key.
+        fn last(&self) -> Option<MockObject> {
+            let st = self.state.lock().unwrap();
+            let key = st.last_key.clone()?;
+            st.objects.get(&key).cloned()
+        }
+
         fn current_etag(&self) -> Option<String> {
-            self.state.lock().unwrap().etag.clone()
+            self.last().map(|o| o.etag)
         }
 
         fn object(&self) -> Option<Vec<u8>> {
-            self.state.lock().unwrap().object.clone()
+            self.last().map(|o| o.body)
+        }
+
+        /// The stored object under a specific repo key.
+        fn object_for(&self, owner_slug: &str, repo_name: &str) -> Option<MockObject> {
+            let key = format!("test-bucket/repos/v1/{owner_slug}/{repo_name}.tar.zst");
+            self.state.lock().unwrap().objects.get(&key).cloned()
         }
 
         fn put_attempts(&self) -> Vec<PutAttempt> {
@@ -4312,6 +4910,29 @@ mod tests {
             self.state.lock().unwrap().park_next_put = true;
         }
 
+        /// Accept and COMMIT the next PUT, then answer 500. The response-loss
+        /// arm: the write is durable and the client is told it failed.
+        fn commit_then_lose_next_put_response(&self) {
+            self.state.lock().unwrap().lose_next_response = Some(true);
+        }
+
+        /// Deliver the next PUT in full and then fail it WITHOUT committing. The
+        /// client's knowledge is identical to the arm above — that is the whole
+        /// point — so only asking the store can tell the two apart.
+        fn fail_next_put_after_delivery(&self) {
+            self.state.lock().unwrap().lose_next_response = Some(false);
+        }
+
+        /// The attempt id stamped on whatever the last successful PUT stored.
+        fn stored_attempt(&self) -> Option<String> {
+            self.last().and_then(|o| o.attempt)
+        }
+
+        /// How many DELETEs the mock actually carried out.
+        fn deletes(&self) -> u32 {
+            self.state.lock().unwrap().deletes
+        }
+
         /// Let a parked handler go. Only the socket-level arm needs this; the
         /// deterministic assertion is `replay_captured`.
         fn open_gate(&self) {
@@ -4329,9 +4950,11 @@ mod tests {
             let captured = st.captured.clone().expect("a PUT was captured");
             evaluate_put(
                 &mut st,
+                &captured.key,
                 captured.body,
                 captured.if_match.as_deref(),
                 captured.if_none_match.as_deref(),
+                captured.attempt.as_deref(),
             )
             .0
         }
@@ -4365,11 +4988,26 @@ mod tests {
         if_match: Option<&str>,
         if_none_match: Option<&str>,
     ) -> Result<String, u16> {
+        mock_put_as(client, body, if_match, if_none_match, None).await
+    }
+
+    /// The same, stamped with an attempt id, so a test can seed an object that
+    /// belongs to a NAMED attempt (its own, or a foreign one).
+    async fn mock_put_as(
+        client: &aws_sdk_s3::Client,
+        body: &[u8],
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
+        attempt: Option<&str>,
+    ) -> Result<String, u16> {
         let mut req = client
             .put_object()
             .bucket("test-bucket")
             .key("repos/v1/owner/repo.tar.zst")
             .body(aws_sdk_s3::primitives::ByteStream::from(body.to_vec()));
+        if let Some(attempt) = attempt {
+            req = req.metadata(ATTEMPT_METADATA_KEY, attempt);
+        }
         if let Some(v) = if_match {
             req = req.if_match(v);
         }
@@ -4917,7 +5555,7 @@ mod tests {
         // colons so its slug is exactly "owner" and the IfAbsent upload is
         // refused against the seeded key.
         let err = store
-            .release_after_write("owner", "repo")
+            .release_after_write("owner", "repo", &PublishAttemptId::new())
             .await
             .expect_err("a create-only upload over an existing key must be refused");
         assert!(
@@ -4935,10 +5573,14 @@ mod tests {
 
     /// MUST-NOT. A 404 is permanent (no such bucket, a misrouted endpoint), so
     /// reporting it as a lost precondition would tell a client to retry
-    /// something that can never succeed. `delete` has no callers, so a racing
-    /// delete cannot produce this.
+    /// something that can never succeed. Archive keys are never deleted by the
+    /// write path, so a racing delete cannot produce this.
+    ///
+    /// It must land as `NotPublished` rather than `Ambiguous`: a 4xx is an answer
+    /// the server gave BEFORE storing anything, so it does prove the write did
+    /// not commit, which is what licenses a caller to compensate.
     #[tokio::test]
-    async fn upload_classifies_404_as_other_under_either_precondition() {
+    async fn upload_classifies_404_as_a_definite_non_publication() {
         let (endpoint, server) = start_fixed_status_stub(404).await;
         let client = TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint);
 
@@ -4952,16 +5594,25 @@ mod tests {
                 .await
                 .expect_err("404 must be an error");
             assert!(
-                matches!(err, UploadError::Other(_)),
+                matches!(err, UploadError::NotPublished(_)),
                 "404 under {precondition:?} must NOT be a lost precondition, got {err:?}"
+            );
+            assert!(
+                err.proves_not_published(),
+                "a 404 is a definite refusal, so compensation is licensed"
             );
         }
 
         server.abort();
     }
 
+    /// THE P2 SPLIT. A 5xx says the server FAILED, not that it did not commit:
+    /// an S3-compatible store can accept and durably record a conditional PUT and
+    /// then fail while producing the response. Classifying that as a definite
+    /// failure is what let guarded writes invalidate their cache and fork
+    /// creation drop its only local clone for a write that had landed.
     #[tokio::test]
-    async fn upload_classifies_500_as_other() {
+    async fn upload_classifies_500_as_ambiguous_not_definite_failure() {
         let (endpoint, server) = start_fixed_status_stub(500).await;
         let client = TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint);
 
@@ -4976,8 +5627,12 @@ mod tests {
                 .await
                 .expect_err("500 must be an error");
             assert!(
-                matches!(err, UploadError::Other(_)),
-                "500 under {precondition:?} must be Other, got {err:?}"
+                matches!(err, UploadError::Ambiguous { .. }),
+                "500 under {precondition:?} must be ambiguous, got {err:?}"
+            );
+            assert!(
+                !err.proves_not_published(),
+                "a 5xx must never license destructive compensation, got {err:?}"
             );
         }
 
@@ -5746,6 +6401,957 @@ mod tests {
         );
 
         mock.open_gate();
+        mock.shutdown();
+    }
+
+    // ── attempt identity and publication stage (#285) ──────────────────────
+
+    /// The mock has to MODEL attempt metadata or every reconciliation test below
+    /// is vacuous: a HEAD that never echoes what the PUT stamped would make
+    /// `attempt_landed` answer `false` unconditionally and the fix would look
+    /// like it worked by doing nothing.
+    #[tokio::test]
+    async fn mock_round_trips_the_attempt_metadata_a_put_stamped() {
+        let mock = S3Mock::start().await;
+        let client = TigrisClient::for_testing_with_endpoint("test-bucket", mock.endpoint());
+
+        let dir = payload_dir("stamped");
+        let attempt = PublishAttemptId::new();
+        let receipt = client
+            .upload_tracked(
+                "owner",
+                "repo",
+                dir.path(),
+                UploadPrecondition::IfAbsent,
+                attempt.clone(),
+                None,
+            )
+            .await
+            .expect("the create must publish");
+        assert_eq!(receipt.attempt, attempt);
+        assert!(
+            receipt.etag.is_some(),
+            "an acknowledged PUT carries the generation it minted"
+        );
+        assert_eq!(mock.stored_attempt().as_deref(), Some(attempt.as_str()));
+
+        let stored = client
+            .head_generation("owner", "repo")
+            .await
+            .expect("HEAD")
+            .expect("an object is stored");
+        assert!(
+            stored.belongs_to(&attempt),
+            "HEAD must report the attempt the PUT stamped, got {stored:?}"
+        );
+        assert!(
+            !stored.belongs_to(&PublishAttemptId::new()),
+            "a different attempt must not match"
+        );
+        assert!(client
+            .attempt_landed("owner", "repo", &attempt)
+            .await
+            .expect("reconcile"));
+
+        mock.shutdown();
+    }
+
+    /// P2 FINDING 4, THE HEADLINE. A server that accepts the COMPLETE conditional
+    /// PUT, commits it, and then loses or corrupts the response before the SDK
+    /// can return success.
+    ///
+    /// Classifying that as a definite failure is what made fork creation drop its
+    /// only local clone and skip the DB insert for a write that HAD landed, after
+    /// which every retry saw the orphan object under `If-None-Match: *` and
+    /// returned `RepoExists` — the fork name unusable until an operator cleaned
+    /// up. The outcome must be ambiguous, and it must be RECONCILABLE: the
+    /// attempt id travelled with the bytes, so the client can ask the store what
+    /// it holds.
+    #[tokio::test]
+    async fn a_put_that_commits_and_loses_its_response_is_ambiguous_and_reconcilable() {
+        let mock = S3Mock::start().await;
+        let client = TigrisClient::for_testing_with_endpoint("test-bucket", mock.endpoint());
+
+        let dir = payload_dir("committed-but-unreported");
+        let attempt = PublishAttemptId::new();
+        mock.commit_then_lose_next_put_response();
+        let stage = PublishStageCell::new();
+        let err = client
+            .upload_tracked(
+                "owner",
+                "repo",
+                dir.path(),
+                UploadPrecondition::IfAbsent,
+                attempt.clone(),
+                Some(&stage),
+            )
+            .await
+            .expect_err("the client never saw a success response");
+
+        assert!(
+            matches!(err, UploadError::Ambiguous { .. }),
+            "a lost response is not proof of failure, got {err:?}"
+        );
+        assert!(
+            !err.proves_not_published(),
+            "compensating this would delete a write that landed"
+        );
+        assert_eq!(
+            stage.get(),
+            PublishStage::Ambiguous {
+                attempt: attempt.clone()
+            },
+            "the stage must record the attempt whose fate is unresolved"
+        );
+
+        // The write IS durable, and the attempt id is what proves it.
+        assert!(
+            client
+                .attempt_landed("owner", "repo", &attempt)
+                .await
+                .expect("reconcile"),
+            "the store committed this attempt's bytes, so reconciliation must recover it"
+        );
+        assert_eq!(mock.stored_attempt().as_deref(), Some(attempt.as_str()));
+
+        mock.shutdown();
+    }
+
+    /// The other half of "closes or corrupts": a peer that reads the whole
+    /// request and then drops the socket without answering at all. There is no
+    /// HTTP status to classify on, so the SdkError variant is all there is — and
+    /// only a construction failure proves the request never left.
+    #[tokio::test]
+    async fn a_closed_response_with_no_http_status_is_ambiguous() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    // Consume what the client sends — the request IS delivered —
+                    // then hang up without a response.
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(250),
+                        sock.read(&mut buf),
+                    )
+                    .await;
+                    drop(sock);
+                });
+            }
+        });
+
+        let client = TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint);
+        let dir = payload_dir("no-answer");
+        let err = client
+            .upload("owner", "repo", dir.path(), UploadPrecondition::IfAbsent)
+            .await
+            .expect_err("a dropped connection must not read as success");
+        assert!(
+            matches!(err, UploadError::Ambiguous { .. }),
+            "a request delivered with no response read must stay ambiguous, got {err:?}"
+        );
+        assert!(!err.proves_not_published());
+
+        server.abort();
+    }
+
+    /// The conditional delete must be atomic, not merely narrowed. A successor
+    /// publishing between the ownership HEAD and the DELETE is the exact race a
+    /// "look it up again first" guard leaves open, and `roll_generation_after_
+    /// next_heads` is the seam that sits in that window deterministically.
+    #[tokio::test]
+    async fn a_generation_that_moves_between_the_head_and_the_delete_is_not_deleted() {
+        let mock = S3Mock::start().await;
+        let client = TigrisClient::for_testing_with_endpoint("test-bucket", mock.endpoint());
+        let attempt = PublishAttemptId::new();
+
+        mock_put_as(
+            &mock_s3_client(mock.endpoint()),
+            b"ours",
+            None,
+            None,
+            Some(attempt.as_str()),
+        )
+        .await
+        .expect("seed this attempt's object");
+
+        // The ownership HEAD sees our attempt and our ETag; the store then moves
+        // on before the DELETE fenced on that ETag arrives.
+        mock.roll_generation_after_next_heads(1);
+        let outcome = client
+            .delete_if_attempt_matches("owner", "repo", &attempt)
+            .await
+            .expect("a refused conditional delete is an outcome, not an error");
+        assert_eq!(
+            outcome,
+            AttemptDelete::NotOurs,
+            "a delete whose generation moved under it must be refused, not retried blind"
+        );
+        assert_eq!(mock.deletes(), 0, "nothing may have been deleted");
+        assert!(mock.object().is_some(), "the object must survive");
+
+        mock.shutdown();
+    }
+
+    /// The must-do direction: an attempt's OWN orphan is still cleanable, or a
+    /// failed fork would tombstone its name forever.
+    #[tokio::test]
+    async fn an_attempts_own_object_is_deleted_and_a_foreign_one_is_not() {
+        let mock = S3Mock::start().await;
+        let client = TigrisClient::for_testing_with_endpoint("test-bucket", mock.endpoint());
+        let mine = PublishAttemptId::new();
+        let theirs = PublishAttemptId::new();
+
+        assert_eq!(
+            client
+                .delete_if_attempt_matches("owner", "repo", &mine)
+                .await
+                .expect("delete"),
+            AttemptDelete::Absent,
+            "an empty key is nothing to clean up"
+        );
+
+        mock_put_as(
+            &mock_s3_client(mock.endpoint()),
+            b"theirs",
+            None,
+            None,
+            Some(theirs.as_str()),
+        )
+        .await
+        .expect("seed a foreign object");
+        assert_eq!(
+            client
+                .delete_if_attempt_matches("owner", "repo", &mine)
+                .await
+                .expect("delete"),
+            AttemptDelete::NotOurs
+        );
+        assert!(mock.object().is_some(), "a foreign object must survive");
+
+        mock_put_as(
+            &mock_s3_client(mock.endpoint()),
+            b"mine",
+            None,
+            None,
+            Some(mine.as_str()),
+        )
+        .await
+        .expect("replace it with ours");
+        assert_eq!(
+            client
+                .delete_if_attempt_matches("owner", "repo", &mine)
+                .await
+                .expect("delete"),
+            AttemptDelete::Deleted
+        );
+        assert!(mock.object().is_none(), "our own orphan must be removable");
+
+        mock.shutdown();
+    }
+
+    /// P2 FINDING 4, the fork path. `release_after_write` is fork creation's
+    /// publish, and a lost response there must reach the handler as ambiguous so
+    /// it can recover the committed attempt instead of dropping its clone.
+    #[sqlx::test]
+    async fn fork_publish_that_loses_its_response_stays_recoverable(pool: PgPool) {
+        let mock = S3Mock::start().await;
+        let tmp = TempDir::new().unwrap();
+        let repos_dir = tmp.path().join("repos");
+        let local = repos_dir.join("owner").join("repo.git");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        store::init_bare(&local).expect("a bare repo to upload");
+
+        let store = RepoStore::new(
+            repos_dir,
+            Some(mock_tigris(&mock)),
+            pool.clone(),
+            Duration::from_secs(30),
+        );
+        let attempt = PublishAttemptId::new();
+        mock.commit_then_lose_next_put_response();
+        let err = store
+            .release_after_write("owner", "repo", &attempt)
+            .await
+            .expect_err("the client saw no success");
+        assert!(
+            !err.proves_not_published(),
+            "the fork must not treat a lost response as licence to delete its clone, got {err:?}"
+        );
+        assert!(
+            store
+                .fork_attempt_landed("owner", "repo", &attempt)
+                .await
+                .expect("reconcile"),
+            "the archive IS published under this attempt, so the fork must be recoverable \
+             rather than fenced behind its own orphan"
+        );
+
+        mock.shutdown();
+    }
+
+    /// P1 FINDING 3, the object half, driven through the REAL recovery path.
+    ///
+    /// The interleaving: the background recovery observed no row for this fork
+    /// name (the DB below has none), a successor then committed and published
+    /// under that name, and only afterwards did the recovery resume its cleanup.
+    /// Before the attempt guard, that cleanup deleted the successor's archive and
+    /// directory after the successor had already answered 201.
+    #[sqlx::test]
+    async fn fork_recovery_resuming_after_a_successor_deletes_neither_object_nor_path(
+        pool: PgPool,
+    ) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let tmp = TempDir::new().unwrap();
+        let repos_dir = tmp.path().join("repos");
+        let store = RepoStore::new(
+            repos_dir.clone(),
+            Some(mock_tigris(&mock)),
+            pool.clone(),
+            Duration::from_secs(30),
+        );
+
+        let failed = PublishAttemptId::new();
+        let successor = PublishAttemptId::new();
+
+        // The successor owns both resources by the time cleanup resumes.
+        mock_put_as(
+            &mock_s3_client(mock.endpoint()),
+            b"successor-archive",
+            None,
+            None,
+            Some(successor.as_str()),
+        )
+        .await
+        .expect("the successor published");
+        let disk_path = repos_dir.join("owner").join("repo.git");
+        std::fs::create_dir_all(&disk_path).unwrap();
+        std::fs::write(disk_path.join("HEAD"), b"successor").unwrap();
+        claim_fork_disk_path(&disk_path, &successor);
+
+        // The failed attempt resumes its compensation.
+        store
+            .compensate_fork_archive("owner", "repo", &disk_path, &failed)
+            .await;
+
+        assert_eq!(
+            mock.deletes(),
+            0,
+            "a failed attempt must not delete the successor's archive"
+        );
+        assert_eq!(
+            mock.stored_attempt().as_deref(),
+            Some(successor.as_str()),
+            "the successor's object must still be what is stored"
+        );
+        assert!(
+            disk_path.exists(),
+            "a failed attempt must not delete the successor's repository directory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(disk_path.join("HEAD")).unwrap(),
+            "successor"
+        );
+
+        mock.shutdown();
+    }
+
+    /// The must-do direction of the same guard: an attempt that still owns both
+    /// resources must be able to clean up after itself, or a failed fork leaves
+    /// an orphan that fences its own name.
+    #[sqlx::test]
+    async fn fork_compensation_removes_what_this_attempt_still_owns(pool: PgPool) {
+        let mock = S3Mock::start().await;
+        let tmp = TempDir::new().unwrap();
+        let repos_dir = tmp.path().join("repos");
+        let store = RepoStore::new(
+            repos_dir.clone(),
+            Some(mock_tigris(&mock)),
+            pool.clone(),
+            Duration::from_secs(30),
+        );
+
+        let attempt = PublishAttemptId::new();
+        mock_put_as(
+            &mock_s3_client(mock.endpoint()),
+            b"my-orphan",
+            None,
+            None,
+            Some(attempt.as_str()),
+        )
+        .await
+        .expect("this attempt published");
+        let disk_path = repos_dir.join("owner").join("repo.git");
+        std::fs::create_dir_all(&disk_path).unwrap();
+        claim_fork_disk_path(&disk_path, &attempt);
+
+        store
+            .compensate_fork_archive("owner", "repo", &disk_path, &attempt)
+            .await;
+
+        assert!(
+            mock.object().is_none(),
+            "this attempt's orphan must be gone"
+        );
+        assert!(!disk_path.exists(), "this attempt's clone must be gone");
+
+        mock.shutdown();
+    }
+
+    // ── the quarantined generation (#285 finding 2) ────────────────────────
+
+    /// A store whose Tigris compression parks on `gate`, so a publish can be
+    /// stalled at `PublishStage::PreparingArchive` — the window in which no
+    /// request has been constructed, let alone sent.
+    async fn compression_gated_store(
+        mock: &S3Mock,
+        opts: &sqlx::postgres::PgConnectOptions,
+        repos_dir: &Path,
+        bound: std::time::Duration,
+        gate: Arc<crate::git::tigris::BlockingGate>,
+    ) -> RepoStore {
+        RepoStore::new(
+            repos_dir.to_path_buf(),
+            Some(mock_tigris(mock).with_compress_gate(gate)),
+            no_reap_pool(opts, 2).await,
+            bound,
+        )
+    }
+
+    /// P1 FINDING 1, at the release boundary. A publish whose bound expires while
+    /// the archive is still being COMPRESSED never constructed a request, so it
+    /// is a definite non-publication — not the unknowable in-flight PUT the
+    /// timeout arm used to report for every stall alike.
+    ///
+    /// The observable is the mock's PUT log: zero attempts. That is what
+    /// distinguishes this from the parked-PUT tests above, where exactly one
+    /// request arrived.
+    #[sqlx::test]
+    async fn a_bound_that_expires_before_dispatch_is_a_definite_failure(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
+        let owner = "did:key:z6MkStageCompress";
+        let repo = "stage-compress-repo";
+
+        // The acquire-side refresh must run BEFORE the gate closes: it does no
+        // compression of its own, but the store is shared and holding the gate
+        // early would prove nothing about the release.
+        let store = compression_gated_store(
+            &mock,
+            &opts,
+            repos.path(),
+            std::time::Duration::from_millis(600),
+            Arc::clone(&gate),
+        )
+        .await;
+        let guard = store.acquire_write(owner, repo).await.expect("acquire");
+        marked_repo(&guard.local_path, "writer");
+        let local_path = guard.local_path.clone();
+
+        let outcome = guard.release(true).await;
+
+        assert!(
+            matches!(outcome, ReleaseOutcome::UploadFailed),
+            "a bound that expired before any PUT was dispatched is a DEFINITE failure, \
+             got {outcome:?}"
+        );
+        assert!(
+            mock.put_attempts().is_empty(),
+            "no request may have reached the store, got {:?}",
+            mock.put_attempts()
+        );
+        assert!(
+            !local_path.exists(),
+            "a definite non-publication must invalidate the local write cache; only an \
+             unresolved dispatch may leave the tree in place"
+        );
+        assert!(
+            warn_lines_for(repo).contains("before any PUT was dispatched"),
+            "the distinct verdict must be visible in the log, got {:?}",
+            warn_lines_for(repo)
+        );
+
+        // Let the parked blocking thread finish so it is not stranded.
+        gate.open();
+        mock.shutdown();
+    }
+
+    /// P1 FINDING 2. A bounded release whose PUT is in flight leaves the writer's
+    /// tree at the ORDINARY live path with no confirmed generation behind it. The
+    /// writer gets its 503 — and then a same-node read must not hand that tree
+    /// out as an ordinary successful read.
+    ///
+    /// Deleting the tree is deliberately not the fix and is asserted against: the
+    /// PUT may have landed, and this can be the only local copy of it.
+    #[sqlx::test]
+    async fn an_unresolved_publish_quarantines_the_tree_and_a_later_read_refuses(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let bound = std::time::Duration::from_millis(750);
+        let store = fenced_store_with_bound(&mock, &opts, repos.path(), bound).await;
+        let owner = "did:key:z6MkQuarantineRead";
+        let repo = "quarantine-read-repo";
+        let slug = owner_slug_of(owner);
+
+        let seed = TempDir::new().unwrap();
+        marked_repo(seed.path(), "seed");
+        mock_tigris(&mock)
+            .upload(&slug, repo, seed.path(), UploadPrecondition::Unconditional)
+            .await
+            .expect("seeding the archive");
+
+        let guard = store.acquire_write(owner, repo).await.expect("acquire");
+        std::fs::write(guard.local_path.join("MARKER"), "unresolved").unwrap();
+        let local_path = guard.local_path.clone();
+        mock.park_next_put();
+        let outcome = guard.release(true).await;
+
+        assert!(
+            matches!(outcome, ReleaseOutcome::UploadUnknowable),
+            "the PUT was consumed and left unresolved, got {outcome:?}"
+        );
+        assert!(
+            outcome.into_result().is_err(),
+            "the writer must get a retryable refusal, not a 2xx"
+        );
+        assert!(
+            local_path.exists(),
+            "the tree must NOT be deleted: the PUT may have landed and this could be the \
+             only local copy"
+        );
+
+        // THE READ. Pre-fix this returned the live path on filesystem existence
+        // alone and served the unresolved refs indefinitely.
+        let read = store.acquire(owner, repo).await;
+        let err = read.expect_err("an unconfirmed tree must not be served as an ordinary read");
+        assert!(
+            err.downcast_ref::<RepoUnavailable>().is_some(),
+            "the refusal must be the retryable one, got {err:#}"
+        );
+        assert!(
+            local_path.exists(),
+            "refusing must not delete the tree either"
+        );
+
+        mock.open_gate();
+        mock.shutdown();
+    }
+
+    /// The release valve, and what keeps the quarantine from being a permanent
+    /// outage: once the abandoned PUT actually commits, the stored object carries
+    /// THIS attempt's id, reconciliation says so, and the read is served.
+    #[sqlx::test]
+    async fn a_quarantined_tree_is_served_once_the_store_confirms_the_attempt(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let bound = std::time::Duration::from_millis(750);
+        let store = fenced_store_with_bound(&mock, &opts, repos.path(), bound).await;
+        let owner = "did:key:z6MkQuarantineLift";
+        let repo = "quarantine-lift-repo";
+
+        let guard = store.acquire_write(owner, repo).await.expect("acquire");
+        marked_repo(&guard.local_path, "unresolved");
+        let local_path = guard.local_path.clone();
+        mock.park_next_put();
+        assert!(matches!(
+            guard.release(true).await,
+            ReleaseOutcome::UploadUnknowable
+        ));
+        assert!(
+            store.acquire(owner, repo).await.is_err(),
+            "refused while unresolved"
+        );
+
+        // The abandoned PUT reaches the store's commit point and lands.
+        assert_eq!(mock.replay_captured(), 200);
+
+        let served = store
+            .acquire(owner, repo)
+            .await
+            .expect("a confirmed attempt must lift the quarantine");
+        assert_eq!(served, local_path.as_path());
+        assert!(
+            store.acquire(owner, repo).await.is_ok(),
+            "the marker must have been cleared, not re-evaluated on every read"
+        );
+
+        mock.open_gate();
+        mock.shutdown();
+    }
+
+    /// THE CONTROL. An ordinary confirmed write must leave no quarantine behind,
+    /// or every read after every push would refuse. It asserts an outcome the
+    /// quarantine does not change, which is what lets the two tests above
+    /// attribute their red.
+    #[sqlx::test]
+    async fn a_confirmed_publish_leaves_the_tree_readable(pool: PgPool) {
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let store = fenced_store(&mock, &opts, repos.path()).await;
+        let owner = "did:key:z6MkQuarantineControl";
+        let repo = "quarantine-control-repo";
+
+        let guard = store.acquire_write(owner, repo).await.expect("acquire");
+        marked_repo(&guard.local_path, "clean");
+        guard
+            .release(true)
+            .await
+            .into_result()
+            .expect("an uncontended publish lands");
+
+        store
+            .acquire(owner, repo)
+            .await
+            .expect("a confirmed write must be readable with no reconciliation at all");
+
+        mock.shutdown();
+    }
+
+    /// P2 FINDING 4, at a GUARDED WRITE. The review names this arm explicitly:
+    /// "guarded issue/push writes also take definite-failure cache and
+    /// compensation paths despite not knowing whether their generation landed."
+    ///
+    /// The store here accepts the complete PUT, commits it, and then loses the
+    /// response. Pre-fix that arrived as `UploadError::Other`, which `release`
+    /// read as `UploadFailed` and answered by deleting the local tree and running
+    /// the caller's compensator (`create_issue` deletes the issue ref it just
+    /// wrote) — undoing a write that IS durable in object storage, so the next
+    /// reader downloads an archive containing the "undone" work.
+    ///
+    /// The correct outcome is a retryable refusal with the tree kept and
+    /// quarantined, and — because the attempt id travelled with the bytes — a
+    /// later read that RECONCILES and is served.
+    #[sqlx::test]
+    async fn a_guarded_write_whose_response_is_lost_is_not_compensated(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let store = fenced_store(&mock, &opts, repos.path()).await;
+        let owner = "did:key:z6MkLostResponseWrite";
+        let repo = "lost-response-repo";
+
+        let guard = store.acquire_write(owner, repo).await.expect("acquire");
+        marked_repo(&guard.local_path, "writer");
+        let local_path = guard.local_path.clone();
+
+        let compensated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        mock.commit_then_lose_next_put_response();
+        let outcome = {
+            let compensated = Arc::clone(&compensated);
+            guard
+                .release_compensating(true, move |_path| {
+                    compensated.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+        };
+
+        assert!(
+            matches!(outcome, ReleaseOutcome::UploadUnknowable),
+            "a lost response is not a definite failure, got {outcome:?}"
+        );
+        assert!(
+            outcome.into_result().is_err(),
+            "the writer still must not be told it succeeded"
+        );
+        assert!(
+            !compensated.load(std::sync::atomic::Ordering::SeqCst),
+            "RED: the caller's undo ran for a write that IS published — create_issue would \
+             have deleted the issue ref that other nodes will fetch"
+        );
+        assert!(
+            local_path.exists(),
+            "RED: the local tree was invalidated for a write that landed"
+        );
+
+        // ...and because the attempt travelled with the bytes, the quarantine is
+        // answerable rather than a standing outage.
+        store
+            .acquire(owner, repo)
+            .await
+            .expect("the committed attempt must reconcile and be served");
+
+        mock.shutdown();
+    }
+
+    /// A write that follows an unresolved one heals the path: the under-lock
+    /// refresh replaces the tree with the stored generation, so the quarantine it
+    /// inherited is answered rather than carried forever.
+    #[sqlx::test]
+    async fn the_next_write_clears_an_inherited_quarantine(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let bound = std::time::Duration::from_millis(750);
+        let store = fenced_store_with_bound(&mock, &opts, repos.path(), bound).await;
+        let owner = "did:key:z6MkQuarantineHeal";
+        let repo = "quarantine-heal-repo";
+        let slug = owner_slug_of(owner);
+
+        let seed = TempDir::new().unwrap();
+        marked_repo(seed.path(), "seed");
+        mock_tigris(&mock)
+            .upload(&slug, repo, seed.path(), UploadPrecondition::Unconditional)
+            .await
+            .expect("seeding the archive");
+
+        let guard = store.acquire_write(owner, repo).await.expect("acquire");
+        std::fs::write(guard.local_path.join("MARKER"), "unresolved").unwrap();
+        mock.park_next_put();
+        assert!(matches!(
+            guard.release(true).await,
+            ReleaseOutcome::UploadUnknowable
+        ));
+        assert!(store.acquire(owner, repo).await.is_err());
+
+        // A successor takes the freed lock; its refresh downloads the confirmed
+        // archive over the quarantined tree.
+        let successor = store.acquire_write(owner, repo).await.expect("successor");
+        std::fs::write(successor.local_path.join("MARKER"), "successor").unwrap();
+        successor
+            .release(true)
+            .await
+            .into_result()
+            .expect("the successor publishes");
+
+        store
+            .acquire(owner, repo)
+            .await
+            .expect("the healed path must read normally again");
+
+        mock.open_gate();
+        mock.shutdown();
+    }
+
+    // ── fork creation through the handler (#285 findings 3 and 4) ──────────
+
+    /// A state whose repo store publishes to `mock`, plus a PUBLIC source repo
+    /// that is already on disk and already in object storage — so the fork's own
+    /// create-only PUT is the first and only PUT the handler makes, and a
+    /// one-shot response-loss flag can be aimed at it.
+    async fn fork_state(
+        mock: &S3Mock,
+        pool: &PgPool,
+        repos_dir: &Path,
+        source_owner: &str,
+        source_name: &str,
+    ) -> crate::state::AppState {
+        let opts = (*pool.connect_options()).clone();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store = fenced_store(mock, &opts, repos_dir).await;
+        // `fork_repo` derives the clone's destination from `config.repos_dir`,
+        // not from the store, so the two have to agree or the validated join
+        // rejects the default (relative) config path.
+        let mut config = (*state.config).clone();
+        config.repos_dir = repos_dir.to_path_buf();
+        state.config = Arc::new(config);
+
+        let now = chrono::Utc::now();
+        state
+            .db
+            .create_repo(&crate::db::RepoRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: source_name.to_string(),
+                owner_did: source_owner.to_string(),
+                description: None,
+                is_public: true,
+                default_branch: "main".to_string(),
+                created_at: now,
+                updated_at: now,
+                disk_path: format!("/unused/{source_name}"),
+                forked_from: None,
+                machine_id: None,
+            })
+            .await
+            .expect("seed the source repo row");
+
+        let slug = owner_slug_of(source_owner);
+        let source_path = repos_dir.join(&slug).join(format!("{source_name}.git"));
+        store::init_bare(&source_path).expect("a real bare source repo");
+        // Publish the SOURCE key so `acquire` finds it already migrated and does
+        // not lazily upload it; the fork's PUT must be the only one.
+        mock_tigris(mock)
+            .upload(
+                &slug,
+                source_name,
+                &source_path,
+                UploadPrecondition::Unconditional,
+            )
+            .await
+            .expect("seed the source archive");
+        state
+    }
+
+    async fn do_fork(
+        state: &crate::state::AppState,
+        source_owner: &str,
+        source_name: &str,
+        forker: &str,
+        fork_name: &str,
+    ) -> std::result::Result<(axum::http::StatusCode, String), crate::error::AppError> {
+        crate::api::repos::fork_repo(
+            axum::extract::State(state.clone()),
+            axum::Extension(crate::auth::AuthenticatedDid(forker.to_string())),
+            axum::extract::Path((
+                crate::db::normalize_owner_key(source_owner).to_string(),
+                source_name.to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            axum::Json(crate::api::repos::ForkRepoRequest {
+                name: Some(fork_name.to_string()),
+            }),
+        )
+        .await
+        .map(|(status, body)| (status, body.0.id))
+    }
+
+    /// P2 FINDING 4, THE USER-VISIBLE FAILURE MODE. The fork's create-only PUT
+    /// commits, and the response is lost before the SDK can report success.
+    ///
+    /// Pre-fix that arrived as a definite failure: `ForkCloneGuard` removed the
+    /// only local clone and no DB row was inserted, leaving an orphan object
+    /// under the fork's key. Every retry then sent `If-None-Match: *`, saw the
+    /// orphan and answered `RepoExists` — the fork name unusable until an
+    /// operator cleaned up. The attempt id stamped into the object is what turns
+    /// "did my request succeed" (undecidable) into "are the published bytes mine"
+    /// (decidable), so the committed attempt is RECOVERED.
+    #[sqlx::test]
+    async fn a_fork_whose_publish_lost_its_response_is_recovered_not_fenced(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let repos = TempDir::new().unwrap();
+        let source_owner = "did:key:z6MkForkSourceAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let forker = "did:key:z6MkForkerLostRespAAAAAAAAAAAAAAAAAAAAA";
+        let state = fork_state(&mock, &pool, repos.path(), source_owner, "src").await;
+
+        mock.commit_then_lose_next_put_response();
+        let (status, id) = do_fork(&state, source_owner, "src", forker, "recovered")
+            .await
+            .expect("a committed publish must not be reported as a failure");
+
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+        let row = state
+            .db
+            .get_repo(crate::db::normalize_owner_key(forker), "recovered")
+            .await
+            .expect("lookup")
+            .expect("the fork row must have been inserted");
+        assert_eq!(row.id, id);
+
+        // The object is the fork's, stamped with the row that owns it.
+        let stored = mock
+            .object_for(&owner_slug_of(forker), "recovered")
+            .expect("the fork archive is published");
+        assert_eq!(
+            stored.attempt.as_deref(),
+            Some(row.id.as_str()),
+            "the published archive must name the row that owns it"
+        );
+        assert!(
+            repos
+                .path()
+                .join(owner_slug_of(forker))
+                .join("recovered.git")
+                .exists(),
+            "the fork's clone must still be on disk"
+        );
+
+        // ...and the name is NOT fenced: it resolves to a real repository.
+        assert!(state
+            .db
+            .get_repo_by_id(&row.id)
+            .await
+            .expect("lookup")
+            .is_some());
+
+        mock.shutdown();
+    }
+
+    /// The other half of the ambiguity, where the client's knowledge is
+    /// IDENTICAL: the PUT was delivered in full and failed, and this time it did
+    /// not commit.
+    ///
+    /// Nothing may be destroyed on this path either — the request could still be
+    /// in flight — so the answer is a retryable refusal with the only local clone
+    /// left in place, not a deletion.
+    #[sqlx::test]
+    async fn a_fork_whose_publish_is_unresolved_keeps_its_clone_and_refuses_retryably(
+        pool: PgPool,
+    ) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let repos = TempDir::new().unwrap();
+        let source_owner = "did:key:z6MkForkSourceBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let forker = "did:key:z6MkForkerUnresolvedAAAAAAAAAAAAAAAAAAA";
+        let state = fork_state(&mock, &pool, repos.path(), source_owner, "src").await;
+
+        mock.fail_next_put_after_delivery();
+        let err = do_fork(&state, source_owner, "src", forker, "unresolved")
+            .await
+            .expect_err("an unresolved publish must not report success");
+        assert!(
+            matches!(err, crate::error::AppError::RepoUnavailable),
+            "the refusal must be the retryable one, got {err:?}"
+        );
+
+        assert!(
+            repos
+                .path()
+                .join(owner_slug_of(forker))
+                .join("unresolved.git")
+                .exists(),
+            "RED: the only local copy of a write that MAY have landed was deleted"
+        );
+        assert_eq!(
+            mock.deletes(),
+            0,
+            "nothing may be deleted while the outcome is unresolved"
+        );
+        assert!(
+            state
+                .db
+                .get_repo(crate::db::normalize_owner_key(forker), "unresolved")
+                .await
+                .expect("lookup")
+                .is_none(),
+            "no row may be inserted for a publish that is not confirmed"
+        );
+
+        mock.shutdown();
+    }
+
+    /// THE CONTROL. An ordinary fork must still work end to end, or the two
+    /// assertions above would pass on a handler that simply never forks.
+    #[sqlx::test]
+    async fn an_ordinary_fork_publishes_and_commits(pool: PgPool) {
+        let mock = S3Mock::start().await;
+        let repos = TempDir::new().unwrap();
+        let source_owner = "did:key:z6MkForkSourceCCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let forker = "did:key:z6MkForkerPlainAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = fork_state(&mock, &pool, repos.path(), source_owner, "src").await;
+
+        let (status, id) = do_fork(&state, source_owner, "src", forker, "plain")
+            .await
+            .expect("an uncontended fork must succeed");
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+        let stored = mock
+            .object_for(&owner_slug_of(forker), "plain")
+            .expect("the fork archive is published");
+        assert_eq!(stored.attempt.as_deref(), Some(id.as_str()));
+
         mock.shutdown();
     }
 }
