@@ -905,12 +905,19 @@ impl std::fmt::Debug for ReplayReservation<'_> {
 /// apart.
 #[derive(Debug, PartialEq, Eq)]
 enum FreshnessViolation {
-    /// Older than [`GOSSIP_REF_UPDATE_FRESHNESS_WINDOW`].
-    TooOld,
+    /// Older than [`GOSSIP_REF_UPDATE_FRESHNESS_WINDOW`]. Carries the PARSED
+    /// instant, not the wire string, and that choice is load-bearing: the
+    /// refusal detail is rendered from this value, so what reaches the log is a
+    /// bounded canonical re-encoding rather than whatever bytes the sender put
+    /// on the wire (see [`freshness_refusal_detail`]).
+    TooOld(DateTime<Utc>),
     /// Ahead of this node's clock by more than
-    /// [`GOSSIP_REF_UPDATE_FUTURE_SKEW`].
-    TooFarFuture,
+    /// [`GOSSIP_REF_UPDATE_FUTURE_SKEW`]. Carries the parsed instant for the
+    /// same reason as `TooOld`.
+    TooFarFuture(DateTime<Utc>),
     /// Not parseable as RFC-3339, so it cannot be freshness-checked at all.
+    /// Nothing to carry: there is no parsed value, and the wire string is the
+    /// one thing the detail must NOT interpolate raw.
     Unparseable,
 }
 
@@ -942,12 +949,53 @@ fn check_freshness(timestamp: &str, now: DateTime<Utc>) -> Result<(), FreshnessV
     let skew = chrono::Duration::seconds(GOSSIP_REF_UPDATE_FUTURE_SKEW.as_secs() as i64);
 
     if now - stamped > window {
-        return Err(FreshnessViolation::TooOld);
+        return Err(FreshnessViolation::TooOld(stamped));
     }
     if stamped - now > skew {
-        return Err(FreshnessViolation::TooFarFuture);
+        return Err(FreshnessViolation::TooFarFuture(stamped));
     }
     Ok(())
+}
+
+/// Render the refusal detail for one freshness violation, safe to log.
+///
+/// Every arm bounds what it interpolates, and the split between the two
+/// strategies is the point of this function existing. The tempting shortcut —
+/// echo `wire_timestamp` raw in the parsed arms because the parser accepted it
+/// — rests on a false invariant: `DateTime::parse_from_rfc3339` accepts
+/// arbitrarily many fractional-second digits, so an event stamped with an old
+/// instant followed by megabytes of trailing digits parses successfully,
+/// lands in `TooOld`, and would copy the sender's entire wire string into a
+/// `warn!`. Successful parsing proves the string names an instant; it proves
+/// nothing about the length of the bytes that named it.
+///
+/// So the parsed arms render `to_rfc3339()` of the PARSED instant instead: a
+/// canonical re-encoding whose length is fixed by this build's formatter, not
+/// by the sender, and which cannot contain a control character by
+/// construction. Nothing diagnostic is lost — the instant is the only fact the
+/// operator acts on, and the overlong fraction the canonical form drops is
+/// precisely the part that carried no information.
+///
+/// The unparseable arm has no parsed value to render, so there the wire string
+/// itself goes through [`sanitize_for_log`], which bounds it and strips
+/// control characters.
+fn freshness_refusal_detail(violation: &FreshnessViolation, wire_timestamp: &str) -> String {
+    match violation {
+        FreshnessViolation::TooOld(stamped) => format!(
+            "ref-update timestamp {} is more than {}s old",
+            stamped.to_rfc3339(),
+            GOSSIP_REF_UPDATE_FRESHNESS_WINDOW.as_secs()
+        ),
+        FreshnessViolation::TooFarFuture(stamped) => format!(
+            "ref-update timestamp {} is more than {}s ahead of this node's clock",
+            stamped.to_rfc3339(),
+            GOSSIP_REF_UPDATE_FUTURE_SKEW.as_secs()
+        ),
+        FreshnessViolation::Unparseable => format!(
+            "ref-update timestamp {} is not a valid RFC-3339 instant",
+            sanitize_for_log(wire_timestamp)
+        ),
+    }
 }
 
 /// Render an attacker-controlled string safe to put in a log line.
@@ -1246,33 +1294,17 @@ pub(crate) async fn ingest_ref_update(
         // in production.
         let now = ingest_now();
         if let Err(violation) = check_freshness(&event.timestamp, now) {
-            let detail = match violation {
-                FreshnessViolation::TooOld => format!(
-                    "ref-update timestamp {} is more than {}s old",
-                    event.timestamp,
-                    GOSSIP_REF_UPDATE_FRESHNESS_WINDOW.as_secs()
-                ),
-                FreshnessViolation::TooFarFuture => format!(
-                    "ref-update timestamp {} is more than {}s ahead of this node's clock",
-                    event.timestamp,
-                    GOSSIP_REF_UPDATE_FUTURE_SKEW.as_secs()
-                ),
-                // The one arm that must sanitize, and only this one. The two
-                // above ran through `DateTime::parse_from_rfc3339`
-                // successfully, so their `event.timestamp` is a legal RFC-3339
-                // instant by construction: bounded length, no control
-                // characters. This arm is reached precisely BECAUSE the parser
-                // refused the string, so what it holds is arbitrary
-                // attacker-chosen bytes of arbitrary length, and this detail
-                // reaches a `warn!`. Unsanitized that is two sinks at once: a
-                // newline or an ANSI escape forges log lines, and a megabyte of
-                // timestamp writes a megabyte of log per refused event.
-                FreshnessViolation::Unparseable => format!(
-                    "ref-update timestamp {} is not a valid RFC-3339 instant",
-                    sanitize_for_log(&event.timestamp)
-                ),
-            };
-            return IngestOutcome::StaleTimestamp(detail);
+            // Every arm of the detail is rendered bounded, not just the
+            // unparseable one. This detail reaches a `warn!` in the swarm
+            // loop, and `event.timestamp` is attacker-chosen on all three
+            // paths: a parseable stamp can still carry megabytes of
+            // fractional-second digits, so "the parser accepted it" is not
+            // "safe to echo". `freshness_refusal_detail` holds that invariant
+            // and its rationale.
+            return IngestOutcome::StaleTimestamp(freshness_refusal_detail(
+                &violation,
+                &event.timestamp,
+            ));
         }
 
         // Keyed on the canonical signing bytes, which is what makes the two
@@ -4142,8 +4174,11 @@ mod tests {
         let window = GOSSIP_REF_UPDATE_FRESHNESS_WINDOW.as_secs() as i64;
         assert_eq!(
             check_freshness(&stamp(-(window + 1)), freshness_now()),
-            Err(FreshnessViolation::TooOld),
-            "an event one second past the window must be refused as stale-past"
+            Err(FreshnessViolation::TooOld(
+                freshness_now() - chrono::Duration::seconds(window + 1)
+            )),
+            "an event one second past the window must be refused as stale-past, carrying the \
+             parsed instant"
         );
     }
 
@@ -4171,12 +4206,17 @@ mod tests {
         let skew = GOSSIP_REF_UPDATE_FUTURE_SKEW.as_secs() as i64;
         assert_eq!(
             check_freshness(&stamp(skew + 1), freshness_now()),
-            Err(FreshnessViolation::TooFarFuture),
-            "one second past the skew allowance must be refused as stale-future"
+            Err(FreshnessViolation::TooFarFuture(
+                freshness_now() + chrono::Duration::seconds(skew + 1)
+            )),
+            "one second past the skew allowance must be refused as stale-future, carrying the \
+             parsed instant"
         );
         assert_eq!(
             check_freshness(&stamp(300), freshness_now()),
-            Err(FreshnessViolation::TooFarFuture),
+            Err(FreshnessViolation::TooFarFuture(
+                freshness_now() + chrono::Duration::seconds(300)
+            )),
             "five minutes ahead is inside abs(delta) < window and must still be refused"
         );
     }
@@ -4244,6 +4284,82 @@ mod tests {
         // the diagnostic value it exists to preserve.
         let legal = "2026-07-02T12:00:00.123456789+05:30";
         assert_eq!(sanitize_for_log(legal), legal);
+    }
+
+    /// The hole this test pins shut: `DateTime::parse_from_rfc3339` accepts
+    /// arbitrarily many fractional-second digits, so a timestamp can PARSE and
+    /// still be megabytes long on the wire. The first cut of this guard echoed
+    /// the wire string raw in the `TooOld` and `TooFarFuture` details on the
+    /// reasoning that a successfully parsed string is a legal bounded instant —
+    /// a false invariant, because parsing proves the string names an instant,
+    /// not that the bytes naming it are bounded. This drives an overlong but
+    /// parseable stamp through both refusal directions and asserts the emitted
+    /// detail — the exact string the swarm loop logs — is bounded, control-free,
+    /// and renders the canonical form of the parsed instant instead of the wire
+    /// bytes.
+    #[test]
+    fn an_overlong_parseable_timestamp_is_rendered_bounded_in_both_directions() {
+        let window = GOSSIP_REF_UPDATE_FRESHNESS_WINDOW.as_secs() as i64;
+        let skew = GOSSIP_REF_UPDATE_FUTURE_SKEW.as_secs() as i64;
+
+        // A whole-second instant plus a mebibyte of fractional zeros: the
+        // fraction changes the wire length and nothing else, so the parsed
+        // instant is exactly the offset instant and the stamp is the attack
+        // shape verbatim — old instant, enormous fraction, parses fine.
+        let overlong = |secs: i64| -> (DateTime<Utc>, String) {
+            let instant = freshness_now() + chrono::Duration::seconds(secs);
+            let wire = format!(
+                "{}.{}Z",
+                instant.format("%Y-%m-%dT%H:%M:%S"),
+                "0".repeat(1 << 20)
+            );
+            (instant, wire)
+        };
+
+        let (past_instant, past_wire) = overlong(-(window + 1));
+        let (future_instant, future_wire) = overlong(skew + 1);
+        for (instant, wire, expected) in [
+            (
+                past_instant,
+                past_wire,
+                FreshnessViolation::TooOld(past_instant),
+            ),
+            (
+                future_instant,
+                future_wire,
+                FreshnessViolation::TooFarFuture(future_instant),
+            ),
+        ] {
+            let violation = check_freshness(&wire, freshness_now()).expect_err(
+                "an overlong fraction must not smuggle the stamp past the freshness window",
+            );
+            assert_eq!(
+                violation, expected,
+                "the violation must carry the parsed instant, because the detail is rendered \
+                 from it"
+            );
+
+            let detail = freshness_refusal_detail(&violation, &wire);
+            assert!(
+                detail.chars().count() < 160,
+                "the emitted detail must be bounded regardless of wire length, got {} chars",
+                detail.chars().count()
+            );
+            assert!(
+                !detail.chars().any(char::is_control),
+                "a control character in the detail forges log lines, got {detail:?}"
+            );
+            assert!(
+                detail.contains(&instant.to_rfc3339()),
+                "the detail must still name the refused instant, canonically rendered, or the \
+                 bound would cost the operator the one diagnostic fact: {detail}"
+            );
+            assert!(
+                !detail.contains(&"0".repeat(64)),
+                "the sender's fractional digits must not be echoed: {} chars leaked",
+                detail.len()
+            );
+        }
     }
 
     /// The frozen legacy artifact's own timestamp, driven through the parser
