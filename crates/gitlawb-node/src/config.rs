@@ -795,7 +795,8 @@ impl Config {
                 if crate::p2p::tilde_suffix_escapes_home(suffix) {
                     return Err(format!(
                         "GITLAWB_P2P_KEY ({}) must stay inside the home directory after `~/` \
-                         expansion; rooted suffixes such as `~//etc/p2p.key` are refused",
+                         expansion; rooted suffixes such as `~//etc/p2p.key`, drive-prefixed \
+                         suffixes, and `..` traversal are refused",
                         self.p2p_key_path
                     ));
                 }
@@ -1529,28 +1530,213 @@ mod tests {
         ])
     }
 
+    /// The configuration half of the key-storage contract matrix: enabled
+    /// versus disabled p2p, crossed with the path spellings the contract
+    /// rules on. The filesystem-object half (which objects at and around the
+    /// key path boot or are refused) lives in `p2p::tests::
+    /// p2p_key_storage_contract_matrix`; nothing there runs unless this gate
+    /// lets a config through.
+    ///
+    /// Rule 1 is proven through its own rejections: every disabled row uses a
+    /// path that an enabled row shows to be invalid, so `Ok` on the disabled
+    /// row is direct evidence the validator never resolved or inspected the
+    /// unused key storage.
     #[test]
-    fn p2p_disabled_skips_key_path_validation() {
-        for path in ["p2p.key", "~/", "~//etc/p2p.key"] {
-            assert!(
-                config_with_p2p_port_and_key(0, path).validate().is_ok(),
-                "p2p disabled must not validate unused key path {path:?}"
-            );
+    fn p2p_key_storage_contract_config_matrix() {
+        enum Expect {
+            Accepted,
+            Rejected(&'static str),
+        }
+
+        struct Row {
+            port: u16,
+            path: &'static str,
+            expect: Expect,
+            /// Skip when no home directory resolves: the row's outcome is
+            /// about `~/` expansion, which then legitimately fails earlier
+            /// with the no-home error instead.
+            needs_home: bool,
+        }
+
+        let rows = [
+            // Rule 1: disabled p2p leaves its unused key storage alone.
+            Row {
+                port: 0,
+                path: "p2p.key",
+                expect: Expect::Accepted,
+                needs_home: false,
+            },
+            Row {
+                port: 0,
+                path: "~/",
+                expect: Expect::Accepted,
+                needs_home: false,
+            },
+            Row {
+                port: 0,
+                path: "~//etc/p2p.key",
+                expect: Expect::Accepted,
+                needs_home: false,
+            },
+            Row {
+                port: 0,
+                path: "~/../etc/p2p.key",
+                expect: Expect::Accepted,
+                needs_home: false,
+            },
+            Row {
+                port: 0,
+                path: "",
+                expect: Expect::Accepted,
+                needs_home: false,
+            },
+            // Enabled: ordinary absolute and home-relative paths pass, a
+            // doubled separator in an absolute path is harmless (it does not
+            // re-root anything), and the shipped default resolves beneath
+            // home (asserted separately below).
+            Row {
+                port: 7546,
+                path: "/data/keys/p2p.key",
+                expect: Expect::Accepted,
+                needs_home: false,
+            },
+            Row {
+                port: 7546,
+                path: "/data//keys/p2p.key",
+                expect: Expect::Accepted,
+                needs_home: false,
+            },
+            Row {
+                port: 7546,
+                path: "~/.gitlawb/p2p.key",
+                expect: Expect::Accepted,
+                needs_home: true,
+            },
+            // Rule 2: a `~/` suffix that would re-root or walk out of home is
+            // refused at parse time, before any join. These fire whether or
+            // not a home directory resolves, because the suffix is judged
+            // before expansion.
+            Row {
+                port: 7546,
+                path: "~//etc/p2p.key",
+                expect: Expect::Rejected("inside the home directory"),
+                needs_home: false,
+            },
+            Row {
+                port: 7546,
+                path: "~/../etc/p2p.key",
+                expect: Expect::Rejected("inside the home directory"),
+                needs_home: false,
+            },
+            // Rule 3's lexical pre-checks, still gated on the port.
+            Row {
+                port: 7546,
+                path: "p2p.key",
+                expect: Expect::Rejected("directory"),
+                needs_home: false,
+            },
+            Row {
+                port: 7546,
+                path: "~/",
+                expect: Expect::Rejected("must name a key file"),
+                needs_home: true,
+            },
+        ];
+
+        let have_home = dirs_next::home_dir().is_some();
+        for row in rows {
+            if row.needs_home && !have_home {
+                continue;
+            }
+            let result = config_with_p2p_port_and_key(row.port, row.path).validate();
+            match row.expect {
+                Expect::Accepted => assert!(
+                    result.is_ok(),
+                    "[port={} path={:?}] must be accepted, got: {result:?}",
+                    row.port,
+                    row.path
+                ),
+                Expect::Rejected(needle) => {
+                    let err = result.expect_err(&format!(
+                        "[port={} path={:?}] must be rejected",
+                        row.port, row.path
+                    ));
+                    assert!(
+                        err.contains(needle),
+                        "[port={} path={:?}] rejection must mention {needle:?}, got: {err}",
+                        row.port,
+                        row.path
+                    );
+                }
+            }
         }
     }
 
+    /// Rule 1's absence-of-IO half against a real on-disk trap: a disabled
+    /// node pointed at a key path whose parent is a symlink — a shape the
+    /// enabled path refuses and must never chmod — validates clean and leaves
+    /// the trap directory exactly as it was.
+    #[cfg(unix)]
     #[test]
-    fn p2p_tilde_suffix_that_escapes_home_is_rejected() {
-        if dirs_next::home_dir().is_none() {
-            return;
-        }
-        let err = config_with_p2p_key("~//etc/p2p.key")
-            .validate()
-            .expect_err("~//etc must not escape home");
+    fn p2p_disabled_key_storage_is_never_inspected_or_mutated() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("real");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = base.path().join("keys");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let key_path = link.join("p2p.key");
+
+        let config = Config::parse_from([
+            "gitlawb-node",
+            "--p2p-port",
+            "0",
+            "--p2p-key-path",
+            key_path.to_str().unwrap(),
+        ]);
         assert!(
-            err.contains("inside the home directory") || err.contains("rooted suffixes"),
-            "escaped tilde suffix must be refused, got: {err}"
+            config.validate().is_ok(),
+            "a disabled node must not validate the unused key path"
         );
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "the symlink target's mode must stay unchanged");
+        assert_eq!(
+            std::fs::read_dir(&target).unwrap().count(),
+            0,
+            "nothing may be created behind the symlink"
+        );
+    }
+
+    /// Rule 2's positive direction: the shipped `~/` default resolves to a
+    /// path beneath the selected home, and suffixes that would escape are
+    /// left unexpanded (and then rejected by `validate`, as the matrix above
+    /// asserts) rather than joined and repaired after.
+    #[test]
+    fn p2p_tilde_expansion_stays_beneath_home() {
+        let Some(home) = dirs_next::home_dir() else {
+            return;
+        };
+
+        let resolved = config_with_p2p_key("~/.gitlawb/p2p.key").resolved_p2p_key_path();
+        assert!(
+            resolved.starts_with(&home),
+            "the resolved default must stay beneath home"
+        );
+        assert!(
+            resolved.ends_with(".gitlawb/p2p.key"),
+            "the resolved default must keep the configured suffix"
+        );
+
+        for path in ["~//etc/p2p.key", "~/../etc/p2p.key"] {
+            assert_eq!(
+                config_with_p2p_key(path).resolved_p2p_key_path(),
+                Path::new(path),
+                "an escaping suffix must never be joined onto home"
+            );
+        }
     }
 
     /// A p2p key path that names no directory component would put the node's

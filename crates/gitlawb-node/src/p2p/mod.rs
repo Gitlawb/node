@@ -263,10 +263,25 @@ const MAX_P2P_KEY_BYTES: usize = 4096;
 
 /// Whether the remainder of a `~/...` value would escape home when joined.
 ///
-/// `home.join("/etc/p2p.key")` discards `home` because the right-hand path is
-/// absolute, so doubled separators and rooted suffixes must be rejected first.
+/// This is rule 2 of the key-storage contract (see
+/// [`load_or_create_p2p_keypair`]): a `~/`-prefixed path must stay beneath the
+/// resolved home directory. `PathBuf::join` does not guarantee that on its
+/// own — an absolute right-hand operand *replaces* the left-hand side, so
+/// `home.join("/etc/p2p.key")` (from `GITLAWB_P2P_KEY=~//etc/p2p.key`, whose
+/// doubled separator leaves a rooted suffix after the `~/` is stripped) is
+/// `/etc/p2p.key`. On Windows a drive or UNC prefix replaces the base the same
+/// way even without a root, and `..` walks back out of home lexically. So the
+/// suffix is accepted only when every component is an ordinary name (or a
+/// no-op `.`), which is exactly the class of suffixes for which
+/// `home.join(suffix)` provably keeps `home` as a prefix. Everything else is
+/// rejected before the join, instead of joined and repaired after.
 pub(crate) fn tilde_suffix_escapes_home(suffix: &str) -> bool {
-    Path::new(suffix).has_root()
+    Path::new(suffix).components().any(|c| {
+        matches!(
+            c,
+            Component::RootDir | Component::Prefix(_) | Component::ParentDir
+        )
+    })
 }
 
 /// Inspect `dir` without following symlinks. Ok when absent; Err when present
@@ -436,17 +451,54 @@ pub(crate) fn validate_p2p_key_path(
 
 /// Load the node's persistent libp2p identity from `key_path`, generating and
 /// storing a fresh Ed25519 keypair the first time.
+///
+/// This is the enforcement point for the key-storage contract. Rules 1 and 2
+/// live in configuration, rules 3–5 here:
+///
+///   1. Disabled p2p (`GITLAWB_P2P_PORT=0`) never resolves, inspects, or
+///      mutates key storage at all (`Config::validate` gates on the port).
+///   2. A `~/`-relative path is parsed exactly once, and the suffix is proven
+///      relative before it is joined, so expansion cannot land outside home
+///      ([`tilde_suffix_escapes_home`]).
+///   3. Every mutation of the key directory goes through a [`KeyDirHandle`]:
+///      a descriptor opened without following symlinks and `fstat`-verified to
+///      be a real directory this uid owns. chmod, scratch creation,
+///      publication, cleanup, and the durability sync all address that
+///      descriptor, so replacing the pathname after validation redirects
+///      nothing. Paths that cannot reach that state are rejected before any
+///      chmod or key IO.
+///   4. An existing key is opened through the same handle without following
+///      symlinks and without blocking, and the *opened* object must be a
+///      regular file within [`MAX_P2P_KEY_BYTES`] before any byte of it is
+///      trusted ([`read_p2p_keypair_from`]).
+///   5. Losing a creation race — at the key directory or at the key file — is
+///      a normal concurrent-first-start outcome: the loser verifies what the
+///      winner made and adopts it, so simultaneous boots converge on one
+///      PeerId.
 pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
+    // Rule 3's rejection half: refuse paths that cannot name a securable key
+    // file before anything on disk is created, opened, or chmodded. Purely
+    // inspective — the checks below re-establish everything it observed on the
+    // actual opened objects, so this exists for early, precise errors rather
+    // than for safety.
     validate_p2p_key_path(key_path, None).map_err(|e| anyhow::anyhow!(e))?;
-    let parent = key_parent(key_path);
+
+    // Validation rejected paths without a final component, so `file_name` is
+    // present from here on; the error is a backstop, not a reachable path for
+    // a validated config.
+    let key_name = key_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("GITLAWB_P2P_KEY ({}) names no file", key_path.display()))?
+        .to_os_string();
 
     // Runs on both the load and the create path: the directory guards the key
     // just as much as the key's own mode does, and an existing directory keeps
-    // whatever mode it was made with.
-    ensure_key_dir(parent)?;
+    // whatever mode it was made with. The returned handle is the anchor every
+    // later operation goes through.
+    let dir = ensure_key_dir(key_parent(key_path))?;
 
-    if std::fs::symlink_metadata(key_path).is_ok() {
-        return read_p2p_keypair(key_path);
+    if let Some(file) = open_existing_key(&dir, &key_name, key_path)? {
+        return read_p2p_keypair_from(file, key_path);
     }
 
     let kp = identity::Keypair::generate_ed25519();
@@ -458,7 +510,7 @@ pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> 
             .map_err(|e| anyhow::anyhow!("failed to serialize p2p key: {e}"))?,
     );
 
-    match write_key_atomically(key_path, &bytes) {
+    match write_key_atomically(&dir, &key_name, &bytes) {
         Ok(()) => {
             info!(
                 path = %key_path.display(),
@@ -467,16 +519,277 @@ pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> 
             );
             Ok(kp)
         }
-        // Another node process won the race between the existence check and the
-        // atomic publish.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read_p2p_keypair(key_path),
+        // Rule 5 at the key-file layer: another node process won the race
+        // between the open above and the atomic publish. Adopt its key,
+        // through the same handle, so both processes converge on one PeerId.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let file = open_existing_key(&dir, &key_name, key_path)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "p2p key at {} vanished after another process published it; \
+                     refusing to guess which identity this node should have",
+                    key_path.display()
+                )
+            })?;
+            read_p2p_keypair_from(file, key_path)
+        }
         Err(e) => Err(anyhow::Error::new(e)
             .context(format!("failed to write p2p key to {}", key_path.display()))),
     }
 }
 
-/// Create the directory holding the key with owner-only permissions, and
-/// tighten it if it already exists with a looser mode. Write permission on this
+/// An open, verified handle on the key directory: the anchor that closes the
+/// gap between checking the directory and mutating it.
+///
+/// A `symlink_metadata` check followed by path-addressed chmod/open/link calls
+/// is a check-then-use sequence: whatever the check proved about the pathname
+/// can be invalidated by renaming a symlink or another object into place
+/// before the next call resolves the same path again. This handle is the fix.
+/// On unix it is opened with `O_NOFOLLOW` (a symlink in the final position
+/// fails instead of being followed) and `O_DIRECTORY` (any other object type
+/// fails), and every judgment after that — owner, mode, the chmod itself —
+/// comes from `fstat`/`fchmod` on the descriptor, while scratch creation
+/// (`openat`), publication (`linkat`), cleanup (`unlinkat`), and the
+/// durability sync (`fsync`) address children *relative to* the descriptor.
+/// After the open there is no second pathname resolution left to redirect.
+///
+/// Child names are single components this module generates itself (the key's
+/// `file_name` and the scratch names), never operator input containing
+/// separators.
+///
+/// On non-unix targets the same sequence falls back to path-addressed calls
+/// with a no-follow pre-check; the pre-flight validation still runs, and unix
+/// is where the node deploys.
+#[derive(Debug)]
+struct KeyDirHandle {
+    #[cfg(unix)]
+    dir: std::fs::File,
+    /// On unix: for error messages only, never resolved again for IO.
+    path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl KeyDirHandle {
+    /// Open `dir_path` refusing symlinks and non-directories at the open
+    /// itself, so rejection happens before any chmod or key IO rather than
+    /// after a separate stat that something else could invalidate.
+    fn open(dir_path: &Path) -> std::io::Result<KeyDirHandle> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(dir_path)?;
+        Ok(KeyDirHandle {
+            dir,
+            path: dir_path.to_path_buf(),
+        })
+    }
+
+    /// `fstat` on the held descriptor: the object this metadata describes is
+    /// the object every other method mutates, with no path in between.
+    fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        self.dir.metadata()
+    }
+
+    /// `fchmod` on the held descriptor, for the same reason.
+    fn tighten_to_0700(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        self.dir
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+    }
+
+    /// `openat` relative to the held descriptor. `O_NOFOLLOW` and `O_CLOEXEC`
+    /// are always added: no child of the key directory is ever a symlink this
+    /// module is willing to follow.
+    fn open_child(
+        &self,
+        name: &std::ffi::OsStr,
+        flags: libc::c_int,
+        mode: libc::mode_t,
+    ) -> std::io::Result<std::fs::File> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let name = Self::child_name(name)?;
+        // SAFETY: `openat` resolves `name` relative to our owned, verified
+        // directory descriptor and returns a new descriptor on success;
+        // `from_raw_fd` assumes ownership of it exactly once.
+        let fd = unsafe {
+            libc::openat(
+                self.dir.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::c_uint::from(mode),
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is a valid descriptor we just received and own.
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+
+    /// Open an existing key for reading. `O_NONBLOCK` so that a FIFO left at
+    /// the key path cannot park startup in `open(2)` waiting for a writer;
+    /// whether the opened object is actually a regular file is judged by
+    /// `fstat` on the result, in [`read_p2p_keypair_from`].
+    fn open_key_for_read(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+        self.open_child(name, libc::O_RDONLY | libc::O_NONBLOCK, 0)
+    }
+
+    /// Create a scratch file with 0600 applied at creation. `O_EXCL` keeps a
+    /// collision an error rather than an adoption.
+    fn create_scratch(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+        self.open_child(
+            name,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o600 as libc::mode_t,
+        )
+    }
+
+    /// Atomically publish `from` at `to` via `linkat` on the held descriptor.
+    /// Fails with `AlreadyExists` if anything already occupies `to`, which is
+    /// the signal the concurrency protocol in the caller relies on.
+    fn publish(&self, from: &std::ffi::OsStr, to: &std::ffi::OsStr) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        let from = Self::child_name(from)?;
+        let to = Self::child_name(to)?;
+        // SAFETY: both names resolve relative to our owned directory
+        // descriptor; `linkat` with no flags follows no symlinks.
+        let rc = unsafe {
+            libc::linkat(
+                self.dir.as_raw_fd(),
+                from.as_ptr(),
+                self.dir.as_raw_fd(),
+                to.as_ptr(),
+                0,
+            )
+        };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// `unlinkat` relative to the held descriptor.
+    fn remove_child(&self, name: &std::ffi::OsStr) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        let name = Self::child_name(name)?;
+        // SAFETY: resolves relative to our owned directory descriptor;
+        // `unlinkat` without AT_REMOVEDIR removes only non-directories.
+        let rc = unsafe { libc::unlinkat(self.dir.as_raw_fd(), name.as_ptr(), 0) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// `fsync` the directory itself so a just-published entry survives a crash.
+    fn sync(&self) -> std::io::Result<()> {
+        self.dir.sync_all()
+    }
+
+    fn child_name(name: &std::ffi::OsStr) -> std::io::Result<std::ffi::CString> {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "key file name contains an interior NUL byte",
+            )
+        })
+    }
+}
+
+#[cfg(not(unix))]
+impl KeyDirHandle {
+    fn open(dir_path: &Path) -> std::io::Result<KeyDirHandle> {
+        let md = std::fs::symlink_metadata(dir_path)?;
+        if md.is_symlink() || !md.is_dir() {
+            // The closest std kind to ELOOP/ENOTDIR that maps onto the same
+            // caller-side diagnosis as the unix open flags.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a real directory",
+            ));
+        }
+        Ok(KeyDirHandle {
+            path: dir_path.to_path_buf(),
+        })
+    }
+
+    fn open_key_for_read(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+        let path = self.path.join(name);
+        if std::fs::symlink_metadata(&path)?.is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "p2p key is a symlink",
+            ));
+        }
+        std::fs::OpenOptions::new().read(true).open(path)
+    }
+
+    fn create_scratch(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.path.join(name))
+    }
+
+    fn publish(&self, from: &std::ffi::OsStr, to: &std::ffi::OsStr) -> std::io::Result<()> {
+        std::fs::hard_link(self.path.join(from), self.path.join(to))
+    }
+
+    fn remove_child(&self, name: &std::ffi::OsStr) -> std::io::Result<()> {
+        std::fs::remove_file(self.path.join(name))
+    }
+
+    fn sync(&self) -> std::io::Result<()> {
+        // Directory fsync is not expressible through std here; publication
+        // durability degrades to best-effort on non-unix targets.
+        Ok(())
+    }
+}
+
+/// Map a failed [`KeyDirHandle::open`] to the operator-facing explanation.
+///
+/// `ELOOP` is the flag-refused symlink and `ENOTDIR` the wrong object type;
+/// both messages match the ones `parent_directory_is_safe_to_mutate` produces
+/// at validation time, because they are the same finding made at the moment
+/// that actually matters — the open that everything after is anchored to.
+fn describe_unusable_key_dir(dir: &Path, e: std::io::Error) -> anyhow::Error {
+    #[cfg(unix)]
+    {
+        match e.raw_os_error() {
+            Some(code) if code == libc::ELOOP => {
+                return anyhow::anyhow!(
+                    "GITLAWB_P2P_KEY's directory {} must be a real directory, not a symlink",
+                    dir.display()
+                );
+            }
+            Some(code) if code == libc::ENOTDIR => {
+                return anyhow::anyhow!(
+                    "GITLAWB_P2P_KEY's directory {} must be a directory, not another file type",
+                    dir.display()
+                );
+            }
+            _ => {}
+        }
+    }
+    #[cfg(not(unix))]
+    if e.kind() == std::io::ErrorKind::InvalidInput {
+        return anyhow::anyhow!(
+            "GITLAWB_P2P_KEY's directory {} must be a real directory, not a symlink \
+             or another file type",
+            dir.display()
+        );
+    }
+    anyhow::Error::new(e).context(format!("failed to open key directory {}", dir.display()))
+}
+
+/// Create the directory holding the key with owner-only permissions, tighten
+/// it if it already exists with a looser mode, and hand back the verified
+/// handle every subsequent operation is anchored to. Write permission on this
 /// directory is enough to unlink or replace the 0600 key inside it, so the
 /// directory guards the key as much as the key's own mode does.
 ///
@@ -496,7 +809,7 @@ pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> 
 /// `~/.gitlawb/identity.pem` lives in this directory too, so this covers both
 /// keys. Issue #231 owns the sibling gap in `main.rs`'s own creation path for
 /// that file; nothing here touches it.
-fn ensure_key_dir(dir: &Path) -> Result<()> {
+fn ensure_key_dir(dir: &Path) -> Result<KeyDirHandle> {
     #[cfg(unix)]
     {
         let euid = effective_uid();
@@ -505,10 +818,11 @@ fn ensure_key_dir(dir: &Path) -> Result<()> {
         }
     }
 
-    parent_directory_is_safe_to_mutate(dir).map_err(|e| anyhow::anyhow!(e))?;
-
     // Missing ancestors are created at the ambient mode. Only the nominated key
-    // directory itself is pinned to 0700.
+    // directory itself is pinned to 0700 and anchored; ancestors are ordinary
+    // path infrastructure (the shipped default's `~/.gitlawb` on a first boot),
+    // and `foreign_ancestor_error` has already refused ones somebody else
+    // could swap out from under us.
     if let Some(parent) = dir.parent() {
         if !parent.as_os_str().is_empty() && parent != dir {
             std::fs::create_dir_all(parent).with_context(|| {
@@ -520,8 +834,8 @@ fn ensure_key_dir(dir: &Path) -> Result<()> {
         }
     }
 
-    match std::fs::symlink_metadata(dir) {
-        Ok(_) => {}
+    let handle = match KeyDirHandle::open(dir) {
+        Ok(handle) => handle,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let mut builder = std::fs::DirBuilder::new();
             #[cfg(unix)]
@@ -531,28 +845,33 @@ fn ensure_key_dir(dir: &Path) -> Result<()> {
             }
             match builder.create(dir) {
                 Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    parent_directory_is_safe_to_mutate(dir).map_err(|e| anyhow::anyhow!(e))?;
-                }
+                // Rule 5 at the directory layer: two first boots can both see
+                // the leaf absent, and only one `mkdir` wins. Losing is a
+                // successful outcome of the same state transition, not an
+                // error — what matters is what actually occupies the path now,
+                // and the re-open below judges that object itself (a symlink
+                // or non-directory raced into place fails there, before any
+                // chmod or key IO). The winner's owner and mode are then
+                // verified through the handle like any pre-existing directory.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(e) => {
                     return Err(e).with_context(|| {
                         format!("failed to create key directory {}", dir.display())
                     });
                 }
             }
+            KeyDirHandle::open(dir).map_err(|e| describe_unusable_key_dir(dir, e))?
         }
-        Err(e) => {
-            return Err(e)
-                .with_context(|| format!("failed to stat key directory {}", dir.display()));
-        }
-    }
+        Err(e) => return Err(describe_unusable_key_dir(dir, e)),
+    };
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
 
-        let md = std::fs::symlink_metadata(dir)
+        let md = handle
+            .metadata()
             .with_context(|| format!("failed to stat key directory {}", dir.display()))?;
 
         let euid = effective_uid();
@@ -567,21 +886,22 @@ fn ensure_key_dir(dir: &Path) -> Result<()> {
                 mode = format!("{mode:04o}"),
                 "key directory grants access beyond its owner; tightening it to 0700"
             );
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).with_context(
-                || {
-                    format!(
-                        "key directory {} has mode {:04o}, which lets other users replace \
-                         the keys it holds, and it could not be tightened; run `chmod 700 {}`",
-                        dir.display(),
-                        mode,
-                        dir.display()
-                    )
-                },
-            )?;
+            // `fchmod` through the handle: the directory whose mode changes is
+            // the object that was just verified, not whatever the pathname
+            // resolves to by now.
+            handle.tighten_to_0700().with_context(|| {
+                format!(
+                    "key directory {} has mode {:04o}, which lets other users replace \
+                     the keys it holds, and it could not be tightened; run `chmod 700 {}`",
+                    dir.display(),
+                    mode,
+                    dir.display()
+                )
+            })?;
         }
     }
 
-    Ok(())
+    Ok(handle)
 }
 
 /// Write the key to a scratch file in the same directory, then publish it to
@@ -597,52 +917,48 @@ fn ensure_key_dir(dir: &Path) -> Result<()> {
 /// symlink, which it does not follow), so the two properties hold together
 /// without a check-then-act gap. The scratch file is unlinked either way, so a
 /// failed start leaves the key directory as it found it.
-fn write_key_atomically(key_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = key_parent(key_path);
-    let (tmp_path, mut file) = create_scratch_key_file(dir)?;
-    let result = fill_and_publish(&mut file, bytes, &tmp_path, key_path);
+fn write_key_atomically(
+    dir: &KeyDirHandle,
+    key_name: &std::ffi::OsStr,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let (scratch_name, mut file) = create_scratch_key_file(dir)?;
+    let result = fill_and_publish(&mut file, bytes, dir, &scratch_name, key_name);
     drop(file);
-    // Unconditional: on success the key is reachable through `key_path`, and on
-    // failure nothing may be left behind.
-    let _ = std::fs::remove_file(&tmp_path);
+    // Unconditional: on success the key is reachable through its own link, and
+    // on failure nothing may be left behind.
+    let _ = dir.remove_child(&scratch_name);
     result
 }
 
 /// Open a uniquely named scratch file in `dir` with owner-only permissions
 /// applied at creation time. The name carries the pid so concurrent node starts
-/// do not pick the same one, and `create_new` (`O_EXCL`) plus the retry makes a
-/// collision with a leftover or a sibling thread impossible rather than merely
-/// unlikely.
-fn create_scratch_key_file(dir: &Path) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+/// do not pick the same one, and `O_EXCL` plus the retry makes a collision
+/// with a leftover or a sibling thread impossible rather than merely unlikely.
+fn create_scratch_key_file(
+    dir: &KeyDirHandle,
+) -> std::io::Result<(std::ffi::OsString, std::fs::File)> {
     let pid = std::process::id();
     for attempt in 0..64u32 {
-        let tmp_path = dir.join(format!(".p2p.key.{pid}.{attempt}.tmp"));
-
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-
-        match opts.open(&tmp_path) {
-            Ok(file) => return Ok((tmp_path, file)),
+        let scratch_name = std::ffi::OsString::from(format!(".p2p.key.{pid}.{attempt}.tmp"));
+        match dir.create_scratch(&scratch_name) {
+            Ok(file) => return Ok((scratch_name, file)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::AlreadyExists,
-        format!("no free scratch key file name in {}", dir.display()),
+        format!("no free scratch key file name in {}", dir.path.display()),
     ))
 }
 
 fn fill_and_publish(
     file: &mut std::fs::File,
     bytes: &[u8],
-    tmp_path: &Path,
-    key_path: &Path,
+    dir: &KeyDirHandle,
+    scratch_name: &std::ffi::OsStr,
+    key_name: &std::ffi::OsStr,
 ) -> std::io::Result<()> {
     use std::io::Write;
 
@@ -656,25 +972,19 @@ fn fill_and_publish(
     // The bytes must be durable before the name that points at them appears,
     // otherwise a crash can leave the entry pointing at an empty file.
     file.sync_all()?;
-    std::fs::hard_link(tmp_path, key_path)?;
+    dir.publish(scratch_name, key_name)?;
 
-    let dir = key_parent(key_path);
-    let dir_file = std::fs::File::open(dir).map_err(|e| {
-        std::io::Error::new(
-            e.kind(),
-            format!(
-                "failed to open key directory {} for durability sync after publishing the key: {e}",
-                dir.display()
-            ),
-        )
-    })?;
-    dir_file.sync_all().map_err(|e| {
+    // The new directory entry must reach disk too, and the sync goes to the
+    // same descriptor the entry was created through — not to a fresh
+    // path-resolved open of the directory, which could by now be something
+    // else entirely.
+    dir.sync().map_err(|e| {
         std::io::Error::new(
             e.kind(),
             format!(
                 "failed to sync key directory {} after publishing the key; the identity may not \
                  survive a crash until the next successful start: {e}",
-                dir.display()
+                dir.path.display()
             ),
         )
     })?;
@@ -737,37 +1047,55 @@ fn read_bounded_key_bytes<R: std::io::Read>(
     Ok(buf)
 }
 
-/// Read an existing key file, refusing one whose permissions or contents make
-/// it untrustworthy. Never regenerates: a node that silently replaces an
-/// unreadable key file would change its PeerId without the operator knowing.
-fn read_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
+/// Open the key through the verified directory handle, mapping "no key yet"
+/// to `None` and everything else to an error the operator can act on.
+///
+/// The open itself refuses symlinks (`O_NOFOLLOW`) and cannot block on a FIFO
+/// (`O_NONBLOCK`); what kind of object was actually opened is judged by
+/// [`read_p2p_keypair_from`] on the descriptor it returns.
+fn open_existing_key(
+    dir: &KeyDirHandle,
+    key_name: &std::ffi::OsStr,
+    key_path: &Path,
+) -> Result<Option<std::fs::File>> {
+    match dir.open_key_for_read(key_name) {
+        Ok(file) => Ok(Some(file)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e).context(format!(
+            "failed to open p2p key at {} (a symlink here is refused rather than followed)",
+            key_path.display()
+        ))),
+    }
+}
+
+/// Read an existing, already-opened key file, refusing one whose type,
+/// permissions, size, or contents make it untrustworthy. Never regenerates: a
+/// node that silently replaces an unreadable key file would change its PeerId
+/// without the operator knowing.
+///
+/// Every judgment is made by `fstat` on `file` itself — the object that will
+/// be read — not on the pathname it was opened by. Regular-file status is an
+/// explicit invariant, not an inference from "not a directory, not a symlink":
+/// a FIFO or device node that survived the open (thanks to `O_NONBLOCK`) is
+/// refused here before a byte of it is consumed, and the read that follows is
+/// capped at [`MAX_P2P_KEY_BYTES`] so nothing that lies about being finite can
+/// feed the process an unbounded stream.
+fn read_p2p_keypair_from(mut file: std::fs::File, key_path: &Path) -> Result<identity::Keypair> {
+    let md = file
+        .metadata()
+        .with_context(|| format!("failed to stat p2p key at {}", key_path.display()))?;
+
+    if !md.is_file() {
+        anyhow::bail!(
+            "p2p key at {} must be a regular file; directories, FIFOs, and special files are refused",
+            key_path.display()
+        );
+    }
+
     #[cfg(unix)]
-    let bytes = {
+    {
         use std::os::unix::fs::MetadataExt;
-        use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::fs::PermissionsExt;
-
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(key_path)
-            .with_context(|| {
-                format!(
-                    "failed to open p2p key at {} (a symlink here is refused rather than followed)",
-                    key_path.display()
-                )
-            })?;
-
-        let md = file
-            .metadata()
-            .with_context(|| format!("failed to stat p2p key at {}", key_path.display()))?;
-
-        if !md.is_file() {
-            anyhow::bail!(
-                "p2p key at {} must be a regular file; directories, FIFOs, and special files are refused",
-                key_path.display()
-            );
-        }
 
         let euid = effective_uid();
         if let Some(err) = foreign_ownership_error("key", key_path, md.uid(), euid) {
@@ -784,23 +1112,9 @@ fn read_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
                 key_path.display()
             );
         }
+    }
 
-        read_bounded_key_bytes(&mut file, key_path)?
-    };
-
-    #[cfg(not(unix))]
-    let bytes = {
-        let data = std::fs::read(key_path)
-            .with_context(|| format!("failed to read p2p key from {}", key_path.display()))?;
-        if data.len() > MAX_P2P_KEY_BYTES {
-            anyhow::bail!(
-                "p2p key at {} exceeds the maximum accepted size of {} bytes",
-                key_path.display(),
-                MAX_P2P_KEY_BYTES
-            );
-        }
-        Zeroizing::new(data)
-    };
+    let bytes = read_bounded_key_bytes(&mut file, key_path)?;
 
     // An empty file decodes as a valid protobuf with a key type of RSA, so
     // without this the operator gets a misleading complaint about a missing
@@ -817,6 +1131,22 @@ fn read_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
         .with_context(|| format!("invalid p2p key in {}", key_path.display()))?;
     info!(path = %key_path.display(), "loaded existing p2p identity");
     Ok(kp)
+}
+
+/// Test-only convenience over the anchored read path: production callers hold
+/// the [`KeyDirHandle`] from [`ensure_key_dir`] and go through
+/// [`open_existing_key`] directly, so nothing outside the tests re-resolves
+/// the pathname here.
+#[cfg(test)]
+fn read_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> {
+    let dir = KeyDirHandle::open(key_parent(key_path))
+        .map_err(|e| describe_unusable_key_dir(key_parent(key_path), e))?;
+    let key_name = key_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("p2p key path {} names no file", key_path.display()))?;
+    let file = open_existing_key(&dir, key_name, key_path)?
+        .ok_or_else(|| anyhow::anyhow!("p2p key at {} does not exist", key_path.display()))?;
+    read_p2p_keypair_from(file, key_path)
 }
 
 /// Start the libp2p swarm. Returns a handle for sending commands and the
@@ -1181,6 +1511,18 @@ mod tests {
             );
             assert!(!leaked, "{path:?} must not have been created");
         }
+
+        // Beyond the probed names themselves: rejection must have caused no
+        // filesystem mutation at all, scratch files and directories included.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "rejected paths must leave the working directory untouched, found: {leftovers:?}"
+        );
 
         println!("p2p-key-backstop: asserted");
     }
@@ -1758,6 +2100,310 @@ mod tests {
             format!("{err:#}").contains("maximum accepted size"),
             "oversized refusal must name the size cap, got: {err:#}"
         );
+    }
+
+    /// Rule 2's parse-time half, in both directions, plus the invariant the
+    /// acceptance rule is designed around: any accepted suffix joins to a path
+    /// that still has home as a prefix. `PathBuf::join` replaces its base for
+    /// rooted (and, on Windows, prefixed) right-hand operands, and `..` walks
+    /// back out lexically, so those are exactly the rejected classes.
+    #[test]
+    fn tilde_suffix_escapes_home_matches_the_join_invariant() {
+        let accepted = [".gitlawb/p2p.key", "keys/p2p.key", "./keys/p2p.key"];
+        for suffix in accepted {
+            assert!(
+                !tilde_suffix_escapes_home(suffix),
+                "{suffix:?} stays beneath home and must be accepted"
+            );
+        }
+
+        for suffix in [
+            // `~//etc/p2p.key`: the doubled separator leaves a rooted suffix,
+            // and a rooted right-hand operand REPLACES home in `join`.
+            "/etc/p2p.key",
+            "//etc/p2p.key",
+            // Walks back out of home lexically.
+            "../etc/p2p.key",
+            "keys/../../p2p.key",
+        ] {
+            assert!(
+                tilde_suffix_escapes_home(suffix),
+                "{suffix:?} escapes home and must be rejected"
+            );
+        }
+
+        // Platform-prefixed forms replace the base in `join` even without a
+        // root, so they are escapes on the platform that parses them.
+        #[cfg(windows)]
+        for suffix in ["C:/p2p.key", r"C:p2p.key", r"\\srv\share\p2p.key"] {
+            assert!(
+                tilde_suffix_escapes_home(suffix),
+                "{suffix:?} carries a prefix and must be rejected"
+            );
+        }
+
+        // The invariant itself, on the accepted set.
+        let home = Path::new("/homes/gitlawb");
+        for suffix in accepted {
+            assert!(
+                home.join(suffix).starts_with(home),
+                "accepted suffix {suffix:?} must keep home as a prefix"
+            );
+        }
+    }
+
+    /// The key-storage contract, kept together in one table: which filesystem
+    /// objects at and around the key path boot, and which are refused — and
+    /// that every refusal leaves the filesystem exactly as it found it.
+    ///
+    /// Each row gets its own temp base (no cwd, no umask, no shared state).
+    /// Refused rows are compared against a full recursive snapshot (path,
+    /// type, mode, size) taken after setup, so an unintended chmod, a scratch
+    /// file, a followed symlink, or a created directory all fail the row.
+    /// The deep single-behavior tests around this one stay authoritative for
+    /// their details (identity stability, race convergence, tightening); this
+    /// table is the contract's index. The enabled/disabled and path-spelling
+    /// half of the matrix lives with `Config::validate`'s tests, which gate
+    /// on `p2p_port` before any of this code runs.
+    #[cfg(unix)]
+    #[test]
+    fn p2p_key_storage_contract_matrix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        enum Expect {
+            /// Must boot; the key must sit 0600 inside a 0700 directory and
+            /// reload to the same PeerId.
+            Boots,
+            /// Must fail with the needle in the message, mutating nothing.
+            Refused(&'static str),
+            /// Must fail promptly, mutating nothing; the message is
+            /// platform-dependent (e.g. what `open(2)` says about a socket).
+            RefusedAny,
+        }
+
+        struct Row {
+            name: &'static str,
+            setup: fn(&Path) -> std::path::PathBuf,
+            expect: Expect,
+        }
+
+        fn valid_key_at(path: &Path) {
+            let kp = identity::Keypair::generate_ed25519();
+            std::fs::write(path, kp.to_protobuf_encoding().unwrap()).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        /// Rows probing refusal of the key object itself pre-create the key
+        /// directory already at 0700: `ensure_key_dir` legitimately tightens
+        /// a looser directory on the way in (its own tests cover that), and
+        /// pre-tightening keeps this table's no-mutation assertion about the
+        /// refusal itself rather than about that documented repair.
+        fn key_dir_0700(base: &Path) -> std::path::PathBuf {
+            let dir = base.join("keys");
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            dir
+        }
+
+        /// (path, is_dir, is_symlink, mode, len) for every entry under `base`,
+        /// via `symlink_metadata` so links are recorded, not followed.
+        fn snapshot(base: &Path) -> Vec<(std::path::PathBuf, bool, bool, u32, u64)> {
+            let mut out = Vec::new();
+            let mut stack = vec![base.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(&dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    let md = std::fs::symlink_metadata(&path).unwrap();
+                    out.push((
+                        path.clone(),
+                        md.is_dir(),
+                        md.is_symlink(),
+                        md.permissions().mode(),
+                        md.len(),
+                    ));
+                    if md.is_dir() && !md.is_symlink() {
+                        stack.push(path);
+                    }
+                }
+            }
+            out.sort();
+            out
+        }
+
+        let rows = [
+            Row {
+                name: "fresh path under a real parent boots",
+                setup: |base| base.join("keys").join("p2p.key"),
+                expect: Expect::Boots,
+            },
+            Row {
+                name: "existing 0600 regular key boots",
+                setup: |base| {
+                    let dir = key_dir_0700(base);
+                    let path = dir.join("p2p.key");
+                    valid_key_at(&path);
+                    path
+                },
+                expect: Expect::Boots,
+            },
+            Row {
+                name: "symlinked parent is refused, target untouched",
+                setup: |base| {
+                    let target = base.join("real");
+                    std::fs::create_dir(&target).unwrap();
+                    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                    let link = base.join("keys");
+                    std::os::unix::fs::symlink(&target, &link).unwrap();
+                    link.join("p2p.key")
+                },
+                expect: Expect::Refused("symlink"),
+            },
+            Row {
+                name: "regular-file parent is refused, mode and content kept",
+                setup: |base| {
+                    let file = base.join("keys");
+                    std::fs::write(&file, b"payload").unwrap();
+                    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
+                        .unwrap();
+                    file.join("p2p.key")
+                },
+                expect: Expect::Refused("directory"),
+            },
+            Row {
+                name: "symlink at the key position is refused",
+                setup: |base| {
+                    let dir = base.join("keys");
+                    std::fs::create_dir(&dir).unwrap();
+                    let real = dir.join("real.key");
+                    valid_key_at(&real);
+                    let link = dir.join("p2p.key");
+                    std::os::unix::fs::symlink(&real, &link).unwrap();
+                    link
+                },
+                expect: Expect::Refused("symlink"),
+            },
+            Row {
+                name: "dangling symlink at the key position is refused",
+                setup: |base| {
+                    let dir = base.join("keys");
+                    std::fs::create_dir(&dir).unwrap();
+                    let link = dir.join("p2p.key");
+                    std::os::unix::fs::symlink(dir.join("absent"), &link).unwrap();
+                    link
+                },
+                expect: Expect::Refused("symlink"),
+            },
+            Row {
+                name: "directory at the key position is refused",
+                setup: |base| {
+                    let path = base.join("keys").join("p2p.key");
+                    std::fs::create_dir_all(&path).unwrap();
+                    path
+                },
+                expect: Expect::Refused("must name a key file"),
+            },
+            Row {
+                name: "FIFO at the key position is refused without blocking",
+                setup: |base| {
+                    let dir = key_dir_0700(base);
+                    let path = dir.join("p2p.key");
+                    let c_path =
+                        std::ffi::CString::new(path.to_str().expect("utf-8 path")).unwrap();
+                    // SAFETY: creates a FIFO at `c_path` with mode 0600.
+                    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+                    assert_eq!(rc, 0, "mkfifo: {}", std::io::Error::last_os_error());
+                    path
+                },
+                // No writer ever appears, so completing at all proves the
+                // non-blocking open; the message proves the explicit
+                // regular-file invariant on the opened object.
+                expect: Expect::Refused("regular file"),
+            },
+            Row {
+                name: "unix socket at the key position is refused",
+                setup: |base| {
+                    let dir = key_dir_0700(base);
+                    let path = dir.join("p2p.key");
+                    // The bound socket's fs entry outlives the listener.
+                    std::os::unix::net::UnixListener::bind(&path)
+                        .expect("bind a unix socket at the key path");
+                    path
+                },
+                expect: Expect::RefusedAny,
+            },
+            Row {
+                name: "oversized key is refused unread",
+                setup: |base| {
+                    let dir = key_dir_0700(base);
+                    let path = dir.join("p2p.key");
+                    std::fs::write(&path, vec![0u8; MAX_P2P_KEY_BYTES + 1]).unwrap();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                    path
+                },
+                expect: Expect::Refused("maximum accepted size"),
+            },
+            Row {
+                name: "loose 0644 key is refused, not regenerated",
+                setup: |base| {
+                    let dir = key_dir_0700(base);
+                    let path = dir.join("p2p.key");
+                    valid_key_at(&path);
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                        .unwrap();
+                    path
+                },
+                expect: Expect::Refused("0644"),
+            },
+        ];
+
+        for row in rows {
+            let base = tempfile::tempdir().unwrap();
+            let key_path = (row.setup)(base.path());
+
+            match row.expect {
+                Expect::Boots => {
+                    let kp = load_or_create_p2p_keypair(&key_path)
+                        .unwrap_or_else(|e| panic!("[{}] must boot, got: {e:#}", row.name));
+                    let key_mode =
+                        std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+                    assert_eq!(key_mode, 0o600, "[{}] key must be 0600", row.name);
+                    let dir_mode = std::fs::metadata(key_path.parent().unwrap())
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777;
+                    assert_eq!(dir_mode, 0o700, "[{}] key directory must be 0700", row.name);
+                    let reloaded = load_or_create_p2p_keypair(&key_path)
+                        .unwrap_or_else(|e| panic!("[{}] must reload, got: {e:#}", row.name));
+                    assert_eq!(
+                        PeerId::from(kp.public()),
+                        PeerId::from(reloaded.public()),
+                        "[{}] identity must be stable",
+                        row.name
+                    );
+                }
+                ref refusal => {
+                    let before = snapshot(base.path());
+                    let err = load_or_create_p2p_keypair(&key_path)
+                        .expect_err(&format!("[{}] must be refused", row.name));
+                    if let Expect::Refused(needle) = refusal {
+                        assert!(
+                            format!("{err:#}").contains(needle),
+                            "[{}] refusal must mention {needle:?}, got: {err:#}",
+                            row.name
+                        );
+                    }
+                    assert_eq!(
+                        before,
+                        snapshot(base.path()),
+                        "[{}] refusal must not mutate the filesystem",
+                        row.name
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(unix)]
