@@ -946,12 +946,59 @@ pub async fn git_receive_pack(
     let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
     let receive_result = smart_http::receive_pack(&disk_path, body, git_timeout).await;
 
+    // Buffer the protocol response while the lock is still held. `receive_pack`
+    // builds it from an in-memory `Vec<u8>`, so this costs a move rather than a
+    // read, and the bytes are the only place git says which refs it actually
+    // took: a zero exit means the process ran, not that every ref landed.
+    let receive_result = match receive_result {
+        Ok(resp) => buffer_receive_pack_response(resp).await,
+        Err(e) => Err(e),
+    };
+
+    // ── The two writes that publish a branch's new tip, INSIDE the lock ──
+    //
+    // Both used to run after `guard.release`, and both are unconditional
+    // last-write-wins on (repo, ref). Released first, two accepted pushes A then
+    // B for one branch race here: the git write lock ordered the ref updates,
+    // but nothing ordered these, so B's UPDATE can land before A's and leave the
+    // stored head — and therefore the pull request rollup, which prefers a
+    // non-null stored head over the fallback — pinned to the commit the branch
+    // no longer points at. `record_push_events` has the same inversion by a
+    // different route: `latest_push_sha_for_ref` reads the highest `seq`, and
+    // seq order is insert order, not receive-pack order.
+    //
+    // Holding the repository lock across them is what makes the database order
+    // equal the git order. It is a bounded, batched pair of statements against
+    // an already-open pool, on a path that just ran a subprocess over the whole
+    // pack, so the lock is held marginally longer for a property that cannot be
+    // recovered afterwards.
+    //
+    // The refs are the ACCEPTED ones, never the declared ones (see
+    // `accepted_ref_updates`): a ref receive-pack answered `ng` did not land,
+    // and publishing its SHA here would advertise a commit this node does not
+    // have and point the rollup at it.
+    let accepted: Vec<RefUpdate> = match &receive_result {
+        Ok((_, report)) => accepted_ref_updates(report, &ref_updates),
+        // Nothing is known to have landed, and nothing downstream of this runs:
+        // the `?` below turns the error into the response.
+        Err(_) => Vec::new(),
+    };
+    if !accepted.is_empty() {
+        // Keep the stored head of every open PR fed by this push in step with
+        // the branch, and let closed and merged PRs keep the head they froze at.
+        update_open_pr_heads(&state.db, &record.id, &accepted).await;
+        // Record the push for the catch-up poll surface, before the webhooks
+        // below fire. A subscriber whose delivery fails finds the work by
+        // polling instead.
+        record_push_events(&state.db, &record.id, &accepted).await;
+    }
+
     // Always release the advisory lock — even on error — to prevent stale locks
     // from blocking subsequent pushes. Only upload to Tigris when the push
     // succeeded; uploading a half-applied repo would propagate corruption.
     guard.release(receive_result.is_ok()).await;
 
-    let result = receive_result.map_err(|e| {
+    let (parts, report) = receive_result.map_err(|e| {
         let app = git_service_app_error(&e);
         match &app {
             AppError::Timeout(_) => tracing::warn!(repo = %name, "git receive-pack timed out"),
@@ -1014,17 +1061,8 @@ pub async fn git_receive_pack(
         }
     }
 
-    // Keep the stored head of every open PR fed by this push in step with the
-    // branch, and let closed and merged PRs keep the head they froze at.
-    if !ref_updates.is_empty() {
-        update_open_pr_heads(&state.db, &record.id, &ref_updates).await;
-    }
-
-    // Record the push for the catch-up poll surface, before the webhooks below
-    // fire. A subscriber whose delivery fails finds the work by polling instead.
-    if !ref_updates.is_empty() {
-        record_push_events(&state.db, &record.id, &ref_updates).await;
-    }
+    // `update_open_pr_heads` and `record_push_events` ran above, before the lock
+    // was released, over the ACCEPTED refs. They are not repeated here.
 
     // Fire push webhooks — one per ref update
     if !ref_updates.is_empty() {
@@ -1393,7 +1431,10 @@ pub async fn git_receive_pack(
         });
     }
 
-    Ok(result)
+    // The protocol response goes back to the client exactly as git wrote it,
+    // report-status and all: buffering it above changed what this node LEARNS
+    // from the push, never what the client is told about it.
+    Ok(Response::from_parts(parts, axum::body::Body::from(report)))
 }
 
 /// GET /api/v1/repos/{owner}/{repo}/refs
@@ -1663,10 +1704,75 @@ pub async fn get_icaptcha_proof(
 
 // ── Pkt-line parsing ──────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub(crate) struct RefUpdate {
     pub(crate) old_sha: String,
     pub(crate) new_sha: String,
     pub(crate) ref_name: String,
+}
+
+/// Split a `receive_pack` response into its head and its buffered body.
+///
+/// `smart_http::receive_pack` builds the body from a `Vec<u8>` it already holds,
+/// so this is a move rather than a read; the `usize::MAX` bound is the size of
+/// what git produced and not a limit the client can choose. The handler needs
+/// the bytes because the report-status inside them is the only statement git
+/// makes about which individual refs it took.
+async fn buffer_receive_pack_response(
+    resp: Response,
+) -> anyhow::Result<(axum::http::response::Parts, Vec<u8>)> {
+    let (parts, body) = resp.into_parts();
+    let bytes = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .map_err(|e| anyhow::anyhow!("could not read the receive-pack response: {e}"))?;
+    Ok((parts, bytes.to_vec()))
+}
+
+/// The subset of `declared` that receive-pack's report-status says it TOOK.
+///
+/// A zero exit from receive-pack means the process ran, not that the push
+/// applied: git reports a non-fast-forward, a hook rejection or a failed update
+/// as an `ng <ref> <reason>` pkt-line in a response that still exits zero. Every
+/// side effect keyed on the refs parsed from the REQUEST therefore publishes
+/// refs that were refused — a stored pull request head pointing at a commit this
+/// node does not have, and a push event handing a poller a SHA that resolves to
+/// nothing.
+///
+/// The three answers, and why each is what it is:
+///
+///   * `unpack fail` — the pack never landed, so no ref could have moved.
+///     Nothing is accepted.
+///   * a parsed report — only the refs it names with `ok`. A ref the report does
+///     not mention is not proven to have landed, and the failure that matters
+///     here is publishing a SHA that was never installed, so an unmentioned ref
+///     is left out rather than assumed.
+///   * NO parseable report — every declared ref, unchanged from the behaviour
+///     before this existed. A client that did not request `report-status` gets
+///     no report at all, and a truncated one says nothing either way; treating
+///     that silence as rejection would permanently drop the poll events for a
+///     push git really did accept, which is the failure the catch-up surface
+///     exists to prevent. This is the inconclusive case, and it is the one place
+///     the trade runs the other way.
+///
+/// The parser is [`smart_http::parse_report_status`], shared with PR #384 rather
+/// than written twice.
+fn accepted_ref_updates(report: &[u8], declared: &[RefUpdate]) -> Vec<RefUpdate> {
+    let Some((unpack_ok, results)) = smart_http::parse_report_status(report) else {
+        return declared.to_vec();
+    };
+    if !unpack_ok {
+        return Vec::new();
+    }
+    let landed: std::collections::HashSet<&str> = results
+        .iter()
+        .filter(|(_, ok)| *ok)
+        .map(|(ref_name, _)| ref_name.as_str())
+        .collect();
+    declared
+        .iter()
+        .filter(|u| landed.contains(u.ref_name.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// Record one catch-up poll event per ref update of a push.
@@ -1723,12 +1829,16 @@ pub(crate) const MAX_REFS_PER_PUSH: usize = 10_000;
 ///
 /// A 400, not a 429: the request itself is the problem and waiting will not make
 /// it acceptable. The message names the limit so a client can split the push.
+///
+/// The count it sees is a floor, not the request's true one:
+/// [`parse_ref_updates`] stops one past the limit, so a push of a million refs
+/// arrives here as `MAX_REFS_PER_PUSH + 1`. The message says "more than" rather
+/// than reporting a number that would be a lie.
 fn bound_declared_refs(ref_updates: &[RefUpdate]) -> Result<()> {
     if ref_updates.len() > MAX_REFS_PER_PUSH {
         return Err(AppError::BadRequest(format!(
-            "push declares {} ref updates, which is more than the {MAX_REFS_PER_PUSH} this node \
-             accepts in one request; push fewer refs at a time",
-            ref_updates.len()
+            "push declares more ref updates than the {MAX_REFS_PER_PUSH} this node accepts in \
+             one request; push fewer refs at a time"
         )));
     }
     Ok(())
@@ -1876,6 +1986,17 @@ async fn update_open_pr_heads(db: &crate::db::Db, repo_id: &str, ref_updates: &[
 
 /// Parse git receive-pack pkt-line ref updates from the request body.
 /// Format per line: `<40-hex-old> <40-hex-new> <refname>[NUL capabilities]\n`
+///
+/// STOPS one past [`MAX_REFS_PER_PUSH`], which is the point of the cap rather
+/// than an optimisation of it. The git routes raise the transport body limit to
+/// GITLAWB_MAX_PACK_BYTES (2 GB by default), so before this bound a signed
+/// caller could make the node scan the whole body and allocate three `String`s
+/// for every well-formed pkt-line in it, and only then be told 400 by
+/// [`bound_declared_refs`] — the work the cap exists to refuse, done in full
+/// before the refusal. Stopping at the limit plus one leaves
+/// `bound_declared_refs` a value it can still refuse on while bounding what is
+/// retained, and the returned count is deliberately not the request's real one
+/// (see that function).
 fn parse_ref_updates(body: &[u8]) -> Vec<RefUpdate> {
     let mut updates = Vec::new();
     let mut pos = 0;
@@ -1921,6 +2042,12 @@ fn parse_ref_updates(body: &[u8]) -> Vec<RefUpdate> {
                 new_sha: parts[1].to_string(),
                 ref_name: parts[2].to_string(),
             });
+            // One past the cap is enough for `bound_declared_refs` to refuse.
+            // Everything after it would be scanned and allocated only to be
+            // thrown away with the request.
+            if updates.len() > MAX_REFS_PER_PUSH {
+                break;
+            }
         }
     }
 
@@ -3036,10 +3163,53 @@ mod tests {
         .expect("git_receive_pack not found (renamed or removed?)");
 
         assert!(
-            body.contains("update_open_pr_heads(&state.db, &record.id, &ref_updates)"),
-            "the receive-pack handler must feed the parsed ref updates to the \
+            body.contains("update_open_pr_heads(&state.db, &record.id, &accepted)"),
+            "the receive-pack handler must feed the ACCEPTED ref updates to the \
              stored-head update; without that call every head-maintenance test \
-             here passes against a helper nothing invokes"
+             here passes against a helper nothing invokes, and with the DECLARED \
+             set it moves heads to refs git refused"
+        );
+        assert!(
+            body.contains("record_push_events(&state.db, &record.id, &accepted)"),
+            "the poll surface must be fed the accepted ref updates for the same \
+             two reasons"
+        );
+    }
+
+    /// Both writes that publish a branch's new tip happen while the repository
+    /// write lock is still held.
+    ///
+    /// The lock is what orders two concurrent pushes to one branch. Released
+    /// first, the pair below is an unordered race: the later push's UPDATE can
+    /// land before the earlier one's and leave the stored head — which the
+    /// rollup prefers over its fallback — pinned to a commit the branch has
+    /// moved past. There is no per-row version to make the UPDATE conditional
+    /// on, so the ordering has to come from the lock, and that is a property of
+    /// WHERE the calls sit rather than of what they do.
+    #[test]
+    fn the_head_and_event_writes_happen_before_the_lock_is_released() {
+        let src = include_str!("repos.rs");
+        let body = crate::test_support::scrape_source_region(
+            src,
+            Some("fn git_receive_pack("),
+            Some("\n}"),
+        )
+        .expect("git_receive_pack not found (renamed or removed?)");
+
+        let heads = body
+            .find("update_open_pr_heads(&state.db, &record.id, &accepted)")
+            .expect("the stored-head update must be called from the push handler");
+        let events = body
+            .find("record_push_events(&state.db, &record.id, &accepted)")
+            .expect("the push-event recorder must be called from the push handler");
+        let release = body
+            .find("guard.release(")
+            .expect("the write lock release must still be in the push handler");
+
+        assert!(
+            heads < release && events < release,
+            "both writes must run before guard.release; after it, two accepted \
+             pushes for one branch are ordered by nothing at all"
         );
     }
 
@@ -3183,6 +3353,163 @@ mod tests {
         assert_eq!(head_of(&db, "repo-fan", 2).await, Some(sha_for(3)));
     }
 
+    // ── receive-pack report-status ────────────────────────────────────────
+    //
+    // These drive `accepted_ref_updates`, which is the consumer of the parser
+    // ported from PR #384; testing through it covers both without duplicating
+    // the parser's own test surface in `git/smart_http.rs`.
+
+    /// One pkt-line: four lowercase hex length digits (covering themselves)
+    /// followed by the payload.
+    fn pkt(payload: &str) -> String {
+        format!("{:04x}{}", payload.len() + 4, payload)
+    }
+
+    /// The report as receive-pack writes it when the client did NOT ask for
+    /// `side-band-64k`: bare pkt-lines, no channel byte.
+    fn plain_report(lines: &[&str]) -> Vec<u8> {
+        let mut out = String::new();
+        for line in lines {
+            out.push_str(&pkt(&format!("{line}\n")));
+        }
+        out.push_str("0000");
+        out.into_bytes()
+    }
+
+    /// The report as receive-pack actually writes it for a `git push` over
+    /// smart HTTP, which negotiates `side-band-64k`.
+    ///
+    /// The framing here is not invented: it is the byte layout captured from
+    /// `git receive-pack` 2.50.1 refusing one ref of a two-ref push. The report
+    /// is DOUBLE wrapped — an outer pkt-line carrying a band byte, whose
+    /// payload is itself a pkt-line stream — and a band-2 packet carrying the
+    /// hook's stderr sits ahead of it. A parser that peels only the outer layer
+    /// sees `000eunpack ok` as its first line, fails to match, and answers
+    /// "cannot tell" for every push it exists to classify.
+    fn sideband_report(stderr: &str, lines: &[&str]) -> Vec<u8> {
+        let mut out = String::new();
+        if !stderr.is_empty() {
+            out.push_str(&pkt(&format!("\x02{stderr}\n")));
+        }
+        let mut inner = String::new();
+        for line in lines {
+            inner.push_str(&pkt(&format!("{line}\n")));
+        }
+        inner.push_str("0000");
+        out.push_str(&pkt(&format!("\x01{inner}")));
+        out.push_str("0000");
+        out.into_bytes()
+    }
+
+    fn names(updates: &[RefUpdate]) -> Vec<&str> {
+        updates.iter().map(|u| u.ref_name.as_str()).collect()
+    }
+
+    fn two_ref_push() -> Vec<RefUpdate> {
+        vec![
+            ref_update("refs/heads/main", PR_SHA_OLD, PR_SHA_NEW),
+            ref_update("refs/heads/third", ZERO_SHA, PR_SHA_NEW),
+        ]
+    }
+
+    /// A ref receive-pack answered `ng` is not applied, and nothing keyed on the
+    /// push may treat it as though it were.
+    ///
+    /// receive-pack exits ZERO here. The pack unpacked, one ref moved, and the
+    /// other was refused as a non-fast-forward — a per-ref verdict carried only
+    /// in the `ng` pkt-line of a response the handler used to forward without
+    /// reading. Every side effect derived from the REQUEST therefore fired for
+    /// the refused ref too: the pull request on that branch had its stored head
+    /// moved to a commit this node does not have, and the poll surface handed
+    /// subscribers a SHA that resolves to nothing.
+    #[test]
+    fn only_the_refs_receive_pack_accepted_survive() {
+        let declared = two_ref_push();
+        let report = sideband_report(
+            "error: denying non-fast-forward refs/heads/main (you should pull first)",
+            &[
+                "unpack ok",
+                "ng refs/heads/main non-fast-forward",
+                "ok refs/heads/third",
+            ],
+        );
+
+        assert_eq!(
+            names(&accepted_ref_updates(&report, &declared)),
+            vec!["refs/heads/third"],
+            "a refused ref must not reach the writes that publish a branch tip"
+        );
+
+        // The control: the same push with both refs taken keeps both, so what
+        // the filter removes is the rejection and not simply the second ref.
+        let all_ok = sideband_report(
+            "",
+            &["unpack ok", "ok refs/heads/main", "ok refs/heads/third"],
+        );
+        assert_eq!(
+            names(&accepted_ref_updates(&all_ok, &declared)),
+            vec!["refs/heads/main", "refs/heads/third"],
+            "an accepted push must keep every ref it declared"
+        );
+    }
+
+    /// `unpack fail` means the pack never landed, so no ref could have moved,
+    /// whatever else the report goes on to say.
+    #[test]
+    fn an_unpack_failure_accepts_nothing() {
+        let declared = two_ref_push();
+        let report = plain_report(&["unpack fail", "ng refs/heads/main unpacker error"]);
+        assert!(
+            accepted_ref_updates(&report, &declared).is_empty(),
+            "nothing lands when the pack itself did not unpack"
+        );
+    }
+
+    /// The non-sideband framing parses too — a client that did not negotiate
+    /// `side-band-64k` still gets its refs classified.
+    #[test]
+    fn the_plain_pkt_line_report_is_read_as_well_as_the_sideband_one() {
+        let declared = two_ref_push();
+        let report = plain_report(&[
+            "unpack ok",
+            "ng refs/heads/main non-fast-forward",
+            "ok refs/heads/third",
+        ]);
+        assert_eq!(
+            names(&accepted_ref_updates(&report, &declared)),
+            vec!["refs/heads/third"]
+        );
+    }
+
+    /// No report at all is INCONCLUSIVE, and inconclusive keeps every ref.
+    ///
+    /// A client that never requested `report-status` is told nothing about
+    /// individual refs, and neither is a reader of a truncated response. Reading
+    /// that silence as rejection would drop the poll events and the head update
+    /// for a push git really did accept — permanently, since nothing re-derives
+    /// them — which is the failure the catch-up surface exists to prevent. This
+    /// is the one place the trade runs toward keeping rather than dropping, and
+    /// it is also what makes the change a no-op for clients that say nothing.
+    #[test]
+    fn an_unreadable_report_leaves_every_declared_ref_in_place() {
+        let declared = two_ref_push();
+        for (label, report) in [
+            ("empty", Vec::new()),
+            ("flush only", b"0000".to_vec()),
+            (
+                "not a report",
+                b"random bytes that are not pkt-lines".to_vec(),
+            ),
+            ("truncated", b"0057\x01000eunpack o".to_vec()),
+        ] {
+            assert_eq!(
+                names(&accepted_ref_updates(&report, &declared)).len(),
+                2,
+                "a {label} report says nothing either way and must not drop refs"
+            );
+        }
+    }
+
     /// The total-ref bound refuses, and it refuses BEFORE git is handed the
     /// pack: at the bound the push is admitted, one over it is a 400 naming the
     /// limit.
@@ -3204,6 +3531,55 @@ mod tests {
             err.to_string().contains(&MAX_REFS_PER_PUSH.to_string()),
             "the refusal must name the limit the client has to get under, got: {err}"
         );
+    }
+
+    /// A receive-pack request body carrying `n` well-formed ref-update lines.
+    fn ref_update_request(n: usize) -> Vec<u8> {
+        let mut out = String::new();
+        for i in 0..n {
+            out.push_str(&pkt(&format!(
+                "{PR_SHA_OLD} {} refs/heads/b{i}\n",
+                sha_for(i)
+            )));
+        }
+        out.push_str("0000");
+        out.into_bytes()
+    }
+
+    /// The parser STOPS at the cap instead of scanning and allocating the whole
+    /// request and being refused afterwards.
+    ///
+    /// The bound was worth nothing where it stood. Git routes raise the body
+    /// limit to GITLAWB_MAX_PACK_BYTES — 2 GB by default — and `parse_ref_updates`
+    /// ran over the entire body first, keeping three heap-allocated strings for
+    /// every valid pkt-line in it; `bound_declared_refs` then reported a 400
+    /// against a vector that had already cost exactly the work the cap exists to
+    /// refuse, and concurrent requests multiplied it.
+    ///
+    /// The two arms are the whole property: one past the cap is retained, so the
+    /// refusal still fires, and nothing beyond that is. The control at the cap
+    /// shows the early stop did not start truncating ordinary pushes.
+    #[test]
+    fn the_ref_parser_stops_one_past_the_bound_instead_of_scanning_the_whole_body() {
+        let far_over = parse_ref_updates(&ref_update_request(MAX_REFS_PER_PUSH * 3));
+        assert_eq!(
+            far_over.len(),
+            MAX_REFS_PER_PUSH + 1,
+            "the parser must stop as soon as the cap is exceeded, not at the end \
+             of whatever the client sent"
+        );
+        assert!(
+            bound_declared_refs(&far_over).is_err(),
+            "what the parser kept must still be enough to refuse on"
+        );
+
+        let at = parse_ref_updates(&ref_update_request(MAX_REFS_PER_PUSH));
+        assert_eq!(
+            at.len(),
+            MAX_REFS_PER_PUSH,
+            "a push exactly at the cap must be parsed in full"
+        );
+        assert!(bound_declared_refs(&at).is_ok());
     }
 
     /// The bound is only worth anything ahead of the accept. It runs before the
@@ -3515,11 +3891,12 @@ mod push_event_wiring_tests {
         .expect("git_receive_pack not found (renamed or removed?)");
 
         assert!(
-            body.contains("record_push_events(&state.db, &record.id, &ref_updates)"),
-            "the receive-pack handler must feed the parsed ref updates to the \
+            body.contains("record_push_events(&state.db, &record.id, &accepted)"),
+            "the receive-pack handler must feed the ACCEPTED ref updates to the \
              push-event recorder; without that call the catch-up poll surface is \
              fed by nothing and every scenario test for it passes against a \
-             helper the push path never invokes"
+             helper the push path never invokes, and with the DECLARED set it \
+             publishes SHAs git refused"
         );
     }
 

@@ -86,6 +86,127 @@ pub async fn receive_pack(
         .body(Body::from(output))?)
 }
 
+// ── receive-pack report-status ────────────────────────────────────────────
+//
+// PORTED VERBATIM from PR #384 (`fix/issue-26-split-1-durable-post-receive`),
+// which introduced these two functions for the same reason: `receive_pack`
+// forwards git's protocol response untouched, and a zero exit says nothing
+// about whether any individual ref was taken. Kept byte-for-byte identical so
+// the two branches converge on one parser rather than growing two that disagree
+// about what "accepted" means; whichever lands second should drop its copy.
+
+/// Parse the git-receive-pack report-status output to determine per-ref
+/// success/failure. Returns `(unpack_ok, per_ref_results)` where
+/// `per_ref_results` is a list of `(ref_name, is_ok)`.
+///
+/// The report-status format (after the sideband framing) is:
+/// ```text
+/// unpack ok\n          (or: unpack fail\n)
+/// ok <refname>\n       (per successful ref)
+/// ng <refname> <reason>\n  (per rejected ref)
+/// \n                   (empty line terminates)
+/// ```
+///
+/// Returns `None` if the output cannot be parsed (e.g. the client did
+/// not request report-status, or the output is truncated). In that
+/// case the caller should treat all refs as uncertain.
+pub fn parse_report_status(output: &[u8]) -> Option<(bool, Vec<(String, bool)>)> {
+    let text = std::str::from_utf8(output).ok()?;
+    // Strip sideband framing: each line starts with a pkt-line length
+    // prefix and a channel byte (1 = stdout, 2 = stderr). The actual
+    // data starts after the first `0000` flush packet or after we
+    // strip sideband bytes.
+    let stripped = strip_sideband(text)?;
+    // DIVERGES FROM #384 by these three lines, and deliberately.
+    //
+    // When the client asked for `side-band-64k` — which `git push` over smart
+    // HTTP does — receive-pack multiplexes the report onto band 1, and what
+    // travels on that band is itself a pkt-line stream. One pass of
+    // `strip_sideband` peels the outer framing and leaves `000eunpack ok\n...`,
+    // whose first line is not `unpack ok`, so the parse below returns None and
+    // every ref falls back to inconclusive: the parser would answer "cannot
+    // tell" for exactly the pushes it exists to classify. A second pass peels
+    // the inner layer. It is a no-op on the single-wrapped shape, because
+    // plain report text does not begin with four hex digits and
+    // `strip_sideband` declines it.
+    let stripped = strip_sideband(&stripped).unwrap_or(stripped);
+    let lines: Vec<&str> = stripped.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+
+    // First non-empty line is "unpack ok" or "unpack fail".
+    let unpack_line = lines.iter().find(|l| !l.is_empty())?;
+    let unpack_ok = if unpack_line.starts_with("unpack ok") {
+        true
+    } else if unpack_line.starts_with("unpack fail") {
+        false
+    } else {
+        return None;
+    };
+
+    let mut results = Vec::new();
+    for line in &lines[1..] {
+        let line = line.trim();
+        if line.is_empty() {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("ok ") {
+            results.push((rest.to_string(), true));
+        } else if let Some(rest) = line.strip_prefix("ng ") {
+            // "ng <refname> <reason>" — skip the reason
+            let ref_name = rest.split_whitespace().next()?.to_string();
+            results.push((ref_name, false));
+        }
+    }
+
+    Some((unpack_ok, results))
+}
+
+/// Strip git sideband framing from a pkt-line encoded output.
+/// Sideband-encoded lines start with a 4-hex-digit length, then a
+/// channel byte (0x01=stdout, 0x02=stderr), then payload. Returns
+/// the decoded payload lines concatenated, or `None` if the framing
+/// is malformed.
+fn strip_sideband(text: &str) -> Option<String> {
+    let mut output = String::new();
+    let mut pos = 0;
+    let bytes = text.as_bytes();
+
+    loop {
+        if pos + 4 > bytes.len() {
+            break;
+        }
+        let len_str = std::str::from_utf8(&bytes[pos..pos + 4]).ok()?;
+        let len = usize::from_str_radix(len_str, 16).ok()?;
+        if len == 0 {
+            // Flush packet — end of sideband stream
+            break;
+        }
+        if len < 4 || pos + len > bytes.len() {
+            break;
+        }
+        let pkt_data = std::str::from_utf8(&bytes[pos + 4..pos + len]).ok()?;
+        pos += len;
+
+        // Sideband: first byte is channel (1=stdout, 2=stderr)
+        if let Some(payload) = pkt_data.strip_prefix('\x01') {
+            output.push_str(payload);
+        } else if pkt_data.starts_with('\x02') {
+            // stderr — skip (git error messages)
+        } else {
+            // Not sideband encoded — pass through
+            output.push_str(pkt_data);
+        }
+    }
+
+    if output.is_empty() {
+        None
+    } else {
+        Some(output)
+    }
+}
+
 /// Sends SIGTERM to a child's whole process group on drop, unless disarmed first.
 ///
 /// A served `git upload-pack`/`receive-pack` forks helpers such as `pack-objects`.
