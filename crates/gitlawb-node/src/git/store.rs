@@ -25,8 +25,122 @@ pub fn init_bare(path: &Path) -> Result<()> {
     // Write a default HEAD pointing to main
     std::fs::write(path.join("HEAD"), "ref: refs/heads/main\n")?;
 
+    // #26 Split PR 1: turn reflogs ON for this bare repo. `core.logAllRefUpdates`
+    // defaults to FALSE for bare repositories, so without this a bare repo keeps no
+    // record of what a ref did — only what it currently points at.
+    //
+    // The durable post-receive outbox's startup reconcile needs exactly that record.
+    // Its job is to decide whether a `prepared` transition (old -> new) actually
+    // LANDED after a crash, and the current SHA alone cannot answer that: a row
+    // claiming B -> A also "matches" a ref that was already sitting at A for some
+    // unrelated reason, and promoting it would write a push event, a certificate,
+    // and an anchor for a transition that never happened. The reflog is git's own
+    // per-ref landing record — one line per update carrying `<old> <new>` plus the
+    // time it happened — so [`ref_reflog_entries`] can prove the ref moved the way
+    // the row claims, and prove it moved AFTER the row was written.
+    //
+    // Failure is non-fatal on purpose: a repo without reflogs still serves every
+    // git operation, it only loses AUTOMATIC crash recovery for its outbox rows
+    // (the reconcile leaves those rows `prepared` for human-attended recovery
+    // rather than promoting something it cannot prove).
+    let config = Command::new("git")
+        .args(["config", "core.logAllRefUpdates", "true"])
+        .current_dir(path)
+        .output();
+    match config {
+        Ok(out) if !out.status.success() => {
+            tracing::warn!(
+                path = %path.display(),
+                stderr = %String::from_utf8_lossy(&out.stderr),
+                "failed to enable core.logAllRefUpdates; durable-outbox reconcile will \
+                 not be able to prove ref landings for this repo"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                err = %e,
+                "failed to run git config core.logAllRefUpdates; durable-outbox reconcile \
+                 will not be able to prove ref landings for this repo"
+            );
+        }
+        Ok(_) => {}
+    }
+
     tracing::info!("initialized bare repo at {}", path.display());
     Ok(())
+}
+
+/// One parsed reflog entry: the `<old> <new>` pair a single ref update recorded,
+/// plus the unix timestamp git stamped it with.
+///
+/// This is the unit of PER-REF LANDING PROOF the durable-outbox reconcile runs on.
+/// A row that claims `old -> new` is only promoted when the ref's reflog carries an
+/// entry with the same pair, stamped at or after the row was written; see
+/// [`crate::durable_outbox::reconcile_prepared_from_disk`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReflogEntry {
+    pub old_sha: String,
+    pub new_sha: String,
+    /// Seconds since the unix epoch, as git wrote them.
+    pub at: i64,
+}
+
+/// Read the reflog of one ref in a bare repository, newest entry LAST.
+///
+/// Reads `logs/<ref_name>` directly rather than shelling out to `git reflog`: the
+/// file format is stable and documented, the reconcile may call this once per
+/// stranded row at startup, and a plain file read cannot be defeated by the ref's
+/// reflog having been expired out of the `git reflog show` default window.
+///
+/// Returns `Ok(None)` when the repo keeps no reflog for that ref — either because
+/// `core.logAllRefUpdates` was off when the ref moved (repos created before
+/// [`init_bare`] started enabling it) or because the ref was deleted (git removes a
+/// deleted ref's reflog with it). `None` is NOT evidence that nothing landed; it is
+/// the absence of evidence, and callers must treat it as "unproven", never as
+/// "proven false".
+///
+/// Line format (`git-check-ref-format`/`refs` docs):
+/// `<old-sha> <new-sha> <committer name> <email> <unix-ts> <tz>\t<message>`
+pub fn ref_reflog_entries(repo_path: &Path, ref_name: &str) -> Result<Option<Vec<ReflogEntry>>> {
+    // Refuse anything that could climb out of `logs/`. Ref names are validated at
+    // the push edge, but this function takes a name off a DB row, so it re-checks
+    // rather than trusting the row.
+    if ref_name.is_empty()
+        || ref_name.contains("..")
+        || ref_name.starts_with('/')
+        || !ref_name.starts_with("refs/")
+    {
+        bail!("refusing to read a reflog for a non-refs/ ref name: {ref_name}");
+    }
+    let path = repo_path.join("logs").join(ref_name);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("failed to read reflog"),
+    };
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        // The message after the TAB can contain anything, including spaces and
+        // (in a `git commit -m` subject) tabs of its own, so split the header off
+        // at the FIRST tab and tokenize only that.
+        let header = line.split('\t').next().unwrap_or(line);
+        let tokens: Vec<&str> = header.split_whitespace().collect();
+        // `<old> <new> <ident...> <ts> <tz>`: at minimum old, new, ts, tz.
+        if tokens.len() < 4 {
+            continue;
+        }
+        let at = match tokens[tokens.len() - 2].parse::<i64>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        out.push(ReflogEntry {
+            old_sha: tokens[0].to_string(),
+            new_sha: tokens[1].to_string(),
+            at,
+        });
+    }
+    Ok(Some(out))
 }
 
 /// Check if a path contains a valid bare git repository.
@@ -881,6 +995,80 @@ mod tests {
     use super::branch_diff_names;
     use std::path::Path;
     use std::process::Command;
+
+    /// #26 split 1/4: a bare repo this node creates must KEEP REFLOGS, because
+    /// the durable-outbox reconcile has no other way to prove that a stranded
+    /// transition actually landed. `core.logAllRefUpdates` defaults to false for
+    /// bare repos, so without the explicit config a crashed push is unrecoverable
+    /// — the reconcile can see where a ref points, never how it got there.
+    ///
+    /// MUTATION (RED): drop the `git config core.logAllRefUpdates` call in
+    /// `init_bare` and no `logs/refs/heads/main` file appears.
+    #[test]
+    fn init_bare_keeps_reflogs_so_a_landing_can_be_proven() {
+        let td = tempfile::TempDir::new().unwrap();
+        let bare = td.path().join("repo.git");
+        super::init_bare(&bare).unwrap();
+
+        // Build a commit and move a ref onto it, the way receive-pack would.
+        let run = |args: &[&str]| -> String {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&bare)
+                .stdin(std::process::Stdio::null())
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let tree = run(&["mktree"]);
+        let commit = run(&["commit-tree", &tree, "-m", "root"]);
+        run(&["update-ref", "refs/heads/main", &commit]);
+
+        let entries = super::ref_reflog_entries(&bare, "refs/heads/main")
+            .unwrap()
+            .expect("a repo created by init_bare keeps a reflog for its refs");
+        assert_eq!(entries.len(), 1, "one update, one entry");
+        assert_eq!(
+            entries[0].old_sha, "0000000000000000000000000000000000000000",
+            "the entry records where the ref came FROM — the half a current-SHA \
+             check can never recover"
+        );
+        assert_eq!(entries[0].new_sha, commit);
+        assert!(
+            entries[0].at > 0,
+            "the entry is timestamped, so proof can be required to postdate the intent"
+        );
+    }
+
+    /// A ref with no reflog reads as `None` — "no evidence", which callers must
+    /// treat as unproven rather than as proof of nothing having happened.
+    #[test]
+    fn ref_reflog_entries_is_none_when_the_repo_kept_no_log() {
+        let td = tempfile::TempDir::new().unwrap();
+        let bare = td.path().join("repo.git");
+        super::init_bare(&bare).unwrap();
+        assert!(
+            super::ref_reflog_entries(&bare, "refs/heads/never-existed")
+                .unwrap()
+                .is_none(),
+            "a missing reflog is None, not an empty proof set"
+        );
+        // A name that could climb out of `logs/` is refused outright.
+        assert!(
+            super::ref_reflog_entries(&bare, "../../etc/passwd").is_err(),
+            "reflog lookups take a ref name off a DB row, so the path is re-checked"
+        );
+    }
 
     #[test]
     fn branch_diff_names_lists_changed_paths() {

@@ -64,6 +64,34 @@ const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 /// human-attended recovery. This is the second correctness barrier,
 /// and the reason a `prepared` row that happens to match a current
 /// on-disk SHA does not silently turn into completed accounting.
+///
+/// P1 (reviewer round 3, second half): the SHA check plus the age
+/// window is still not landing PROOF. The reviewer's case is
+/// `old = B, new = A` on a ref that was ALREADY sitting at A — which
+/// is not an exotic coincidence but the ordinary shape of a REJECTED
+/// push, because git refuses an update whose expected old value does
+/// not match the ref. Both checks pass, the push never happened, and
+/// the drain would sign a certificate for it.
+///
+/// The live path answers this from git's `report-status` body; that
+/// body is long gone by the time the reconcile runs, so the proof is
+/// re-derived from the repository itself: the ref's REFLOG must carry
+/// an entry whose `<old> <new>` pair is exactly this row's, stamped at
+/// or after the row was written (see [`reflog_proves_landing`]). That
+/// is git's own record of the ref MOVING the way the row claims, after
+/// the intent was durable, which is precisely what a coincidental tip
+/// cannot produce.
+///
+/// Deletions are exempt from the reflog half: git removes a ref's
+/// reflog when it removes the ref, so absence of the ref plus the age
+/// window is all the evidence that can exist for one.
+///
+/// No reflog means NO PROOF, and no proof means no promotion — the row
+/// stays put and is logged for human-attended recovery.
+/// [`crate::git::store::init_bare`] turns `core.logAllRefUpdates` on
+/// for every repo this node creates (bare repos default it off), so
+/// the gap is repos predating that. Deliberate trade: a stranded row
+/// an operator can see beats accounting the node cannot substantiate.
 pub async fn reconcile_prepared_from_disk(state: AppState, limit: i64) -> anyhow::Result<usize> {
     // P1 (reviewer-1/2 round 3): also reconcile `uncertain` rows,
     // not just `prepared`. A receive-pack error that leaves rows
@@ -150,9 +178,11 @@ pub async fn reconcile_prepared_from_disk(state: AppState, limit: i64) -> anyhow
             // SHA matched (or deletion confirmed by absent ref). Before
             // promoting, confirm the row is recent enough to be the
             // transition that produced the current on-disk state.
-            let row_age = DateTime::parse_from_rfc3339(&row.created_at)
+            let row_created_at = DateTime::parse_from_rfc3339(&row.created_at)
                 .ok()
-                .map(|t| Utc::now().signed_duration_since(t.with_timezone(&Utc)))
+                .map(|t| t.with_timezone(&Utc));
+            let row_age = row_created_at
+                .map(|t| Utc::now().signed_duration_since(t))
                 .unwrap_or_else(|| {
                     tracing::warn!(
                         row_id = %row.id,
@@ -175,6 +205,33 @@ pub async fn reconcile_prepared_from_disk(state: AppState, limit: i64) -> anyhow
                 );
                 continue;
             }
+            // P1 (reviewer round 3): landing PROOF, not just a matching
+            // tip. The reflog must show this exact `old -> new` move,
+            // stamped after the row was written. Deletions are exempt —
+            // a deleted ref takes its reflog with it, so absence plus
+            // the age window above is the whole evidence set for one.
+            if !is_deletion
+                && !reflog_proves_landing(
+                    disk_path,
+                    &row.ref_name,
+                    &row.old_sha,
+                    &row.new_sha,
+                    row_created_at,
+                )
+            {
+                tracing::warn!(
+                    row_id = %row.id,
+                    request_id = %row.request_id,
+                    repo_id = %row.repo_id,
+                    ref_name = %row.ref_name,
+                    row_old_sha = %row.old_sha,
+                    row_new_sha = %row.new_sha,
+                    "reconcile: the ref sits at the row's new_sha but no reflog entry proves THIS \
+                     transition landed (a coincidental tip, or a repo without \
+                     core.logAllRefUpdates); staying prepared (human-attended recovery)"
+                );
+                continue;
+            }
             to_promote.push(row.id.clone());
         }
     }
@@ -191,6 +248,64 @@ pub async fn reconcile_prepared_from_disk(state: AppState, limit: i64) -> anyhow
     }
     Ok(flipped as usize)
 }
+
+/// Does the ref's reflog prove that THIS row's transition landed?
+///
+/// True only when `logs/<ref>` carries an entry whose `<old> <new>`
+/// pair is exactly this row's, stamped at or after the row became
+/// durable (allowing [`REFLOG_CLOCK_SKEW`], since git stamps whole
+/// seconds while `created_at` carries sub-second precision). The
+/// timestamp half is what separates a landing from a LATER push that
+/// re-introduced the same pair: proof must postdate the intent it
+/// proves.
+///
+/// False whenever proof is UNAVAILABLE — no reflog file (a repo
+/// predating `core.logAllRefUpdates` in
+/// [`crate::git::store::init_bare`]), an unreadable one, or no
+/// matching entry. Absence of evidence is not evidence, so the caller
+/// leaves such rows where they are instead of deciding either way.
+fn reflog_proves_landing(
+    disk_path: &std::path::Path,
+    ref_name: &str,
+    old_sha: &str,
+    new_sha: &str,
+    row_created_at: Option<DateTime<Utc>>,
+) -> bool {
+    let entries = match crate::git::store::ref_reflog_entries(disk_path, ref_name) {
+        Ok(Some(entries)) => entries,
+        Ok(None) => return false,
+        Err(e) => {
+            tracing::warn!(
+                err = %e,
+                ref_name = %ref_name,
+                "reconcile: could not read the ref's reflog; treating the landing as unproven"
+            );
+            return false;
+        }
+    };
+    // No parseable `created_at` means no lower bound to check an entry
+    // against, and the age gate above has already refused such a row;
+    // refuse here too rather than accept an entry of any age.
+    let Some(created_at) = row_created_at else {
+        return false;
+    };
+    let floor = created_at.timestamp() - REFLOG_CLOCK_SKEW.num_seconds();
+    entries
+        .iter()
+        .any(|e| e.old_sha == old_sha && e.new_sha == new_sha && e.at >= floor)
+}
+
+/// How far BEFORE a row's `created_at` a reflog entry may be stamped
+/// and still count as proof of that row's landing.
+///
+/// Git writes whole-second reflog timestamps while `created_at` is an
+/// RFC 3339 instant with sub-second precision, so a ref that landed
+/// 200ms after the intent was written can carry a reflog stamp one
+/// second EARLIER than the row. The tolerance covers that truncation
+/// and small clock jitter; it is deliberately far smaller than
+/// [`MAX_RECONCILE_AGE`], so it cannot readmit an old entry left by a
+/// previous push of the same pair.
+pub const REFLOG_CLOCK_SKEW: chrono::Duration = chrono::Duration::seconds(60);
 
 /// P2 (reviewer-1/2 round 3): multi-pass reconcile for the prepared/
 /// uncertain backlog. Mirrors `drain_pending_ref_transitions_all`:
@@ -1149,6 +1264,235 @@ mod drain_tests {
             .await
             .unwrap();
         assert_eq!(n, 1, "fresh row with matching SHA is promoted");
+    }
+
+    // ----- P1 (reviewer round 3, second half): reflog landing proof -----
+    //
+    // The SHA match plus the age window says "the ref is where the row
+    // wanted it". It does NOT say the row's push is what put it there.
+    // These tests pin the difference, which is what
+    // `reflog_proves_landing` decides.
+
+    /// THE reviewer's case. A row claims `B -> A` while the ref has been
+    /// sitting at A all along — the ordinary shape of a REJECTED push,
+    /// since git refuses an update whose expected old value is stale.
+    /// The SHA matches and the row is fresh, so only the reflog refuses
+    /// it; without that refusal the drain writes a push event, a signed
+    /// certificate and an anchor for a transition that never happened.
+    ///
+    /// MUTATION (RED): drop the `reflog_proves_landing` gate and this
+    /// promotes 1.
+    #[sqlx::test]
+    async fn reconcile_refuses_a_coincidental_tip_with_no_reflog_proof(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        crate::git::store::init_bare(&bare).expect("init_bare");
+        // The ref reached A by an unrelated update: its reflog says
+        // `0{40} -> A`, never `B -> A`.
+        let on_disk_sha = seed_ref_on_bare(&bare, "refs/heads/main");
+
+        let repo_id = seed_repo_row(&state, bare.to_str().unwrap()).await;
+        let mut row = make_row(&repo_id, "refs/heads/main", &"b".repeat(40), &on_disk_sha);
+        row.state = pending_state::PREPARED.to_string();
+        row.applied_at = None;
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row)
+            .await
+            .unwrap();
+
+        let n = reconcile_prepared_from_disk(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "the current SHA is not landing proof: a row whose claimed old_sha never \
+             appears in the ref's reflog must stay put"
+        );
+        let still_pending = state
+            .db
+            .list_pending_ref_transitions_prepared_or_uncertain(100)
+            .await
+            .unwrap();
+        assert_eq!(still_pending.len(), 1, "the row is left where it was");
+        let applied = state
+            .db
+            .list_pending_ref_transitions_applied(100)
+            .await
+            .unwrap();
+        assert!(applied.is_empty(), "the drain must never see it");
+    }
+
+    /// The positive control for the test above: the SAME on-disk SHA,
+    /// but a row whose transition the reflog actually records (the
+    /// `0{40} -> A` entry that created the ref). Proof present, so the
+    /// row promotes — the strict gate must not break real recovery.
+    #[sqlx::test]
+    async fn reconcile_promotes_a_row_the_reflog_proves(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        crate::git::store::init_bare(&bare).expect("init_bare");
+        let on_disk_sha = seed_ref_on_bare(&bare, "refs/heads/main");
+
+        let repo_id = seed_repo_row(&state, bare.to_str().unwrap()).await;
+        let mut row = make_row(&repo_id, "refs/heads/main", &"0".repeat(40), &on_disk_sha);
+        row.state = pending_state::PREPARED.to_string();
+        row.applied_at = None;
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row)
+            .await
+            .unwrap();
+
+        let n = reconcile_prepared_from_disk(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "a transition the reflog records is promoted");
+    }
+
+    /// A repo that keeps no reflog (created before `init_bare` enabled
+    /// `core.logAllRefUpdates`) can produce no proof, and no proof means
+    /// no promotion — never a fallback to the SHA-only guess.
+    #[sqlx::test]
+    async fn reconcile_leaves_a_row_prepared_when_the_repo_keeps_no_reflog(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        crate::git::store::init_bare(&bare).expect("init_bare");
+        let on_disk_sha = seed_ref_on_bare(&bare, "refs/heads/main");
+        // Model a legacy repo: throw the reflogs away after the fact.
+        std::fs::remove_dir_all(bare.join("logs")).expect("remove logs");
+
+        let repo_id = seed_repo_row(&state, bare.to_str().unwrap()).await;
+        let mut row = make_row(&repo_id, "refs/heads/main", &"0".repeat(40), &on_disk_sha);
+        row.state = pending_state::PREPARED.to_string();
+        row.applied_at = None;
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row)
+            .await
+            .unwrap();
+
+        let n = reconcile_prepared_from_disk(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "absence of evidence is not evidence: without a reflog the row waits for \
+             human-attended recovery"
+        );
+    }
+
+    /// A reflog entry that PREDATES the row cannot be proof of that
+    /// row's landing: it is the signature of an earlier push that moved
+    /// the same pair. The SHA matches and the row is fresh, so only the
+    /// timestamp floor refuses it.
+    #[sqlx::test]
+    async fn reconcile_refuses_a_reflog_entry_older_than_the_row(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        crate::git::store::init_bare(&bare).expect("init_bare");
+        let on_disk_sha = seed_ref_on_bare(&bare, "refs/heads/main");
+
+        // Rewrite the entry's timestamp to an hour back — far outside
+        // REFLOG_CLOCK_SKEW, which only covers git's whole-second
+        // truncation.
+        let log_path = bare.join("logs/refs/heads/main");
+        let raw = std::fs::read_to_string(&log_path).expect("reflog exists");
+        let old_ts = (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp();
+        let rewritten: String = raw
+            .lines()
+            .map(|line| {
+                let (header, msg) = line.split_once('\t').unwrap_or((line, ""));
+                let mut tokens: Vec<String> =
+                    header.split_whitespace().map(|s| s.to_string()).collect();
+                let n = tokens.len();
+                tokens[n - 2] = old_ts.to_string();
+                format!("{}\t{}\n", tokens.join(" "), msg)
+            })
+            .collect();
+        std::fs::write(&log_path, rewritten).expect("rewrite reflog");
+
+        let repo_id = seed_repo_row(&state, bare.to_str().unwrap()).await;
+        let mut row = make_row(&repo_id, "refs/heads/main", &"0".repeat(40), &on_disk_sha);
+        row.state = pending_state::PREPARED.to_string();
+        row.applied_at = None;
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row)
+            .await
+            .unwrap();
+
+        let n = reconcile_prepared_from_disk(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "proof must postdate the intent it proves, or a row inherits an older \
+             push's reflog entry"
+        );
+    }
+
+    /// The reflog gate must NOT break the deletion recovery above it. A
+    /// deleted ref takes its reflog with it, so a landed
+    /// `git push :branch` can never produce reflog proof; absence of the
+    /// ref plus the age window is the whole evidence set for one, and
+    /// the gate exempts deletions for exactly that reason.
+    ///
+    /// MUTATION (RED): drop the `!is_deletion` guard on the reflog check
+    /// and a landed deletion stops being recoverable again.
+    #[sqlx::test]
+    async fn reconcile_still_promotes_a_landed_deletion_which_can_have_no_reflog(
+        pool: sqlx::PgPool,
+    ) {
+        use std::process::Command;
+        let state = crate::test_support::test_state(pool).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        crate::git::store::init_bare(&bare).expect("init_bare");
+        let doomed_sha = seed_ref_on_bare(&bare, "refs/heads/doomed");
+        // The push landed: the branch is gone, and so is its reflog.
+        let out = Command::new("git")
+            .args(["update-ref", "-d", "refs/heads/doomed"])
+            .current_dir(&bare)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("git update-ref -d");
+        assert!(
+            out.status.success(),
+            "update-ref -d failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let repo_id = seed_repo_row(&state, bare.to_str().unwrap()).await;
+        let mut row = make_row(&repo_id, "refs/heads/doomed", &doomed_sha, ZERO_SHA);
+        row.state = pending_state::PREPARED.to_string();
+        row.applied_at = None;
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row)
+            .await
+            .unwrap();
+
+        let n = reconcile_prepared_from_disk(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "a landed branch delete is still recovered");
+        let applied = state
+            .db
+            .list_pending_ref_transitions_applied(100)
+            .await
+            .unwrap();
+        assert_eq!(applied.len(), 1, "the deletion row reaches the drain");
+        assert_eq!(applied[0].id, row.id);
     }
 
     // ----- P2-A drain resilience tests -----
