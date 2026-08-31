@@ -2480,6 +2480,39 @@ pub async fn git_receive_pack(
         }
     }
 
+    // On non-zero exit, return an error to the caller. The outbox
+    // rows have already been handled above (marked uncertain/cancelled
+    // based on report-status). This preserves backward compatibility
+    // with callers that expect an error on non-zero git exit.
+    if !exit_ok {
+        // Release the guard before returning the error.
+        let reclaimed = guard
+            .lock()
+            .expect("repo write-lock mutex poisoned")
+            .take()
+            .expect("the write lock is only taken here, and only once");
+        reclaimed.release(false).await;
+        drop(lease);
+
+        let stderr_msg = if let Some((unpack_ok, ref_results)) = &report {
+            if !*unpack_ok {
+                "unpack failed".to_string()
+            } else {
+                let rejected: Vec<&str> = ref_results
+                    .iter()
+                    .filter(|(_, ok)| !ok)
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                format!("refs rejected: {rejected:?}")
+            }
+        } else {
+            "git-receive-pack failed".to_string()
+        };
+        return Err(AppError::Git(format!(
+            "git-receive-pack failed: {stderr_msg}"
+        )));
+    }
+
     // #174 F2/U5: the post-receive replication tail runs in an independently owned
     // task. It parks on `git_encrypt_semaphore` (withheld / candidate / full-scan
     // resolution), so leaving it in the request future means a client/proxy disconnect

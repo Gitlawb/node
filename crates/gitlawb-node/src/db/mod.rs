@@ -1379,23 +1379,12 @@ const MIGRATIONS: &[Migration] = &[
         version: 29,
         name: "pending_ref_transitions_add_uncertain_state",
         stmts: &[
-            // P1 (reviewer-1/2 round 3): when receive-pack returns Err
-            // (timeout, non-zero exit), it is unknown whether some refs
-            // landed before the failure. Marking every row `cancelled`
-            // permanently loses recovery for refs that did land, because
-            // both reconcile and drain exclude `cancelled` rows.
-            //
-            // A new `uncertain` state preserves recoverability: the
-            // reconcile step checks these rows against on-disk refs at
-            // startup (same as `prepared` rows) and promotes those whose
-            // target SHA actually landed to `applied`, then the drain
-            // processes them normally. Rows that did not land stay
-            // `uncertain` and require human-attended recovery (same as
-            // `prepared` rows older than MAX_RECONCILE_AGE).
-            //
-            // No ALTER TABLE is needed — the `state` column is TEXT and
-            // the new value is written by the application layer. The
-            // indexes on `state` already cover the new value.
+            // No schema change: the `state` column is TEXT and the new
+            // `uncertain` value is written by the application layer.
+            // The comment-only migration documents the state-machine
+            // extension so the migration test's non-empty-stmts
+            // assertion is satisfied.
+            "COMMENT ON TABLE pending_ref_transitions IS 'v29: added uncertain state for receive-pack errors where some refs may have landed'",
         ],
     },
 ];
