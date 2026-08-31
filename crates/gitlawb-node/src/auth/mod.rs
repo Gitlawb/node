@@ -517,6 +517,7 @@ mod tests {
             rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
             create_ip_rate_limiter: RateLimiter::new(1000, Duration::from_secs(3600)),
             push_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+            close_issue_rate_limiter: RateLimiter::new(120, Duration::from_secs(3600)),
             ipfs_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
             ipfs_work_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
             ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,

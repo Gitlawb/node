@@ -209,9 +209,6 @@ pub async fn merge_pr(
         return Err(AppError::BadRequest(format!("PR is already {}", pr.status)));
     }
 
-    // Shed 503 + Retry-After on an exhausted write-lock POOL instead of a generic
-    // git 500 (#173 F1). Merging holds no admission permit, so it reaches the pool
-    // unthrottled; reuse the push handler's mapping so the two cannot drift.
     let guard = state
         .repo_store
         .acquire_write(&record.owner_did, &record.name)
@@ -228,7 +225,10 @@ pub async fn merge_pr(
     );
 
     // Always release the advisory lock — even on error; upload to Tigris only on success.
-    guard.release(merge_result.is_ok()).await;
+    // Short-circuit on a refused publish before the PR is marked merged and
+    // before the webhook fires. Both are irreversible announcements of a merge
+    // commit that only exists on this node's disk.
+    guard.release(merge_result.is_ok()).await.into_result()?;
 
     let merge_sha = merge_result.map_err(|e| AppError::Git(e.to_string()))?;
 
@@ -428,12 +428,8 @@ pub async fn list_comments(
     Ok(Json(serde_json::json!({ "comments": comments })))
 }
 
-/// #173 F1 follow-up: `merge_pr` reaches `acquire_write` holding NO admission permit
-/// (unlike the push handler, which is capped by the git-push semaphore), so it is one
-/// of the callers most likely to meet an exhausted write-lock POOL under load. An
-/// exhausted pool is a capacity signal, so the merge must shed 503 + Retry-After
-/// (`AppError::Overloaded`) the way the push handler does, not report the generic
-/// 500 git error that says nothing about retrying.
+/// #173 F1 follow-up: merge holds no admission permit, so an exhausted write-lock
+/// pool must shed 503 + Retry-After.
 #[cfg(test)]
 mod lock_pool_shed_tests {
     use super::*;
@@ -457,20 +453,15 @@ mod lock_pool_shed_tests {
         }
     }
 
-    /// RED-before/GREEN-after for `merge_pr`. Both directions: the shed while the only
-    /// lock-pool connection is held by a guard on a DIFFERENT repo (so this is pool
-    /// capacity, not advisory-lock contention on this repo), and the must-not case
-    /// once that connection is back.
     #[sqlx::test]
     async fn merge_pr_lock_pool_exhaustion_sheds_503_not_500(pool: PgPool) {
         let owner = "did:key:zMERGELOCKPOOLOWNERAAAAAAAAAAAAAAAAAAAAA";
         let mut state = crate::test_support::test_state(pool.clone()).await;
-        // One lock-pool connection with a short checkout timeout, so a single held
-        // guard exhausts it promptly rather than at the pool default.
         state.repo_store = crate::git::repo_store::RepoStore::new(
             std::path::PathBuf::from("/tmp/gitlawb-pulls-lockpool"),
             None,
             crate::git::repo_store::build_lock_pool(&pool, 1, std::time::Duration::from_secs(1)),
+            std::time::Duration::from_secs(300),
         );
 
         let repo = seed_repo(owner, "lp-merge");
@@ -524,9 +515,7 @@ mod lock_pool_shed_tests {
             "merge_pr: a capacity shed must tell the client when to retry"
         );
 
-        // MUST-NOT: with the pool free again the merge is not shed as capacity (it
-        // fails later on the nonexistent on-disk repo, which is a git 500).
-        held.release(false).await;
+        let _ = held.release(false).await;
         let admitted = merge_pr(
             State(state.clone()),
             Extension(AuthenticatedDid(owner.to_string())),

@@ -103,6 +103,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
         create_ip_rate_limiter: RateLimiter::new(1000, Duration::from_secs(3600)),
         push_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+        close_issue_rate_limiter: RateLimiter::new(120, Duration::from_secs(3600)),
         ipfs_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         ipfs_work_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
@@ -554,6 +555,35 @@ mod tests {
                 .expect("get_repo")
                 .is_none(),
             "no fork row may be created for a refused fork"
+        );
+    }
+
+    /// Fork disk paths must go through `validated_repo_disk_path` so a user-supplied
+    /// name cannot reach `remove_dir_all` on an escaped path (CodeQL path-injection).
+    #[sqlx::test]
+    async fn fork_rejects_name_that_fails_validated_disk_path(pool: PgPool) {
+        let owner = "did:key:zFORKOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        let repo = seed_repo(owner, "fork-src");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/fork",
+                axum::routing::post(crate::api::repos::fork_repo),
+            )
+            .with_state(state.clone());
+        let too_long = "a".repeat(101);
+        let uri = format!("/api/v1/repos/{owner}/fork-src/fork");
+        let body = Body::from(format!(r#"{{"name":"{too_long}"}}"#));
+        let resp = router
+            .oneshot(signed_request_as(owner, Method::POST, &uri, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "fork names that fail validated_repo_disk_path must be rejected before clone"
         );
     }
 
@@ -15936,65 +15966,6 @@ mod tests {
             use super::*;
             use crate::api::repos::drain_faults;
 
-            /// Process-wide tracing capture so a test can assert the give-up is logged at
-            /// ERROR. A global default subscriber can only be installed once per process,
-            /// so it is shared by every test here and assertions filter on the repo id,
-            /// which is a fresh uuid per test.
-            mod logcap {
-                use std::sync::{Arc, Mutex, OnceLock};
-                use tracing::{Event, Level, Subscriber};
-                use tracing_subscriber::layer::{Context, Layer};
-                use tracing_subscriber::prelude::*;
-
-                type Lines = Arc<Mutex<Vec<(Level, String)>>>;
-
-                fn lines() -> &'static Lines {
-                    static LINES: OnceLock<Lines> = OnceLock::new();
-                    LINES.get_or_init(|| Arc::new(Mutex::new(Vec::new())))
-                }
-
-                struct Capture;
-                impl<S: Subscriber> Layer<S> for Capture {
-                    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-                        struct V(String);
-                        impl tracing::field::Visit for V {
-                            fn record_debug(
-                                &mut self,
-                                field: &tracing::field::Field,
-                                value: &dyn std::fmt::Debug,
-                            ) {
-                                self.0.push_str(&format!(" {}={:?}", field.name(), value));
-                            }
-                        }
-                        let mut v = V(String::new());
-                        event.record(&mut v);
-                        lines()
-                            .lock()
-                            .unwrap()
-                            .push((*event.metadata().level(), v.0));
-                    }
-                }
-
-                pub(super) fn install() {
-                    static ONCE: OnceLock<()> = OnceLock::new();
-                    ONCE.get_or_init(|| {
-                        let _ = tracing::subscriber::set_global_default(
-                            tracing_subscriber::registry().with(Capture),
-                        );
-                    });
-                }
-
-                pub(super) fn errors_containing(needle: &str) -> Vec<String> {
-                    lines()
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .filter(|(lvl, msg)| *lvl == Level::ERROR && msg.contains(needle))
-                        .map(|(_, msg)| msg.clone())
-                        .collect()
-                }
-            }
-
             /// SCENARIO 1. The repo re-read fails once, then succeeds: the drain lap
             /// must still RUN, under the refreshed state, and pin the coalesced push's
             /// object. RED before the fix (the single `Err` returned `None`, the lap
@@ -16060,11 +16031,11 @@ mod tests {
             }
 
             /// SCENARIO 2. Every re-read attempt fails: the loop must give up on a BOUND
-            /// (asserted as a literal, so raising or removing the bound goes RED) and log
-            /// the give-up at ERROR so the residual loss is observable rather than silent.
+            /// (asserted as a literal, so raising or removing the bound goes RED) and hit
+            /// the give-up path that logs at ERROR in production (asserted here via the
+            /// drain_faults seam, which fires on the same branch as that log).
             #[sqlx::test]
             async fn u2_sustained_repo_reread_failure_is_bounded_and_logged(pool: PgPool) {
-                logcap::install();
                 let state = test_state(pool).await;
                 let owner = new_did();
                 let repo = seed_repo(&owner, "u2-bounded");
@@ -16115,11 +16086,10 @@ mod tests {
                     !state.db.is_pinned(&obj2).await.unwrap(),
                     "with the read never succeeding there is nothing fresh to act on"
                 );
-                let errs = logcap::errors_containing(&repo.id);
                 assert!(
-                    !errs.is_empty(),
-                    "the exhausted drain re-read is logged at ERROR with the repo id, so \
-                     the residual work loss is observable; captured: {errs:?}"
+                    drain_faults::reread_exhausted(&repo.id),
+                    "the exhausted drain re-read must hit the give-up path that logs at \
+                     ERROR in production"
                 );
                 assert!(
                     state.encrypt_inflight.is_empty(),

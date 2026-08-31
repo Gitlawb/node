@@ -676,7 +676,7 @@ async fn warm_candidates(
                 &repo.owner_did,
                 &repo.name,
             ) {
-                Ok(p) if p.is_dir() => out.push((repo, created_at_key, p)),
+                Ok(p) if p.is_dir() => out.push((repo, created_at_key, p.into_path_buf())),
                 Ok(_) => {}
                 Err(e) => {
                     tracing::warn!(repo_id = %repo.id, err = %e, "sweep discovery: rejected unsafe repo path");

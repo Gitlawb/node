@@ -61,6 +61,27 @@ pub fn create_issue(repo_path: &Path, issue_id: &str, json: &str) -> Result<()> 
     Ok(())
 }
 
+/// Remove a single issue ref while the write guard still holds the advisory lock,
+/// after a definite publish refusal. Best-effort: a failed delete leaves a
+/// local-only orphan, which is still better than telling the client to retry into a
+/// duplicate id. Not used on `UploadUnknowable`, where the PUT may still land.
+pub fn delete_issue_ref(
+    git_bin: &str,
+    repo_path: &Path,
+    issue_id: &str,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    let ref_name = format!("refs/gitlawb/issues/{issue_id}");
+    crate::git::visibility_pack::run_bounded_git(
+        git_bin,
+        &["update-ref", "-d", &ref_name],
+        repo_path,
+        b"",
+        deadline,
+    )?;
+    Ok(())
+}
+
 /// List all issue refs and return their JSON content.
 pub fn list_issues(repo_path: &Path) -> Result<Vec<String>> {
     // List all refs under refs/gitlawb/issues/
@@ -276,6 +297,27 @@ mod tests {
         let result = resolve_issue_id(dir.path(), "abc12345");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn delete_issue_ref_removes_a_created_ref() {
+        let dir = TempDir::new().unwrap();
+        init_repo(&dir);
+        let full_id = "eee88888-0000-0000-0000-000000000000";
+        create_issue(
+            dir.path(),
+            full_id,
+            r#"{"id":"eee88888-0000-0000-0000-000000000000","status":"open"}"#,
+        )
+        .unwrap();
+        delete_issue_ref(
+            "git",
+            dir.path(),
+            full_id,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(resolve_issue_id(dir.path(), full_id).unwrap(), None);
     }
 
     #[test]
