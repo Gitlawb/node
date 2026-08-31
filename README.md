@@ -445,6 +445,7 @@ Read:
 
 - [`docs/RUN-A-NODE.md`](docs/RUN-A-NODE.md)
 - [`docs/ECONOMICS.md`](docs/ECONOMICS.md)
+- [`docs/STORAGE-AND-PINNING.md`](docs/STORAGE-AND-PINNING.md)
 
 Use a dedicated low-balance operator wallet. Do not use a treasury wallet as the heartbeat key.
 
