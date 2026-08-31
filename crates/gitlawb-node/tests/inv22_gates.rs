@@ -415,8 +415,8 @@ fn f3_second_writer_leased_until_reap() {
          NOT RepoWriteGuard (which drops at the disconnect instant, reopening F3).",
     );
     let receive = repos_production
-        .find("smart_http::receive_pack(")
-        .expect("F3 gate stale: git_receive_pack no longer calls smart_http::receive_pack");
+        .find("smart_http::receive_pack_raw(")
+        .expect("F3 gate stale: git_receive_pack no longer calls smart_http::receive_pack_raw");
     assert!(
         lease_acquire < with_lease && with_lease < receive,
         "F3 gate bypassed: the write lease must be acquired, then carried by the \
@@ -533,10 +533,8 @@ fn inv22_replication_tail_spawns_at_the_durability_boundary() {
         .expect("split always yields a first chunk");
 
     let success_flag = production
-        .find("let push_succeeded = receive_result.is_ok();")
-        .expect(
-            "U5 gate missing: the tail's success gate must be bound from receive_result.is_ok()",
-        );
+        .find("let push_succeeded = all_refs_ok;")
+        .expect("U5 gate missing: the tail's success gate must be bound from all_refs_ok");
     let gate_open = production
         .find("if push_succeeded {")
         .expect("U5 gate missing: the tail spawn must be gated on the push having succeeded");
