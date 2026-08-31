@@ -19,6 +19,27 @@ use crate::{Error, Result};
 /// The certificate type discriminant. Always `"gitlawb/ref-update/v1"`.
 pub const CERT_TYPE: &str = "gitlawb/ref-update/v1";
 
+/// Exact url-safe unpadded base64 length of a 64-byte Ed25519 signature.
+/// Anything longer cannot decode to a valid signature, so the tolerant
+/// threshold scan refuses to base64-decode it at all — the length gate is what
+/// keeps an attacker-sized sig string from costing allocation before the
+/// signature is rejected.
+const ENCODED_SIG_LEN: usize = 86;
+
+/// Hard ceiling on signature entries a certificate may carry into the
+/// tolerant threshold scan. A legitimate certificate holds one entry per
+/// maintainer (a re-sign after key rotation may briefly leave a second), so
+/// this is far above any real signer set, while turning the scan's worst case
+/// from "one curve verification per attacker-appended entry" into a small
+/// constant. Rejection is loud (`Err`), not a silent prefix scan: scanning
+/// only the first N entries would let junk placed ahead of the real
+/// signatures starve them out of the window, which is the #349 denial again
+/// in positional form. An attacker positioned to inflate the list past this
+/// ceiling can already suppress the certificate outright, so the loud
+/// rejection concedes nothing that was not already conceded to that
+/// attacker.
+const MAX_SIGNATURE_ENTRIES: usize = 64;
+
 /// A signature on a ref-update certificate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertSignature {
@@ -141,22 +162,51 @@ impl RefUpdateCert {
         Ok(valid)
     }
 
-    /// The DIDs whose signature entries validate, skipping any that are
-    /// malformed or invalid rather than failing.
+    /// Check if this certificate satisfies a threshold of valid signatures
+    /// from the provided set of authorized maintainer DIDs.
     ///
-    /// Signature entries are appended outside the signed body, so any third
-    /// party can attach a junk entry without key material. Counting only the
-    /// entries that actually verify — instead of short-circuiting on the first
-    /// bad one, as [`Self::verify_all`] does — prevents that from becoming a
-    /// denial-of-service on an otherwise valid certificate (#349). A forged
-    /// entry that names a real maintainer DID but carries a bad signature is
-    /// skipped, so it cannot inflate the count either.
-    fn valid_signers(&self) -> Result<Vec<Did>> {
+    /// Counts distinct signer DIDs, not signature entries: a repeated
+    /// signature from the same maintainer counts once. Malformed and invalid
+    /// signature entries are skipped, not fatal — entries live outside the
+    /// signed body, so any third party can append junk without key material,
+    /// and short-circuiting on the first bad one (as [`Self::verify_all`]
+    /// does) would let that junk deny an otherwise valid certificate (#349).
+    ///
+    /// Tolerance must not become an unbounded verification path (#349 review
+    /// round 2): entries are attacker-extensible, so the work done for them is
+    /// bounded BEFORE the loop, not discovered inside it:
+    ///
+    /// - a list over [`MAX_SIGNATURE_ENTRIES`] is rejected outright (see the
+    ///   constant for why loud rejection beats a silent prefix scan);
+    /// - an encoded signature is length-gated before base64 work — a 64-byte
+    ///   Ed25519 signature is exactly [`ENCODED_SIG_LEN`] characters in
+    ///   url-safe unpadded base64, so an oversized blob never allocates;
+    /// - entries whose signer is not in `maintainers`, or is already counted,
+    ///   are skipped on a string compare, before any decode or curve work —
+    ///   so even within the cap, junk naming strangers costs no crypto;
+    /// - the scan returns as soon as the threshold is met.
+    pub fn satisfies_threshold(&self, maintainers: &[Did], threshold: usize) -> Result<bool> {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        if self.signatures.len() > MAX_SIGNATURE_ENTRIES {
+            return Err(Error::RefCert(format!(
+                "certificate carries {} signature entries (max {})",
+                self.signatures.len(),
+                MAX_SIGNATURE_ENTRIES
+            )));
+        }
+        if threshold == 0 {
+            return Ok(true);
+        }
         let signing_bytes = self.body.to_signing_bytes()?;
-        let mut valid = Vec::new();
+        let mut counted: HashSet<&Did> = HashSet::new();
 
         for cert_sig in &self.signatures {
+            if counted.contains(&cert_sig.signer) || !maintainers.contains(&cert_sig.signer) {
+                continue;
+            }
+            if cert_sig.sig.len() != ENCODED_SIG_LEN {
+                continue;
+            }
             let Ok(vk) = cert_sig.signer.to_verifying_key() else {
                 continue;
             };
@@ -167,25 +217,14 @@ impl RefUpdateCert {
                 continue;
             };
             if verify(&vk, &signing_bytes, &sig_bytes).is_ok() {
-                valid.push(cert_sig.signer.clone());
+                counted.insert(&cert_sig.signer);
+                if counted.len() >= threshold {
+                    return Ok(true);
+                }
             }
         }
 
-        Ok(valid)
-    }
-
-    /// Check if this certificate satisfies a threshold of valid signatures
-    /// from the provided set of authorized maintainer DIDs.
-    ///
-    /// Counts distinct signer DIDs, not signature entries: a repeated
-    /// signature from the same maintainer counts once. Malformed or invalid
-    /// signature entries are ignored (see [`Self::valid_signers`]), so an
-    /// attacker cannot deny a valid cert by appending junk signatures.
-    pub fn satisfies_threshold(&self, maintainers: &[Did], threshold: usize) -> Result<bool> {
-        let valid = self.valid_signers()?;
-        let distinct_signers: HashSet<&Did> =
-            valid.iter().filter(|d| maintainers.contains(d)).collect();
-        Ok(distinct_signers.len() >= threshold)
+        Ok(counted.len() >= threshold)
     }
 
     /// Validate the certificate structure (not signatures).
@@ -480,6 +519,66 @@ mod tests {
         // Only kp1 actually signed the body: 2-of-2 must fail, 1-of-2 holds.
         assert!(!cert.satisfies_threshold(&maintainers, 2).unwrap());
         assert!(cert.satisfies_threshold(&maintainers, 1).unwrap());
+    }
+
+    /// The tolerant scan must not be an unbounded verification path: a list
+    /// past MAX_SIGNATURE_ENTRIES is rejected loudly before any curve work,
+    /// while a list at the cap still verifies normally.
+    #[test]
+    fn satisfies_threshold_rejects_an_oversized_signature_list() {
+        let kp = Keypair::generate();
+        let mut cert = RefUpdateCert::new(
+            kp.did(),
+            "refs/heads/main".to_string(),
+            dummy_hash('0'),
+            dummy_hash('a'),
+            1,
+            &kp,
+        )
+        .unwrap();
+        let junk = || CertSignature {
+            signer: Keypair::generate().did(),
+            sig: "AAAA".to_string(),
+        };
+        while cert.signatures.len() < MAX_SIGNATURE_ENTRIES {
+            cert.signatures.push(junk());
+        }
+        let maintainers = vec![kp.did()];
+        // At the cap: still fine, the real signature counts.
+        assert!(cert.satisfies_threshold(&maintainers, 1).unwrap());
+        // One past the cap: loud rejection, no tolerant scan.
+        cert.signatures.push(junk());
+        let err = cert.satisfies_threshold(&maintainers, 1).unwrap_err();
+        assert!(err.to_string().contains("signature entries"));
+    }
+
+    /// An entry whose encoded signature is not the exact base64 length of a
+    /// 64-byte Ed25519 signature is skipped before any base64 decode — an
+    /// attacker-sized sig string must cost neither allocation nor curve work,
+    /// and must not affect the verdict.
+    #[test]
+    fn satisfies_threshold_skips_an_oversized_encoded_signature() {
+        let kp1 = Keypair::generate();
+        let kp2 = Keypair::generate();
+        let mut cert = RefUpdateCert::new(
+            kp1.did(),
+            "refs/heads/main".to_string(),
+            dummy_hash('0'),
+            dummy_hash('a'),
+            1,
+            &kp1,
+        )
+        .unwrap();
+        // Names a real maintainer, valid base64 alphabet, but megabytes long:
+        // the length gate must refuse it without decoding.
+        cert.signatures.push(CertSignature {
+            signer: kp2.did(),
+            sig: "A".repeat(2 * 1024 * 1024),
+        });
+
+        let maintainers = vec![kp1.did(), kp2.did()];
+        assert!(cert.satisfies_threshold(&maintainers, 1).unwrap());
+        assert!(!cert.satisfies_threshold(&maintainers, 2).unwrap());
     }
 
     #[test]
