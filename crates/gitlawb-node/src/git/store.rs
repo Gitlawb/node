@@ -2592,7 +2592,6 @@ mod reflog_tests {
     /// `seed_ref_on_bare` helper from the durable_outbox test module
     /// is duplicated here because it is test-private to that module;
     /// keeping it private avoids a public-test-helper sprawl.
-
     fn seed_bare_ref(bare: &Path, ref_name: &str) -> String {
         let tree = String::from_utf8(
             Command::new("git")
