@@ -115,7 +115,7 @@ async fn main() -> Result<()> {
     }
 
     // Load or generate the node's identity keypair
-    let keypair = load_or_create_keypair(&config)?;
+    let keypair = Arc::new(load_or_create_keypair(&config)?);
     // Sealing key for the legacy-scan continuation tokens, DERIVED from the identity
     // just loaded so it is the same key after a restart (see `derive_scan_token_key`).
     let scan_token_key = AppState::derive_scan_token_key(&keypair);
@@ -265,6 +265,8 @@ async fn main() -> Result<()> {
             Arc::clone(&db),
             config.auto_sync,
             shutdown_rx,
+            Arc::clone(&keypair),
+            config.require_signed_peer_writes,
         )
         .await
         {
@@ -412,7 +414,7 @@ async fn main() -> Result<()> {
         config: Arc::new(config.clone()),
         db,
         node_did: node_did.clone(),
-        node_keypair: Arc::new(keypair),
+        node_keypair: keypair,
         p2p: p2p_handle,
         http_client,
         ref_update_tx,

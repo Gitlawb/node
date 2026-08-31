@@ -2758,6 +2758,11 @@ async fn post_receive_replication_tail(
                 if announce {
                     if let Some(p2p) = &p2p_handle {
                         p2p.publish_ref_update(crate::p2p::RefUpdateEvent {
+                            // Named, not literal: the ingest gate compares `v`
+                            // against this same constant, so a bump has to move
+                            // both ends together rather than leaving the emitter
+                            // on a version the gate no longer accepts.
+                            v: crate::p2p::CURRENT_REF_UPDATE_VERSION,
                             node_did: node_did_str.clone(),
                             pusher_did: pusher_did_clone.clone(),
                             repo: repo_slug.clone(),
@@ -2768,6 +2773,15 @@ async fn post_receive_replication_tail(
                             timestamp: chrono::Utc::now().to_rfc3339(),
                             cert_id: None,
                             cid: cid.map(|s| s.to_string()),
+                            // Left unsigned here on purpose. The swarm loop
+                            // signs the event with the node keypair via
+                            // `p2p::signed_publish_bytes` immediately before it
+                            // publishes, and skips the publish outright if
+                            // signing fails, so the wire always carries a
+                            // signature even though this construction site does
+                            // not. Setting one here would be signed over a
+                            // payload the publisher has not finished building.
+                            sig: None,
                         })
                         .await;
                     }

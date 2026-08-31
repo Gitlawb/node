@@ -143,6 +143,23 @@ impl RateLimiter {
         false
     }
 
+    /// The configured key ceiling. Tests use it to assert that a limiter a
+    /// production factory builds is actually bounded, which flooding the real
+    /// ceiling in distinct keys would be far too slow to show.
+    #[cfg(test)]
+    pub fn max_keys(&self) -> usize {
+        self.max_keys
+    }
+
+    /// The configured per-key request cap. Tests use it to assert that a
+    /// limiter a production factory builds carries the cap it is documented
+    /// with; re-asserting the constant on its own cannot tell whether the
+    /// factory passed that constant or a different one.
+    #[cfg(test)]
+    pub fn max_requests(&self) -> usize {
+        self.max_requests
+    }
+
     pub async fn cleanup(&self) {
         let now = Instant::now();
         let mut state = self.state.lock().await;

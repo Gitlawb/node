@@ -369,6 +369,12 @@ GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true
 
 `POST /api/v1/sync/trigger` is not part of the staged rollout: it always requires a signature in both config modes and returns 401 without one, because each call drives an O(peers) outbound fan-out.
 
+The flag is not HTTP-only. It also gates inbound gossip ref-update events on the libp2p mesh, which carry an Ed25519 payload signature rather than RFC 9421 headers because there are no HTTP headers to sign. Set to `true`, an unsigned gossip event is dropped. Set to `false`, an unsigned event is accepted with a warning during the rolling-upgrade window, and the write budget it consumes is charged to the forwarding peer rather than to the DID it claims, since an unsigned event's claimed DID is asserted and not proven. A present-but-invalid signature is refused in both modes; that is forgery, not an un-upgraded peer.
+
+Because the flag now spans both transports, the rollout order matters in one direction: **upgrade every gossip-publishing peer to a build that signs events before you set this to `true`.** Enabling it while an old publisher is still live drops that publisher's ref-updates on arrival, and the publisher sees no error, because gossip has no response to carry one. Upgrading the HTTP peers alone is not sufficient.
+
+There is a second precondition on gossip ingest that the flag does not control. A publisher's `node_did` must already exist in the receiving node's peers table, or the event is dropped as an unknown peer DID. This holds in both modes, signed and unsigned alike: a valid signature proves key possession, not membership. Rows reach that table over HTTP, either from `GITLAWB_BOOTSTRAP_PEERS` when this node contacts a bootstrap peer and records the DID it reports, or from a prior `POST /api/v1/peers/announce`. So a peer that only ever joined the libp2p mesh, with no HTTP announce and no bootstrap contact in either direction, will have its ref-updates dropped even with a good signature and the flag off. If gossip is silently not landing from a peer you can see on the mesh, check that its DID is in `GET /api/v1/peers` on the receiving side first.
+
 ---
 
 ## Configuration
@@ -392,7 +398,7 @@ Important node settings:
 | `GITLAWB_BOOTSTRAP_PEERS` | Comma-separated HTTP peer URLs. |
 | `GITLAWB_P2P_BOOTSTRAP` | Comma-separated libp2p multiaddrs. |
 | `GITLAWB_BOOTSTRAP_DISABLE_SEEDS` | Disable embedded seed peers for isolated dev/test networks. |
-| `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` | Require signed peer announce/sync writes. Defaults to `false` during the staged rollout below. |
+| `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` | Require peer writes to prove their DID on every transport: RFC 9421 signatures on the announce/sync routes, and an Ed25519 payload signature on gossip ref-update events. Defaults to `false` during the staged rollout below. Upgrade every gossip publisher before enabling, or their updates are dropped with no error on their side. |
 | `GITLAWB_ENFORCE_OWNER_PUSH` | Require the authenticated pusher to be the repo owner on `git-receive-pack`. **Defaults to `true`.** A `did:key` signature is authentication, not authorization — anyone can mint a key and sign — so with this off every signed caller may push to every repository, private ones included. Delegated and CI keys count as non-owners: a UCAN `git/push` capability is verified but not yet honored for authorization, so they cannot push while this is on. Set `false` only for a rolling upgrade; see [`docs/RUN-A-NODE.md`](docs/RUN-A-NODE.md). |
 | `GITLAWB_AUTO_SYNC` | Enable automatic sync from known peers. |
 | `GITLAWB_MAX_PACK_BYTES` | Max git pack body size for smart-HTTP routes. |
