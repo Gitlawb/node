@@ -3637,32 +3637,51 @@ impl Db {
         fence_epoch: i64,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        // Take the row lock on `repos` first, then read the
-        // epoch. `set_visibility_rule` takes the same lock when
-        // it updates `policy_epoch`, so a rule write that
-        // committed between the POST and now is already visible
-        // (the rule write's commit released the lock; we acquire
-        // it now and read the new value). A rule write in
-        // flight blocks on our lock; the record is aborted.
-        //
-        // `i64::MAX` is the "no fence" sentinel used by
-        // push-side admission (where the decision is made at
-        // request time, not pin time). The row lock is still
-        // acquired — every record goes through the lock — but
-        // the comparison is skipped so push-side callers don't
-        // have to fabricate a fake fence epoch.
-        let current_epoch = self.repo_policy_epoch_locked(&mut tx, repo_id).await?;
-        if fence_epoch != i64::MAX && current_epoch != fence_epoch {
-            // The decision the pinner acted under is no longer
-            // the decision the database would land the row
-            // under. Roll back; no row, no source, no
-            // failure-marker delete.
-            tx.rollback().await.ok();
-            anyhow::bail!(
-                "policy epoch changed during pin dispatch \
-                 (captured={fence_epoch}, current={current_epoch}); \
-                 pin record aborted, no row landed"
-            );
+        // P2 (reviewer round 9): `i64::MAX` is the "no fence"
+        // sentinel used by push-side admission. The push path
+        // has no decision to invalidate, so the row lock is
+        // unnecessary and would queue `touch_repo`, the
+        // quarantine toggle, and rule writes behind every pin
+        // record. Skip the lock + comparison entirely on the
+        // sentinel path; the unfenced record then runs through
+        // the same INSERT / COALESCE / pin_repo_sources
+        // statements with no policy_epoch read.
+        if fence_epoch != i64::MAX {
+            // Fenced path: take the row lock and compare.
+            // `set_visibility_rule` takes the same lock when it
+            // updates `policy_epoch`, so a rule write that
+            // committed between the POST and now is already
+            // visible (the rule write's commit released the
+            // lock; we acquire it now and read the new value).
+            // A rule write in flight blocks on our lock; the
+            // record is aborted.
+            //
+            // A missing repos row returns `None` and bails
+            // fail-closed (was `unwrap_or(0)` — a fail-open
+            // path against a non-existent repo).
+            let current_epoch = self.repo_policy_epoch_locked(&mut tx, repo_id).await?;
+            let current_epoch = match current_epoch {
+                Some(e) => e,
+                None => {
+                    tx.rollback().await.ok();
+                    anyhow::bail!(
+                        "policy epoch row missing for {repo_id}; \
+                         pin record aborted, no row landed"
+                    );
+                }
+            };
+            if current_epoch != fence_epoch {
+                // The decision the pinner acted under is no longer
+                // the decision the database would land the row
+                // under. Roll back; no row, no source, no
+                // failure-marker delete.
+                tx.rollback().await.ok();
+                anyhow::bail!(
+                    "policy epoch changed during pin dispatch \
+                     (captured={fence_epoch}, current={current_epoch}); \
+                     pin record aborted, no row landed"
+                );
+            }
         }
         // The remainder is the same INSERT / COALESCE /
         // pin_repo_sources logic as the 3-arg form. Kept inline
@@ -4087,40 +4106,64 @@ impl Db {
     /// real local pin. If IPFS is enabled later, the reconciliation sweep will
     /// re-derive provenance by re-pinning these objects (their `cid IS NULL` or
     /// `pinata_cid` shape keeps them out of the gap filter's "already done" set).
+    /// Fenced Pinata record (P2 reviewer round 9): `fence_epoch ==
+    /// i64::MAX` is the "no fence" sentinel used by the pre-existing
+    /// unfenced callers (test fixtures, the reconciliation path)
+    /// and the helper skips the row lock and the policy_epoch read
+    /// entirely on that path. With a real epoch, the helper takes
+    /// the same row lock as `record_pinned_cid_with_source_fenced`
+    /// and aborts the record if the epoch moved.
     pub async fn record_pinata_cid(
         &self,
         sha256_hex: &str,
         raw_cid: &str,
         pinata_cid: &str,
         repo_id: Option<&str>,
+        fence_epoch: i64,
     ) -> Result<()> {
-        // The "Pinata-only" signal is `raw_cid == pinata_cid`: the caller
-        // computed the local resolver key, found it matched the provider
-        // CID, and concluded this object was never on local IPFS. Storing
-        // cid=NULL in that case keeps the resolver's resolver-key column
-        // honest — a dag-pb provider CID must not become the alias under
-        // which `GET /ipfs/{cid}` serves raw bytes (the bytes do not hash
-        // to it, #173). After v30 the `local_ipfs_provenance` column
-        // carries the durable "real local pin" signal independently, so
-        // the inference here only controls the `cid` shape, not
-        // provenance.
-        //
-        // ON CONFLICT also clears `cid` when the existing row has the legacy
-        // `cid = pinata_cid` fallback shape. A row in that shape was never
-        // a real local IPFS pin — the value was faked because the object
-        // was Pinata-only — and v27 already bulk-cleared it on upgrade,
-        // but a new push of a Pinata-only object against a pre-v27 row
-        // still needs the belt-and-suspenders clear. Distinct cid values
-        // are genuine local pins and are left untouched.
+        let mut tx = self.pool.begin().await?;
+        if fence_epoch != i64::MAX {
+            // Same row-lock-and-compare pattern as
+            // `record_pinned_cid_with_source_fenced`. A narrowing
+            // rule that lands between the Pinata POST and the
+            // record is observed here, and the record is aborted.
+            // `repo_id` is the pinned side of the contract; the
+            // Pinata record attaches a `repo_id` only when one
+            // is in scope, but the fence itself only makes sense
+            // when a repo is involved — `None` is treated as
+            // "no fence possible" and falls through to the
+            // unfenced record.
+            if let Some(rid) = repo_id {
+                let current_epoch = self.repo_policy_epoch_locked(&mut tx, rid).await?;
+                let current_epoch = match current_epoch {
+                    Some(e) => e,
+                    None => {
+                        tx.rollback().await.ok();
+                        anyhow::bail!(
+                            "policy epoch row missing for {rid}; \
+                             pinata record aborted, no row landed"
+                        );
+                    }
+                };
+                if current_epoch != fence_epoch {
+                    tx.rollback().await.ok();
+                    anyhow::bail!(
+                        "policy epoch changed during pinata dispatch \
+                         (captured={fence_epoch}, current={current_epoch}); \
+                         pinata record aborted, no row landed"
+                    );
+                }
+            }
+        }
+        // Same INSERT as the unfenced `record_pinata_cid`. The
+        // `cid`-NULLs-on-Pinata-only path is the same: a
+        // dag-pb provider CID must not become the alias under
+        // which `/ipfs/{cid}` serves raw bytes.
         let cid = if raw_cid == pinata_cid {
             None
         } else {
             Some(raw_cid)
         };
-        // `local_ipfs_provenance` is intentionally NOT set here, NOT
-        // touched in the ON CONFLICT branch: this writer does not pin
-        // locally. A later local-IPFS pin (`record_pinned_cid_with_source`)
-        // upgrades the flag.
         sqlx::query(
             "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid, repo_id)
              VALUES ($1, $2, $3, $4, $5)
@@ -4131,12 +4174,13 @@ impl Db {
                  repo_id = COALESCE(pinned_cids.repo_id, EXCLUDED.repo_id)",
         )
         .bind(sha256_hex)
-        .bind(cid) // NULL when raw_cid == pinata_cid (Pinata-only); otherwise the resolver key
+        .bind(cid)
         .bind(Utc::now().to_rfc3339())
         .bind(pinata_cid)
         .bind(repo_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 }
@@ -4809,6 +4853,22 @@ impl Db {
         Ok(row.map(|r| r.get::<i64, _>("policy_epoch")).unwrap_or(0))
     }
 
+    /// Bump `policy_epoch` for `repo_id` by one, mirroring the
+    /// `UPDATE repos SET policy_epoch = policy_epoch + 1`
+    /// statement `set_visibility_rule` / `remove_visibility_rule`
+    /// run. Test-only: production rule writes are wrapped in a
+    /// transaction that also touches the visibility_rules table;
+    /// the standalone bump here is for the test fixture that
+    /// drives a fenced-record-with-bumped-epoch scenario.
+    #[cfg(test)]
+    pub async fn bump_repo_policy_epoch(&self, repo_id: &str) -> Result<()> {
+        sqlx::query("UPDATE repos SET policy_epoch = policy_epoch + 1 WHERE id = $1")
+            .bind(repo_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// #218 review round 9 (guidance #3 — linearization point):
     /// read the repo's policy epoch under a row lock that a
     /// narrowing rule write must also acquire. Caller must hold
@@ -4826,12 +4886,21 @@ impl Db {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         repo_id: &str,
-    ) -> Result<i64> {
+    ) -> Result<Option<i64>> {
         let row = sqlx::query("SELECT policy_epoch FROM repos WHERE id = $1 FOR UPDATE")
             .bind(repo_id)
             .fetch_optional(&mut **tx)
             .await?;
-        Ok(row.map(|r| r.get::<i64, _>("policy_epoch")).unwrap_or(0))
+        // P2 (reviewer round 9): a missing repos row used to fold
+        // to 0 via `unwrap_or(0)`, so a fenced record call against
+        // a non-existent repo would silently compare 0 == 0 and
+        // PASS — exactly the fail-open path a missing row should
+        // NOT admit. The row-level lock on a missing predicate
+        // takes no lock either, so nothing was serializing
+        // anyway. Return `None`; callers that must compare
+        // (`record_pinned_cid_with_source_fenced`,
+        // `record_pinata_cid_fenced`) bail fail-closed.
+        Ok(row.map(|r| r.get::<i64, _>("policy_epoch")))
     }
 
     pub async fn list_visibility_rules(&self, repo_id: &str) -> Result<Vec<VisibilityRule>> {
@@ -5988,9 +6057,15 @@ mod migration_tests {
         );
 
         // ── Pinata-only INSERT (new post-v12 row) ──────────────────────
-        db.record_pinata_cid("sha_pinata_only", "QmPinataOnly", "QmPinataOnly", None)
-            .await
-            .unwrap();
+        db.record_pinata_cid(
+            "sha_pinata_only",
+            "QmPinataOnly",
+            "QmPinataOnly",
+            None,
+            i64::MAX,
+        )
+        .await
+        .unwrap();
         assert!(
             !db.has_ipfs_cid("sha_pinata_only").await.unwrap(),
             "Pinata-only row must NOT be classified as having a local IPFS CID"
@@ -6473,7 +6548,7 @@ mod migration_tests {
         db.record_pinned_cid("sha_stale", "QmStaleWrong", None)
             .await
             .unwrap();
-        db.record_pinata_cid("sha_stale", "QmRawStale", "QmPinataX", None)
+        db.record_pinata_cid("sha_stale", "QmRawStale", "QmPinataX", None, i64::MAX)
             .await
             .unwrap();
 
@@ -6511,9 +6586,15 @@ mod migration_tests {
         .unwrap();
 
         // Recording a new (different) Pinata CID must NULL the stale fallback cid.
-        db.record_pinata_cid("sha_fallback", "QmRawFallback", "QmPinataNew", None)
-            .await
-            .unwrap();
+        db.record_pinata_cid(
+            "sha_fallback",
+            "QmRawFallback",
+            "QmPinataNew",
+            None,
+            i64::MAX,
+        )
+        .await
+        .unwrap();
 
         let cid: Option<String> =
             sqlx::query_scalar("SELECT cid FROM pinned_cids WHERE sha256_hex = 'sha_fallback'")
@@ -6526,9 +6607,15 @@ mod migration_tests {
         db.record_pinned_cid("sha_genuine", "QmLocalGenuine", None)
             .await
             .unwrap();
-        db.record_pinata_cid("sha_genuine", "QmRawGenuine", "QmPinataGenuine", None)
-            .await
-            .unwrap();
+        db.record_pinata_cid(
+            "sha_genuine",
+            "QmRawGenuine",
+            "QmPinataGenuine",
+            None,
+            i64::MAX,
+        )
+        .await
+        .unwrap();
         let cid: String =
             sqlx::query_scalar("SELECT cid FROM pinned_cids WHERE sha256_hex = 'sha_genuine'")
                 .fetch_one(&db.pool)
@@ -9991,6 +10078,148 @@ mod cid_candidate_order_tests {
         assert_eq!(
             after, sorted,
             "the order must be a stated one (ascending oid), not whatever the heap holds"
+        );
+    }
+}
+
+#[cfg(test)]
+mod policy_fence_tests {
+    //! P1 (reviewer round 9): the third fence has a single
+    //! production call site but no test that can fail when the
+    //! guard stops comparing. These tests pin the three modes:
+    //!
+    //! 1. matching epoch lands the row
+    //! 2. epoch bumped between capture and record aborts the
+    //!    record with no row landed
+    //! 3. the i64::MAX "no fence" sentinel skips the lock and
+    //!    lands the row
+    //!
+    //! P2: a missing repos row must fail closed (was
+    //! `unwrap_or(0)` — a fail-open path against a non-existent
+    //! repo).
+    use super::{Db, RepoRecord};
+    use chrono::Utc;
+    use sqlx::PgPool;
+    use std::time::{Duration, Instant};
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    async fn seed_repo(db: &Db) -> String {
+        let repo_id = uuid::Uuid::new_v4().to_string();
+        db.create_repo(&RepoRecord {
+            id: repo_id.clone(),
+            name: "fence-test".into(),
+            owner_did: "did:key:zFENCE".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: "/tmp/fence-test".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+        repo_id
+    }
+
+    #[sqlx::test]
+    async fn record_pinned_cid_with_source_fenced_pins_under_matching_epoch(pool: PgPool) {
+        let db = db(pool).await;
+        let repo_id = seed_repo(&db).await;
+        let epoch = db.repo_policy_epoch(&repo_id).await.unwrap();
+        db.record_pinned_cid_with_source_fenced("sha-match-1", "cid-match-1", &repo_id, epoch)
+            .await
+            .expect("matching epoch must land the row");
+    }
+
+    #[sqlx::test]
+    async fn record_pinned_cid_with_source_fenced_aborts_on_epoch_bump(pool: PgPool) {
+        let db = db(pool).await;
+        let repo_id = seed_repo(&db).await;
+        // Capture an epoch, then bump the policy_epoch between
+        // capture and record. The fenced record must abort and
+        // the row must NOT land.
+        let captured = db.repo_policy_epoch(&repo_id).await.unwrap();
+        // Simulate a narrowing rule write by bumping the epoch
+        // the way `set_visibility_rule` would.
+        db.bump_repo_policy_epoch(&repo_id).await.unwrap();
+        let result = db
+            .record_pinned_cid_with_source_fenced("sha-bump-1", "cid-bump-1", &repo_id, captured)
+            .await;
+        assert!(result.is_err(), "epoch bump must abort the record");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("policy epoch changed"),
+            "the abort message names the failure class, got: {err}"
+        );
+        // No row should have landed in pinned_cids.
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM pinned_cids WHERE sha256_hex = 'sha-bump-1'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0, "no row landed when the epoch was bumped");
+    }
+
+    #[sqlx::test]
+    async fn record_pinned_cid_with_source_fenced_with_sentinel_skips_comparison(pool: PgPool) {
+        // P2 (reviewer round 9): the i64::MAX sentinel is the
+        // push-side "no fence" path. The call must succeed
+        // even against a repo whose policy_epoch is something
+        // other than i64::MAX, because the comparison is
+        // skipped on the sentinel path. Also: the sentinel
+        // path must NOT take the row lock (push side has no
+        // decision to invalidate).
+        let db = db(pool).await;
+        let repo_id = seed_repo(&db).await;
+        // Epoch here is 0 by default; the i64::MAX sentinel
+        // would fail any comparison. The test passes only
+        // because the sentinel path skips the comparison AND
+        // the row lock.
+        let start = Instant::now();
+        db.record_pinned_cid_with_source_fenced(
+            "sha-sentinel-1",
+            "cid-sentinel-1",
+            &repo_id,
+            i64::MAX,
+        )
+        .await
+        .expect("i64::MAX sentinel must land the row without comparing or locking");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "sentinel-path record should not contend on a row lock, \
+             took {elapsed:?}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn record_pinned_cid_with_source_fenced_bails_on_missing_repo(pool: PgPool) {
+        // P2 (reviewer round 9): a record call against a
+        // non-existent repo must NOT silently pass. The
+        // previous `unwrap_or(0)` paired with `i64::MAX != 0`
+        // admitted a row against a missing repos row. The
+        // helper now bails with no row landed.
+        let db = db(pool).await;
+        let result = db
+            .record_pinned_cid_with_source_fenced(
+                "sha-missing-1",
+                "cid-missing-1",
+                "nonexistent-repo-id",
+                0,
+            )
+            .await;
+        assert!(result.is_err(), "missing repos row must abort the record");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("policy epoch row missing"),
+            "the abort message names the failure class, got: {err}"
         );
     }
 }

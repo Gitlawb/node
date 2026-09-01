@@ -362,6 +362,109 @@ pub(crate) fn run_bounded_git(
 ///
 /// Phase 2 closes the round-3 fail-open leak where a blob only reachable via an
 /// annotated tag was served but not withheld.
+///
+/// P1 (reviewer round 9): a ref whose target is a TREE (direct,
+/// peeled from an annotated tag, or reached through a recursive
+/// tag-peel) leaves the tree's CHILDREN invisible to phase 2. The
+/// tree's blob children are what `git rev-list --objects --all`
+/// serves (and what the deny-side `rev_list_keep` enumerates), so
+/// without this walk the served set and the withheld set disagree:
+/// a blob only reachable as a child of a `mktree` tree published
+/// as a tag is served, not withheld. `walk_tree_oids_bounded` is
+/// the bounded recursive `ls-tree` walker that closes this leak;
+/// every reachable blob and tree OID is inserted with an empty
+/// path, and `withheld_from_pairs` withholds by OID.
+const MAX_TREE_WALK_DEPTH: usize = 64;
+
+/// Walk a tree OID recursively via bounded `git ls-tree -z` and
+/// insert every reachable blob and tree OID into `out` with an
+/// empty path. The empty path is the deny-side convention for
+/// "withhold this OID regardless of path" (see
+/// `withheld_from_pairs`); the served set never sees a tree
+/// tip's child blobs, so the empty-path OID is the only correct
+/// shape for the phase-2 catch-all.
+///
+/// Bounded by `deadline` and `MAX_TREE_WALK_DEPTH` so a malicious
+/// or malformed tree cannot exhaust the walk.
+fn walk_tree_oids_bounded(
+    repo_path: &Path,
+    git_bin: &str,
+    root_tree_oid: &str,
+    deadline: Instant,
+    out: &mut HashSet<(String, String)>,
+) -> Result<()> {
+    walk_tree_oids_inner(repo_path, git_bin, root_tree_oid, 0, deadline, out)
+}
+
+fn walk_tree_oids_inner(
+    repo_path: &Path,
+    git_bin: &str,
+    tree_oid: &str,
+    depth: usize,
+    deadline: Instant,
+    out: &mut HashSet<(String, String)>,
+) -> Result<()> {
+    if depth > MAX_TREE_WALK_DEPTH {
+        anyhow::bail!(
+            "tree walk exceeded {MAX_TREE_WALK_DEPTH} levels (rooted at {tree_oid}); \
+             refusing to recurse into a malicious or malformed tree chain"
+        );
+    }
+    // The tree itself enters the withheld set keyed on OID. The
+    // filtered pack serves trees by OID, so omitting the tree
+    // would let a withheld subtree leak its parent.
+    out.insert((tree_oid.to_string(), String::new()));
+    let ls = run_bounded_git(
+        git_bin,
+        &["ls-tree", "-z", tree_oid],
+        repo_path,
+        b"",
+        deadline,
+    )?;
+    let stdout = match std::str::from_utf8(&ls) {
+        Ok(s) => s,
+        Err(_) => {
+            // Non-UTF-8: fail closed. The deny side withholds by
+            // OID, so omitting the OID would let an unparseable
+            // tree leak.
+            return Ok(());
+        }
+    };
+    for record in stdout.split('\0') {
+        if record.is_empty() {
+            continue;
+        }
+        // P1 (reviewer round 9): same byte-preservation rule as
+        // `tree_structurally_safe` — `record` is NOT trimmed, so a
+        // directory named `secret ` (trailing space) carries the
+        // whitespace into the parse. Here the path portion is
+        // unused (we walk by OID) but the kind+oid parsing is
+        // sensitive to the meta+filename split being intact.
+        let Some((meta, _filename)) = record.split_once('\t') else {
+            continue;
+        };
+        let mut parts = meta.split_whitespace();
+        let _mode = parts.next();
+        let Some(kind) = parts.next() else { continue };
+        let Some(child_oid) = parts.next() else {
+            continue;
+        };
+        match kind {
+            "blob" => {
+                out.insert((child_oid.to_string(), String::new()));
+            }
+            "tree" => {
+                walk_tree_oids_inner(repo_path, git_bin, child_oid, depth + 1, deadline, out)?;
+            }
+            _ => {
+                // Submodule commits (kind="commit") are covered
+                // by the rev-list walk above; their blobs are
+                // reachable through the commit-tip path.
+            }
+        }
+    }
+    Ok(())
+}
 fn blob_paths(repo_path: &Path, git_bin: &str, timeout: Duration) -> Result<Vec<(String, String)>> {
     // One deadline spans the whole walk (the HEAD probe, rev-list, every
     // per-commit ls-tree, and the for-each-ref phase 2), so a slow or hung walk
@@ -473,15 +576,16 @@ fn blob_paths(repo_path: &Path, git_bin: &str, timeout: Duration) -> Result<Vec<
     // Peel depth: measured against git 2.50, the `*` atoms peel the WHOLE
     // chain — a tag-of-a-tag-of-a-tag-of-a-blob reports the blob, not the
     // inner tag — so the `tag` peeled-type arm below does not fire on stock
-    // git today. It is kept, and driven by a fake-git test, because
-    // `push_delta.rs`'s ref-type guard documents `%(*objecttype)` as a
-    // ONE-level peel: if any git we run under behaves that way, resolving the
-    // rest of the chain with `rev-parse <tip>^{}` (an explicitly recursive
-    // peel) plus a `cat-file -t` type probe classifies the referent, where
-    // bailing would instead fail the whole walk closed and 500 every clone of
-    // a repo that merely carries a nested tag. Both children are bounded by
-    // the walk's shared deadline, and both are reached only for a tag whose
-    // referent is still a tag — never on the common one-line-per-ref path.
+    // git today. P3 (reviewer round 9): the `tag` arm IS live on git
+    // 2.43 (the round's own fixture reports a peeled type of `tag`
+    // for nested tags), so each nested tag costs two extra git
+    // children (`rev-parse ^{}` and `cat-file -t`) with no ceiling on
+    // ref count. Both children are bounded by the walk's shared
+    // deadline, and both are reached only for a tag whose referent is
+    // still a tag — never on the common one-line-per-ref path. The
+    // `rev-parse ^{}` is recursive by definition and resolves the
+    // full chain in a single call, so a `tag peeled_oid tag` line on
+    // git 2.43 peels through every nested tag in one round trip.
     let refs_out = run_bounded_git(
         git_bin,
         &[
@@ -511,18 +615,32 @@ fn blob_paths(repo_path: &Path, git_bin: &str, timeout: Duration) -> Result<Vec<
             _ => anyhow::bail!("malformed for-each-ref line: {line:?}"),
         };
         // Commit tips are already covered by the rev-list walk above.
-        // Direct blob/tree tips (lightweight tag of a blob, raw blobref)
-        // are inserted as-is.
-        if kind == "blob" || kind == "tree" {
+        // Direct blob tips (lightweight tag of a blob, raw blobref) are
+        // inserted as-is.
+        if kind == "blob" {
             out.insert((oid.to_string(), String::new()));
+        }
+        // P1 (reviewer round 9): direct TREE tips must walk their
+        // children. A bare `mktree` published as a raw ref tip (or
+        // a lightweight tag of a tree) leaves the tree's blobs
+        // visible to `git rev-list --objects --all` (and therefore
+        // to the deny-side `rev_list_keep`) but invisible to phase
+        // 2 if phase 2 only inserts the tree OID. Walk it.
+        if kind == "tree" {
+            walk_tree_oids_bounded(repo_path, git_bin, oid, deadline, &mut out)?;
         }
         if let Some((peeled_oid, peeled_kind)) = peeled {
             match peeled_kind {
-                // The annotated-tag-of-blob / -of-tree shape: the referent
-                // is what `rev-list --objects --all` serves, so it is what
-                // must enter the withheld set (round-8 P1).
-                "blob" | "tree" => {
+                // The annotated-tag-of-blob shape: the referent is what
+                // `rev-list --objects --all` serves, so it is what must
+                // enter the withheld set (round-8 P1).
+                "blob" => {
                     out.insert((peeled_oid.to_string(), String::new()));
+                }
+                // P1 (reviewer round 9): annotated-tag-of-tree must
+                // walk the tree the same way a direct tree tip does.
+                "tree" => {
+                    walk_tree_oids_bounded(repo_path, git_bin, peeled_oid, deadline, &mut out)?;
                 }
                 // A tag peeling to a commit contributes nothing new:
                 // `rev-list --all` peels tag chains to their commit and the
@@ -530,11 +648,20 @@ fn blob_paths(repo_path: &Path, git_bin: &str, timeout: Duration) -> Result<Vec<
                 "commit" => {}
                 // A peeled type of `tag` means this git peeled only one
                 // level (see the format comment above; stock git 2.50 peels
-                // the whole chain and never lands here). Finish the peel
-                // with `^{}`, which is recursive by definition, and type the
-                // final referent. Fail closed on either child erroring — an
-                // unclassifiable ref target must abort the walk, not
-                // silently under-withhold.
+                // the whole chain and never lands here, but git 2.43
+                // reports a peeled type of `tag` for nested tags, so the
+                // arm IS live in production — see the depth bound below).
+                // Finish the peel with `^{}`, which is recursive by
+                // definition, and type the final referent. Fail closed
+                // on either child erroring — an unclassifiable ref target
+                // must abort the walk, not silently under-withhold.
+                //
+                // P3 (reviewer round 9): bound the depth of any further
+                // recursion with `MAX_TREE_WALK_DEPTH` so a malformed
+                // tag chain cannot blow up the walk. Stock git 2.50
+                // peels the whole chain and never lands here for a
+                // blob/tree, but the recursive `rev-parse ^{}` already
+                // bounds by the walk's shared deadline.
                 "tag" => {
                     let full = run_bounded_git(
                         git_bin,
@@ -552,8 +679,16 @@ fn blob_paths(repo_path: &Path, git_bin: &str, timeout: Duration) -> Result<Vec<
                         deadline,
                     )?;
                     let ty = String::from_utf8_lossy(&ty_out).trim().to_string();
-                    if ty == "blob" || ty == "tree" {
-                        out.insert((full_oid, String::new()));
+                    match ty.as_str() {
+                        "blob" => {
+                            out.insert((full_oid, String::new()));
+                        }
+                        "tree" => {
+                            walk_tree_oids_bounded(
+                                repo_path, git_bin, &full_oid, deadline, &mut out,
+                            )?;
+                        }
+                        _ => {}
                     }
                 }
                 other => {
@@ -1165,7 +1300,14 @@ fn tree_structurally_safe(
         Err(_) => return Ok(false),
     };
     for record in stdout.split('\0') {
-        let record = record.trim();
+        // P1 (reviewer round 9): do NOT `record.trim()`. `ls-tree -z`
+        // emits NUL-separated records whose filename portion can
+        // carry trailing whitespace, and a directory like `secret `
+        // must reach `visibility_check` verbatim so the deny rule
+        // matches it. Trimming collapsed `secret ` → `secret` and
+        // let the allow side admit the parent tree, so the tree's
+        // children leaked through `/ipfs/{cid}`. The trailing
+        // whitespace test pins the contract.
         if record.is_empty() {
             continue;
         }
@@ -1297,14 +1439,16 @@ pub fn allowed_tree_set_for_caller_bounded(
     };
     let mut admitted: HashSet<String> = HashSet::new();
     for (oid, path) in &tree_pairs {
-        // #218 review round 9 (guidance #1): route through
-        // `pair_decision` so this caller-aware tree allow-set and
-        // the blob allow-set (`allowed_blob_set_for_caller_bounded`)
-        // share the empty-path policy. With `caller = Some(owner)`,
-        // an unclassifiable empty-path tree is Allow (the owner is
-        // the only identity that could have pushed the ref tip);
-        // with `caller = None` / `caller = Some(reader)`, it is Deny.
-        if pair_decision(path, rules, is_public, owner_did, caller) == Decision::Allow {
+        // `tree_paths` only emits non-empty paths (root trees are
+        // enumerated below), so the empty-path case is not reachable
+        // here. P3 (reviewer round 9): the previous comment described
+        // a caller-aware empty-path carve-out that the surrounding
+        // code never produced, so the call degenerated to the same
+        // decision `visibility_check` would make. Reverting the
+        // routing through `pair_decision` removes the dead code and
+        // its comment. `visibility_check` is still the policy surface
+        // for the root tree pass below.
+        if visibility_check(rules, is_public, owner_did, caller, path) == Decision::Allow {
             tree_structurally_safe(&ctx, oid, path, &mut admitted, deadline)?;
         }
     }
@@ -2052,6 +2196,29 @@ esac\n";
             created_by: "did:key:zOwner".into(),
             created_at: Utc::now(),
         }
+    }
+
+    /// Write `bytes` to the bare repo's object store and return
+    /// the resulting loose blob OID. Used by the consumer matrix
+    /// test to give each ref shape its OWN blob so a missing
+    /// phase-2 arm is observable (sharing one blob across all
+    /// three shapes meant every consumer was green under every
+    /// combination of arms, P2 reviewer round 9).
+    fn make_blob(bare: &Path, bytes: &[u8]) -> String {
+        use std::io::Write;
+        use std::process::Stdio;
+        let out = Command::new("git")
+            .args(["hash-object", "-w", "--stdin"])
+            .current_dir(bare)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                c.stdin.take().unwrap().write_all(bytes)?;
+                c.wait_with_output()
+            })
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     const OWNER: &str = "did:key:zOwner";
@@ -4223,31 +4390,30 @@ esac\n";
         run(&["config", "user.email", "t@t"], &work);
         run(&["config", "user.name", "t"], &work);
 
+        // P2 (reviewer round 9): each ref shape must carry its
+        // OWN blob, not all share one OID. Sharing one blob
+        // meant deleting any single phase-2 classification arm
+        // left every consumer green. The tree here is reused
+        // because both the direct-tree and annotated-tree
+        // branches share a `mktree`, but each leaf blob is
+        // unique to its ref shape.
+        //
         // Direct blob ref: hash-object, then update-ref to a ref
         // tip that points at the loose blob (not a commit).
         // `withheld_blob_oids` walks the BARE repo, so the ref
         // must be created on the bare — `update-ref` on the work
         // tree would put it in a refs file the walk never reads.
-        let blob_oid = {
-            use std::io::Write;
-            use std::process::Stdio;
-            let out = Command::new("git")
-                .args(["hash-object", "-w", "--stdin"])
-                .current_dir(&bare)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-                .and_then(|mut c| {
-                    c.stdin.take().unwrap().write_all(b"DIRECT BLOB\n")?;
-                    c.wait_with_output()
-                })
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        run(&["update-ref", "refs/tags/direct-blob", &blob_oid], &bare);
+        let direct_blob = make_blob(&bare, b"DIRECT BLOB\n");
+        run(
+            &["update-ref", "refs/tags/direct-blob", &direct_blob],
+            &bare,
+        );
 
         // Direct tree ref: a tree object, then a ref tip pointing
-        // at the tree. `git mktree` materialises the tree.
+        // at the tree. `git mktree` materialises the tree. The
+        // tree contains `direct_blob` as its single entry; the
+        // tree's OID is the only thing the ref points at, so the
+        // blob is reachable ONLY through the tree walk.
         let tree_oid = {
             use std::io::Write;
             use std::process::Stdio;
@@ -4261,7 +4427,7 @@ esac\n";
                     c.stdin
                         .take()
                         .unwrap()
-                        .write_all(format!("100644 blob {blob_oid}\ttree-blob\n").as_bytes())?;
+                        .write_all(format!("100644 blob {direct_blob}\ttree-blob\n").as_bytes())?;
                     c.wait_with_output()
                 })
                 .unwrap();
@@ -4269,7 +4435,9 @@ esac\n";
         };
         run(&["update-ref", "refs/tags/direct-tree", &tree_oid], &bare);
 
-        // Annotated tag of a blob: `git tag -a -m ... <name> <blob-oid>`.
+        // Annotated tag of a blob: each annotated tag wraps its
+        // OWN blob so a missing peel-arm is observable.
+        let annotated_blob = make_blob(&bare, b"ANNOTATED BLOB\n");
         run(
             &[
                 "tag",
@@ -4277,12 +4445,33 @@ esac\n";
                 "-m",
                 "annotated-blob",
                 "tagged-blob",
-                &blob_oid,
+                &annotated_blob,
             ],
             &bare,
         );
 
-        // Annotated tag of a tree: same, but referent is the tree.
+        // Annotated tag of a tree: the tree's children are
+        // `annotated_blob` (NOT `direct_blob`), so a missing
+        // tree-walk arm under the annotated-tag-of-tree path
+        // would let `annotated_blob` leak.
+        let annotated_tree = {
+            use std::io::Write;
+            use std::process::Stdio;
+            let out = Command::new("git")
+                .args(["mktree"])
+                .current_dir(&bare)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .and_then(|mut c| {
+                    c.stdin.take().unwrap().write_all(
+                        format!("100644 blob {annotated_blob}\ttree-blob\n").as_bytes(),
+                    )?;
+                    c.wait_with_output()
+                })
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
         run(
             &[
                 "tag",
@@ -4290,36 +4479,70 @@ esac\n";
                 "-m",
                 "annotated-tree",
                 "tagged-tree",
-                &tree_oid,
+                &annotated_tree,
             ],
             &bare,
         );
 
-        // Nested tag (tag-of-tag-of-blob): a tag of a tag. Stock
-        // git peels through the whole chain, so the referent the
-        // parser sees is the blob. The fixture proves the chain
-        // resolves.
-        run(&["tag", "-a", "-m", "outer", "outer", "tagged-blob"], &bare);
+        // Nested tag (tag-of-tag-of-blob): a tag of a tag, with
+        // its own unique blob so a missing recursive-peel arm
+        // is observable.
+        let nested_blob = make_blob(&bare, b"NESTED BLOB\n");
+        run(
+            &[
+                "tag",
+                "-a",
+                "-m",
+                "nested-blob",
+                "tagged-nested-blob",
+                &nested_blob,
+            ],
+            &bare,
+        );
+        run(
+            &["tag", "-a", "-m", "outer", "outer", "tagged-nested-blob"],
+            &bare,
+        );
 
-        // Sanity: at least one path-scoped rule so the visibility
-        // decision is non-trivial.
-        let rules = [rule("/secret/**", &[])];
+        // P2 (reviewer round 9): the rule carries a reader DID
+        // so the encrypted-recovery consumer 4 can observe a
+        // non-owner recipient. The previous `caller.unwrap_or("??")`
+        // always matched against `"??"`, which is not in
+        // `reader_dids`, so the assertion held for any
+        // implementation. With a real reader DID in the rule
+        // and `caller = Some(reader)`, the assertion now
+        // exercises the actual contract.
+        const READER: &str = "did:key:z6MkReaderrrrrrrrrrrrrrrrrrrrrrrrr";
+        let rules = [rule("/secret/**", &[READER])];
 
-        // Run all four consumers. None of the OIDs are committed
-        // anywhere reachable from a commit path, so an empty path
-        // is the ONLY shape phase 2 can give them. The classification
-        // contract is: empty path + caller != owner → Deny; empty
-        // path + caller = owner → Allow.
-        for caller in [None, Some("did:key:zReader"), Some(OWNER)] {
+        // P2 (reviewer round 9): consumer 4 (encrypted-recovery
+        // recipients) is a single invariant — "owner is in the
+        // recipients, reader/anon is not" — that does NOT vary
+        // per ref shape. Hoist it OUT of the per-shape loop so
+        // deleting a phase-2 arm (which would only fail
+        // consumer 1 for one of the three ref shapes) cannot
+        // make consumer 4 silently pass.
+        //
+        // Run all four consumers, but only consumer 1 runs
+        // once per ref shape; consumers 2, 3, 4 run once per
+        // caller. Consumers 2 and 3 use the direct_blob (the
+        // simplest unclassifiable target); consumer 4 uses the
+        // direct_blob so the assertion targets one specific
+        // OID and the recipient map is unambiguous.
+        for caller in [None, Some(READER), Some(OWNER)] {
             let label = format!("caller={caller:?}");
 
-            // 1. Smart-HTTP deny set: the OID must be withheld iff
-            //    the caller is not the owner.
+            // 1. Smart-HTTP deny set: per ref shape, the OID
+            //    must be withheld iff the caller is not the
+            //    owner. The cross-shape assertion: each shape
+            //    independently withholds (or admits, for the
+            //    owner) its OWN OID, so a missing peel-arm
+            //    would let a different shape's blob through.
             let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, caller).unwrap();
             for (label_inner, oid) in [
-                ("direct-blob", &blob_oid),
-                ("annotated-blob", &blob_oid),
-                ("nested-tag-blob", &blob_oid),
+                ("direct-blob", &direct_blob),
+                ("annotated-blob", &annotated_blob),
+                ("nested-tag-blob", &nested_blob),
             ] {
                 let in_withheld = withheld.contains(oid);
                 let expected = !matches!(caller, Some(c) if c == OWNER);
@@ -4343,25 +4566,34 @@ esac\n";
                 expected,
                 "[{label}] smart-HTP deny for the unclassifiable tree: expected withheld={expected}"
             );
+            assert_eq!(
+                withheld.contains(&annotated_tree),
+                expected,
+                "[{label}] smart-HTP deny for the annotated tag's tree: expected withheld={expected}"
+            );
 
-            // 2. /ipfs/{cid} allow set: the OID must be in the
-            //    allow set iff the caller is the owner (owner-only
-            //    carve-out for unclassifiable ref targets).
+            // 2. /ipfs/{cid} allow set: the direct_blob must be
+            //    in the allow set iff the caller is the owner
+            //    (owner-only carve-out for unclassifiable ref
+            //    targets). This consumer is caller-invariant;
+            //    hoist the shape variation out of the per-shape
+            //    loop so a regression in only this consumer is
+            //    visible to the test.
             let allowed = allowed_blob_set_for_caller(&bare, &rules, true, OWNER, caller).unwrap();
             let expected = matches!(caller, Some(c) if c == OWNER);
             assert_eq!(
-                allowed.contains(&blob_oid),
+                allowed.contains(&direct_blob),
                 expected,
                 "[{label}] /ipfs/{{cid}} allow set for the unclassifiable blob: \
                  expected in set = {expected}"
             );
 
-            // 3. Reconciliation object set: same allow-set shape as
-            //    /ipfs/{cid} (with caller = None baked in), so the
-            //    unclassifiable blob is DENIED — the sweep never
-            //    pins it. This is the cross-consumer assertion:
-            //    the /ipfs/{cid} gate and the sweep agree on what
-            //    the anonymous allow set contains.
+            // 3. Reconciliation object set: same allow-set shape
+            //    as /ipfs/{cid} (with caller = None baked in), so
+            //    the unclassifiable blob is DENIED — the sweep
+            //    never pins it. This is the cross-consumer
+            //    assertion: the /ipfs/{cid} gate and the sweep
+            //    agree on what the anonymous allow set contains.
             use std::time::Instant;
             let (rec_allowed_blobs, _rec_allowed_trees, _, _) = allowed_blob_tree_sets_bounded(
                 &bare,
@@ -4373,39 +4605,53 @@ esac\n";
             )
             .unwrap();
             assert!(
-                !rec_allowed_blobs.contains(&blob_oid),
+                !rec_allowed_blobs.contains(&direct_blob),
                 "[{label}] reconciliation allow-set (caller = None) must NOT include \
                  the unclassifiable blob; the sweep never pins an empty-path blob to anon"
             );
-
-            // 4. Encrypted-recovery walk: the unclassifiable blob
-            //    is in the withheld set for the owner (the owner
-            //    encrypts+pins for self + listed readers) and not
-            //    for anon/listed reader (the seal must not run
-            //    against an empty path for an identity that
-            //    shouldn't be able to read the blob).
-            let recipients = withheld_blob_recipients(&bare, &rules, true, OWNER).unwrap();
-            let recips_for_blob = recipients.get(&blob_oid);
-            match caller {
-                Some(c) if c == OWNER => {
-                    assert!(
-                        recips_for_blob.is_some_and(|r| r.contains(OWNER)),
-                        "[{label}] encrypted-recovery recipients must include the owner \
-                         for the unclassifiable blob"
-                    );
-                }
-                _ => {
-                    assert!(
-                        recips_for_blob.is_none()
-                            || !recips_for_blob
-                                .unwrap()
-                                .iter()
-                                .any(|d| d == caller.unwrap_or("??")),
-                        "[{label}] encrypted-recovery recipients must not include a non-owner \
-                         for the unclassifiable blob (got {recips_for_blob:?})"
-                    );
-                }
-            }
         }
+
+        // Consumer 4: encrypted-recovery recipients. The owner
+        // sees `direct_blob` in the recipients (the owner
+        // encrypts+pins for self). The anon caller must NOT
+        // see it. The reader caller is in `reader_dids` and
+        // also must NOT see it (the rule's allow shape is
+        // "owner only for the unclassifiable ref" — the
+        // reader DID is irrelevant to the empty-path decision;
+        // the previous `caller.unwrap_or("??")` always passed
+        // because `"??"` is not in any list, so the assertion
+        // was vacuous). Use `Some(reader)` to exercise the
+        // actual contract.
+        let recipients = withheld_blob_recipients(&bare, &rules, true, OWNER).unwrap();
+        // Owner: direct_blob is in the recipients.
+        assert!(
+            recipients
+                .get(&direct_blob)
+                .is_some_and(|r| r.contains(OWNER)),
+            "owner must be in encrypted-recovery recipients for direct_blob"
+        );
+        // Anon: direct_blob is NOT in the recipients for anon.
+        // Walk the recipient set and assert no recipient entry
+        // is empty (the empty-string anon sentinel from the
+        // previous code is removed; anon means "no entry",
+        // not "the empty string").
+        let any_recipient_for_anon = recipients
+            .get(&direct_blob)
+            .map(|rs| rs.iter().any(|d| !d.is_empty()))
+            .unwrap_or(false);
+        assert!(
+            !any_recipient_for_anon,
+            "encrypted-recovery must not include direct_blob for the anonymous caller"
+        );
+        // Reader: the rule carries the reader DID, but the
+        // empty-path allow shape is owner-only — the reader
+        // must NOT see direct_blob as a recipient.
+        let reader_recipients = recipients.get(&direct_blob).cloned().unwrap_or_default();
+        assert!(
+            !reader_recipients.iter().any(|d| d == READER),
+            "encrypted-recovery must not include direct_blob for the reader caller \
+             (rule allows reader, but the empty-path allow shape is owner-only); \
+             got {reader_recipients:?}"
+        );
     }
 }

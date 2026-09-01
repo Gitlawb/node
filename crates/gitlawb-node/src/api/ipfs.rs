@@ -2553,9 +2553,15 @@ mod closed_pool_tests {
         let raw2 = "bafkreip2pinataonlyresolverkeyrawcid";
         let pinata2 = "QmPinataProviderCidForRawOnlyRow";
         assert_ne!(raw2, pinata2);
-        db.record_pinata_cid(sha_pinata_raw, raw2, pinata2, Some("repo-p2-pinata-raw"))
-            .await
-            .unwrap();
+        db.record_pinata_cid(
+            sha_pinata_raw,
+            raw2,
+            pinata2,
+            Some("repo-p2-pinata-raw"),
+            i64::MAX,
+        )
+        .await
+        .unwrap();
 
         // (3) pinata-only (raw == provider, legacy pre-v27 shape would
         // have been `cid = pinata_cid`; v27 cleared that to NULL. The
@@ -2564,9 +2570,15 @@ mod closed_pool_tests {
         // provider CID that doesn't hash to the raw bytes, #173).
         let sha_pinata_null = "sha_p2_pinata_only_null_cid";
         let same = "QmPinataOnlyCidRawEqualsProvider";
-        db.record_pinata_cid(sha_pinata_null, same, same, Some("repo-p2-pinata-null"))
-            .await
-            .unwrap();
+        db.record_pinata_cid(
+            sha_pinata_null,
+            same,
+            same,
+            Some("repo-p2-pinata-null"),
+            i64::MAX,
+        )
+        .await
+        .unwrap();
 
         // (4) dual: local first (sets the flag and `cid`), then Pinata
         // (sets `pinata_cid` and preserves `cid` and `local_ipfs_provenance`).
@@ -2576,7 +2588,7 @@ mod closed_pool_tests {
         db.record_pinned_cid_with_source(sha_dual, raw4, "repo-p2-dual")
             .await
             .unwrap();
-        db.record_pinata_cid(sha_dual, raw4, pinata4, Some("repo-p2-dual"))
+        db.record_pinata_cid(sha_dual, raw4, pinata4, Some("repo-p2-dual"), i64::MAX)
             .await
             .unwrap();
 

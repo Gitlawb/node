@@ -70,7 +70,6 @@ const ENCRYPTED_MANIFEST_ANCHOR_FAILED_MSG: &str =
 /// work completed — the unattempted prefix must retry at the
 /// head of the next pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // documented scaffolding; the closure is the live consumer
 pub(crate) enum ProgressState {
     /// No work was attempted this pass (fence capture failed,
     /// refilter returned `None`, dispatch produced an empty
@@ -90,17 +89,44 @@ impl ProgressState {
     /// Map the three states to the wire form: `Some(value)` for
     /// a write, `None` for "leave the row alone".
     ///
-    /// The closure `next_offset_write(scan_ok, had_work, dispatched)`
-    /// in `run_pass` is the same logic in closure form; this
-    /// method exists for tests and for any future caller that
-    /// wants the type rather than the wire tuple.
-    #[allow(dead_code)] // the closure is the live consumer; this is the documented mapping
+    /// The function [`next_offset_write`] is the same logic in
+    /// callable form; this method exists so a future caller
+    /// that has a `ProgressState` in hand (rather than the
+    /// inputs to `next_offset_write`) can convert without
+    /// re-deriving the decision.
     pub(crate) fn to_wire(&self) -> Option<Option<String>> {
         match self {
             ProgressState::Idle => None,
             ProgressState::Advanced { last_dispatched } => Some(Some(last_dispatched.clone())),
             ProgressState::Drained => Some(None),
         }
+    }
+}
+
+/// The next-offset decision. Called by `run_pass` at the
+/// cursor-write site and exposed at module scope so a test can
+/// drive it with known `(scan_ok, had_work, dispatched)` triples
+/// and assert that the returned `ProgressState` (and its
+/// `to_wire()`) is what the cursor-write site will land. P2
+/// (reviewer round 9): the previous test never called the
+/// closure, so the wire-form test pinned itself to its own
+/// arm-by-arm reproduction. Now there is one encoding and the
+/// test calls the function under test.
+pub(crate) fn next_offset_write(
+    scan_ok: bool,
+    had_work: bool,
+    dispatched: Option<String>,
+) -> ProgressState {
+    if !scan_ok {
+        ProgressState::Idle
+    } else if let Some(last) = dispatched {
+        ProgressState::Advanced {
+            last_dispatched: last,
+        }
+    } else if !had_work {
+        ProgressState::Drained
+    } else {
+        ProgressState::Idle
     }
 }
 
@@ -1027,13 +1053,17 @@ async fn run_pass(
         // missed offset write means the next pass starts at the head
         // (the worst case is one pass at the old sort order).
         //
-        // `next_offset_write` returns `Some(value_to_write)` or `None` for
-        // "leave the row alone", so the two backends cannot drift apart.
+        // `next_offset_write` returns a `ProgressState` directly
+        // (the documented shape), and the write site converts to
+        // the wire form via `to_wire`. One encoding — the enum
+        // is no longer a parallel implementation of the same
+        // logic. P2 (reviewer round 9): the previous code held
+        // `Option<Option<String>>` in the closure and the
+        // `ProgressState` enum on the side, with the two only
+        // cross-checked in a test that never called the closure.
+        // Now there is one mapping.
         //
-        // #218 review round 9 (guidance #4 — model the states
-        // explicitly): the tri-state `Option<Option<String>>` is
-        // the wire form; `ProgressState` is the documented shape
-        // the closure maps from. Three states:
+        // The three states:
         //   - `Idle`: no work was attempted this pass (fence
         //     capture failed, refilter returned `None`, dispatch
         //     produced an empty `to_pin`). The cursor is
@@ -1049,21 +1079,11 @@ async fn run_pass(
         // IPFS missing set clears the IPFS offset but does NOT
         // touch the Pinata offset, and vice versa. The write
         // site persists each backend's state without sharing.
-        let next_offset_write =
-            |scan_ok: bool, had_work: bool, dispatched: Option<String>| -> Option<Option<String>> {
-                if !scan_ok {
-                    None
-                } else if dispatched.is_some() {
-                    Some(dispatched)
-                } else if !had_work {
-                    Some(None)
-                } else {
-                    None
-                }
-            };
 
         if ipfs_enabled {
-            if let Some(next) = next_offset_write(ipfs_scan_ok, ipfs_had_work, ipfs_dispatched) {
+            let next_wire =
+                next_offset_write(ipfs_scan_ok, ipfs_had_work, ipfs_dispatched).to_wire();
+            if let Some(next) = next_wire {
                 if let Err(e) = db
                     .save_reconciliation_offset(&repo.id, "IPFS", next.as_deref())
                     .await
@@ -1075,9 +1095,9 @@ async fn run_pass(
             }
         }
         if pinata_enabled {
-            if let Some(next) =
-                next_offset_write(pinata_scan_ok, pinata_had_work, pinata_dispatched)
-            {
+            let next_wire =
+                next_offset_write(pinata_scan_ok, pinata_had_work, pinata_dispatched).to_wire();
+            if let Some(next) = next_wire {
                 if let Err(e) = db
                     .save_reconciliation_offset(&repo.id, "PINATA", next.as_deref())
                     .await
@@ -1281,7 +1301,7 @@ async fn run_pass(
 
 #[cfg(test)]
 mod tests {
-    use super::ProgressState;
+    use super::{next_offset_write, ProgressState};
     use tokio::sync::watch;
 
     /// Build a minimal Config with both IPFS and Pinata fields empty so the
@@ -1303,20 +1323,69 @@ mod tests {
         std::sync::Arc::new(cfg)
     }
 
-    /// #218 review round 9 (guidance #4): pin the wire-form
-    /// mapping at the cargo-test level so a future change to
-    /// `ProgressState`'s variants or the closure logic in
-    /// `run_pass` has a single test to point at. The mapping
-    /// is:
-    /// - `Idle` → `None` (caller preserves the previous offset;
-    ///   the unattempted prefix retries at the head of the next
-    ///   pass).
-    /// - `Advanced { last }` → `Some(Some(last))` (caller writes
-    ///   the offset; the next pass rotates past `last`).
-    /// - `Drained` → `Some(None)` (caller clears the offset; a
-    ///   future pass sees a fresh start).
+    /// #218 review round 9 (guidance #4): the wire-form test
+    /// now drives `next_offset_write` directly with the same
+    /// `(scan_ok, had_work, dispatched)` triples the
+    /// cursor-write site uses, and asserts the returned
+    /// `ProgressState` (and its `to_wire()`) is what the
+    /// cursor-write site will land. P2 (reviewer round 9): the
+    /// previous test never called the closure, so it pinned
+    /// itself to its own arm-by-arm reproduction of the enum.
+    /// Now there is one encoding and the test calls the function
+    /// under test.
     #[test]
-    fn progress_state_to_wire_matches_the_closure() {
+    fn next_offset_write_decision_table() {
+        // scan_ok=false short-circuits to Idle regardless of the
+        // other inputs — fence capture failed, the cursor must
+        // be preserved.
+        assert_eq!(
+            next_offset_write(false, true, Some("Z".to_string())),
+            ProgressState::Idle,
+            "scan_ok=false must produce Idle (fence capture failed, cursor preserved)"
+        );
+        assert_eq!(
+            next_offset_write(false, false, None),
+            ProgressState::Idle,
+            "scan_ok=false must produce Idle even with no work"
+        );
+        // dispatched.is_some() is Advanced, regardless of had_work.
+        assert_eq!(
+            next_offset_write(true, true, Some("X".to_string())),
+            ProgressState::Advanced {
+                last_dispatched: "X".to_string()
+            },
+            "dispatched.is_some() must produce Advanced (the next pass rotates past last)"
+        );
+        assert_eq!(
+            next_offset_write(true, false, Some("Y".to_string())),
+            ProgressState::Advanced {
+                last_dispatched: "Y".to_string()
+            },
+            "dispatched.is_some() wins over !had_work"
+        );
+        // No dispatch, no work → Drained (cursor cleared).
+        assert_eq!(
+            next_offset_write(true, false, None),
+            ProgressState::Drained,
+            "scan_ok=true with no work and no dispatch must produce Drained (cursor cleared)"
+        );
+        // No dispatch, had_work → Idle (cursor preserved).
+        assert_eq!(
+            next_offset_write(true, true, None),
+            ProgressState::Idle,
+            "had_work but no dispatch must produce Idle (cursor preserved, retry at head)"
+        );
+    }
+
+    /// The to_wire mapping for the three states, kept as a
+    /// separate test so a future change to either side of the
+    /// pair (enum variant vs. wire form) is caught. P2 (reviewer
+    /// round 9): with the closure now returning `ProgressState`
+    /// directly and the wire form derived via `to_wire`, this
+    /// is a pure mapping test, not a guard on the closure
+    /// logic.
+    #[test]
+    fn progress_state_to_wire_mapping() {
         assert_eq!(
             ProgressState::Idle.to_wire(),
             None,
@@ -2360,7 +2429,7 @@ mod tests {
             raw_cid, pinata_cid,
             "the test fixture must use distinct raw and provider CIDs"
         );
-        db.record_pinata_cid(sha, raw_cid, pinata_cid, None)
+        db.record_pinata_cid(sha, raw_cid, pinata_cid, None, i64::MAX)
             .await
             .unwrap();
 

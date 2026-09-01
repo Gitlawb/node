@@ -451,7 +451,15 @@ pub async fn pin_new_objects(
                 if let Err(e) = crate::ipfs_pin::db_bounded(
                     crate::ipfs_pin::db_record_deadline(deadline),
                     crate::ipfs_pin::retry_db_record(|| {
-                        db.record_pinata_cid(&sha, &raw_cid, &cid, Some(repo_id))
+                        // P2 (reviewer round 9): Pinata's POST is
+                        // irreversible exactly like IPFS's, so
+                        // route the record through the fenced
+                        // variant when a fence is in scope. The
+                        // `i64::MAX` sentinel tells the helper
+                        // to skip the lock + comparison (the
+                        // unfenced caller path).
+                        let fence_epoch = fence.map(|f| f.captured_epoch()).unwrap_or(i64::MAX);
+                        db.record_pinata_cid(&sha, &raw_cid, &cid, Some(repo_id), fence_epoch)
                     }),
                 )
                 .await
@@ -1373,9 +1381,15 @@ mod tests {
         // bytes.
         let raw_cid =
             gitlawb_core::cid::Cid::from_git_object_bytes(b"pinata skip seed").to_string();
-        db.record_pinata_cid(&sha, &raw_cid, "QmSeedProviderCid", Some("repo-seed"))
-            .await
-            .unwrap();
+        db.record_pinata_cid(
+            &sha,
+            &raw_cid,
+            "QmSeedProviderCid",
+            Some("repo-seed"),
+            i64::MAX,
+        )
+        .await
+        .unwrap();
         db.record_pin_source(&sha, "repo-seed").await.unwrap();
         let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let endpoint = delaying_pinata_endpoint(

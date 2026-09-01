@@ -200,19 +200,26 @@ pub(crate) async fn silent_http_endpoint() -> String {
 /// lines (the same as a bare default `*) : ;;` arm).
 #[allow(dead_code)] // referenced by `fake_git_with_refs` and the round-9 fixtures
 pub(crate) fn fake_git_for_ref_body(refs: &[(&str, &str, &str, &str)]) -> String {
+    // P2 (reviewer round 9): the previous body emitted
+    // `echo ... ;;` per ref, which is a `;;` PER REF inside
+    // a single case arm. The first `;;` closes the arm, and
+    // every subsequent `echo` parses as a pattern line, which
+    // `sh -n` rejects with "word unexpected". The right shape
+    // is one `;;` per arm, emitted once after the last ref.
     let mut body = String::new();
     if refs.is_empty() {
         body.push_str("    : ;;\n");
     } else {
         for (oid, kind, peeled_oid, peeled_kind) in refs {
             if peeled_oid.is_empty() && peeled_kind.is_empty() {
-                body.push_str(&format!("    echo '{oid} {kind}' ;;\n"));
+                body.push_str(&format!("    echo '{oid} {kind}'\n"));
             } else {
                 body.push_str(&format!(
-                    "    echo '{oid} tag {peeled_oid} {peeled_kind}' ;;\n"
+                    "    echo '{oid} tag {peeled_oid} {peeled_kind}'\n"
                 ));
             }
         }
+        body.push_str("    ;;\n");
     }
     body
 }
@@ -239,6 +246,11 @@ mod helper_tests {
     /// shape `blob_paths` phase 2 parses. Pin the format at the
     /// cargo-test level so a parser regression breaks this
     /// helper test in addition to the production tests.
+    /// P2 (reviewer round 9): also execute the generated script
+    /// through `sh -n` and against a tempdir; the previous
+    /// substring check passed while the script was a `sh`
+    /// syntax error (the `;;` was emitted once per ref inside
+    /// a single case arm, which `sh` rejects).
     #[test]
     fn fake_git_with_refs_emits_the_column_shape() {
         let script = fake_git_with_refs(&[
@@ -257,6 +269,48 @@ mod helper_tests {
         assert!(
             script.contains("'tag0000000000000000000000000000000000 tag peel000000000000000000000000000000 blob'"),
             "annotated tag tip must emit four tokens: got\n{script}"
+        );
+
+        // P2 (reviewer round 9): execute the script through
+        // `sh -n` to catch the `;;` per-ref syntax error the
+        // previous test missed. The previous test only checked
+        // substring presence and was green while the script was
+        // malformed shell.
+        let sh_n = std::process::Command::new("sh")
+            .args(["-n", "-c", &script])
+            .status()
+            .expect("sh -n must run");
+        assert!(
+            sh_n.success(),
+            "the generated script must be valid shell; \
+             `sh -n` exited {sh_n:?}\n----\n{script}\n----"
+        );
+
+        // Also run the script for real against a tempdir. The
+        // non-tag tip must echo the two-token line, and the
+        // annotated-tag tip must echo the four-token line.
+        let td = tempfile::tempdir().expect("tempdir");
+        let script_path = td.path().join("fake-git.sh");
+        std::fs::write(&script_path, &script).expect("write script");
+        std::fs::set_permissions(
+            &script_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("chmod");
+        let out = std::process::Command::new(&script_path)
+            .arg("for-each-ref")
+            .output()
+            .expect("run script");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("commit0000000000000000000000000000000 commit"),
+            "the two-token tip must print: stdout={stdout:?}\nscript:\n{script}"
+        );
+        assert!(
+            stdout.contains(
+                "tag0000000000000000000000000000000000 tag peel000000000000000000000000000000 blob"
+            ),
+            "the four-token tip must print: stdout={stdout:?}\nscript:\n{script}"
         );
     }
 
@@ -4836,7 +4890,13 @@ mod tests {
         let raw_cid = gitlawb_core::cid::Cid::from_git_object_bytes(&raw).to_string();
         state
             .db
-            .record_pinata_cid(&fx.public_oid, &raw_cid, "QmProvider", Some(&repo.id))
+            .record_pinata_cid(
+                &fx.public_oid,
+                &raw_cid,
+                "QmProvider",
+                Some(&repo.id),
+                i64::MAX,
+            )
             .await
             .expect("seed pinata pin");
 
@@ -5871,7 +5931,7 @@ mod tests {
         // raw CID in `cid` with the provider CID in `pinata_cid`.
         state
             .db
-            .record_pinata_cid("po1", &raw1, "pcid1", Some("repoA"))
+            .record_pinata_cid("po1", &raw1, "pcid1", Some("repoA"), i64::MAX)
             .await
             .unwrap();
         assert_eq!(
@@ -5902,7 +5962,7 @@ mod tests {
             .unwrap();
         state
             .db
-            .record_pinata_cid("po2", "rawcid2", "pcid2", Some("repoB"))
+            .record_pinata_cid("po2", "rawcid2", "pcid2", Some("repoB"), i64::MAX)
             .await
             .unwrap();
         assert_eq!(
@@ -5932,7 +5992,7 @@ mod tests {
             .unwrap();
         state
             .db
-            .record_pinata_cid("po3", "rawcid3", "pcid3", Some("repoY"))
+            .record_pinata_cid("po3", "rawcid3", "pcid3", Some("repoY"), i64::MAX)
             .await
             .unwrap();
         assert_eq!(
@@ -5964,7 +6024,7 @@ mod tests {
         // Pinata-first: no prior local pin, so this INSERT creates the row.
         state
             .db
-            .record_pinata_cid("pfsha", &raw_cid, provider_cid, Some("repoP"))
+            .record_pinata_cid("pfsha", &raw_cid, provider_cid, Some("repoP"), i64::MAX)
             .await
             .unwrap();
 
