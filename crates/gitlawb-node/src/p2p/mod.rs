@@ -518,10 +518,10 @@ fn verify_and_create_ancestor_chain(dir: &Path, euid: u32) -> Result<()> {
         }
 
         match std::io::Error::last_os_error().raw_os_error() {
-            Some(code) if code == libc::ELOOP => {
+            Some(code) if code == libc::ELOOP || code == libc::ENOTDIR => {
                 anyhow::bail!(
-                    "p2p key directory {} sits under {}, which is a symlink; the node \
-                     refuses symlinks on the key storage path",
+                    "p2p key directory {} sits under {}, which is a symlink or another object \
+                     type; the node refuses anything but a real directory on the key storage path",
                     dir.display(),
                     acc.display()
                 );
@@ -2707,6 +2707,84 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ancestor_walk_refuses_group_writable_ancestors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for mode in [0o770u32, 0o775] {
+            let base = key_base_0700();
+            let ancestor = base.path().join("g");
+            std::fs::create_dir(&ancestor).unwrap();
+            std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            let path = ancestor.join("keys").join("p2p.key");
+            let err = load_or_create_p2p_keypair(&path)
+                .expect_err("a group-writable ancestor must be refused");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("writable beyond its owner"),
+                "mode {mode:04o} must be refused for group write, got: {msg}"
+            );
+            // Refusal must not create the key directory or the key.
+            assert!(!ancestor.join("keys").exists(), "key dir must not be created");
+            assert!(!path.exists(), "key must not be created");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ancestor_walk_accepts_safe_and_sticky_ancestors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A 0755 ancestor (no group/world write) is accepted and the key boots.
+        let base = key_base_0700();
+        let safe = base.path().join("safe");
+        std::fs::create_dir(&safe).unwrap();
+        std::fs::set_permissions(&safe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let kp = load_or_create_p2p_keypair(&safe.join("keys").join("p2p.key"))
+            .expect("a 0755 ancestor must boot");
+        assert_eq!(
+            PeerId::from(
+                load_or_create_p2p_keypair(&safe.join("keys").join("p2p.key"))
+                    .unwrap()
+                    .public()
+            ),
+            PeerId::from(kp.public()),
+            "the identity must reload stably"
+        );
+
+        // A 1777 sticky ancestor (the /tmp shape) is accepted: sticky blocks
+        // rename/delete of others' entries even though the directory is
+        // world-writable.
+        let sticky = base.path().join("sticky");
+        std::fs::create_dir(&sticky).unwrap();
+        std::fs::set_permissions(&sticky, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let _ = load_or_create_p2p_keypair(&sticky.join("keys").join("p2p.key"))
+            .expect("a 1777 sticky ancestor must boot");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ancestor_walk_refuses_intermediate_symlink() {
+        let base = key_base_0700();
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let path = link.join("keys").join("p2p.key");
+        let err = load_or_create_p2p_keypair(&path)
+            .expect_err("an intermediate symlink component must be refused");
+        assert!(
+            format!("{err:#}").contains("symlink"),
+            "intermediate symlink refusal must name the symlink, got: {err:#}"
+        );
+        // The symlink target must be untouched: no keys dir, no key inside.
+        assert!(!real.join("keys").exists(), "symlink target must be untouched");
     }
 
     #[cfg(unix)]
