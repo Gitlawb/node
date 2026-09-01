@@ -2444,6 +2444,34 @@ pub async fn git_receive_pack(
     // refs.
     let pending_ref_names: Vec<&str> = ref_updates.iter().map(|u| u.ref_name.as_str()).collect();
 
+    // P2 (reviewer round 5): the push event id is keyed on
+    // `first_ref_name` (the request's first requested ref). If
+    // that ref was rejected but a later ref landed, the drain's
+    // `derive_one` — which only writes the event for the row whose
+    // `ref_name == first_ref_name` — would never find a match and
+    // the event would be lost on crash. Rewrite `first_ref_name`
+    // to the first OK ref so the drain reaches the right row.
+    if let Some(first_ok) = ref_updates
+        .iter()
+        .find(|u| ok_set.contains(u.ref_name.as_str()))
+    {
+        if first_ok.ref_name != first_ref_name {
+            if let Err(e) = state
+                .db
+                .rewrite_pending_ref_transitions_first_ref_name(&request_id, &first_ok.ref_name)
+                .await
+            {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    repo = %name,
+                    "failed to rewrite first_ref_name to the first OK ref; \
+                     a crash before push-event write will lose the event"
+                );
+            }
+        }
+    }
+
     if !unpack_ok && report.is_some() {
         // Unpack failed explicitly — every row is proven not to have
         // landed. Mark all prepared rows for this request as
@@ -2723,6 +2751,14 @@ pub async fn git_receive_pack(
     // above, so a recovery re-pass against the same transition
     // produces the same primary keys and the idempotent inserts collapse.
     let did = auth.0.as_str();
+    // P2 (reviewer round 5): the request-scoped push event is a
+    // durable artifact on the same footing as the per-ref certs and
+    // anchor jobs. Track its write success so the per-ref cleanup
+    // gate can leave the row in `applied` when the write failed —
+    // otherwise a transient failure on the live path discards the
+    // push event and the trust bump permanently, because the drain
+    // cannot see a row the live path already deleted.
+    let mut push_event_write_ok = false;
     {
         // P1 (reviewer-1 round 4): the request-scoped push event
         // uses the FIRST OK ref's `new_sha` as `commit_hash`, NOT
@@ -2733,17 +2769,23 @@ pub async fn git_receive_pack(
         // first OK ref's new_sha keeps the push event's
         // `commit_hash` truthful; if every ref was rejected we
         // already returned above (`any_ref_ok` is false).
+        //
+        // P2 (reviewer round 5): the push event id is also keyed
+        // on the first OK ref's name (the row that carries the
+        // event in `derive_one`), so the live and recovery paths
+        // produce the same id. The earlier
+        // `rewrite_pending_ref_transitions_first_ref_name` call
+        // updated every row's `first_ref_name` to this same
+        // first OK ref, so the drain's `row.ref_name ==
+        // row.first_ref_name` check matches.
         let first_ok_update = ref_updates
             .iter()
             .find(|u| ok_set.contains(u.ref_name.as_str()));
-        let commit_hash = match first_ok_update {
-            Some(u) => u.new_sha.clone(),
-            None => Utc::now().timestamp().to_string(),
+        let (push_event_first_ref, commit_hash) = match first_ok_update {
+            Some(u) => (u.ref_name.as_str(), u.new_sha.clone()),
+            None => ("", Utc::now().timestamp().to_string()),
         };
-        // `first_ref_name` for the deterministic push event id
-        // stays the request's first ref name (the same key the
-        // drain uses); the commit_hash is what changes.
-        let push_event_id = crate::db::push_event_id_for(&request_id, &first_ref_name);
+        let push_event_id = crate::db::push_event_id_for(&request_id, push_event_first_ref);
         if let Err(e) = state
             .db
             .record_push_with_id(&push_event_id, did, &record.id, &commit_hash, 0)
@@ -2753,8 +2795,10 @@ pub async fn git_receive_pack(
                 err = %e,
                 request_id = %request_id,
                 repo = %name,
-                "failed to record push event; recovery will re-derive (idempotent)"
+                "failed to record push event; the request-scoped outbox row will be left for the drain to retry"
             );
+        } else {
+            push_event_write_ok = true;
         }
         if let Ok(push_count) = state.db.get_push_count(did).await {
             // 0.05 base (from registration) + 0.05 per push, capped at 1.0
@@ -2833,9 +2877,21 @@ pub async fn git_receive_pack(
                 }
             };
 
-            if cert_ok && anchor_ok {
+            if cert_ok && anchor_ok && push_event_write_ok {
                 // The row id is the deterministic id; look it up
                 // so cleanup can target just this ref's row.
+                //
+                // P2 (reviewer round 5): the push event is
+                // request-scoped (one row, keyed on
+                // `first_ref_name`). The first-ref-name row also
+                // carries the cert and anchor for the first OK
+                // ref; deleting it after a successful push event
+                // write is correct. Non-first-ref rows are
+                // independently keyed on their own `ref_name`; we
+                // delete them only when their own cert + anchor
+                // succeeded AND the request-scoped push event
+                // landed, so a partial failure keeps every
+                // affected row for the drain to re-derive.
                 if let Ok(Some(row_id)) = state
                     .db
                     .lookup_pending_ref_transition_id(&request_id, &update.ref_name)
@@ -2845,9 +2901,10 @@ pub async fn git_receive_pack(
                 }
             }
         }
-        // Delete the per-ref rows whose required writes succeeded.
-        // A failed-write row stays `applied` and the next startup
-        // drain re-derives it (the artifacts are idempotent).
+        // Delete the per-ref rows whose required writes all
+        // succeeded. A failed-write row stays `applied` and the
+        // next startup drain re-derives it (the artifacts are
+        // idempotent).
         for row_id in &ok_ref_ids {
             if let Err(e) = state.db.delete_pending_ref_transition(row_id).await {
                 tracing::warn!(

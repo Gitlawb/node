@@ -3167,6 +3167,37 @@ impl Db {
         Ok(res.rows_affected())
     }
 
+    /// Rewrite `first_ref_name` on every row of a request. Called by
+    /// the live handler when the requested first ref was rejected
+    /// but a later ref landed — the push event id is keyed on
+    /// `first_ref_name`, so without this rewrite the drain's
+    /// `derive_one` (which only writes the event for the row whose
+    /// `ref_name == first_ref_name`) would never find a match and
+    /// the push event would be permanently lost.
+    ///
+    /// P2 (reviewer round 5): a mixed push where the first ref is
+    /// rejected but a later ref lands must still produce a push
+    /// event under the OK ref's identity. The live path already
+    /// picks the first OK ref for `commit_hash`; this rewrite
+    /// makes the drain reach the same row.
+    #[allow(dead_code)]
+    pub async fn rewrite_pending_ref_transitions_first_ref_name(
+        &self,
+        request_id: &str,
+        new_first_ref_name: &str,
+    ) -> Result<u64> {
+        let res = sqlx::query(
+            r#"UPDATE pending_ref_transitions
+               SET first_ref_name = $1
+               WHERE request_id = $2 AND first_ref_name <> $1"#,
+        )
+        .bind(new_first_ref_name)
+        .bind(request_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Test-only: insert a row directly in the given state. Used to
     /// simulate the crash window ("row is `applied` but the handler
     /// never reached the push event / cert / anchor code") without

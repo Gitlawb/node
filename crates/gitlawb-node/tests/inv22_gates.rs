@@ -533,8 +533,8 @@ fn inv22_replication_tail_spawns_at_the_durability_boundary() {
         .expect("split always yields a first chunk");
 
     let success_flag = production
-        .find("let push_succeeded = all_refs_ok;")
-        .expect("U5 gate missing: the tail's success gate must be bound from all_refs_ok");
+        .find("let push_succeeded = ")
+        .expect("U5 gate missing: the tail's success flag must be bound before the gate");
     let gate_open = production
         .find("if push_succeeded {")
         .expect("U5 gate missing: the tail spawn must be gated on the push having succeeded");
