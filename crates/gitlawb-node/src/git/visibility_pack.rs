@@ -4623,35 +4623,46 @@ esac\n";
         // was vacuous). Use `Some(reader)` to exercise the
         // actual contract.
         let recipients = withheld_blob_recipients(&bare, &rules, true, OWNER).unwrap();
-        // Owner: direct_blob is in the recipients.
+
+        // P2 (reviewer round 9): the recipient set is
+        // CALLER-INVARIANT — it enumerates every identity
+        // (owner + every rule's reader DID) that the
+        // path-decision allows for THIS OID. Whether a given
+        // caller can decrypt the seal is a separate question
+        // answered at seal time (the seal checks membership in
+        // the recipient set). The test asserts the recipient
+        // set shape, not the seal-time check, because the
+        // seal is a separate code path tested elsewhere.
+        //
+        // The contract the test pins:
+        //   - The owner is in the recipient set (the owner
+        //     encrypts+pins for self).
+        //   - The empty-string anon sentinel is NOT in the
+        //     recipient set (anon does not decrypt anything
+        //     from the seal; the empty path is owner-only).
+        //   - A reader DID listed on a rule whose path does
+        //     not match the empty path is NOT in the recipient
+        //     set (the pair_decision empty-path allow shape
+        //     is owner-only; the reader is on a path-scoped
+        //     rule that does not match the empty path, so the
+        //     seal cannot leak `direct_blob` to the reader
+        //     through the empty path).
+        let direct_recipients = recipients.get(&direct_blob).cloned().unwrap_or_default();
         assert!(
-            recipients
-                .get(&direct_blob)
-                .is_some_and(|r| r.contains(OWNER)),
-            "owner must be in encrypted-recovery recipients for direct_blob"
+            direct_recipients.contains(OWNER),
+            "owner must be in encrypted-recovery recipients for direct_blob; \
+             got {direct_recipients:?}"
         );
-        // Anon: direct_blob is NOT in the recipients for anon.
-        // Walk the recipient set and assert no recipient entry
-        // is empty (the empty-string anon sentinel from the
-        // previous code is removed; anon means "no entry",
-        // not "the empty string").
-        let any_recipient_for_anon = recipients
-            .get(&direct_blob)
-            .map(|rs| rs.iter().any(|d| !d.is_empty()))
-            .unwrap_or(false);
         assert!(
-            !any_recipient_for_anon,
-            "encrypted-recovery must not include direct_blob for the anonymous caller"
+            !direct_recipients.iter().any(|d| d.is_empty()),
+            "the empty-string anon sentinel must not be a recipient of direct_blob; \
+             got {direct_recipients:?}"
         );
-        // Reader: the rule carries the reader DID, but the
-        // empty-path allow shape is owner-only — the reader
-        // must NOT see direct_blob as a recipient.
-        let reader_recipients = recipients.get(&direct_blob).cloned().unwrap_or_default();
         assert!(
-            !reader_recipients.iter().any(|d| d == READER),
-            "encrypted-recovery must not include direct_blob for the reader caller \
-             (rule allows reader, but the empty-path allow shape is owner-only); \
-             got {reader_recipients:?}"
+            !direct_recipients.iter().any(|d| d == READER),
+            "a reader DID on a path-scoped rule that does not match the empty path must \
+             not be a recipient of direct_blob (empty-path allow shape is owner-only); \
+             got {direct_recipients:?}"
         );
     }
 }
