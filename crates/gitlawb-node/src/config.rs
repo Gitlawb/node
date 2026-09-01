@@ -120,7 +120,9 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_P2P_PORT", default_value_t = 7546)]
     pub p2p_port: u16,
 
-    /// Path to the persistent libp2p identity key
+    /// Path to the persistent libp2p identity key. With a relative path the
+    /// node verifies the working directory (ownership and write permissions)
+    /// before using it.
     #[arg(long, env = "GITLAWB_P2P_KEY", default_value = "~/.gitlawb/p2p.key")]
     pub p2p_key_path: String,
 

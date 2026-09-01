@@ -471,8 +471,9 @@ fn verify_and_create_ancestor_chain(dir: &Path, euid: u32) -> Result<()> {
             )
         };
         if fd < 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("failed to open the filesystem root for {}", dir.display()));
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!("failed to open the filesystem root for {}", dir.display())
+            });
         }
         (OwnedFd(fd), PathBuf::from("/"))
     } else {
@@ -487,8 +488,9 @@ fn verify_and_create_ancestor_chain(dir: &Path, euid: u32) -> Result<()> {
             )
         };
         if fd < 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("failed to open the working directory for {}", dir.display()));
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!("failed to open the working directory for {}", dir.display())
+            });
         }
         let display = std::env::current_dir()
             .map(|d| {
@@ -553,7 +555,9 @@ fn verify_and_create_ancestor_chain(dir: &Path, euid: u32) -> Result<()> {
                             format!(
                                 "failed to create key directory component {} below {}",
                                 name.to_string_lossy(),
-                                acc.parent().map(|p| p.display().to_string()).unwrap_or_default()
+                                acc.parent()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_default()
                             )
                         });
                     }
@@ -1919,7 +1923,11 @@ mod tests {
         assert_eq!(keys_mode & 0o777, 0o700, "key directory must be owner-only");
 
         let key_mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(key_mode & 0o777, 0o600, "key file must be owner-read/write only");
+        assert_eq!(
+            key_mode & 0o777,
+            0o600,
+            "key file must be owner-read/write only"
+        );
 
         println!("p2p-key-multilevel: asserted");
     }
@@ -2903,7 +2911,10 @@ mod tests {
                 "mode {mode:04o} must be refused for group write, got: {msg}"
             );
             // Refusal must not create the key directory or the key.
-            assert!(!ancestor.join("keys").exists(), "key dir must not be created");
+            assert!(
+                !ancestor.join("keys").exists(),
+                "key dir must not be created"
+            );
             assert!(!path.exists(), "key must not be created");
         }
     }
@@ -2958,7 +2969,10 @@ mod tests {
             "intermediate symlink refusal must name the symlink, got: {err:#}"
         );
         // The symlink target must be untouched: no keys dir, no key inside.
-        assert!(!real.join("keys").exists(), "symlink target must be untouched");
+        assert!(
+            !real.join("keys").exists(),
+            "symlink target must be untouched"
+        );
     }
 
     #[cfg(unix)]
