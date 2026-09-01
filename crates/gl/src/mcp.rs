@@ -696,7 +696,9 @@ async fn call_tool(
             let name = args["name"].as_str().context("missing 'name'")?;
             let owner = resolve_owner(&args, &client).await?;
             let repo = crate::http::read_json(
-                client.get(&format!("/api/v1/repos/{owner}/{name}")).await?,
+                client
+                    .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}"))
+                    .await?,
                 "repo",
             )
             .await?;
@@ -708,7 +710,7 @@ async fn call_tool(
             let owner = resolve_owner(&args, &client).await?;
             let commits = crate::http::read_json(
                 client
-                    .get(&format!("/api/v1/repos/{owner}/{name}/commits"))
+                    .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/commits"))
                     .await?,
                 "commits",
             )
@@ -849,7 +851,7 @@ async fn call_tool(
             let owner = resolve_owner(&args, &client).await?;
             let resp = crate::http::read_json(
                 client
-                    .get(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
+                    .get_maybe_signed(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
                     .await?,
                 "pull requests",
             )
@@ -863,14 +865,14 @@ async fn call_tool(
             let owner = resolve_owner(&args, &client).await?;
             let pr = crate::http::read_json(
                 client
-                    .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
+                    .get_maybe_signed(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
                     .await?,
                 "pull request",
             )
             .await?;
             let reviews = crate::http::read_json(
                 client
-                    .get(&format!(
+                    .get_maybe_signed(&format!(
                         "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"
                     ))
                     .await?,
@@ -888,7 +890,7 @@ async fn call_tool(
             let owner = resolve_owner(&args, &client).await?;
             let resp = crate::http::read_json(
                 client
-                    .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
+                    .get_maybe_signed(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
                     .await?,
                 "diff",
             )
