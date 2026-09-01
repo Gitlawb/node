@@ -64,6 +64,7 @@ const CONVERTED_IN_186: &[&str] = &[
     "register.rs",
     "repo.rs",
     "star.rs",
+    "status.rs",
     "sync.rs",
     "task.rs",
     "visibility.rs",

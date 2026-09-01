@@ -76,7 +76,7 @@ pub async fn run(args: StatusArgs) -> Result<()> {
         if let Some(line) = section_unavailable_line("PRs", &pr_resp) {
             println!("{line}");
         } else if let Ok(r) = pr_resp {
-            if let Ok(body) = r.json::<Value>().await {
+            if let Ok(body) = crate::http::read_json(r, "pull requests").await {
                 let prs = body["pulls"].as_array().cloned().unwrap_or_default();
                 let open: Vec<_> = prs
                     .iter()
@@ -105,7 +105,7 @@ pub async fn run(args: StatusArgs) -> Result<()> {
         if let Some(line) = section_unavailable_line("issues", &issue_resp) {
             println!("{line}");
         } else if let Ok(r) = issue_resp {
-            if let Ok(body) = r.json::<Value>().await {
+            if let Ok(body) = crate::http::read_json(r, "issues").await {
                 let issues = body["issues"].as_array().cloned().unwrap_or_default();
                 let open: Vec<_> = issues
                     .iter()
