@@ -541,7 +541,11 @@ fn verify_and_create_ancestor_chain(dir: &Path, euid: u32) -> Result<()> {
                 // no-follow and verify whatever actually landed. `AlreadyExists`
                 // is a race: the winner gets the same full verification below.
                 // SAFETY: mkdirat creates `name` relative to the verified parent
-                // descriptor; mode 0700 is pinned at creation.
+                // descriptor; mode 0700 is the requested mode, but the umask can
+                // still mask it down (mkdirat applies the process umask), so the
+                // created directory is fchmod'd to exactly 0700 after it is
+                // reopened below.
+                let mut created = false;
                 if unsafe { libc::mkdirat(cur.0, cname.as_ptr(), 0o700) } != 0 {
                     let mk_err = std::io::Error::last_os_error();
                     if mk_err.kind() != std::io::ErrorKind::AlreadyExists {
@@ -553,6 +557,8 @@ fn verify_and_create_ancestor_chain(dir: &Path, euid: u32) -> Result<()> {
                             )
                         });
                     }
+                } else {
+                    created = true;
                 }
                 // SAFETY: openat as above, re-checking the winner.
                 let fd = unsafe {
@@ -569,6 +575,24 @@ fn verify_and_create_ancestor_chain(dir: &Path, euid: u32) -> Result<()> {
                             acc.display()
                         )
                     });
+                }
+                // We created this directory ourselves, so pin its mode to
+                // exactly 0700 (the requested mode, unmasked). A race winner
+                // (`created == false`) is not fchmod'd: it is verified as-is.
+                if created {
+                    // SAFETY: `fd` is the descriptor of the directory this
+                    // process just created and owns.
+                    if unsafe { libc::fchmod(fd, 0o700) } != 0 {
+                        let ch_err = std::io::Error::last_os_error();
+                        // SAFETY: `fd` is a descriptor we own from openat.
+                        unsafe { libc::close(fd) };
+                        return Err(ch_err).with_context(|| {
+                            format!(
+                                "failed to pin mode 0700 on created key directory component {}",
+                                acc.display()
+                            )
+                        });
+                    }
                 }
                 // SAFETY: `fd` is a descriptor we own from openat; the OwnedFd
                 // below takes ownership and closes it when the chain advances.
@@ -2665,6 +2689,39 @@ mod tests {
                     path
                 },
                 expect: Expect::Boots,
+            },
+            Row {
+                name: "group-writable ancestor is refused",
+                setup: |base| {
+                    let g = base.join("g");
+                    std::fs::create_dir(&g).unwrap();
+                    std::fs::set_permissions(&g, std::fs::Permissions::from_mode(0o775)).unwrap();
+                    g.join("keys").join("p2p.key")
+                },
+                expect: Expect::Refused("writable beyond its owner"),
+            },
+            Row {
+                name: "world-writable non-sticky ancestor is refused",
+                setup: |base| {
+                    let w = base.join("w");
+                    std::fs::create_dir(&w).unwrap();
+                    std::fs::set_permissions(&w, std::fs::Permissions::from_mode(0o777)).unwrap();
+                    w.join("keys").join("p2p.key")
+                },
+                expect: Expect::Refused("writable beyond its owner"),
+            },
+            Row {
+                name: "intermediate symlink component is refused, target untouched",
+                setup: |base| {
+                    let real = base.join("real");
+                    std::fs::create_dir(&real).unwrap();
+                    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                    let link = base.join("link");
+                    std::os::unix::fs::symlink(&real, &link).unwrap();
+                    link.join("keys").join("p2p.key")
+                },
+                expect: Expect::Refused("symlink"),
             },
             Row {
                 name: "symlinked parent is refused, target untouched",
