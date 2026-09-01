@@ -477,7 +477,9 @@ pub(crate) async fn cmd_commits(
     node: String,
     dir: Option<PathBuf>,
 ) -> Result<()> {
-    let client = NodeClient::new(&node, None);
+    // Sign when an identity is available so a private repo's owner can read their
+    // own commits; `owner/name` against a public repo still works anonymously.
+    let client = NodeClient::new(&node, load_keypair_from_dir(dir.as_deref()).ok());
 
     let (owner, name) = if repo.contains('/') {
         let (o, n) = repo.split_once('/').unwrap();
@@ -488,7 +490,7 @@ pub(crate) async fn cmd_commits(
     };
 
     let url = format!("/api/v1/repos/{owner}/{name}/commits?branch={branch}&limit={limit}");
-    let resp = crate::http::read_json(client.get(&url).await?, "commits").await?;
+    let resp = crate::http::read_json(client.get_maybe_signed(&url).await?, "commits").await?;
 
     let commits = resp["commits"].as_array().cloned().unwrap_or_default();
     if commits.is_empty() {
@@ -928,6 +930,9 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/commits".to_string()),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"commits":[]}"#)
@@ -956,6 +961,9 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/commits".to_string()),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"commits":[{"sha":"abc1234567","message":"initial commit","author_name":"alice","date":"2026-03-18T00:00:00Z"}]}"#)
@@ -964,6 +972,38 @@ mod tests {
 
         cmd_commits(
             "myrepo".to_string(),
+            "main".to_string(),
+            20,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Empty dir → no identity → get_maybe_signed must fall back to an anonymous
+    // GET (the public-repo path). `owner/name` needs no local identity, so this
+    // is the negative twin of the #115 signing fix. Assert NO signature header.
+    #[tokio::test]
+    async fn test_cmd_commits_anonymous_when_no_identity() {
+        let dir = TempDir::new().unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/owner/pubrepo/commits".to_string()),
+            )
+            .match_header("signature", mockito::Matcher::Missing)
+            .match_header("signature-input", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"commits":[]}"#)
+            .create_async()
+            .await;
+
+        cmd_commits(
+            "owner/pubrepo".to_string(),
             "main".to_string(),
             20,
             server.url(),

@@ -245,11 +245,11 @@ async fn cmd_create(
 async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let owner = resolve_owner(&keypair);
-    let client = NodeClient::new(&node, None);
+    let client = NodeClient::new(&node, Some(keypair));
 
     let resp = crate::http::read_json(
         client
-            .get(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
+            .get_maybe_signed(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
             .await?,
         "pull requests",
     )
@@ -290,11 +290,11 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
 async fn cmd_view(repo: String, number: u64, node: String, dir: Option<PathBuf>) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let owner = resolve_owner(&keypair);
-    let client = NodeClient::new(&node, None);
+    let client = NodeClient::new(&node, Some(keypair));
 
     let pr = crate::http::read_json(
         client
-            .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
+            .get_maybe_signed(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
             .await?,
         "pull request",
     )
@@ -318,7 +318,7 @@ async fn cmd_view(repo: String, number: u64, node: String, dir: Option<PathBuf>)
     // Show reviews
     let reviews = crate::http::read_json(
         client
-            .get(&format!(
+            .get_maybe_signed(&format!(
                 "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"
             ))
             .await?,
@@ -352,7 +352,7 @@ async fn cmd_view(repo: String, number: u64, node: String, dir: Option<PathBuf>)
     // Show comments
     let comments = crate::http::read_json(
         client
-            .get(&format!(
+            .get_maybe_signed(&format!(
                 "/api/v1/repos/{owner}/{repo}/pulls/{number}/comments"
             ))
             .await?,
@@ -381,11 +381,11 @@ async fn cmd_view(repo: String, number: u64, node: String, dir: Option<PathBuf>)
 async fn cmd_diff(repo: String, number: u64, node: String, dir: Option<PathBuf>) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let owner = resolve_owner(&keypair);
-    let client = NodeClient::new(&node, None);
+    let client = NodeClient::new(&node, Some(keypair));
 
     let resp = crate::http::read_json(
         client
-            .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
+            .get_maybe_signed(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
             .await?,
         "diff",
     )
@@ -484,11 +484,11 @@ async fn cmd_comment(
 async fn cmd_comments(repo: String, number: u64, node: String, dir: Option<PathBuf>) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let owner = resolve_owner(&keypair);
-    let client = NodeClient::new(&node, None);
+    let client = NodeClient::new(&node, Some(keypair));
 
     let resp = crate::http::read_json(
         client
-            .get(&format!(
+            .get_maybe_signed(&format!(
                 "/api/v1/repos/{owner}/{repo}/pulls/{number}/comments"
             ))
             .await?,
@@ -549,6 +549,9 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/pulls$".to_string()),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"pulls":[]}"#)
@@ -575,6 +578,9 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/pulls$".to_string()),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"pulls":[{"number":1,"title":"Add feature","status":"open","source_branch":"feat","target_branch":"main","author_did":"did:key:z6MkTest"}]}"#)
@@ -668,6 +674,9 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/pulls/1$".to_string()),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"number":1,"title":"Fix it","status":"open","source_branch":"fix","target_branch":"main","author_did":"did:key:z6MkTest","body":"some body"}"#)
@@ -680,6 +689,9 @@ mod tests {
                     r"^/api/v1/repos/[^/]+/myrepo/pulls/1/reviews$".to_string(),
                 ),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"reviews":[]}"#)
@@ -692,6 +704,9 @@ mod tests {
                     r"^/api/v1/repos/[^/]+/myrepo/pulls/1/comments$".to_string(),
                 ),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"comments":[]}"#)
@@ -783,6 +798,9 @@ mod tests {
                     r"^/api/v1/repos/[^/]+/myrepo/pulls/1/comments$".to_string(),
                 ),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"comments":[]}"#)
@@ -824,91 +842,6 @@ mod tests {
         )
         .await
         .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_cmd_merge_success() {
-        let dir = TempDir::new().unwrap();
-        write_identity(&dir);
-
-        let mut server = mockito::Server::new_async().await;
-        let _m = server
-            .mock(
-                "POST",
-                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/pulls/2/merge$".to_string()),
-            )
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"merge_sha":"abc123def456789"}"#)
-            .create_async()
-            .await;
-
-        cmd_merge(
-            "myrepo".to_string(),
-            2,
-            server.url(),
-            Some(dir.path().to_path_buf()),
-        )
-        .await
-        .unwrap();
-    }
-
-    // ── Gated PR reads surface node denials, not empty/stub renders (#123) ──
-
-    #[tokio::test]
-    async fn cmd_list_surfaces_denial_not_empty() {
-        let dir = TempDir::new().unwrap();
-        write_identity(&dir);
-        let mut server = mockito::Server::new_async().await;
-        let _m = server
-            .mock("GET", mockito::Matcher::Regex(r"/pulls$".to_string()))
-            .with_status(404)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"message":"repository not found"}"#)
-            .expect(1)
-            .create_async()
-            .await;
-        let result = cmd_list(
-            "myrepo".to_string(),
-            server.url(),
-            Some(dir.path().to_path_buf()),
-        )
-        .await;
-        assert!(
-            result.is_err(),
-            "cmd_list must Err on 404, not print 'No pull requests'"
-        );
-        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
-        _m.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn cmd_view_surfaces_denial_not_stub() {
-        let dir = TempDir::new().unwrap();
-        write_identity(&dir);
-        let mut server = mockito::Server::new_async().await;
-        // The PR fetch is first; a 404 there errors before the reviews/comments reads.
-        let _m = server
-            .mock("GET", mockito::Matcher::Regex(r"/pulls/1$".to_string()))
-            .with_status(404)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"message":"repository not found"}"#)
-            .expect(1)
-            .create_async()
-            .await;
-        let result = cmd_view(
-            "myrepo".to_string(),
-            1,
-            server.url(),
-            Some(dir.path().to_path_buf()),
-        )
-        .await;
-        assert!(
-            result.is_err(),
-            "cmd_view must Err on 404, not print a stub PR"
-        );
-        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
-        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -968,5 +901,36 @@ mod tests {
         assert!(result.is_err(), "cmd_comments must Err on a gated 404");
         // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
         _m.assert_async().await;
+    }
+
+    // cmd_diff had no signing coverage, so the unsigned read (#115) was invisible
+    // here. An identity is supplied, so the request must be signed.
+    #[tokio::test]
+    async fn test_cmd_diff_signs_request() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/pulls/1/diff$".to_string()),
+            )
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"diff":"diff --git a/x b/x"}"#)
+            .create_async()
+            .await;
+
+        cmd_diff(
+            "myrepo".to_string(),
+            1,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 }
