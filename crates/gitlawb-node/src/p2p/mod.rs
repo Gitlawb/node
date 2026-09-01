@@ -477,7 +477,8 @@ fn verify_and_create_ancestor_chain(dir: &Path, euid: u32) -> Result<()> {
         (OwnedFd(fd), PathBuf::from("/"))
     } else {
         // SAFETY: open(2) on "." returns a descriptor for the process cwd
-        // itself; O_NOFOLLOW and O_DIRECTORY pin the object type.
+        // itself; O_NOFOLLOW and O_DIRECTORY pin the object type. The display
+        // path is only for error messages (no pathname is re-resolved for IO).
         let dot = std::ffi::CString::new(".").unwrap();
         let fd = unsafe {
             libc::open(
@@ -489,7 +490,16 @@ fn verify_and_create_ancestor_chain(dir: &Path, euid: u32) -> Result<()> {
             return Err(std::io::Error::last_os_error())
                 .with_context(|| format!("failed to open the working directory for {}", dir.display()));
         }
-        (OwnedFd(fd), PathBuf::new())
+        let display = std::env::current_dir()
+            .map(|d| {
+                if d.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    d
+                }
+            })
+            .unwrap_or_else(|_| PathBuf::from("."));
+        (OwnedFd(fd), display)
     };
 
     verify_component(anchor.0, dir, &anchor_display, euid)?;
@@ -1917,6 +1927,113 @@ mod tests {
         );
     }
 
+    /// Fixture: a relative key path under a WORLD-WRITABLE non-sticky cwd must
+    /// be refused before anything is created.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=p2p-key-cwd-writable"]
+    fn fixture_p2p_key_relative_under_writable_cwd_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("p2p-key-cwd-writable") {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(dir.path()).expect("chdir into isolated tempdir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let err = load_or_create_p2p_keypair(Path::new("keys/p2p.key"))
+            .expect_err("a relative key path under a writable cwd must be refused");
+        let cwd = std::env::current_dir().expect("cwd still readable");
+        assert!(
+            format!("{err:#}").contains(&cwd.display().to_string()),
+            "the refusal must name the working directory, got: {err:#}"
+        );
+
+        // Nothing may be created in the cwd.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a refused cwd must not have `keys` created, found: {leftovers:?}"
+        );
+
+        println!("p2p-key-cwd-writable: asserted");
+    }
+
+    /// Fixture: a relative key path under a safe 0700 cwd boots and reloads to
+    /// the same PeerId.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=p2p-key-cwd-safe"]
+    fn fixture_p2p_key_relative_under_safe_cwd_boots() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("p2p-key-cwd-safe") {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(dir.path()).expect("chdir into isolated tempdir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let kp = load_or_create_p2p_keypair(Path::new("keys/p2p.key"))
+            .expect("a relative key path under a safe cwd must boot");
+        let reloaded = load_or_create_p2p_keypair(Path::new("keys/p2p.key"))
+            .expect("the same relative key path must reload");
+        assert_eq!(
+            PeerId::from(kp.public()),
+            PeerId::from(reloaded.public()),
+            "the relative-path identity must be stable across reloads"
+        );
+
+        println!("p2p-key-cwd-safe: asserted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p2p_relative_key_path_verifies_the_cwd() {
+        for (fixture, env, label) in [
+            (
+                "p2p::tests::fixture_p2p_key_relative_under_writable_cwd_is_refused",
+                "p2p-key-cwd-writable",
+                "writable-cwd refusal",
+            ),
+            (
+                "p2p::tests::fixture_p2p_key_relative_under_safe_cwd_boots",
+                "p2p-key-cwd-safe",
+                "safe-cwd boot",
+            ),
+        ] {
+            let output = fixture_command_with_env(fixture, env)
+                .output()
+                .expect("spawn the cwd fixture");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "the {label} fixture must pass in its child process\n\
+                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            );
+            assert!(
+                stdout.contains("1 passed"),
+                "the {label} fixture filter must select exactly one test\n--- stdout ---\n{stdout}"
+            );
+            assert!(
+                stdout.contains(if env == "p2p-key-cwd-writable" {
+                    "p2p-key-cwd-writable: asserted"
+                } else {
+                    "p2p-key-cwd-safe: asserted"
+                }),
+                "the {label} fixture must print its sentinel\n--- stdout ---\n{stdout}"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn p2p_key_file_is_0600_on_unix() {
@@ -2868,7 +2985,6 @@ mod tests {
         EUID_OVERRIDE.with(|c| c.set(Some(real_uid.wrapping_add(1))));
         let result = ensure_key_dir(&nested);
         EUID_OVERRIDE.with(|c| c.set(None));
-
         let err = format!(
             "{:#}",
             result.expect_err("a directory under a foreign-owned ancestor must be refused")
@@ -2880,6 +2996,41 @@ mod tests {
         assert!(
             !nested.exists(),
             "the key directory must not have been created"
+        );
+    }
+
+    /// The cwd anchor's ownership is verified the same way as any other
+    /// component: with an overridden euid the real cwd is foreign and a
+    /// relative key path must be refused before anything is created.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_key_dir_refuses_a_foreign_owned_cwd_anchor() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let real_uid = std::fs::metadata(base.path()).unwrap().uid();
+
+        // Drive the walk on a relative key directory; the anchor is the cwd,
+        // which is `base` only if the test process chdir'd there. Instead of
+        // touching the process-global cwd, point the walk at a path whose
+        // anchor walk sees the cwd: with the euid override armed, the cwd is
+        // foreign and must be refused.
+        EUID_OVERRIDE.with(|c| c.set(Some(real_uid.wrapping_add(1))));
+        let result = ensure_key_dir(Path::new("keys"));
+        EUID_OVERRIDE.with(|c| c.set(None));
+
+        let err = format!(
+            "{:#}",
+            result.expect_err("a foreign-owned cwd anchor must be refused")
+        );
+        assert!(
+            err.contains("owned by uid") || err.contains("control which identity"),
+            "the cwd-anchor refusal must name the ownership hazard, got: {err}"
+        );
+        assert!(
+            !Path::new("keys").exists(),
+            "the key directory must not have been created under a foreign cwd"
         );
     }
 
