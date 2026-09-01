@@ -2930,7 +2930,7 @@ mod tests {
             err.contains(&format!(
                 "owned by uid {real_uid} but this node runs as uid {other}"
             )),
-            "the refusal must name the file's owner and the running uid, got: {err}"
+            "the refusal must name the file's owner and the running uid"
         );
         assert!(
             read_p2p_keypair(&path).is_ok(),
@@ -2959,11 +2959,11 @@ mod tests {
             );
             assert!(
                 err.contains("owned by uid"),
-                "mode {mode:04o} must be refused, got: {err}"
+                "mode {mode:04o} must be refused"
             );
             assert!(
                 !err.contains("could not be tightened"),
-                "ownership must be reported before chmod, got: {err}"
+                "ownership must be reported before chmod"
             );
             assert_eq!(
                 std::fs::metadata(&keys).unwrap().permissions().mode() & 0o777,
@@ -2991,7 +2991,7 @@ mod tests {
         );
         assert!(
             err.contains("sits under") && err.contains("control which identity"),
-            "must be refused for the ancestor, got: {err}"
+            "must be refused for the ancestor"
         );
         assert!(
             !nested.exists(),
@@ -3026,7 +3026,7 @@ mod tests {
         );
         assert!(
             err.contains("owned by uid") || err.contains("control which identity"),
-            "the cwd-anchor refusal must name the ownership hazard, got: {err}"
+            "the cwd-anchor refusal must name the ownership hazard"
         );
         assert!(
             !Path::new("keys").exists(),
@@ -3042,7 +3042,7 @@ mod tests {
         for uid in [0u32, 1000, 65534] {
             assert!(
                 foreign_ownership_error("key", path, uid, uid).is_none(),
-                "uid {uid} owning its own key must not be refused"
+                "a uid owning its own key must not be refused"
             );
         }
 
@@ -3050,7 +3050,7 @@ mod tests {
             .expect("a key owned by another uid must be refused");
         assert!(
             err.contains("1000") && err.contains("1001"),
-            "the refusal must name both uids, got: {err}"
+            "the refusal must name both uids"
         );
     }
 
