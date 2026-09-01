@@ -2216,13 +2216,13 @@ impl Db {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn remove_label(&self, repo_id: &str, label: &str) -> Result<()> {
-        sqlx::query("DELETE FROM repo_labels WHERE repo_id = $1 AND label = $2")
+    pub async fn remove_label(&self, repo_id: &str, label: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM repo_labels WHERE repo_id = $1 AND label = $2")
             .bind(repo_id)
             .bind(label)
             .execute(&self.pool)
             .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn list_labels(&self, repo_id: &str) -> Result<Vec<String>> {
