@@ -250,39 +250,23 @@ mod v1_payload_tests {
     /// `issue_ref_certificate` so a regression in the issuer flips the test.
     /// The DB row is created against `test_support::test_state`, which
     /// gives us a real `AppState` with a real node keypair.
-    #[test]
-    fn issuer_stamps_v2_over_v1_payload() {
-        // P2 (reviewer round 2): the previous form built a
-        // `RefCertificate` literal and asserted `version == 1` —
-        // true no matter what the signer does, so flipping the
-        // issuer's version (or its payload shape) left it green.
-        // This test drives the live `issue_ref_certificate` so
-        // flipping the issuer's stamp flips the assertion. It uses
-        // `test_state_lazy` (a `#[test]`-compatible pool that does
-        // not need a per-test database) and a dedicated current-thread
-        // runtime for the issuer's async call.
-        //
-        // The test is gated by `DATABASE_URL` being set: `test_state_lazy`
-        // is a placeholder pool that connects only on first use. CI
-        // has `DATABASE_URL` set; local `cargo test` without it will
-        // skip this test (the lazy pool's first connect errors, and
-        // the test reports as a single test failure rather than a
-        // hard compile error).
-        let state = crate::test_support::test_state_lazy();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
+    #[sqlx::test]
+    #[allow(clippy::async_yields_async)]
+    async fn issuer_stamps_v2_over_v1_payload(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
         let repo_id = "repo-issuer-observe";
         let ref_name = "refs/heads/main";
         let old = "0".repeat(40);
         let new = "a".repeat(40);
         let pusher = "did:key:z6MkPusher";
-        let cert = rt
-            .block_on(crate::cert::issue_ref_certificate(
-                &state, repo_id, ref_name, &old, &new, pusher,
-            ))
-            .expect("issue_ref_certificate must succeed");
+
+        // Drive the live issuer. The function generates a UUID
+        // for the cert id, so the test reads the row back by
+        // (repo_id, ref_name) to verify the issuer's claim.
+        let cert =
+            crate::cert::issue_ref_certificate(&state, repo_id, ref_name, &old, &new, pusher)
+                .await
+                .expect("issue_ref_certificate must succeed");
 
         // The cert returned by the issuer is the source of truth
         // for both the version claim and the signed bytes.
