@@ -80,7 +80,6 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
     });
 
     let mut checks = Vec::new();
-    let mut all_ok = true;
 
     // ── 1. Identity ───────────────────────────────────────────────────────
     let pem_path = dir.join("identity.pem");
@@ -156,8 +155,14 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
         Ok(v) if !v.is_empty() => {
             checks.push(Check::pass("GITLAWB_NODE", v.to_string()));
         }
+        // `--node` defaults to `https://node.gitlawb.com` and the CLI works
+        // fine without the variable, so an unset env is advisory, not a
+        // failure. Warn-class keeps the exit code 0 for a stock working
+        // install; this used to be Fail, which the obvious "return non-zero
+        // on any failure" change would have flipped to exit 1 on every
+        // default-config install (#357).
         _ => {
-            checks.push(Check::fail(
+            checks.push(Check::warn(
                 "GITLAWB_NODE",
                 "not set — git-remote-gitlawb will fall back to http://127.0.0.1:7545",
                 "export GITLAWB_NODE=https://node.gitlawb.com",
@@ -285,23 +290,21 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
             CheckState::Fail => "✗",
         };
         println!("  {icon}  {:<24}  {}", check.label, check.detail);
-        if matches!(check.state, CheckState::Fail) {
-            all_ok = false;
-        }
     }
 
     println!();
 
+    let has_failures_now = has_failures(&checks);
     let has_issues = checks
         .iter()
         .any(|c| matches!(c.state, CheckState::Fail | CheckState::Warn));
     if !has_issues {
         println!("Everything looks good. Run `gl quickstart` to create your first repo.");
     } else {
-        if all_ok {
-            println!("Setup looks good with some warnings:");
-        } else {
+        if has_failures_now {
             println!("Some checks failed. Suggested fixes:");
+        } else {
+            println!("Setup looks good with some warnings:");
         }
         for check in &checks {
             if matches!(check.state, CheckState::Fail | CheckState::Warn) {
@@ -311,12 +314,29 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
             }
         }
         println!();
-        if !all_ok {
+        if has_failures_now {
             println!("Run `gl quickstart` for a guided setup.");
         }
     }
 
+    // #357: a non-zero exit is the only signal scripting and CI have. Warn-only
+    // rows stay exit 0 (iCaptcha offline, version drift, shell-alias shadowing
+    // are all non-fatal); Fail-class rows (identity, registration, node
+    // reachable, git-remote-gitlawb present, git present) flip to exit 1.
+    // Direct `process::exit` rather than returning Err: the prose above is the
+    // user-facing summary, and an anyhow Error frame would just duplicate it.
+    if has_failures(&checks) {
+        std::process::exit(1);
+    }
+
     Ok(())
+}
+
+/// True when at least one check is Fail-class. Warn-only runs (iCaptcha offline,
+/// version drift, shell-alias shadowing, GITLAWB_NODE unset) keep exit 0;
+/// this is the gating predicate for #357's exit-status fix.
+fn has_failures(checks: &[Check]) -> bool {
+    checks.iter().any(|c| matches!(c.state, CheckState::Fail))
 }
 
 /// Check if a binary name exists anywhere on PATH.
@@ -643,5 +663,58 @@ mod tests {
         let check = check_version("0.1.0", &server.url()).await;
         assert!(matches!(check.state, CheckState::Ok));
         assert!(check.detail.contains("GitHub API returned HTTP 403"));
+    }
+
+    /// #357: an all-Ok run does not flip the exit code to non-zero — a healthy
+    /// install must keep returning 0 so scripts like `gl doctor && gl push`
+    /// keep working.
+    #[test]
+    fn exit_predicate_is_false_for_all_ok() {
+        let checks = vec![
+            Check::pass("identity", "ok"),
+            Check::pass("registration", "ok"),
+            Check::pass("git", "ok"),
+        ];
+        assert!(!has_failures(&checks));
+    }
+
+    /// #357: Warn-class rows (iCaptcha offline, version drift, shell-alias
+    /// shadowing, GITLAWB_NODE unset on a default-config install) are NOT
+    /// exit-status failures — they are still printed to the user but the
+    /// process exits 0. This is the rule that the previous "any
+    /// Fail-or-Warn row → exit 1" change would have broken for stock
+    /// installs that simply have not set the env var.
+    #[test]
+    fn exit_predicate_is_false_for_warn_only() {
+        let checks = vec![
+            Check::pass("identity", "ok"),
+            Check::warn("GITLAWB_NODE", "unset", "export GITLAWB_NODE=..."),
+            Check::warn("iCaptcha", "offline", "check connectivity"),
+            Check::warn("version", "drift", "upgrade"),
+            Check::warn("shell alias", "omz git plugin", "unalias gl"),
+        ];
+        assert!(!has_failures(&checks));
+    }
+
+    /// #357: a single Fail-class row trips the exit code. The set of Fail
+    /// rows is whatever `run` writes through `Check::fail`: identity missing
+    /// or unparseable, registration missing/malformed, node unreachable,
+    /// git-remote-gitlawb absent, git absent.
+    #[test]
+    fn exit_predicate_is_true_when_a_fail_row_is_present() {
+        let checks = vec![
+            Check::pass("registration", "ok"),
+            Check::fail("identity", "missing", "gl identity new"),
+            Check::pass("git", "ok"),
+        ];
+        assert!(has_failures(&checks));
+
+        let mixed_warns = vec![
+            Check::pass("identity", "ok"),
+            Check::warn("GITLAWB_NODE", "unset", "export"),
+            Check::fail("node", "unreachable", "check network"),
+            Check::warn("iCaptcha", "offline", "check"),
+        ];
+        assert!(has_failures(&mixed_warns));
     }
 }
