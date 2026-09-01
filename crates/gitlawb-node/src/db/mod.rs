@@ -207,20 +207,22 @@ pub struct PendingRefTransition {
     pub created_at: String,
     pub applied_at: Option<String>,
     pub cancelled_at: Option<String>,
-    /// The first ref name in the live push's `ref_updates`, persisted on
-    /// every row so the recovery drain can reproduce the live path's
-    /// "one push event per push, keyed on the first ref" cardinality. A
-    /// multi-ref push writes N rows; the recovery drain must NOT emit N
-    /// push events (one per `ref_name`), which would inflate
-    /// `get_push_count` and the trust score. The cert and anchor ids
-    /// stay per-ref / per-transition — only the push event id is
-    /// request-scoped.
-    ///
-    /// Migration v28 added this column with `NOT NULL DEFAULT ''` and a
-    /// backfill `UPDATE` that copies `ref_name` into `first_ref_name`
-    /// for every historic row. The live handler now passes the request's
-    /// actual first ref name explicitly.
-    pub first_ref_name: String,
+    /// Zero-based position of this row in the live push's `ref_updates`
+    /// — the live handler assigns `0..N-1` as it walks the pkap-line
+    /// parsed refs in order. The push event identity and the cert
+    /// identity are both `(request_id, ordinal)`, so a recovery replay
+    /// re-derives the same artifact ids the live path produced without
+    /// depending on which ref happened to land first. Migration v30
+    /// added this column; the live handler sets it from
+    /// `ref_updates.iter().enumerate()` so it is stable across live and
+    /// recovery.
+    pub ordinal: i32,
+    /// Snapshot of the git-side update kind at intent time:
+    /// `"create"`, `"update"`, `"delete"`, or `"branch-create"` /
+    /// `"tag-create"`. Recovery re-derives this from the per-ref
+    /// report if it is null, so the column is informational. Migration
+    /// v30 added it; older rows are `NULL`.
+    pub git_target_kind: Option<String>,
 }
 
 /// #26 Split PR 1 — anchor handoff row, owned by PR 1, consumed by PR 2.
@@ -243,6 +245,79 @@ pub struct AnchorJob {
     pub claimed_at: Option<String>,
 }
 
+/// #26 Split PR 1 — request-level durability row. One per `git
+/// receive-pack` call. Written in state `received` BEFORE
+/// `receive_pack_raw` runs, so a node crash between intent and the
+/// git return is recoverable. After git returns, the live handler
+/// transitions the row to `outcomes_committed` (with `parsed_report`
+/// and `accepted_ordinal` stamped) or `rejected_at_git`. The drain
+/// (step 3) reads `effects_pending` rows and runs the per-ref effect
+/// writes; today step 2 only reads the row to gate the push-event
+/// identity on the request's `accepted_ordinal`.
+///
+/// `request_bytes` is the raw HTTP body the handler received; the
+/// drain could in principle re-run `git receive-pack` against it
+/// after a crash, but the v30 model treats the parsed report as the
+/// durable truth and the `request_bytes` column is informational.
+/// `request_bytes_hash` is the SHA-256 hex of the body so a future
+/// replay can verify the row's content matches what the handler saw.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)] // wired by the handler refactor in the next slice
+pub struct ReceivePackRequest {
+    pub id: String,
+    pub repo_id: String,
+    pub pusher_did: String,
+    pub node_did: String,
+    pub request_bytes: Vec<u8>,
+    pub request_bytes_hash: String,
+    pub state: String,
+    pub git_exit_ok: Option<bool>,
+    pub parsed_report: Option<serde_json::Value>,
+    pub accepted_ordinal: Option<i32>,
+    pub attempt_count: i32,
+    pub last_error: Option<String>,
+    pub next_attempt_at: Option<String>,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+}
+
+/// #26 Split PR 1 — request-level state vocabulary. The `received` →
+/// `outcomes_committed | rejected_at_git` transition happens in the
+/// live handler (step 2). The `outcomes_committed → effects_pending
+/// → complete` lifecycle lives in step 3's effect executor. Every
+/// state-flip helper is a single SQL `UPDATE … WHERE state = <from>`;
+/// a state helper not gated on the `from` state is a bug because it
+/// could clobber a row the drain is concurrently updating.
+#[allow(dead_code)] // constants are used by tests + the next-slice handler
+pub mod request_state {
+    /// The handler wrote the row but git has not yet returned. The
+    /// drain will not pick this row up.
+    #[allow(dead_code)]
+    pub const RECEIVED: &str = "received";
+    /// Git returned, the report was parsed, and the request has
+    /// outcomes. The drain reads rows in this state (and its
+    /// retry variant `effects_pending`) and runs the per-ref
+    /// effect writes. Step 2 only writes this state; the
+    /// `effects_pending → complete` flip is step 3.
+    #[allow(dead_code)]
+    pub const OUTCOMES_COMMITTED: &str = "outcomes_committed";
+    /// The drain attempted to run effects and failed; it left
+    /// `next_attempt_at` in the future. Step-3 territory.
+    #[allow(dead_code)]
+    pub const EFFECTS_PENDING: &str = "effects_pending";
+    /// Drain succeeded. Step 3's terminal state for a successful
+    /// push. The request row is retained for the 7-day window
+    /// the v30 partial index on `completed_at` is built for.
+    #[allow(dead_code)]
+    pub const COMPLETE: &str = "complete";
+    /// Git returned with a non-zero exit and no parseable report.
+    /// No effects were ever run; the request row is terminal.
+    /// The on-disk state of the children's refs is left to the
+    /// reconcile step (the children remain in `prepared`).
+    #[allow(dead_code)]
+    pub const REJECTED_AT_GIT: &str = "rejected_at_git";
+}
+
 /// SHA-256 hex of an arbitrary tuple, used as the deterministic id for the
 /// artifacts that recovery inserts idempotently. Returns 64 lowercase hex
 /// characters. The input is concatenated with `\x1f` (ASCII Unit Separator)
@@ -262,23 +337,26 @@ pub fn deterministic_id(parts: &[&str]) -> String {
 }
 
 /// Deterministic id for a push event row. Derived from
-/// `(request_id, ref_name)` so a recovery pass re-firing the same
+/// `(request_id, ordinal)` so a recovery pass re-firing the same
 /// transition produces the same id and the ON CONFLICT collapses to a
-/// no-op rather than creating a second push event.
+/// no-op rather than creating a second push event. Migration v30
+/// made the request's `accepted_ordinal` the carrier of the push
+/// event identity, so this helper takes the ordinal the request row
+/// stamps at `mark_request_outcomes_committed` time.
 #[allow(dead_code)] // wired by the handler refactor in the next slice
-pub fn push_event_id_for(request_id: &str, ref_name: &str) -> String {
-    deterministic_id(&["push_event", request_id, ref_name])
+pub fn push_event_id_for(request_id: &str, ordinal: i32) -> String {
+    deterministic_id(&["push_event", request_id, &ordinal.to_string()])
 }
 
 /// Deterministic id for a ref certificate row. Derived from
-/// `(request_id, ref_name)` for the same idempotency reason as
+/// `(request_id, ordinal)` for the same idempotency reason as
 /// `push_event_id_for`. The certificate's `id` column is the primary
 /// key; the unique index on `(repo_id, ref_name)` still applies, so
 /// the recovery path must additionally check for an existing cert
 /// before inserting to avoid the upsert replacing a live-path cert.
 #[allow(dead_code)] // wired by the handler refactor in the next slice
-pub fn ref_cert_id_for(request_id: &str, ref_name: &str) -> String {
-    deterministic_id(&["ref_cert", request_id, ref_name])
+pub fn ref_cert_id_for(request_id: &str, ordinal: i32) -> String {
+    deterministic_id(&["ref_cert", request_id, &ordinal.to_string()])
 }
 
 /// Deterministic id for an anchor job. The anchor's uniqueness contract
@@ -2765,12 +2843,13 @@ impl Db {
     /// `signature_input` are the raw RFC 9421 header values, persisted
     /// for audit; they were already verified at handler entry.
     ///
-    /// `first_ref_name` is the FIRST ref name in the live push's
-    /// `ref_updates`. It is persisted on every row of the same
-    /// `request_id` so the recovery drain can reproduce the live
-    /// path's "one push event per push, keyed on the first ref"
-    /// cardinality. The caller computes it from `ref_updates` once and
-    /// passes the same value for every row.
+    /// `ordinal` is the zero-based position of each ref in the pkap-line
+    /// stream; the live handler sets it from
+    /// `ref_updates.iter().enumerate()`. `git_target_kind` is a snapshot
+    /// of the update's git-side classification (`"create"`, `"update"`,
+    /// `"delete"`, …). The recovery re-derives the latter from the
+    /// per-ref report if the column is null, so the column is
+    /// informational and optional.
     #[allow(dead_code, clippy::too_many_arguments)] // wired by the handler refactor in the next slice
     pub async fn insert_pending_ref_transitions(
         &self,
@@ -2782,7 +2861,6 @@ impl Db {
         signature_header: &str,
         signature_input: &str,
         content_digest: &str,
-        first_ref_name: &str,
     ) -> Result<Vec<PendingRefTransition>> {
         let now = Utc::now().to_rfc3339();
         // P2 (reviewer-2 round 2): wrap the multi-row insert in a
@@ -2798,7 +2876,8 @@ impl Db {
         // them and the handler can safely return 503.
         let mut tx = self.pool.begin().await?;
         let mut out = Vec::with_capacity(ref_updates.len());
-        for update in ref_updates {
+        for (ordinal, update) in ref_updates.iter().enumerate() {
+            let ordinal_i32 = ordinal as i32;
             let id = deterministic_id(&[
                 "pending_ref_transition",
                 request_id,
@@ -2811,8 +2890,8 @@ impl Db {
                 r#"INSERT INTO pending_ref_transitions
                    (id, request_id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did,
                     signature_header, signature_input, content_digest, state, created_at,
-                    first_ref_name)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"#,
+                    ordinal, git_target_kind)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"#,
             )
             .bind(&id)
             .bind(request_id)
@@ -2827,7 +2906,8 @@ impl Db {
             .bind(content_digest)
             .bind(pending_state::PREPARED)
             .bind(&now)
-            .bind(first_ref_name)
+            .bind(ordinal_i32)
+            .bind(Option::<String>::None)
             .execute(&mut *tx)
             .await?;
             out.push(PendingRefTransition {
@@ -2846,11 +2926,234 @@ impl Db {
                 created_at: now.clone(),
                 applied_at: None,
                 cancelled_at: None,
-                first_ref_name: first_ref_name.to_string(),
+                ordinal: ordinal_i32,
+                git_target_kind: None,
             });
         }
         tx.commit().await?;
         Ok(out)
+    }
+
+    // ── request-level surface (#26 Split PR 1 step 2) ────────────
+
+    /// Insert a `receive_pack_requests` row in state `received`. Step 2
+    /// calls this from the handler's intent path BEFORE
+    /// `smart_http::receive_pack` runs; a node crash after this point
+    /// and before the live outcomes commit leaves the row in
+    /// `received` and its children in `prepared`, which the reconcile
+    /// step (already on this branch) handles via on-disk SHA + reflog
+    /// proof.
+    ///
+    /// The insert is single-row; the matching children are written by
+    /// the handler's existing `insert_pending_ref_transitions` call in
+    /// the SAME transaction boundary. Step 2 does not introduce a
+    /// "with-children" wrapper — the handler's call ordering is the
+    /// contract, and the tests pin the two writes as a pair.
+    pub async fn insert_receive_pack_request(&self, req: &ReceivePackRequest) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO receive_pack_requests
+               (id, repo_id, pusher_did, node_did, request_bytes, request_bytes_hash,
+                state, git_exit_ok, parsed_report, accepted_ordinal, attempt_count,
+                last_error, next_attempt_at, created_at, completed_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"#,
+        )
+        .bind(&req.id)
+        .bind(&req.repo_id)
+        .bind(&req.pusher_did)
+        .bind(&req.node_did)
+        .bind(&req.request_bytes)
+        .bind(&req.request_bytes_hash)
+        .bind(&req.state)
+        .bind(req.git_exit_ok)
+        .bind(req.parsed_report.as_ref())
+        .bind(req.accepted_ordinal)
+        .bind(req.attempt_count)
+        .bind(req.last_error.as_deref())
+        .bind(req.next_attempt_at.as_deref())
+        .bind(&req.created_at)
+        .bind(req.completed_at.as_deref())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Read a single `receive_pack_requests` row by id. Used by
+    /// `durable_outbox::derive_one` to look up the request's
+    /// `accepted_ordinal` so the push-event identity is anchored to
+    /// the request rather than the per-ref `first_ref_name` rewrite
+    /// the v30 migration dropped.
+    #[allow(dead_code)] // step-3 drain-side caller; round-trip test pins the contract
+    pub async fn get_receive_pack_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<ReceivePackRequest>> {
+        let row = sqlx::query(
+            r#"SELECT id, repo_id, pusher_did, node_did, request_bytes, request_bytes_hash,
+                       state, git_exit_ok, parsed_report, accepted_ordinal, attempt_count,
+                       last_error, next_attempt_at, created_at, completed_at
+               FROM receive_pack_requests WHERE id = $1"#,
+        )
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(row_to_receive_pack_request))
+    }
+
+    /// `received → outcomes_committed`. The handler calls this once
+    /// per request, with the parsed report, the git exit, and the
+    /// ordinal of the first ref the report proves landed. The state
+    /// gate in the WHERE clause means a concurrent drain cannot
+    /// re-flip a row the handler is mid-update.
+    pub async fn mark_request_outcomes_committed(
+        &self,
+        request_id: &str,
+        git_exit_ok: bool,
+        parsed_report: &serde_json::Value,
+        accepted_ordinal: Option<i32>,
+    ) -> Result<u64> {
+        let res = sqlx::query(
+            r#"UPDATE receive_pack_requests
+               SET state = $2, git_exit_ok = $3, parsed_report = $4,
+                   accepted_ordinal = $5
+               WHERE id = $1 AND state = $6"#,
+        )
+        .bind(request_id)
+        .bind(request_state::OUTCOMES_COMMITTED)
+        .bind(git_exit_ok)
+        .bind(parsed_report)
+        .bind(accepted_ordinal)
+        .bind(request_state::RECEIVED)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// `received → rejected_at_git`. Step 2 calls this when git
+    /// returned non-zero with no parseable report. The children
+    /// stay in `prepared` and the reconcile step decides their
+    /// fate via on-disk SHA + reflog proof.
+    pub async fn mark_request_rejected_at_git(
+        &self,
+        request_id: &str,
+        last_error: Option<&str>,
+    ) -> Result<u64> {
+        let res = sqlx::query(
+            r#"UPDATE receive_pack_requests
+               SET state = $2, git_exit_ok = FALSE, last_error = $3,
+                   completed_at = $4
+               WHERE id = $1 AND state = $5"#,
+        )
+        .bind(request_id)
+        .bind(request_state::REJECTED_AT_GIT)
+        .bind(last_error)
+        .bind(Utc::now().to_rfc3339())
+        .bind(request_state::RECEIVED)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// `outcomes_committed → effects_pending`. Step 3's effect
+    /// executor calls this when the drain picked up a request and
+    /// scheduled a retry. Step 2 introduces the helper but does
+    /// not call it; the contract is pinned by the step-3 tests
+    /// that will land in the same series.
+    #[allow(dead_code)] // step 3 owns the call site
+    pub async fn mark_request_effects_pending(
+        &self,
+        request_id: &str,
+        next_attempt_at: &str,
+        last_error: &str,
+    ) -> Result<u64> {
+        let res = sqlx::query(
+            r#"UPDATE receive_pack_requests
+               SET state = $2, attempt_count = attempt_count + 1,
+                   next_attempt_at = $3, last_error = $4
+               WHERE id = $1 AND state = $5"#,
+        )
+        .bind(request_id)
+        .bind(request_state::EFFECTS_PENDING)
+        .bind(next_attempt_at)
+        .bind(last_error)
+        .bind(request_state::OUTCOMES_COMMITTED)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// `effects_pending → complete`. Step 3 calls this after a
+    /// successful effects run. Step 2 introduces the helper but
+    /// does not call it; the contract is pinned by step-3 tests.
+    #[allow(dead_code)] // step 3 owns the call site
+    pub async fn mark_request_complete(&self, request_id: &str) -> Result<u64> {
+        let res = sqlx::query(
+            r#"UPDATE receive_pack_requests
+               SET state = $2, completed_at = $3
+               WHERE id = $1 AND state IN ($4, $5)"#,
+        )
+        .bind(request_id)
+        .bind(request_state::COMPLETE)
+        .bind(Utc::now().to_rfc3339())
+        .bind(request_state::OUTCOMES_COMMITTED)
+        .bind(request_state::EFFECTS_PENDING)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Drain-side read. Returns every request whose state is
+    /// `outcomes_committed` or `effects_pending` and whose
+    /// `next_attempt_at` is null or in the past. Step 3 owns the
+    /// call site; step 2 introduces the helper for the same
+    /// contract-pin reason as the state-flip helpers above.
+    #[allow(dead_code)] // step 3 owns the call site
+    pub async fn list_receive_pack_requests_due(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<ReceivePackRequest>> {
+        let limit = limit.max(1);
+        let rows = sqlx::query(
+            r#"SELECT id, repo_id, pusher_did, node_did, request_bytes, request_bytes_hash,
+                       state, git_exit_ok, parsed_report, accepted_ordinal, attempt_count,
+                       last_error, next_attempt_at, created_at, completed_at
+               FROM receive_pack_requests
+               WHERE state IN ($1, $2)
+                 AND (next_attempt_at IS NULL OR next_attempt_at < $3)
+               ORDER BY created_at ASC, id ASC
+               LIMIT $4"#,
+        )
+        .bind(request_state::OUTCOMES_COMMITTED)
+        .bind(request_state::EFFECTS_PENDING)
+        .bind(Utc::now().to_rfc3339())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(row_to_receive_pack_request).collect())
+    }
+
+    /// Backoff helper for the step-3 effect executor. Step 2
+    /// introduces it but does not call it; the contract is pinned
+    /// by step-3 tests.
+    #[allow(dead_code)] // step 3 owns the call site
+    pub async fn update_request_attempt(
+        &self,
+        request_id: &str,
+        attempt_count: i32,
+        next_attempt_at: &str,
+        last_error: &str,
+    ) -> Result<u64> {
+        let res = sqlx::query(
+            r#"UPDATE receive_pack_requests
+               SET attempt_count = $2, next_attempt_at = $3, last_error = $4
+               WHERE id = $1"#,
+        )
+        .bind(request_id)
+        .bind(attempt_count)
+        .bind(next_attempt_at)
+        .bind(last_error)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
     }
 
     /// Flip every `prepared` row attached to `request_id` to `applied`.
@@ -3016,7 +3319,7 @@ impl Db {
         let rows = sqlx::query(
             r#"SELECT id, request_id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did,
                        signature_header, signature_input, content_digest, state, created_at,
-                       applied_at, cancelled_at, first_ref_name
+                       applied_at, cancelled_at, ordinal, git_target_kind
                FROM pending_ref_transitions
                WHERE state = $1
                ORDER BY applied_at ASC NULLS LAST, id ASC
@@ -3049,7 +3352,7 @@ impl Db {
         let rows = sqlx::query(
             r#"SELECT id, request_id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did,
                        signature_header, signature_input, content_digest, state, created_at,
-                       applied_at, cancelled_at, first_ref_name
+                       applied_at, cancelled_at, ordinal, git_target_kind
                FROM pending_ref_transitions
                WHERE state = $1
                ORDER BY created_at ASC, id ASC
@@ -3114,7 +3417,7 @@ impl Db {
         let rows = sqlx::query(
             r#"SELECT id, request_id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did,
                        signature_header, signature_input, content_digest, state, created_at,
-                       applied_at, cancelled_at, first_ref_name
+                       applied_at, cancelled_at, ordinal, git_target_kind
                FROM pending_ref_transitions
                WHERE state IN ($1, $2) AND (created_at, id) > ($3, $4)
                ORDER BY created_at ASC, id ASC
@@ -3267,37 +3570,6 @@ impl Db {
         Ok(res.rows_affected())
     }
 
-    /// Rewrite `first_ref_name` on every row of a request. Called by
-    /// the live handler when the requested first ref was rejected
-    /// but a later ref landed — the push event id is keyed on
-    /// `first_ref_name`, so without this rewrite the drain's
-    /// `derive_one` (which only writes the event for the row whose
-    /// `ref_name == first_ref_name`) would never find a match and
-    /// the push event would be permanently lost.
-    ///
-    /// P2 (reviewer round 5): a mixed push where the first ref is
-    /// rejected but a later ref lands must still produce a push
-    /// event under the OK ref's identity. The live path already
-    /// picks the first OK ref for `commit_hash`; this rewrite
-    /// makes the drain reach the same row.
-    #[allow(dead_code)]
-    pub async fn rewrite_pending_ref_transitions_first_ref_name(
-        &self,
-        request_id: &str,
-        new_first_ref_name: &str,
-    ) -> Result<u64> {
-        let res = sqlx::query(
-            r#"UPDATE pending_ref_transitions
-               SET first_ref_name = $1
-               WHERE request_id = $2 AND first_ref_name <> $1"#,
-        )
-        .bind(new_first_ref_name)
-        .bind(request_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected())
-    }
-
     /// Test-only: insert a row directly in the given state. Used to
     /// simulate the crash window ("row is `applied` but the handler
     /// never reached the push event / cert / anchor code") without
@@ -3325,8 +3597,8 @@ impl Db {
             r#"INSERT INTO pending_ref_transitions
                (id, request_id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did,
                 signature_header, signature_input, content_digest, state, created_at,
-                applied_at, cancelled_at, first_ref_name)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)"#,
+                applied_at, cancelled_at, ordinal, git_target_kind)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)"#,
         )
         .bind(&row.id)
         .bind(&row.request_id)
@@ -3343,7 +3615,8 @@ impl Db {
         .bind(&row.created_at)
         .bind(applied_at_opt)
         .bind(cancelled_at_opt)
-        .bind(&row.first_ref_name)
+        .bind(row.ordinal)
+        .bind(row.git_target_kind.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -5064,6 +5337,26 @@ fn row_to_cert(r: sqlx::postgres::PgRow) -> RefCertificate {
 }
 
 #[allow(dead_code)] // wired by the handler refactor in the next slice
+fn row_to_receive_pack_request(r: sqlx::postgres::PgRow) -> ReceivePackRequest {
+    ReceivePackRequest {
+        id: r.get("id"),
+        repo_id: r.get("repo_id"),
+        pusher_did: r.get("pusher_did"),
+        node_did: r.get("node_did"),
+        request_bytes: r.get("request_bytes"),
+        request_bytes_hash: r.get("request_bytes_hash"),
+        state: r.get("state"),
+        git_exit_ok: r.get("git_exit_ok"),
+        parsed_report: r.get("parsed_report"),
+        accepted_ordinal: r.get("accepted_ordinal"),
+        attempt_count: r.get("attempt_count"),
+        last_error: r.get("last_error"),
+        next_attempt_at: r.get("next_attempt_at"),
+        created_at: r.get("created_at"),
+        completed_at: r.get("completed_at"),
+    }
+}
+
 fn row_to_pending_ref_transition(r: sqlx::postgres::PgRow) -> PendingRefTransition {
     PendingRefTransition {
         id: r.get("id"),
@@ -5081,7 +5374,8 @@ fn row_to_pending_ref_transition(r: sqlx::postgres::PgRow) -> PendingRefTransiti
         created_at: r.get("created_at"),
         applied_at: r.get("applied_at"),
         cancelled_at: r.get("cancelled_at"),
-        first_ref_name: r.get("first_ref_name"),
+        ordinal: r.get("ordinal"),
+        git_target_kind: r.get("git_target_kind"),
     }
 }
 
@@ -5955,14 +6249,14 @@ mod migration_tests {
         // then drop the owner_did column to simulate a pre-v10 schema.
         db.migrate().await.unwrap();
         sqlx::query("ALTER TABLE received_ref_updates DROP COLUMN owner_did")
-            .execute(&db.pool)
+            .execute(db.pool())
             .await
             .unwrap();
 
         // Truncate schema_migrations and re-seed at v9 — simulate an existing
         // node that has run v1..v9 but not yet v10.
         sqlx::query("DELETE FROM schema_migrations")
-            .execute(&db.pool)
+            .execute(db.pool())
             .await
             .unwrap();
         for m in MIGRATIONS.iter().take_while(|m| m.version < 10) {
@@ -5973,7 +6267,7 @@ mod migration_tests {
             .bind(m.version)
             .bind(m.name)
             .bind("2026-07-01T00:00:00Z")
-            .execute(&db.pool)
+            .execute(db.pool())
             .await
             .unwrap();
         }
@@ -5998,12 +6292,12 @@ mod migration_tests {
         .bind::<Option<String>>(None)
         .bind("2026-07-01T12:00:01Z")
         .bind("12D3KooWPeer")
-        .execute(&db.pool)
+        .execute(db.pool())
         .await
         .unwrap();
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM received_ref_updates")
-                .fetch_one(&db.pool)
+                .fetch_one(db.pool())
                 .await
                 .unwrap(),
             1,
@@ -6019,7 +6313,7 @@ mod migration_tests {
         let owner: Option<String> =
             sqlx::query_scalar("SELECT owner_did FROM received_ref_updates WHERE id = $1")
                 .bind(&row_id)
-                .fetch_one(&db.pool)
+                .fetch_one(db.pool())
                 .await
                 .unwrap();
         assert_eq!(owner, None, "existing row's owner_did must be NULL");
@@ -6030,7 +6324,7 @@ mod migration_tests {
              FROM information_schema.columns
              WHERE table_name = 'received_ref_updates' AND column_name = 'owner_did'",
         )
-        .fetch_one(&db.pool)
+        .fetch_one(db.pool())
         .await
         .unwrap();
         assert_eq!(col.0, "owner_did");
@@ -6040,7 +6334,7 @@ mod migration_tests {
         // (c) Version 11 is recorded as applied.
         let v11_count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 11")
-                .fetch_one(&db.pool)
+                .fetch_one(db.pool())
                 .await
                 .unwrap();
         assert_eq!(
@@ -6069,7 +6363,7 @@ mod migration_tests {
     async fn attempted_at_of(db: &super::Db, repo: &str) -> Option<String> {
         sqlx::query_scalar("SELECT attempted_at FROM sync_queue WHERE repo = $1")
             .bind(repo)
-            .fetch_one(&db.pool)
+            .fetch_one(db.pool())
             .await
             .unwrap()
     }
@@ -6089,11 +6383,11 @@ mod migration_tests {
 
         // Roll back to v11: drop the column and forget the version.
         sqlx::query("ALTER TABLE sync_queue DROP COLUMN attempted_at")
-            .execute(&db.pool)
+            .execute(db.pool())
             .await
             .unwrap();
         sqlx::query("DELETE FROM schema_migrations WHERE version = 17")
-            .execute(&db.pool)
+            .execute(db.pool())
             .await
             .unwrap();
 
@@ -6107,7 +6401,7 @@ mod migration_tests {
              FROM information_schema.columns
              WHERE table_name = 'sync_queue' AND column_name = 'attempted_at'",
         )
-        .fetch_one(&db.pool)
+        .fetch_one(db.pool())
         .await
         .unwrap();
         assert_eq!(col.0, "text");
@@ -6115,7 +6409,7 @@ mod migration_tests {
 
         let recorded: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 17")
-                .fetch_one(&db.pool)
+                .fetch_one(db.pool())
                 .await
                 .unwrap();
         assert_eq!(recorded.0, 1, "v17 must be recorded as applied");
@@ -6161,13 +6455,13 @@ mod migration_tests {
         sqlx::query("UPDATE sync_queue SET enqueued_at = $1 WHERE repo = $2")
             .bind("2026-07-29T00:00:00Z")
             .bind("z6Mkfoo/older")
-            .execute(&db.pool)
+            .execute(db.pool())
             .await
             .unwrap();
         sqlx::query("UPDATE sync_queue SET enqueued_at = $1 WHERE repo = $2")
             .bind("2026-07-29T00:00:01Z")
             .bind("z6Mkfoo/newer")
-            .execute(&db.pool)
+            .execute(db.pool())
             .await
             .unwrap();
 
@@ -6192,7 +6486,7 @@ mod migration_tests {
         enqueue_one(&db, "z6Mkfoo/a").await;
         let before: String =
             sqlx::query_scalar("SELECT enqueued_at FROM sync_queue WHERE repo = 'z6Mkfoo/a'")
-                .fetch_one(&db.pool)
+                .fetch_one(db.pool())
                 .await
                 .unwrap();
 
@@ -6200,7 +6494,7 @@ mod migration_tests {
 
         let after: String =
             sqlx::query_scalar("SELECT enqueued_at FROM sync_queue WHERE repo = 'z6Mkfoo/a'")
-                .fetch_one(&db.pool)
+                .fetch_one(db.pool())
                 .await
                 .unwrap();
         assert_eq!(before, after);
@@ -7861,7 +8155,7 @@ mod ref_certificate_tests {
     ///   `old_sha` / `new_sha` / `pusher_did` / `issued_at` /
     ///   `signature` to the new transition's values,
     /// - the deterministic `cert_id` (derived from
-    ///   `ref_cert_id_for(request_id, ref_name)`) is preserved
+    ///   `ref_cert_id_for(request_id, ordinal)`) is preserved
     ///   across the re-push, and
     /// - exactly one cert row exists for the ref after the
     ///   re-push.
@@ -7903,7 +8197,7 @@ mod ref_certificate_tests {
             "0000",
             "1111",
             "did:key:zFirstPusher",
-            &ref_cert_id_for("req-A", "refs/heads/main"),
+            &ref_cert_id_for("req-A", 0),
         )
         .await
         .unwrap();
@@ -7924,7 +8218,7 @@ mod ref_certificate_tests {
             "aaaa",
             "bbbb",
             "did:key:zSecondPusher",
-            &ref_cert_id_for("req-A", "refs/heads/main"),
+            &ref_cert_id_for("req-A", 0),
         )
         .await
         .unwrap();
@@ -7933,8 +8227,8 @@ mod ref_certificate_tests {
         assert_eq!(c1.id, c2.id, "cert id is preserved across re-push");
         assert_eq!(
             c1.id,
-            ref_cert_id_for("req-A", "refs/heads/main"),
-            "cert id is the deterministic (request_id, ref_name) hash"
+            ref_cert_id_for("req-A", 0),
+            "cert id is the deterministic (request_id, ordinal) hash"
         );
 
         // The upsert updated every other field to the second push.
@@ -9167,7 +9461,7 @@ mod peer_authority_tests {
             .bind(legacy)
             .bind(HONEST_URL)
             .bind(chrono::Utc::now().to_rfc3339())
-            .execute(&db.pool)
+            .execute(db.pool())
             .await
             .expect("seeding a pre-gate row must succeed");
 
@@ -9862,7 +10156,6 @@ mod pending_ref_transition_tests {
                 "Signature: sig=...",
                 "Signature-Input: ...",
                 "Content-Digest: ...",
-                "refs/heads/main",
             )
             .await
             .unwrap();
@@ -9907,7 +10200,6 @@ mod pending_ref_transition_tests {
             "Signature: sig=...",
             "Signature-Input: ...",
             "Content-Digest: ...",
-            "refs/heads/main",
         )
         .await
         .unwrap();
@@ -9948,7 +10240,6 @@ mod pending_ref_transition_tests {
             "Signature: sig=...",
             "Signature-Input: ...",
             "Content-Digest: ...",
-            "refs/heads/main",
         )
         .await
         .unwrap();
@@ -9985,7 +10276,6 @@ mod pending_ref_transition_tests {
             "Signature: sig=...",
             "Signature-Input: ...",
             "Content-Digest: ...",
-            "refs/heads/main",
         )
         .await
         .unwrap();
@@ -10032,11 +10322,11 @@ mod pending_ref_transition_tests {
             created_at: now.clone(),
             applied_at: Some(now.clone()),
             cancelled_at: None,
-            // Single-ref test, so the request's first ref name is the
-            // same as the ref name. The new multi-ref test sets this
-            // explicitly to the request's actual first ref across all
-            // rows of the same `request_id`.
-            first_ref_name: "refs/heads/main".to_string(),
+            // Single-ref test fixture; the request's only child is
+            // ordinal 0. Multi-ref tests set the ordinal explicitly
+            // for each child row.
+            ordinal: 0,
+            git_target_kind: Some("update".to_string()),
         };
         db.insert_pending_ref_transition_for_test(&row)
             .await
@@ -10046,8 +10336,8 @@ mod pending_ref_transition_tests {
         // artifacts; the row is then deleted.
         let first = db.list_pending_ref_transitions_applied(100).await.unwrap();
         assert_eq!(first.len(), 1);
-        let push_id_1 = push_event_id_for(&row.request_id, &row.ref_name);
-        let cert_id_1 = ref_cert_id_for(&row.request_id, &row.ref_name);
+        let push_id_1 = push_event_id_for(&row.request_id, row.ordinal);
+        let cert_id_1 = ref_cert_id_for(&row.request_id, row.ordinal);
         let anchor_id_1 =
             anchor_job_id_for(&row.repo_id, &row.ref_name, &row.old_sha, &row.new_sha);
 
@@ -10055,8 +10345,8 @@ mod pending_ref_transition_tests {
         // the same ids; the inserts collapse.
         let second = db.list_pending_ref_transitions_applied(100).await.unwrap();
         assert_eq!(second.len(), 1, "the row is still in `applied`");
-        let push_id_2 = push_event_id_for(&row.request_id, &row.ref_name);
-        let cert_id_2 = ref_cert_id_for(&row.request_id, &row.ref_name);
+        let push_id_2 = push_event_id_for(&row.request_id, row.ordinal);
+        let cert_id_2 = ref_cert_id_for(&row.request_id, row.ordinal);
         let anchor_id_2 =
             anchor_job_id_for(&row.repo_id, &row.ref_name, &row.old_sha, &row.new_sha);
         assert_eq!(push_id_1, push_id_2, "push id is deterministic");
@@ -10137,7 +10427,6 @@ mod pending_ref_transition_tests {
             "Signature: sig=...",
             "Signature-Input: ...",
             "Content-Digest: ...",
-            "refs/heads/main",
         )
         .await
         .unwrap();
@@ -10182,7 +10471,6 @@ mod pending_ref_transition_tests {
             "Signature: sig=...",
             "Signature-Input: ...",
             "Content-Digest: ...",
-            "refs/heads/main",
         )
         .await
         .unwrap();
@@ -10223,7 +10511,6 @@ mod pending_ref_transition_tests {
             "Signature: sig=...",
             "Signature-Input: ...",
             "Content-Digest: ...",
-            "refs/heads/main",
         )
         .await
         .unwrap();
@@ -10259,7 +10546,6 @@ mod pending_ref_transition_tests {
             "Signature: sig=...",
             "Signature-Input: ...",
             "Content-Digest: ...",
-            "refs/heads/main",
         )
         .await
         .unwrap();
@@ -10299,7 +10585,6 @@ mod pending_ref_transition_tests {
             "Signature: sig=...",
             "Signature-Input: ...",
             "Content-Digest: ...",
-            "refs/heads/main",
         )
         .await
         .unwrap();
@@ -10371,8 +10656,8 @@ mod pending_ref_transition_tests {
             r#"INSERT INTO pending_ref_transitions
                (id, request_id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did,
                 signature_header, signature_input, content_digest, state, created_at,
-                first_ref_name)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"#,
+                ordinal, git_target_kind)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"#,
         )
         .bind(&collision_id)
         .bind("req-pre-seed")
@@ -10387,8 +10672,9 @@ mod pending_ref_transition_tests {
         .bind("digest-pre")
         .bind(pending_state::PREPARED)
         .bind(Utc::now().to_rfc3339())
-        .bind("refs/heads/main")
-        .execute(&db.pool)
+        .bind(1_i32) // second child of the seeded request
+        .bind(Option::<String>::None)
+        .execute(db.pool())
         .await
         .unwrap();
 
@@ -10407,7 +10693,6 @@ mod pending_ref_transition_tests {
                 "sig",
                 "sig-input",
                 "digest",
-                "refs/heads/main",
             )
             .await;
         assert!(
@@ -10424,7 +10709,7 @@ mod pending_ref_transition_tests {
             "SELECT COUNT(*) FROM pending_ref_transitions WHERE request_id = $1",
         )
         .bind("req-atomic")
-        .fetch_one(&db.pool)
+        .fetch_one(db.pool())
         .await
         .unwrap();
         assert_eq!(
@@ -10436,7 +10721,7 @@ mod pending_ref_transition_tests {
             "SELECT COUNT(*) FROM pending_ref_transitions WHERE id = $1",
         )
         .bind(&collision_id)
-        .fetch_one(&db.pool)
+        .fetch_one(db.pool())
         .await
         .unwrap();
         assert_eq!(pres, 1, "the pre-seeded row is untouched");
@@ -10458,19 +10743,16 @@ mod pending_ref_transition_tests {
     /// the entire reason for using a hash instead of a UUID.
     #[test]
     fn push_event_id_for_is_stable() {
-        assert_eq!(
-            push_event_id_for("req-x", "refs/heads/main"),
-            push_event_id_for("req-x", "refs/heads/main")
-        );
+        assert_eq!(push_event_id_for("req-x", 0), push_event_id_for("req-x", 0));
         assert_ne!(
-            push_event_id_for("req-x", "refs/heads/main"),
-            push_event_id_for("req-y", "refs/heads/main"),
+            push_event_id_for("req-x", 0),
+            push_event_id_for("req-y", 0),
             "different request ids produce different push event ids"
         );
         assert_ne!(
-            push_event_id_for("req-x", "refs/heads/main"),
-            push_event_id_for("req-x", "refs/heads/feature"),
-            "different refs produce different push event ids"
+            push_event_id_for("req-x", 0),
+            push_event_id_for("req-x", 1),
+            "different ordinals produce different push event ids"
         );
     }
 }

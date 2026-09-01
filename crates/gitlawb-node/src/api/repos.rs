@@ -2263,7 +2263,6 @@ pub async fn git_receive_pack(
     // receive_pack call, so a rejection above (owner enforcement,
     // branch protection, etc.) does not produce a `prepared` row
     // that nothing will ever flip.
-    let request_id = uuid::Uuid::new_v4().to_string();
     let signature_header = headers
         .get("signature")
         .and_then(|v| v.to_str().ok())
@@ -2279,20 +2278,53 @@ pub async fn git_receive_pack(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    // The first ref name is hoisted here so it is the SAME value
-    // persisted on every `pending_ref_transitions` row of this request
-    // (request-scoped) AND the SAME value used to derive the push event
-    // id below. The recovery drain reads `first_ref_name` from each row
-    // and keys `push_event_id_for` on it, so the live and recovery
-    // paths produce the same id and the ON CONFLICT (id) DO NOTHING in
-    // `record_push_with_id` collapses a live push followed by a recovery
-    // pass into a single push event row. An empty `ref_updates` is
-    // defensive: receive-pack on a push with no refs would have already
-    // been rejected upstream, so this branch is unreachable in practice.
-    let first_ref_name = ref_updates
-        .first()
-        .map(|u| u.ref_name.clone())
-        .unwrap_or_default();
+    // #26 Split PR 1 — request-level intent row. Written BEFORE
+    // `smart_http::receive_pack` runs, in state `received`, carrying
+    // the raw HTTP body the handler will hand to git and the SHA-256
+    // of it. The recovery drain (step 3) and the on-disk reconcile
+    // (already on this branch) both key off this row; a node crash
+    // between this write and the outcomes commit leaves the row in
+    // `received` and its children in `prepared`, which is the
+    // recoverable state.
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    let request_bytes_hash = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&body);
+        hex::encode(h.finalize())
+    };
+    let req_row = crate::db::ReceivePackRequest {
+        id: request_id.clone(),
+        repo_id: record.id.clone(),
+        pusher_did: auth.0.to_string(),
+        node_did: state.node_did.to_string(),
+        request_bytes: body.to_vec(),
+        request_bytes_hash,
+        state: crate::db::request_state::RECEIVED.to_string(),
+        git_exit_ok: None,
+        parsed_report: None,
+        accepted_ordinal: None,
+        attempt_count: 0,
+        last_error: None,
+        next_attempt_at: None,
+        created_at: now.clone(),
+        completed_at: None,
+    };
+    if let Err(e) = state.db.insert_receive_pack_request(&req_row).await {
+        // A durable-intent write failure here means we cannot
+        // guarantee recovery for the upcoming git apply. Refuse the
+        // push with 503 rather than risk a ref landing with no
+        // recovery record.
+        tracing::error!(
+            err = %e,
+            repo = %name,
+            "failed to persist receive-pack request row; refusing push"
+        );
+        return Err(AppError::Overloaded(
+            "durable intent write failed, retry shortly".into(),
+        ));
+    }
     if let Err(e) = state
         .db
         .insert_pending_ref_transitions(
@@ -2304,7 +2336,6 @@ pub async fn git_receive_pack(
             &signature_header,
             &signature_input,
             &content_digest,
-            &first_ref_name,
         )
         .await
     {
@@ -2444,33 +2475,18 @@ pub async fn git_receive_pack(
     // refs.
     let pending_ref_names: Vec<&str> = ref_updates.iter().map(|u| u.ref_name.as_str()).collect();
 
-    // P2 (reviewer round 5): the push event id is keyed on
-    // `first_ref_name` (the request's first requested ref). If
-    // that ref was rejected but a later ref landed, the drain's
-    // `derive_one` — which only writes the event for the row whose
-    // `ref_name == first_ref_name` — would never find a match and
-    // the event would be lost on crash. Rewrite `first_ref_name`
-    // to the first OK ref so the drain reaches the right row.
-    if let Some(first_ok) = ref_updates
+    // #26 Split PR 1: the push event id is keyed on
+    // `(request_id, accepted_ordinal)`. The `accepted_ordinal` is
+    // the ordinal (in `ref_updates`) of the FIRST ref the report
+    // proves landed; the v30 migration's `ordinal` column carries
+    // the position. No `first_ref_name` rewrite is needed because
+    // the identity is on the request, not on a mutable per-ref
+    // column. Compute it once here so the per-ref effects loop can
+    // stamp the request row at the right moment.
+    let accepted_ordinal: Option<i32> = ref_updates
         .iter()
-        .find(|u| ok_set.contains(u.ref_name.as_str()))
-    {
-        if first_ok.ref_name != first_ref_name {
-            if let Err(e) = state
-                .db
-                .rewrite_pending_ref_transitions_first_ref_name(&request_id, &first_ok.ref_name)
-                .await
-            {
-                tracing::warn!(
-                    err = %e,
-                    request_id = %request_id,
-                    repo = %name,
-                    "failed to rewrite first_ref_name to the first OK ref; \
-                     a crash before push-event write will lose the event"
-                );
-            }
-        }
-    }
+        .position(|u| ok_set.contains(u.ref_name.as_str()))
+        .map(|i| i as i32);
 
     if !unpack_ok && report.is_some() {
         // Unpack failed explicitly — every row is proven not to have
@@ -2592,6 +2608,78 @@ pub async fn git_receive_pack(
                 request_id = %request_id,
                 repo = %name,
                 "failed to mark pending ref transitions uncertain (no report)"
+            );
+        }
+    }
+
+    // #26 Split PR 1: transition the request row to
+    // `outcomes_committed` (with `parsed_report` and
+    // `accepted_ordinal` stamped) or `rejected_at_git` (when git
+    // returned non-zero with no parseable report). The drain
+    // (step 3) reads `outcomes_committed` rows; today the live
+    // path also runs the per-ref effects inline below so the
+    // request moves to `complete` is step-3 territory.
+    //
+    // The transition runs as a side-effect of the four-branch
+    // flip above: a parseable report always lands in
+    // `outcomes_committed`; the no-report non-zero-exit branch
+    // (the implicit `None =>` else) lands in `rejected_at_git`.
+    if let Some(parsed) = &report {
+        let parsed_json = serde_json::json!({
+            "unpack_ok": parsed.0,
+            "ref_results": parsed.1.iter().map(|(n, ok)| serde_json::json!({
+                "ref_name": n,
+                "ok": ok,
+            })).collect::<Vec<_>>(),
+        });
+        if let Err(e) = state
+            .db
+            .mark_request_outcomes_committed(&request_id, exit_ok, &parsed_json, accepted_ordinal)
+            .await
+        {
+            tracing::warn!(
+                err = %e,
+                request_id = %request_id,
+                repo = %name,
+                "failed to stamp request outcomes; the request row stays in `received` and the drain will not see it"
+            );
+        }
+    } else if !exit_ok {
+        // No report AND non-zero exit: request goes to
+        // `rejected_at_git`. Children stay in `prepared` for the
+        // reconcile step to decide via on-disk SHA + reflog proof.
+        if let Err(e) = state
+            .db
+            .mark_request_rejected_at_git(
+                &request_id,
+                Some("git returned non-zero exit with no parseable report"),
+            )
+            .await
+        {
+            tracing::warn!(
+                err = %e,
+                request_id = %request_id,
+                repo = %name,
+                "failed to mark request rejected_at_git; the request row stays in `received` and the drain will not see it"
+            );
+        }
+    } else {
+        // No report but exit zero (implicit-ok): every ref
+        // accepted. The per-ref state flip above already marked
+        // every child `applied`; the request row goes to
+        // `outcomes_committed` with `parsed_report = null` and
+        // `accepted_ordinal = Some(0)`.
+        let parsed_json = serde_json::Value::Null;
+        if let Err(e) = state
+            .db
+            .mark_request_outcomes_committed(&request_id, exit_ok, &parsed_json, accepted_ordinal)
+            .await
+        {
+            tracing::warn!(
+                err = %e,
+                request_id = %request_id,
+                repo = %name,
+                "failed to stamp request outcomes (implicit-ok); the request row stays in `received`"
             );
         }
     }
@@ -2770,22 +2858,25 @@ pub async fn git_receive_pack(
         // `commit_hash` truthful; if every ref was rejected we
         // already returned above (`any_ref_ok` is false).
         //
-        // P2 (reviewer round 5): the push event id is also keyed
-        // on the first OK ref's name (the row that carries the
-        // event in `derive_one`), so the live and recovery paths
-        // produce the same id. The earlier
-        // `rewrite_pending_ref_transitions_first_ref_name` call
-        // updated every row's `first_ref_name` to this same
-        // first OK ref, so the drain's `row.ref_name ==
-        // row.first_ref_name` check matches.
-        let first_ok_update = ref_updates
-            .iter()
-            .find(|u| ok_set.contains(u.ref_name.as_str()));
-        let (push_event_first_ref, commit_hash) = match first_ok_update {
-            Some(u) => (u.ref_name.as_str(), u.new_sha.clone()),
-            None => ("", Utc::now().timestamp().to_string()),
+        // #26 Split PR 1: the push event id is keyed on
+        // `(request_id, accepted_ordinal)`, not on a per-ref name.
+        // The `accepted_ordinal` was computed at the per-ref state
+        // flip; it is the position in `ref_updates` of the first
+        // ref the report proves landed. The `commit_hash` is that
+        // ref's `new_sha`, NOT `ref_updates.first()`. If every ref
+        // was rejected, `accepted_ordinal` is `None` and we already
+        // returned above (`any_ref_ok` is false).
+        let commit_hash = match accepted_ordinal {
+            Some(ord) => ref_updates
+                .get(ord as usize)
+                .map(|u| u.new_sha.clone())
+                .unwrap_or_else(|| Utc::now().timestamp().to_string()),
+            None => Utc::now().timestamp().to_string(),
         };
-        let push_event_id = crate::db::push_event_id_for(&request_id, push_event_first_ref);
+        let push_event_id = match accepted_ordinal {
+            Some(ord) => crate::db::push_event_id_for(&request_id, ord),
+            None => String::new(),
+        };
         if let Err(e) = state
             .db
             .record_push_with_id(&push_event_id, did, &record.id, &commit_hash, 0)
@@ -2821,7 +2912,13 @@ pub async fn git_receive_pack(
             if !ok_set.contains(update.ref_name.as_str()) {
                 continue;
             }
-            let cert_id = crate::db::ref_cert_id_for(&request_id, &update.ref_name);
+            let cert_id = {
+                let ordinal = ref_updates
+                    .iter()
+                    .position(|u| u.ref_name == update.ref_name)
+                    .unwrap_or(0) as i32;
+                crate::db::ref_cert_id_for(&request_id, ordinal)
+            };
             let cert_result = cert::issue_ref_certificate(
                 &state,
                 &record.id,

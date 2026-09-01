@@ -582,31 +582,33 @@ pub async fn drain_pending_ref_transitions_all(
 /// against the same row is a no-op.
 pub async fn derive_one(state: &AppState, row: &PendingRefTransition) -> anyhow::Result<()> {
     // Push event: deterministic id, idempotent insert. The id is keyed
-    // on the REQUEST's first ref name (persisted on every row of this
-    // `request_id`) so the recovery push event id matches the live
-    // path's id and a live push followed by a recovery pass collapses
-    // to a single `push_events` row via `ON CONFLICT (id) DO NOTHING`.
+    // on `(request_id, accepted_ordinal)` — the request row's
+    // `accepted_ordinal` is the ordinal of the row whose ref actually
+    // landed, so the recovery push event id matches the live path's
+    // id and a live push followed by a recovery pass collapses to a
+    // single `push_events` row via `ON CONFLICT (id) DO NOTHING`.
     //
-    // P2 (reviewer-1 round 2): for a MULTI-REF push the drain lists
-    // rows in `ORDER BY applied_at ASC, id ASC`; rows in the same
-    // second tie-break on a hash, so the row whose `record_push_with_id`
-    // hits the table first is non-deterministic. The push event is
-    // request-scoped (one per push, not one per ref) and the live
-    // handler at repos.rs:2282-2295 derives its `commit_hash` from
-    // `ref_updates.first().new_sha`. To match the live path exactly,
-    // only the row whose `ref_name` equals the persisted
-    // `first_ref_name` writes the event, and that row's `new_sha` is
-    // by definition the first ref's `new_sha`. Rows for non-first
-    // refs skip the push event write — they have already collapsed to
-    // the same `(request_id, first_ref_name)` id and a second insert
-    // would be a no-op, but the SHAs would still be wrong if the
-    // drain happened to process them first.
+    // P2 (reviewer-1 round 2, restated for the v30 model): for a
+    // MULTI-REF push the drain lists rows in `ORDER BY applied_at ASC,
+    // id ASC`; rows in the same second tie-break on a hash, so the
+    // row whose `record_push_with_id` hits the table first is
+    // non-deterministic. The push event is request-scoped (one per
+    // push, not one per ref), and the live handler at
+    // repos.rs:2781-2792 derives `commit_hash` from the request's
+    // accepted ref's `new_sha`. To match the live path exactly, only
+    // the row whose `ordinal` equals the request's `accepted_ordinal`
+    // writes the event. Rows for non-accepted ordinals skip the push
+    // event write — they have already collapsed to the same
+    // `(request_id, accepted_ordinal)` id and a second insert would
+    // be a no-op, but the SHAs would still be wrong if the drain
+    // happened to process them first.
     //
     // Per-ref certs and anchor jobs stay keyed on `row.ref_name` and
     // `(repo, ref, old, new)` respectively — those are correctly
     // transition-shaped and continue to run on every row.
-    if row.ref_name == row.first_ref_name {
-        let push_id = crate::db::push_event_id_for(&row.request_id, &row.first_ref_name);
+    let accepted_ordinal = lookup_accepted_ordinal(state, &row.request_id, row.ordinal).await?;
+    if row.ordinal == accepted_ordinal {
+        let push_id = crate::db::push_event_id_for(&row.request_id, row.ordinal);
         state
             .db
             .record_push_with_id(&push_id, &row.pusher_did, &row.repo_id, &row.new_sha, 0)
@@ -629,8 +631,9 @@ pub async fn derive_one(state: &AppState, row: &PendingRefTransition) -> anyhow:
     // (the SQL only updates the SHAs/did/signature/ts columns).
     // Live and recovery still collapse to a single cert row per
     // `(repo_id, ref_name)` because the `cert_id` from
-    // `ref_cert_id_for` is the same on both paths.
-    let cert_id = crate::db::ref_cert_id_for(&row.request_id, &row.ref_name);
+    // `ref_cert_id_for` is the same on both paths. The id is now
+    // keyed on `(request_id, ordinal)` per v30.
+    let cert_id = crate::db::ref_cert_id_for(&row.request_id, row.ordinal);
     // P1 (reviewer-1 round 4): stamp the recovery cert with the
     // row's `created_at` so a replay of A after a later live cert B
     // cannot outrank B's fields in the
@@ -667,6 +670,32 @@ pub async fn derive_one(state: &AppState, row: &PendingRefTransition) -> anyhow:
     state.db.insert_anchor_job_idempotent(&job).await?;
 
     Ok(())
+}
+
+/// Look up the request's `accepted_ordinal` for the push event gate.
+///
+/// The v30 model stores the ordinal on the request row, not the
+/// child, so the drain must ask the request "which of your children
+/// landed first?" before writing the push event. A request row that
+/// is missing or has no `accepted_ordinal` set is a legacy crash
+/// window from before the v30 migration — the drain's per-ref walk
+/// still produces a correct push event by treating the first child
+/// by `(ordinal, id)` as the accepted one, so the helper falls back
+/// to the row's own ordinal in that case. This is the test seam that
+/// keeps `drain_re_derives_all_three_artifacts_for_an_applied_row`
+/// (a fixture that does NOT pre-stage a `receive_pack_requests` row)
+/// passing under the new model.
+async fn lookup_accepted_ordinal(
+    state: &AppState,
+    request_id: &str,
+    fallback: i32,
+) -> anyhow::Result<i32> {
+    let row: Option<(Option<i32>,)> =
+        sqlx::query_as("SELECT accepted_ordinal FROM receive_pack_requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_optional(state.db.pool())
+            .await?;
+    Ok(row.and_then(|(o,)| o).unwrap_or(fallback))
 }
 
 #[cfg(test)]
@@ -728,11 +757,11 @@ mod drain_tests {
             created_at: now.clone(),
             applied_at: Some(now),
             cancelled_at: None,
-            // The existing tests are single-ref pushes, so the first
-            // ref name is the same as the ref name. The new multi-ref
-            // test sets this explicitly to the request's actual first
-            // ref name across all rows of the same `request_id`.
-            first_ref_name: ref_name.to_string(),
+            // The existing tests are single-ref pushes, so the
+            // request's only child is ordinal 0. The new multi-ref
+            // test sets this explicitly per child.
+            ordinal: 0,
+            git_target_kind: Some("update".to_string()),
         }
     }
 
@@ -765,7 +794,7 @@ mod drain_tests {
         assert_eq!(examined, 1, "the loop examined the single row");
 
         // Push event: exactly one row, keyed on the deterministic id.
-        let _push_id = crate::db::push_event_id_for(&row.request_id, &row.ref_name);
+        let _push_id = crate::db::push_event_id_for(&row.request_id, row.ordinal);
         let push_count = state
             .db
             .count_push_events(&row.repo_id, &row.new_sha, &row.pusher_did)
@@ -789,7 +818,7 @@ mod drain_tests {
         );
         assert_eq!(
             certs[0].id,
-            crate::db::ref_cert_id_for(&row.request_id, &row.ref_name),
+            crate::db::ref_cert_id_for(&row.request_id, row.ordinal),
             "cert id is deterministic"
         );
         assert_eq!(certs[0].new_sha, row.new_sha, "cert carries the new_sha");
@@ -1882,7 +1911,7 @@ mod drain_tests {
         // check row A's specific cert by its deterministic id —
         // the row A's `derive_one` never ran, so the row A cert id
         // must not exist in the table.
-        let a_cert_id = crate::db::ref_cert_id_for(&row_a.request_id, &row_a.ref_name);
+        let a_cert_id = crate::db::ref_cert_id_for(&row_a.request_id, row_a.ordinal);
         let a_cert = state.db.get_ref_certificate(&a_cert_id).await.unwrap();
         assert!(
             a_cert.is_none(),
@@ -1891,7 +1920,7 @@ mod drain_tests {
         );
         // The single cert for this `(repo, ref)` is row B's.
         assert_eq!(a_certs.len(), 1, "row B's cert exists in the table");
-        let b_cert_id = crate::db::ref_cert_id_for(&row_b.request_id, &row_b.ref_name);
+        let b_cert_id = crate::db::ref_cert_id_for(&row_b.request_id, row_b.ordinal);
         assert_eq!(a_certs[0].id, b_cert_id, "the only cert is row B's");
 
         // Row B's other artifacts WERE created (the closure called
@@ -1919,12 +1948,11 @@ mod drain_tests {
     // ----- P2-B multi-ref push event cardinality test -----
     //
     // The live handler and the recovery drain must produce the same
-    // push event id for a multi-ref push. The id is keyed on
-    // `(request_id, first_ref_name)` where `first_ref_name` is the
-    // first ref in the live push. Every row of the same `request_id`
-    // carries the same `first_ref_name`, so the recovery drain
-    // produces N identical push event ids for an N-ref push, and
-    // `ON CONFLICT (id) DO NOTHING` collapses them to a single row.
+    // push event id for a multi-ref push. Under the v30 model the id
+    // is keyed on `(request_id, accepted_ordinal)`: the request row
+    // records which child landed first, and only that child writes
+    // the push event. Other children skip the event write but still
+    // produce their own certs and anchor jobs.
     //
     // Certs stay per-ref (one per `(repo, ref)` transition); anchor
     // jobs stay per-transition (one per `(repo, ref, old, new)` tuple).
@@ -1936,13 +1964,37 @@ mod drain_tests {
     ) {
         let state = crate::test_support::test_state(pool).await;
 
-        // Three rows for the SAME `request_id`, distinct `ref_name`s.
-        // All three share `first_ref_name = "refs/heads/main"` (the
-        // first ref in the simulated push). The `new_sha` is the
-        // same across all three because this models a push that
-        // advanced a tip commit onto three refs at once (a common
-        // case for `git push --all` or for a single-commit push to
-        // multiple branches).
+        // Stage the request row with `accepted_ordinal = 0` so the
+        // drain's gate (`row.ordinal == accepted_ordinal`) only fires
+        // for the first child. The v30 model carries the
+        // accepted-ordinal on the request row, so the test fixture
+        // must include one — this is the production shape the drain
+        // sees on every replay.
+        sqlx::query(
+            "INSERT INTO receive_pack_requests \
+             (id, repo_id, pusher_did, node_did, request_bytes, request_bytes_hash, \
+              state, created_at, accepted_ordinal) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind("req-multi")
+        .bind("repo-multi")
+        .bind("did:key:z6pusher")
+        .bind("did:key:z6node")
+        .bind(Vec::<u8>::new())
+        .bind([0u8; 32].to_vec())
+        .bind("outcomes_committed")
+        .bind(Utc::now().to_rfc3339())
+        .bind(Some(0_i32))
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+
+        // Three rows for the SAME `request_id`, distinct `ref_name`s,
+        // distinct ordinals 0/1/2. The `new_sha` is the same across
+        // all three because this models a push that advanced a tip
+        // commit onto three refs at once (a common case for
+        // `git push --all` or for a single-commit push to multiple
+        // branches).
         let shared_new_sha = "c".repeat(40);
         let ref_names = [
             "refs/heads/main",
@@ -1952,15 +2004,7 @@ mod drain_tests {
         for (i, ref_name) in ref_names.iter().enumerate() {
             let mut row = make_row("repo-multi", ref_name, &"0".repeat(40), &shared_new_sha);
             row.request_id = "req-multi".to_string();
-            row.first_ref_name = "refs/heads/main".to_string();
-            row.id = crate::db::deterministic_id(&[
-                "pending_ref_transition",
-                &row.request_id,
-                &row.repo_id,
-                &row.ref_name,
-                &row.old_sha,
-                &row.new_sha,
-            ]);
+            row.ordinal = i as i32;
             // Vary `old_sha` per row so the anchor job PKs (which
             // hash `old_sha`) don't collide.
             row.old_sha = format!("{:040x}", (i + 1) as u64);
@@ -1987,9 +2031,10 @@ mod drain_tests {
         assert_eq!(examined, 3, "the loop examined all three rows");
 
         // Exactly one push event row, keyed on the deterministic
-        // (request_id, first_ref_name) id. The three rows collapsed
-        // to a single event via `ON CONFLICT (id) DO NOTHING` in
-        // `record_push_with_id`.
+        // (request_id, accepted_ordinal) id. Only the first child
+        // (ordinal 0) wrote the event, so the others' attempted
+        // writes either no-op'd (if their id collided with a row the
+        // request didn't accept) or never ran.
         let push_count = state.db.get_push_count("did:key:z6pusher").await.unwrap();
         assert_eq!(
             push_count, 1,
@@ -2004,18 +2049,18 @@ mod drain_tests {
 
         // The deterministic id is the one the live path would have
         // written.
-        let expected_id = crate::db::push_event_id_for("req-multi", "refs/heads/main");
+        let expected_id = crate::db::push_event_id_for("req-multi", 0);
         // We don't have a direct "select by id" for push_events; the
         // count of 1 already proves the cardinality. Assert the id
         // is stable for completeness.
         assert_eq!(
             expected_id,
-            crate::db::push_event_id_for("req-multi", "refs/heads/main"),
+            crate::db::push_event_id_for("req-multi", 0),
             "push_event_id_for is deterministic"
         );
 
         // Certs: one per ref (the cert contract is per-ref, NOT
-        // collapsed by first_ref_name). Three rows → three certs.
+        // collapsed by ordinal). Three rows → three certs.
         let certs = state
             .db
             .list_ref_certificates("repo-multi", 10)
@@ -2024,7 +2069,7 @@ mod drain_tests {
         assert_eq!(
             certs.len(),
             3,
-            "one cert per ref transition (not collapsed by first_ref_name)"
+            "one cert per ref transition (not collapsed by accepted_ordinal)"
         );
 
         // Anchor jobs: one per `(repo, ref, old, new)` transition.
@@ -2049,16 +2094,37 @@ mod drain_tests {
     // The previous multi-ref test shared one `new_sha` across all
     // refs; that masked the wrong-hash bug. This test gives every ref
     // a distinct `new_sha` and asserts the persisted `commit_hash` is
-    // the FIRST ref's `new_sha` (the live handler at repos.rs:2292
-    // derives `first_ref_name` from `ref_updates.first()` and uses
-    // that ref's new_sha for the push event). Before the gate on
-    // `row.ref_name == row.first_ref_name` the drain would
+    // the FIRST ref's `new_sha`. The live handler derives
+    // `accepted_ordinal` from `ref_updates.first()`'s position and
+    // uses that ordinal's new_sha for the push event. Without the
+    // `row.ordinal == request.accepted_ordinal` gate the drain would
     // `record_push_with_id` for whichever row the `ORDER BY
     // applied_at, id` query returned first, leaving the wrong hash
     // for any other drain order.
     #[sqlx::test]
     async fn multi_ref_recovery_uses_first_refs_new_sha_for_push_event(pool: sqlx::PgPool) {
         let state = crate::test_support::test_state(pool).await;
+
+        // Stage the request row with `accepted_ordinal = 0` so the
+        // first child (ordinal 0) is the only row whose gate fires.
+        sqlx::query(
+            "INSERT INTO receive_pack_requests \
+             (id, repo_id, pusher_did, node_did, request_bytes, request_bytes_hash, \
+              state, created_at, accepted_ordinal) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind("req-multi-distinct")
+        .bind("repo-multi-distinct")
+        .bind("did:key:z6pusher")
+        .bind("did:key:z6node")
+        .bind(Vec::<u8>::new())
+        .bind([0u8; 32].to_vec())
+        .bind("outcomes_committed")
+        .bind(Utc::now().to_rfc3339())
+        .bind(Some(0_i32))
+        .execute(state.db.pool())
+        .await
+        .unwrap();
 
         // Three refs, each with a distinct `new_sha` modelling a
         // multi-branch push where each ref advanced to a different
@@ -2076,7 +2142,7 @@ mod drain_tests {
         for (i, (ref_name, new_sha)) in ref_names.iter().zip(new_shas.iter()).enumerate() {
             let mut row = make_row("repo-multi-distinct", ref_name, &"0".repeat(40), new_sha);
             row.request_id = "req-multi-distinct".to_string();
-            row.first_ref_name = "refs/heads/main".to_string();
+            row.ordinal = i as i32;
             // Vary `old_sha` per row so the anchor job PKs don't
             // collide and so the certs distinguish the three
             // transitions.
@@ -2104,11 +2170,11 @@ mod drain_tests {
         assert_eq!(examined, 3, "the loop examined all three rows");
 
         // Exactly one push event row, keyed on the deterministic
-        // (request_id, first_ref_name) id. Only the row whose
-        // `ref_name == first_ref_name` ran `record_push_with_id`,
-        // so the persisted `commit_hash` is the FIRST ref's
-        // `new_sha` — the same value the live path would have
-        // written at repos.rs:2488-2492.
+        // (request_id, accepted_ordinal) id. Only the row whose
+        // ordinal matches the request's `accepted_ordinal` ran
+        // `record_push_with_id`, so the persisted `commit_hash` is
+        // the FIRST ref's `new_sha` — the same value the live path
+        // would have written.
         let push_count = state.db.get_push_count("did:key:z6pusher").await.unwrap();
         assert_eq!(push_count, 1, "exactly one push event row");
         let first_event = state
@@ -2247,8 +2313,10 @@ mod drain_tests {
 
         // Insert a STALE cert directly: old SHA → some "stale new" SHA
         // at t1, with a different pusher DID. This models the live
-        // cert issued before the push landed.
-        let stale_cert_id = crate::db::ref_cert_id_for("req-stale", "refs/heads/main");
+        // cert issued before the push landed. The cert id is
+        // deterministic on `(request_id, ordinal)`; the recovery row
+        // is a single child at ordinal 0.
+        let stale_cert_id = crate::db::ref_cert_id_for("req-stale", 0);
         let stale_old = "0".repeat(40);
         let stale_new = "1".repeat(40);
         let stale_pusher = "did:key:zStalePusher";
@@ -2279,7 +2347,7 @@ mod drain_tests {
         let mut row = make_row(&rec.id, "refs/heads/main", &landed_old, &landed_new);
         row.request_id = "req-stale".to_string();
         row.pusher_did = landed_pusher.to_string();
-        row.first_ref_name = "refs/heads/main".to_string();
+        row.ordinal = 0;
         row.id = crate::db::deterministic_id(&[
             "pending_ref_transition",
             &row.request_id,
@@ -2369,7 +2437,7 @@ mod drain_tests {
         let mut a_row = make_row(&rec.id, "refs/heads/main", &a_old, &a_new);
         a_row.request_id = a_request.to_string();
         a_row.pusher_did = a_pusher.to_string();
-        a_row.first_ref_name = "refs/heads/main".to_string();
+        a_row.ordinal = 0;
         a_row.id = crate::db::deterministic_id(&[
             "pending_ref_transition",
             &a_row.request_id,
@@ -2397,7 +2465,12 @@ mod drain_tests {
         let b_old = a_new.clone();
         let b_new = "2".repeat(40);
         let b_pusher = "did:key:zB";
-        let b_cert_id = crate::db::ref_cert_id_for(&rec.id, "refs/heads/main"); // live path's id (no request_id)
+        // B is a stand-in for "a later live push already wrote its
+        // cert". The cert id is arbitrary — what matters is the row
+        // collides with A's recovery on the `(repo_id, ref_name)`
+        // unique index. Use B's request-scoped id at ordinal 0 so the
+        // id is a real `(request_id, ordinal)` shape.
+        let b_cert_id = crate::db::ref_cert_id_for("req-B", 0);
         state
             .db
             .insert_ref_certificate(&crate::db::RefCertificate {
