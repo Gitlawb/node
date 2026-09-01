@@ -494,7 +494,7 @@ mod tests {
         .await;
         assert!(
             result.is_ok(),
-            "cert show must complete despite a denied node-info lookup: {result:?}"
+            "cert show must complete despite a denied node-info lookup"
         );
         _cert.assert_async().await;
         _root.assert_async().await;
@@ -537,7 +537,7 @@ mod tests {
         .await;
         assert!(
             result.is_ok(),
-            "cert show must complete despite malformed node info: {result:?}"
+            "cert show must complete despite malformed node info"
         );
         _cert.assert_async().await;
         _root.assert_async().await;
@@ -581,7 +581,7 @@ mod tests {
         .await;
         assert!(
             result.is_ok(),
-            "cert show must complete when node info lacks a DID: {result:?}"
+            "cert show must complete when node info lacks a DID"
         );
         _cert.assert_async().await;
         _root.assert_async().await;
@@ -664,7 +664,7 @@ mod tests {
             None,
         )
         .await;
-        assert!(result.is_ok(), "got: {result:?}");
+        assert!(result.is_ok(), "cert show must report a matching node DID");
         _cert.assert_async().await;
         _root.assert_async().await;
     }
@@ -705,7 +705,10 @@ mod tests {
             None,
         )
         .await;
-        assert!(result.is_ok(), "got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "cert show must warn, not fail, on a mismatching node DID"
+        );
         _cert.assert_async().await;
         _root.assert_async().await;
     }
@@ -798,10 +801,7 @@ mod tests {
         let (cert, _root) = cert_server(&mut server, &id, &body, Some(&info)).await;
 
         let got = cmd_show("alice/r".to_string(), id, server.url(), None, true, None).await;
-        assert!(
-            got.is_ok(),
-            "valid sig + matching issuer must pass: {got:?}"
-        );
+        assert!(got.is_ok(), "valid sig + matching issuer must pass");
         cert.assert_async().await;
     }
 
@@ -859,7 +859,7 @@ mod tests {
             Some(kp.did().as_str().to_string()),
         )
         .await;
-        assert!(got.is_ok(), "explicit anchor must pass: {got:?}");
+        assert!(got.is_ok(), "explicit anchor must pass");
         cert.assert_async().await;
     }
 
