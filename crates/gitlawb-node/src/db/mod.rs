@@ -1387,6 +1387,106 @@ const MIGRATIONS: &[Migration] = &[
             "COMMENT ON TABLE pending_ref_transitions IS 'v29: added uncertain state for receive-pack errors where some refs may have landed'",
         ],
     },
+    Migration {
+        // #26 Split PR 1 round 6 — request-level data model.
+        //
+        // Reviewer finding: the request's push event was encoded into
+        // a mutable per-ref column (`first_ref_name`) whose correct
+        // value is knowable only after git, and the correction was
+        // not committed atomically with the per-ref outcomes. A
+        // crash between git updating a later ref and the rewrite
+        // left the durable rows naming the rejected ref, and
+        // `derive_one`'s `row.ref_name == row.first_ref_name` guard
+        // then meant no push event ever landed for the accepted
+        // child.
+        //
+        // The state-transition model (see
+        // .gravirei/plans/state-model-durable-post-receive.md)
+        // replaces `first_ref_name` with a request-level record
+        // that owns the push event and the trust score. The per-ref
+        // child becomes an ordinal child of that request. The
+        // push event id is keyed on
+        // `(request_id, accepted_ordinal)` — not on `ref_name` —
+        // so a mixed first-rejected/later-accepted push still
+        // produces exactly one push event under the request that
+        // did land.
+        //
+        // Version is 30 on this branch (the v29 migration is the
+        // highest here; the cert-compat branch had renumbered its
+        // own v28 to v37 independently). Re-check the floor on
+        // every push — the open PR list moves it.
+        version: 30,
+        name: "receive_pack_requests",
+        stmts: &[
+            // The new request table. The push event and trust
+            // score are written in the same database transaction as
+            // the per-ref child outcomes, so a crash between git
+            // and effect-write rolls everything back together; the
+            // drain sees a coherent row in `outcomes_committed`
+            // (or its retry variant) and re-runs the same effect
+            // pipeline.
+            r#"CREATE TABLE IF NOT EXISTS receive_pack_requests (
+                id                 TEXT NOT NULL PRIMARY KEY,
+                repo_id            TEXT NOT NULL,
+                pusher_did         TEXT NOT NULL,
+                node_did           TEXT NOT NULL,
+                request_bytes      BYTEA NOT NULL,
+                request_bytes_hash BYTEA NOT NULL,
+                state              TEXT NOT NULL,
+                git_exit_ok        BOOLEAN,
+                parsed_report      JSONB,
+                accepted_ordinal   INTEGER,
+                attempt_count      INTEGER NOT NULL DEFAULT 0,
+                last_error         TEXT,
+                next_attempt_at    TEXT,
+                created_at         TEXT NOT NULL,
+                completed_at       TEXT
+            )"#,
+            // The state-transition gate: the recovery drain
+            // selects rows in `outcomes_committed` (and its retry
+            // variant) and walks them by `(created_at, id)`. A
+            // composite index lets the drain do a single index scan
+            // without sorting.
+            "CREATE INDEX IF NOT EXISTS idx_receive_pack_requests_state_created ON receive_pack_requests (state, created_at, id)",
+            // The drain's retry predicate. `next_attempt_at IS NULL OR
+            // next_attempt_at < now()` is a frequent lookup; the
+            // partial index keeps the index small.
+            "CREATE INDEX IF NOT EXISTS idx_receive_pack_requests_state_next_attempt ON receive_pack_requests (state, next_attempt_at) WHERE state IN ('outcomes_committed', 'effects_pending')",
+            // The 7-day bounded-retirement predicate. The purge
+            // task deletes `complete` and `rejected_at_git` rows
+            // older than the retention interval.
+            "CREATE INDEX IF NOT EXISTS idx_receive_pack_requests_completed_at ON receive_pack_requests (completed_at) WHERE state IN ('complete', 'rejected_at_git')",
+            // The new ordinal column on the per-ref child. The
+            // drain and the effect executor both read this in
+            // `ORDER BY request_id, ordinal` order to reproduce
+            // the live path's ref-walk sequence.
+            "ALTER TABLE pending_ref_transitions ADD COLUMN IF NOT EXISTS ordinal INTEGER NOT NULL DEFAULT 0",
+            // The git-side marker's snapshot kind. Recovery
+            // re-derives this from the per-ref report if it is
+            // null, so the column is informational and the
+            // migration does not need to backfill it.
+            "ALTER TABLE pending_ref_transitions ADD COLUMN IF NOT EXISTS git_target_kind TEXT",
+            // Drop `first_ref_name`. The push event identity is
+            // now `(request_id, accepted_ordinal)` and lives on
+            // the request row, not on a child. The live handler
+            // never writes this column after this migration; the
+            // drain and the effect executor do not read it. The
+            // column is `IF EXISTS` so a fresh database that never
+            // ran v28 is unaffected.
+            //
+            // P3 (reviewer round 5): the recovery gate had been
+            // patching `first_ref_name` after git returned; the
+            // patch is the bug, the drop closes it. The model
+            // forbids the pattern (request-level event identity
+            // is encoded in mutable per-ref state) so removing
+            // the column is the structural fix, not a workaround.
+            "ALTER TABLE pending_ref_transitions DROP COLUMN IF EXISTS first_ref_name",
+            // Document the new relationship. The `comment on
+            // column` form leaves a discoverable note for anyone
+            // reading the schema in psql.
+            "COMMENT ON COLUMN pending_ref_transitions.ordinal IS 'v30: ordinal position in the parsed ref_updates list, 0-indexed. The drain and the effect executor read in ORDER BY request_id, ordinal to reproduce the live path'",
+        ],
+    },
 ];
 
 /// Max distinct source repos recorded per pinned object (F1, #173 jatmn round 8).
