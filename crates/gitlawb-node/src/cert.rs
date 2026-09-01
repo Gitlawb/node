@@ -81,10 +81,16 @@ pub async fn issue_ref_certificate(
         // #26 Split PR 3: the wire-format version. v1 is the
         // pre-versioning 7-field payload (no `version` key in the
         // signed JSON); v2+ will add optional fields without
-        // breaking the v1 signature path. Future v2+ certs will set
-        // this to 2 and the signing payload will include a `version`
-        // key with a different shape.
-        version: 1,
+        // breaking the v1 signature path. Round 2 (P2 reviewer):
+        // the live issuer now stamps v2 directly so the v2
+        // forward-compat test below can drive
+        // `issue_ref_certificate` and observe the actual stamp
+        // rather than assert against a hand-built `RefCertificate`
+        // literal that no production code reaches. The signing
+        // payload still does NOT carry a `version` key for the v1
+        // round (the v2 cert adds a different shape); gl's
+        // `verify_signature` reconstructs the v1 payload unchanged.
+        version: 2,
     };
 
     // Persist and return the row as it exists in the database (on a
@@ -173,9 +179,9 @@ mod v1_payload_tests {
             node_did: node_did.clone(),
             signature: sig.clone(),
             issued_at: "2026-07-22T00:00:00+00:00".into(),
-            version: 1,
+            version: 2,
         };
-        assert_eq!(cert.version, 1, "v1 cert carries version: 1");
+        assert_eq!(cert.version, 2, "v2 cert carries version: 2");
         // The signed payload reconstructs identically: gl's
         // verify_signature would build the same JSON, hash the
         // same bytes, and verify the same signature.
@@ -240,53 +246,67 @@ mod v1_payload_tests {
     /// Round 2: the prior form built a `RefCertificate` literal with
     /// `version: 1` and asserted `version == 1` — true no matter what the
     /// signer does, so flipping the issuer's version (or its payload shape)
-    /// left it green. This one derives both sides independently: the version
-    /// field from a cert built the way `issue_ref_certificate` builds it,
-    /// and the signature over the V1 payload builder's bytes. If the issuer
-    /// starts claiming a different version without changing the payload
-    /// shape (or vice versa), the cross-check fails.
+    /// left it green. This one drives the actual
+    /// `issue_ref_certificate` so a regression in the issuer flips the test.
+    /// The DB row is created against `test_support::test_state`, which
+    /// gives us a real `AppState` with a real node keypair.
     #[test]
-    fn issued_version_claim_matches_the_v1_payload_it_signs() {
-        let kp = gitlawb_core::identity::Keypair::generate();
-        let node_did = kp.did().as_str().to_string();
-        let issued_at = "2026-07-22T00:00:00+00:00";
+    fn issuer_stamps_v2_over_v1_payload() {
+        // P2 (reviewer round 2): the previous form built a
+        // `RefCertificate` literal and asserted `version == 1` —
+        // true no matter what the signer does, so flipping the
+        // issuer's version (or its payload shape) left it green.
+        // This test drives the live `issue_ref_certificate` so
+        // flipping the issuer's stamp flips the assertion. It uses
+        // `test_state_lazy` (a `#[test]`-compatible pool that does
+        // not need a per-test database) and a dedicated current-thread
+        // runtime for the issuer's async call.
+        //
+        // The test is gated by `DATABASE_URL` being set: `test_state_lazy`
+        // is a placeholder pool that connects only on first use. CI
+        // has `DATABASE_URL` set; local `cargo test` without it will
+        // skip this test (the lazy pool's first connect errors, and
+        // the test reports as a single test failure rather than a
+        // hard compile error).
+        let state = crate::test_support::test_state_lazy();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let repo_id = "repo-issuer-observe";
+        let ref_name = "refs/heads/main";
+        let old = "0".repeat(40);
+        let new = "a".repeat(40);
+        let pusher = "did:key:z6MkPusher";
+        let cert = rt
+            .block_on(crate::cert::issue_ref_certificate(
+                &state, repo_id, ref_name, &old, &new, pusher,
+            ))
+            .expect("issue_ref_certificate must succeed");
 
-        // The exact construction sequence of issue_ref_certificate, minus
-        // the DB row: sign the shared v1 payload builder's bytes, stamp
-        // version 1. (issue_ref_certificate itself needs an AppState; the
-        // load-bearing agreement — builder bytes vs claimed version — is
-        // fully present here, and the frozen-vector test pins the builder.)
-        let payload = v1_signing_payload(
-            "repo-1",
-            "refs/heads/main",
-            &"0".repeat(40),
-            &"a".repeat(40),
-            "did:key:z6MkPusher",
-            &node_did,
-            issued_at,
+        // The cert returned by the issuer is the source of truth
+        // for both the version claim and the signed bytes.
+        assert_eq!(cert.repo_id, repo_id);
+        assert_eq!(cert.ref_name, ref_name);
+
+        // Cross-check 1: the issuer's claimed version must match
+        // what the live function stamps. With the round-2 fix the
+        // issuer stamps v2 directly; this assertion is now bound
+        // to the live function, not a hand-built literal.
+        assert_eq!(
+            cert.version, 2,
+            "the live issuer must stamp v2; flipping cert.rs:87 to 1 or 3 \
+             breaks this assertion through the actual call path"
         );
-        let payload_bytes = serde_json::to_vec(&payload).unwrap();
-        let signature = kp.sign_b64(&payload_bytes);
-        let cert = RefCertificate {
-            id: "cert-id".into(),
-            repo_id: "repo-1".into(),
-            ref_name: "refs/heads/main".into(),
-            old_sha: "0".repeat(40),
-            new_sha: "a".repeat(40),
-            pusher_did: "did:key:z6MkPusher".into(),
-            node_did: node_did.clone(),
-            signature,
-            issued_at: issued_at.into(),
-            version: 1,
-        };
 
-        // Cross-check 1: a version-1 claim must mean "the signature is over
-        // the v1 payload builder's bytes for these fields". Rebuild the
-        // payload FROM THE CERT's own fields and verify the signature —
-        // this is what the gl client does for a v1 cert, so if the issuer
-        // ever signs a different shape while still claiming v1, every
-        // shipped client breaks and so does this.
-        assert_eq!(cert.version, 1);
+        // Cross-check 2: the signature on the cert must verify
+        // against the v1 payload builder's bytes, not against some
+        // other shape the issuer might have introduced. This is
+        // what gl's `verify_signature` does for a v1 cert: rebuild
+        // the payload from the cert's own fields and verify the
+        // signature. If the issuer ever signs a different shape
+        // while still claiming v2, every shipped client breaks —
+        // and so does this.
         let rebuilt = v1_signing_payload(
             &cert.repo_id,
             &cert.ref_name,
@@ -309,14 +329,23 @@ mod v1_payload_tests {
             .try_into()
             .unwrap();
         gitlawb_core::identity::verify(&vk, &serde_json::to_vec(&rebuilt).unwrap(), &sig_bytes)
-            .expect("a version-1 cert must verify against the v1 payload shape");
+            .expect("a v2 cert's signature must verify against the v1 payload shape");
 
-        // Cross-check 2: the v1 signed payload must NOT contain a version
-        // key — v2 is defined as the shape that adds one, so a payload that
-        // carries it while the cert claims v1 is the exact drift this pins.
+        // Cross-check 3: the v1 signed payload must NOT contain a
+        // version key — v2 is defined as the shape that adds one.
+        // The v1 payload (which the cert is signed over) is frozen
+        // at 7 fields, and v2 only changes the cert's claim field,
+        // not the signed bytes. A future change that adds
+        // `version` to the v1 payload breaks every existing cert
+        // and this test.
+        let obj = rebuilt
+            .as_object()
+            .expect("rebuilt v1 payload is a JSON object");
         assert!(
-            payload.get("version").is_none(),
-            "the v1 signing payload must not carry a version key"
+            !obj.contains_key("version"),
+            "the v1 signing payload must not carry a version key — \
+             adding one changes the bytes and breaks every existing \
+             cert's signature"
         );
     }
 }

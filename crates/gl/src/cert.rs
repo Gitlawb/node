@@ -31,7 +31,13 @@ pub enum CertCmd {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
-    /// Show a specific ref certificate and verify its signature
+    /// Show a specific ref certificate and verify its signature.
+    ///
+    /// `--verify` requires `--expect-node <did>` since v2 cert
+    /// compat (Round 2): the queried node's self-reported DID is no
+    /// longer accepted as a trust anchor, so callers must name the
+    /// issuer they trust. See the `BREAKING CHANGE:` note on the
+    /// commit that introduced this requirement.
     Show {
         /// Repository in <owner>/<repo> or <repo> format
         repo: String,
@@ -797,7 +803,15 @@ mod tests {
         });
 
         let mut server = mockito::Server::new_async().await;
-        let _cert = server
+        // P3 (reviewer round 2): both mocks are required to be
+        // hit for the test to mean anything. `mockito 1.7`'s
+        // `assert_on_drop` is off by default, so the previous
+        // `_cert` and `_root` bindings would silently let a
+        // regression that skipped the root fetch pass.
+        // `.expect(2)` pins each mock's call count (the cert mock
+        // is hit twice because the test runs `cmd_show` twice) and
+        // `.assert_async()` at the end fires if any are unmet.
+        let cert_mock = server
             .mock(
                 "GET",
                 "/api/v1/repos/o/r/certs/0123456789abcdef0123456789abcdef0123",
@@ -805,15 +819,20 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(cert_json.to_string())
+            .expect(2)
             .create_async()
             .await;
-        // The forger's matching self-report — the exact shape that used to
-        // convert into a trust anchor.
-        let _root = server
+        // The forger's matching self-report — the exact shape
+        // that used to convert into a trust anchor. The guard's
+        // whole point is to make the test FAIL if a future
+        // regression stops calling `/` here: `.expect(2)` +
+        // `.assert_async()` makes that dependency visible.
+        let root_mock = server
             .mock("GET", "/")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(serde_json::json!({ "did": node_did }).to_string())
+            .expect(2)
             .create_async()
             .await;
 
@@ -845,5 +864,13 @@ mod tests {
         )
         .await
         .expect("explicitly anchored --verify of a valid v1 cert must pass");
+
+        // P3 (reviewer round 2): confirm the mocks were actually
+        // hit. Without this, a regression that skipped the cert or
+        // root fetches would still produce a passing test (the
+        // `expect_err` arm succeeds, the positive control succeeds)
+        // and the test would mean nothing.
+        cert_mock.assert_async().await;
+        root_mock.assert_async().await;
     }
 }
