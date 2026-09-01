@@ -13,7 +13,9 @@ use anyhow::Result;
 use clap::Args;
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use gitlawb_core::resolve_transport_node;
+
+use crate::http::{sanitize_node_msg, NodeClient};
 
 const PUBLIC_NODE: &str = "https://node.gitlawb.com";
 const GITHUB_API_BASE: &str = "https://api.github.com";
@@ -141,27 +143,51 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
     }
 
     // ── 3. GITLAWB_NODE env var ───────────────────────────────────────────
-    match std::env::var("GITLAWB_NODE") {
-        // A loopback host is a legitimate setup (self-hosted node, dev
-        // harness) — the connectivity check below fails loudly if it is not
-        // actually reachable, so don't red-flag the configuration itself.
-        Ok(v) if is_loopback_url(&v) => {
-            checks.push(Check::pass(
-                "GITLAWB_NODE",
-                format!(
-                    "{v} (local node — intentional for self-hosting/dev; unset to target the public network)"
-                ),
-            ));
-        }
-        Ok(v) if !v.is_empty() => {
-            checks.push(Check::pass("GITLAWB_NODE", v.to_string()));
-        }
-        _ => {
-            checks.push(Check::fail(
-                "GITLAWB_NODE",
-                "not set — git-remote-gitlawb will fall back to http://127.0.0.1:7545",
-                "export GITLAWB_NODE=https://node.gitlawb.com",
-            ));
+    // The node `git clone` / `git push` will contact is not always the node `gl`
+    // contacts: `--node` defaults to the public node and an explicit flag outranks
+    // the environment, so the two diverge whenever the variable is unset, blank, or
+    // overridden. Probing only `gl`'s node is what let doctor greenlight an install
+    // whose transport was dead, so resolve the transport's node through the same
+    // function the helper uses and report on that one.
+    let env_node = std::env::var("GITLAWB_NODE").ok();
+    let transport_node = resolve_transport_node(env_node.as_deref());
+    let gl_node = sanitize_node_msg(&args.node);
+
+    if transport_node == args.node {
+        // gl and the transport agree, so one row covers both. A loopback host is a
+        // legitimate setup (self-hosted node, dev harness) and the connectivity
+        // check below fails loudly if it is not actually reachable, so don't
+        // red-flag the configuration itself.
+        let detail = if is_loopback_url(&transport_node) {
+            format!(
+                "{gl_node} (local node, intentional for self-hosting/dev; unset to target the public network)"
+            )
+        } else {
+            gl_node.clone()
+        };
+        checks.push(Check::pass("GITLAWB_NODE", detail));
+    } else {
+        let verdict = probe_transport(&transport_node).await;
+        let detail = format!(
+            "git push/clone will use {} ({}); gl targets {gl_node}",
+            sanitize_node_msg(&transport_node),
+            verdict.detail
+        );
+        // Single-quote the value: this line is printed under "Suggested fixes" for
+        // the user to paste into a shell, and the URL is caller-supplied.
+        let fix = format!("export GITLAWB_NODE='{gl_node}'");
+        // Tiering follows who chose the broken value. An unset variable on a stock
+        // install is advisory: `gl` works, only `git push`/`git clone` do not, and
+        // #357 requires that install to keep exiting 0. A variable the user set to
+        // something unusable is a real misconfiguration.
+        let env_was_set = env_node
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|v| !v.is_empty());
+        if verdict.usable || !env_was_set {
+            checks.push(Check::warn("GITLAWB_NODE", detail, fix));
+        } else {
+            checks.push(Check::fail("GITLAWB_NODE", detail, fix));
         }
     }
 
@@ -317,6 +343,63 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Outcome of probing the node the git transport will use.
+struct TransportVerdict {
+    /// True only when the endpoint identified itself as a gitlawb node. A bare 200
+    /// is not enough: any local service answering on that port would otherwise be
+    /// reported as a working transport, which is the false green this check exists
+    /// to catch.
+    usable: bool,
+    detail: String,
+}
+
+/// Probe `url` and describe what is actually there.
+///
+/// Deliberately not `NodeClient`: this call must not follow the user's proxy
+/// (a proxy swallows a loopback probe and reports a running local node as dead)
+/// and must not inherit the 30s request timeout, which stalls every stock
+/// `gl doctor` run behind a hung listener.
+async fn probe_transport(url: &str) -> TransportVerdict {
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return TransportVerdict {
+                usable: false,
+                detail: format!("probe failed: {}", sanitize_node_msg(&e.to_string())),
+            }
+        }
+    };
+    let target = format!("{}/", url.trim_end_matches('/'));
+    match client.get(&target).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let info = resp.json::<serde_json::Value>().await.unwrap_or_default();
+            if info["did"].as_str().is_some() {
+                TransportVerdict {
+                    usable: true,
+                    detail: "reachable".to_string(),
+                }
+            } else {
+                TransportVerdict {
+                    usable: false,
+                    detail: "something is listening but it is not a gitlawb node".to_string(),
+                }
+            }
+        }
+        Ok(resp) => TransportVerdict {
+            usable: false,
+            detail: format!("returned HTTP {}", resp.status()),
+        },
+        Err(e) => TransportVerdict {
+            usable: false,
+            detail: format!("unreachable: {}", sanitize_node_msg(&e.to_string())),
+        },
+    }
 }
 
 /// Check if a binary name exists anywhere on PATH.
