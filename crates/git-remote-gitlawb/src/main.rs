@@ -25,6 +25,7 @@
 use anyhow::{bail, Context, Result};
 use gitlawb_core::http_sig::sign_request;
 use gitlawb_core::identity::Keypair;
+use gitlawb_core::{resolve_transport_node, DEFAULT_LOCAL_NODE};
 use std::io::{self, BufRead, Read, Write};
 
 fn main() -> Result<()> {
@@ -63,9 +64,9 @@ fn main() -> Result<()> {
 
     let (_, short_owner, repo_name) = parse_gitlawb_url(url)?;
 
-    // v0.1: default to localhost. Override with GITLAWB_NODE env var.
-    let node_base =
-        std::env::var("GITLAWB_NODE").unwrap_or_else(|_| "http://127.0.0.1:7545".to_string());
+    // v0.1: default to localhost. Override with GITLAWB_NODE env var. Shared with
+    // `gl doctor` so the diagnostic reports the URL this actually resolves.
+    let node_base = node_base_from_env();
     let repo_base = format!("{}/{}/{}", node_base, short_owner, repo_name);
     tracing::debug!("repo_base: {repo_base}");
 
@@ -76,6 +77,12 @@ fn main() -> Result<()> {
     let keypair = load_keypair();
 
     run_helper(&repo_base, keypair.as_ref())
+}
+
+/// The node base URL this helper will contact, resolved through the same function
+/// `gl doctor` reports on so the diagnostic cannot describe a different node.
+fn node_base_from_env() -> String {
+    resolve_transport_node(std::env::var("GITLAWB_NODE").ok().as_deref())
 }
 
 // ── CLI argument handling ──────────────────────────────────────────────────────
@@ -123,7 +130,7 @@ fn help_text() -> String {
          \x20   git clone gitlawb://did:key:z6Mk.../<repo>\n\
          \n\
          ENVIRONMENT:\n\
-         \x20   GITLAWB_NODE   Node base URL (default: http://127.0.0.1:7545)\n\
+         \x20   GITLAWB_NODE   Node base URL (default: {DEFAULT_LOCAL_NODE})\n\
          \x20   GITLAWB_KEY    Identity PEM path for signed fetch/push (default: ~/.gitlawb/identity.pem)\n\
          \x20   GITLAWB_LOG    Log filter (default: warn)\n\
          \n\
@@ -2014,7 +2021,19 @@ mod tests {
         assert!(help.contains("--version"));
         assert!(help.contains("--help"));
         assert!(help.contains("GITLAWB_NODE"));
+        // The advertised default must be the value the helper actually resolves.
+        assert!(help.contains(DEFAULT_LOCAL_NODE));
         assert!(help.ends_with('\n'));
+    }
+
+    /// The helper's own resolution must stay the shared one; a site walking back to
+    /// a private literal is exactly the drift the shared function exists to stop.
+    #[test]
+    fn node_base_matches_the_shared_resolver() {
+        // No env manipulation: assert the call site delegates, for the default case.
+        let expected = resolve_transport_node(std::env::var("GITLAWB_NODE").ok().as_deref());
+        assert_eq!(node_base_from_env(), expected);
+        assert_eq!(resolve_transport_node(None), DEFAULT_LOCAL_NODE);
     }
 
     // ── #117 multi-round fetch negotiation ───────────────────────────────────
