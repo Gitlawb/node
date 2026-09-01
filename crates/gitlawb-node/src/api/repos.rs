@@ -2393,6 +2393,22 @@ pub async fn git_receive_pack(
     // ones actually landed at the next startup.
     let report = smart_http::parse_report_status(&receive_raw);
 
+    // (unpack_ok, all_in_report_ok, ok_set, request_failed).
+    //
+    // The reviewer wanted: distinguish per-ref ok/ng from
+    // unparseable/incomplete reports. The two cases are:
+    //
+    //   - report parsed: ok_set is exactly the refs the report
+    //     named with `ok`. Refs the report did NOT mention are
+    //     "unmentioned" and become `uncertain` for reconcile.
+    //   - report absent (the client did not request report-status,
+    //     or the framing was unreadable): no in-band ng signal,
+    //     and the only ground truth we have is the process exit.
+    //     A zero exit with no report is a successful push whose
+    //     refs we cannot enumerate per-ref — the legacy
+    //     "all_refs_ok = exit_ok" semantic. A non-zero exit with
+    //     no report means we cannot prove which refs landed, so
+    //     every row is `uncertain` for reconcile.
     let (unpack_ok, all_in_report_ok, ok_set, request_failed) = match &report {
         Some((unpack_ok, ref_results)) => {
             let ok_set: std::collections::HashSet<&str> = ref_results
@@ -2403,8 +2419,18 @@ pub async fn git_receive_pack(
             let all_in_report_ok = ref_results.iter().all(|(_, ok)| *ok);
             (*unpack_ok, all_in_report_ok, ok_set, !exit_ok)
         }
+        None if exit_ok => {
+            // No report but the process exited zero: every pushed
+            // ref is implicitly ok — the legacy semantic that
+            // receive-pack tests / clients without report-status
+            // rely on.
+            let ok_set: std::collections::HashSet<&str> =
+                ref_updates.iter().map(|u| u.ref_name.as_str()).collect();
+            (true, true, ok_set, false)
+        }
         None => {
-            // No report available — every ref's fate is uncertain.
+            // No report and a non-zero exit: we cannot prove which
+            // refs landed. Mark all rows `uncertain` for reconcile.
             let ok_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
             (false, true, ok_set, !exit_ok)
         }
@@ -2506,10 +2532,28 @@ pub async fn git_receive_pack(
                 );
             }
         }
+    } else if ok_set.len() == pending_ref_names.len() && !pending_ref_names.is_empty() {
+        // Implicit-ok path: report was absent but the process exit
+        // was zero, so every pushed ref is treated as landed. Mark
+        // all prepared rows `applied` so the drain (and the live
+        // per-ref effects below) can run.
+        if let Err(e) = state
+            .db
+            .mark_pending_ref_transitions_applied(&request_id)
+            .await
+        {
+            tracing::error!(
+                err = %e,
+                request_id = %request_id,
+                repo = %name,
+                "failed to mark pending ref transitions applied (implicit ok, no report)"
+            );
+        }
     } else {
-        // No report at all — every ref's fate is uncertain. The
-        // next startup reconcile will use the reflog proof to
-        // promote only those whose transition actually landed.
+        // No report at all AND non-zero exit — every ref's fate is
+        // uncertain. The next startup reconcile will use the
+        // reflog proof to promote only those whose transition
+        // actually landed.
         if let Err(e) = state
             .db
             .mark_pending_ref_transitions_uncertain(&request_id)

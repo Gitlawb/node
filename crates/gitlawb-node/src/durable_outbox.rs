@@ -31,13 +31,6 @@ use std::collections::HashMap;
 /// The git all-zeros object id — the create/delete sentinel in a ref update.
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 
-/// `git reflog` stores committer timestamps in unix seconds; the
-/// reconcile gate passes the row's `created_at` as the floor below
-/// which a reflog entry cannot be the row's own transition. Subtract
-/// this slack so clock skew between the row's INSERT and the actual
-/// `git update-ref` does not cause a real transition to look stale.
-const REFLOG_FLOOR_SLACK_SECS: i64 = 5;
-
 /// Promote `prepared` rows whose `new_sha` matches the on-disk ref to
 /// `applied`, so the recovery drain (which only reads `state =
 /// 'applied'`) picks them up on the next pass. The reconcile runs at
@@ -217,71 +210,20 @@ async fn reconcile_prepared_page(
                 );
                 continue;
             }
-            // P1 (reviewer-1/2 round 4): SHA match is necessary but not
-            // sufficient. A later push that re-introduced the same SHA on
-            // the same ref, a deletion of an already-missing ref, or two
-            // requests deleting the same ref can ALL satisfy the SHA
-            // match under the wrong request's identity. The reflog is
-            // the durable, request-specific record: a reflog entry whose
-            // (old → new) tuple matches the row and whose timestamp is
-            // at-or-after the row's `created_at` is the only way to
-            // prove this transition produced the current on-disk state.
-            //
-            // The helper fails closed: a missing reflog, a malformed
-            // entry, or any `Err` from `git reflog show` becomes
-            // `Ok(false)`. The reconcile gate treats "no proof" as
-            // "stay prepared / uncertain for human-attended recovery",
-            // never as "promote".
-            let row_created_at = match DateTime::parse_from_rfc3339(&row.created_at) {
-                Ok(t) => t.with_timezone(&Utc) - chrono::Duration::seconds(REFLOG_FLOOR_SLACK_SECS),
-                Err(e) => {
-                    tracing::warn!(
-                        err = %e,
-                        row_id = %row.id,
-                        request_id = %row.request_id,
-                        ref_name = %row.ref_name,
-                        "reconcile: unparseable row created_at; staying prepared \
-                         (cannot prove request-specific transition)"
-                    );
-                    continue;
-                }
-            };
-            let has_proof = match crate::git::store::has_reflog_landing(
-                disk_path,
-                &row.ref_name,
-                &row.old_sha,
-                &row.new_sha,
-                row_created_at,
-            ) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(
-                        err = %e,
-                        row_id = %row.id,
-                        request_id = %row.request_id,
-                        ref_name = %row.ref_name,
-                        "reconcile: reflog probe failed; staying prepared (human-attended recovery)"
-                    );
-                    continue;
-                }
-            };
-            if !has_proof {
-                tracing::warn!(
-                    row_id = %row.id,
-                    request_id = %row.request_id,
-                    repo_id = %row.repo_id,
-                    ref_name = %row.ref_name,
-                    row_old_sha = %row.old_sha,
-                    row_new_sha = %row.new_sha,
-                    is_deletion = is_deletion,
-                    "reconcile: SHA match has no reflog proof; staying prepared. \
-                     This can mean (a) core.logAllRefUpdates is not `always` on this \
-                     repo's bare directory, (b) the row's transition did not actually \
-                     land, or (c) a later request re-introduced the same SHA. \
-                     Human-attended recovery required before any cert/anchor is issued."
-                );
-                continue;
-            }
+            // P1 (reviewer round 3): the reflog proof is required
+            // below via `reflog_proves_landing` for non-deletions.
+            // Deletions stay exempt — git removes a ref's reflog
+            // along with the ref, so a deleted ref's transition is
+            // proven by the absence-plus-age check, not by a reflog
+            // entry that cannot exist. (See `reflog_proves_landing`
+            // for the full invariant.) The earlier round-4 work in
+            // this branch added a separate `has_reflog_landing`
+            // helper, but it duplicated the gate without the deletion
+            // exemption, so it prevented landed deletions from
+            // being promoted — the wrong direction. Kevin's
+            // `reflog_proves_landing` is the canonical gate; the
+            // call site below applies it with the `!is_deletion`
+            // exemption, so the redundant block is removed here.
             // SHA matched (or deletion confirmed by absent ref). Before
             // promoting, confirm the row is recent enough to be the
             // transition that produced the current on-disk state.
