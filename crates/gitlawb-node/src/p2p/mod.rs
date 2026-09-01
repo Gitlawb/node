@@ -9,7 +9,7 @@
 
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -339,47 +339,240 @@ fn foreign_ownership_error(what: &str, path: &Path, owner_uid: u32, euid: u32) -
     ))
 }
 
-/// Refuse a key directory whose existing ancestors are controlled by someone
-/// else, before creating anything inside them.
+/// Descriptor-anchored ancestor walk from a trusted anchor to the key
+/// directory's parent.
+///
+/// This replaces the old `foreign_ancestor_error` walk (path-following
+/// `metadata`, missing components skipped, group-write never checked, and the
+/// separately-created `create_dir_all` output never re-verified) with one walk
+/// that verifies and creates the chain together:
+///
+///   1. Resolve the trusted anchor: the filesystem root for an absolute path,
+///      or the process cwd (opened as `.`, no-follow) for a relative one. The
+///      cwd's own ancestors are out of scope: the process cwd is an inode that
+///      external users cannot repoint, which is what makes a relative anchor
+///      safe.
+///   2. Walk every component strictly above the key directory, opening each one
+///      relative to the previously verified descriptor without following
+///      symlinks, and judge it by fstat on the opened descriptor: real
+///      directory, owner is the effective uid or root, no write bits beyond the
+///      owner unless sticky (the 1777 `/tmp` shape is accepted; 0770/0775 and
+///      non-sticky 0777 are refused).
+///   3. Create a missing component at 0700 relative to the verified parent,
+///      then reopen it no-follow and verify the object that actually landed.
+///      `AlreadyExists` on create is a race: the winner gets the same full
+///      verification, never automatic acceptance or refusal.
+///
+/// The key directory itself (the leaf) is deliberately not part of this walk:
+/// `ensure_key_dir` opens it no-follow, checks its ownership, and tightens it
+/// to 0700 afterwards.
 #[cfg(unix)]
-fn foreign_ancestor_error(dir: &Path, euid: u32) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
-    use std::os::unix::fs::PermissionsExt;
+fn verify_and_create_ancestor_chain(dir: &Path, euid: u32) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
 
-    for ancestor in dir.ancestors().skip(1) {
-        let md = match std::fs::metadata(ancestor) {
-            Ok(md) => md,
-            Err(_) => continue,
-        };
+    /// Refuse an opened component unless it is a real directory owned by
+    /// `euid` or root with no write bits beyond the owner unless sticky.
+    fn verify_component(fd: i32, key_dir: &Path, component: &Path, euid: u32) -> Result<()> {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: fstat writes the stat struct on success; the return value is
+        // checked before the struct is read.
+        if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to stat {}", component.display()));
+        }
+        let st = unsafe { st.assume_init() };
 
-        let owner = md.uid();
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+            anyhow::bail!(
+                "p2p key directory {} sits under {}, which is not a real directory; the node \
+                 refuses symlinks and other object types on the key storage path",
+                key_dir.display(),
+                component.display()
+            );
+        }
+
+        let owner = st.st_uid;
         if owner != euid && owner != 0 {
-            return Some(format!(
+            anyhow::bail!(
                 "p2p key directory {} sits under {}, which is owned by uid {} rather than this \
                  node (uid {}) or root; that user can rename or replace the directory holding \
                  the key and so control which identity the node presents. Put the key somewhere \
                  this user or root owns the whole path.",
-                dir.display(),
-                ancestor.display(),
+                key_dir.display(),
+                component.display(),
                 owner,
                 euid
-            ));
+            );
         }
 
-        let mode = md.permissions().mode() & 0o777;
-        let sticky = md.permissions().mode() & 0o1000 != 0;
-        if mode & 0o002 != 0 && !sticky {
-            return Some(format!(
+        let write_bits = st.st_mode & 0o777;
+        let sticky = st.st_mode & 0o1000 != 0;
+        if write_bits & 0o022 != 0 && !sticky {
+            anyhow::bail!(
                 "p2p key directory {} sits under {}, which has mode {:04o} and is writable \
                  beyond its owner; anyone with that write access can rename or replace the \
                  directory holding the key and so control which identity the node presents.",
-                dir.display(),
-                ancestor.display(),
-                mode
-            ));
+                key_dir.display(),
+                component.display(),
+                write_bits
+            );
+        }
+        Ok(())
+    }
+
+    fn child_name(name: &std::ffi::OsStr) -> std::io::Result<std::ffi::CString> {
+        std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path component contains an interior NUL byte",
+            )
+        })
+    }
+
+    /// Owning wrapper for a raw directory descriptor, so the walk's descriptor
+    /// chain is closed on every exit path (success, error, or early return).
+    struct OwnedFd(i32);
+    impl Drop for OwnedFd {
+        fn drop(&mut self) {
+            // SAFETY: close(2) on a descriptor this struct owns.
+            unsafe { libc::close(self.0) };
         }
     }
-    None
+
+    // The components strictly above the key directory, below the anchor.
+    let Some(parent) = dir.parent() else {
+        // `dir` is the filesystem root; there is no chain to walk.
+        return Ok(());
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let absolute = parent.is_absolute();
+    let components: Vec<std::ffi::OsString> = parent
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(n) => Some(n.to_os_string()),
+            _ => None,
+        })
+        .collect();
+
+    // Open and verify the anchor. The descriptor stays owned for the whole walk
+    // and is closed on every exit path.
+    let (anchor, anchor_display) = if absolute {
+        // SAFETY: open(2) on "/" returns a new descriptor we own on success;
+        // the root is not a symlink, so O_NOFOLLOW is moot there.
+        let root = std::ffi::CString::new("/").unwrap();
+        let fd = unsafe {
+            libc::open(
+                root.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to open the filesystem root for {}", dir.display()));
+        }
+        (OwnedFd(fd), PathBuf::from("/"))
+    } else {
+        // SAFETY: open(2) on "." returns a descriptor for the process cwd
+        // itself; O_NOFOLLOW and O_DIRECTORY pin the object type.
+        let dot = std::ffi::CString::new(".").unwrap();
+        let fd = unsafe {
+            libc::open(
+                dot.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to open the working directory for {}", dir.display()));
+        }
+        (OwnedFd(fd), PathBuf::new())
+    };
+
+    verify_component(anchor.0, dir, &anchor_display, euid)?;
+
+    let mut acc = anchor_display;
+    let mut cur = anchor;
+    for name in &components {
+        let cname = child_name(name)?;
+        acc.push(name);
+
+        // SAFETY: openat resolves `name` relative to the previously verified
+        // parent descriptor; O_NOFOLLOW refuses a symlink at this position.
+        let fd = unsafe {
+            libc::openat(
+                cur.0,
+                cname.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: `fd` is a descriptor we own from openat; the OwnedFd
+            // below takes ownership and closes it when the chain advances.
+            verify_component(fd, dir, &acc, euid)?;
+            cur = OwnedFd(fd);
+            continue;
+        }
+
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(code) if code == libc::ELOOP => {
+                anyhow::bail!(
+                    "p2p key directory {} sits under {}, which is a symlink; the node \
+                     refuses symlinks on the key storage path",
+                    dir.display(),
+                    acc.display()
+                );
+            }
+            Some(code) if code == libc::ENOENT => {
+                // Create relative to the verified parent at 0700, then reopen
+                // no-follow and verify whatever actually landed. `AlreadyExists`
+                // is a race: the winner gets the same full verification below.
+                // SAFETY: mkdirat creates `name` relative to the verified parent
+                // descriptor; mode 0700 is pinned at creation.
+                if unsafe { libc::mkdirat(cur.0, cname.as_ptr(), 0o700) } != 0 {
+                    let mk_err = std::io::Error::last_os_error();
+                    if mk_err.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(mk_err).with_context(|| {
+                            format!(
+                                "failed to create key directory component {} below {}",
+                                name.to_string_lossy(),
+                                acc.parent().map(|p| p.display().to_string()).unwrap_or_default()
+                            )
+                        });
+                    }
+                }
+                // SAFETY: openat as above, re-checking the winner.
+                let fd = unsafe {
+                    libc::openat(
+                        cur.0,
+                        cname.as_ptr(),
+                        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error()).with_context(|| {
+                        format!(
+                            "failed to reopen created key directory component {}",
+                            acc.display()
+                        )
+                    });
+                }
+                // SAFETY: `fd` is a descriptor we own from openat; the OwnedFd
+                // below takes ownership and closes it when the chain advances.
+                verify_component(fd, dir, &acc, euid)?;
+                cur = OwnedFd(fd);
+            }
+            _ => {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!("failed to open key directory component {}", acc.display())
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether the configured path names a directory rather than a key file.
@@ -813,16 +1006,13 @@ fn ensure_key_dir(dir: &Path) -> Result<KeyDirHandle> {
     #[cfg(unix)]
     {
         let euid = effective_uid();
-        if let Some(err) = foreign_ancestor_error(dir, euid) {
-            anyhow::bail!(err);
-        }
+        verify_and_create_ancestor_chain(dir, euid)?;
     }
 
-    // Missing ancestors are created at the ambient mode. Only the nominated key
-    // directory itself is pinned to 0700 and anchored; ancestors are ordinary
-    // path infrastructure (the shipped default's `~/.gitlawb` on a first boot),
-    // and `foreign_ancestor_error` has already refused ones somebody else
-    // could swap out from under us.
+    // Non-unix builds keep the platform-neutral ancestor creation: the
+    // descriptor-anchored walk above is unix-only, so without this a non-unix
+    // first boot would have no way to create missing ancestors at all.
+    #[cfg(not(unix))]
     if let Some(parent) = dir.parent() {
         if !parent.as_os_str().is_empty() && parent != dir {
             std::fs::create_dir_all(parent).with_context(|| {
@@ -1443,6 +1633,31 @@ mod tests {
         );
     }
 
+    /// A tempdir base whose mode is 0700, for tests that place the key
+    /// DIRECTORY beneath it.
+    ///
+    /// `tempfile::tempdir()` creates the base at `0777 & !umask` (0775 under
+    /// the suite's umask 0002), and the descriptor-anchored ancestor walk
+    /// refuses any group-writable ancestor, so a key tree built under a plain
+    /// tempdir base would be refused for the base's mode rather than for
+    /// whatever the test is actually exercising. Chmodding the base to 0700
+    /// keeps the ancestor contract intact while giving the test a safe parent.
+    #[cfg(unix)]
+    fn key_base_0700() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    /// Non-unix builds have no ancestor walk, so the plain tempdir is a safe
+    /// base already.
+    #[cfg(not(unix))]
+    fn key_base_0700() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
     // ---- Permission probe, run in a child process -------------------------
     //
     // The probe has to create the key under a zeroed umask, otherwise a
@@ -1583,6 +1798,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("keys").join("p2p.key");
 
+        // The tempdir base is itself an ancestor of the key directory under
+        // umask 0000, and the ancestor walk refuses any group/world-writable
+        // component; pin it to 0700 so the fixture measures the CREATED
+        // directory/key modes rather than the tempdir's own mode.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
         // SAFETY: `umask` only reads and replaces the process-wide value, and
         // this process exists solely for this probe. No restore: the value dies
         // with the child.
@@ -1612,6 +1833,88 @@ mod tests {
         // (a renamed variable, a changed value) would report 1 passed while
         // checking nothing. The parent requires this line.
         println!("{FIXTURE_SENTINEL}");
+    }
+
+    /// Fixture: create a MULTI-LEVEL missing ancestor chain under a zeroed
+    /// umask and assert every created ancestor lands 0700, not 0777.
+    ///
+    /// This is the r4-F2 shape: `create_dir_all` creates missing intermediates
+    /// at `0777 & !umask`, so under umask 0000 the intermediate directories
+    /// would land world-writable. Only the nominated key directory is pinned
+    /// today. The fix must make the ancestor walk create every missing
+    /// component at 0700 and verify it.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=p2p-key-multilevel"]
+    fn fixture_p2p_key_multilevel_ancestors_under_zero_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("p2p-key-multilevel") {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a").join("b").join("keys").join("p2p.key");
+
+        // Pin the tempdir base to 0700 (it is the anchor's child and would
+        // otherwise land 0775 under umask 0000, which the ancestor walk
+        // correctly refuses); the fixture measures the CREATED `a`/`b`
+        // ancestors, not the tempdir's own mode.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // SAFETY: `umask` only reads and replaces the process-wide value, and
+        // this process exists solely for this probe. No restore: the value dies
+        // with the child.
+        unsafe { libc::umask(0o000) };
+        load_or_create_p2p_keypair(&path).expect("key creation under a permissive umask");
+
+        for ancestor in [dir.path().join("a"), dir.path().join("a").join("b")] {
+            let mode = std::fs::metadata(&ancestor).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o700,
+                "created ancestor {} must be owner-only, not world-writable under umask 0000",
+                ancestor.display()
+            );
+        }
+
+        let keys_mode = std::fs::metadata(dir.path().join("a").join("b").join("keys"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(keys_mode & 0o777, 0o700, "key directory must be owner-only");
+
+        let key_mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(key_mode & 0o777, 0o600, "key file must be owner-read/write only");
+
+        println!("p2p-key-multilevel: asserted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p2p_multilevel_missing_ancestors_are_created_0700_under_zero_umask() {
+        let output = fixture_command_with_env(
+            "p2p::tests::fixture_p2p_key_multilevel_ancestors_under_zero_umask",
+            "p2p-key-multilevel",
+        )
+        .output()
+        .expect("spawn the multilevel fixture");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "the multilevel fixture must pass in its child process\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the fixture filter must select exactly one test that passed\n--- stdout ---\n{stdout}"
+        );
+        assert!(
+            stdout.contains("p2p-key-multilevel: asserted"),
+            "the fixture must print its sentinel after asserting\n--- stdout ---\n{stdout}"
+        );
     }
 
     #[cfg(unix)]
@@ -1755,7 +2058,7 @@ mod tests {
     fn p2p_nested_key_path_leaves_ancestor_modes_unchanged() {
         use std::os::unix::fs::PermissionsExt;
 
-        let base = tempfile::tempdir().unwrap();
+        let base = key_base_0700();
         let ancestor_a = base.path().join("a");
         let ancestor_b = ancestor_a.join("b");
         std::fs::create_dir_all(&ancestor_b).unwrap();
@@ -1804,7 +2107,7 @@ mod tests {
     fn p2p_existing_key_dir_with_loose_permissions_is_tightened() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = key_base_0700();
         let key_dir = dir.path().join("keys");
         std::fs::create_dir(&key_dir).unwrap();
         std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1835,7 +2138,7 @@ mod tests {
 
     #[test]
     fn p2p_failed_key_write_leaves_no_file_at_the_final_path() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = key_base_0700();
         let key_dir = dir.path().join("keys");
         let path = key_dir.join("p2p.key");
 
@@ -2032,7 +2335,7 @@ mod tests {
 
     #[test]
     fn p2p_concurrent_first_boot_dir_creation_converges() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = key_base_0700();
         let key_path = dir.path().join("keys").join("p2p.key");
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let key_path2 = key_path.clone();
@@ -2065,7 +2368,7 @@ mod tests {
     fn p2p_fifo_key_path_is_refused_without_blocking() {
         use std::ffi::CString;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = key_base_0700();
         let key_dir = dir.path().join("keys");
         std::fs::create_dir(&key_dir).unwrap();
         let path = key_dir.join("p2p.key");
@@ -2083,7 +2386,7 @@ mod tests {
 
     #[test]
     fn p2p_oversized_key_file_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = key_base_0700();
         let key_dir = dir.path().join("keys");
         std::fs::create_dir(&key_dir).unwrap();
         let path = key_dir.join("p2p.key");
@@ -2359,7 +2662,7 @@ mod tests {
         ];
 
         for row in rows {
-            let base = tempfile::tempdir().unwrap();
+            let base = key_base_0700();
             let key_path = (row.setup)(base.path());
 
             match row.expect {
