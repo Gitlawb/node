@@ -4,7 +4,6 @@
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
-use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::http::NodeClient;
@@ -82,12 +81,7 @@ async fn resolve_repo(
             did.split(':').next_back().unwrap_or(&did).to_string()
         } else {
             let client = signed_client(node, dir);
-            let info: Value = client
-                .get_authed("/")
-                .await?
-                .json()
-                .await
-                .context("failed to fetch node info")?;
+            let info = crate::http::read_json(client.get_authed("/").await?, "node info").await?;
             let did = info["did"].as_str().context("node info missing 'did'")?;
             did.split(':').next_back().unwrap_or(did).to_string()
         };
@@ -100,12 +94,7 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
 
     let client = signed_client(&node, dir.as_deref());
     let path = format!("/api/v1/repos/{owner}/{name}/certs");
-    let resp: Value = client
-        .get_authed(&path)
-        .await?
-        .json()
-        .await
-        .context("failed to list certificates")?;
+    let resp = crate::http::read_json(client.get_authed(&path).await?, "certificates").await?;
 
     let certs = resp["certificates"].as_array().cloned().unwrap_or_default();
 
@@ -139,14 +128,10 @@ async fn cmd_show(
     let client = signed_client(&node, dir.as_deref());
     let id = resolve_cert_id(&client, &owner, &name, &id).await?;
 
-    // Fetch the certificate
+    // Fetch the certificate. read_json checks status first and surfaces the node's
+    // capped+sanitized message on a non-2xx (a bounded error read, not the whole body).
     let path = format!("/api/v1/repos/{owner}/{name}/certs/{id}");
-    let resp = client
-        .get_authed(&path)
-        .await?
-        .error_for_status()
-        .context("certificate not found")?;
-    let cert: Value = resp.json().await.context("certificate not found")?;
+    let cert = crate::http::read_json(client.get_authed(&path).await?, "certificate").await?;
 
     let cert_id = cert["id"].as_str().unwrap_or("?");
     let ref_name = cert["ref_name"].as_str().unwrap_or("?");
@@ -191,27 +176,20 @@ async fn cmd_show(
 
     // Contextual only — the verdict above stands on its own, so a node-info
     // hiccup here must not turn a successfully displayed certificate into an
-    // error exit.
-    let current_node_did = match client.get("/").await {
-        Ok(resp) => resp
-            .json::<Value>()
-            .await
-            .ok()
-            .and_then(|info| info["did"].as_str().map(str::to_string)),
-        Err(_) => None,
+    // error exit. Route the lookup through read_json so a denial or a capped
+    // error body yields a reportable reason instead of an opaque None, and keep
+    // "carried no DID" distinct from "the lookup failed": an empty DID must not
+    // reach the comparison and fabricate a mismatch warning.
+    let current: std::result::Result<String, String> = match client.get("/").await {
+        Ok(resp) => match crate::http::read_json(resp, "node info").await {
+            Ok(info) => did_from_node_info(&info),
+            Err(e) => Err(e.to_string()),
+        },
+        Err(e) => Err(e.to_string()),
     };
-    match current_node_did.as_deref() {
-        Some(current) if current == node_did => {
-            println!("  Issuing node DID matches the node being queried.");
-        }
-        Some(current) => {
-            println!("  WARNING: Certificate node DID ({node_did}) does not match");
-            println!("           current node DID ({current}).");
-            println!("           This certificate was issued by a different node.");
-        }
-        None => {
-            println!("  NOTE: could not fetch current node info — skipping node-DID comparison.");
-        }
+    let current_node_did = current.as_ref().ok().cloned();
+    for line in did_check_report(&current, node_did) {
+        println!("{line}");
     }
 
     if require_valid {
@@ -237,6 +215,46 @@ async fn cmd_show(
     }
 
     Ok(())
+}
+
+/// Pull the node's DID out of a `GET /` body for the comparison in `cmd_show`.
+///
+/// A missing OR empty `did` is a failure, not a value: letting `""` through
+/// would reach the comparison and print a mismatch WARNING against a DID the
+/// node never claimed, which reads as "issued by a different node" when the
+/// truth is that the lookup told us nothing.
+fn did_from_node_info(info: &serde_json::Value) -> std::result::Result<String, String> {
+    match info["did"].as_str() {
+        Some(did) if !did.is_empty() => Ok(did.to_string()),
+        _ => Err("node info response carried no DID".to_string()),
+    }
+}
+
+/// Select the report lines for the node-DID comparison in `cmd_show`.
+///
+/// `current` is the current node's DID, or the reason it could not be
+/// determined. A comparison verdict (match or WARNING) is only produced when a
+/// real DID was obtained; otherwise the report degrades to a could-not-compare
+/// hint naming the reason, plus the offline-verification guidance. The signature
+/// verdict printed above stands on its own either way — this block only answers
+/// *which* node issued the certificate.
+fn did_check_report(current: &std::result::Result<String, String>, node_did: &str) -> Vec<String> {
+    match current {
+        Ok(current) if current == node_did => {
+            vec!["  Issuing node DID matches the node being queried.".to_string()]
+        }
+        Ok(current) => vec![
+            format!("  WARNING: Certificate node DID ({node_did}) does not match"),
+            format!("           current node DID ({current})."),
+            "           This certificate was issued by a different node.".to_string(),
+        ],
+        Err(reason) => vec![
+            format!("  Could not fetch the current node's DID ({reason}), so the comparison"),
+            "  with the certificate's node DID is unavailable.".to_string(),
+            "  To verify offline, use the node's Ed25519 public key derived from:".to_string(),
+            format!("    did:key → {node_did}"),
+        ],
+    }
 }
 
 /// Rebuild the node's canonical signing payload (field order must match
@@ -291,14 +309,7 @@ async fn resolve_cert_id(client: &NodeClient, owner: &str, name: &str, id: &str)
     }
 
     let path = format!("/api/v1/repos/{owner}/{name}/certs?prefix={id}");
-    let resp: Value = client
-        .get_authed(&path)
-        .await?
-        .error_for_status()
-        .context("failed to list certificates")?
-        .json()
-        .await
-        .context("failed to list certificates")?;
+    let resp = crate::http::read_json(client.get_authed(&path).await?, "certificates").await?;
 
     let certs = resp["certificates"].as_array().cloned().unwrap_or_default();
     let matches: Vec<String> = certs
@@ -396,5 +407,559 @@ mod tests {
             "not-base64url!!!",
         );
         assert!(garbage.is_err(), "malformed signature must not verify");
+    }
+
+    #[tokio::test]
+    async fn cmd_list_surfaces_denial_not_empty() {
+        // A gated 404 on the repo-scoped certs read must Err, not print "No certificates".
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/alice/secret/certs$".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = cmd_list("alice/secret".to_string(), server.url(), None).await;
+        assert!(result.is_err(), "cert list must Err on a gated 404");
+        // Prove the gated certs path was actually requested: without this, an
+        // unmatched route (mockito's 501, also non-2xx) would satisfy is_err().
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_surfaces_denial() {
+        // A slash-free repo with an empty identity dir forces the GET / node-info
+        // fetch. A gated 404 there must Err (surfacing the status), proving the
+        // read_json conversion is load-bearing rather than silently ignored.
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap(); // empty, no identity.pem, forces the GET / branch
+        let _m = server
+            .mock("GET", "/")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"denied"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let err = resolve_repo("noslash", &server.url(), Some(dir.path()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"), "got: {err}");
+        _m.assert_async().await;
+    }
+
+    // The `GET /` node-info lookup after the cert loads is a fail-soft diagnostic:
+    // a response-level failure degrades to a could-not-compare hint and the command
+    // completes Ok, never a fabricated mismatch warning and never a fatal Err. The
+    // cert fetch itself stays fail-closed. A >=36-char id skips resolve_cert_id so
+    // only two mocks are needed.
+    #[tokio::test]
+    async fn cmd_show_completes_with_degraded_hint_when_node_info_denied() {
+        let mut server = mockito::Server::new_async().await;
+        let long_id = "a".repeat(36);
+        let _cert = server
+            .mock(
+                "GET",
+                format!("/api/v1/repos/alice/secret/certs/{long_id}").as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"id":"c1","ref_name":"refs/heads/main","old_sha":"0","new_sha":"1","pusher_did":"p","node_did":"n","signature":"s","issued_at":"2026-01-01T00:00:00Z"}"#,
+            )
+            .create_async()
+            .await;
+        let _root = server
+            .mock("GET", "/")
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"denied"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = cmd_show(
+            "alice/secret".to_string(),
+            long_id,
+            server.url(),
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "cert show must complete despite a denied node-info lookup"
+        );
+        _cert.assert_async().await;
+        _root.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_show_degrades_on_malformed_node_info() {
+        // A 2xx node-info body that fails to parse degrades the same way a denial
+        // does: hint printed, command completes Ok.
+        let mut server = mockito::Server::new_async().await;
+        let long_id = "a".repeat(36);
+        let _cert = server
+            .mock(
+                "GET",
+                format!("/api/v1/repos/alice/secret/certs/{long_id}").as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"id":"c1","ref_name":"refs/heads/main","old_sha":"0","new_sha":"1","pusher_did":"p","node_did":"n","signature":"s","issued_at":"2026-01-01T00:00:00Z"}"#,
+            )
+            .create_async()
+            .await;
+        let _root = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_body("not json")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = cmd_show(
+            "alice/secret".to_string(),
+            long_id,
+            server.url(),
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "cert show must complete despite malformed node info"
+        );
+        _cert.assert_async().await;
+        _root.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_show_degrades_when_node_info_lacks_did() {
+        // A 2xx node-info body with no `did` routes to the degraded hint, not a
+        // fabricated empty-DID mismatch warning; the command completes Ok.
+        let mut server = mockito::Server::new_async().await;
+        let long_id = "a".repeat(36);
+        let _cert = server
+            .mock(
+                "GET",
+                format!("/api/v1/repos/alice/secret/certs/{long_id}").as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"id":"c1","ref_name":"refs/heads/main","old_sha":"0","new_sha":"1","pusher_did":"p","node_did":"n","signature":"s","issued_at":"2026-01-01T00:00:00Z"}"#,
+            )
+            .create_async()
+            .await;
+        let _root = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = cmd_show(
+            "alice/secret".to_string(),
+            long_id,
+            server.url(),
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "cert show must complete when node info lacks a DID"
+        );
+        _cert.assert_async().await;
+        _root.assert_async().await;
+    }
+
+    // Must-not case: the certificate fetch itself stays fail-closed. A gated 404
+    // aborts the command with the status surfaced, and the node-info lookup is
+    // never reached (the expect(0) assert proves it never ran).
+    #[tokio::test]
+    async fn cmd_show_surfaces_denied_certificate() {
+        let mut server = mockito::Server::new_async().await;
+        let long_id = "a".repeat(36);
+        let _cert = server
+            .mock(
+                "GET",
+                format!("/api/v1/repos/alice/secret/certs/{long_id}").as_str(),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let _root = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"did":"n"}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let err = cmd_show(
+            "alice/secret".to_string(),
+            long_id,
+            server.url(),
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("404"), "got: {err}");
+        _cert.assert_async().await;
+        _root.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_show_reports_matching_node_did() {
+        // Pins the unchanged success path: node info fetched, DIDs compared, Ok.
+        let mut server = mockito::Server::new_async().await;
+        let long_id = "a".repeat(36);
+        let _cert = server
+            .mock(
+                "GET",
+                format!("/api/v1/repos/alice/secret/certs/{long_id}").as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"id":"c1","ref_name":"refs/heads/main","old_sha":"0","new_sha":"1","pusher_did":"p","node_did":"n","signature":"s","issued_at":"2026-01-01T00:00:00Z"}"#,
+            )
+            .create_async()
+            .await;
+        let _root = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"did":"n"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = cmd_show(
+            "alice/secret".to_string(),
+            long_id,
+            server.url(),
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "cert show must report a matching node DID");
+        _cert.assert_async().await;
+        _root.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_show_warns_on_mismatching_node_did() {
+        // A real, differing node DID drives the WARNING branch end to end; the
+        // command still completes Ok.
+        let mut server = mockito::Server::new_async().await;
+        let long_id = "a".repeat(36);
+        let _cert = server
+            .mock(
+                "GET",
+                format!("/api/v1/repos/alice/secret/certs/{long_id}").as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"id":"c1","ref_name":"refs/heads/main","old_sha":"0","new_sha":"1","pusher_did":"p","node_did":"n","signature":"s","issued_at":"2026-01-01T00:00:00Z"}"#,
+            )
+            .create_async()
+            .await;
+        let _root = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"did":"did:key:other"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = cmd_show(
+            "alice/secret".to_string(),
+            long_id,
+            server.url(),
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "cert show must warn, not fail, on a mismatching node DID"
+        );
+        _cert.assert_async().await;
+        _root.assert_async().await;
+    }
+
+    // ── --verify issuer anchoring ────────────────────────────────────────────
+    //
+    // Every other cmd_show test passes require_valid=false, so the whole
+    // `if require_valid` block went unexecuted. It is the security-bearing half of
+    // the command: a valid signature only proves the certificate is internally
+    // consistent (a hostile node can mint a keypair, name it in node_did, and
+    // self-sign), so --verify must additionally anchor the issuer to a DID the
+    // caller trusts. These drive all four outcomes plus the must-not case.
+    //
+    // The certificate must carry a REAL signature over the canonical payload:
+    // with a bogus one, --verify bails on the signature and never reaches the
+    // anchoring, which would make every assertion below vacuous.
+    fn signed_cert(node_kp: &gitlawb_core::identity::Keypair) -> (String, String) {
+        let node_did = node_kp.did().as_str().to_string();
+        let id = "a".repeat(36); // >= 36 chars skips resolve_cert_id's prefix lookup
+        let payload = serde_json::json!({
+            "repo_id": "repo-1",
+            "ref":     "refs/heads/main",
+            "old":     "0".repeat(40),
+            "new":     "b".repeat(40),
+            "pusher":  "did:key:z6MkPusher",
+            "node":    node_did,
+            "ts":      "2026-07-22T00:00:00+00:00",
+        });
+        let sig = node_kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
+        let body = serde_json::json!({
+            "id": id,
+            "repo_id": "repo-1",
+            "ref_name": "refs/heads/main",
+            "old_sha": "0".repeat(40),
+            "new_sha": "b".repeat(40),
+            "pusher_did": "did:key:z6MkPusher",
+            "node_did": node_did,
+            "signature": sig,
+            "issued_at": "2026-07-22T00:00:00+00:00",
+        })
+        .to_string();
+        (id, body)
+    }
+
+    /// Mount the cert fetch, plus a `GET /` answering with `node_info` (a JSON
+    /// body) or a denial when `None`.
+    async fn cert_server(
+        server: &mut mockito::Server,
+        id: &str,
+        cert_body: &str,
+        node_info: Option<&str>,
+    ) -> (mockito::Mock, mockito::Mock) {
+        let cert = server
+            .mock("GET", format!("/api/v1/repos/alice/r/certs/{id}").as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(cert_body)
+            .expect(1)
+            .create_async()
+            .await;
+        let root = match node_info {
+            Some(b) => {
+                server
+                    .mock("GET", "/")
+                    .with_status(200)
+                    .with_header("content-type", "application/json")
+                    .with_body(b)
+                    .create_async()
+                    .await
+            }
+            None => {
+                server
+                    .mock("GET", "/")
+                    .with_status(403)
+                    .with_header("content-type", "application/json")
+                    .with_body(r#"{"message":"denied"}"#)
+                    .create_async()
+                    .await
+            }
+        };
+        (cert, root)
+    }
+
+    #[tokio::test]
+    async fn verify_ok_when_issuing_node_is_the_queried_node() {
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let (id, body) = signed_cert(&kp);
+        let info = format!(r#"{{"did":"{}"}}"#, kp.did().as_str());
+        let mut server = mockito::Server::new_async().await;
+        let (cert, _root) = cert_server(&mut server, &id, &body, Some(&info)).await;
+
+        let got = cmd_show("alice/r".to_string(), id, server.url(), None, true, None).await;
+        assert!(got.is_ok(), "valid sig + matching issuer must pass");
+        cert.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn verify_bails_when_issuer_is_a_different_node() {
+        // The self-signing-hostile-node case: the signature verifies against the
+        // key the cert names, but that key is not the node we queried.
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let (id, body) = signed_cert(&kp);
+        let other = gitlawb_core::identity::Keypair::generate();
+        let info = format!(r#"{{"did":"{}"}}"#, other.did().as_str());
+        let mut server = mockito::Server::new_async().await;
+        let (cert, _root) = cert_server(&mut server, &id, &body, Some(&info)).await;
+
+        let err = cmd_show("alice/r".to_string(), id, server.url(), None, true, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected issuer"), "got: {err}");
+        cert.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn verify_bails_when_node_info_denied_and_no_expect_node() {
+        // Fail closed: with no trusted DID to anchor against, --verify must NOT
+        // fall through to a pass just because the signature checked out.
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let (id, body) = signed_cert(&kp);
+        let mut server = mockito::Server::new_async().await;
+        let (cert, _root) = cert_server(&mut server, &id, &body, None).await;
+
+        let err = cmd_show("alice/r".to_string(), id, server.url(), None, true, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot anchor the issuer"), "got: {err}");
+        cert.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn verify_ok_when_expect_node_anchors_a_denied_lookup() {
+        // --expect-node supplies the trust anchor the denied lookup could not, so
+        // the same denial that fails the case above now passes.
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let (id, body) = signed_cert(&kp);
+        let mut server = mockito::Server::new_async().await;
+        let (cert, _root) = cert_server(&mut server, &id, &body, None).await;
+
+        let got = cmd_show(
+            "alice/r".to_string(),
+            id,
+            server.url(),
+            None,
+            true,
+            Some(kp.did().as_str().to_string()),
+        )
+        .await;
+        assert!(got.is_ok(), "explicit anchor must pass");
+        cert.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn verify_bails_on_a_bad_signature_before_anchoring() {
+        // The must-not: a forged certificate naming the queried node must fail on
+        // the signature, even though its issuer would otherwise anchor cleanly.
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let (id, body) = signed_cert(&kp);
+        let forged = body.replace(&"b".repeat(40), &"c".repeat(40));
+        let info = format!(r#"{{"did":"{}"}}"#, kp.did().as_str());
+        let mut server = mockito::Server::new_async().await;
+        let (cert, _root) = cert_server(&mut server, &id, &forged, Some(&info)).await;
+
+        let err = cmd_show("alice/r".to_string(), id, server.url(), None, true, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("signature did not verify"), "got: {err}");
+        cert.assert_async().await;
+    }
+
+    // The must-not case for the DID extraction: an empty or missing `did` has to
+    // become a could-not-compare reason. If it leaks through as a value, the
+    // comparison below fabricates a mismatch WARNING against a DID the node
+    // never claimed.
+    #[test]
+    fn did_from_node_info_rejects_empty_and_missing() {
+        assert!(did_from_node_info(&serde_json::json!({"did": "n"})).is_ok());
+        for body in [
+            serde_json::json!({"did": ""}),
+            serde_json::json!({}),
+            serde_json::json!({"did": 7}),
+        ] {
+            let got = did_from_node_info(&body);
+            assert!(
+                got.is_err(),
+                "must not yield a comparable DID: {body} -> {got:?}"
+            );
+        }
+        // And the reason it produces must route to the degraded hint, never a verdict.
+        let report =
+            did_check_report(&did_from_node_info(&serde_json::json!({"did": ""})), "n").join("\n");
+        assert!(
+            !report.contains("WARNING"),
+            "fabricated a mismatch: {report}"
+        );
+        assert!(report.contains("Could not fetch"), "got: {report}");
+    }
+
+    // did_check_report is the three-way selector between the match text, the
+    // mismatch WARNING, and the degraded could-not-compare hint. Substring
+    // asserts (not full-line equality) so cosmetic wording edits don't break them.
+
+    #[test]
+    fn did_check_report_match() {
+        let report = did_check_report(&Ok("n".to_string()), "n").join("\n");
+        assert!(
+            report.contains("matches the node being queried"),
+            "got: {report}"
+        );
+        assert!(!report.contains("WARNING"), "got: {report}");
+        assert!(!report.contains("Could not fetch"), "got: {report}");
+    }
+
+    #[test]
+    fn did_check_report_mismatch() {
+        let report = did_check_report(&Ok("did:key:other".to_string()), "n").join("\n");
+        assert!(report.contains("WARNING"), "got: {report}");
+        assert!(report.contains("does not match"), "got: {report}");
+        assert!(report.contains("did:key:other"), "got: {report}");
+        assert!(!report.contains("Could not fetch"), "got: {report}");
+    }
+
+    #[test]
+    fn did_check_report_missing_did_reason() {
+        let report =
+            did_check_report(&Err("node info response carried no DID".to_string()), "n").join("\n");
+        assert!(report.contains("Could not fetch"), "got: {report}");
+        assert!(
+            report.contains("node info response carried no DID"),
+            "got: {report}"
+        );
+        assert!(report.contains("verify offline"), "got: {report}");
+        // The must-not case: no real DID was obtained, so no comparison verdict
+        // may be claimed in either direction.
+        assert!(!report.contains("WARNING"), "got: {report}");
+        assert!(
+            !report.contains("matches the node being queried"),
+            "got: {report}"
+        );
+    }
+
+    #[test]
+    fn did_check_report_lookup_error_reason() {
+        let report =
+            did_check_report(&Err("node info failed (403): denied".to_string()), "n").join("\n");
+        assert!(report.contains("Could not fetch"), "got: {report}");
+        assert!(report.contains("403"), "got: {report}");
+        assert!(report.contains("verify offline"), "got: {report}");
+        assert!(!report.contains("WARNING"), "got: {report}");
     }
 }

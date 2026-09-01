@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
-use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::http::NodeClient;
@@ -57,24 +56,16 @@ async fn cmd_list(node: String, capability: Option<String>) -> Result<()> {
         .get(&path)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-
-    if status == reqwest::StatusCode::NOT_FOUND {
+    // Keep the bespoke 404 hint (older node without the agents API) ahead of
+    // read_json; every other status routes through it (capped + sanitized error).
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
         anyhow::bail!(
             "this node does not yet support the agents API (v0.3+)\n\
              upgrade the node or check GITLAWB_NODE is pointing to the right server"
         );
     }
 
-    let body: Value = resp
-        .json()
-        .await
-        .context("invalid JSON from node — is GITLAWB_NODE correct?")?;
-
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("list agents failed ({status}): {msg}");
-    }
+    let body = crate::http::read_json(resp, "list agents").await?;
 
     let agents = body["agents"].as_array().cloned().unwrap_or_default();
 
@@ -117,24 +108,15 @@ async fn cmd_show(did: String, node: String) -> Result<()> {
         .get(&format!("/api/v1/agents/{did}"))
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-
-    if status == reqwest::StatusCode::NOT_FOUND {
+    // Keep the bespoke 404 hint ahead of read_json; other statuses route through it.
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
         anyhow::bail!(
             "agent not found, or this node does not yet support the agents API (v0.3+)\n\
              upgrade the node or check GITLAWB_NODE is pointing to the right server"
         );
     }
 
-    let agent: Value = resp
-        .json()
-        .await
-        .context("invalid JSON from node — is GITLAWB_NODE correct?")?;
-
-    if !status.is_success() {
-        let msg = agent["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("agent not found ({status}): {msg}");
-    }
+    let agent = crate::http::read_json(resp, "agent").await?;
 
     let full_did = agent["did"].as_str().unwrap_or("?");
     let trust = agent["trust_score"].as_f64().unwrap_or(0.0);
@@ -215,11 +197,14 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
         let err = cmd_list(server.url(), None).await.unwrap_err();
         assert!(err.to_string().contains("agents API"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -230,11 +215,14 @@ mod tests {
             .with_status(500)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"internal error"}"#)
+            .expect(1)
             .create_async()
             .await;
 
         let err = cmd_list(server.url(), None).await.unwrap_err();
         assert!(err.to_string().contains("list agents failed"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -261,6 +249,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"agent not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -268,6 +257,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("agents API") || err.to_string().contains("not found"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
