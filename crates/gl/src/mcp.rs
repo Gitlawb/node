@@ -43,7 +43,6 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 use crate::http::NodeClient;
-use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
 pub struct McpArgs {
@@ -637,7 +636,7 @@ async fn call_tool(
     node: &str,
     dir: Option<&std::path::Path>,
 ) -> Result<String> {
-    let keypair = load_keypair_from_dir(dir).ok();
+    let keypair = crate::identity::load_optional_keypair(dir)?;
     let client = NodeClient::new(node, keypair.clone());
 
     match name {

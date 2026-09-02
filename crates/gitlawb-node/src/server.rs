@@ -1,5 +1,6 @@
-use async_graphql_axum::{GraphQLRequest, GraphQLResponse, GraphQLSubscription};
-use axum::extract::DefaultBodyLimit;
+use async_graphql::http::ALL_WEBSOCKET_PROTOCOLS;
+use async_graphql_axum::{GraphQLProtocol, GraphQLRequest, GraphQLResponse, GraphQLWebSocket};
+use axum::extract::{DefaultBodyLimit, WebSocketUpgrade};
 use axum::{
     extract::State,
     middleware,
@@ -49,6 +50,30 @@ async fn graphql_handler(
     state.graphql_schema.execute(inner).await.into()
 }
 
+async fn graphql_ws_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    rate_limit::PeerAddr(peer): rate_limit::PeerAddr,
+    protocol: GraphQLProtocol,
+    upgrade: WebSocketUpgrade,
+) -> axum::response::Response {
+    let mut data = async_graphql::Data::default();
+    data.insert(rate_limit::TaskReadBrake {
+        limiter: state.task_read_rate_limiter.clone(),
+        key: rate_limit::client_key(&headers, peer, state.push_limiter_trust),
+        request_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    });
+    let schema = state.graphql_schema.as_ref().clone();
+    upgrade
+        .protocols(ALL_WEBSOCKET_PROTOCOLS)
+        .on_upgrade(move |stream| {
+            GraphQLWebSocket::new(stream, schema, protocol)
+                .with_data(data)
+                .serve()
+        })
+        .into_response()
+}
+
 async fn graphql_playground() -> impl IntoResponse {
     axum::response::Html(async_graphql::http::playground_source(
         async_graphql::http::GraphQLPlaygroundConfig::new("/graphql")
@@ -71,14 +96,13 @@ fn add_auth_layers(router: Router<AppState>, state: AppState) -> Router<AppState
 
 pub fn build_router(state: AppState) -> Router {
     // ── GraphQL routes ─────────────────────────────────────────────────────
-    let schema = state.graphql_schema.as_ref().clone();
     let graphql_routes = Router::new()
         .route("/graphql", get(graphql_playground).post(graphql_handler))
         // Attach the verified DID to /graphql when a signature is present. The
         // layer covers only routes added before it, so /graphql/ws (added after,
         // read-only subscriptions) stays open.
         .layer(middleware::from_fn(auth::optional_signature))
-        .route_service("/graphql/ws", GraphQLSubscription::new(schema));
+        .route("/graphql/ws", get(graphql_ws_handler));
 
     // ── Task routes (write — require HTTP Signature) ───────────────────────
     let task_write_routes = add_auth_layers(
@@ -649,5 +673,160 @@ async fn p2p_info(State(state): State<AppState>) -> Json<serde_json::Value> {
             }))
         }
         None => Json(json!({ "enabled": false })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::test_state;
+    use sqlx::PgPool;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn ws_send_text(stream: &mut tokio::net::TcpStream, text: &str) {
+        let payload = text.as_bytes();
+        let len = payload.len();
+        let mut frame = Vec::new();
+        frame.push(0x81);
+        let mask = [0x12, 0x34, 0x56, 0x78];
+        if len <= 125 {
+            frame.push(0x80 | (len as u8));
+        } else if len <= 65535 {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&(len as u16).to_be_bytes());
+        } else {
+            frame.push(0x80 | 127);
+            frame.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+        frame.extend_from_slice(&mask);
+        for (i, b) in payload.iter().enumerate() {
+            frame.push(b ^ mask[i % 4]);
+        }
+        stream.write_all(&frame).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    async fn ws_recv_text(stream: &mut tokio::net::TcpStream) -> String {
+        let mut header = [0u8; 2];
+        stream.read_exact(&mut header).await.unwrap();
+        let b1 = header[1];
+        let masked = (b1 & 0x80) != 0;
+        let mut len = (b1 & 0x7f) as usize;
+        if len == 126 {
+            let mut ext = [0u8; 2];
+            stream.read_exact(&mut ext).await.unwrap();
+            len = u16::from_be_bytes(ext) as usize;
+        } else if len == 127 {
+            let mut ext = [0u8; 8];
+            stream.read_exact(&mut ext).await.unwrap();
+            len = u64::from_be_bytes(ext) as usize;
+        }
+        let mask = if masked {
+            let mut m = [0u8; 4];
+            stream.read_exact(&mut m).await.unwrap();
+            Some(m)
+        } else {
+            None
+        };
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).await.unwrap();
+        if let Some(m) = mask {
+            for (i, b) in payload.iter_mut().enumerate() {
+                *b ^= m[i % 4];
+            }
+        }
+        String::from_utf8(payload).unwrap()
+    }
+
+    async fn connect_ws(addr: std::net::SocketAddr) -> tokio::net::TcpStream {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "GET /graphql/ws HTTP/1.1\r\n\
+             Host: {}\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Protocol: graphql-transport-ws\r\n\r\n",
+            addr
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp.starts_with("HTTP/1.1 101 Switching Protocols"));
+
+        // Init connection
+        ws_send_text(&mut stream, r#"{"type":"connection_init"}"#).await;
+        let ack = ws_recv_text(&mut stream).await;
+        assert!(ack.contains("connection_ack"));
+
+        stream
+    }
+
+    #[sqlx::test]
+    async fn graphql_ws_task_query_enforces_per_request_field_limit(pool: PgPool) {
+        let state = test_state(pool).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_router(state);
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut stream = connect_ws(addr).await;
+
+        // Query with 6 aliased task fields (exceeding MAX_GRAPHQL_TASK_READS_PER_REQUEST = 5)
+        let query = r#"{"id":"1","type":"subscribe","payload":{"query":"query { f1: tasks { items { id } } f2: tasks { items { id } } f3: tasks { items { id } } f4: tasks { items { id } } f5: tasks { items { id } } f6: tasks { items { id } } }"}}"#;
+        ws_send_text(&mut stream, query).await;
+        let resp = ws_recv_text(&mut stream).await;
+        assert!(
+            resp.contains("rate limit exceeded"),
+            "6th task field over WS must be braked: {resp}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn graphql_ws_task_query_enforces_per_ip_rate_limit(pool: PgPool) {
+        let mut state = test_state(pool).await;
+        // Restrict task read rate limiter to 1 request per 60s
+        state.task_read_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, std::time::Duration::from_secs(60));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_router(state);
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut stream = connect_ws(addr).await;
+
+        // First task query succeeds (or returns valid data)
+        let query1 = r#"{"id":"1","type":"subscribe","payload":{"query":"query { tasks { items { id } } }"}}"#;
+        ws_send_text(&mut stream, query1).await;
+        let resp1 = ws_recv_text(&mut stream).await;
+        assert!(!resp1.contains("rate limit exceeded"));
+
+        // Second task query on the same connection hits per-IP limiter
+        let query2 = r#"{"id":"2","type":"subscribe","payload":{"query":"query { tasks { items { id } } }"}}"#;
+        ws_send_text(&mut stream, query2).await;
+        let resp2 = ws_recv_text(&mut stream).await;
+        assert!(
+            resp2.contains("rate limit exceeded"),
+            "exceeded per-IP limiter over WS must return rate limit message: {resp2}"
+        );
     }
 }

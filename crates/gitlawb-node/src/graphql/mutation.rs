@@ -73,7 +73,7 @@ impl MutationRoot {
         let assignee_did = caller.to_string();
         let db = ctx.data_unchecked::<Arc<Db>>();
         let tx = ctx.data_unchecked::<tokio::sync::broadcast::Sender<TaskEventBroadcast>>();
-        crate::api::tasks::get_visible_task(db, &id, Some(caller))
+        crate::api::tasks::get_claimable_task(db, &id, caller)
             .await
             .map_err(crate::graphql::graphql_app_err)?
             .ok_or_else(|| async_graphql::Error::new("task not found"))?;
