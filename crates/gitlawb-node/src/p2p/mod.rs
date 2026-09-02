@@ -339,6 +339,303 @@ fn foreign_ownership_error(what: &str, path: &Path, owner_uid: u32, euid: u32) -
     ))
 }
 
+/// Pinned-creation primitives: the only way to obtain a `Pinned<T>`.
+///
+/// POSIX applies the process umask to every requested creation mode, so the
+/// mode argument to `mkdirat`, `openat(O_CREAT)`, `mkdir` or `create_dir_all`
+/// is a REQUEST and not a result. Under a mask that removes owner bits a
+/// requested 0700 directory lands 0000 and cannot be reopened at all, and a
+/// requested 0600 key is published unreadable, so the boot that created it
+/// succeeds on its already-open descriptor and the next boot loses p2p.
+///
+/// Every object this process creates therefore goes through one rule: create,
+/// pin the mode on the object we just made, reopen or keep the descriptor, and
+/// verify the ACHIEVED mode by `fstat` before anything relies on it. A race
+/// winner is never pinned; it is verified as-is, which is the rule the ancestor
+/// walk already applied and this module preserves.
+///
+/// `Pinned<T>`'s field is private to this module and no constructor is
+/// exported, so a descriptor that did not go through one of these helpers
+/// cannot be handed to key-directory construction or to publication. That is
+/// what makes the rule compile-enforced rather than reviewed.
+#[cfg(unix)]
+pub(crate) mod pin {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::path::Path;
+
+    /// A file or directory whose achieved mode has been verified on this
+    /// descriptor. Constructible only by the helpers below.
+    #[derive(Debug)]
+    pub(crate) struct Pinned<T>(T);
+
+    impl<T> Pinned<T> {
+        pub(crate) fn get(&self) -> &T {
+            &self.0
+        }
+        pub(crate) fn get_mut(&mut self) -> &mut T {
+            &mut self.0
+        }
+        pub(crate) fn into_inner(self) -> T {
+            self.0
+        }
+    }
+
+    // Test-only injection points, thread-local so an armed test cannot
+    // disturb the ones running beside it.
+    //   SKIP_MODE_PIN     makes the pin a no-op, so the exact-mode verification
+    //                     is observed refusing rather than silently masked by a
+    //                     pin that was doing the work (INV-21(i)).
+    //   RACE_CREATE_MODE  creates the component by path between the ENOENT and
+    //                     the mkdirat, so the race-lost arm is deterministic.
+    #[cfg(test)]
+    thread_local! {
+        pub(crate) static SKIP_MODE_PIN: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        pub(crate) static RACE_CREATE_MODE: std::cell::Cell<Option<u32>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    fn io_err(kind: std::io::ErrorKind, msg: String) -> std::io::Error {
+        std::io::Error::new(kind, msg)
+    }
+
+    /// `fstat` the descriptor and require the exact mode, the expected object
+    /// type, and ownership by this uid. The error names the ACHIEVED mode
+    /// against the REQUESTED one, which is what lets a failure be attributed to
+    /// the mode rather than read as a generic open failure.
+    pub(crate) fn verify_exact_mode(
+        fd: std::os::fd::RawFd,
+        want: libc::mode_t,
+        want_dir: bool,
+        display: &Path,
+        euid: u32,
+    ) -> std::io::Result<()> {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: fstat writes the struct on success; the return value is
+        // checked before the struct is read.
+        if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fstat returned 0, so the struct is initialised.
+        let st = unsafe { st.assume_init() };
+
+        let is_dir = (st.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+        if is_dir != want_dir {
+            return Err(io_err(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is not {}",
+                    display.display(),
+                    if want_dir {
+                        "a directory"
+                    } else {
+                        "a regular file"
+                    }
+                ),
+            ));
+        }
+        if st.st_uid != euid {
+            return Err(io_err(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is owned by uid {} rather than this node (uid {})",
+                    display.display(),
+                    st.st_uid,
+                    euid
+                ),
+            ));
+        }
+        let achieved = st.st_mode & 0o7777;
+        if achieved != want {
+            return Err(io_err(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} achieved mode {:04o}, requested {:04o}; the process umask masks every \
+                     requested creation mode, so the mode must be pinned on the descriptor and \
+                     verified rather than assumed",
+                    display.display(),
+                    achieved,
+                    want
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Create `name` below `parent_fd` at exactly 0700, or adopt the winner of
+    /// a creation race.
+    ///
+    /// Returns the descriptor and whether this process created it. The pin is
+    /// issued BEFORE the reopen, by name off the verified parent, because a
+    /// directory that landed 0000 cannot be opened for reading at all, so a pin
+    /// that waits for the reopen is unreachable in exactly the case it exists
+    /// for. That by-name step is safe because `parent_fd` is verified here
+    /// against the same predicate the ancestor walk applies (real directory,
+    /// owned by this uid or root, no write beyond the owner unless sticky), and
+    /// sticky forbids a non-owner from renaming our entry. The verdict is still
+    /// the `fstat` on the reopened descriptor, not the chmod.
+    pub(crate) fn create_dir_pinned_at(
+        parent_fd: std::os::fd::RawFd,
+        name: &std::ffi::OsStr,
+        display: &Path,
+        euid: u32,
+    ) -> std::io::Result<(Pinned<OwnedFd>, bool)> {
+        use std::os::unix::ffi::OsStrExt;
+
+        // The helper carries its own precondition rather than inheriting it
+        // from one call site: the by-name chmod below is only safe over a
+        // parent that cannot be repointed by another user.
+        verify_trusted_parent(parent_fd, display, euid)?;
+
+        let cname = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            io_err(
+                std::io::ErrorKind::InvalidInput,
+                "path component contains an interior NUL byte".to_string(),
+            )
+        })?;
+        let open_flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC;
+
+        // Fast path: it already exists. Adopt and verify as-is (never pin).
+        // SAFETY: openat resolves `name` relative to the verified parent.
+        let existing = unsafe { libc::openat(parent_fd, cname.as_ptr(), open_flags) };
+        if existing >= 0 {
+            // SAFETY: a descriptor we just received and own exactly once.
+            return Ok((Pinned(unsafe { OwnedFd::from_raw_fd(existing) }), false));
+        }
+        let open_err = std::io::Error::last_os_error();
+        if open_err.raw_os_error() != Some(libc::ENOENT) {
+            return Err(open_err);
+        }
+
+        #[cfg(test)]
+        if let Some(mode) = RACE_CREATE_MODE.with(|c| c.take()) {
+            // SAFETY: mkdirat creates `name` relative to the verified parent.
+            unsafe { libc::mkdirat(parent_fd, cname.as_ptr(), mode as libc::mode_t) };
+        }
+
+        let mut created = true;
+        // SAFETY: mkdirat creates `name` relative to the verified parent
+        // descriptor. 0700 is the requested mode; the umask masks it, which the
+        // pin below repairs.
+        if unsafe { libc::mkdirat(parent_fd, cname.as_ptr(), 0o700) } != 0 {
+            let mk_err = std::io::Error::last_os_error();
+            if mk_err.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(mk_err);
+            }
+            // Lost the race. The winner is verified, never pinned.
+            created = false;
+        }
+
+        if created {
+            let skip = {
+                #[cfg(test)]
+                {
+                    SKIP_MODE_PIN.with(|c| c.get())
+                }
+                #[cfg(not(test))]
+                {
+                    false
+                }
+            };
+            if !skip {
+                // SAFETY: fchmodat with flags 0 on a name below the verified
+                // parent; the object was created by this process a moment ago
+                // and the parent cannot be repointed by another user.
+                if unsafe { libc::fchmodat(parent_fd, cname.as_ptr(), 0o700, 0) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+        }
+
+        // SAFETY: openat as above, re-resolving the object that actually landed.
+        let fd = unsafe { libc::openat(parent_fd, cname.as_ptr(), open_flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a descriptor we just received and own exactly once.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+
+        if created {
+            verify_exact_mode(owned.as_raw_fd(), 0o700, true, display, euid)?;
+        }
+        Ok((Pinned(owned), created))
+    }
+
+    /// Pin a file this process just created to `want` on its held descriptor
+    /// and verify the achieved mode.
+    pub(crate) fn pin_created_file(
+        file: std::fs::File,
+        want: libc::mode_t,
+        display: &Path,
+        euid: u32,
+    ) -> std::io::Result<Pinned<std::fs::File>> {
+        let skip = {
+            #[cfg(test)]
+            {
+                SKIP_MODE_PIN.with(|c| c.get())
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        };
+        if !skip {
+            // SAFETY: fchmod on a descriptor this process owns.
+            if unsafe { libc::fchmod(file.as_raw_fd(), want) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        verify_exact_mode(file.as_raw_fd(), want, false, display, euid)?;
+        Ok(Pinned(file))
+    }
+
+    /// The ancestor predicate, applied to the parent this helper is about to
+    /// chmod a child of.
+    fn verify_trusted_parent(
+        fd: std::os::fd::RawFd,
+        display: &Path,
+        euid: u32,
+    ) -> std::io::Result<()> {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: fstat writes the struct on success; checked before read.
+        if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fstat returned 0.
+        let st = unsafe { st.assume_init() };
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+            return Err(io_err(
+                std::io::ErrorKind::InvalidInput,
+                format!("{}'s parent is not a directory", display.display()),
+            ));
+        }
+        if st.st_uid != euid && st.st_uid != 0 {
+            return Err(io_err(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{}'s parent is owned by uid {} rather than this node (uid {}) or root",
+                    display.display(),
+                    st.st_uid,
+                    euid
+                ),
+            ));
+        }
+        let perms = st.st_mode & 0o777;
+        let sticky = st.st_mode & 0o1000 != 0;
+        if perms & 0o022 != 0 && !sticky {
+            return Err(io_err(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{}'s parent has mode {:04o} and is writable beyond its owner",
+                    display.display(),
+                    perms
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Descriptor-anchored ancestor walk from a trusted anchor to the key
 /// directory's parent.
 ///
@@ -367,8 +664,8 @@ fn foreign_ownership_error(what: &str, path: &Path, owner_uid: u32, euid: u32) -
 /// `ensure_key_dir` opens it no-follow, checks its ownership, and tightens it
 /// to 0700 afterwards.
 #[cfg(unix)]
-fn verify_and_create_ancestor_chain(dir: &Path, euid: u32) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
+fn verify_and_create_ancestor_chain(dir: &Path, euid: u32) -> Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd, FromRawFd};
 
     /// Refuse an opened component unless it is a real directory owned by
     /// `euid` or root with no write bits beyond the owner unless sticky.
@@ -420,29 +717,16 @@ fn verify_and_create_ancestor_chain(dir: &Path, euid: u32) -> Result<()> {
         Ok(())
     }
 
-    fn child_name(name: &std::ffi::OsStr) -> std::io::Result<std::ffi::CString> {
-        std::ffi::CString::new(name.as_bytes()).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "path component contains an interior NUL byte",
-            )
-        })
-    }
-
-    /// Owning wrapper for a raw directory descriptor, so the walk's descriptor
-    /// chain is closed on every exit path (success, error, or early return).
-    struct OwnedFd(i32);
-    impl Drop for OwnedFd {
-        fn drop(&mut self) {
-            // SAFETY: close(2) on a descriptor this struct owns.
-            unsafe { libc::close(self.0) };
-        }
-    }
-
     // The components strictly above the key directory, below the anchor.
     let Some(parent) = dir.parent() else {
-        // `dir` is the filesystem root; there is no chain to walk.
-        return Ok(());
+        // `dir` is the filesystem root, so there is no parent descriptor to
+        // hand back. `key_parent_is_filesystem_root` already refuses this
+        // configuration lexically; this arm is the backstop and bails rather
+        // than opening `/` for a path the validator rejects.
+        anyhow::bail!(
+            "p2p key directory {} is the filesystem root; the key needs a dedicated directory",
+            dir.display()
+        );
     };
     let parent = if parent.as_os_str().is_empty() {
         Path::new(".")
@@ -475,7 +759,11 @@ fn verify_and_create_ancestor_chain(dir: &Path, euid: u32) -> Result<()> {
                 format!("failed to open the filesystem root for {}", dir.display())
             });
         }
-        (OwnedFd(fd), PathBuf::from("/"))
+        // SAFETY: a descriptor we just received and own exactly once.
+        (
+            unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
+            PathBuf::from("/"),
+        )
     } else {
         // SAFETY: open(2) on "." returns a descriptor for the process cwd
         // itself; O_NOFOLLOW and O_DIRECTORY pin the object type. The display
@@ -501,116 +789,51 @@ fn verify_and_create_ancestor_chain(dir: &Path, euid: u32) -> Result<()> {
                 }
             })
             .unwrap_or_else(|_| PathBuf::from("."));
-        (OwnedFd(fd), display)
+        // SAFETY: a descriptor we just received and own exactly once.
+        (unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }, display)
     };
 
-    verify_component(anchor.0, dir, &anchor_display, euid)?;
+    verify_component(anchor.as_raw_fd(), dir, &anchor_display, euid)?;
 
     let mut acc = anchor_display;
     let mut cur = anchor;
     for name in &components {
-        let cname = child_name(name)?;
         acc.push(name);
 
-        // SAFETY: openat resolves `name` relative to the previously verified
-        // parent descriptor; O_NOFOLLOW refuses a symlink at this position.
-        let fd = unsafe {
-            libc::openat(
-                cur.0,
-                cname.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
-        if fd >= 0 {
-            // SAFETY: `fd` is a descriptor we own from openat; the OwnedFd
-            // below takes ownership and closes it when the chain advances.
-            verify_component(fd, dir, &acc, euid)?;
-            cur = OwnedFd(fd);
-            continue;
-        }
+        // One call covers both cases: an existing component is opened
+        // no-follow and adopted as-is, a missing one is created at 0700, pinned
+        // on the object this process just made, reopened, and verified at its
+        // ACHIEVED mode. Before this, the create arm pinned only AFTER the
+        // reopen, so under a mask that strips owner bits the reopen failed
+        // EACCES and the pin was unreachable in exactly the case it existed
+        // for.
+        let (next, _created) = pin::create_dir_pinned_at(cur.as_raw_fd(), name, &acc, euid)
+            .map_err(|e| walk_component_error(e, dir, &acc))?;
 
-        match std::io::Error::last_os_error().raw_os_error() {
-            Some(code) if code == libc::ELOOP || code == libc::ENOTDIR => {
-                anyhow::bail!(
-                    "p2p key directory {} sits under {}, which is a symlink or another object \
-                     type; the node refuses anything but a real directory on the key storage path",
-                    dir.display(),
-                    acc.display()
-                );
-            }
-            Some(code) if code == libc::ENOENT => {
-                // Create relative to the verified parent at 0700, then reopen
-                // no-follow and verify whatever actually landed. `AlreadyExists`
-                // is a race: the winner gets the same full verification below.
-                // SAFETY: mkdirat creates `name` relative to the verified parent
-                // descriptor; mode 0700 is the requested mode, but the umask can
-                // still mask it down (mkdirat applies the process umask), so the
-                // created directory is fchmod'd to exactly 0700 after it is
-                // reopened below.
-                let mut created = false;
-                if unsafe { libc::mkdirat(cur.0, cname.as_ptr(), 0o700) } != 0 {
-                    let mk_err = std::io::Error::last_os_error();
-                    if mk_err.kind() != std::io::ErrorKind::AlreadyExists {
-                        return Err(mk_err).with_context(|| {
-                            format!(
-                                "failed to create key directory component {} below {}",
-                                name.to_string_lossy(),
-                                acc.parent()
-                                    .map(|p| p.display().to_string())
-                                    .unwrap_or_default()
-                            )
-                        });
-                    }
-                } else {
-                    created = true;
-                }
-                // SAFETY: openat as above, re-checking the winner.
-                let fd = unsafe {
-                    libc::openat(
-                        cur.0,
-                        cname.as_ptr(),
-                        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
-                    )
-                };
-                if fd < 0 {
-                    return Err(std::io::Error::last_os_error()).with_context(|| {
-                        format!(
-                            "failed to reopen created key directory component {}",
-                            acc.display()
-                        )
-                    });
-                }
-                // We created this directory ourselves, so pin its mode to
-                // exactly 0700 (the requested mode, unmasked). A race winner
-                // (`created == false`) is not fchmod'd: it is verified as-is.
-                if created {
-                    // SAFETY: `fd` is the descriptor of the directory this
-                    // process just created and owns.
-                    if unsafe { libc::fchmod(fd, 0o700) } != 0 {
-                        let ch_err = std::io::Error::last_os_error();
-                        // SAFETY: `fd` is a descriptor we own from openat.
-                        unsafe { libc::close(fd) };
-                        return Err(ch_err).with_context(|| {
-                            format!(
-                                "failed to pin mode 0700 on created key directory component {}",
-                                acc.display()
-                            )
-                        });
-                    }
-                }
-                // SAFETY: `fd` is a descriptor we own from openat; the OwnedFd
-                // below takes ownership and closes it when the chain advances.
-                verify_component(fd, dir, &acc, euid)?;
-                cur = OwnedFd(fd);
-            }
-            _ => {
-                return Err(std::io::Error::last_os_error()).with_context(|| {
-                    format!("failed to open key directory component {}", acc.display())
-                });
-            }
-        }
+        // The R3 predicate still judges every component, created or adopted.
+        verify_component(next.get().as_raw_fd(), dir, &acc, euid)?;
+        cur = next.into_inner();
     }
-    Ok(())
+    Ok(cur)
+}
+
+/// Map an io error from the pinned-creation helper onto the walk's own
+/// vocabulary, preserving the symlink and wrong-object-type messages the
+/// storage-contract tests assert on.
+#[cfg(unix)]
+fn walk_component_error(e: std::io::Error, key_dir: &Path, component: &Path) -> anyhow::Error {
+    match e.raw_os_error() {
+        Some(code) if code == libc::ELOOP || code == libc::ENOTDIR => anyhow::anyhow!(
+            "p2p key directory {} sits under {}, which is a symlink or another object type; \
+             the node refuses anything but a real directory on the key storage path",
+            key_dir.display(),
+            component.display()
+        ),
+        _ => anyhow::Error::new(e).context(format!(
+            "failed to open or create key directory component {}",
+            component.display()
+        )),
+    }
 }
 
 /// Whether the configured path names a directory rather than a key file.
@@ -800,9 +1023,27 @@ struct KeyDirHandle {
 
 #[cfg(unix)]
 impl KeyDirHandle {
+    /// Build a handle from a descriptor that has already been pinned and
+    /// verified by [`pin::create_dir_pinned_at`].
+    ///
+    /// This is the only unix constructor on the production path, and taking a
+    /// `Pinned` rather than a bare descriptor is what makes the mode rule
+    /// compile-enforced: a directory that never went through the pin helper
+    /// cannot be turned into a `KeyDirHandle`, so it cannot reach key IO.
+    fn from_pinned_fd(pinned: pin::Pinned<std::os::fd::OwnedFd>, dir_path: &Path) -> KeyDirHandle {
+        KeyDirHandle {
+            dir: std::fs::File::from(pinned.into_inner()),
+            path: dir_path.to_path_buf(),
+        }
+    }
+
     /// Open `dir_path` refusing symlinks and non-directories at the open
     /// itself, so rejection happens before any chmod or key IO rather than
     /// after a separate stat that something else could invalidate.
+    ///
+    /// Test-only on unix: the production path builds its handle from the
+    /// pinned descriptor the walk hands back, never by re-resolving a pathname.
+    #[cfg(test)]
     fn open(dir_path: &Path) -> std::io::Result<KeyDirHandle> {
         use std::os::unix::fs::OpenOptionsExt;
 
@@ -869,12 +1110,22 @@ impl KeyDirHandle {
 
     /// Create a scratch file with 0600 applied at creation. `O_EXCL` keeps a
     /// collision an error rather than an adoption.
-    fn create_scratch(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
-        self.open_child(
+    fn create_scratch(
+        &self,
+        name: &std::ffi::OsStr,
+    ) -> std::io::Result<pin::Pinned<std::fs::File>> {
+        let file = self.open_child(
             name,
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
             0o600 as libc::mode_t,
-        )
+        )?;
+        // 0600 was the REQUESTED mode and the umask has already edited it, so
+        // pin it on the descriptor we hold and verify what actually landed.
+        // Without this the key is published at whatever the mask allowed, the
+        // creating boot still succeeds on this open descriptor, and the NEXT
+        // boot cannot read its own key. `O_EXCL` guarantees this process
+        // created the inode, so there is no race winner to leave alone.
+        pin::pin_created_file(file, 0o600, &self.path.join(name), effective_uid())
     }
 
     /// Atomically publish `from` at `to` via `linkat` on the held descriptor.
@@ -960,7 +1211,10 @@ impl KeyDirHandle {
         std::fs::OpenOptions::new().read(true).open(path)
     }
 
-    fn create_scratch(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+    fn create_scratch(
+        &self,
+        name: &std::ffi::OsStr,
+    ) -> std::io::Result<pin::Pinned<std::fs::File>> {
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1004,6 +1258,16 @@ fn describe_unusable_key_dir(dir: &Path, e: std::io::Error) -> anyhow::Error {
                     dir.display()
                 );
             }
+            Some(code) if code == libc::EACCES => {
+                return anyhow::anyhow!(
+                    "GITLAWB_P2P_KEY's directory {} cannot be opened by this node; run \
+                     `chmod 700 {}` if it should own it. Check the directory's current mode \
+                     first: two node processes starting at once can produce this transiently, \
+                     in which case the directory is already 0700 and the next start succeeds.",
+                    dir.display(),
+                    dir.display()
+                );
+            }
             _ => {}
         }
     }
@@ -1040,74 +1304,45 @@ fn describe_unusable_key_dir(dir: &Path, e: std::io::Error) -> anyhow::Error {
 /// `~/.gitlawb/identity.pem` lives in this directory too, so this covers both
 /// keys. Issue #231 owns the sibling gap in `main.rs`'s own creation path for
 /// that file; nothing here touches it.
+#[cfg(unix)]
 fn ensure_key_dir(dir: &Path) -> Result<KeyDirHandle> {
-    #[cfg(unix)]
-    {
-        let euid = effective_uid();
-        verify_and_create_ancestor_chain(dir, euid)?;
-    }
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    // Non-unix builds keep the platform-neutral ancestor creation: the
-    // descriptor-anchored walk above is unix-only, so without this a non-unix
-    // first boot would have no way to create missing ancestors at all.
-    #[cfg(not(unix))]
-    if let Some(parent) = dir.parent() {
-        if !parent.as_os_str().is_empty() && parent != dir {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "failed to create parent directories for key directory {}",
-                    dir.display()
-                )
-            })?;
-        }
-    }
+    let euid = effective_uid();
 
-    let handle = match KeyDirHandle::open(dir) {
-        Ok(handle) => handle,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = std::fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            match builder.create(dir) {
-                Ok(()) => {}
-                // Rule 5 at the directory layer: two first boots can both see
-                // the leaf absent, and only one `mkdir` wins. Losing is a
-                // successful outcome of the same state transition, not an
-                // error — what matters is what actually occupies the path now,
-                // and the re-open below judges that object itself (a symlink
-                // or non-directory raced into place fails there, before any
-                // chmod or key IO). The winner's owner and mode are then
-                // verified through the handle like any pre-existing directory.
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("failed to create key directory {}", dir.display())
-                    });
-                }
-            }
-            KeyDirHandle::open(dir).map_err(|e| describe_unusable_key_dir(dir, e))?
-        }
-        Err(e) => return Err(describe_unusable_key_dir(dir, e)),
-    };
+    // The walk hands back the key directory's PARENT descriptor, so the leaf is
+    // created and judged relative to a verified parent rather than by resolving
+    // its pathname a second time.
+    let parent_fd = verify_and_create_ancestor_chain(dir, euid)?;
+    let leaf_name = dir.file_name().ok_or_else(|| {
+        anyhow::anyhow!(
+            "p2p key directory {} names no final component",
+            dir.display()
+        )
+    })?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        use std::os::unix::fs::PermissionsExt;
+    let (pinned, created) = pin::create_dir_pinned_at(parent_fd.as_raw_fd(), leaf_name, dir, euid)
+        .map_err(|e| describe_unusable_key_dir(dir, e))?;
+    let handle = KeyDirHandle::from_pinned_fd(pinned, dir);
 
+    // A directory this process just created is already verified at exactly 0700
+    // by the helper. Only an adopted one (pre-existing, or the winner of a
+    // creation race) is judged here, and it is never widened beyond 0700.
+    if !created {
         let md = handle
             .metadata()
             .with_context(|| format!("failed to stat key directory {}", dir.display()))?;
 
-        let euid = effective_uid();
         if let Some(err) = foreign_ownership_error("key directory", dir, md.uid(), euid) {
             anyhow::bail!(err);
         }
 
-        let mode = md.permissions().mode() & 0o777;
+        // Read the full permission word, not `& 0o777`: an inherited setgid bit
+        // makes a 2700 directory compare unequal to 0700, and judging the two
+        // on different bit widths would skip the repair and then fail the
+        // verify.
+        let mode = md.permissions().mode() & 0o7777;
         if mode & 0o077 != 0 {
             warn!(
                 dir = %dir.display(),
@@ -1126,8 +1361,74 @@ fn ensure_key_dir(dir: &Path) -> Result<KeyDirHandle> {
                     dir.display()
                 )
             })?;
+            let after = handle
+                .metadata()
+                .with_context(|| format!("failed to re-stat key directory {}", dir.display()))?
+                .permissions()
+                .mode()
+                & 0o7777;
+            if after != 0o700 {
+                anyhow::bail!(
+                    "key directory {} achieved mode {:04o}, requested 0700, after tightening",
+                    dir.display(),
+                    after
+                );
+            }
+        } else if mode != 0o700 {
+            // Over-closed, and deliberately NOT widened. Granting owner-write
+            // back to a directory an operator froze would override their
+            // intent, and it would fire the "a loose key directory was
+            // tightened, treat the key as exposed" advice for a case where
+            // nothing was ever exposed. Refuse with the remedy instead, which
+            // is how an over-closed key FILE is already handled.
+            anyhow::bail!(
+                "p2p key directory {} has mode {:04o}, which this node cannot use; it is not \
+                 widened automatically because a directory closed on purpose is an operator \
+                 decision. Run `chmod 700 {}` if the node should own it.",
+                dir.display(),
+                mode,
+                dir.display()
+            );
         }
     }
+
+    Ok(handle)
+}
+
+/// Non-unix builds have no descriptor-anchored walk and no mode enforcement,
+/// so they keep the platform-neutral create-then-open flow unchanged.
+#[cfg(not(unix))]
+fn ensure_key_dir(dir: &Path) -> Result<KeyDirHandle> {
+    if let Some(parent) = dir.parent() {
+        if !parent.as_os_str().is_empty() && parent != dir {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create parent directories for key directory {}",
+                    dir.display()
+                )
+            })?;
+        }
+    }
+
+    let handle = match KeyDirHandle::open(dir) {
+        Ok(handle) => handle,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::DirBuilder::new().create(dir) {
+                Ok(()) => {}
+                // Losing a creation race is a successful outcome of the same
+                // state transition; the re-open below judges whatever occupies
+                // the path now.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("failed to create key directory {}", dir.display())
+                    });
+                }
+            }
+            KeyDirHandle::open(dir).map_err(|e| describe_unusable_key_dir(dir, e))?
+        }
+        Err(e) => return Err(describe_unusable_key_dir(dir, e)),
+    };
 
     Ok(handle)
 }
@@ -1165,7 +1466,7 @@ fn write_key_atomically(
 /// with a leftover or a sibling thread impossible rather than merely unlikely.
 fn create_scratch_key_file(
     dir: &KeyDirHandle,
-) -> std::io::Result<(std::ffi::OsString, std::fs::File)> {
+) -> std::io::Result<(std::ffi::OsString, pin::Pinned<std::fs::File>)> {
     let pid = std::process::id();
     for attempt in 0..64u32 {
         let scratch_name = std::ffi::OsString::from(format!(".p2p.key.{pid}.{attempt}.tmp"));
@@ -1182,7 +1483,7 @@ fn create_scratch_key_file(
 }
 
 fn fill_and_publish(
-    file: &mut std::fs::File,
+    file: &mut pin::Pinned<std::fs::File>,
     bytes: &[u8],
     dir: &KeyDirHandle,
     scratch_name: &std::ffi::OsStr,
@@ -1192,14 +1493,14 @@ fn fill_and_publish(
 
     #[cfg(test)]
     if FAIL_KEY_WRITE.with(|f| f.get()) {
-        file.write_all(&bytes[..bytes.len() / 2])?;
+        file.get_mut().write_all(&bytes[..bytes.len() / 2])?;
         return Err(std::io::Error::other("injected key-write failure"));
     }
 
-    file.write_all(bytes)?;
+    file.get_mut().write_all(bytes)?;
     // The bytes must be durable before the name that points at them appears,
     // otherwise a crash can leave the entry pointing at an empty file.
-    file.sync_all()?;
+    file.get_mut().sync_all()?;
     dir.publish(scratch_name, key_name)?;
 
     // The new directory entry must reach disk too, and the sync goes to the
@@ -1289,6 +1590,19 @@ fn open_existing_key(
     match dir.open_key_for_read(key_name) {
         Ok(file) => Ok(Some(file)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        // An unreadable key is its own diagnosis and must not be reported as a
+        // refused symlink: a key published under a mask that stripped the owner
+        // bits lands here, and naming the wrong cause sends the operator after
+        // a link that does not exist. The key is NOT chmodded back; a key file
+        // closed on purpose is an operator decision.
+        Err(e) if e.raw_os_error() == Some(libc::EACCES) => {
+            Err(anyhow::Error::new(e).context(format!(
+                "failed to open p2p key at {}: this node cannot read it. Run `chmod 600 {}` if \
+                 the key should be readable, or delete it to generate a fresh identity.",
+                key_path.display(),
+                key_path.display()
+            )))
+        }
         Err(e) => Err(anyhow::Error::new(e).context(format!(
             "failed to open p2p key at {} (a symlink here is refused rather than followed)",
             key_path.display()
@@ -1956,6 +2270,656 @@ mod tests {
         assert!(
             stdout.contains("p2p-key-multilevel: asserted"),
             "the fixture must print its sentinel after asserting\n--- stdout ---\n{stdout}"
+        );
+    }
+
+    // ---- U1: umask x layout x phase lifecycle matrix ----------------------
+    //
+    // The committed umask fixtures above both use `umask(0o000)`, the
+    // PERMISSIVE direction, which proves only that an ambient mask cannot
+    // WIDEN a requested mode. Neither can go red on the round-5 defect, which
+    // needs a mask that REMOVES owner access: under `umask 0777` a requested
+    // 0700 lands 0000, the no-follow reopen fails EACCES before the repairing
+    // fchmod is reached, and a requested 0600 key is published unreadable, so
+    // the boot that created it succeeds on its already-open descriptor and the
+    // NEXT boot silently loses p2p.
+    //
+    // `umask` is process-global, so the matrix cannot live in the shared test
+    // process; every row is a child, double-gated like the fixtures above.
+
+    /// Requested modes, named once so the failure text can print achieved
+    /// against requested rather than a bare boolean.
+    #[cfg(unix)]
+    const WANT_DIR_MODE: u32 = 0o700;
+    #[cfg(unix)]
+    const WANT_KEY_MODE: u32 = 0o600;
+    /// Mode the fixture builds PRE-EXISTING ancestors at. Not group-writable,
+    /// so the ancestor predicate accepts it, and R6 says it must survive.
+    #[cfg(unix)]
+    const PREEXISTING_ANCESTOR_MODE: u32 = 0o755;
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path)
+            .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    /// Every object on the key path with its achieved mode against what the
+    /// contract requested. This is what makes a RED attributable to the mode
+    /// rather than to "something failed" (INV-21(g)); red-check matches on it.
+    #[cfg(unix)]
+    fn describe_key_tree(base: &Path, key: &Path) -> String {
+        let mut out = String::new();
+        let mut cur = key.parent();
+        let mut dirs = Vec::new();
+        while let Some(d) = cur {
+            dirs.push(d.to_path_buf());
+            if d == base {
+                break;
+            }
+            cur = d.parent();
+        }
+        dirs.reverse();
+        for d in dirs {
+            match std::fs::symlink_metadata(&d) {
+                Ok(_) => out.push_str(&format!(
+                    "  dir  {} achieved mode {:04o}, requested {:04o}\n",
+                    d.display(),
+                    mode_of(&d),
+                    WANT_DIR_MODE
+                )),
+                Err(e) => out.push_str(&format!("  dir  {} absent ({e})\n", d.display())),
+            }
+        }
+        match std::fs::symlink_metadata(key) {
+            Ok(_) => out.push_str(&format!(
+                "  key  {} achieved mode {:04o}, requested {:04o}\n",
+                key.display(),
+                mode_of(key),
+                WANT_KEY_MODE
+            )),
+            Err(e) => out.push_str(&format!("  key  {} absent ({e})\n", key.display())),
+        }
+        out
+    }
+
+    /// Fail with the achieved-vs-requested tree rather than the bare error, so
+    /// the reason a row went red is in the output.
+    #[cfg(unix)]
+    fn expect_boot(base: &Path, key: &Path, phase: &str) -> identity::Keypair {
+        match load_or_create_p2p_keypair(key) {
+            Ok(kp) => kp,
+            // `{e:#}`, not `{e}`: the mode refusal is raised deep in the pin
+            // helper and every layer above it adds context, so the default
+            // format shows only "failed to write p2p key" and hides the
+            // achieved-versus-requested text that says WHY. A failure whose
+            // reason is not in the output cannot be attributed to the mode.
+            Err(e) => panic!(
+                "{phase} must boot, got: {e:#}\nkey storage at failure:\n{}",
+                describe_key_tree(base, key)
+            ),
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_contract_modes(base: &Path, key: &Path, layout: &str) {
+        let keys_dir = key.parent().unwrap();
+        let created_dirs: Vec<std::path::PathBuf> = match layout {
+            // `a` and `b` were created by the node, `keys` too.
+            "all-missing" => vec![
+                base.join("a"),
+                base.join("a").join("b"),
+                keys_dir.to_path_buf(),
+            ],
+            // `a` and `b` pre-existed; only `keys` was created.
+            "ancestors-present" => vec![keys_dir.to_path_buf()],
+            // nothing was created.
+            "leaf-present" => vec![],
+            other => panic!("unknown layout {other}"),
+        };
+        for d in created_dirs {
+            assert_eq!(
+                mode_of(&d),
+                WANT_DIR_MODE,
+                "created directory {} achieved mode {:04o}, requested {:04o}\n{}",
+                d.display(),
+                mode_of(&d),
+                WANT_DIR_MODE,
+                describe_key_tree(base, key)
+            );
+        }
+        if layout != "all-missing" {
+            for d in [base.join("a"), base.join("a").join("b")] {
+                assert_eq!(
+                    mode_of(&d),
+                    PREEXISTING_ANCESTOR_MODE,
+                    "pre-existing ancestor {} must keep its mode (R6): achieved {:04o}, \
+                     expected {:04o}",
+                    d.display(),
+                    mode_of(&d),
+                    PREEXISTING_ANCESTOR_MODE
+                );
+            }
+        }
+        assert_eq!(
+            mode_of(key),
+            WANT_KEY_MODE,
+            "key {} achieved mode {:04o}, requested {:04o}\n{}",
+            key.display(),
+            mode_of(key),
+            WANT_KEY_MODE,
+            describe_key_tree(base, key)
+        );
+        let entries: Vec<String> = std::fs::read_dir(keys_dir)
+            .expect("read key directory")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![key.file_name().unwrap().to_string_lossy().into_owned()],
+            "the key directory must hold only the published key, no scratch residue: {entries:?}"
+        );
+    }
+
+    /// Build the pre-existing part of the layout. Runs AFTER the umask is set,
+    /// with explicit chmods, so a pre-existing directory has the mode the row
+    /// names regardless of the mask.
+    #[cfg(unix)]
+    fn build_layout(base: &Path, layout: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let ab = base.join("a").join("b");
+        match layout {
+            "all-missing" => {}
+            "ancestors-present" | "leaf-present" => {
+                // One level at a time, chmodding each before descending.
+                // `create_dir_all` would build every level under the row's
+                // umask first, so under 0777 the outermost lands 0000 and the
+                // next `mkdir` inside it fails: the fixture that proves umask
+                // independence has to be umask-independent itself.
+                for d in [base.join("a"), ab.clone()] {
+                    std::fs::create_dir(&d).expect("create pre-existing ancestor");
+                    std::fs::set_permissions(
+                        &d,
+                        std::fs::Permissions::from_mode(PREEXISTING_ANCESTOR_MODE),
+                    )
+                    .expect("chmod pre-existing ancestor");
+                }
+                if layout == "leaf-present" {
+                    let keys = ab.join("keys");
+                    std::fs::create_dir(&keys).expect("create pre-existing leaf");
+                    std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700))
+                        .expect("chmod pre-existing leaf");
+                }
+            }
+            other => panic!("unknown layout {other}"),
+        }
+    }
+
+    /// Fixture: one (umask, layout, phase) row of the lifecycle matrix.
+    ///
+    /// Double-gated exactly like the fixtures above: `#[ignore]` keeps it out
+    /// of a normal run and the env check keeps it inert under a bare
+    /// `--ignored` sweep, which would otherwise set a process-global umask
+    /// inside the shared test process.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=p2p-key-umask"]
+    fn fixture_p2p_key_umask_lifecycle() {
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("p2p-key-umask") {
+            return;
+        }
+
+        let base = std::path::PathBuf::from(
+            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+        );
+        let umask_str = std::env::var("GITLAWB_TEST_UMASK").expect("GITLAWB_TEST_UMASK");
+        let umask_val = u32::from_str_radix(&umask_str, 8).expect("octal umask");
+        let layout = std::env::var("GITLAWB_TEST_LAYOUT").expect("GITLAWB_TEST_LAYOUT");
+        let phase = std::env::var("GITLAWB_TEST_PHASE").expect("GITLAWB_TEST_PHASE");
+
+        // The EACCES rows are meaningless as root, which bypasses mode checks.
+        // Fail loudly rather than skipping: a silent skip here would make the
+        // whole matrix vacuous in a root container.
+        // SAFETY: `geteuid` only reads the calling process's effective uid.
+        assert_ne!(
+            unsafe { libc::geteuid() },
+            0,
+            "the lifecycle matrix must not run as root: mode refusals do not apply to uid 0"
+        );
+
+        // SAFETY: `umask` only reads and replaces the process-wide value, and
+        // this process exists solely for this row. No restore: the value dies
+        // with the child.
+        unsafe { libc::umask(umask_val as libc::mode_t) };
+
+        let key = base.join("a").join("b").join("keys").join("p2p.key");
+
+        let peer_id = match phase.as_str() {
+            "create" => {
+                build_layout(&base, &layout);
+                let kp = expect_boot(&base, &key, "first boot");
+                assert_contract_modes(&base, &key, &layout);
+                PeerId::from(kp.public())
+            }
+            "reload" => {
+                // The tree was left by a previous `create` child under this
+                // same base; this process only reads it.
+                assert!(
+                    key.exists(),
+                    "reload row requires the create row to have published a key at {}",
+                    key.display()
+                );
+                let kp = expect_boot(&base, &key, "reload in a fresh process");
+                assert_contract_modes(&base, &key, &layout);
+                PeerId::from(kp.public())
+            }
+            "create-concurrent" => {
+                build_layout(&base, &layout);
+                let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+                let mut handles = Vec::new();
+                for _ in 0..2 {
+                    let b = std::sync::Arc::clone(&barrier);
+                    let k = key.clone();
+                    handles.push(std::thread::spawn(move || {
+                        b.wait();
+                        load_or_create_p2p_keypair(&k).map(|kp| PeerId::from(kp.public()))
+                    }));
+                }
+                let results: Vec<Result<PeerId>> =
+                    handles.into_iter().map(|h| h.join().unwrap()).collect();
+                let winners: Vec<PeerId> = results
+                    .iter()
+                    .filter_map(|r| r.as_ref().ok())
+                    .copied()
+                    .collect();
+                // Requiring at least one success is what keeps this row able to
+                // go RED. "every Ok agrees" alone passes when zero creators
+                // succeed, which is exactly the regression a widened
+                // create-to-pin window would produce.
+                assert!(
+                    !winners.is_empty(),
+                    "at least one concurrent creator must succeed; all failed:\n{:?}\n{}",
+                    results
+                        .iter()
+                        .map(|r| r.as_ref().err().map(|e| e.to_string()))
+                        .collect::<Vec<_>>(),
+                    describe_key_tree(&base, &key)
+                );
+                assert!(
+                    winners.iter().all(|p| *p == winners[0]),
+                    "concurrent creators disagreed on the PeerId: {winners:?}"
+                );
+                assert_contract_modes(&base, &key, &layout);
+                // A fresh reload after both finish must agree with the winners.
+                let reloaded = PeerId::from(expect_boot(&base, &key, "post-race reload").public());
+                assert_eq!(
+                    reloaded, winners[0],
+                    "the published key must reload to the winning PeerId"
+                );
+                reloaded
+            }
+            "create-interrupted" => {
+                build_layout(&base, &layout);
+                FAIL_KEY_WRITE.with(|f| f.set(true));
+                let interrupted = load_or_create_p2p_keypair(&key);
+                FAIL_KEY_WRITE.with(|f| f.set(false));
+                assert!(
+                    interrupted.is_err(),
+                    "an injected write failure must not report success"
+                );
+                assert!(
+                    !key.exists(),
+                    "an interrupted publish must leave nothing at the final key path"
+                );
+                let keys_dir = key.parent().unwrap();
+                if keys_dir.exists() {
+                    let residue: Vec<String> = std::fs::read_dir(keys_dir)
+                        .expect("read key directory")
+                        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                        .collect();
+                    assert!(
+                        residue.is_empty(),
+                        "an interrupted publish must leave no scratch residue: {residue:?}"
+                    );
+                }
+                let kp = expect_boot(&base, &key, "boot after an interrupted publish");
+                assert_contract_modes(&base, &key, &layout);
+                PeerId::from(kp.public())
+            }
+            other => panic!("unknown phase {other}"),
+        };
+
+        // Printed only after every assertion for this row, and carrying the
+        // PeerId so the parent can compare create against reload. "1 passed"
+        // does not prove the row asserted anything: the env gate above returns
+        // early, and an early return is itself a passing test.
+        println!("p2p-key-umask: asserted peer_id={peer_id}");
+    }
+
+    // ---- U2: the pin and the exact-mode verify are load-bearing -----------
+
+    /// Fixture: disable the pin and confirm the exact-mode VERIFY is what
+    /// refuses, naming the achieved mode.
+    ///
+    /// Without this the verify could be inert: with the pin doing the work, a
+    /// weakened or deleted verify would never be observed. Deleting the added
+    /// term alone and watching it go red is the INV-21(i) precondition.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=p2p-key-skip-pin"]
+    fn fixture_p2p_key_skip_pin_is_caught_by_the_verify() {
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("p2p-key-skip-pin") {
+            return;
+        }
+        let base = std::path::PathBuf::from(
+            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+        );
+        let target = std::env::var("GITLAWB_TEST_TARGET").expect("GITLAWB_TEST_TARGET");
+        let umask_val =
+            u32::from_str_radix(&std::env::var("GITLAWB_TEST_UMASK").unwrap(), 8).unwrap();
+
+        // SAFETY: `umask` only reads and replaces the process-wide value, and
+        // this process exists solely for this probe.
+        unsafe { libc::umask(umask_val as libc::mode_t) };
+        pin::SKIP_MODE_PIN.with(|c| c.set(true));
+
+        let key = base.join("keys").join("p2p.key");
+        let err = load_or_create_p2p_keypair(&key)
+            .expect_err("with the pin disabled the exact-mode verify must refuse");
+        let text = format!("{err:#}");
+
+        // The refusal must name the ACHIEVED mode. A generic failure would let
+        // an unrelated RED (an EACCES on the reopen, say) pass for this one.
+        let (want_achieved, want_requested) = match target.as_str() {
+            "dir" => ("achieved mode 0500", "requested 0700"),
+            "key" => ("achieved mode 0200", "requested 0600"),
+            other => panic!("unknown target {other}"),
+        };
+        assert!(
+            text.contains(want_achieved) && text.contains(want_requested),
+            "the refusal must name the achieved mode against the requested one, got: {text}"
+        );
+        println!("p2p-key-skip-pin: asserted target={target}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p2p_key_mode_pin_is_load_bearing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // dir: umask 0277 leaves a created directory at 0500, which is still
+        // openable, so the reopen succeeds and only the verify can catch it.
+        // key: umask 0477 leaves a created file at 0200.
+        for (target, umask) in [("dir", "0277"), ("key", "0477")] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            if target == "key" {
+                // Pre-create the key directory so the run reaches the key.
+                let keys = base.path().join("keys");
+                std::fs::create_dir(&keys).unwrap();
+                std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let output = fixture_command_with_env(
+                "p2p::tests::fixture_p2p_key_skip_pin_is_caught_by_the_verify",
+                "p2p-key-skip-pin",
+            )
+            .env("GITLAWB_TEST_BASE", base.path())
+            .env("GITLAWB_TEST_TARGET", target)
+            .env("GITLAWB_TEST_UMASK", umask)
+            .output()
+            .expect("spawn the skip-pin fixture");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "target={target}: the skip-pin fixture must pass\n\
+                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            );
+            assert!(
+                stdout.contains("1 passed"),
+                "target={target}: filter must select one passing test\n{stdout}"
+            );
+            assert!(
+                stdout.contains(&format!("p2p-key-skip-pin: asserted target={target}")),
+                "target={target}: fixture must print its sentinel\n{stdout}"
+            );
+        }
+    }
+
+    /// A directory this process did NOT create is verified as-is and never
+    /// chmodded, which is what keeps a concurrent first boot from rewriting the
+    /// winner's directory.
+    #[cfg(unix)]
+    #[test]
+    fn ancestor_race_winner_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = key_base_0700();
+        let key = base.path().join("a").join("keys").join("p2p.key");
+
+        // Arm the race: `a` is created by "another process" at 0750 in the
+        // window between the ENOENT and our mkdirat.
+        pin::RACE_CREATE_MODE.with(|c| c.set(Some(0o750)));
+        load_or_create_p2p_keypair(&key).expect("a race-won ancestor at 0750 is acceptable");
+
+        let mode = std::fs::metadata(base.path().join("a"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            mode, 0o750,
+            "race winner must keep its mode: achieved {mode:04o}, expected 0750"
+        );
+    }
+
+    /// The leaf rule in both directions: a directory that is too OPEN is
+    /// tightened, one that is too CLOSED is refused rather than widened.
+    #[cfg(unix)]
+    #[test]
+    fn key_directory_is_tightened_when_loose_and_refused_when_over_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Too open: tightened to exactly 0700.
+        for loose in [0o750u32, 0o755, 0o770] {
+            let base = key_base_0700();
+            let keys = base.path().join("keys");
+            std::fs::create_dir(&keys).unwrap();
+            std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(loose)).unwrap();
+            load_or_create_p2p_keypair(&keys.join("p2p.key")).unwrap_or_else(|e| {
+                panic!("a loose key directory ({loose:04o}) is tightened: {e}")
+            });
+            let after = std::fs::metadata(&keys).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(after, 0o700, "loose {loose:04o} must be tightened to 0700");
+        }
+
+        // An inherited setgid bit must be repaired, not refused: 2700 compares
+        // unequal to 0700 on the full word, and judging the predicate on 0o777
+        // while verifying on 0o7777 would skip the repair and then fail.
+        {
+            let base = key_base_0700();
+            let keys = base.path().join("keys");
+            std::fs::create_dir(&keys).unwrap();
+            std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o2750)).unwrap();
+            load_or_create_p2p_keypair(&keys.join("p2p.key"))
+                .expect("a setgid key directory is repaired rather than refused");
+            let after = std::fs::metadata(&keys).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(after, 0o700, "setgid 2750 must be tightened to 0700");
+        }
+
+        // Too closed: refused, named, and left exactly as the operator set it.
+        for closed in [0o500u32, 0o100, 0o600] {
+            let base = key_base_0700();
+            let keys = base.path().join("keys");
+            std::fs::create_dir(&keys).unwrap();
+            std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(closed)).unwrap();
+            let err = load_or_create_p2p_keypair(&keys.join("p2p.key"))
+                .expect_err("an over-closed key directory must be refused, not widened");
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("chmod 700"),
+                "the refusal must name the remedy, got: {text}"
+            );
+            let after = std::fs::metadata(&keys).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(
+                after, closed,
+                "an over-closed directory ({closed:04o}) must be left untouched, found {after:04o}"
+            );
+            assert!(
+                !keys.join("p2p.key").exists(),
+                "a refusal must not create a key"
+            );
+        }
+    }
+
+    /// An unreadable existing key names its own cause and its own remedy, and
+    /// is never chmodded back.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_existing_key_is_refused_with_the_chmod_600_remedy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = key_base_0700();
+        let keys = base.path().join("keys");
+        std::fs::create_dir(&keys).unwrap();
+        std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let key = keys.join("p2p.key");
+
+        let created = load_or_create_p2p_keypair(&key).expect("first boot");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let err = load_or_create_p2p_keypair(&key).expect_err("an unreadable key must be refused");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("chmod 600"),
+            "the refusal must name the remedy, got: {text}"
+        );
+        // The old message blamed a symlink for every open failure, which sent
+        // the operator after a link that does not exist.
+        assert!(
+            !text.contains("symlink here is refused"),
+            "an unreadable key must not be reported as a refused symlink, got: {text}"
+        );
+        assert_eq!(
+            std::fs::metadata(&key).unwrap().permissions().mode() & 0o7777,
+            0o000,
+            "a refusal must not chmod the key back"
+        );
+
+        // 0400 is readable and owner-only, so it still loads.
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let reloaded = load_or_create_p2p_keypair(&key).expect("a 0400 key still loads");
+        assert_eq!(
+            PeerId::from(created.public()),
+            PeerId::from(reloaded.public()),
+            "the reloaded key must be the same identity"
+        );
+    }
+
+    /// Parent for the lifecycle matrix: drives every row as a child process,
+    /// inspects the resulting tree itself, and requires create and reload to
+    /// agree on the PeerId.
+    #[cfg(unix)]
+    #[test]
+    fn p2p_key_lifecycle_matrix_is_umask_independent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const SENTINEL: &str = "p2p-key-umask: asserted peer_id=";
+
+        // Run one row and return the PeerId it printed.
+        fn run_row(base: &Path, umask: &str, layout: &str, phase: &str) -> String {
+            let output = fixture_command_with_env(
+                "p2p::tests::fixture_p2p_key_umask_lifecycle",
+                "p2p-key-umask",
+            )
+            .env("GITLAWB_TEST_BASE", base)
+            .env("GITLAWB_TEST_UMASK", umask)
+            .env("GITLAWB_TEST_LAYOUT", layout)
+            .env("GITLAWB_TEST_PHASE", phase)
+            .output()
+            .expect("spawn the lifecycle fixture");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let row = format!("umask={umask} layout={layout} phase={phase}");
+
+            assert!(
+                output.status.success(),
+                "row {row} must pass in its child process\n\
+                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            );
+            // A filter matching nothing runs zero tests and exits 0.
+            assert!(
+                stdout.contains("1 passed"),
+                "row {row}: the fixture filter must select exactly one test that passed\
+                 \n--- stdout ---\n{stdout}"
+            );
+            // And "1 passed" does not prove it asserted: the env gate's early
+            // return is itself a passing test.
+            let line = stdout
+                .lines()
+                .find(|l| l.starts_with(SENTINEL))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "row {row}: the fixture must print its sentinel after asserting\
+                     \n--- stdout ---\n{stdout}"
+                    )
+                });
+            line[SENTINEL.len()..].trim().to_string()
+        }
+
+        // A base the PARENT owns, at 0700 so the ancestor predicate accepts it,
+        // and created here (not in the child) so it survives across the create
+        // and reload processes of the same row.
+        fn fresh_base() -> tempfile::TempDir {
+            let d = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            d
+        }
+
+        let umasks = ["0000", "0022", "0777"];
+        let layouts = ["all-missing", "ancestors-present", "leaf-present"];
+
+        // 9 create/reload pairs: every umask against every layout.
+        for umask in umasks {
+            for layout in layouts {
+                let base = fresh_base();
+                let created = run_row(base.path(), umask, layout, "create");
+                let reloaded = run_row(base.path(), umask, layout, "reload");
+                assert_eq!(
+                    created, reloaded,
+                    "umask={umask} layout={layout}: a fresh process must reload the same PeerId"
+                );
+            }
+        }
+
+        // 12 concurrent/interrupted rows on the two layouts where creation
+        // actually happens.
+        for umask in umasks {
+            for layout in ["all-missing", "leaf-present"] {
+                for phase in ["create-concurrent", "create-interrupted"] {
+                    let base = fresh_base();
+                    let created = run_row(base.path(), umask, layout, phase);
+                    let reloaded = run_row(base.path(), umask, layout, "reload");
+                    assert_eq!(
+                        created, reloaded,
+                        "umask={umask} layout={layout} phase={phase}: reload must agree"
+                    );
+                }
+            }
+        }
+
+        // A tree created under an ordinary mask must reload under a hostile
+        // one: reload creates nothing, so the mask must not matter there.
+        let base = fresh_base();
+        let created = run_row(base.path(), "0022", "all-missing", "create");
+        let reloaded = run_row(base.path(), "0777", "all-missing", "reload");
+        assert_eq!(
+            created, reloaded,
+            "a key created under umask 0022 must reload unchanged under umask 0777"
         );
     }
 
