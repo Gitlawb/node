@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use gitlawb_core::http_sig::sign_request;
 use gitlawb_core::identity::Keypair;
@@ -187,6 +187,43 @@ async fn main() -> Result<()> {
         shutdown_tx.subscribe(),
     ));
 
+    // Resolve the p2p identity BEFORE the database connect, both arms of the
+    // port gate together.
+    //
+    // The key load is pure filesystem work with no database dependency, and
+    // its failure is deliberately non-fatal. Leaving it behind the DB connect
+    // meant the "HTTP up, p2p off" outcome and the port-zero no-IO guarantee
+    // were both unobservable whenever the database was unreachable, because
+    // `connect_db_with_retry` retries indefinitely and never falls through.
+    // Moving only the load would have left the disabled arm stranded, so the
+    // whole gate moves and just `p2p::start` stays behind the database.
+    let p2p_local_key = if config.p2p_port > 0 {
+        match p2p::load_or_create_p2p_keypair(&config.resolved_p2p_key_path()) {
+            Ok(local_key) => {
+                metrics::set_p2p_key_load_failed(false);
+                Some(local_key)
+            }
+            // Non-fatal by policy, and the cost is named rather than hidden:
+            // the node keeps serving HTTP with a green /health while it is off
+            // the p2p network entirely. Logged at error with a stable event
+            // name and mirrored into a metric, so the outage is alertable
+            // without reading startup logs by hand.
+            Err(e) => {
+                error!(
+                    err = %format!("{e:#}"),
+                    event = "p2p_identity_key_load_failed",
+                    "failed to load p2p identity key, continuing without p2p"
+                );
+                metrics::set_p2p_key_load_failed(true);
+                None
+            }
+        }
+    } else {
+        info!("p2p disabled (p2p_port = 0)");
+        metrics::set_p2p_key_load_failed(false);
+        None
+    };
+
     // Connect to PostgreSQL database. A transient outage or bad secret should
     // not crash-loop the process and hammer the database provider; permanent
     // misconfiguration surfaces through error-level logs and the /ready check.
@@ -250,49 +287,37 @@ async fn main() -> Result<()> {
     // Ensure repos directory exists
     std::fs::create_dir_all(&config.repos_dir).context("failed to create repos directory")?;
 
-    // Start libp2p swarm (if p2p_port > 0)
-    let p2p_handle = if config.p2p_port > 0 {
-        let bootstrap_addrs = config
-            .p2p_bootstrap
-            .iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        let shutdown_rx = shutdown_tx.subscribe();
-        match p2p::load_or_create_p2p_keypair(&config.resolved_p2p_key_path()) {
-            Ok(local_key) => {
-                match p2p::start(
-                    local_key,
-                    config.p2p_port,
-                    bootstrap_addrs,
-                    Arc::clone(&db),
-                    config.auto_sync,
-                    shutdown_rx,
-                )
-                .await
-                {
-                    Ok(handle) => {
-                        info!(port = config.p2p_port, peer_id = %handle.local_peer_id, "libp2p swarm started");
-                        Some(Arc::new(handle))
-                    }
-                    Err(e) => {
-                        tracing::warn!(err = %e, "failed to start libp2p swarm — continuing without p2p");
-                        None
-                    }
+    // The identity was resolved before the database connect; this is only the
+    // swarm start, which genuinely needs the database handle.
+    let p2p_handle = match p2p_local_key {
+        Some(local_key) => {
+            let bootstrap_addrs = config
+                .p2p_bootstrap
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            let shutdown_rx = shutdown_tx.subscribe();
+            match p2p::start(
+                local_key,
+                config.p2p_port,
+                bootstrap_addrs,
+                Arc::clone(&db),
+                config.auto_sync,
+                shutdown_rx,
+            )
+            .await
+            {
+                Ok(handle) => {
+                    info!(port = config.p2p_port, peer_id = %handle.local_peer_id, "libp2p swarm started");
+                    Some(Arc::new(handle))
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "failed to start libp2p swarm — continuing without p2p");
+                    None
                 }
             }
-            // Deliberately non-fatal, and the cost is worth naming: an
-            // unreadable key file takes the node off the p2p network for the
-            // whole run while /health keeps reporting healthy, so the outage is
-            // visible only to whoever reads the logs. Making it fatal, or
-            // surfacing it in the health response, is its own change.
-            Err(e) => {
-                tracing::warn!(err = %e, "failed to load p2p identity key, continuing without p2p");
-                None
-            }
         }
-    } else {
-        info!("p2p disabled (p2p_port = 0)");
-        None
+        None => None,
     };
 
     // Shared no-redirect HTTP client. See build_http_client for the SSRF rationale.

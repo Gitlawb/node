@@ -813,7 +813,12 @@ impl Config {
                     self.p2p_key_path
                 ));
             }
-            crate::p2p::validate_p2p_key_path(&p2p_key_path, Some(&self.p2p_key_path))?;
+            // Lexical only: this runs before the listener binds and its
+            // failure stops the node, so it must not decide anything about
+            // live filesystem objects. Storage faults belong to the load path,
+            // which degrades instead of exiting.
+            crate::p2p::validate_p2p_key_config(&p2p_key_path, Some(&self.p2p_key_path))
+                .map_err(|e| e.to_string())?;
         }
 
         Ok(())
@@ -1710,6 +1715,106 @@ mod tests {
             0,
             "nothing may be created behind the symlink"
         );
+    }
+
+    /// The other half of the scoping pair: p2p ENABLED, hostile resource on
+    /// disk, and `validate` still passes.
+    ///
+    /// This is the finding-2 boundary. A symlinked parent, a regular file
+    /// where the key directory should be, and an unreadable parent are live
+    /// storage facts, not properties of the configured value, so they belong
+    /// to the load path, which degrades. Deciding them here made the node exit
+    /// before binding for exactly the cases README and `.env.example` promise
+    /// leave HTTP up. Each row also proves validate touched nothing: an
+    /// inspection is still an observation, and the port-zero test above is the
+    /// disabled half of the same pair.
+    #[cfg(unix)]
+    #[test]
+    fn enabled_p2p_does_not_treat_live_storage_faults_as_configuration_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn snapshot(root: &std::path::Path) -> Vec<String> {
+            let mut out = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(root) {
+                for e in entries.flatten() {
+                    let md = std::fs::symlink_metadata(e.path()).unwrap();
+                    out.push(format!(
+                        "{} dir={} link={} mode={:04o}",
+                        e.path().display(),
+                        md.is_dir(),
+                        md.is_symlink(),
+                        md.permissions().mode() & 0o7777
+                    ));
+                }
+            }
+            out.sort();
+            out
+        }
+
+        /// Builds a trap under `base` and returns the key path inside it.
+        type BuildTrap = Box<dyn Fn(&std::path::Path) -> std::path::PathBuf>;
+
+        // (label, build the trap, the key path inside it)
+        let cases: Vec<(&str, BuildTrap)> = vec![
+            (
+                "symlinked parent",
+                Box::new(|base: &std::path::Path| {
+                    let target = base.join("real");
+                    std::fs::create_dir(&target).unwrap();
+                    let link = base.join("keys");
+                    std::os::unix::fs::symlink(&target, &link).unwrap();
+                    link.join("p2p.key")
+                }),
+            ),
+            (
+                "regular file as the key directory",
+                Box::new(|base: &std::path::Path| {
+                    let file = base.join("keys");
+                    std::fs::write(&file, b"not a directory").unwrap();
+                    file.join("p2p.key")
+                }),
+            ),
+            (
+                "unreadable parent",
+                Box::new(|base: &std::path::Path| {
+                    let locked = base.join("locked");
+                    std::fs::create_dir(&locked).unwrap();
+                    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+                        .unwrap();
+                    locked.join("keys").join("p2p.key")
+                }),
+            ),
+        ];
+
+        for (label, build) in cases {
+            let base = tempfile::tempdir().unwrap();
+            let key_path = build(base.path());
+            let before = snapshot(base.path());
+
+            let config = Config::parse_from([
+                "gitlawb-node",
+                "--p2p-port",
+                "7546",
+                "--p2p-key-path",
+                key_path.to_str().unwrap(),
+            ]);
+            let verdict = config.validate();
+            assert!(
+                verdict.is_ok(),
+                "{label}: a live storage fault is not a configuration error, got: {verdict:?}"
+            );
+            assert_eq!(
+                snapshot(base.path()),
+                before,
+                "{label}: validation must not mutate the key tree"
+            );
+
+            // Leave the tempdir removable.
+            let locked = base.path().join("locked");
+            if locked.exists() {
+                let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700));
+            }
+        }
     }
 
     /// Rule 2's positive direction: the shipped `~/` default resolves to a

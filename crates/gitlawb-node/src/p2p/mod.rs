@@ -284,35 +284,6 @@ pub(crate) fn tilde_suffix_escapes_home(suffix: &str) -> bool {
     })
 }
 
-/// Inspect `dir` without following symlinks. Ok when absent; Err when present
-/// but not a real directory.
-pub(crate) fn parent_directory_is_safe_to_mutate(dir: &Path) -> Result<(), String> {
-    match std::fs::symlink_metadata(dir) {
-        Ok(md) => {
-            if md.is_symlink() {
-                return Err(format!(
-                    "GITLAWB_P2P_KEY's directory {} must be a real directory, not a symlink",
-                    dir.display()
-                ));
-            }
-            if !md.is_dir() {
-                return Err(format!(
-                    "GITLAWB_P2P_KEY's directory {} must be a directory, not another file type",
-                    dir.display()
-                ));
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(format!(
-                "failed to inspect key directory {}: {e}",
-                dir.display()
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Mode bits alone do not make something node-owned. A `0700` directory or a
 /// `0600` file belonging to a different user passes every permission check here
 /// while that user keeps the ability to replace what is inside it, which means
@@ -853,53 +824,60 @@ fn path_denotes_a_directory(key_path: &Path, configured_raw: Option<&str>) -> bo
         _ => {}
     }
 
-    if let Ok(md) = std::fs::symlink_metadata(key_path) {
-        return md.is_dir();
-    }
-
+    // Deliberately lexical only. Asking the filesystem whether the path is
+    // currently a directory turns a configuration question into a live storage
+    // observation, and the load path already refuses a directory at the key
+    // position by fstat on the descriptor it opened.
     false
 }
 
 /// Validate the resolved key path before creating or chmodding anything.
 ///
 /// `configured_raw` is the operator's `GITLAWB_P2P_KEY` string when available.
-pub(crate) fn validate_p2p_key_path(
+/// A key path that cannot name a securable key file, whatever is on disk.
+///
+/// A distinct type rather than a `String` so the two failure domains cannot be
+/// confused at a call site: this one is boot-fatal, and everything the load
+/// path discovers about live filesystem objects is not.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct P2pKeyConfigError(String);
+
+pub(crate) fn validate_p2p_key_config(
     key_path: &Path,
     configured_raw: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), P2pKeyConfigError> {
     let display = configured_raw.unwrap_or_else(|| key_path.to_str().unwrap_or("<invalid utf-8>"));
 
     if names_no_usable_directory(key_path) {
-        return Err(format!(
+        return Err(P2pKeyConfigError(format!(
             "GITLAWB_P2P_KEY ({display}) must include a directory that does not walk back through \
              `..`, such as ./keys/p2p.key or /data/keys/p2p.key: the node will not store its p2p \
              identity key in the working directory, where the directory holding it cannot be secured."
-        ));
+        )));
     }
 
     if key_parent_is_filesystem_root(key_path) {
-        return Err(format!(
+        return Err(P2pKeyConfigError(format!(
             "GITLAWB_P2P_KEY ({display}) must not place the key in the filesystem root; use a \
              dedicated directory such as /data/keys/p2p.key"
-        ));
+        )));
     }
 
     if path_denotes_a_directory(key_path, configured_raw) {
-        return Err(format!(
+        return Err(P2pKeyConfigError(format!(
             "GITLAWB_P2P_KEY ({display}) must name a key file, not a directory"
-        ));
+        )));
     }
 
-    if let Ok(md) = std::fs::symlink_metadata(key_path) {
-        if md.is_symlink() {
-            return Err(format!(
-                "GITLAWB_P2P_KEY ({display}) must name a regular key file; symlinks are refused"
-            ));
-        }
-    }
-
-    parent_directory_is_safe_to_mutate(key_parent(key_path))?;
-
+    // Nothing below this point may look at the filesystem. A symlink at the key
+    // path, a directory in its place, a symlinked or non-directory parent, and
+    // an unreadable parent are all live storage facts, and the load path
+    // re-establishes every one of them on a descriptor it actually opens:
+    // `open_key_for_read` adds O_NOFOLLOW, `read_p2p_keypair_from` refuses a
+    // non-regular file, and the leaf openat gives ELOOP or ENOTDIR through
+    // `describe_unusable_key_dir`. Deciding them here made the same fault
+    // fatal or degradable depending only on which layer noticed it first.
     Ok(())
 }
 
@@ -935,7 +913,7 @@ pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> 
     // inspective — the checks below re-establish everything it observed on the
     // actual opened objects, so this exists for early, precise errors rather
     // than for safety.
-    validate_p2p_key_path(key_path, None).map_err(|e| anyhow::anyhow!(e))?;
+    validate_p2p_key_config(key_path, None).map_err(|e| anyhow::anyhow!(e))?;
 
     // Validation rejected paths without a final component, so `file_name` is
     // present from here on; the error is a backstop, not a reachable path for
@@ -1253,6 +1231,18 @@ fn describe_unusable_key_dir(dir: &Path, e: std::io::Error) -> anyhow::Error {
                 );
             }
             Some(code) if code == libc::ENOTDIR => {
+                // Linux returns ENOTDIR, not ELOOP, when O_NOFOLLOW is
+                // combined with O_DIRECTORY on a symlink, so the errno alone
+                // cannot separate a symlink from a regular file. The refusal
+                // already happened; this lstat only picks the wording, and
+                // naming the symlink is what tells an operator what to look
+                // for.
+                if std::fs::symlink_metadata(dir).is_ok_and(|md| md.is_symlink()) {
+                    return anyhow::anyhow!(
+                        "GITLAWB_P2P_KEY's directory {} must be a real directory, not a symlink",
+                        dir.display()
+                    );
+                }
                 return anyhow::anyhow!(
                     "GITLAWB_P2P_KEY's directory {} must be a directory, not another file type",
                     dir.display()
@@ -3211,24 +3201,51 @@ mod tests {
         }
     }
 
+    /// The config validator is LEXICAL only, in both directions.
+    ///
+    /// It used to also stat the key path and its parent, which meant a
+    /// symlinked or unreadable parent exited the node as invalid configuration
+    /// while the very same class of fault found one layer later only logged a
+    /// warning. The live cases now belong to the storage matrix; what stays
+    /// here is what can be decided from the configured string alone.
     #[test]
-    fn validate_p2p_key_path_rejects_root_parent_and_directory_targets() {
-        let root_err =
-            validate_p2p_key_path(Path::new("/p2p.key"), Some("/p2p.key")).expect_err("/p2p.key");
-        assert!(
-            root_err.contains("filesystem root"),
-            "root-parent paths must be refused before chmod, got: {root_err}"
-        );
+    fn validate_p2p_key_config_decides_only_lexical_properties() {
+        // Refused: properties of the value itself.
+        for (raw, needle) in [
+            ("/p2p.key", "filesystem root"),
+            ("keys/", "must include a directory"),
+            ("p2p.key", "must include a directory"),
+            ("a/../p2p.key", "must include a directory"),
+        ] {
+            let err = validate_p2p_key_config(Path::new(raw), Some(raw))
+                .expect_err("a lexically invalid key path must be refused");
+            assert!(
+                err.to_string().contains(needle),
+                "{raw} must be refused for {needle}, got: {err}"
+            );
+        }
 
+        // Accepted, and it must stay accepted no matter what is on disk: an
+        // existing directory at the key position, a symlinked parent and an
+        // unreadable parent are storage facts the load path judges on a
+        // descriptor. Deciding them here is what made the fatal/degraded split
+        // depend on which layer looked first.
         let dir = tempfile::tempdir().unwrap();
         let key_dir = dir.path().join("keys");
         std::fs::create_dir(&key_dir).unwrap();
-        let dir_err = validate_p2p_key_path(&key_dir, Some(key_dir.to_str().unwrap()))
-            .expect_err("an existing directory target");
-        assert!(
-            dir_err.contains("must name a key file"),
-            "directory targets must be refused before chmod, got: {dir_err}"
-        );
+        validate_p2p_key_config(&key_dir, Some(key_dir.to_str().unwrap()))
+            .expect("an existing directory on disk is not a configuration error");
+
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("real");
+            std::fs::create_dir(&target).unwrap();
+            let link = dir.path().join("linked");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let via_link = link.join("p2p.key");
+            validate_p2p_key_config(&via_link, Some(via_link.to_str().unwrap()))
+                .expect("a symlinked parent is not a configuration error");
+        }
     }
 
     #[cfg(unix)]
@@ -3460,13 +3477,17 @@ mod tests {
     fn p2p_symlinked_key_parent_is_refused_before_chmod() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        // A 0700 base: a plain tempdir is 0775 under the suite's umask, and
+        // the pinned-creation helper verifies its own parent, so an unsafe
+        // base is refused before the symlink under test is ever reached.
+        let dir = key_base_0700();
         let real_parent = dir.path().join("real");
         std::fs::create_dir(&real_parent).unwrap();
         std::fs::set_permissions(&real_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let safe = dir.path().join("safe");
         std::fs::create_dir(&safe).unwrap();
+        std::fs::set_permissions(&safe, std::fs::Permissions::from_mode(0o700)).unwrap();
         let link = safe.join("keys");
         std::os::unix::fs::symlink(&real_parent, &link).unwrap();
 
@@ -3803,8 +3824,7 @@ mod tests {
             Row {
                 name: "symlink at the key position is refused",
                 setup: |base| {
-                    let dir = base.join("keys");
-                    std::fs::create_dir(&dir).unwrap();
+                    let dir = key_dir_0700(base);
                     let real = dir.join("real.key");
                     valid_key_at(&real);
                     let link = dir.join("p2p.key");
@@ -3816,8 +3836,7 @@ mod tests {
             Row {
                 name: "dangling symlink at the key position is refused",
                 setup: |base| {
-                    let dir = base.join("keys");
-                    std::fs::create_dir(&dir).unwrap();
+                    let dir = key_dir_0700(base);
                     let link = dir.join("p2p.key");
                     std::os::unix::fs::symlink(dir.join("absent"), &link).unwrap();
                     link
@@ -3827,11 +3846,16 @@ mod tests {
             Row {
                 name: "directory at the key position is refused",
                 setup: |base| {
-                    let path = base.join("keys").join("p2p.key");
-                    std::fs::create_dir_all(&path).unwrap();
+                    let dir = key_dir_0700(base);
+                    let path = dir.join("p2p.key");
+                    std::fs::create_dir(&path).unwrap();
                     path
                 },
-                expect: Expect::Refused("must name a key file"),
+                // The refusal moved from the config validator to the load
+                // path, which judges the object it actually opened rather than
+                // a pathname it stat'd, so it names the object type instead of
+                // the setting. Same verdict, better diagnosis.
+                expect: Expect::Refused("must be a regular file"),
             },
             Row {
                 name: "FIFO at the key position is refused without blocking",
