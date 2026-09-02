@@ -14359,6 +14359,236 @@ mod tests {
         assert!(resp.status().is_success());
     }
 
+    /// #344: `remove_label` must canonicalize the path segment the same way
+    /// `add_label` does, so a label stored as `bug` is matched by `DELETE
+    /// .../labels/Bug`. A delete that matched nothing must be reported as 404
+    /// rather than as `removed:true` — the no-op-rendered-as-success shape the
+    /// rest of the API already rejects on the client side.
+    #[sqlx::test]
+    async fn remove_label_canonicalizes_and_404s_on_no_match(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zLBLREMOVEO0000000000000000000000000000000000";
+        let owner_short = "zLBLREMOVEO0000000000000000000000000000000000";
+        let repo_name = "lbl-remove";
+        state
+            .db
+            .create_repo(&seed_repo(owner, repo_name))
+            .await
+            .expect("seed repo");
+        state
+            .db
+            .add_label(
+                &state
+                    .db
+                    .get_repo(owner_short, repo_name)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                "bug",
+            )
+            .await
+            .expect("seed label");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/labels/{label}",
+                    axum::routing::delete(crate::api::labels::remove_label),
+                )
+                .with_state(state.clone())
+        };
+
+        // Mixed-case path segment matches the lowercased stored label.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/Bug"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "canonicalized delete succeeds"
+        );
+        let body = json_body(resp).await;
+        assert_eq!(body["label"], "bug");
+        assert_eq!(body["removed"], true);
+
+        // Second delete with the same form → no row, must 404 not 200/removed:true.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/Bug"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "no-op delete must report 404, not removed:true"
+        );
+
+        // Path with surrounding whitespace still canonicalizes to a valid label.
+        state
+            .db
+            .add_label(
+                &state
+                    .db
+                    .get_repo(owner_short, repo_name)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                "feature",
+            )
+            .await
+            .expect("seed feature label");
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/%20feature%20"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "trimmed path segment matches the stored label"
+        );
+
+        // Path segment that canonicalizes to an invalid (empty) label → 400.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/%20%20"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a label that canonicalizes to empty is a client error"
+        );
+
+        // Disallowed charset → 400 (validation lives in the shared path now).
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/bad%20label"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "spaces are rejected by canonicalize_label"
+        );
+
+        // Length arm: 51 chars → 400, 50 chars decouples the no-match 404 from
+        // the double-delete above so the helper's len>50 branch is pinned
+        // even if the earlier 404 assertion is ever reworked.
+        let too_long = "a".repeat(51);
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/{too_long}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "51-char label is rejected by canonicalize_label"
+        );
+
+        let exactly_50 = "a".repeat(50);
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/{exactly_50}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "50-char label passes validation but still 404s when absent"
+        );
+    }
+
+    /// #344: `remove_label` stays owner-gated. A non-owner with a real signed
+    /// request against a label that does exist gets 403, never 404 — the
+    /// owner-gated write keeps the existence-leak shape separate from the
+    /// not-found shape (matches `add_label` and the AGENTS.md gate rules).
+    #[sqlx::test]
+    async fn remove_label_denies_non_owner(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zLBLRMOwnr0000000000000000000000000000000000";
+        let owner_short = "zLBLRMOwnr0000000000000000000000000000000000";
+        let stranger = "did:key:zLBLRMStrn0000000000000000000000000000000000";
+        let repo_name = "lbl-rm-priv";
+        state
+            .db
+            .create_repo(&seed_repo(owner, repo_name))
+            .await
+            .expect("seed repo");
+        let repo_id = state
+            .db
+            .get_repo(owner_short, repo_name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        state
+            .db
+            .add_label(&repo_id, "bug")
+            .await
+            .expect("seed label");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/labels/{label}",
+                    axum::routing::delete(crate::api::labels::remove_label),
+                )
+                .with_state(state.clone())
+        };
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/bug"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "non-owner gets 403, the owner-gated mutation shape"
+        );
+
+        // Label is still there.
+        let labels = state.db.list_labels(&repo_id).await.unwrap();
+        assert!(labels.contains(&"bug".to_string()));
+    }
+
     #[sqlx::test]
     async fn list_repo_bounties_gate_denies_anon_on_private(pool: PgPool) {
         let state = test_state(pool).await;
