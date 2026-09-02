@@ -159,6 +159,17 @@ impl Row {
 /// fire. The first version of this file did that and hung for minutes on a row
 /// that was supposed to fail in fifteen seconds.
 fn read_until(child: &mut ChildGuard, needle: &str) -> (bool, String) {
+    read_until_all(child, &[needle])
+}
+
+/// Read until EVERY needle has appeared, the stream ends, or the deadline
+/// passes.
+///
+/// Waiting on a single line is a race here: the degraded server logs "ready"
+/// from a spawned task while the p2p gate logs its verdict from the main task,
+/// so whichever the reader stops at first can leave the other uncaptured. That
+/// made this file pass or fail depending on scheduling.
+fn read_until_all(child: &mut ChildGuard, needles: &[&str]) -> (bool, String) {
     let stdout = child.take_stdout();
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -179,7 +190,7 @@ fn read_until(child: &mut ChildGuard, needle: &str) -> (bool, String) {
     let mut acc = String::new();
     let start = Instant::now();
     loop {
-        if acc.contains(needle) {
+        if needles.iter().all(|n| acc.contains(n)) {
             return (true, acc);
         }
         let left = match DEADLINE.checked_sub(start.elapsed()) {
@@ -190,7 +201,7 @@ fn read_until(child: &mut ChildGuard, needle: &str) -> (bool, String) {
             Ok(line) => acc.push_str(&line),
             // Sender gone: the stream ended. One last check, then give up.
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return (acc.contains(needle), acc)
+                return (needles.iter().all(|n| acc.contains(n)), acc)
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return (false, acc),
         }
@@ -264,14 +275,33 @@ fn assert_fatal_before_bind(row: &Row, key: &str, cwd: &Path) {
 fn assert_degrades_with_http_up(row: &Row, key: &str, cwd: &Path, label: &str) {
     let before = snapshot(&row.tree());
     let mut child = row.spawn(key, "7546", cwd);
-    let (found, log) = read_until(&mut child, "degraded HTTP server ready");
+    let (found, log) = read_until_all(
+        &mut child,
+        &[
+            "degraded HTTP server ready",
+            "failed to load p2p identity key",
+        ],
+    );
     assert!(
         found,
         "{label}: the node must bind and serve while p2p is off\n--- stderr ---\n{log}"
     );
+    // The operator docs promise a specific signal, so pin it here: the level,
+    // the stable event name, and the message. A degrade that logs at warn or
+    // renames the event silently breaks the alert those docs tell operators to
+    // build, and asserting only the prose would not notice.
+    let clean_log = strip_ansi(&log);
+    let signal = clean_log
+        .lines()
+        .find(|l| l.contains("failed to load p2p identity key"))
+        .unwrap_or_else(|| panic!("{label}: the p2p failure must be logged\n{clean_log}"));
     assert!(
-        log.contains("failed to load p2p identity key"),
-        "{label}: the p2p failure must be logged\n--- stderr ---\n{log}"
+        signal.contains("ERROR"),
+        "{label}: the p2p failure must be logged at error level, got: {signal}"
+    );
+    assert!(
+        signal.contains("p2p_identity_key_load_failed"),
+        "{label}: the p2p failure must carry the documented event name, got: {signal}"
     );
 
     let clean = strip_ansi(&log);
