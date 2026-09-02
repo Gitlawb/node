@@ -1433,6 +1433,87 @@ fn ensure_key_dir(dir: &Path) -> Result<KeyDirHandle> {
     Ok(handle)
 }
 
+/// Create `key_path`'s directory pinned to 0700 and publish `bytes` into it at
+/// a verified 0600, using the same scratch-then-link path the p2p key uses.
+///
+/// Exposed for the node identity PEM in `main.rs`, which lives in the same
+/// `~/.gitlawb` directory and had its own creation flow: `create_dir_all` with
+/// no mode, then `write`, then `set_permissions`. That is the sequence INV-23
+/// prohibits, and it left the directory world-writable under a permissive
+/// umask and unopenable under a restrictive one, which took the node down
+/// before any p2p code ran.
+///
+/// Deliberately NOT the full `ensure_key_dir`: that carries the ancestor
+/// trust walk, and importing its refusals onto a path that never had them
+/// would turn an unsafe-but-working deployment into a boot failure on
+/// upgrade. Only the immediate parent is created through the pin helper, which
+/// verifies the grandparent it is about to chmod a child of; ancestors above
+/// that keep today's `create_dir_all` behavior.
+#[cfg(unix)]
+pub(crate) fn create_pinned_dir_and_publish(key_path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let dir = key_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} names no directory to hold it", key_path.display()))?;
+    let file_name = key_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{} names no key file", key_path.display()))?;
+    let dir_name = dir
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{} names no final directory component", dir.display()))?;
+
+    // Ancestors above the key directory keep the existing behavior; only the
+    // directory that actually holds the secret is pinned.
+    if let Some(grandparent) = dir.parent() {
+        if !grandparent.as_os_str().is_empty() {
+            std::fs::create_dir_all(grandparent).with_context(|| {
+                format!("failed to create parent directories for {}", dir.display())
+            })?;
+        }
+    }
+    let grandparent = dir.parent().filter(|g| !g.as_os_str().is_empty());
+    let gp_path = grandparent.unwrap_or_else(|| Path::new("."));
+    let gp = std::fs::File::open(gp_path)
+        .with_context(|| format!("failed to open {}", gp_path.display()))?;
+
+    let euid = effective_uid();
+    let (pinned, created) = pin::create_dir_pinned_at(gp.as_raw_fd(), dir_name, dir, euid)
+        .map_err(|e| {
+            anyhow::Error::new(e)
+                .context(format!("failed to create key directory {}", dir.display()))
+        })?;
+    let handle = KeyDirHandle::from_pinned_fd(pinned, dir);
+
+    // An adopted directory is tightened when it grants access beyond the owner,
+    // the same rule the p2p key directory follows, so an existing 0755
+    // `~/.gitlawb` stops being world-traversable on the next start.
+    if !created {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = handle
+            .metadata()
+            .with_context(|| format!("failed to stat key directory {}", dir.display()))?
+            .permissions()
+            .mode()
+            & 0o7777;
+        if mode & 0o077 != 0 {
+            warn!(
+                dir = %dir.display(),
+                mode = format!("{mode:04o}"),
+                "identity key directory grants access beyond its owner; tightening it to 0700"
+            );
+            handle
+                .tighten_to_0700()
+                .with_context(|| format!("failed to tighten key directory {}", dir.display()))?;
+        }
+    }
+
+    write_key_atomically(&handle, file_name, bytes)
+        .with_context(|| format!("failed to write identity key to {}", key_path.display()))?;
+    let _ = gp;
+    Ok(())
+}
+
 /// Write the key to a scratch file in the same directory, then publish it to
 /// `key_path` in one atomic step, so no reader ever sees a partial key and a
 /// crash mid-write cannot leave a truncated file at the final path.

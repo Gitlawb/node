@@ -1374,10 +1374,14 @@ async fn ping_peer_readiness_with_timeout(
 }
 
 fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
-    let key_path = config.resolved_key_path();
+    load_or_create_keypair_at(&config.resolved_key_path())
+}
 
+/// The node identity key's load-or-create, taken by path so the storage
+/// contract can be tested without building a whole `Config`.
+fn load_or_create_keypair_at(key_path: &std::path::Path) -> Result<Keypair> {
     if key_path.exists() {
-        let pem = std::fs::read_to_string(&key_path)
+        let pem = std::fs::read_to_string(key_path)
             .with_context(|| format!("failed to read key from {}", key_path.display()))?;
         let kp = Keypair::from_pem(&pem).map_err(|e| anyhow::anyhow!("invalid PEM key: {e}"))?;
         info!(path = %key_path.display(), "loaded existing identity");
@@ -1388,18 +1392,23 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
             .to_pem()
             .map_err(|e| anyhow::anyhow!("failed to serialize key: {e}"))?;
 
-        if let Some(parent) = key_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
+        // The directory is created pinned to 0700 and the PEM is published
+        // through the same scratch-then-link path the p2p key uses, at a
+        // verified 0600. The previous flow (create_dir_all with no mode, then
+        // write, then set_permissions) is the sequence INV-23 prohibits: it
+        // left the directory world-writable under a permissive umask, and
+        // under a restrictive one it could not be opened at all, which failed
+        // the whole node here, before the listener binds.
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::write(&key_path, pem.as_bytes())?;
-            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        p2p::create_pinned_dir_and_publish(key_path, pem.as_bytes())?;
+
         #[cfg(not(unix))]
-        std::fs::write(&key_path, pem.as_bytes())?;
+        {
+            if let Some(parent) = key_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(key_path, pem.as_bytes())?;
+        }
 
         info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
         Ok(kp)
@@ -1840,5 +1849,192 @@ mod gossip_ssrf_tests {
     async fn ping_peer_readiness_reports_unready_on_connection_error() {
         let ok = ping_peer_readiness(&production_http_client(), "http://127.0.0.1:1").await;
         assert!(!ok, "a connection error must count as an unready peer");
+    }
+}
+
+#[cfg(test)]
+mod identity_key_storage_tests {
+    use super::*;
+
+    /// Fixture: create the node identity key under a hostile umask.
+    ///
+    /// `~/.gitlawb` holds BOTH keys, and `load_or_create_keypair` runs before
+    /// the listener binds, so a mask that strips owner bits here takes the
+    /// whole node down before any p2p code is reached. Double-gated like the
+    /// p2p fixtures: `#[ignore]` keeps it out of a normal run and the env check
+    /// keeps it inert under a bare `--ignored` sweep, which would otherwise set
+    /// a process-global umask inside the shared test process.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=identity-key-umask"]
+    fn fixture_identity_key_under_hostile_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("identity-key-umask") {
+            return;
+        }
+        let base = std::path::PathBuf::from(
+            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+        );
+        let umask_val =
+            u32::from_str_radix(&std::env::var("GITLAWB_TEST_UMASK").unwrap(), 8).unwrap();
+
+        // SAFETY: `umask` only reads and replaces the process-wide value, and
+        // this process exists solely for this probe. No restore: the value dies
+        // with the child.
+        unsafe { libc::umask(umask_val as libc::mode_t) };
+
+        let key = base.join(".gitlawb").join("identity.pem");
+        let kp = load_or_create_keypair_at(&key).unwrap_or_else(|e| {
+            let dir_mode = std::fs::symlink_metadata(key.parent().unwrap())
+                .map(|m| format!("{:04o}", m.permissions().mode() & 0o7777))
+                .unwrap_or_else(|_| "absent".into());
+            panic!(
+                "first boot must create the node identity, got: {e:#}\n  \
+                 dir {} achieved mode {}, requested 0700",
+                key.parent().unwrap().display(),
+                dir_mode
+            )
+        });
+
+        let dir_mode = std::fs::symlink_metadata(key.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "identity key directory achieved mode {dir_mode:04o}, requested 0700"
+        );
+        let key_mode = std::fs::symlink_metadata(&key)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            key_mode, 0o600,
+            "identity key achieved mode {key_mode:04o}, requested 0600"
+        );
+
+        // The identity must survive a reload, same as the p2p key.
+        let reloaded = load_or_create_keypair_at(&key).expect("reload the identity");
+        assert_eq!(kp.did(), reloaded.did(), "the identity must be stable");
+
+        println!("identity-key-umask: asserted did={}", kp.did());
+    }
+
+    /// A pre-existing directory that grants access beyond the owner is
+    /// tightened on the next start, which is the INV-23(a) half issue #231
+    /// names: a 0600 PEM inside a 0755 directory is still replaceable by
+    /// anyone who can write that directory.
+    #[cfg(unix)]
+    #[test]
+    fn existing_identity_key_directory_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = base.path().join(".gitlawb");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let key = dir.join("identity.pem");
+        load_or_create_keypair_at(&key).expect("first boot into a loose directory");
+
+        let mode = std::fs::symlink_metadata(&dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            mode, 0o700,
+            "a loose identity key directory must be tightened"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&key)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600,
+            "the identity key must be owner-only"
+        );
+    }
+
+    /// An existing key is loaded, never rewritten and never chmodded: the
+    /// creation path is the only thing this change touches.
+    #[cfg(unix)]
+    #[test]
+    fn existing_identity_key_is_loaded_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let key = base.path().join(".gitlawb").join("identity.pem");
+
+        let created = load_or_create_keypair_at(&key).expect("first boot");
+        let before = std::fs::read(&key).unwrap();
+
+        // A deliberately odd but readable mode must survive: an existing key is
+        // the operator's, and this path does not repair it.
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let reloaded = load_or_create_keypair_at(&key).expect("reload");
+
+        assert_eq!(created.did(), reloaded.did(), "the identity must be stable");
+        assert_eq!(
+            std::fs::read(&key).unwrap(),
+            before,
+            "the key must not be rewritten"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&key)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o400,
+            "an existing key's mode must not be changed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_key_storage_is_umask_independent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for umask in ["0000", "0022", "0777"] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+            let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+            cmd.args([
+                "identity_key_storage_tests::fixture_identity_key_under_hostile_umask",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("GITLAWB_TEST_FIXTURE", "identity-key-umask")
+            .env("GITLAWB_TEST_BASE", base.path())
+            .env("GITLAWB_TEST_UMASK", umask);
+            let output = cmd.output().expect("spawn the identity-key fixture");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            assert!(
+                output.status.success(),
+                "umask={umask}: the identity-key fixture must pass\n\
+                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            );
+            // A filter matching nothing exits 0, and the fixture's env gate
+            // returns early as a passing test, so neither alone is proof.
+            assert!(
+                stdout.contains("1 passed"),
+                "umask={umask}: filter must select one passing test\n{stdout}"
+            );
+            assert!(
+                stdout.contains("identity-key-umask: asserted did="),
+                "umask={umask}: fixture must print its sentinel\n{stdout}"
+            );
+        }
     }
 }
