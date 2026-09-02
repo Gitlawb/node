@@ -14495,6 +14495,41 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "spaces are rejected by canonicalize_label"
         );
+
+        // Length arm: 51 chars → 400, 50 chars decouples the no-match 404 from
+        // the double-delete above so the helper's len>50 branch is pinned
+        // even if the earlier 404 assertion is ever reworked.
+        let too_long = "a".repeat(51);
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/{too_long}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "51-char label is rejected by canonicalize_label"
+        );
+
+        let exactly_50 = "a".repeat(50);
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner_short}/{repo_name}/labels/{exactly_50}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "50-char label passes validation but still 404s when absent"
+        );
     }
 
     /// #344: `remove_label` stays owner-gated. A non-owner with a real signed
