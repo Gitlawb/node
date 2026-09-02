@@ -407,6 +407,74 @@ pub(crate) async fn get_visible_task(
     Ok(task_visible(&task, caller, &repos_by_id, &rules_by_repo).then_some(task))
 }
 
+/// Whether `task` is eligible to be claimed by `caller`.
+///
+/// Distinct from read visibility (`task_visible`): prospective agents need to
+/// claim open (unassigned) tasks, including repo-less tasks or tasks on
+/// publicly-accessible repositories, without those task bodies being enumerable
+/// on unassigned read listings (#327 review). If a task is pre-assigned to a
+/// specific DID, only that designated assignee (or delegator) may claim it.
+pub(crate) fn task_claimable(
+    task: &AgentTask,
+    caller: &str,
+    repos_by_id: &HashMap<String, RepoRecord>,
+    rules_by_repo: &HashMap<String, Vec<VisibilityRule>>,
+) -> bool {
+    if crate::api::did_matches(caller, &task.delegator_did) {
+        return true;
+    }
+    if let Some(assignee) = task.assignee_did.as_deref() {
+        return crate::api::did_matches(caller, assignee);
+    }
+    // Unassigned task: check repo visibility if repo is specified and locally hosted
+    let Some(repo_id) = task.repo_id.as_deref() else {
+        // Unscoped open task (no repo_id) is claimable by any authenticated agent
+        return true;
+    };
+    if repo_id.contains('/') {
+        return true;
+    }
+    let Some(record) = repos_by_id.get(repo_id) else {
+        return true;
+    };
+    let rules = rules_by_repo
+        .get(&record.id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    crate::visibility::listable_at_root(rules, record.is_public, &record.owner_did, Some(caller))
+}
+
+/// Fetch a task for claiming, returning `None` if the task does not exist or
+/// if `caller` is not eligible to claim it. Preserves opaque 404 behavior for
+/// ineligible callers so existence of inaccessible tasks is not leaked.
+pub(crate) async fn get_claimable_task(
+    db: &crate::db::Db,
+    id: &str,
+    caller: &str,
+) -> crate::error::Result<Option<AgentTask>> {
+    let Some(task) = db.get_task(id).await? else {
+        return Ok(None);
+    };
+    let (repos_by_id, rules_by_repo) = match task.repo_id.as_deref() {
+        Some(repo_id) if !repo_id.contains('/') => {
+            let ids = [repo_id.to_string()];
+            let repos = db.list_repos_deduped_by_ids(&ids).await?;
+            match repos.into_iter().find(|r| r.id == repo_id) {
+                Some(record) => {
+                    let rules = db.list_visibility_rules(&record.id).await?;
+                    (
+                        HashMap::from([(record.id.clone(), record)]),
+                        HashMap::from([(repo_id.to_string(), rules)]),
+                    )
+                }
+                None => (HashMap::new(), HashMap::new()),
+            }
+        }
+        _ => (HashMap::new(), HashMap::new()),
+    };
+    Ok(task_claimable(&task, caller, &repos_by_id, &rules_by_repo).then_some(task))
+}
+
 /// Broadcast a task event only when the task is publicly visible.
 /// Matches `if announce` on ref updates: private-task status changes stay off
 /// the unauthenticated GraphQL subscription.
@@ -543,9 +611,9 @@ pub async fn claim_task(
             "assignee_did must be the authenticated signer".into(),
         ));
     }
-    // Same visibility gate as complete/fail: invisible tasks are 404 so
+    // Claim eligibility gate: invisible/ineligible tasks are 404 so
     // existence is not leaked via a successful claim or a leaking 409.
-    get_visible_task(&state.db, &id, Some(&auth.0))
+    get_claimable_task(&state.db, &id, &auth.0)
         .await?
         .ok_or_else(|| AppError::NotFound("task not found".into()))?;
     let task =
@@ -1960,11 +2028,16 @@ mod visible_tasks_tests {
     }
 
     #[sqlx::test]
-    async fn claim_task_on_invisible_task_returns_404_not_success_or_409(pool: PgPool) {
+    async fn claim_task_on_private_repo_task_returns_404_not_success_or_409(pool: PgPool) {
         let state = test_state(pool).await;
         state
             .db
-            .create_task(&task("t1", None, DELEGATOR))
+            .create_repo(&repo("private-repo", DELEGATOR, "private", false))
+            .await
+            .unwrap();
+        state
+            .db
+            .create_task(&task("t1", Some("private-repo"), DELEGATOR))
             .await
             .unwrap();
 
@@ -1980,9 +2053,71 @@ mod visible_tasks_tests {
         assert_eq!(
             claim_resp.status(),
             StatusCode::NOT_FOUND,
-            "claiming an invisible task must 404, not succeed or leak via 409"
+            "claiming an invisible private-repo task must 404, not succeed or leak via 409"
         );
         assert_not_found_envelope(&body_json(claim_resp).await);
+    }
+
+    #[sqlx::test]
+    async fn open_repoless_task_create_claim_complete_lifecycle(pool: PgPool) {
+        let state = test_state(pool).await;
+        const CLAIMANT: &str = "did:key:z6MkClaimantAgentAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        // Delegator creates an open, unassigned, repo-less task
+        state
+            .db
+            .create_task(&task("open-task", None, DELEGATOR))
+            .await
+            .unwrap();
+
+        // Stranger/Claimant cannot read the task via anonymous GET /api/v1/tasks
+        let list_resp = list_router(state.clone())
+            .oneshot(anon_get("/api/v1/tasks"))
+            .await
+            .unwrap();
+        let list_body = body_json(list_resp).await;
+        assert_eq!(list_body["tasks"].as_array().unwrap().len(), 0);
+
+        // Claimant successfully claims the open task
+        let claim_resp = full_task_router(state.clone())
+            .oneshot(signed_request_as(
+                CLAIMANT,
+                Method::POST,
+                "/api/v1/tasks/open-task/claim",
+                Body::from(format!(r#"{{"assignee_did":"{CLAIMANT}"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(claim_resp.status(), StatusCode::OK);
+        let claim_body = body_json(claim_resp).await;
+        assert_eq!(claim_body["status"], "claimed");
+        assert_eq!(claim_body["assignee_did"], CLAIMANT);
+
+        // Claimant can now read the claimed task
+        let get_resp = full_task_router(state.clone())
+            .oneshot(signed_request_as(
+                CLAIMANT,
+                Method::GET,
+                "/api/v1/tasks/open-task",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+
+        // Claimant completes the task
+        let complete_resp = full_task_router(state.clone())
+            .oneshot(signed_request_as(
+                CLAIMANT,
+                Method::POST,
+                "/api/v1/tasks/open-task/complete",
+                Body::from(r#"{"result":"task finished successfully"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(complete_resp.status(), StatusCode::OK);
+        let complete_body = body_json(complete_resp).await;
+        assert_eq!(complete_body["status"], "completed");
     }
 
     /// Goes RED if `claim_task`'s `assignee_did IS NULL OR assignee_did = $2`

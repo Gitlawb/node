@@ -198,6 +198,36 @@ async fn cmd_create(
 /// (#327 review).
 const SERVER_PAGE_CAP: i64 = 200;
 
+/// Maximum response size in bytes accepted for a single task page (2 MiB).
+/// Bounds memory allocation against a hostile node returning an oversized
+/// payload or chunked stream before JSON deserialization runs (#327 review).
+pub(crate) const MAX_TASK_PAGE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Stream a task response body into a byte-preserving capped buffer before JSON
+/// deserialization. Rejects oversized responses (both Content-Length declared
+/// and chunked streams) before allocation can exceed the budget.
+pub(crate) async fn read_task_page_json(mut resp: reqwest::Response) -> Result<Value> {
+    if let Some(content_length) = resp.content_length() {
+        if content_length > MAX_TASK_PAGE_BYTES as u64 {
+            anyhow::bail!(
+                "task response exceeds byte budget (declared {content_length} bytes, limit is {MAX_TASK_PAGE_BYTES} bytes)"
+            );
+        }
+    }
+
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context("failed reading response body")? {
+        if buf.len() + chunk.len() > MAX_TASK_PAGE_BYTES {
+            anyhow::bail!(
+                "task response exceeds byte budget (exceeded {MAX_TASK_PAGE_BYTES} bytes)"
+            );
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice(&buf).context("invalid JSON response")
+}
+
 /// Requests one `gl`/MCP list call may issue while following continuations.
 /// The node examines at most 1,000 candidate rows per request, so a long
 /// window of tasks the caller cannot read returns empty pages that still carry
@@ -247,7 +277,10 @@ impl TaskList {
             _ => "node's authorization scan ceiling reached",
         };
         let resume = match &self.next_cursor {
-            Some(c) => format!("; continue with --cursor {c}"),
+            Some(c) => {
+                let sanitized = crate::http::sanitize_node_msg(c);
+                format!("; continue with --cursor {sanitized}")
+            }
             None => String::new(),
         };
         Some(format!(
@@ -399,16 +432,14 @@ pub(crate) async fn fetch_tasks(
         if let Some(c) = &current_request_cursor {
             path.push_str(&format!("&cursor={}", urlencoding::encode(c)));
         }
-        let raw_val: Value = client
+        let resp = client
             .get_maybe_signed(&path)
             .await
             .context("failed to list tasks")?
             // No `context` here: the reqwest error already names the status,
             // and MCP surfaces this message verbatim to the model.
-            .error_for_status()?
-            .json()
-            .await
-            .context("invalid JSON response")?;
+            .error_for_status()?;
+        let raw_val: Value = read_task_page_json(resp).await?;
         pages += 1;
 
         let page = parse_task_page(raw_val)?;
@@ -416,13 +447,16 @@ pub(crate) async fn fetch_tasks(
             TaskPage::Paginated { tasks, .. } | TaskPage::Legacy { tasks } => tasks,
         };
 
+        let mut page_seen = seen_task_ids.clone();
         let mut has_duplicate_row = false;
         for t in page_tasks {
-            if let Some(id) = t.get("id").and_then(|v| v.as_str()) {
-                if seen_task_ids.contains(id) {
-                    has_duplicate_row = true;
-                    break;
-                }
+            let id = match t.get("id").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s,
+                _ => anyhow::bail!("malformed task response: task missing non-empty string 'id'"),
+            };
+            if !page_seen.insert(id.to_string()) {
+                has_duplicate_row = true;
+                break;
             }
         }
         if has_duplicate_row {
@@ -450,16 +484,28 @@ pub(crate) async fn fetch_tasks(
                 incomplete: page_incomplete,
                 next_cursor,
             } => {
-                for t in page_tasks {
-                    if let Some(id) = t.get("id").and_then(|v| v.as_str()) {
-                        seen_task_ids.insert(id.to_string());
-                    }
-                    tasks.push(t);
-                }
+                seen_task_ids = page_seen;
+                tasks.extend(page_tasks);
                 incomplete = page_incomplete;
 
                 if tasks.len() as i64 >= limit {
-                    safe_resume_cursor = if has_more { next_cursor } else { None };
+                    if has_more {
+                        let Some(next) = next_cursor else {
+                            incomplete = true;
+                            safe_resume_cursor = None;
+                            break TaskListStop::NoProgress;
+                        };
+
+                        if seen_cursors.contains(&next) {
+                            incomplete = true;
+                            safe_resume_cursor = None;
+                            break TaskListStop::NoProgress;
+                        }
+
+                        safe_resume_cursor = Some(next);
+                    } else {
+                        safe_resume_cursor = None;
+                    }
                     break TaskListStop::LimitReached;
                 }
 
@@ -489,12 +535,7 @@ pub(crate) async fn fetch_tasks(
                 }
             }
             TaskPage::Legacy { tasks: page_tasks } => {
-                for t in page_tasks {
-                    if let Some(id) = t.get("id").and_then(|v| v.as_str()) {
-                        seen_task_ids.insert(id.to_string());
-                    }
-                    tasks.push(t);
-                }
+                tasks.extend(page_tasks);
                 incomplete = true;
                 safe_resume_cursor = None;
                 break TaskListStop::LegacyProtocol;
@@ -519,7 +560,8 @@ async fn cmd_list(
     node: String,
     dir: Option<PathBuf>,
 ) -> Result<()> {
-    let client = NodeClient::new(&node, load_keypair_from_dir(dir.as_deref()).ok());
+    let keypair = crate::identity::load_optional_keypair(dir.as_deref())?;
+    let client = NodeClient::new(&node, keypair);
     let result = fetch_tasks(
         &client,
         status.as_deref(),
@@ -537,17 +579,16 @@ async fn cmd_list(
 }
 
 async fn cmd_view(id: String, node: String, dir: Option<PathBuf>) -> Result<()> {
-    let client = NodeClient::new(&node, load_keypair_from_dir(dir.as_deref()).ok());
-    let resp: Value = client
+    let keypair = crate::identity::load_optional_keypair(dir.as_deref())?;
+    let client = NodeClient::new(&node, keypair);
+    let resp = client
         .get_maybe_signed(&format!("/api/v1/tasks/{}", id))
         .await
         .context("failed to get task")?
         .error_for_status()
-        .context("failed to get task")?
-        .json()
-        .await
-        .context("invalid JSON response")?;
-    print_json(&resp);
+        .context("failed to get task")?;
+    let resp_json: Value = read_task_page_json(resp).await?;
+    print_json(&resp_json);
     Ok(())
 }
 
@@ -721,7 +762,6 @@ mod tests {
     #[tokio::test]
     async fn test_list_tasks_empty() {
         let mut server = mockito::Server::new_async().await;
-        let dir = tempfile::TempDir::new().unwrap();
 
         let _m = server
             .mock(
@@ -734,16 +774,9 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_list(
-            None,
-            None,
-            50,
-            None,
-            server.url(),
-            Some(dir.path().to_path_buf()),
-        )
-        .await
-        .unwrap();
+        cmd_list(None, None, 50, None, server.url(), None)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1484,7 +1517,6 @@ mod tests {
     #[tokio::test]
     async fn test_view_task_not_found() {
         let mut server = mockito::Server::new_async().await;
-        let dir = tempfile::TempDir::new().unwrap();
 
         let _m = server
             .mock("GET", "/api/v1/tasks/nope")
@@ -1495,13 +1527,9 @@ mod tests {
             .create_async()
             .await;
 
-        let err = cmd_view(
-            "nope".to_string(),
-            server.url(),
-            Some(dir.path().to_path_buf()),
-        )
-        .await
-        .unwrap_err();
+        let err = cmd_view("nope".to_string(), server.url(), None)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("failed to get task"));
     }
 
@@ -1653,5 +1681,209 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    // ── Exact-limit continuation & progress tests (#327 review) ──────
+
+    #[tokio::test]
+    async fn test_exact_limit_missing_cursor_marked_incomplete() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/tasks?limit=1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[{"id":"t1"}],"has_more":true,"next_cursor":null}"#)
+            .create_async()
+            .await;
+
+        let client = NodeClient::new(server.url(), None);
+        let result = fetch_tasks(&client, None, None, 1, None).await.unwrap();
+        assert_eq!(result.stop, TaskListStop::NoProgress);
+        assert!(result.incomplete);
+        assert_eq!(result.next_cursor, None);
+        assert!(!result.to_json()["complete"].as_bool().unwrap());
+        assert!(result.truncation_warning().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_exact_limit_cyclic_cursor_marked_incomplete() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/tasks?limit=1&cursor=cur1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[{"id":"t1"}],"has_more":true,"next_cursor":"cur1"}"#)
+            .create_async()
+            .await;
+
+        let client = NodeClient::new(server.url(), None);
+        let result = fetch_tasks(&client, None, None, 1, Some("cur1"))
+            .await
+            .unwrap();
+        assert_eq!(result.stop, TaskListStop::NoProgress);
+        assert!(result.incomplete);
+        assert_eq!(result.next_cursor, None);
+        assert!(!result.to_json()["complete"].as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_exact_limit_valid_advancing_cursor_complete() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/tasks?limit=1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[{"id":"t1"}],"has_more":true,"next_cursor":"cur2"}"#)
+            .create_async()
+            .await;
+
+        let client = NodeClient::new(server.url(), None);
+        let result = fetch_tasks(&client, None, None, 1, None).await.unwrap();
+        assert_eq!(result.stop, TaskListStop::LimitReached);
+        assert!(!result.incomplete);
+        assert_eq!(result.next_cursor.as_deref(), Some("cur2"));
+        assert!(result.to_json()["complete"].as_bool().unwrap());
+    }
+
+    // ── Page-local row identity & schema tests (#327 review) ─────────
+
+    #[tokio::test]
+    async fn test_page_duplicate_ids_within_single_page_marked_incomplete() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/tasks?limit=2")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[{"id":"dup1"},{"id":"dup1"}],"has_more":false}"#)
+            .create_async()
+            .await;
+
+        let client = NodeClient::new(server.url(), None);
+        let result = fetch_tasks(&client, None, None, 2, None).await.unwrap();
+        assert_eq!(result.stop, TaskListStop::NoProgress);
+        assert!(result.incomplete);
+        assert!(
+            result.tasks.is_empty(),
+            "unvalidated page must not be committed to tasks"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_page_missing_or_empty_id_fails_validation() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/tasks?limit=2")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[{"kind":"test"},{"id":""}],"has_more":false}"#)
+            .create_async()
+            .await;
+
+        let client = NodeClient::new(server.url(), None);
+        let err = fetch_tasks(&client, None, None, 2, None).await.unwrap_err();
+        assert!(err.to_string().contains("missing non-empty string 'id'"));
+    }
+
+    // ── Sanitized cursor diagnostics test (#327 review) ─────────────
+
+    #[test]
+    fn test_truncation_warning_sanitizes_terminal_cursor() {
+        let malicious_cursor = "c1\x1b[31mRED\x1b[0m\nnewline\u{202e}bidi".to_string();
+        let list = TaskList {
+            tasks: vec![json!({"id": "t1"})],
+            incomplete: true,
+            next_cursor: Some(malicious_cursor.clone()),
+            pages: 1,
+            stop: TaskListStop::PageCap,
+        };
+        let warning = list.truncation_warning().unwrap();
+        // Control bytes and bidi overrides must not be present in terminal warning
+        assert!(!warning.contains('\x1b'));
+        assert!(!warning.contains('\n'));
+        assert!(!warning.contains('\u{202e}'));
+        assert!(warning.contains("--cursor c1[31mRED[0mnewlinebidi"));
+        // Protocol token itself remains unmodified
+        assert_eq!(list.next_cursor.as_ref().unwrap(), &malicious_cursor);
+    }
+
+    // ── Response byte budget tests (#327 review) ─────────────────────
+
+    #[tokio::test]
+    async fn test_read_task_page_json_oversized_content_length() {
+        let mut server = mockito::Server::new_async().await;
+        let large_payload = vec![b' '; MAX_TASK_PAGE_BYTES + 1024];
+        let _m = server
+            .mock("GET", "/api/v1/tasks?limit=1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(large_payload)
+            .create_async()
+            .await;
+
+        let client = NodeClient::new(server.url(), None);
+        let err = fetch_tasks(&client, None, None, 1, None).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("task response exceeds byte budget"));
+    }
+
+    #[tokio::test]
+    async fn test_read_task_page_json_oversized_chunked() {
+        let mut server = mockito::Server::new_async().await;
+        let large_payload = "x".repeat(3 * 1024 * 1024);
+        let _m = server
+            .mock("GET", "/api/v1/tasks?limit=1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(large_payload)
+            .create_async()
+            .await;
+
+        let client = NodeClient::new(server.url(), None);
+        let err = fetch_tasks(&client, None, None, 1, None).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("task response exceeds byte budget"));
+    }
+
+    // ── Identity failure zero-network-request tests (#327 review) ────
+
+    #[tokio::test]
+    async fn test_cmd_list_explicit_missing_dir_errors_no_network() {
+        let server = mockito::Server::new_async().await;
+        // Server has NO mocks configured: any network request would cause test failure
+        let nonexistent = std::path::PathBuf::from("/nonexistent/path/for/identity/test");
+        let err = cmd_list(None, None, 10, None, server.url(), Some(nonexistent))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no identity found"));
+    }
+
+    #[tokio::test]
+    async fn test_cmd_list_explicit_corrupt_pem_errors_no_network() {
+        let server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("identity.pem"), b"NOT A VALID PEM").unwrap();
+        let err = cmd_list(
+            None,
+            None,
+            10,
+            None,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("failed to load keypair from PEM"));
+    }
+
+    #[tokio::test]
+    async fn test_cmd_view_explicit_missing_dir_errors_no_network() {
+        let server = mockito::Server::new_async().await;
+        let nonexistent = std::path::PathBuf::from("/nonexistent/path/for/identity/test");
+        let err = cmd_view("task-1".to_string(), server.url(), Some(nonexistent))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no identity found"));
     }
 }

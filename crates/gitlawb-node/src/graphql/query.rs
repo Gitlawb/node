@@ -837,7 +837,6 @@ mod tests {
             );
         }
 
-        // Presented with the filter that issued it, the same token is accepted.
         let resp = anon(
             &schema,
             &format!(
@@ -846,6 +845,67 @@ mod tests {
         )
         .await;
         assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
+    }
+
+    #[sqlx::test]
+    async fn tasks_anonymous_denial_hides_repoless_task_and_leaks_no_token(pool: PgPool) {
+        let db = db(pool).await;
+        let task = crate::db::AgentTask {
+            id: "t1".into(),
+            repo_id: None,
+            kind: "code-review".into(),
+            status: "pending".into(),
+            delegator_did: "did:key:z6MkDelegator".into(),
+            assignee_did: None,
+            capability: "agent:task".into(),
+            ucan_token: Some("secret-ucan-token".into()),
+            payload: Some("payload".into()),
+            result: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            deadline: None,
+        };
+        db.create_task(&task).await.unwrap();
+
+        let schema = schema(db);
+        let query = "{ tasks { items { id } } }";
+        let resp = anon(&schema, query).await;
+        assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
+        assert_eq!(count_tasks(&resp), 0);
+        let rendered = format!("{:?}", resp.data);
+        assert!(!rendered.contains("secret-ucan-token"));
+    }
+
+    #[sqlx::test]
+    async fn task_anonymous_denial_returns_null_and_leaks_no_token(pool: PgPool) {
+        let db = db(pool).await;
+        let task = crate::db::AgentTask {
+            id: "t1".into(),
+            repo_id: None,
+            kind: "code-review".into(),
+            status: "pending".into(),
+            delegator_did: "did:key:z6MkDelegator".into(),
+            assignee_did: None,
+            capability: "agent:task".into(),
+            ucan_token: Some("secret-ucan-token".into()),
+            payload: Some("payload".into()),
+            result: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            deadline: None,
+        };
+        db.create_task(&task).await.unwrap();
+
+        let schema = schema(db);
+        let query = r#"{ task(id: "t1") { id } }"#;
+        let resp = anon(&schema, query).await;
+        assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
+        let async_graphql::Value::Object(obj) = &resp.data else {
+            panic!("data not an object: {:?}", resp.data);
+        };
+        assert_eq!(obj.get("task"), Some(&async_graphql::Value::Null));
+        let rendered = format!("{:?}", resp.data);
+        assert!(!rendered.contains("secret-ucan-token"));
     }
 
     fn task_page_bool(resp: &async_graphql::Response, field: &str) -> bool {
