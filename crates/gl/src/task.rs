@@ -327,6 +327,12 @@ pub(crate) fn parse_task_page(val: Value) -> Result<TaskPage> {
             }
         };
 
+        if !has_more && next_cursor.is_some() {
+            anyhow::bail!(
+                "malformed task response: 'next_cursor' present when 'has_more' is false"
+            );
+        }
+
         Ok(TaskPage::Paginated {
             tasks: tasks_arr,
             has_more,
@@ -406,6 +412,37 @@ pub(crate) async fn fetch_tasks(
         pages += 1;
 
         let page = parse_task_page(raw_val)?;
+        let page_tasks = match &page {
+            TaskPage::Paginated { tasks, .. } | TaskPage::Legacy { tasks } => tasks,
+        };
+
+        let mut has_duplicate_row = false;
+        for t in page_tasks {
+            if let Some(id) = t.get("id").and_then(|v| v.as_str()) {
+                if seen_task_ids.contains(id) {
+                    has_duplicate_row = true;
+                    break;
+                }
+            }
+        }
+        if has_duplicate_row {
+            incomplete = true;
+            safe_resume_cursor = None;
+            break TaskListStop::NoProgress;
+        }
+
+        // `want` is the remaining total, capped at the server page.
+        // A valid-shaped page larger than that can push the helper
+        // (and therefore both CLI and MCP) past `--limit`. Treat it
+        // as protocol-invalid rather than clipping, matching the
+        // hostile-node handling for duplicate rows and cursor cycles.
+        if page_tasks.len() as i64 > want {
+            anyhow::bail!(
+                "protocol-invalid task page: got {} tasks, asked for {want}",
+                page_tasks.len()
+            );
+        }
+
         match page {
             TaskPage::Paginated {
                 tasks: page_tasks,
@@ -413,33 +450,6 @@ pub(crate) async fn fetch_tasks(
                 incomplete: page_incomplete,
                 next_cursor,
             } => {
-                let mut has_duplicate_row = false;
-                for t in &page_tasks {
-                    if let Some(id) = t.get("id").and_then(|v| v.as_str()) {
-                        if seen_task_ids.contains(id) {
-                            has_duplicate_row = true;
-                            break;
-                        }
-                    }
-                }
-                if has_duplicate_row {
-                    incomplete = true;
-                    safe_resume_cursor = None;
-                    break TaskListStop::NoProgress;
-                }
-
-                // `want` is the remaining total, capped at the server page.
-                // A valid-shaped page larger than that can push the helper
-                // (and therefore both CLI and MCP) past `--limit`. Treat it
-                // as protocol-invalid rather than clipping, matching the
-                // hostile-node handling for duplicate rows and cursor cycles.
-                if page_tasks.len() as i64 > want {
-                    anyhow::bail!(
-                        "protocol-invalid task page: got {} tasks, asked for {want}",
-                        page_tasks.len()
-                    );
-                }
-
                 for t in page_tasks {
                     if let Some(id) = t.get("id").and_then(|v| v.as_str()) {
                         seen_task_ids.insert(id.to_string());
@@ -1049,6 +1059,40 @@ mod tests {
         );
     }
 
+    /// A legacy node returning more rows than requested must also be rejected
+    /// as protocol-invalid before exposing any task rows to the caller.
+    #[tokio::test]
+    async fn list_rejects_oversized_legacy_page() {
+        let mut server = mockito::Server::new_async().await;
+        let oversized = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/tasks\?limit=1$".into()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"tasks":[{"id":"t1","kind":"test"},{"id":"t2","kind":"test"}],"count":2}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = fetch_tasks(&client_for(&server), None, None, 1, None)
+            .await
+            .expect_err("oversized legacy page must not succeed");
+        oversized.assert_async().await;
+        let msg = err.to_string();
+        assert!(
+            msg.contains("protocol-invalid") && msg.contains("asked for 1"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("\"id\":\"t2\""),
+            "the extra rows must not appear in the error: {msg}"
+        );
+    }
+
     /// Malformed responses (missing fields, wrong types) must fail with an error
     /// rather than silently succeeding.
     #[tokio::test]
@@ -1060,6 +1104,7 @@ mod tests {
             r#"{"tasks":[],"has_more":"true"}"#,
             r#"{"tasks":[],"has_more":true,"incomplete":"no"}"#,
             r#"{"tasks":[],"has_more":true,"next_cursor":123}"#,
+            r#"{"tasks":[],"has_more":false,"next_cursor":"stray"}"#,
             r#"{"tasks":[],"next_cursor":"c1"}"#,
             r#"[]"#,
         ];
@@ -1083,6 +1128,31 @@ mod tests {
             );
             m.assert_async().await;
         }
+    }
+
+    /// Contradictory pagination metadata (`has_more: false` alongside a non-empty `next_cursor`)
+    /// must be rejected as malformed rather than silently accepted or converting into complete: true.
+    #[tokio::test]
+    async fn list_rejects_contradictory_has_more_false_with_cursor() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[],"has_more":false,"next_cursor":"c1"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = fetch_tasks(&client_for(&server), None, None, 50, None)
+            .await
+            .expect_err("has_more: false with next_cursor must be rejected as malformed");
+        m.assert_async().await;
+        assert!(
+            err.to_string()
+                .contains("next_cursor' present when 'has_more' is false"),
+            "{err}"
+        );
     }
 
     /// A node that loops cursors (c1 -> c2 -> c1) must be detected as a cycle,

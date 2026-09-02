@@ -1150,6 +1150,12 @@ const MIGRATIONS: &[Migration] = &[
             // the keyset order, so the LIMIT is an Index Cond stop. Column order
             // and DESC are load-bearing and must match the query. The CASE in the
             // assignee indexes must stay byte-identical to ASSIGNEE_DID_CASE_SQL.
+            //
+            // Drop the single-column idx_agent_tasks_assignee_key from v27 and
+            // idx_agent_tasks_status from v1 so the planner never picks a
+            // non-keyset index that requires an in-memory Sort before LIMIT.
+            "DROP INDEX IF EXISTS idx_agent_tasks_assignee_key",
+            "DROP INDEX IF EXISTS idx_agent_tasks_status",
             "CREATE INDEX IF NOT EXISTS idx_agent_tasks_created_at_id ON agent_tasks (created_at DESC, id DESC)",
             "CREATE INDEX IF NOT EXISTS idx_agent_tasks_status_created_at_id ON agent_tasks (status, created_at DESC, id DESC)",
             "CREATE INDEX IF NOT EXISTS idx_agent_tasks_assignee_key_created_at_id ON agent_tasks ((CASE WHEN assignee_did LIKE 'did:key:%' AND position(':' in substr(assignee_did, 9)) = 0 THEN substr(assignee_did, 9) ELSE assignee_did END), created_at DESC, id DESC)",
@@ -5182,6 +5188,20 @@ mod migration_tests {
             .await
             .unwrap();
             assert!(exists.0, "{name} must exist");
+        }
+
+        for old_name in ["idx_agent_tasks_assignee_key", "idx_agent_tasks_status"] {
+            let exists: (bool,) = sqlx::query_as(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pg_indexes
+                    WHERE tablename = 'agent_tasks' AND indexname = $1
+                )",
+            )
+            .bind(old_name)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert!(!exists.0, "{old_name} must be dropped by v28");
         }
 
         sqlx::query("DROP INDEX IF EXISTS idx_agent_tasks_created_at_id")
