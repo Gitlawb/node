@@ -120,9 +120,13 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_P2P_PORT", default_value_t = 7546)]
     pub p2p_port: u16,
 
-    /// Path to the persistent libp2p identity key. With a relative path the
-    /// node verifies the working directory (ownership and write permissions)
-    /// before using it.
+    /// Path to the persistent libp2p identity key. A value that cannot name a
+    /// securable key file (a bare filename, `..` traversal, a trailing
+    /// separator, the filesystem root, or a `~/` path that escapes home) is
+    /// refused before the node binds. A problem with the storage itself leaves
+    /// p2p off while HTTP keeps serving, logged as p2p_identity_key_load_failed.
+    /// With a relative path the node verifies the working directory (ownership
+    /// and write permissions) before using it.
     #[arg(long, env = "GITLAWB_P2P_KEY", default_value = "~/.gitlawb/p2p.key")]
     pub p2p_key_path: String,
 
