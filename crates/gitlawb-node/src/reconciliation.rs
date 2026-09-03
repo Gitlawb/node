@@ -662,9 +662,33 @@ async fn run_pass(
             }
         };
 
-        if object_list.is_empty() {
-            continue;
-        }
+        // #218 review round 10 (P1): a path-scoped repo whose only
+        // reachable object is a direct blob/tree ref yields an
+        // empty public list (the anonymous public classifier removes
+        // the only object from the served set) while
+        // `withheld_blob_recipients_bounded` still assigns that
+        // object to the owner recovery set below. Skipping the
+        // whole repo here would suppress encrypted recovery too,
+        // and a lost/failed encrypted copy would never be
+        // repaired. Track empty-public-work as a flag and run
+        // the public phase conditionally; encrypted phase 2 runs
+        // regardless.
+        let has_public_work = !object_list.is_empty();
+
+        // Backend enable flags live outside the `if has_public_work`
+        // block because phase 2 (encrypted) consults `ipfs_enabled`
+        // and `_pin_permit` regardless of public-work state. Pulling
+        // them out of the inner block is a round 10 P1 follow-up:
+        // before that, an empty public list (which made
+        // `has_public_work` false) left these names out of scope
+        // for phase 2 and the build failed.
+        let ipfs_enabled = !config.ipfs_api.is_empty();
+        let pinata_enabled = !config.pinata_jwt.is_empty();
+        // `_pin_permit` is set by the public phase when it had gaps
+        // to pin; phase 2 reuses it. When `has_public_work` is false
+        // the public phase never ran, so the permit starts as
+        // `None` and phase 2 acquires a fresh one.
+        let mut _pin_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
 
         // Fresh budget for the authorization-at-dispatch re-derivations (R1/R2):
         // the scan may have legitimately consumed its whole `scan_deadline`, and
@@ -678,6 +702,14 @@ async fn run_pass(
         // silently skipped every pass — empty `to_pin` behind a warn.
 
         // ── Phase 1: Public-object pinning (IPFS + Pinata) ────────────────
+        // Wrapped in `if has_public_work` so an empty public set
+        // (post-scan or post-refilter) still lets phase 2 run
+        // (round 10 P1). The `recheck_public_pin` and the
+        // mid-pass refilter inside this block BOTH have early
+        // `continue` paths that would otherwise skip phase 2
+        // entirely; we replaced the second with the flag flip
+        // above.
+        if has_public_work {
         // Re-check quarantine AND visibility right now (fresh rules + repo row),
         // then re-derive the allowed set from those fresh rules so a path-scoped
         // narrowing made mid-scan is honored before anything is pinned.
@@ -710,11 +742,19 @@ async fn run_pass(
             continue;
         };
         if object_list.is_empty() {
-            continue;
+            // #218 review round 10 (P1): a mid-pass visibility
+            // narrowing can leave the public set empty while
+            // withheld recipients are still non-empty. The
+            // IPFS/Pinata dispatch arms below already no-op on an
+            // empty `ipfs_missing`/`pinata_missing` (the lists the
+            // block fills in), so we only need to skip the offset
+            // bookkeeping and let phase 2 run.
+            tracing::debug!(repo = %repo_slug, "refiltered public set is empty; encrypted recovery still runs");
         }
 
-        let ipfs_enabled = !config.ipfs_api.is_empty();
-        let pinata_enabled = !config.pinata_jwt.is_empty();
+        // `ipfs_enabled` and `pinata_enabled` are declared outside
+        // the `if has_public_work` block (see above) so phase 2
+        // can read them when the public list is empty.
 
         // Per-(repo, backend) continuation offset (#218 review P2): loaded
         // here so the same offset is read once, used to rotate the
@@ -847,7 +887,10 @@ async fn run_pass(
         // The permit is held across the public pin loops AND the encrypted seal
         // below (which also writes to IPFS) and dropped at the end of this repo's
         // iteration.
-        let _pin_permit = if !ipfs_missing.is_empty() || !pinata_missing.is_empty() {
+        // Reassign the outer `_pin_permit` (declared before this
+        // block so phase 2 can read it even when the public phase
+        // did not run) instead of shadowing with `let`.
+        _pin_permit = if !ipfs_missing.is_empty() || !pinata_missing.is_empty() {
             let permit = pin_sem.clone().acquire_owned().await?;
             Some(permit)
         } else {
@@ -1108,6 +1151,7 @@ async fn run_pass(
                 tracing::debug!(repo = %repo_slug, "Pinata dispatched nothing this pass, continuation offset left unchanged");
             }
         }
+        } // end of `if has_public_work { ... }` (round 10 P1)
 
         // ── Phase 2: Encrypted recovery-copy resealing (withheld blobs) ──
 
