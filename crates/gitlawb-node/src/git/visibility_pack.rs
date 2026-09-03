@@ -424,10 +424,18 @@ fn walk_tree_oids_inner(
     let stdout = match std::str::from_utf8(&ls) {
         Ok(s) => s,
         Err(_) => {
-            // Non-UTF-8: fail closed. The deny side withholds by
-            // OID, so omitting the OID would let an unparseable
-            // tree leak.
-            return Ok(());
+            // Non-UTF-8: fail closed. A lossy decode would let an
+            // invalid-byte filename in a denied path fall through
+            // (U+FFFD vs the rule's bytes), the same under-withhold
+            // class phase 1 closes at :526. The child OIDs of this
+            // tree would otherwise stay out of the withheld set while
+            // `rev-list --objects --all` still serves them to an
+            // anonymous clone. Bail to keep the walk and the
+            // phase-1 path on the same classification.
+            anyhow::bail!(
+                "git ls-tree -z {tree_oid} returned a non-UTF-8 path; \
+                 refusing to produce a partial (under-withheld) set"
+            );
         }
     };
     for record in stdout.split('\0') {
@@ -3757,6 +3765,131 @@ esac\n";
         assert!(
             result.is_err(),
             "a non-UTF-8 path must fail closed (Err), not be lossy-decoded and leaked"
+        );
+    }
+
+    /// #218 review round 10 (P1): `walk_tree_oids_inner` previously
+    /// returned `Ok(())` on a non-UTF-8 `ls-tree -z` listing,
+    /// inserting only the tree OID and skipping the child blob/tree
+    /// OIDs. A direct tree ref (or an annotated tag peeling to a
+    /// tree) is valid Git input; `git rev-list --objects --all`
+    /// still enumerates the tree and every descendant. The
+    /// keep-side therefore removed the tree from the served set but
+    /// passed the child blob OIDs to `pack-objects`, exposing their
+    /// bytes to an anonymous clone. Phase 1 already bails on the
+    /// same input at `:526`; this test pins the walk on the same
+    /// fail-closed outcome for direct tree refs and peeled
+    /// tag-of-tree refs (the two non-commit shapes that round 9
+    /// added tolerance for).
+    #[cfg(unix)]
+    #[test]
+    fn fails_closed_on_non_utf8_tree_tip() {
+        use std::os::unix::ffi::OsStrExt;
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        std::fs::create_dir_all(&work).unwrap();
+        let run = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-q"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        // Hash a blob, then index it at a path whose directory byte is invalid UTF-8.
+        let blob_oid = {
+            let out = Command::new("git")
+                .args(["hash-object", "-w", "--stdin"])
+                .current_dir(&work)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut c| {
+                    use std::io::Write;
+                    c.stdin.take().unwrap().write_all(b"TOP SECRET\n")?;
+                    c.wait_with_output()
+                })
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let mut bad_path = std::ffi::OsString::from("s");
+        bad_path.push(std::ffi::OsStr::from_bytes(&[0xFF]));
+        bad_path.push("cret/b.txt");
+        let cacheinfo = {
+            let mut s = std::ffi::OsString::from(format!("100644,{blob_oid},"));
+            s.push(&bad_path);
+            s
+        };
+        assert!(
+            Command::new("git")
+                .arg("update-index")
+                .arg("--add")
+                .arg("--cacheinfo")
+                .arg(&cacheinfo)
+                .current_dir(&work)
+                .status()
+                .unwrap()
+                .success(),
+            "git update-index failed"
+        );
+        // Direct tree ref: a ref whose target is the TREE OID, not a commit.
+        // `git update-ref refs/tags/direct-tree <tree_oid>` writes that.
+        let tree_oid = String::from_utf8_lossy(
+            &Command::new("git")
+                .args(["write-tree"])
+                .current_dir(&work)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        run(
+            &["update-ref", "refs/tags/direct-tree", &tree_oid],
+            &work,
+        );
+        // Peeled tag-of-tree: an annotated tag whose target is the same tree.
+        // The walker has to peel the tag before it reaches the tree.
+        run(&["tag", "-a", "-m", "tagged", "tag-of-tree", &tree_oid], &work);
+        // Push both to the bare clone so the walker exercises the
+        // post-clone refs.
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        // Direct-tree case: the ref's target is the tree OID. The
+        // walker must fail closed (Err) so the keep-side withholds
+        // the whole subtree by name, never serving the child blob.
+        let rules = [rule("/s\u{fffd}cret/**", &[])];
+        let direct = withheld_blob_oids(&bare, &rules, true, OWNER, None);
+        assert!(
+            direct.is_err(),
+            "a direct-tree ref with a non-UTF-8 child must fail closed (Err), \
+             not return Ok with a partial withheld set (review round 10 P1)"
+        );
+
+        // Peeled-tag case: same input, but the walker has to peel
+        // the annotated tag before recursing. The same fail-closed
+        // invariant must hold.
+        let peeled = withheld_blob_oids(&bare, &rules, true, OWNER, None);
+        assert!(
+            peeled.is_err(),
+            "a peeled annotated-tag-of-tree with a non-UTF-8 child must \
+             fail closed (Err), not return Ok with a partial withheld set"
         );
     }
 
