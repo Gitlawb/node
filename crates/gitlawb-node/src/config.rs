@@ -126,7 +126,9 @@ pub struct Config {
     /// refused before the node binds. A problem with the storage itself leaves
     /// p2p off while HTTP keeps serving, logged as p2p_identity_key_load_failed.
     /// With a relative path the node verifies the working directory (ownership
-    /// and write permissions) before using it.
+    /// and write permissions) before using it. A 0755 key directory is tightened
+    /// on start; rotate the key only if the directory was group/world-writable
+    /// or the key was group/world-readable.
     #[arg(long, env = "GITLAWB_P2P_KEY", default_value = "~/.gitlawb/p2p.key")]
     pub p2p_key_path: String,
 

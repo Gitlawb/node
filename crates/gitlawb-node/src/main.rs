@@ -1950,8 +1950,8 @@ mod identity_key_storage_tests {
 
     /// A pre-existing directory that grants access beyond the owner is
     /// tightened on the next start, which is the INV-23(a) half issue #231
-    /// names: a 0600 PEM inside a 0755 directory is still replaceable by
-    /// anyone who can write that directory.
+    /// names. Write on the directory is what lets another user replace a
+    /// 0600 PEM; 0755 is tightened too, but is not replacement authority.
     #[cfg(unix)]
     #[test]
     fn existing_identity_key_directory_is_tightened() {
@@ -2059,6 +2059,101 @@ mod identity_key_storage_tests {
             assert!(
                 stdout.contains("identity-key-umask: asserted did="),
                 "umask={umask}: fixture must print its sentinel\n{stdout}"
+            );
+        }
+    }
+
+    /// Bare `GITLAWB_KEY=identity.pem` (and `./identity.pem`) must still create
+    /// the identity in the working directory. The p2p key refuses that form on
+    /// purpose; the node identity has always allowed it.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=identity-key-bare"]
+    fn fixture_bare_identity_key_in_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("identity-key-bare") {
+            return;
+        }
+        let cwd = std::path::PathBuf::from(
+            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+        );
+        std::env::set_current_dir(&cwd).expect("chdir into isolated tempdir");
+        let cwd_mode_before = std::fs::symlink_metadata(".").unwrap().permissions().mode() & 0o7777;
+
+        let name = std::env::var("GITLAWB_TEST_KEY_NAME").expect("GITLAWB_TEST_KEY_NAME");
+        let kp = load_or_create_keypair_at(std::path::Path::new(&name))
+            .unwrap_or_else(|e| panic!("bare identity path {name:?} must create, got: {e:#}"));
+        assert!(
+            std::path::Path::new(&name).exists() || std::path::Path::new("identity.pem").exists(),
+            "the key must land in the working directory"
+        );
+        let key = if std::path::Path::new(&name).exists() {
+            std::path::PathBuf::from(&name)
+        } else {
+            std::path::PathBuf::from("identity.pem")
+        };
+        assert_eq!(
+            std::fs::symlink_metadata(&key)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600,
+            "the identity key must be owner-only"
+        );
+        let cwd_mode_after = std::fs::symlink_metadata(".").unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            cwd_mode_before, cwd_mode_after,
+            "creating a bare identity key must not chmod the working directory"
+        );
+        let reloaded = load_or_create_keypair_at(std::path::Path::new(&name)).expect("reload");
+        assert_eq!(kp.did(), reloaded.did(), "the identity must be stable");
+        println!("identity-key-bare: asserted did={}", kp.did());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bare_identity_key_path_creates_in_cwd_without_chmodding_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for name in ["identity.pem", "./identity.pem"] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+            cmd.args([
+                "identity_key_storage_tests::fixture_bare_identity_key_in_cwd",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("GITLAWB_TEST_FIXTURE", "identity-key-bare")
+            .env("GITLAWB_TEST_BASE", base.path())
+            .env("GITLAWB_TEST_KEY_NAME", name);
+            let output = cmd.output().expect("spawn the bare-identity fixture");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "name={name}: bare identity path must create\n\
+                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            );
+            assert!(
+                stdout.contains("1 passed"),
+                "name={name}: filter must select one passing test\n{stdout}"
+            );
+            assert!(
+                stdout.contains("identity-key-bare: asserted did="),
+                "name={name}: fixture must print its sentinel\n{stdout}"
+            );
+            let cwd_mode = std::fs::symlink_metadata(base.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(
+                cwd_mode, 0o755,
+                "name={name}: the parent test must also see cwd left at 0755"
             );
         }
     }

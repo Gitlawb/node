@@ -450,6 +450,7 @@ pub(crate) mod pin {
         name: &std::ffi::OsStr,
         display: &Path,
         euid: u32,
+        open_flags: libc::c_int,
     ) -> std::io::Result<(Pinned<OwnedFd>, bool)> {
         use std::os::unix::ffi::OsStrExt;
 
@@ -464,7 +465,6 @@ pub(crate) mod pin {
                 "path component contains an interior NUL byte".to_string(),
             )
         })?;
-        let open_flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC;
 
         // Fast path: it already exists. Adopt and verify as-is (never pin).
         // SAFETY: openat resolves `name` relative to the verified parent.
@@ -513,7 +513,11 @@ pub(crate) mod pin {
                 // parent; the object was created by this process a moment ago
                 // and the parent cannot be repointed by another user.
                 if unsafe { libc::fchmodat(parent_fd, cname.as_ptr(), 0o700, 0) } != 0 {
-                    return Err(std::io::Error::last_os_error());
+                    return Err(rollback_created_dir(
+                        parent_fd,
+                        &cname,
+                        std::io::Error::last_os_error(),
+                    ));
                 }
             }
         }
@@ -521,15 +525,42 @@ pub(crate) mod pin {
         // SAFETY: openat as above, re-resolving the object that actually landed.
         let fd = unsafe { libc::openat(parent_fd, cname.as_ptr(), open_flags) };
         if fd < 0 {
-            return Err(std::io::Error::last_os_error());
+            let err = std::io::Error::last_os_error();
+            return Err(if created {
+                rollback_created_dir(parent_fd, &cname, err)
+            } else {
+                err
+            });
         }
         // SAFETY: a descriptor we just received and own exactly once.
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
 
         if created {
-            verify_exact_mode(owned.as_raw_fd(), 0o700, true, display, euid)?;
+            if let Err(err) = verify_exact_mode(owned.as_raw_fd(), 0o700, true, display, euid) {
+                drop(owned);
+                return Err(rollback_created_dir(parent_fd, &cname, err));
+            }
         }
         Ok((Pinned(owned), created))
+    }
+
+    /// Remove a directory `mkdirat` created in this invocation. Never called
+    /// for an `AlreadyExists` race winner.
+    fn rollback_created_dir(
+        parent_fd: std::os::fd::RawFd,
+        cname: &std::ffi::CString,
+        primary: std::io::Error,
+    ) -> std::io::Error {
+        // SAFETY: `name` was created by this invocation under `parent_fd`.
+        let rc = unsafe { libc::unlinkat(parent_fd, cname.as_ptr(), libc::AT_REMOVEDIR) };
+        if rc == 0 {
+            return primary;
+        }
+        let clean = std::io::Error::last_os_error();
+        std::io::Error::new(
+            primary.kind(),
+            format!("{primary}; also failed to remove the directory this process created: {clean}"),
+        )
     }
 
     /// Pin a file this process just created to `want` on its held descriptor
@@ -635,6 +666,28 @@ pub(crate) mod pin {
 /// `ensure_key_dir` opens it no-follow, checks its ownership, and tightens it
 /// to 0700 afterwards.
 #[cfg(unix)]
+fn walk_dir_open_flags() -> libc::c_int {
+    // Traversal needs search/execute, not directory-list. `O_RDONLY` on a
+    // directory additionally requires read permission, so a safe 0111 ancestor
+    // would fail before the ownership/write-authority predicate ran.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC
+    }
+}
+
+#[cfg(unix)]
+fn leaf_dir_open_flags() -> libc::c_int {
+    // The key directory handle must support fsync and fchmod. Those fail on
+    // an `O_PATH` descriptor, and a 0700 leaf is owner-readable.
+    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC
+}
+
+#[cfg(unix)]
 fn verify_and_create_ancestor_chain(dir: &Path, euid: u32) -> Result<std::os::fd::OwnedFd> {
     use std::os::fd::{AsRawFd, FromRawFd};
 
@@ -719,12 +772,7 @@ fn verify_and_create_ancestor_chain(dir: &Path, euid: u32) -> Result<std::os::fd
         // SAFETY: open(2) on "/" returns a new descriptor we own on success;
         // the root is not a symlink, so O_NOFOLLOW is moot there.
         let root = std::ffi::CString::new("/").unwrap();
-        let fd = unsafe {
-            libc::open(
-                root.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
+        let fd = unsafe { libc::open(root.as_ptr(), walk_dir_open_flags()) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error()).with_context(|| {
                 format!("failed to open the filesystem root for {}", dir.display())
@@ -740,12 +788,7 @@ fn verify_and_create_ancestor_chain(dir: &Path, euid: u32) -> Result<std::os::fd
         // itself; O_NOFOLLOW and O_DIRECTORY pin the object type. The display
         // path is only for error messages (no pathname is re-resolved for IO).
         let dot = std::ffi::CString::new(".").unwrap();
-        let fd = unsafe {
-            libc::open(
-                dot.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
+        let fd = unsafe { libc::open(dot.as_ptr(), walk_dir_open_flags()) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error()).with_context(|| {
                 format!("failed to open the working directory for {}", dir.display())
@@ -778,8 +821,9 @@ fn verify_and_create_ancestor_chain(dir: &Path, euid: u32) -> Result<std::os::fd
         // reopen, so under a mask that strips owner bits the reopen failed
         // EACCES and the pin was unreachable in exactly the case it existed
         // for.
-        let (next, _created) = pin::create_dir_pinned_at(cur.as_raw_fd(), name, &acc, euid)
-            .map_err(|e| walk_component_error(e, dir, &acc))?;
+        let (next, _created) =
+            pin::create_dir_pinned_at(cur.as_raw_fd(), name, &acc, euid, walk_dir_open_flags())
+                .map_err(|e| walk_component_error(e, dir, &acc))?;
 
         // The R3 predicate still judges every component, created or adopted.
         verify_component(next.get().as_raw_fd(), dir, &acc, euid)?;
@@ -1004,15 +1048,32 @@ impl KeyDirHandle {
     /// Build a handle from a descriptor that has already been pinned and
     /// verified by [`pin::create_dir_pinned_at`].
     ///
-    /// This is the only unix constructor on the production path, and taking a
-    /// `Pinned` rather than a bare descriptor is what makes the mode rule
-    /// compile-enforced: a directory that never went through the pin helper
-    /// cannot be turned into a `KeyDirHandle`, so it cannot reach key IO.
+    /// Taking a `Pinned` rather than a bare descriptor is what makes the mode
+    /// rule compile-enforced for nominated key directories: a directory that
+    /// never went through the pin helper cannot reach that constructor.
     fn from_pinned_fd(pinned: pin::Pinned<std::os::fd::OwnedFd>, dir_path: &Path) -> KeyDirHandle {
         KeyDirHandle {
             dir: std::fs::File::from(pinned.into_inner()),
             path: dir_path.to_path_buf(),
         }
+    }
+
+    /// Publish into an already-existing directory without creating or chmodding
+    /// it. The working-directory case for a bare node-identity filename uses
+    /// this so the p2p key's named-directory contract is not imported onto
+    /// `GITLAWB_KEY=identity.pem`.
+    fn from_existing_dir(dir: std::fs::File, dir_path: &Path) -> std::io::Result<KeyDirHandle> {
+        let md = dir.metadata()?;
+        if !md.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} is not a directory", dir_path.display()),
+            ));
+        }
+        Ok(KeyDirHandle {
+            dir,
+            path: dir_path.to_path_buf(),
+        })
     }
 
     /// Open `dir_path` refusing symlinks and non-directories at the open
@@ -1103,7 +1164,15 @@ impl KeyDirHandle {
         // creating boot still succeeds on this open descriptor, and the NEXT
         // boot cannot read its own key. `O_EXCL` guarantees this process
         // created the inode, so there is no race winner to leave alone.
-        pin::pin_created_file(file, 0o600, &self.path.join(name), effective_uid())
+        pin::pin_created_file(file, 0o600, &self.path.join(name), effective_uid()).map_err(|e| {
+            match self.remove_child(name) {
+                Ok(()) => e,
+                Err(clean) => std::io::Error::new(
+                    e.kind(),
+                    format!("{e}; also failed to remove the scratch this process created: {clean}"),
+                ),
+            }
+        })
     }
 
     /// Atomically publish `from` at `to` via `linkat` on the held descriptor.
@@ -1135,6 +1204,11 @@ impl KeyDirHandle {
     fn remove_child(&self, name: &std::ffi::OsStr) -> std::io::Result<()> {
         use std::os::fd::AsRawFd;
 
+        #[cfg(test)]
+        if FAIL_SCRATCH_UNLINK.with(|f| f.get()) {
+            return Err(std::io::Error::other("injected scratch unlink failure"));
+        }
+
         let name = Self::child_name(name)?;
         // SAFETY: resolves relative to our owned directory descriptor;
         // `unlinkat` without AT_REMOVEDIR removes only non-directories.
@@ -1147,6 +1221,8 @@ impl KeyDirHandle {
 
     /// `fsync` the directory itself so a just-published entry survives a crash.
     fn sync(&self) -> std::io::Result<()> {
+        #[cfg(test)]
+        SYNC_COUNT.with(|c| c.set(c.get() + 1));
         self.dir.sync_all()
     }
 
@@ -1272,6 +1348,12 @@ fn describe_unusable_key_dir(dir: &Path, e: std::io::Error) -> anyhow::Error {
     anyhow::Error::new(e).context(format!("failed to open key directory {}", dir.display()))
 }
 
+/// Group or world write on a directory is replacement authority over the next
+/// entry. Execute or list without write is not.
+fn dir_mode_allows_untrusted_replace(mode: u32) -> bool {
+    mode & 0o022 != 0
+}
+
 /// Create the directory holding the key with owner-only permissions, tighten
 /// it if it already exists with a looser mode, and hand back the verified
 /// handle every subsequent operation is anchored to. Write permission on this
@@ -1312,8 +1394,14 @@ fn ensure_key_dir(dir: &Path) -> Result<KeyDirHandle> {
         )
     })?;
 
-    let (pinned, created) = pin::create_dir_pinned_at(parent_fd.as_raw_fd(), leaf_name, dir, euid)
-        .map_err(|e| describe_unusable_key_dir(dir, e))?;
+    let (pinned, created) = pin::create_dir_pinned_at(
+        parent_fd.as_raw_fd(),
+        leaf_name,
+        dir,
+        euid,
+        leaf_dir_open_flags(),
+    )
+    .map_err(|e| describe_unusable_key_dir(dir, e))?;
     let handle = KeyDirHandle::from_pinned_fd(pinned, dir);
 
     // A directory this process just created is already verified at exactly 0700
@@ -1334,22 +1422,38 @@ fn ensure_key_dir(dir: &Path) -> Result<KeyDirHandle> {
         // verify.
         let mode = md.permissions().mode() & 0o7777;
         if mode & 0o077 != 0 {
+            let writable = dir_mode_allows_untrusted_replace(mode);
             warn!(
                 dir = %dir.display(),
                 mode = format!("{mode:04o}"),
-                "key directory grants access beyond its owner; tightening it to 0700"
+                writable,
+                "{}",
+                if writable {
+                    "key directory is writable beyond its owner; tightening it to 0700. Treat a key that was sitting there as possibly exposed"
+                } else {
+                    "key directory grants access beyond its owner; tightening it to 0700"
+                }
             );
             // `fchmod` through the handle: the directory whose mode changes is
             // the object that was just verified, not whatever the pathname
             // resolves to by now.
             handle.tighten_to_0700().with_context(|| {
-                format!(
-                    "key directory {} has mode {:04o}, which lets other users replace \
-                     the keys it holds, and it could not be tightened; run `chmod 700 {}`",
-                    dir.display(),
-                    mode,
-                    dir.display()
-                )
+                if writable {
+                    format!(
+                        "key directory {} has mode {:04o}, which lets other users replace \
+                         the keys it holds, and it could not be tightened; run `chmod 700 {}`",
+                        dir.display(),
+                        mode,
+                        dir.display()
+                    )
+                } else {
+                    format!(
+                        "key directory {} has mode {:04o} and could not be tightened; run `chmod 700 {}`",
+                        dir.display(),
+                        mode,
+                        dir.display()
+                    )
+                }
             })?;
             let after = handle
                 .metadata()
@@ -1442,13 +1546,30 @@ fn ensure_key_dir(dir: &Path) -> Result<KeyDirHandle> {
 #[cfg(unix)]
 pub(crate) fn create_pinned_dir_and_publish(key_path: &Path, bytes: &[u8]) -> Result<()> {
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
 
-    let dir = key_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("{} names no directory to hold it", key_path.display()))?;
     let file_name = key_path
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("{} names no key file", key_path.display()))?;
+
+    // A bare filename (`identity.pem`) or `./identity.pem` publishes into the
+    // working directory. That form is legal for GITLAWB_KEY and illegal for
+    // GITLAWB_P2P_KEY; this helper must not chmod cwd as if it were a nominated
+    // key directory.
+    let parent = key_parent(key_path);
+    if parent == Path::new(".") {
+        let cwd = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(".")
+            .with_context(|| "failed to open the working directory for the identity key")?;
+        let handle = KeyDirHandle::from_existing_dir(cwd, Path::new("."))?;
+        write_key_atomically(&handle, file_name, bytes)
+            .with_context(|| format!("failed to write identity key to {}", key_path.display()))?;
+        return Ok(());
+    }
+
+    let dir = parent;
     let dir_name = dir
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("{} names no final directory component", dir.display()))?;
@@ -1468,11 +1589,12 @@ pub(crate) fn create_pinned_dir_and_publish(key_path: &Path, bytes: &[u8]) -> Re
         .with_context(|| format!("failed to open {}", gp_path.display()))?;
 
     let euid = effective_uid();
-    let (pinned, created) = pin::create_dir_pinned_at(gp.as_raw_fd(), dir_name, dir, euid)
-        .map_err(|e| {
-            anyhow::Error::new(e)
-                .context(format!("failed to create key directory {}", dir.display()))
-        })?;
+    let (pinned, created) =
+        pin::create_dir_pinned_at(gp.as_raw_fd(), dir_name, dir, euid, leaf_dir_open_flags())
+            .map_err(|e| {
+                anyhow::Error::new(e)
+                    .context(format!("failed to create key directory {}", dir.display()))
+            })?;
     let handle = KeyDirHandle::from_pinned_fd(pinned, dir);
 
     // An adopted directory is tightened when it grants access beyond the owner,
@@ -1487,10 +1609,17 @@ pub(crate) fn create_pinned_dir_and_publish(key_path: &Path, bytes: &[u8]) -> Re
             .mode()
             & 0o7777;
         if mode & 0o077 != 0 {
+            let writable = dir_mode_allows_untrusted_replace(mode);
             warn!(
                 dir = %dir.display(),
                 mode = format!("{mode:04o}"),
-                "identity key directory grants access beyond its owner; tightening it to 0700"
+                writable,
+                "{}",
+                if writable {
+                    "identity key directory is writable beyond its owner; tightening it to 0700"
+                } else {
+                    "identity key directory grants access beyond its owner; tightening it to 0700"
+                }
             );
             handle
                 .tighten_to_0700()
@@ -1515,8 +1644,10 @@ pub(crate) fn create_pinned_dir_and_publish(key_path: &Path, bytes: &[u8]) -> Re
 /// key between the check and the rename. `hard_link` is atomic and fails with
 /// `AlreadyExists` if anything already occupies the path (a real file, or a
 /// symlink, which it does not follow), so the two properties hold together
-/// without a check-then-act gap. The scratch file is unlinked either way, so a
-/// failed start leaves the key directory as it found it.
+/// without a check-then-act gap. On success the scratch name is unlinked and
+/// the directory is fsynced again so the leftover name is not the durable
+/// state. On failure the scratch is removed too, and a cleanup error is
+/// reported alongside the write error.
 fn write_key_atomically(
     dir: &KeyDirHandle,
     key_name: &std::ffi::OsStr,
@@ -1525,10 +1656,39 @@ fn write_key_atomically(
     let (scratch_name, mut file) = create_scratch_key_file(dir)?;
     let result = fill_and_publish(&mut file, bytes, dir, &scratch_name, key_name);
     drop(file);
-    // Unconditional: on success the key is reachable through its own link, and
-    // on failure nothing may be left behind.
-    let _ = dir.remove_child(&scratch_name);
-    result
+    match result {
+        Ok(()) => {
+            dir.remove_child(&scratch_name).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "published the key but failed to remove the scratch name {}: {e}",
+                        Path::new(&scratch_name).display()
+                    ),
+                )
+            })?;
+            dir.sync().map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to sync key directory {} after removing the scratch name; the \
+                         identity may not survive a crash until the next successful start: {e}",
+                        dir.path.display()
+                    ),
+                )
+            })?;
+            Ok(())
+        }
+        Err(e) => {
+            if let Err(clean) = dir.remove_child(&scratch_name) {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("{e}; also failed to remove the scratch this process created: {clean}"),
+                ));
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Open a uniquely named scratch file in `dir` with owner-only permissions
@@ -1596,6 +1756,12 @@ thread_local! {
     /// Test-only fault injection for the key write. Thread-local so an armed
     /// test cannot disturb the others running beside it.
     static FAIL_KEY_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Test-only fault injection for scratch unlink after publish.
+    static FAIL_SCRATCH_UNLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// How many times this test thread fsync'd a key directory.
+    static SYNC_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 
     /// Test-only override for the process effective uid.
     static EUID_OVERRIDE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
@@ -2025,6 +2191,16 @@ pub async fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dir_mode_replace_authority_is_the_write_bits() {
+        assert!(!dir_mode_allows_untrusted_replace(0o755));
+        assert!(!dir_mode_allows_untrusted_replace(0o711));
+        assert!(!dir_mode_allows_untrusted_replace(0o111));
+        assert!(dir_mode_allows_untrusted_replace(0o775));
+        assert!(dir_mode_allows_untrusted_replace(0o777));
+        assert!(dir_mode_allows_untrusted_replace(0o722));
+    }
 
     #[test]
     fn p2p_identity_not_derivable_from_did_alone() {
@@ -2758,6 +2934,25 @@ mod tests {
                 stdout.contains(&format!("p2p-key-skip-pin: asserted target={target}")),
                 "target={target}: fixture must print its sentinel\n{stdout}"
             );
+            // A pin/verify failure on an object this process just created must
+            // not leave that object behind. The dir target mkdirat's `keys`;
+            // the key target O_EXCL-creates a scratch file inside a pre-existing
+            // `keys`. Either leftover turns a transient pin fault into the next
+            // boot's adopted-existing path.
+            if target == "dir" {
+                assert!(
+                    !base.path().join("keys").exists(),
+                    "target=dir: a failed pin must remove the directory this process created"
+                );
+            } else {
+                let leftovers: Vec<_> = std::fs::read_dir(base.path().join("keys"))
+                    .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name()).collect())
+                    .unwrap_or_default();
+                assert!(
+                    leftovers.is_empty(),
+                    "target=key: a failed pin must remove the scratch this process created, found: {leftovers:?}"
+                );
+            }
         }
     }
 
@@ -3378,6 +3573,57 @@ mod tests {
         let kp = load_or_create_p2p_keypair(&path).expect("a retry after a failed write must work");
         let reloaded = load_or_create_p2p_keypair(&path).unwrap();
         assert_eq!(PeerId::from(kp.public()), PeerId::from(reloaded.public()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_publish_fsyncs_after_scratch_unlink() {
+        SYNC_COUNT.with(|c| c.set(0));
+        let dir = key_base_0700();
+        let path = dir.path().join("keys").join("p2p.key");
+        load_or_create_p2p_keypair(&path).expect("first boot");
+        let syncs = SYNC_COUNT.with(|c| c.get());
+        assert!(
+            syncs >= 2,
+            "publish must fsync after linking and again after unlinking the scratch, got {syncs}"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(
+            leftovers,
+            vec![std::ffi::OsString::from("p2p.key")],
+            "success must leave only the nominated key, found: {leftovers:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scratch_unlink_failure_is_not_reported_as_success() {
+        let dir = key_base_0700();
+        let key_dir = dir.path().join("keys");
+        let path = key_dir.join("p2p.key");
+
+        FAIL_SCRATCH_UNLINK.with(|f| f.set(true));
+        let result = load_or_create_p2p_keypair(&path);
+        FAIL_SCRATCH_UNLINK.with(|f| f.set(false));
+
+        result.expect_err("an unlink failure after publish must not report success");
+        assert!(
+            path.exists(),
+            "the nominated key is already linked; unlink failure must not delete it"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&key_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leftovers.iter().any(|n| n.starts_with(".p2p.key.") && n.ends_with(".tmp")),
+            "the scratch name must still be present so the failure is visible, found: {leftovers:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -4019,6 +4265,41 @@ mod tests {
         std::fs::set_permissions(&sticky, std::fs::Permissions::from_mode(0o1777)).unwrap();
         let _ = load_or_create_p2p_keypair(&sticky.join("keys").join("p2p.key"))
             .expect("a 1777 sticky ancestor must boot");
+    }
+
+    /// Owner-execute-only (0111) is enough to traverse. Requiring directory
+    /// list permission would refuse a path the ownership/write-authority
+    /// predicate already accepts. The next component must already exist:
+    /// 0111 has no owner-write, so the walk cannot mkdirat through it.
+    #[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+    #[test]
+    fn ancestor_walk_accepts_search_only_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = key_base_0700();
+        let anc = base.path().join("searchonly");
+        let keys = anc.join("keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&anc, std::fs::Permissions::from_mode(0o111)).unwrap();
+
+        let path = keys.join("p2p.key");
+        let loaded = load_or_create_p2p_keypair(&path);
+        let kp = match loaded {
+            Ok(kp) => kp,
+            Err(e) => {
+                std::fs::set_permissions(&anc, std::fs::Permissions::from_mode(0o700)).unwrap();
+                panic!("a search-only ancestor must not require directory-list permission: {e:#}");
+            }
+        };
+        let reloaded = load_or_create_p2p_keypair(&path);
+        std::fs::set_permissions(&anc, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let reloaded = reloaded.expect("reload");
+        assert_eq!(
+            PeerId::from(kp.public()),
+            PeerId::from(reloaded.public()),
+            "the identity must reload stably through a search-only ancestor"
+        );
     }
 
     #[cfg(unix)]
