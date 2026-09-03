@@ -1930,8 +1930,17 @@ impl Db {
     /// Set or clear a repo's quarantine flag and bump the policy epoch
     /// atomically. Returns the number of rows touched (0 if no such repo).
     /// A failure in either statement rolls back both.
+    ///
+    /// Round 10 P1: acquire the in-process per-repo policy mutex
+    /// for the duration of the transaction. The sweep's
+    /// `PolicyFence` holds the same mutex from capture through
+    /// drop, so a quarantine narrow blocks until the in-flight
+    /// pin batch finishes. This closes the "narrow commits
+    /// between the fence's epoch read and the upload's POST"
+    /// window. Multi-process is a known gap (round 10 P1 follow-up).
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn set_repo_quarantine(&self, repo_id: &str, quarantined: bool) -> Result<u64> {
+        let _lock = crate::ipfs_pin::PolicyMutexes::lock(repo_id).await;
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query("UPDATE repos SET quarantined = $1 WHERE id = $2")
             .bind(quarantined)
@@ -4795,6 +4804,10 @@ impl Db {
         reader_dids: &[String],
         created_by: &str,
     ) -> Result<()> {
+        // Round 10 P1: acquire the per-repo policy mutex so a
+        // sweep's `PolicyFence` (which holds the same lock from
+        // capture through drop) blocks until this commit lands.
+        let _lock = crate::ipfs_pin::PolicyMutexes::lock(repo_id).await;
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let readers = serde_json::to_string(reader_dids).unwrap_or_else(|_| "[]".to_string());
@@ -4828,6 +4841,8 @@ impl Db {
 
     /// Remove a visibility rule and bump the repo's policy epoch atomically.
     pub async fn remove_visibility_rule(&self, repo_id: &str, path_glob: &str) -> Result<()> {
+        // Round 10 P1: see set_visibility_rule. Same lock + comment.
+        let _lock = crate::ipfs_pin::PolicyMutexes::lock(repo_id).await;
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM visibility_rules WHERE repo_id = $1 AND path_glob = $2")
             .bind(repo_id)

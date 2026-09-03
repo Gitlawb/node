@@ -1452,26 +1452,97 @@ pub const PIN_BATCH_BUDGET: Duration = Duration::from_secs(120);
 /// (R1-P1). `None` (the push path) means "no fence": the push derives its own
 /// object list at admission and holds a write lease, so no sweep-style batch
 /// snapshot crosses the dispatch boundary.
-#[derive(Clone)]
+///
+/// Round 10 P1: an epoch read alone does NOT order a commit with a later
+/// HTTP request. The fence additionally holds an in-process per-repo
+/// mutex from capture through drop, and the narrow path (rule
+/// insert, quarantine set, etc.) acquires the same mutex before its
+/// update. The narrow therefore blocks until the in-flight batch
+/// releases the lock, and the in-flight batch blocks until the
+/// narrow's commit lands. Multi-process / multi-node is a known gap
+/// (a per-repo advisory lock in Postgres would extend the same
+/// guarantee across processes; deferred to a follow-up).
 pub struct PolicyFence {
     db: crate::db::Db,
     repo_id: String,
     epoch: i64,
+    /// RAII: the per-repo mutex guard, released on drop. `None`
+    /// when the capture path is the unfenced push helper (which
+    /// does not participate in a sweep batch). The `MutexGuard`
+    /// is held directly (no Arc) — `PolicyFence` is `!Clone` for
+    /// the sweep's lifetime — and released when the fence drops
+    /// at the end of the dispatch site.
+    _lock_guard: Option<tokio::sync::MutexGuard<'static, ()>>,
+}
+
+/// Per-repo in-process mutex registry. The narrow acquires the
+/// same per-repo lock that `PolicyFence` holds, so a visibility
+/// change blocks until an in-flight batch finishes. Round 10 P1.
+///
+/// Implementation: a `std::sync::Mutex<HashMap<&'static str, Arc<Mutex<()>>>>`
+/// whose values are `Arc::leak`'d to get a `'static` reference
+/// (the alternative — `OwnedMutexGuard` plus an `Arc` field —
+/// needs the Arc's contents to outlive the registry, which the
+/// map's strong count already ensures; the leak just gives the
+/// returned guard the `'static` lifetime the borrow checker
+/// requires). Memory: one `Arc` header (8 bytes) + one `Mutex`
+/// (40 bytes) per repo ever observed in the process lifetime, vs
+/// the policy epoch row that the narrow maintains anyway.
+pub struct PolicyMutexes;
+
+impl PolicyMutexes {
+    fn registry() -> &'static std::sync::Mutex<
+        std::collections::HashMap<&'static str, &'static tokio::sync::Mutex<()>>,
+    > {
+        use std::sync::OnceLock;
+        static REG: OnceLock<
+            std::sync::Mutex<std::collections::HashMap<&'static str, &'static tokio::sync::Mutex<()>>>,
+        > = OnceLock::new();
+        REG.get_or_init(|| std::sync::Mutex::new(Default::default()))
+    }
+
+    /// Acquire the per-repo lock. The returned guard is RAII; drop
+    /// to release. The same lock is shared with `PolicyFence`.
+    pub async fn lock(repo_id: &str) -> tokio::sync::MutexGuard<'static, ()> {
+        // Leak the repo_id str for the slot key. Repo ids are
+        // 36-char UUIDs; the leak is bounded by the number of
+        // distinct repos ever observed.
+        let repo_id_static: &'static str = Box::leak(repo_id.to_string().into_boxed_str());
+        let mu: &'static tokio::sync::Mutex<()> = {
+            let mut g = Self::registry().lock().expect("policy mutex registry poisoned");
+            g.entry(repo_id_static).or_insert_with(|| {
+                let m = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                Box::leak(Box::new(m))
+            })
+        };
+        mu.lock().await
+    }
 }
 
 impl PolicyFence {
     /// Capture the current policy epoch for `repo_id`. A read failure is a
     /// skip, not a retry-with-zero: the caller must not dispatch a batch it
-    /// cannot fence (fail closed on a stale allow).
+    /// cannot fence (fail closed on a stale allow). The capture ALSO
+    /// acquires the per-repo in-process mutex from
+    /// [`PolicyMutexes::lock`], which is released when the returned
+    /// `PolicyFence` is dropped. The narrow path acquires the same
+    /// lock before its update (round 10 P1).
     pub async fn capture(db: &crate::db::Db, repo_id: &str) -> Option<Self> {
+        // Acquire the per-repo lock FIRST, before reading the epoch, so
+        // a narrow that lands between the lock acquire and the read is
+        // impossible: the narrow cannot proceed until the fence is
+        // dropped at the end of the batch.
+        let lock_guard = PolicyMutexes::lock(repo_id).await;
         match db.repo_policy_epoch(repo_id).await {
             Ok(epoch) => Some(PolicyFence {
                 db: db.clone(),
                 repo_id: repo_id.to_string(),
                 epoch,
+                _lock_guard: Some(lock_guard),
             }),
             Err(e) => {
                 tracing::warn!(repo = %repo_id, err = %e, "policy-epoch read failed; not fencing pin batch");
+                // lock_guard drops here, releasing the lock.
                 None
             }
         }
