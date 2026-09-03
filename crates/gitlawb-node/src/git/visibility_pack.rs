@@ -760,6 +760,13 @@ fn all_object_paths(
     let commits_stdout = String::from_utf8_lossy(&commits_out);
     let mut blob_set: HashSet<(String, String)> = HashSet::new();
     let mut tree_set: HashSet<(String, String)> = HashSet::new();
+    // OID-only indexes for the phase 2 membership check below. Without
+    // these the catch-all branch does O(O×P) `blob_set.iter().any(...)`
+    // scans, which on a 50k-object repo runs hundreds of millions of
+    // string compares per pass (round 10 P2). Maintained alongside the
+    // path-pair sets so the OID is O(1) lookup, not O(P).
+    let mut blob_oids: HashSet<String> = HashSet::new();
+    let mut tree_oids: HashSet<String> = HashSet::new();
     // Phase 1: enumerate trees AND blobs with their paths via
     // `git ls-tree -r -t <commit>`. `-t` is the tree counterpart of `-r`:
     // without it, recursive listings emit only blob entries. Each line is
@@ -782,13 +789,6 @@ fn all_object_paths(
         // ls-tree -r -t below still enumerates every reachable
         // blob/subtree tree at its real path; only the root tree's
         // gate is restructured.
-        let _root_tree_out = run_bounded_git(
-            git_bin,
-            &["rev-parse", &format!("{commit}^{{tree}}")],
-            repo_path,
-            b"",
-            deadline,
-        )?;
         let listing_out = run_bounded_git(
             git_bin,
             &["ls-tree", "-r", "-t", "-z", commit],
@@ -813,11 +813,13 @@ fn all_object_paths(
             match kind {
                 Some("blob") => {
                     if let Some(oid) = oid {
+                        blob_oids.insert(oid.to_string());
                         blob_set.insert((oid.to_string(), format!("/{path}")));
                     }
                 }
                 Some("tree") => {
                     if let Some(oid) = oid {
+                        tree_oids.insert(oid.to_string());
                         tree_set.insert((oid.to_string(), format!("/{path}")));
                     }
                 }
@@ -857,10 +859,13 @@ fn all_object_paths(
         match kind {
             // Only insert if not already present (ls-tree gives path, this
             // catch-all has no path; prefer the path-annotated entry).
-            Some("blob") if !blob_set.iter().any(|(o, _)| o == oid) => {
+            // Round 10 P2: O(1) OID index lookup, not O(O×P) path-pair scan.
+            Some("blob") if !blob_oids.contains(oid) => {
+                blob_oids.insert(oid.to_string());
                 blob_set.insert((oid.to_string(), String::new()));
             }
-            Some("tree") if !tree_set.iter().any(|(o, _)| o == oid) => {
+            Some("tree") if !tree_oids.contains(oid) => {
+                tree_oids.insert(oid.to_string());
                 tree_set.insert((oid.to_string(), String::new()));
             }
             _ => {}
