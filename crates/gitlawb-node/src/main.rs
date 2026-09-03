@@ -586,6 +586,7 @@ async fn main() -> Result<()> {
     }
 
     let _legacy_cid_sweep = spawn_legacy_cid_sweep(&state, &config);
+    let _queue_lifecycle_sweep = spawn_queue_lifecycle_sweep(&state, &config);
 
     let router = server::build_router(state.clone());
     // Re-register the socket bound at startup — same fd, so there was never a
@@ -795,6 +796,43 @@ fn spawn_legacy_cid_sweep(state: &AppState, config: &Config) -> tokio::task::Joi
             // Shutdown mid-walk simply drops the run; the persisted cursor means the
             // next boot picks up where this one stopped.
             _ = shutdown_rx.changed() => {}
+        }
+    })
+}
+
+/// #26 Split PR 1 step 4 — periodic queue-lifecycle purge. Runs on
+/// the same detached task pattern as `spawn_legacy_cid_sweep`:
+/// tokio::spawn with a shutdown watcher, never on the boot path. The
+/// interval is fixed at 24 hours (the spec calls for "one per
+/// cluster per day"); the inter-batch delay is implicit in the
+/// batch size plus the wall-clock cost of each pass. The drain
+/// (`drain_receive_pack_requests_all`) and the purge
+/// (`purge_request_queue`) share the same `DRAIN_PER_PASS_LIMIT`
+/// budget so a 1000-row purge pass takes roughly the same time as
+/// a 1000-row drain pass.
+fn spawn_queue_lifecycle_sweep(state: &AppState, config: &Config) -> tokio::task::JoinHandle<()> {
+    let db = state.db.clone();
+    let retention_days = config.queue_retention_days;
+    let batch = config.queue_purge_batch;
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(e) = durable_outbox::purge_request_queue(
+                        &db,
+                        retention_days,
+                        batch,
+                    ).await {
+                        tracing::warn!(err = %e, "queue lifecycle purge failed; will retry on next tick");
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    break;
+                }
+            }
         }
     })
 }

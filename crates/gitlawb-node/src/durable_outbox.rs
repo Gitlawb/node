@@ -476,10 +476,7 @@ where
     F: Fn(AppState, String) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<EffectsOutcome>>,
 {
-    let reqs = state
-        .db
-        .list_receive_pack_requests_due(limit)
-        .await?;
+    let reqs = state.db.list_receive_pack_requests_due(limit).await?;
     let mut processed = 0;
     let examined = reqs.len();
     for req in reqs {
@@ -567,6 +564,54 @@ pub async fn drain_receive_pack_requests_all(
         );
     }
     Ok(total)
+}
+
+/// #26 Split PR 1 step 4 — bounded retirement. Purges terminal
+/// `receive_pack_requests` rows and their per-ref children that are
+/// older than `retention_days`. Runs as a periodic task from
+/// `main.rs` (one per cluster per day is the spec's target rate).
+///
+/// Deletion order matters: purge the parent requests first, then
+/// the orphaned children. The parent delete is bounded by the
+/// partial index `idx_receive_pack_requests_completed_at` (built
+/// by v30); the children delete is bounded by the same predicate
+/// on `applied_at` / `cancelled_at`.
+///
+/// `quarantined` rows are NEVER purged by this path — the spec
+/// reserves those for operator inspection. Step 5 introduces the
+/// `quarantined` state; this PR's purge is intentionally restricted
+/// to `complete` and `rejected_at_git`.
+///
+/// Returns `(requests_deleted, children_deleted)`. The caller logs
+/// the totals; a non-zero `requests_deleted` is the success signal,
+/// and a non-zero `children_deleted` after a `requests_deleted` of
+/// zero is a hint that the children were orphaned by a previous
+/// purge that crashed mid-run.
+pub async fn purge_request_queue(
+    db: &crate::db::Db,
+    retention_days: i64,
+    per_pass_limit: i64,
+) -> anyhow::Result<(u64, u64)> {
+    let older_than = chrono::Utc::now() - chrono::Duration::days(retention_days);
+    let older_than_iso = older_than.to_rfc3339();
+
+    let requests_deleted = db
+        .purge_completed_receive_pack_requests(&older_than_iso, per_pass_limit)
+        .await?;
+    let children_deleted = db
+        .purge_completed_pending_ref_transitions(&older_than_iso, per_pass_limit)
+        .await?;
+
+    if requests_deleted > 0 || children_deleted > 0 {
+        tracing::info!(
+            retention_days,
+            older_than = %older_than_iso,
+            requests_deleted,
+            children_deleted,
+            "queue lifecycle: purged terminal request rows"
+        );
+    }
+    Ok((requests_deleted, children_deleted))
 }
 
 /// Outcome of a single `apply_request_effects` call. The caller (live
@@ -692,11 +737,8 @@ pub async fn apply_request_effects(
     // 6. Push event — written once, for the request. The live and
     //    recovery paths produce the same id because both key on
     //    `(request_id, accepted_ordinal)`.
-    let push_event_id =
-        crate::db::push_event_id_for(&req.id, accepted_ordinal);
-    let accepted_ref = children
-        .iter()
-        .find(|c| c.ordinal == accepted_ordinal);
+    let push_event_id = crate::db::push_event_id_for(&req.id, accepted_ordinal);
+    let accepted_ref = children.iter().find(|c| c.ordinal == accepted_ordinal);
     let commit_hash = accepted_ref
         .map(|c| c.new_sha.clone())
         .unwrap_or_else(|| chrono::Utc::now().timestamp().to_string());
@@ -873,6 +915,7 @@ mod drain_tests {
 
     use super::*;
     use crate::db::pending_state;
+    use crate::db::request_state;
     use crate::db::Db;
     use crate::db::PendingRefTransition;
     use chrono::Utc;
@@ -1010,7 +1053,9 @@ mod drain_tests {
         .unwrap();
 
         for child in children {
-            db.insert_pending_ref_transition_for_test(child).await.unwrap();
+            db.insert_pending_ref_transition_for_test(child)
+                .await
+                .unwrap();
         }
     }
 
@@ -1102,7 +1147,11 @@ mod drain_tests {
         assert_eq!(anchor_count, 1, "exactly one anchor job per transition");
 
         // The request row moved to `complete`.
-        let after = state.db.get_receive_pack_request(&request_id).await.unwrap();
+        let after = state
+            .db
+            .get_receive_pack_request(&request_id)
+            .await
+            .unwrap();
         assert_eq!(
             after.expect("request row exists").state,
             crate::db::request_state::COMPLETE,
@@ -1154,15 +1203,7 @@ mod drain_tests {
                 "message": "deny non-fast-forward",
             }],
         });
-        stage_request_with_children(
-            &state.db,
-            request_id,
-            repo_id,
-            None,
-            &[],
-            parsed_report,
-        )
-        .await;
+        stage_request_with_children(&state.db, request_id, repo_id, None, &[], parsed_report).await;
 
         let (n, examined) = drain_receive_pack_requests(state.clone(), 100)
             .await
@@ -2075,21 +2116,14 @@ mod drain_tests {
         // Drain with the production limits. Two passes of 1000 each
         // cover all 1500 requests; the third pass would be empty and
         // exits the loop early on the `n < per_pass_limit` check.
-        let total = drain_receive_pack_requests_all(
-            state.clone(),
-            DRAIN_PER_PASS_LIMIT,
-            DRAIN_MAX_PASSES,
-        )
-        .await
-        .unwrap();
+        let total =
+            drain_receive_pack_requests_all(state.clone(), DRAIN_PER_PASS_LIMIT, DRAIN_MAX_PASSES)
+                .await
+                .unwrap();
         assert_eq!(total, N, "drain processed the full backlog");
 
         // No `outcomes_committed` requests remain.
-        let after = state
-            .db
-            .count_receive_pack_requests_due()
-            .await
-            .unwrap();
+        let after = state.db.count_receive_pack_requests_due().await.unwrap();
         assert_eq!(
             after, 0,
             "every request row was processed and moved to complete"
@@ -2557,11 +2591,7 @@ mod drain_tests {
         );
 
         // Every request is in `effects_pending` for a future retry.
-        let due = state
-            .db
-            .count_receive_pack_requests_due()
-            .await
-            .unwrap();
+        let due = state.db.count_receive_pack_requests_due().await.unwrap();
         // The Retry path sets `next_attempt_at` 60s in the future,
         // so the due count is 0 — but the requests still exist.
         assert_eq!(due, 0, "Retry schedules the requests 60s out");
@@ -2835,5 +2865,160 @@ mod drain_tests {
             cert.signature, "b-live-signature",
             "signature stays at B's live signature; A's replay must not outrank B's"
         );
+    }
+
+    // #26 Split PR 1 step 4 — bounded retirement. The periodic
+    // purge task deletes terminal `complete` / `rejected_at_git`
+    // rows and their children older than the retention window.
+    // The tests below pin the contract:
+    //
+    // 1. Only `complete` / `rejected_at_git` rows are eligible.
+    // 2. Only rows with `completed_at < now - retention` are eligible.
+    // 3. Children are purged after their parent request.
+    // 4. `quarantined` (not yet a state) and non-terminal states are NEVER purged.
+    // 5. Idempotent: a second purge with no new eligible rows returns (0, 0).
+
+    /// Helper: insert a request row with the given state and `completed_at`.
+    /// Returns the request id.
+    async fn stage_request_for_purge(
+        pool: &sqlx::PgPool,
+        request_id: &str,
+        state: &str,
+        completed_at: Option<&str>,
+    ) {
+        let now = chrono::Utc::now().to_rfc3339();
+        let created_at = now.clone();
+        let bytes = b"purge-test".to_vec();
+        sqlx::query(
+            r#"INSERT INTO receive_pack_requests
+               (id, repo_id, pusher_did, node_did, request_bytes, request_bytes_hash,
+                state, git_exit_ok, parsed_report, accepted_ordinal, attempt_count,
+                last_error, next_attempt_at, created_at, completed_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"#,
+        )
+        .bind(request_id)
+        .bind("purge-test-repo")
+        .bind("did:key:zPurgeTester")
+        .bind("did:key:zPurgeNode")
+        .bind(&bytes)
+        .bind(vec![0u8; 32])
+        .bind(state)
+        .bind(Some(true))
+        .bind(None::<serde_json::Value>)
+        .bind(Some(0_i32))
+        .bind(0_i32)
+        .bind(None::<String>)
+        .bind(None::<String>)
+        .bind(&created_at)
+        .bind(completed_at)
+        .execute(pool)
+        .await
+        .expect("insert request for purge test");
+    }
+
+    #[sqlx::test]
+    async fn purge_deletes_only_old_complete_and_rejected_at_git(pool: sqlx::PgPool) {
+        let db = _db(pool.clone()).await;
+        // 8 days ago, well past the 7-day retention.
+        let old = (chrono::Utc::now() - chrono::Duration::days(8)).to_rfc3339();
+        // 1 day ago, inside the window.
+        let fresh = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let ids_old: Vec<String> = vec![
+            "r-old-complete".into(),
+            "r-old-rejected".into(),
+            "r-fresh-complete".into(),
+            "r-fresh-rejected".into(),
+            "r-old-received".into(),
+            "r-old-outcomes".into(),
+            "r-old-effects-pending".into(),
+            "r-old-no-completion".into(),
+        ];
+        stage_request_for_purge(&pool, "r-old-complete", request_state::COMPLETE, Some(&old)).await;
+        stage_request_for_purge(
+            &pool,
+            "r-old-rejected",
+            request_state::REJECTED_AT_GIT,
+            Some(&old),
+        )
+        .await;
+        stage_request_for_purge(
+            &pool,
+            "r-fresh-complete",
+            request_state::COMPLETE,
+            Some(&fresh),
+        )
+        .await;
+        stage_request_for_purge(
+            &pool,
+            "r-fresh-rejected",
+            request_state::REJECTED_AT_GIT,
+            Some(&fresh),
+        )
+        .await;
+        // Non-terminal states: never purged even when old.
+        stage_request_for_purge(&pool, "r-old-received", request_state::RECEIVED, Some(&old)).await;
+        stage_request_for_purge(
+            &pool,
+            "r-old-outcomes",
+            request_state::OUTCOMES_COMMITTED,
+            Some(&old),
+        )
+        .await;
+        stage_request_for_purge(
+            &pool,
+            "r-old-effects-pending",
+            request_state::EFFECTS_PENDING,
+            Some(&old),
+        )
+        .await;
+        // A request with no completed_at: never purged (NULL is excluded by the WHERE).
+        stage_request_for_purge(&pool, "r-old-no-completion", request_state::COMPLETE, None).await;
+
+        let (reqs, _children) = purge_request_queue(&db, 7, 100).await.unwrap();
+        assert_eq!(reqs, 2, "exactly the two old terminal rows");
+
+        // Verify which ids survived by re-reading each one directly.
+        for id in &ids_old {
+            let after = db.get_receive_pack_request(id).await.unwrap();
+            let expected_deleted = matches!(id.as_str(), "r-old-complete" | "r-old-rejected");
+            if expected_deleted {
+                assert!(after.is_none(), "{id} should have been purged");
+            } else {
+                assert!(after.is_some(), "{id} should have been retained");
+            }
+        }
+    }
+
+    #[sqlx::test]
+    async fn purge_idempotent_returns_zero_on_second_call(pool: sqlx::PgPool) {
+        let db = _db(pool.clone()).await;
+        let old = (chrono::Utc::now() - chrono::Duration::days(8)).to_rfc3339();
+        stage_request_for_purge(&pool, "r-once", request_state::COMPLETE, Some(&old)).await;
+
+        let (a, _) = purge_request_queue(&db, 7, 100).await.unwrap();
+        assert_eq!(a, 1);
+        let (b, _) = purge_request_queue(&db, 7, 100).await.unwrap();
+        assert_eq!(b, 0, "second pass has nothing left to delete");
+    }
+
+    #[sqlx::test]
+    async fn purge_retention_window_pins_at_7_days(pool: sqlx::PgPool) {
+        // The spec calls for a 7-day window. The CLI's `1..=365` range
+        // guarantees a non-zero window, so we don't test retention = 0
+        // here — that path is not exposed to operators. This test pins
+        // the invariant: a row with completed_at = now is INSIDE the
+        // 7-day window and is NOT purged.
+        let db = _db(pool.clone()).await;
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        stage_request_for_purge(&pool, "r-now", request_state::COMPLETE, Some(&now_iso)).await;
+
+        let (n, _) = purge_request_queue(&db, 7, 100).await.unwrap();
+        assert_eq!(
+            n, 0,
+            "row with completed_at = now is inside the 7-day window"
+        );
+
+        let after = db.get_receive_pack_request("r-now").await.unwrap();
+        assert!(after.is_some(), "r-now must survive the 7-day window");
     }
 }

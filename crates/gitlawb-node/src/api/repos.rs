@@ -2858,8 +2858,7 @@ pub async fn git_receive_pack(
             }
         }
         Ok(crate::durable_outbox::EffectsOutcome::Retry { last_error }) => {
-            let next_attempt_at =
-                (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+            let next_attempt_at = (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
             if let Err(e) = state
                 .db
                 .mark_request_effects_pending(&request_id, &next_attempt_at, &last_error)

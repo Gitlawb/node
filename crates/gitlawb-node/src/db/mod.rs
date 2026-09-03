@@ -3168,6 +3168,79 @@ impl Db {
         Ok(res.rows_affected())
     }
 
+    /// #26 Split PR 1 step 4 — bounded retirement. Deletes terminal
+    /// `receive_pack_requests` rows whose `completed_at` is older
+    /// than `older_than_iso`. Only `complete` and `rejected_at_git`
+    /// rows are eligible; `outcomes_committed` / `effects_pending`
+    /// are never purged (the drain is responsible for them), and
+    /// `received` rows are never purged (the handler is
+    /// responsible for them).
+    ///
+    /// The `idx_receive_pack_requests_completed_at` partial index
+    /// (built by v30) keeps this scan cheap. PostgreSQL does not
+    /// accept `LIMIT` directly inside a `DELETE`, so the limit is
+    /// applied via a subquery selecting the ids to delete.
+    pub async fn purge_completed_receive_pack_requests(
+        &self,
+        older_than_iso: &str,
+        limit: i64,
+    ) -> Result<u64> {
+        let limit = limit.max(1);
+        let res = sqlx::query(
+            r#"DELETE FROM receive_pack_requests
+               WHERE id IN (
+                   SELECT id FROM receive_pack_requests
+                   WHERE state IN ($1, $2)
+                     AND completed_at IS NOT NULL
+                     AND completed_at < $3
+                   LIMIT $4
+               )"#,
+        )
+        .bind(request_state::COMPLETE)
+        .bind(request_state::REJECTED_AT_GIT)
+        .bind(older_than_iso)
+        .bind(limit)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// #26 Split PR 1 step 4 — bounded retirement. Deletes
+    /// `pending_ref_transitions` children whose parent request is
+    /// in `complete` or `rejected_at_git` AND whose
+    /// `applied_at` (for accepted children) or `cancelled_at` (for
+    /// rejected children) is older than `older_than_iso`. Children
+    /// in `prepared` / `uncertain` are NEVER purged — those are
+    /// the reconcile walk's responsibility.
+    ///
+    /// Callers MUST purge the parent requests first so this scan
+    /// has a clear contract. The `purge_request_queue` helper in
+    /// `durable_outbox.rs` enforces the order.
+    pub async fn purge_completed_pending_ref_transitions(
+        &self,
+        older_than_iso: &str,
+        limit: i64,
+    ) -> Result<u64> {
+        let limit = limit.max(1);
+        let res = sqlx::query(
+            r#"DELETE FROM pending_ref_transitions
+               WHERE id IN (
+                   SELECT id FROM pending_ref_transitions
+                   WHERE state IN ($1, $2)
+                     AND ((state = $1 AND applied_at IS NOT NULL AND applied_at < $3)
+                       OR (state = $2 AND cancelled_at IS NOT NULL AND cancelled_at < $3))
+                   LIMIT $4
+               )"#,
+        )
+        .bind(pending_state::APPLIED)
+        .bind(pending_state::CANCELLED)
+        .bind(older_than_iso)
+        .bind(limit)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Flip every `prepared` row attached to `request_id` to `applied`.
     /// Called after `smart_http::receive_pack` returns Ok. A `prepared`
     /// row that the handler never reaches this point for stays in

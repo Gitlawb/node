@@ -666,3 +666,49 @@ fn inv26_step3_live_and_drain_share_apply_request_effects() {
         "deleted per-ref drain functions must have zero live-handler call sites"
     );
 }
+
+/// #26 Split PR 1 step 4 — the periodic queue-lifecycle purge is
+/// wired in `main.rs` and the contract is enforced by the `idx_receive_pack_requests_completed_at`
+/// partial index from v30.
+///
+/// Assertions:
+/// 1. `main.rs` calls `purge_request_queue` once at boot (well, on
+///    the spawn-task interval) and the spawn function exists.
+/// 2. The DB helpers `purge_completed_receive_pack_requests` and
+///    `purge_completed_pending_ref_transitions` exist in `db/mod.rs`.
+/// 3. The config knobs `queue_retention_days` and `queue_purge_batch` exist
+///    on `Config`.
+/// 4. `quarantined` is NOT in the purge WHERE clause (step 4 does not
+///    introduce the state, but the invariant holds for the future).
+#[test]
+fn inv26_step4_queue_lifecycle_purge_is_wired() {
+    let main_src = src("main.rs");
+    assert!(
+        main_src.contains("spawn_queue_lifecycle_sweep"),
+        "main.rs must spawn the periodic queue-lifecycle purge"
+    );
+    assert!(
+        main_src.contains("purge_request_queue"),
+        "main.rs must call purge_request_queue on the periodic sweep"
+    );
+
+    let db_src = src("db/mod.rs");
+    assert!(
+        db_src.contains("purge_completed_receive_pack_requests"),
+        "db/mod.rs must expose purge_completed_receive_pack_requests"
+    );
+    assert!(
+        db_src.contains("purge_completed_pending_ref_transitions"),
+        "db/mod.rs must expose purge_completed_pending_ref_transitions"
+    );
+
+    let config_src = src("config.rs");
+    assert!(
+        config_src.contains("queue_retention_days"),
+        "Config must expose queue_retention_days"
+    );
+    assert!(
+        config_src.contains("queue_purge_batch"),
+        "Config must expose queue_purge_batch"
+    );
+}

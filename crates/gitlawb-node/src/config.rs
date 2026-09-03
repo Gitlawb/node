@@ -702,6 +702,33 @@ pub struct Config {
         value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(0..=86_400)
     )]
     pub pin_repair_sweep_delay_secs: u64,
+
+    /// #26 Split PR 1 step 4 — receive-pack queue retention window.
+    /// Terminal `complete` and `rejected_at_git` rows older than
+    /// this are eligible for the periodic purge. `quarantined`
+    /// rows are never purged on a timer. The v30 partial index
+    /// `idx_receive_pack_requests_completed_at` keeps the scan
+    /// cheap regardless of the value.
+    #[arg(
+        long,
+        env = "GITLAWB_QUEUE_RETENTION_DAYS",
+        default_value_t = 7,
+        value_parser = clap::builder::RangedU64ValueParser::<i64>::new().range(1..=365)
+    )]
+    pub queue_retention_days: i64,
+
+    /// #26 Split PR 1 step 4 — receive-pack queue purge batch size.
+    /// Each periodic purge pass deletes at most this many terminal
+    /// rows per batch. The drain and the purge share the same
+    /// `DRAIN_PER_PASS_LIMIT` budget; see the spawn function in
+    /// `main.rs` for the wiring.
+    #[arg(
+        long,
+        env = "GITLAWB_QUEUE_PURGE_BATCH",
+        default_value_t = 1000,
+        value_parser = clap::builder::RangedU64ValueParser::<i64>::new().range(1..=100_000)
+    )]
+    pub queue_purge_batch: i64,
 }
 
 impl Config {
@@ -961,6 +988,30 @@ mod tests {
             Config::try_parse_from(["gitlawb-node", "--pin-repair-sweep-delay-secs", "86401"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn queue_lifecycle_knobs_default_conservatively() {
+        let c = Config::parse_from(["gitlawb-node"]);
+        // 7-day retention matches the v30 partial index comment
+        // and the spec at .gravirei/plans/state-model-durable-post-receive.md.
+        assert_eq!(c.queue_retention_days, 7);
+        // 1000 rows per pass matches DRAIN_PER_PASS_LIMIT in durable_outbox.
+        assert_eq!(c.queue_purge_batch, 1000);
+
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--queue-retention-days", "30"])
+                .queue_retention_days,
+            30
+        );
+        assert!(Config::try_parse_from(["gitlawb-node", "--queue-retention-days", "0"]).is_err());
+        assert!(Config::try_parse_from(["gitlawb-node", "--queue-retention-days", "366"]).is_err());
+
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--queue-purge-batch", "500"]).queue_purge_batch,
+            500
+        );
+        assert!(Config::try_parse_from(["gitlawb-node", "--queue-purge-batch", "0"]).is_err());
     }
 
     #[test]
