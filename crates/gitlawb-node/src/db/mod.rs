@@ -5912,9 +5912,9 @@ mod migration_tests {
         assert_eq!(attempted_at_of(&db, "z6Mkfoo/done").await, None);
     }
 
-    /// Migration v12 makes pinned_cids.cid nullable so record_pinata_cid can
+    /// Migration v32 makes pinned_cids.cid nullable so record_pinata_cid can
     /// create Pinata-only rows without a local IPFS CID.  This test seeds a
-    /// pre-v12 schema (cid NOT NULL, pinata_cid column exists but no
+    /// pre-v32 schema (cid NOT NULL, pinata_cid column exists but no
     /// nullability change yet) with rows in each of the three states the
     /// has_ipfs_cid / filter_ipfs_pinned_oids predicates must classify:
     ///
@@ -5929,11 +5929,11 @@ mod migration_tests {
     /// After the migration we also test that a Pinata-only INSERT (cid = NULL)
     /// works and produces has_ipfs = false, has_pinata = true.
     #[sqlx::test]
-    async fn migration_v12_makes_cid_nullable_and_preserves_classification(pool: sqlx::PgPool) {
+    async fn migration_v32_makes_cid_nullable_and_preserves_classification(pool: sqlx::PgPool) {
         let db = super::Db::for_testing(pool);
 
         // Create all tables, then drop the NOT NULL constraint on cid
-        // and drop schema_migrations records to simulate a pre-v12 node.
+        // and drop schema_migrations records to simulate a pre-v32 node.
         db.migrate().await.unwrap();
         sqlx::query("ALTER TABLE pinned_cids ALTER COLUMN cid SET NOT NULL")
             .execute(&db.pool)
