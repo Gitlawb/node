@@ -259,8 +259,9 @@ pub struct AnchorJob {
 /// drain could in principle re-run `git receive-pack` against it
 /// after a crash, but the v30 model treats the parsed report as the
 /// durable truth and the `request_bytes` column is informational.
-/// `request_bytes_hash` is the SHA-256 hex of the body so a future
-/// replay can verify the row's content matches what the handler saw.
+/// `request_bytes_hash` is the SHA-256 digest of the body as raw
+/// bytes (32 bytes), so a future replay can verify the row's content
+/// matches what the handler saw.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)] // wired by the handler refactor in the next slice
 pub struct ReceivePackRequest {
@@ -269,7 +270,7 @@ pub struct ReceivePackRequest {
     pub pusher_did: String,
     pub node_did: String,
     pub request_bytes: Vec<u8>,
-    pub request_bytes_hash: String,
+    pub request_bytes_hash: Vec<u8>,
     pub state: String,
     pub git_exit_ok: Option<bool>,
     pub parsed_report: Option<serde_json::Value>,

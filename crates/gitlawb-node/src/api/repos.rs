@@ -2292,7 +2292,7 @@ pub async fn git_receive_pack(
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         h.update(&body);
-        hex::encode(h.finalize())
+        h.finalize().to_vec()
     };
     let req_row = crate::db::ReceivePackRequest {
         id: request_id.clone(),
