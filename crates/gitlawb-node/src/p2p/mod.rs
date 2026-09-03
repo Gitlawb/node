@@ -593,7 +593,7 @@ pub(crate) mod pin {
 
     /// The ancestor predicate, applied to the parent this helper is about to
     /// chmod a child of.
-    fn verify_trusted_parent(
+    pub(crate) fn verify_trusted_parent(
         fd: std::os::fd::RawFd,
         display: &Path,
         euid: u32,
@@ -1060,9 +1060,18 @@ impl KeyDirHandle {
 
     /// Publish into an already-existing directory without creating or chmodding
     /// it. The working-directory case for a bare node-identity filename uses
-    /// this so the p2p key's named-directory contract is not imported onto
-    /// `GITLAWB_KEY=identity.pem`.
-    fn from_existing_dir(dir: std::fs::File, dir_path: &Path) -> std::io::Result<KeyDirHandle> {
+    /// this so the p2p key's named-directory contract (pin to 0700) is not
+    /// imported onto `GITLAWB_KEY=identity.pem`. Write-authority is still
+    /// checked: a 0600 key is unprotected if this directory is group/world
+    /// writable, so [`pin::verify_trusted_parent`] runs on the held descriptor
+    /// before the handle is returned.
+    fn from_existing_dir(
+        dir: std::fs::File,
+        dir_path: &Path,
+        held_for: &Path,
+    ) -> std::io::Result<KeyDirHandle> {
+        use std::os::fd::AsRawFd;
+
         let md = dir.metadata()?;
         if !md.is_dir() {
             return Err(std::io::Error::new(
@@ -1070,6 +1079,7 @@ impl KeyDirHandle {
                 format!("{} is not a directory", dir_path.display()),
             ));
         }
+        pin::verify_trusted_parent(dir.as_raw_fd(), held_for, effective_uid())?;
         Ok(KeyDirHandle {
             dir,
             path: dir_path.to_path_buf(),
@@ -1563,7 +1573,7 @@ pub(crate) fn create_pinned_dir_and_publish(key_path: &Path, bytes: &[u8]) -> Re
             .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
             .open(".")
             .with_context(|| "failed to open the working directory for the identity key")?;
-        let handle = KeyDirHandle::from_existing_dir(cwd, Path::new("."))?;
+        let handle = KeyDirHandle::from_existing_dir(cwd, Path::new("."), key_path)?;
         write_key_atomically(&handle, file_name, bytes)
             .with_context(|| format!("failed to write identity key to {}", key_path.display()))?;
         return Ok(());

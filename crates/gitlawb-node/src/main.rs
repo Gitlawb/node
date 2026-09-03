@@ -2157,4 +2157,96 @@ mod identity_key_storage_tests {
             );
         }
     }
+
+    /// A 0600 identity file is not protected if cwd is group/world-writable:
+    /// another local user can unlink or replace the entry. Creating into that
+    /// cwd must fail, and must not leave a key behind. Do not chmod cwd.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=identity-key-bare-writable"]
+    fn fixture_bare_identity_key_in_writable_cwd_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref()
+            != Some("identity-key-bare-writable")
+        {
+            return;
+        }
+        let cwd = std::path::PathBuf::from(
+            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+        );
+        std::env::set_current_dir(&cwd).expect("chdir into isolated tempdir");
+        std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let cwd_mode_before = std::fs::symlink_metadata(".").unwrap().permissions().mode() & 0o7777;
+
+        let Err(err) = load_or_create_keypair_at(std::path::Path::new("identity.pem")) else {
+            panic!("a bare identity path under a writable cwd must be refused");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("writable beyond its owner") || msg.contains("0777"),
+            "the refusal must name the writable-parent reason, got: {msg}"
+        );
+        assert!(
+            !std::path::Path::new("identity.pem").exists(),
+            "a refused cwd must not have identity.pem created"
+        );
+        let cwd_mode_after = std::fs::symlink_metadata(".").unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            cwd_mode_before, cwd_mode_after,
+            "refusing a writable cwd must not chmod it"
+        );
+        println!("identity-key-bare-writable: asserted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bare_identity_key_path_refuses_a_writable_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+        cmd.args([
+            "identity_key_storage_tests::fixture_bare_identity_key_in_writable_cwd_is_refused",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("GITLAWB_TEST_FIXTURE", "identity-key-bare-writable")
+        .env("GITLAWB_TEST_BASE", base.path());
+        let output = cmd
+            .output()
+            .expect("spawn the writable-cwd identity fixture");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "writable cwd must refuse the bare identity path\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "filter must select one passing test\n{stdout}"
+        );
+        assert!(
+            stdout.contains("identity-key-bare-writable: asserted"),
+            "fixture must print its sentinel\n{stdout}"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(base.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "parent must also see no identity.pem, found: {leftovers:?}"
+        );
+        let cwd_mode = std::fs::symlink_metadata(base.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(cwd_mode, 0o777, "cwd must stay 0777");
+    }
 }
