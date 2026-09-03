@@ -357,7 +357,7 @@ fn reflog_proves_landing(
 pub const REFLOG_CLOCK_SKEW: chrono::Duration = chrono::Duration::seconds(60);
 
 /// P2 (reviewer-1/2 round 3): multi-pass reconcile for the prepared/
-/// uncertain backlog. Mirrors `drain_pending_ref_transitions_all`:
+/// uncertain backlog. Mirrors `drain_receive_pack_requests_all`:
 /// runs a reconcile pass in a loop until either a pass examines fewer
 /// rows than `per_pass_limit` (backlog exhausted) or `max_passes`
 /// passes have completed. If rows remain after the last pass, a
@@ -409,8 +409,8 @@ pub async fn reconcile_prepared_from_disk_all(
     Ok(total)
 }
 
-/// Per-pass drain budget. Each call to `drain_pending_ref_transitions`
-/// processes at most this many rows.
+/// Per-pass drain budget. Each call to `drain_receive_pack_requests`
+/// processes at most this many requests.
 pub const DRAIN_PER_PASS_LIMIT: i64 = 1000;
 
 /// Maximum age (relative to `Utc::now()`) at which a `prepared` row
@@ -434,77 +434,102 @@ pub const MAX_RECONCILE_AGE: chrono::Duration = chrono::Duration::seconds(24 * 6
 /// `DRAIN_MAX_PASSES = 10`, the startup drain runs `max_passes` regular
 /// passes (10 × 1000 = 10,000 rows) plus ONE residual pass that
 /// detects overrun and surfaces the residual-backlog warning at
-/// `drain_pending_ref_transitions_all`'s tail. Total rows per boot
+/// `drain_receive_pack_requests_all`'s tail. Total rows per boot
 /// before the warning fires: 11,000. Rows beyond that remain
 /// `applied` and are picked up on the next startup. P2-doc
 /// (reviewer-2 round 2): the previous comment said "up to 10,000" but
 /// the residual pass is the +1.
 pub const DRAIN_MAX_PASSES: usize = 10;
 
-/// One drain pass. Returns the number of transitions fully re-derived
-/// (artifacts written AND row deleted). Production callers use
-/// [`drain_pending_ref_transitions_all`] to drain an unbounded backlog
-/// across multiple passes; tests can call this directly with a small
-/// `limit` to assert behavior on a single batch.
+/// #26 Split PR 1 step 3 — per-request drain. Replaces the v29
+/// per-ref walk with a per-request walk: the unit of work is the
+/// `receive_pack_requests` row, and [`apply_request_effects`] does
+/// all the artifact writes per request in a single idempotent
+/// pass. The drain reads `outcomes_committed` and `effects_pending`
+/// requests whose `next_attempt_at` is due.
 ///
-/// P2-A: a `derive_one` failure on one row is logged but does NOT
-/// abort the rest of the batch — the failing row stays `applied`
-/// for a later startup to retry. A `delete_pending_ref_transition`
-/// failure on a row whose `derive_one` succeeded is also logged and
-/// the row remains `applied`; the next drain re-derives (idempotent
-/// inserts make this safe) and tries the delete again.
-///
-/// P2-D (reviewer-2 round 2): the function returns
-/// `(processed, examined)` rather than just `processed`. The caller
-/// keys the drain's `n < per_pass_limit` exit condition on
-/// `examined` so a pass where every row fails (or every
-/// `derive_one` succeeds but every delete fails) still tells the
-/// outer loop "more rows remain" — the previous `processed` count
-/// was 0 and the loop exited on the first fully-failing pass.
-pub async fn drain_pending_ref_transitions(
+/// P2-A: a `apply_request_effects` failure on one request is logged
+/// but does NOT abort the rest of the batch — the request stays in
+/// `outcomes_committed` (or `effects_pending`) for a later startup
+/// to retry. Idempotent inserts make this safe.
+pub async fn drain_receive_pack_requests(
     state: AppState,
     limit: i64,
 ) -> anyhow::Result<(usize, usize)> {
-    drain_pending_ref_transitions_with(state, limit, |s, r| async move { derive_one(&s, &r).await })
-        .await
+    drain_receive_pack_requests_with(state, limit, |s, req_id| async move {
+        apply_request_effects(&s, &req_id).await
+    })
+    .await
 }
 
-/// Testable seam for the drain loop. Production code calls
-/// [`drain_pending_ref_transitions`], which delegates here with the
-/// real [`derive_one`]. Tests inject a closure that fails for one
-/// row and succeeds for another to assert that the loop does not
-/// abort on a single error.
-pub async fn drain_pending_ref_transitions_with<F, Fut>(
+/// Testable seam for the per-request drain. Production code calls
+/// [`drain_receive_pack_requests`], which delegates here with the
+/// real [`apply_request_effects`]. Tests inject a closure that
+/// returns `Retry` for one request and `Done` for another to assert
+/// the loop's state-flip behavior.
+pub async fn drain_receive_pack_requests_with<F, Fut>(
     state: AppState,
     limit: i64,
     derive_fn: F,
 ) -> anyhow::Result<(usize, usize)>
 where
-    F: Fn(AppState, PendingRefTransition) -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<()>>,
+    F: Fn(AppState, String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<EffectsOutcome>>,
 {
-    let rows = state.db.list_pending_ref_transitions_applied(limit).await?;
+    let reqs = state
+        .db
+        .list_receive_pack_requests_due(limit)
+        .await?;
     let mut processed = 0;
-    let examined = rows.len();
-    for row in rows {
-        match derive_fn(state.clone(), row.clone()).await {
-            Ok(()) => {
-                if let Err(e) = state.db.delete_pending_ref_transition(&row.id).await {
+    let examined = reqs.len();
+    for req in reqs {
+        let request_id = req.id.clone();
+        match derive_fn(state.clone(), request_id.clone()).await {
+            Ok(EffectsOutcome::Done) => {
+                if let Err(e) = state.db.mark_request_complete(&request_id).await {
                     tracing::warn!(
                         err = %e,
-                        row_id = %row.id,
-                        "drain: row derivation succeeded but delete failed; row will be re-derived next startup (idempotent inserts make this safe)"
+                        request_id = %request_id,
+                        "drain: mark_request_complete failed; will retry next startup"
                     );
                     continue;
                 }
                 processed += 1;
             }
+            Ok(EffectsOutcome::Nothing) => {
+                // The request had no `accepted_ordinal`; nothing to
+                // do. Move to `complete` so the drain skips it next
+                // pass.
+                if let Err(e) = state.db.mark_request_complete(&request_id).await {
+                    tracing::warn!(
+                        err = %e,
+                        request_id = %request_id,
+                        "drain: mark_request_complete (Nothing) failed"
+                    );
+                    continue;
+                }
+                processed += 1;
+            }
+            Ok(EffectsOutcome::Retry { last_error }) => {
+                let next_attempt_at =
+                    (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+                if let Err(e) = state
+                    .db
+                    .mark_request_effects_pending(&request_id, &next_attempt_at, &last_error)
+                    .await
+                {
+                    tracing::warn!(
+                        err = %e,
+                        request_id = %request_id,
+                        "drain: mark_request_effects_pending failed; will retry next startup"
+                    );
+                }
+            }
             Err(e) => {
                 tracing::error!(
                     err = %e,
-                    row_id = %row.id,
-                    request_id = %row.request_id,
-                    "drain: derive_fn failed; row left in `applied` for next startup"
+                    request_id = %request_id,
+                    "drain: apply_request_effects returned Err; request left for next startup"
                 );
             }
         }
@@ -512,18 +537,9 @@ where
     Ok((processed, examined))
 }
 
-/// Drain an unbounded `applied` backlog across multiple passes. The
-/// drain stops as soon as a pass returns fewer rows than
-/// `per_pass_limit` (i.e. the backlog is exhausted). If
-/// `max_passes` passes still leave a full pass of work, a warning is
-/// logged and the function returns the count processed so far; the
-/// residual rows remain `applied` for the next startup.
-///
-/// The startup caller in [`crate::main`] uses
-/// `DRAIN_PER_PASS_LIMIT` and `DRAIN_MAX_PASSES` from this module so
-/// the test that asserts "backlog > 1000 is fully processed" can
-/// reference the same constants.
-pub async fn drain_pending_ref_transitions_all(
+/// Drain an unbounded per-request backlog across multiple passes.
+/// The residual warning is keyed on the request-table count.
+pub async fn drain_receive_pack_requests_all(
     state: AppState,
     per_pass_limit: i64,
     max_passes: usize,
@@ -531,171 +547,306 @@ pub async fn drain_pending_ref_transitions_all(
     let mut total = 0;
     for _ in 0..max_passes {
         let (processed, examined) =
-            drain_pending_ref_transitions(state.clone(), per_pass_limit).await?;
+            drain_receive_pack_requests(state.clone(), per_pass_limit).await?;
         total += processed;
-        // Key the exit on `examined`, not `processed`. A fully-failing
-        // batch returns processed=0 but examined=per_pass_limit; the
-        // loop must keep draining the backlog, not stop on the first
-        // 0-successes pass (P2-D, reviewer-2 round 2).
         if (examined as i64) < per_pass_limit {
             return Ok(total);
         }
     }
-    // One more pass to detect residual backlog. If rows remain
-    // after the residual pass, log a warning and return what we
-    // have; the next startup will continue the work.
-    //
-    // P3 (reviewer-2 round 4): key the warning on the REMAINING
-    // count, not the examined count. A backlog of exactly
-    // `per_pass_limit * (max_passes + 1)` rows produces a full final
-    // page that consumes everything — `examined == per_pass_limit`
-    // is true but `remaining == 0`, and the previous logic fired the
-    // warning anyway. Operators treat this warning as the signal that
-    // rows are stranded; a false positive on a clean drain costs the
-    // signal its meaning.
     let (residual_processed, _residual_examined) =
-        drain_pending_ref_transitions(state.clone(), per_pass_limit).await?;
+        drain_receive_pack_requests(state.clone(), per_pass_limit).await?;
     total += residual_processed;
-    let remaining_after_residual = state.db.count_pending_ref_transitions_applied().await?;
+    let remaining_after_residual = state.db.count_receive_pack_requests_due().await?;
     if remaining_after_residual > 0 {
         tracing::warn!(
             total,
             max_passes,
             per_pass_limit,
             remaining_after_residual,
-            "drain backlog exceeds startup budget; residual rows will be picked up on next restart"
+            "drain: per-request backlog exceeds startup budget; residual requests will be picked up on next restart"
         );
     }
     Ok(total)
 }
 
-/// Re-derive the push event, the per-ref certificate, and the anchor
-/// handoff for one `applied` row, using the persisted authentic pusher
-/// identity. This is what closes the reviewer's invariant: the
-/// recovered artifacts carry the original pusher DID, not a
-/// placeholder.
+/// Outcome of a single `apply_request_effects` call. The caller (live
+/// handler or drain) decides what to do with the request row based on
+/// this.
 ///
-/// The push event id and ref certificate id are derived from
-/// `(request_id, ref_name)`; the anchor job id from
-/// `(repo_id, ref_name, old_sha, new_sha)`. All three inserts are
-/// idempotent (see the module-level comment), so a second drain pass
-/// against the same row is a no-op.
-pub async fn derive_one(state: &AppState, row: &PendingRefTransition) -> anyhow::Result<()> {
-    // Push event: deterministic id, idempotent insert. The id is keyed
-    // on `(request_id, accepted_ordinal)` — the request row's
-    // `accepted_ordinal` is the ordinal of the row whose ref actually
-    // landed, so the recovery push event id matches the live path's
-    // id and a live push followed by a recovery pass collapses to a
-    // single `push_events` row via `ON CONFLICT (id) DO NOTHING`.
-    //
-    // P2 (reviewer-1 round 2, restated for the v30 model): for a
-    // MULTI-REF push the drain lists rows in `ORDER BY applied_at ASC,
-    // id ASC`; rows in the same second tie-break on a hash, so the
-    // row whose `record_push_with_id` hits the table first is
-    // non-deterministic. The push event is request-scoped (one per
-    // push, not one per ref), and the live handler at
-    // repos.rs:2781-2792 derives `commit_hash` from the request's
-    // accepted ref's `new_sha`. To match the live path exactly, only
-    // the row whose `ordinal` equals the request's `accepted_ordinal`
-    // writes the event. Rows for non-accepted ordinals skip the push
-    // event write — they have already collapsed to the same
-    // `(request_id, accepted_ordinal)` id and a second insert would
-    // be a no-op, but the SHAs would still be wrong if the drain
-    // happened to process them first.
-    //
-    // Per-ref certs and anchor jobs stay keyed on `row.ref_name` and
-    // `(repo, ref, old, new)` respectively — those are correctly
-    // transition-shaped and continue to run on every row.
-    let accepted_ordinal = lookup_accepted_ordinal(state, &row.request_id, row.ordinal).await?;
-    if row.ordinal == accepted_ordinal {
-        let push_id = crate::db::push_event_id_for(&row.request_id, row.ordinal);
-        state
-            .db
-            .record_push_with_id(&push_id, &row.pusher_did, &row.repo_id, &row.new_sha, 0)
-            .await?;
-    }
-
-    // Ref certificate: the cert is signed by the node, but the
-    // `pusher_did` field carries the ORIGINAL authenticated pusher.
-    //
-    // P1 (reviewer-1 round 2): the recovery path uses the LIVE
-    // `issue_ref_certificate` upsert (`ON CONFLICT (repo_id, ref_name)
-    // DO UPDATE SET … CASE WHEN EXCLUDED.issued_at >
-    // ref_certificates.issued_at …`), not the idempotent DO NOTHING
-    // variant. The previous helper left a stale cert in place if a
-    // live-path cert had been issued before the push actually landed
-    // on disk — the ref on disk was at the new SHA, the cert still
-    // said old. The upsert refreshes the cert's `old_sha` /
-    // `new_sha` / `pusher_did` / `signature` / `issued_at` to the
-    // recovered transition while preserving the deterministic `id`
-    // (the SQL only updates the SHAs/did/signature/ts columns).
-    // Live and recovery still collapse to a single cert row per
-    // `(repo_id, ref_name)` because the `cert_id` from
-    // `ref_cert_id_for` is the same on both paths. The id is now
-    // keyed on `(request_id, ordinal)` per v30.
-    let cert_id = crate::db::ref_cert_id_for(&row.request_id, row.ordinal);
-    // P1 (reviewer-1 round 4): stamp the recovery cert with the
-    // row's `created_at` so a replay of A after a later live cert B
-    // cannot outrank B's fields in the
-    // `EXCLUDED.issued_at > ref_certificates.issued_at` upsert guard.
-    // The live handler uses `issue_ref_certificate` (no override),
-    // which keeps `Utc::now()` — for a live push the wall-clock IS
-    // the transition time.
-    let _ = cert::issue_ref_certificate_with_issued_at(
-        state,
-        &row.repo_id,
-        &row.ref_name,
-        &row.old_sha,
-        &row.new_sha,
-        &row.pusher_did,
-        &cert_id,
-        Some(row.created_at.clone()),
-    )
-    .await?;
-
-    // Anchor handoff: the durable queue PR 2 reads from. Idempotent
-    // on the per-transition id; at most one row per landed state.
-    let anchor_id =
-        crate::db::anchor_job_id_for(&row.repo_id, &row.ref_name, &row.old_sha, &row.new_sha);
-    let job = crate::db::AnchorJob {
-        id: anchor_id,
-        repo_id: row.repo_id.clone(),
-        ref_name: row.ref_name.clone(),
-        old_sha: row.old_sha.clone(),
-        new_sha: row.new_sha.clone(),
-        pusher_did: row.pusher_did.clone(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        claimed_at: None,
-    };
-    state.db.insert_anchor_job_idempotent(&job).await?;
-
-    Ok(())
+/// `Done` — all four artifacts (push event, per-ref certs, per-ref
+/// anchor jobs, trust-score bump) landed. The request is moved to
+/// `complete`.
+///
+/// `Nothing` — the request had no `accepted_ordinal` (no ref proved
+/// landed, or the parsed report was empty). No effects were
+/// attempted. The request is moved to `complete` (or
+/// `rejected_at_git` if the parsed report shows an explicit failure;
+/// the live handler does that flag separately).
+///
+/// `Retry { last_error }` — one or more per-ref effects failed
+/// transiently. The request is moved to `effects_pending` with
+/// `next_attempt_at` in the future. The drain will retry on the next
+/// startup.
+#[derive(Debug)]
+pub enum EffectsOutcome {
+    Done,
+    Nothing,
+    Retry { last_error: String },
 }
 
-/// Look up the request's `accepted_ordinal` for the push event gate.
+/// #26 Split PR 1 step 3 — the shared effect executor. The live
+/// handler and the recovery drain both call this function, so the
+/// per-ref effects fan-out is in exactly one place. The function is
+/// idempotent: every artifact write uses `ON CONFLICT` semantics
+/// (deterministic id, `record_push_with_id` / `insert_anchor_job_idempotent`
+/// / `insert_ref_certificate` upsert), so a recovery replay against
+/// the same request produces the same artifacts the live path did.
 ///
-/// The v30 model stores the ordinal on the request row, not the
-/// child, so the drain must ask the request "which of your children
-/// landed first?" before writing the push event. A request row that
-/// is missing or has no `accepted_ordinal` set is a legacy crash
-/// window from before the v30 migration — the drain's per-ref walk
-/// still produces a correct push event by treating the first child
-/// by `(ordinal, id)` as the accepted one, so the helper falls back
-/// to the row's own ordinal in that case. This is the test seam that
-/// keeps `drain_re_derives_all_three_artifacts_for_an_applied_row`
-/// (a fixture that does NOT pre-stage a `receive_pack_requests` row)
-/// passing under the new model.
-async fn lookup_accepted_ordinal(
+/// Crash-safety window: if a crash lands between "git returned" and
+/// "all four artifacts written", the request row is in
+/// `outcomes_committed` with no effects recorded. The drain picks it
+/// up and re-runs the same effect pipeline, and the idempotent
+/// inserts collapse to no-ops for the artifacts that did land.
+///
+/// If a crash lands between "all artifacts written" and "request
+/// moved to `complete`", the same drain pass completes the state
+/// transition. The artifacts are already in place; the
+/// `mark_request_complete` call is a single SQL UPDATE.
+pub async fn apply_request_effects(
     state: &AppState,
     request_id: &str,
-    fallback: i32,
-) -> anyhow::Result<i32> {
-    let row: Option<(Option<i32>,)> =
-        sqlx::query_as("SELECT accepted_ordinal FROM receive_pack_requests WHERE id = $1")
-            .bind(request_id)
-            .fetch_optional(state.db.pool())
-            .await?;
-    Ok(row.and_then(|(o,)| o).unwrap_or(fallback))
+) -> anyhow::Result<EffectsOutcome> {
+    // 1. Load the request row.
+    let req = state
+        .db
+        .get_receive_pack_request(request_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("request row missing for {request_id}"))?;
+
+    // 2. State gate: only `outcomes_committed` and `effects_pending` are
+    //    eligible. Terminal states (`complete`, `rejected_at_git`) are
+    //    skipped.
+    if !matches!(
+        req.state.as_str(),
+        crate::db::request_state::OUTCOMES_COMMITTED | crate::db::request_state::EFFECTS_PENDING
+    ) {
+        return Ok(EffectsOutcome::Nothing);
+    }
+
+    // 3. No accepted ordinal means no ref proved landed. The request is
+    //    eligible for `complete` (or `rejected_at_git` if the parsed
+    //    report shows an explicit failure, but that flag is set by the
+    //    handler's four-branch flip, not here).
+    let accepted_ordinal = match req.accepted_ordinal {
+        Some(o) => o,
+        None => return Ok(EffectsOutcome::Nothing),
+    };
+
+    // 4. Load the request's children. Certs and anchor jobs run for
+    //    every child whose `ref_name` is in the parsed report's ok
+    //    set; the request row's `parsed_report` is the durable
+    //    record of that set.
+    let children = state
+        .db
+        .list_pending_ref_transitions_for_request(request_id)
+        .await?;
+    let ok_ref_names: std::collections::HashSet<String> = req
+        .parsed_report
+        .as_ref()
+        .and_then(|v| v.get("ref_results"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    let ok = r.get("ok").and_then(|o| o.as_bool()).unwrap_or(false);
+                    let name = r
+                        .get("ref_name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string());
+                    if ok {
+                        name
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let accepted_children: Vec<&PendingRefTransition> = children
+        .iter()
+        .filter(|c| ok_ref_names.contains(&c.ref_name))
+        .collect();
+
+    // 5. Look up the repo for cert/webhook payload construction. If
+    //    the row is missing (deleted under us), bail with Retry so
+    //    the drain re-runs later when the cache is warm again.
+    let repo = match state.db.get_repo_by_id(&req.repo_id).await? {
+        Some(r) => r,
+        None => {
+            return Ok(EffectsOutcome::Retry {
+                last_error: format!("repo {} not found", req.repo_id),
+            });
+        }
+    };
+
+    // 6. Push event — written once, for the request. The live and
+    //    recovery paths produce the same id because both key on
+    //    `(request_id, accepted_ordinal)`.
+    let push_event_id =
+        crate::db::push_event_id_for(&req.id, accepted_ordinal);
+    let accepted_ref = children
+        .iter()
+        .find(|c| c.ordinal == accepted_ordinal);
+    let commit_hash = accepted_ref
+        .map(|c| c.new_sha.clone())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp().to_string());
+    if let Err(e) = state
+        .db
+        .record_push_with_id(
+            &push_event_id,
+            &req.pusher_did,
+            &req.repo_id,
+            &commit_hash,
+            0,
+        )
+        .await
+    {
+        tracing::warn!(
+            err = %e,
+            request_id = %request_id,
+            "apply_request_effects: push event insert failed; request left for drain retry"
+        );
+        return Ok(EffectsOutcome::Retry {
+            last_error: format!("push event: {e}"),
+        });
+    }
+
+    // 7. Trust score bump — best-effort, like the inline handler. A
+    //    failure here does NOT retry the request; the bump is
+    //    informational and the next push will catch up.
+    if let Ok(push_count) = state.db.get_push_count(&req.pusher_did).await {
+        // 0.05 base (from registration) + 0.05 per push, capped at 1.0
+        let new_score = (push_count as f64 * 0.05 + 0.05).min(1.0);
+        let _ = state
+            .db
+            .update_trust_score(&req.pusher_did, new_score)
+            .await;
+    }
+
+    // 8. Per-ref certs and anchor jobs. Each accepted child gets one
+    //    of each. Failures are accumulated; the first one is
+    //    returned as the Retry reason.
+    let mut first_error: Option<String> = None;
+    for child in &accepted_children {
+        let cert_id = crate::db::ref_cert_id_for(&req.id, child.ordinal);
+        if let Err(e) = cert::issue_ref_certificate_with_issued_at(
+            state,
+            &req.repo_id,
+            &child.ref_name,
+            &child.old_sha,
+            &child.new_sha,
+            &req.pusher_did,
+            &cert_id,
+            Some(child.created_at.clone()),
+        )
+        .await
+        {
+            tracing::warn!(
+                err = %e,
+                request_id = %request_id,
+                ref_name = %child.ref_name,
+                "apply_request_effects: cert insert failed; child left for drain retry"
+            );
+            first_error.get_or_insert_with(|| format!("cert {}: {e}", child.ref_name));
+            continue;
+        }
+
+        let anchor_id = crate::db::anchor_job_id_for(
+            &req.repo_id,
+            &child.ref_name,
+            &child.old_sha,
+            &child.new_sha,
+        );
+        let job = crate::db::AnchorJob {
+            id: anchor_id,
+            repo_id: req.repo_id.clone(),
+            ref_name: child.ref_name.clone(),
+            old_sha: child.old_sha.clone(),
+            new_sha: child.new_sha.clone(),
+            pusher_did: req.pusher_did.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            claimed_at: None,
+        };
+        if let Err(e) = state.db.insert_anchor_job_idempotent(&job).await {
+            tracing::warn!(
+                err = %e,
+                request_id = %request_id,
+                ref_name = %child.ref_name,
+                "apply_request_effects: anchor insert failed; child left for drain retry"
+            );
+            first_error.get_or_insert_with(|| format!("anchor {}: {e}", child.ref_name));
+        }
+    }
+
+    if let Some(err) = first_error {
+        return Ok(EffectsOutcome::Retry { last_error: err });
+    }
+
+    // 9. All artifacts landed — clean up the children and let the
+    //    caller move the request to `complete`.
+    if let Err(e) = state
+        .db
+        .delete_pending_ref_transitions_by_request_id(request_id)
+        .await
+    {
+        tracing::warn!(
+            err = %e,
+            request_id = %request_id,
+            "apply_request_effects: child cleanup failed; idempotent retry will pick them up on next pass"
+        );
+        // Don't fail the request — the artifacts are in place and a
+        // future pass is harmless.
+    }
+
+    // 10. Webhooks — best-effort, per landed ref. Same shape as the
+    //     inline handler's webhook block.
+    if !ok_ref_names.is_empty() {
+        let base_url = state
+            .config
+            .public_url
+            .as_deref()
+            .unwrap_or("http://127.0.0.1:7545")
+            .trim_end_matches('/');
+        let owner_short = crate::db::normalize_owner_key(&repo.owner_did);
+        let clone_url = format!("{}/{}/{}.git", base_url, owner_short, repo.name);
+        for child in &accepted_children {
+            let payload = serde_json::json!({
+                "ref": child.ref_name,
+                "before": child.old_sha,
+                "after": child.new_sha,
+                "created": child.old_sha == "0000000000000000000000000000000000000000",
+                "forced": false,
+                "pusher": {
+                    "did": req.pusher_did,
+                },
+                "repository": {
+                    "id": repo.id,
+                    "name": repo.name,
+                    "owner_did": repo.owner_did,
+                    "clone_url": clone_url,
+                },
+            });
+            crate::webhooks::fire_event(
+                state.db.clone(),
+                state.http_client.clone(),
+                &repo.id,
+                "push",
+                payload,
+            );
+        }
+    }
+
+    Ok(EffectsOutcome::Done)
 }
 
 #[cfg(test)]
@@ -765,15 +916,127 @@ mod drain_tests {
         }
     }
 
-    /// The reviewer's proof at the durable-outbox layer. Insert a row
-    /// in `applied` state (the crash window), drain, and assert
-    /// exactly one push event, one cert with the original pusher,
-    /// and one anchor job.
+    /// Stage a `receive_pack_requests` row in `outcomes_committed`
+    /// alongside the per-ref children that landed under it. The
+    /// `parsed_report` is the durable record the effect executor
+    /// reads to decide which children are `ok`. Each child is
+    /// inserted via `insert_pending_ref_transition_for_test`, so
+    /// the deterministic PKs match what the production handler
+    /// would write. The repo row is also seeded so `apply_request_effects`'s
+    /// `get_repo_by_id` lookup succeeds (the live handler always
+    /// has the repo in cache before the effect executor is called).
+    async fn stage_request_with_children(
+        db: &Db,
+        request_id: &str,
+        repo_id: &str,
+        accepted_ordinal: Option<i32>,
+        children: &[PendingRefTransition],
+        parsed_report: serde_json::Value,
+    ) {
+        stage_request_with_pusher(
+            db,
+            request_id,
+            repo_id,
+            "did:key:z6pusher",
+            accepted_ordinal,
+            children,
+            parsed_report,
+        )
+        .await;
+    }
+
+    /// Like [`stage_request_with_children`] but lets the caller pick
+    /// the request row's `pusher_did`. Used by the cert-refresh
+    /// tests where the recovery's pusher DID must NOT match the
+    /// helper's default.
+    async fn stage_request_with_pusher(
+        db: &Db,
+        request_id: &str,
+        repo_id: &str,
+        pusher_did: &str,
+        accepted_ordinal: Option<i32>,
+        children: &[PendingRefTransition],
+        parsed_report: serde_json::Value,
+    ) {
+        // Seed a minimal repo row so the effect executor's
+        // `get_repo_by_id` lookup succeeds. `ON CONFLICT DO NOTHING`
+        // means tests that already seeded a repo (e.g. cert-refresh
+        // tests that need a specific `owner_did`) are unaffected.
+        sqlx::query(
+            r#"INSERT INTO repos (id, name, owner_did, description, is_public, default_branch,
+                                  created_at, updated_at, disk_path, forked_from, machine_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+               ON CONFLICT (id) DO NOTHING"#,
+        )
+        .bind(repo_id)
+        .bind(repo_id)
+        .bind(pusher_did)
+        .bind(Option::<String>::None)
+        .bind(true)
+        .bind("main")
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(format!("/tmp/{repo_id}"))
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .execute(db.pool())
+        .await
+        .expect("seed repo row");
+
+        sqlx::query(
+            r#"INSERT INTO receive_pack_requests
+               (id, repo_id, pusher_did, node_did, request_bytes, request_bytes_hash,
+                state, git_exit_ok, parsed_report, accepted_ordinal, attempt_count,
+                last_error, next_attempt_at, created_at, completed_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"#,
+        )
+        .bind(request_id)
+        .bind(repo_id)
+        .bind(pusher_did)
+        .bind("did:key:z6node")
+        .bind(Vec::<u8>::new())
+        .bind([0u8; 32].to_vec())
+        .bind(crate::db::request_state::OUTCOMES_COMMITTED)
+        .bind(Some(true))
+        .bind(&parsed_report)
+        .bind(accepted_ordinal)
+        .bind(0_i32)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Utc::now().to_rfc3339())
+        .bind(Option::<String>::None)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        for child in children {
+            db.insert_pending_ref_transition_for_test(child).await.unwrap();
+        }
+    }
+
+    /// Build the `parsed_report` JSON the drain reads. The
+    /// `apply_request_effects` effect-executor uses the `ok` field
+    /// per `ref_name` to decide which children get certs and
+    /// anchors; the `accepted_ordinal` field on the request row
+    /// picks the row whose `new_sha` carries the push event.
+    fn parsed_report_ok(refs: &[(&str, bool)]) -> serde_json::Value {
+        serde_json::json!({
+            "unpack_ok": true,
+            "ref_results": refs.iter().map(|(name, ok)| serde_json::json!({
+                "ref_name": name,
+                "ok": ok,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// The reviewer's proof at the durable-outbox layer. Stage a
+    /// `receive_pack_requests` row in `outcomes_committed` with one
+    /// landed child (the crash window — receive_pack returned Ok and
+    /// git accepted, only the effects fan-out didn't run), drain, and
+    /// assert exactly one push event, one cert with the original
+    /// pusher, one anchor job, and the request moved to `complete`.
     #[sqlx::test]
     async fn drain_re_derives_all_three_artifacts_for_an_applied_row(pool: sqlx::PgPool) {
-        // Pre-create the repo so the FK-ish usage in tests doesn't blow up.
-        // The drain itself does not require a repo row to exist; the test
-        // only checks the derived artifacts.
         let state = crate::test_support::test_state(pool).await;
 
         let repo_id = "repo-failure-injection";
@@ -781,17 +1044,23 @@ mod drain_tests {
         let old = "a".repeat(40);
         let new = "b".repeat(40);
         let row = make_row(repo_id, ref_name, &old, &new);
-        state
-            .db
-            .insert_pending_ref_transition_for_test(&row)
-            .await
-            .unwrap();
+        let request_id = row.request_id.clone();
+        let parsed_report = parsed_report_ok(&[(ref_name, true)]);
+        stage_request_with_children(
+            &state.db,
+            &request_id,
+            repo_id,
+            Some(row.ordinal),
+            std::slice::from_ref(&row),
+            parsed_report,
+        )
+        .await;
 
-        let (n, examined) = drain_pending_ref_transitions(state.clone(), 100)
+        let (n, examined) = drain_receive_pack_requests(state.clone(), 100)
             .await
             .unwrap();
-        assert_eq!(n, 1, "exactly one transition re-derived");
-        assert_eq!(examined, 1, "the loop examined the single row");
+        assert_eq!(n, 1, "exactly one request re-derived");
+        assert_eq!(examined, 1, "the loop examined the single request");
 
         // Push event: exactly one row, keyed on the deterministic id.
         let _push_id = crate::db::push_event_id_for(&row.request_id, row.ordinal);
@@ -832,126 +1101,158 @@ mod drain_tests {
             .unwrap();
         assert_eq!(anchor_count, 1, "exactly one anchor job per transition");
 
-        // The drain deleted the row.
-        let after = state
+        // The request row moved to `complete`.
+        let after = state.db.get_receive_pack_request(&request_id).await.unwrap();
+        assert_eq!(
+            after.expect("request row exists").state,
+            crate::db::request_state::COMPLETE,
+            "drain moves the request to complete"
+        );
+        // Children are cleaned up.
+        let still_applied = state
             .db
             .list_pending_ref_transitions_applied(100)
             .await
             .unwrap();
         assert!(
-            after.is_empty(),
-            "drain deletes the row after the work lands"
+            still_applied.is_empty(),
+            "drain deletes the children after the work lands"
         );
 
         // A second drain pass is a no-op.
-        let (n2, examined2) = drain_pending_ref_transitions(state.clone(), 100)
+        let (n2, examined2) = drain_receive_pack_requests(state.clone(), 100)
             .await
             .unwrap();
         assert_eq!(n2, 0, "a second drain pass has nothing to do");
-        assert_eq!(examined2, 0, "no rows to examine on a second pass");
+        assert_eq!(examined2, 0, "no requests to examine on a second pass");
     }
 
-    /// The reviewer's second proof, end-to-end. A `cancelled` row is
-    /// NEVER promoted by the drain. The drain only re-derives
-    /// artifacts for `applied` rows; a row that was `cancelled`
-    /// because receive_pack returned Err stays cancelled, and no
-    /// push event, cert, or anchor is created.
+    /// The reviewer's second proof, end-to-end. A request that git
+    /// rejected (no `accepted_ordinal`) never produces a push event,
+    /// cert, or anchor. The drain still picks up the request
+    /// (because it's in `outcomes_committed` — the live handler
+    /// always lands here after git returns), `apply_request_effects`
+    /// returns `Nothing` because there is no accepted ref, and the
+    /// drain moves the request to `complete` without writing any
+    /// artifacts.
     #[sqlx::test]
-    async fn cancelled_row_produces_no_artifacts(pool: sqlx::PgPool) {
+    async fn rejected_at_git_request_produces_no_artifacts(pool: sqlx::PgPool) {
         let state = crate::test_support::test_state(pool).await;
 
-        let mut row = make_row(
-            "repo-cancel",
-            "refs/heads/main",
-            &"a".repeat(40),
-            &"b".repeat(40),
-        );
-        row.state = pending_state::CANCELLED.to_string();
-        state
-            .db
-            .insert_pending_ref_transition_for_test(&row)
-            .await
-            .unwrap();
+        // Stage a request in `outcomes_committed` with NO
+        // `accepted_ordinal` (git rejected all refs). The drain
+        // picks it up, `apply_request_effects` short-circuits at the
+        // `accepted_ordinal.is_none()` gate, and the drain calls
+        // `mark_request_complete` for `Nothing`.
+        let request_id = "req-rejected";
+        let repo_id = "repo-rejected";
+        let parsed_report = serde_json::json!({
+            "unpack_ok": false,
+            "ref_results": [{
+                "ref_name": "refs/heads/main",
+                "ok": false,
+                "message": "deny non-fast-forward",
+            }],
+        });
+        stage_request_with_children(
+            &state.db,
+            request_id,
+            repo_id,
+            None,
+            &[],
+            parsed_report,
+        )
+        .await;
 
-        let (n, _examined) = drain_pending_ref_transitions(state.clone(), 100)
+        let (n, examined) = drain_receive_pack_requests(state.clone(), 100)
             .await
             .unwrap();
-        assert_eq!(n, 0, "the drain must not promote a cancelled row");
+        assert_eq!(n, 1, "drain processed the no-effect request");
+        assert_eq!(examined, 1, "the loop examined the request");
+
+        // The request is now `complete` — Nothing outcome moves it.
+        let after = state.db.get_receive_pack_request(request_id).await.unwrap();
+        assert_eq!(
+            after.expect("request row exists").state,
+            crate::db::request_state::COMPLETE,
+            "Nothing outcome moves the request to complete"
+        );
 
         // No push event, no cert, no anchor.
-        let push_count = state
-            .db
-            .count_push_events(&row.repo_id, &row.new_sha, &row.pusher_did)
-            .await
-            .unwrap();
-        assert_eq!(push_count, 0);
-        let certs = state
-            .db
-            .list_ref_certificates(&row.repo_id, 10)
-            .await
-            .unwrap();
-        assert!(certs.is_empty());
-        let anchor_count = state
-            .db
-            .count_anchor_jobs(&row.repo_id, &row.ref_name, &row.old_sha, &row.new_sha)
-            .await
-            .unwrap();
-        assert_eq!(anchor_count, 0);
-
-        // The cancelled row is also left untouched.
-        let still = state
+        let push_count = state.db.get_push_count("did:key:z6pusher").await.unwrap();
+        assert_eq!(
+            push_count, 0,
+            "no push event for a request with no accepted ref"
+        );
+        let certs = state.db.list_ref_certificates(repo_id, 10).await.unwrap();
+        assert!(certs.is_empty(), "no certs for a no-effect request");
+        let still_applied = state
             .db
             .list_pending_ref_transitions_applied(100)
             .await
             .unwrap();
-        assert!(still.is_empty(), "drain reads only applied rows");
+        assert!(
+            still_applied.is_empty(),
+            "no children exist for this no-effect request"
+        );
     }
 
-    /// A `prepared` row that the handler never reached the post-Ok
-    /// branch for (e.g. process crash between insert_prepared and
-    /// mark_applied) is also never promoted. The drain reads only
-    /// `applied` rows, so a `prepared` row stays in `prepared` and
-    /// is invisible to the drain.
+    /// A request the handler has not yet finished (state =
+    /// `received`, git has not yet returned) is invisible to the
+    /// per-request drain. The drain only reads `outcomes_committed`
+    /// and `effects_pending`, so a `received` row stays where the
+    /// handler left it and no effects are attempted.
     #[sqlx::test]
-    async fn prepared_row_produces_no_artifacts(pool: sqlx::PgPool) {
+    async fn received_request_produces_no_artifacts(pool: sqlx::PgPool) {
         let state = crate::test_support::test_state(pool).await;
 
-        let mut row = make_row(
-            "repo-prep",
-            "refs/heads/main",
-            &"a".repeat(40),
-            &"b".repeat(40),
+        // Stage the request row directly in `received` (the state
+        // the handler writes before git returns).
+        let request_id = "req-received";
+        let repo_id = "repo-received";
+        sqlx::query(
+            r#"INSERT INTO receive_pack_requests
+               (id, repo_id, pusher_did, node_did, request_bytes, request_bytes_hash,
+                state, git_exit_ok, parsed_report, accepted_ordinal, attempt_count,
+                last_error, next_attempt_at, created_at, completed_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"#,
+        )
+        .bind(request_id)
+        .bind(repo_id)
+        .bind("did:key:z6pusher")
+        .bind("did:key:z6node")
+        .bind(Vec::<u8>::new())
+        .bind([0u8; 32].to_vec())
+        .bind(crate::db::request_state::RECEIVED)
+        .bind(Option::<bool>::None)
+        .bind(Option::<serde_json::Value>::None)
+        .bind(Option::<i32>::None)
+        .bind(0_i32)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Utc::now().to_rfc3339())
+        .bind(Option::<String>::None)
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+
+        // The drain must not pick up a `received` row.
+        let (n, examined) = drain_receive_pack_requests(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "the drain must not touch a `received` request");
+        assert_eq!(examined, 0, "the drain's WHERE excludes `received`");
+
+        // The request is unchanged.
+        let after = state.db.get_receive_pack_request(request_id).await.unwrap();
+        assert_eq!(
+            after.expect("request row exists").state,
+            crate::db::request_state::RECEIVED,
+            "received requests are left to the handler"
         );
-        row.state = pending_state::PREPARED.to_string();
-        state
-            .db
-            .insert_pending_ref_transition_for_test(&row)
-            .await
-            .unwrap();
 
-        let (n, _examined) = drain_pending_ref_transitions(state.clone(), 100)
-            .await
-            .unwrap();
-        assert_eq!(n, 0, "the drain must not promote a prepared row");
-
-        let push_count = state
-            .db
-            .count_push_events(&row.repo_id, &row.new_sha, &row.pusher_did)
-            .await
-            .unwrap();
-        assert_eq!(push_count, 0);
-        let certs = state
-            .db
-            .list_ref_certificates(&row.repo_id, 10)
-            .await
-            .unwrap();
-        assert!(certs.is_empty());
-        let anchor_count = state
-            .db
-            .count_anchor_jobs(&row.repo_id, &row.ref_name, &row.old_sha, &row.new_sha)
-            .await
-            .unwrap();
-        assert_eq!(anchor_count, 0);
+        let push_count = state.db.get_push_count("did:key:z6pusher").await.unwrap();
+        assert_eq!(push_count, 0, "no push event for an unstarted request");
     }
 
     // ----- P1-A reconcile tests -----
@@ -1727,23 +2028,21 @@ mod drain_tests {
     // ----- P2-A drain resilience tests -----
     //
     // These tests cover the "drain must not abort on first failure"
-    // and "drain must not cap at 1000 rows per startup" findings.
-    // Backlog processing uses the production `drain_pending_ref_transitions_all`
-    // (the `DRAIN_PER_PASS_LIMIT` / `DRAIN_MAX_PASSES` constants from
-    // this module) so the test exercises the same wrapper the
-    // startup calls. Failure isolation uses
-    // `drain_pending_ref_transitions_with` to inject a closure that
-    // errors for one row and succeeds for the next.
+    // and "drain must not cap at 1000 requests per startup" findings.
+    // Backlog processing uses the production
+    // `drain_receive_pack_requests_all` (the `DRAIN_PER_PASS_LIMIT` /
+    // `DRAIN_MAX_PASSES` constants from this module) so the test
+    // exercises the same wrapper the startup calls. Failure isolation
+    // uses `drain_receive_pack_requests_with` to inject a closure
+    // that returns `Retry` for one request and `Done` for the next.
 
     #[sqlx::test]
     async fn drain_processes_backlog_larger_than_one_pass(pool: sqlx::PgPool) {
         let state = crate::test_support::test_state(pool).await;
 
-        // Seed 1500 distinct `applied` rows. Each row needs a unique
-        // `request_id` so the deterministic `pending_ref_transition`
-        // PKs (which hash `request_id`) don't collide, and the
-        // push-event / cert / anchor PKs (which also hash
-        // `request_id`) don't collide either.
+        // Seed 1500 distinct request rows. Each request is its own
+        // `receive_pack_requests.id`; per-ref PKs hash the request
+        // id, and the certs / anchor jobs hash the request id too.
         const N: usize = 1500;
         for i in 0..N {
             let mut row = make_row(
@@ -1752,9 +2051,6 @@ mod drain_tests {
                 &"0".repeat(40),
                 &format!("{:040x}", i as u64),
             );
-            // Override `request_id` to a unique value per row. The
-            // `id` is derived from this in `make_row`, so the unique
-            // `request_id` also gives a unique row PK.
             row.request_id = format!("req-{i}");
             row.id = crate::db::deterministic_id(&[
                 "pending_ref_transition",
@@ -1764,17 +2060,22 @@ mod drain_tests {
                 &row.old_sha,
                 &row.new_sha,
             ]);
-            state
-                .db
-                .insert_pending_ref_transition_for_test(&row)
-                .await
-                .unwrap();
+            let parsed_report = parsed_report_ok(&[("refs/heads/main", true)]);
+            stage_request_with_children(
+                &state.db,
+                &row.request_id,
+                "repo-backlog",
+                Some(row.ordinal),
+                std::slice::from_ref(&row),
+                parsed_report,
+            )
+            .await;
         }
 
         // Drain with the production limits. Two passes of 1000 each
-        // cover all 1500 rows; the third pass would be empty and
+        // cover all 1500 requests; the third pass would be empty and
         // exits the loop early on the `n < per_pass_limit` check.
-        let total = drain_pending_ref_transitions_all(
+        let total = drain_receive_pack_requests_all(
             state.clone(),
             DRAIN_PER_PASS_LIMIT,
             DRAIN_MAX_PASSES,
@@ -1783,26 +2084,32 @@ mod drain_tests {
         .unwrap();
         assert_eq!(total, N, "drain processed the full backlog");
 
-        // No `applied` rows remain.
+        // No `outcomes_committed` requests remain.
         let after = state
+            .db
+            .count_receive_pack_requests_due()
+            .await
+            .unwrap();
+        assert_eq!(
+            after, 0,
+            "every request row was processed and moved to complete"
+        );
+        // No per-ref children remain either.
+        let still = state
             .db
             .list_pending_ref_transitions_applied(10_000)
             .await
             .unwrap();
-        assert!(
-            after.is_empty(),
-            "every applied row was processed and deleted"
-        );
+        assert!(still.is_empty(), "every child was cleaned up");
     }
 
     #[sqlx::test]
     async fn drain_continues_past_a_failing_row(pool: sqlx::PgPool) {
         let state = crate::test_support::test_state(pool).await;
 
-        // Seed two `applied` rows, A first so the `ORDER BY applied_at
-        // ASC NULLS LAST, id ASC` query hits A before B. They have
-        // distinct `request_id`s so the deterministic PKs don't
-        // collide.
+        // Seed two requests (A first so the `ORDER BY created_at ASC,
+        // id ASC` query hits A before B). Each request owns a single
+        // child row at ordinal 0.
         let mut row_a = make_row(
             "repo-fail-then-pass",
             "refs/heads/main",
@@ -1833,63 +2140,86 @@ mod drain_tests {
             &row_b.old_sha,
             &row_b.new_sha,
         ]);
-        state
-            .db
-            .insert_pending_ref_transition_for_test(&row_a)
-            .await
-            .unwrap();
-        state
-            .db
-            .insert_pending_ref_transition_for_test(&row_b)
-            .await
-            .unwrap();
+        let parsed_report = parsed_report_ok(&[("refs/heads/main", true)]);
+        stage_request_with_children(
+            &state.db,
+            "req-A",
+            "repo-fail-then-pass",
+            Some(0),
+            std::slice::from_ref(&row_a),
+            parsed_report.clone(),
+        )
+        .await;
+        stage_request_with_children(
+            &state.db,
+            "req-B",
+            "repo-fail-then-pass",
+            Some(0),
+            std::slice::from_ref(&row_b),
+            parsed_report,
+        )
+        .await;
 
-        // Inject a closure that fails for row A and delegates to
-        // `derive_one` for everything else. Row B is processed
-        // normally; row A's failure is logged and the row stays
-        // `applied` for a future retry. The `Fn` bound on the seam
-        // forbids moving the id into the closure, so the closure
-        // clones the id from the outer `row_a_id` local on every
-        // iteration.
-        let row_a_id = row_a.id.clone();
+        // Inject a closure that returns Retry for request A and
+        // delegates to the real `apply_request_effects` for B.
+        // Request A is moved to `effects_pending` for a future
+        // retry; request B is fully processed.
+        let state_for_closure = state.clone();
         let (processed, examined) =
-            drain_pending_ref_transitions_with(state.clone(), 100, |s, r| {
-                let target = row_a_id.clone();
+            drain_receive_pack_requests_with(state.clone(), 100, |_s, req_id| {
+                let target = String::from("req-A");
+                let st = state_for_closure.clone();
                 async move {
-                    if r.id == target {
-                        Err(anyhow::anyhow!("injected derive failure"))
+                    if req_id == target {
+                        Ok(EffectsOutcome::Retry {
+                            last_error: "injected derive failure".to_string(),
+                        })
                     } else {
-                        derive_one(&s, &r).await
+                        apply_request_effects(&st, &req_id).await
                     }
                 }
             })
             .await
             .unwrap();
-        assert_eq!(processed, 1, "only row B is fully processed and deleted");
+        assert_eq!(processed, 1, "only request B is fully processed");
         assert_eq!(
             examined, 2,
-            "the loop examined both rows; processed/derivation is independent of pagination"
+            "the loop examined both requests; processed/derivation is independent of pagination"
         );
 
-        // Row A is still in `applied` (NOT deleted, NOT re-derivable
-        // yet by a future pass that just calls `derive_one` — the
-        // inserted artifacts were never created).
-        let after = state
+        // Request A is in `effects_pending` (Retry moved it there).
+        let a_req = state
             .db
-            .list_pending_ref_transitions_applied(100)
+            .get_receive_pack_request("req-A")
             .await
-            .unwrap();
-        assert_eq!(after.len(), 1, "row A is still in `applied`");
-        assert_eq!(after[0].id, row_a_id);
+            .unwrap()
+            .expect("req-A exists");
+        assert_eq!(
+            a_req.state,
+            crate::db::request_state::EFFECTS_PENDING,
+            "Retry outcome moves A to effects_pending"
+        );
+        // Request B is in `complete`.
+        let b_req = state
+            .db
+            .get_receive_pack_request("req-B")
+            .await
+            .unwrap()
+            .expect("req-B exists");
+        assert_eq!(
+            b_req.state,
+            crate::db::request_state::COMPLETE,
+            "Done outcome moves B to complete"
+        );
 
-        // Row A's artifacts were not created (the closure errored
-        // before any insert ran).
+        // Request A's artifacts were not created (the closure
+        // returned Retry before any insert ran).
         let a_push = state
             .db
             .count_push_events(&row_a.repo_id, &row_a.new_sha, &row_a.pusher_did)
             .await
             .unwrap();
-        assert_eq!(a_push, 0, "row A's push event was not created");
+        assert_eq!(a_push, 0, "request A's push event was not created");
         let a_anchors = state
             .db
             .count_anchor_jobs(
@@ -1900,38 +2230,22 @@ mod drain_tests {
             )
             .await
             .unwrap();
-        assert_eq!(a_anchors, 0, "row A's anchor job was not created");
-        let a_certs = state
-            .db
-            .list_ref_certificates(&row_a.repo_id, 10)
-            .await
-            .unwrap();
-        // The cert table is per-(repo, ref) with one row. Row B's
-        // drain wrote a cert for this `(repo, ref)`. We need to
-        // check row A's specific cert by its deterministic id —
-        // the row A's `derive_one` never ran, so the row A cert id
-        // must not exist in the table.
+        assert_eq!(a_anchors, 0, "request A's anchor job was not created");
         let a_cert_id = crate::db::ref_cert_id_for(&row_a.request_id, row_a.ordinal);
         let a_cert = state.db.get_ref_certificate(&a_cert_id).await.unwrap();
         assert!(
             a_cert.is_none(),
-            "row A's specific cert was not created (got {:?})",
+            "request A's cert id must not exist (got {:?})",
             a_cert.map(|c| c.id)
         );
-        // The single cert for this `(repo, ref)` is row B's.
-        assert_eq!(a_certs.len(), 1, "row B's cert exists in the table");
-        let b_cert_id = crate::db::ref_cert_id_for(&row_b.request_id, row_b.ordinal);
-        assert_eq!(a_certs[0].id, b_cert_id, "the only cert is row B's");
 
-        // Row B's other artifacts WERE created (the closure called
-        // the real `derive_one`, which writes the push event and
-        // anchor job for row B).
+        // Request B's artifacts WERE created.
         let b_push = state
             .db
             .count_push_events(&row_b.repo_id, &row_b.new_sha, &row_b.pusher_did)
             .await
             .unwrap();
-        assert_eq!(b_push, 1, "row B's push event was created");
+        assert_eq!(b_push, 1, "request B's push event was created");
         let b_anchors = state
             .db
             .count_anchor_jobs(
@@ -1942,7 +2256,10 @@ mod drain_tests {
             )
             .await
             .unwrap();
-        assert_eq!(b_anchors, 1, "row B's anchor job was created");
+        assert_eq!(b_anchors, 1, "request B's anchor job was created");
+        let b_cert_id = crate::db::ref_cert_id_for(&row_b.request_id, row_b.ordinal);
+        let b_cert = state.db.get_ref_certificate(&b_cert_id).await.unwrap();
+        assert!(b_cert.is_some(), "request B's cert was created");
     }
 
     // ----- P2-B multi-ref push event cardinality test -----
@@ -1964,43 +2281,18 @@ mod drain_tests {
     ) {
         let state = crate::test_support::test_state(pool).await;
 
-        // Stage the request row with `accepted_ordinal = 0` so the
-        // drain's gate (`row.ordinal == accepted_ordinal`) only fires
-        // for the first child. The v30 model carries the
-        // accepted-ordinal on the request row, so the test fixture
-        // must include one — this is the production shape the drain
-        // sees on every replay.
-        sqlx::query(
-            "INSERT INTO receive_pack_requests \
-             (id, repo_id, pusher_did, node_did, request_bytes, request_bytes_hash, \
-              state, created_at, accepted_ordinal) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-        )
-        .bind("req-multi")
-        .bind("repo-multi")
-        .bind("did:key:z6pusher")
-        .bind("did:key:z6node")
-        .bind(Vec::<u8>::new())
-        .bind([0u8; 32].to_vec())
-        .bind("outcomes_committed")
-        .bind(Utc::now().to_rfc3339())
-        .bind(Some(0_i32))
-        .execute(state.db.pool())
-        .await
-        .unwrap();
-
-        // Three rows for the SAME `request_id`, distinct `ref_name`s,
-        // distinct ordinals 0/1/2. The `new_sha` is the same across
-        // all three because this models a push that advanced a tip
-        // commit onto three refs at once (a common case for
-        // `git push --all` or for a single-commit push to multiple
-        // branches).
+        // Three children for the SAME `request_id`, distinct
+        // `ref_name`s, distinct ordinals 0/1/2. The `new_sha` is
+        // shared across all three because this models a push that
+        // advanced a tip commit onto three refs at once (the
+        // ordinary shape of `git push --all`).
         let shared_new_sha = "c".repeat(40);
         let ref_names = [
             "refs/heads/main",
             "refs/heads/feature-a",
             "refs/heads/feature-b",
         ];
+        let mut children = Vec::new();
         for (i, ref_name) in ref_names.iter().enumerate() {
             let mut row = make_row("repo-multi", ref_name, &"0".repeat(40), &shared_new_sha);
             row.request_id = "req-multi".to_string();
@@ -2016,25 +2308,36 @@ mod drain_tests {
                 &row.old_sha,
                 &row.new_sha,
             ]);
-            state
-                .db
-                .insert_pending_ref_transition_for_test(&row)
-                .await
-                .unwrap();
+            children.push(row);
         }
+        // Stage the request with `accepted_ordinal = Some(0)` so the
+        // first child is the one whose `new_sha` becomes the push
+        // event's commit_hash. All three refs are in the parsed
+        // report's ok set.
+        let parsed_report = parsed_report_ok(&[
+            ("refs/heads/main", true),
+            ("refs/heads/feature-a", true),
+            ("refs/heads/feature-b", true),
+        ]);
+        stage_request_with_children(
+            &state.db,
+            "req-multi",
+            "repo-multi",
+            Some(0),
+            &children,
+            parsed_report,
+        )
+        .await;
 
-        // Drain all three rows.
-        let (n, examined) = drain_pending_ref_transitions(state.clone(), 100)
+        // Drain the request.
+        let (n, examined) = drain_receive_pack_requests(state.clone(), 100)
             .await
             .unwrap();
-        assert_eq!(n, 3, "all three rows re-derived");
-        assert_eq!(examined, 3, "the loop examined all three rows");
+        assert_eq!(n, 1, "the request was processed");
+        assert_eq!(examined, 1, "the loop examined the single request");
 
         // Exactly one push event row, keyed on the deterministic
-        // (request_id, accepted_ordinal) id. Only the first child
-        // (ordinal 0) wrote the event, so the others' attempted
-        // writes either no-op'd (if their id collided with a row the
-        // request didn't accept) or never ran.
+        // (request_id, accepted_ordinal) id.
         let push_count = state.db.get_push_count("did:key:z6pusher").await.unwrap();
         assert_eq!(
             push_count, 1,
@@ -2050,9 +2353,6 @@ mod drain_tests {
         // The deterministic id is the one the live path would have
         // written.
         let expected_id = crate::db::push_event_id_for("req-multi", 0);
-        // We don't have a direct "select by id" for push_events; the
-        // count of 1 already proves the cardinality. Assert the id
-        // is stable for completeness.
         assert_eq!(
             expected_id,
             crate::db::push_event_id_for("req-multi", 0),
@@ -2060,7 +2360,7 @@ mod drain_tests {
         );
 
         // Certs: one per ref (the cert contract is per-ref, NOT
-        // collapsed by ordinal). Three rows → three certs.
+        // collapsed by ordinal). Three children → three certs.
         let certs = state
             .db
             .list_ref_certificates("repo-multi", 10)
@@ -2073,7 +2373,7 @@ mod drain_tests {
         );
 
         // Anchor jobs: one per `(repo, ref, old, new)` transition.
-        // Three rows → three anchor jobs.
+        // Three children → three anchor jobs.
         for (i, ref_name) in ref_names.iter().enumerate() {
             let n = state
                 .db
@@ -2105,27 +2405,6 @@ mod drain_tests {
     async fn multi_ref_recovery_uses_first_refs_new_sha_for_push_event(pool: sqlx::PgPool) {
         let state = crate::test_support::test_state(pool).await;
 
-        // Stage the request row with `accepted_ordinal = 0` so the
-        // first child (ordinal 0) is the only row whose gate fires.
-        sqlx::query(
-            "INSERT INTO receive_pack_requests \
-             (id, repo_id, pusher_did, node_did, request_bytes, request_bytes_hash, \
-              state, created_at, accepted_ordinal) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-        )
-        .bind("req-multi-distinct")
-        .bind("repo-multi-distinct")
-        .bind("did:key:z6pusher")
-        .bind("did:key:z6node")
-        .bind(Vec::<u8>::new())
-        .bind([0u8; 32].to_vec())
-        .bind("outcomes_committed")
-        .bind(Utc::now().to_rfc3339())
-        .bind(Some(0_i32))
-        .execute(state.db.pool())
-        .await
-        .unwrap();
-
         // Three refs, each with a distinct `new_sha` modelling a
         // multi-branch push where each ref advanced to a different
         // tip. The first ref's new_sha is the one the live handler
@@ -2139,6 +2418,7 @@ mod drain_tests {
             "refs/heads/feature-b",
         ];
         let new_shas = [&first_new_sha, &second_new_sha, &third_new_sha];
+        let mut children = Vec::new();
         for (i, (ref_name, new_sha)) in ref_names.iter().zip(new_shas.iter()).enumerate() {
             let mut row = make_row("repo-multi-distinct", ref_name, &"0".repeat(40), new_sha);
             row.request_id = "req-multi-distinct".to_string();
@@ -2155,26 +2435,34 @@ mod drain_tests {
                 &row.old_sha,
                 &row.new_sha,
             ]);
-            state
-                .db
-                .insert_pending_ref_transition_for_test(&row)
-                .await
-                .unwrap();
+            children.push(row);
         }
+        let parsed_report = parsed_report_ok(&[
+            ("refs/heads/main", true),
+            ("refs/heads/feature-a", true),
+            ("refs/heads/feature-b", true),
+        ]);
+        stage_request_with_children(
+            &state.db,
+            "req-multi-distinct",
+            "repo-multi-distinct",
+            Some(0),
+            &children,
+            parsed_report,
+        )
+        .await;
 
-        // Drain all three rows.
-        let (n, examined) = drain_pending_ref_transitions(state.clone(), 100)
+        // Drain the request.
+        let (n, examined) = drain_receive_pack_requests(state.clone(), 100)
             .await
             .unwrap();
-        assert_eq!(n, 3, "all three rows re-derived");
-        assert_eq!(examined, 3, "the loop examined all three rows");
+        assert_eq!(n, 1, "the request was processed");
+        assert_eq!(examined, 1, "the loop examined the single request");
 
         // Exactly one push event row, keyed on the deterministic
-        // (request_id, accepted_ordinal) id. Only the row whose
-        // ordinal matches the request's `accepted_ordinal` ran
-        // `record_push_with_id`, so the persisted `commit_hash` is
-        // the FIRST ref's `new_sha` — the same value the live path
-        // would have written.
+        // (request_id, accepted_ordinal) id. The persisted
+        // `commit_hash` is the FIRST ref's `new_sha` — the same
+        // value the live path would have written.
         let push_count = state.db.get_push_count("did:key:z6pusher").await.unwrap();
         assert_eq!(push_count, 1, "exactly one push event row");
         let first_event = state
@@ -2200,8 +2488,7 @@ mod drain_tests {
             );
         }
 
-        // Certs and anchors stay per-ref and per-transition
-        // (unchanged from the prior round).
+        // Certs stay per-ref (three refs → three certs).
         let certs = state
             .db
             .list_ref_certificates("repo-multi-distinct", 10)
@@ -2214,18 +2501,20 @@ mod drain_tests {
     //
     // The previous loop's exit condition was `(n as i64) < per_pass_limit`
     // where `n` was rows *fully processed* (derive + delete). A pass
-    // where every `derive_one` returns Err logs each failure but
-    // increments `count = 0`; the outer loop sees `0 < per_pass_limit`
-    // and returns. Remaining `applied` rows are never attempted that
-    // boot. The fix returns `(processed, examined)` and keys the exit
-    // on `examined`. This test seeds `per_pass_limit` rows with a
-    // closure that fails for every one, then asserts the drain ran
-    // every row (processed=0, examined=per_pass_limit) so the outer
-    // loop continues to the next pass.
+    // where every `apply_request_effects` returns Retry logs each
+    // failure but increments `processed = 0`; the outer loop sees
+    // `0 < per_pass_limit` and returns. Remaining requests are never
+    // attempted that boot. The fix returns `(processed, examined)`
+    // and keys the exit on `examined`. This test seeds
+    // `per_pass_limit` requests with a closure that retries every
+    // one, then asserts the drain ran every request (processed=0,
+    // examined=per_pass_limit) so the outer loop continues to the
+    // next pass.
     #[sqlx::test]
     async fn drain_does_not_exit_early_when_every_row_fails(pool: sqlx::PgPool) {
         let state = crate::test_support::test_state(pool).await;
         const N: usize = 5;
+        let parsed_report = parsed_report_ok(&[("refs/heads/main", true)]);
         for i in 0..N {
             let mut row = make_row(
                 "repo-all-fail",
@@ -2242,36 +2531,53 @@ mod drain_tests {
                 &row.old_sha,
                 &row.new_sha,
             ]);
-            state
-                .db
-                .insert_pending_ref_transition_for_test(&row)
-                .await
-                .unwrap();
+            stage_request_with_children(
+                &state.db,
+                &row.request_id,
+                "repo-all-fail",
+                Some(row.ordinal),
+                std::slice::from_ref(&row),
+                parsed_report.clone(),
+            )
+            .await;
         }
 
         let (processed, examined) =
-            drain_pending_ref_transitions_with(state.clone(), N as i64, |_s, _r| async move {
-                Err(anyhow::anyhow!("injected: every row fails"))
+            drain_receive_pack_requests_with(state.clone(), N as i64, |_s, _req_id| async move {
+                Ok(EffectsOutcome::Retry {
+                    last_error: "injected: every request fails".to_string(),
+                })
             })
             .await
             .unwrap();
-        assert_eq!(processed, 0, "no row was fully processed");
+        assert_eq!(processed, 0, "no request was fully processed");
         assert_eq!(
             examined, N,
-            "the loop examined every row even though every derive failed"
+            "the loop examined every request even though every derive failed"
         );
 
-        // The all-fail rows are still `applied` for a future retry:
-        // the loop never deletes a row whose derive returned Err.
-        let after = state
+        // Every request is in `effects_pending` for a future retry.
+        let due = state
             .db
-            .list_pending_ref_transitions_applied(100)
+            .count_receive_pack_requests_due()
             .await
             .unwrap();
+        // The Retry path sets `next_attempt_at` 60s in the future,
+        // so the due count is 0 — but the requests still exist.
+        assert_eq!(due, 0, "Retry schedules the requests 60s out");
+        // And there are N total outcomes_committed/effects_pending.
+        let total: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)::BIGINT FROM receive_pack_requests
+               WHERE state IN ($1, $2)"#,
+        )
+        .bind(crate::db::request_state::OUTCOMES_COMMITTED)
+        .bind(crate::db::request_state::EFFECTS_PENDING)
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
         assert_eq!(
-            after.len(),
-            N,
-            "failed rows stay `applied` for the next startup"
+            total, N as i64,
+            "all N requests are still pending for the next startup"
         );
     }
 
@@ -2337,10 +2643,10 @@ mod drain_tests {
             .await
             .unwrap();
 
-        // Seed the durable row with the LANDED transition (what the
-        // push actually applied to disk): a different old_sha and
-        // new_sha, the genuine pusher DID. The drain must refresh
-        // the stale cert to this transition.
+        // Seed the durable child with the LANDED transition (what
+        // the push actually applied to disk): a different old_sha
+        // and new_sha, the genuine pusher DID. The drain must
+        // refresh the stale cert to this transition.
         let landed_old = "2".repeat(40);
         let landed_new = "3".repeat(40);
         let landed_pusher = "did:key:zLandedPusher";
@@ -2356,19 +2662,25 @@ mod drain_tests {
             &row.old_sha,
             &row.new_sha,
         ]);
-        state
-            .db
-            .insert_pending_ref_transition_for_test(&row)
-            .await
-            .unwrap();
+        let parsed_report = parsed_report_ok(&[("refs/heads/main", true)]);
+        stage_request_with_pusher(
+            &state.db,
+            "req-stale",
+            &rec.id,
+            landed_pusher,
+            Some(0),
+            std::slice::from_ref(&row),
+            parsed_report,
+        )
+        .await;
 
         // Drain. The recovery upsert must overwrite the stale cert
         // with the landed transition's SHAs / pusher / signature.
-        let (processed, examined) = drain_pending_ref_transitions(state.clone(), 100)
+        let (processed, examined) = drain_receive_pack_requests(state.clone(), 100)
             .await
             .unwrap();
-        assert_eq!(processed, 1, "the row was drained");
-        assert_eq!(examined, 1, "the loop examined the single row");
+        assert_eq!(processed, 1, "the request was drained");
+        assert_eq!(examined, 1, "the loop examined the single request");
 
         let certs = state.db.list_ref_certificates(&rec.id, 10).await.unwrap();
         assert_eq!(certs.len(), 1, "exactly one cert row, the same id");
@@ -2429,7 +2741,7 @@ mod drain_tests {
         };
         state.db.create_repo(&rec).await.unwrap();
 
-        // A: original push, recovery row still `applied`.
+        // A: original push, request row still in `outcomes_committed`.
         let a_old = "0".repeat(40);
         let a_new = "1".repeat(40);
         let a_pusher = "did:key:zA";
@@ -2449,16 +2761,22 @@ mod drain_tests {
         // Backdate A's created_at by 5 minutes so the replay's
         // stamped `issued_at` is provably older than B's live one.
         a_row.created_at = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
-        state
-            .db
-            .insert_pending_ref_transition_for_test(&a_row)
-            .await
-            .unwrap();
+        let parsed_report = parsed_report_ok(&[("refs/heads/main", true)]);
+        stage_request_with_pusher(
+            &state.db,
+            a_request,
+            &rec.id,
+            a_pusher,
+            Some(0),
+            std::slice::from_ref(&a_row),
+            parsed_report,
+        )
+        .await;
 
         // A's cert was written live (or never — we test the case
-        // where the row was left `applied` and the cert was NOT
-        // yet written, then B's live push arrives first and writes
-        // its cert, then A's drain replays).
+        // where the row was left pending and the cert was NOT yet
+        // written, then B's live push arrives first and writes its
+        // cert, then A's drain replays).
         //
         // Simulate: the live cert B has been written by a later
         // push.
@@ -2466,10 +2784,11 @@ mod drain_tests {
         let b_new = "2".repeat(40);
         let b_pusher = "did:key:zB";
         // B is a stand-in for "a later live push already wrote its
-        // cert". The cert id is arbitrary — what matters is the row
-        // collides with A's recovery on the `(repo_id, ref_name)`
-        // unique index. Use B's request-scoped id at ordinal 0 so the
-        // id is a real `(request_id, ordinal)` shape.
+        // cert". The cert id is arbitrary — what matters is the
+        // row collides with A's recovery on the
+        // `(repo_id, ref_name)` unique index. Use B's
+        // request-scoped id at ordinal 0 so the id is a real
+        // `(request_id, ordinal)` shape.
         let b_cert_id = crate::db::ref_cert_id_for("req-B", 0);
         state
             .db
@@ -2491,11 +2810,11 @@ mod drain_tests {
         // created_at = now-5min) is OLDER than B's cert (now), so
         // the per-column CASE WHEN guards must NOT update B's
         // fields.
-        let (processed, examined) = drain_pending_ref_transitions(state.clone(), 100)
+        let (processed, examined) = drain_receive_pack_requests(state.clone(), 100)
             .await
             .unwrap();
-        assert_eq!(processed, 1, "A's row was drained");
-        assert_eq!(examined, 1, "the loop examined A's row");
+        assert_eq!(processed, 1, "A's request was drained");
+        assert_eq!(examined, 1, "the loop examined A's request");
 
         let certs = state.db.list_ref_certificates(&rec.id, 10).await.unwrap();
         assert_eq!(certs.len(), 1, "exactly one cert row remains");

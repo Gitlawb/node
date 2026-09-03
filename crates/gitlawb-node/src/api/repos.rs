@@ -11,12 +11,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::cert;
 use crate::error::{AppError, Result};
 use crate::git::{smart_http, store, visibility_pack};
 use crate::state::AppState;
 use crate::visibility::{visibility_check, withheld_globs, Decision};
-use crate::webhooks;
 
 /// The git all-zeros object id — the create/delete sentinel in a ref update.
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
@@ -2820,240 +2818,67 @@ pub async fn git_receive_pack(
             .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to build response: {e}")));
     }
 
-    // Request-scoped effects. These run when at least one ref
-    // landed; the per-ref certs and anchor jobs below gate further
-    // on `ok_set` membership. A mixed push where one ref was
-    // rejected still gets the push event and trust score (one or
-    // more refs DID land) but the rejected ref has no cert, no
-    // anchor, and no webhook.
+    // #26 Split PR 1 step 3 — the per-ref effects fan-out moved into
+    // `apply_request_effects`. The live handler and the recovery
+    // drain call the same function, so the live and recovery paths
+    // produce identical artifact ids and the request row's
+    // `accepted_ordinal` is the single source of truth for the push
+    // event identity. A `Retry` outcome here means one or more
+    // per-ref effects failed transiently; the request is left in
+    // `effects_pending` for the drain to pick up on the next
+    // startup. A `Nothing` outcome means the request had no
+    // accepted ref (the four-branch flip above would have caught
+    // that case via `any_ref_ok`, so this is defensive).
     let _ = state.db.touch_repo(&record.id).await;
     crate::metrics::record_push(&record.id);
     crate::metrics::observe_pack_size(body_len as f64);
 
-    // Record push event for trust score and issue a signed ref certificate.
-    // The route is behind `require_signature`, so the verified pusher identity is
-    // always present; use it directly rather than re-parsing the headers.
-    //
-    // #26 Split PR 1: the push event id, the per-ref cert id, and the
-    // anchor job id are all derived from the same `request_id` captured
-    // above, so a recovery re-pass against the same transition
-    // produces the same primary keys and the idempotent inserts collapse.
-    let did = auth.0.as_str();
-    // P2 (reviewer round 5): the request-scoped push event is a
-    // durable artifact on the same footing as the per-ref certs and
-    // anchor jobs. Track its write success so the per-ref cleanup
-    // gate can leave the row in `applied` when the write failed —
-    // otherwise a transient failure on the live path discards the
-    // push event and the trust bump permanently, because the drain
-    // cannot see a row the live path already deleted.
-    let mut push_event_write_ok = false;
-    {
-        // P1 (reviewer-1 round 4): the request-scoped push event
-        // uses the FIRST OK ref's `new_sha` as `commit_hash`, NOT
-        // `ref_updates.first()`. The previous code used the first
-        // requested ref regardless of whether it landed, so a
-        // mixed push with a rejected first ref recorded a
-        // `commit_hash` for a SHA that does not exist. Using the
-        // first OK ref's new_sha keeps the push event's
-        // `commit_hash` truthful; if every ref was rejected we
-        // already returned above (`any_ref_ok` is false).
-        //
-        // #26 Split PR 1: the push event id is keyed on
-        // `(request_id, accepted_ordinal)`, not on a per-ref name.
-        // The `accepted_ordinal` was computed at the per-ref state
-        // flip; it is the position in `ref_updates` of the first
-        // ref the report proves landed. The `commit_hash` is that
-        // ref's `new_sha`, NOT `ref_updates.first()`. If every ref
-        // was rejected, `accepted_ordinal` is `None` and we already
-        // returned above (`any_ref_ok` is false).
-        let commit_hash = match accepted_ordinal {
-            Some(ord) => ref_updates
-                .get(ord as usize)
-                .map(|u| u.new_sha.clone())
-                .unwrap_or_else(|| Utc::now().timestamp().to_string()),
-            None => Utc::now().timestamp().to_string(),
-        };
-        let push_event_id = match accepted_ordinal {
-            Some(ord) => crate::db::push_event_id_for(&request_id, ord),
-            None => String::new(),
-        };
-        if let Err(e) = state
-            .db
-            .record_push_with_id(&push_event_id, did, &record.id, &commit_hash, 0)
-            .await
-        {
-            tracing::warn!(
-                err = %e,
-                request_id = %request_id,
-                repo = %name,
-                "failed to record push event; the request-scoped outbox row will be left for the drain to retry"
-            );
-        } else {
-            push_event_write_ok = true;
-        }
-        if let Ok(push_count) = state.db.get_push_count(did).await {
-            // 0.05 base (from registration) + 0.05 per push, capped at 1.0
-            // 1 push → 0.10, 5 pushes → 0.30, 19 pushes → 1.0
-            let new_score = (push_count as f64 * 0.05 + 0.05).min(1.0);
-            let _ = state.db.update_trust_score(did, new_score).await;
-        }
-
-        // Per-ref durable effects. Each ref's cert + anchor writes
-        // are gated on `ok_set` membership — the rejected ref gets
-        // neither. Track per-ref success so the cleanup at the end
-        // only deletes outbox rows whose required writes all
-        // succeeded; a transient cert failure leaves the row in
-        // `applied` for the startup drain to recover.
-        let mut ok_ref_ids: Vec<String> = Vec::new();
-        for update in &ref_updates {
-            // Skip refs the report-status rejected. Their rows are
-            // already `cancelled` from the per-ref state flip
-            // above.
-            if !ok_set.contains(update.ref_name.as_str()) {
-                continue;
-            }
-            let cert_id = {
-                let ordinal = ref_updates
-                    .iter()
-                    .position(|u| u.ref_name == update.ref_name)
-                    .unwrap_or(0) as i32;
-                crate::db::ref_cert_id_for(&request_id, ordinal)
-            };
-            let cert_result = cert::issue_ref_certificate(
-                &state,
-                &record.id,
-                &update.ref_name,
-                &update.old_sha,
-                &update.new_sha,
-                did,
-                &cert_id,
-            )
-            .await;
-            let cert_ok = match &cert_result {
-                Ok(c) => {
-                    tracing::info!(cert_id = %c.id, repo = %record.name, ref_name = %update.ref_name, pusher = %did, "issued ref certificate");
-                    true
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        err = %e,
-                        request_id = %request_id,
-                        ref_name = %update.ref_name,
-                        "failed to issue ref certificate; outbox row will be left for the drain to retry"
-                    );
-                    false
-                }
-            };
-
-            let anchor_id = crate::db::anchor_job_id_for(
-                &record.id,
-                &update.ref_name,
-                &update.old_sha,
-                &update.new_sha,
-            );
-            let job = crate::db::AnchorJob {
-                id: anchor_id,
-                repo_id: record.id.clone(),
-                ref_name: update.ref_name.clone(),
-                old_sha: update.old_sha.clone(),
-                new_sha: update.new_sha.clone(),
-                pusher_did: did.to_string(),
-                created_at: Utc::now().to_rfc3339(),
-                claimed_at: None,
-            };
-            let anchor_ok = match state.db.insert_anchor_job_idempotent(&job).await {
-                Ok(_) => true,
-                Err(e) => {
-                    tracing::warn!(
-                        err = %e,
-                        request_id = %request_id,
-                        ref_name = %update.ref_name,
-                        "failed to enqueue anchor job; outbox row will be left for the drain to retry"
-                    );
-                    false
-                }
-            };
-
-            if cert_ok && anchor_ok && push_event_write_ok {
-                // The row id is the deterministic id; look it up
-                // so cleanup can target just this ref's row.
-                //
-                // P2 (reviewer round 5): the push event is
-                // request-scoped (one row, keyed on
-                // `first_ref_name`). The first-ref-name row also
-                // carries the cert and anchor for the first OK
-                // ref; deleting it after a successful push event
-                // write is correct. Non-first-ref rows are
-                // independently keyed on their own `ref_name`; we
-                // delete them only when their own cert + anchor
-                // succeeded AND the request-scoped push event
-                // landed, so a partial failure keeps every
-                // affected row for the drain to re-derive.
-                if let Ok(Some(row_id)) = state
-                    .db
-                    .lookup_pending_ref_transition_id(&request_id, &update.ref_name)
-                    .await
-                {
-                    ok_ref_ids.push(row_id);
-                }
-            }
-        }
-        // Delete the per-ref rows whose required writes all
-        // succeeded. A failed-write row stays `applied` and the
-        // next startup drain re-derives it (the artifacts are
-        // idempotent).
-        for row_id in &ok_ref_ids {
-            if let Err(e) = state.db.delete_pending_ref_transition(row_id).await {
+    match crate::durable_outbox::apply_request_effects(&state, &request_id).await {
+        Ok(crate::durable_outbox::EffectsOutcome::Done) => {
+            if let Err(e) = state.db.mark_request_complete(&request_id).await {
                 tracing::warn!(
                     err = %e,
                     request_id = %request_id,
-                    row_id = %row_id,
-                    "failed to delete outbox row after effects landed; drain will re-derive (idempotent)"
+                    repo = %name,
+                    "live path: mark_request_complete failed; drain will pick up"
                 );
             }
         }
-    }
-
-    // Fire push webhooks — one per LANDED ref update only. The
-    // rejected ref is not announced because it did not change
-    // state. Webhook delivery is best-effort and never blocks
-    // outbox cleanup.
-    if !ok_set.is_empty() {
-        let base_url = state
-            .config
-            .public_url
-            .as_deref()
-            .unwrap_or("http://127.0.0.1:7545")
-            .trim_end_matches('/');
-        let owner_short = crate::db::normalize_owner_key(&record.owner_did);
-        let clone_url = format!("{}/{}/{}.git", base_url, owner_short, record.name);
-
-        for update in &ref_updates {
-            if !ok_set.contains(update.ref_name.as_str()) {
-                continue;
+        Ok(crate::durable_outbox::EffectsOutcome::Nothing) => {
+            // No accepted ref (defensive — `any_ref_ok` gates the
+            // call site, so this branch is unreachable in practice).
+            // Mark complete so the drain skips the request.
+            if let Err(e) = state.db.mark_request_complete(&request_id).await {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    repo = %name,
+                    "live path: mark_request_complete (Nothing) failed"
+                );
             }
-            let payload = serde_json::json!({
-                "ref": update.ref_name,
-                "before": update.old_sha,
-                "after": update.new_sha,
-                "created": update.old_sha == ZERO_SHA,
-                "forced": false,
-                "pusher": {
-                    "did": did,
-                },
-                "repository": {
-                    "id": record.id,
-                    "name": record.name,
-                    "owner_did": record.owner_did,
-                    "clone_url": clone_url,
-                },
-            });
-            webhooks::fire_event(
-                state.db.clone(),
-                state.http_client.clone(),
-                &record.id,
-                "push",
-                payload,
+        }
+        Ok(crate::durable_outbox::EffectsOutcome::Retry { last_error }) => {
+            let next_attempt_at =
+                (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+            if let Err(e) = state
+                .db
+                .mark_request_effects_pending(&request_id, &next_attempt_at, &last_error)
+                .await
+            {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    repo = %name,
+                    "live path: mark_request_effects_pending failed; drain will retry"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                err = %e,
+                request_id = %request_id,
+                repo = %name,
+                "live path: apply_request_effects returned Err; request left for drain"
             );
         }
     }

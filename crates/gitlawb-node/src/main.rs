@@ -714,7 +714,7 @@ async fn main() -> Result<()> {
             "pending ref transition reconcile failed at startup (non-fatal; will retry on next start)"
         ),
     }
-    match durable_outbox::drain_pending_ref_transitions_all(
+    match durable_outbox::drain_receive_pack_requests_all(
         state.clone(),
         durable_outbox::DRAIN_PER_PASS_LIMIT,
         durable_outbox::DRAIN_MAX_PASSES,

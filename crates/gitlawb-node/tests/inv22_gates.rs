@@ -547,9 +547,15 @@ fn inv22_replication_tail_spawns_at_the_durability_boundary() {
     let touch = production
         .find("state.db.touch_repo(")
         .expect("U5 gate stale: git_receive_pack no longer calls touch_repo");
-    let webhook = production
-        .find("webhooks::fire_event(")
-        .expect("U5 gate stale: git_receive_pack no longer fires push webhooks");
+    // #26 Split PR 1 step 3 — the webhook fan-out moved into
+    // `durable_outbox::apply_request_effects`, which the live
+    // handler calls inline (the recovery drain calls the same
+    // function on the next startup). The gate now pins that the
+    // handler is wired to the executor, not to a per-ref inline
+    // webhook call.
+    let effects_executor = production
+        .find("apply_request_effects(&state, &request_id)")
+        .expect("U5 gate stale: git_receive_pack no longer calls apply_request_effects inline");
 
     assert!(
         success_flag < gate_open && gate_open < spawn,
@@ -563,9 +569,100 @@ fn inv22_replication_tail_spawns_at_the_durability_boundary() {
          rejected push now spawns a tail"
     );
     assert!(
-        spawn < release && spawn < touch && spawn < webhook,
+        spawn < release && spawn < touch && spawn < effects_executor,
         "U5 gate bypassed: the tail must be spawned BEFORE guard.release, touch_repo \
-         and the webhook fan-out, so a disconnect in any of those windows cannot drop \
+         and the effect executor, so a disconnect in any of those windows cannot drop \
          this push's pins, recovery copy, and announcements"
+    );
+}
+
+/// #26 Split PR 1 step 3 — drain + handler share a single effect
+/// executor. The live handler (api/repos.rs) and the recovery
+/// drain (`durable_outbox::drain_receive_pack_requests_with`) both
+/// call `apply_request_effects`, so the per-ref effects fan-out
+/// lives in exactly one place. The v29 per-ref walk
+/// (`derive_one`, `drain_pending_ref_transitions_all`,
+/// `lookup_accepted_ordinal`) is dead code: any caller reintroduced
+/// would be the per-ref walk the step-3 PR removed. This gate
+/// fails if a call site slips back in or the new seam is bypassed.
+#[test]
+fn inv26_step3_live_and_drain_share_apply_request_effects() {
+    let repos = src("api/repos.rs");
+    let outbox = src("durable_outbox.rs");
+
+    // The live handler calls `apply_request_effects`. Split the
+    // file at the test attribute so test code can't satisfy the
+    // gate by itself.
+    let production_repos = repos
+        .split("\nmod tests {")
+        .next()
+        .expect("split always yields a first chunk");
+
+    assert!(
+        production_repos.contains("apply_request_effects(&state, &request_id)"),
+        "live handler must call `apply_request_effects(&state, &request_id)`; \
+         reverting to a per-ref inline fan-out splits live and recovery"
+    );
+
+    // The drain's per-request seam calls the same executor. Test
+    // code lives below `mod drain_tests`, so split there too.
+    let production_outbox = outbox
+        .split("\nmod drain_tests {")
+        .next()
+        .expect("split always yields a first chunk");
+
+    assert!(
+        production_outbox.contains("drain_receive_pack_requests_with"),
+        "drain seam `drain_receive_pack_requests_with` must exist; \
+         removing it forces a per-ref walk back into the drain"
+    );
+    assert!(
+        production_outbox.contains("apply_request_effects"),
+        "durable_outbox production code must define `apply_request_effects`; \
+         removing it splits the executor between live and recovery"
+    );
+
+    // The drain's per-request walker is wired to the executor.
+    // The closure body of `drain_receive_pack_requests_with` is the
+    // only call site — if a future change calls `derive_one`
+    // instead, this assertion fires.
+    let drain_seam_open = production_outbox
+        .find("pub async fn drain_receive_pack_requests_with<F, Fut>")
+        .expect("drain seam must be defined in the production half");
+    let drain_seam_close = production_outbox[drain_seam_open..]
+        .find("\n}\n")
+        .expect("drain seam body must close");
+    let drain_seam_body = &production_outbox[drain_seam_open..drain_seam_open + drain_seam_close];
+    assert!(
+        drain_seam_body.contains("apply_request_effects"),
+        "drain_receive_pack_requests_with must call apply_request_effects; \
+         wiring it to a per-ref helper reintroduces the v29 walk"
+    );
+
+    // The deleted per-ref drain must have zero call sites in the
+    // production half. A regression that re-adds a caller would
+    // bring back the per-ref fan-out.
+    assert!(
+        !production_outbox.contains("drain_pending_ref_transitions_all("),
+        "deleted `drain_pending_ref_transitions_all` must have zero production call sites; \
+         a per-ref walk is reintroduced"
+    );
+    assert!(
+        !production_outbox.contains("derive_one("),
+        "deleted `derive_one` must have zero production call sites; \
+         the per-ref fan-out is reintroduced"
+    );
+    assert!(
+        !production_outbox.contains("lookup_accepted_ordinal("),
+        "deleted `lookup_accepted_ordinal` must have zero production call sites; \
+         the per-ref ordinal lookup is reintroduced"
+    );
+    assert!(
+        !production_repos.contains("derive_one("),
+        "deleted `derive_one` must have zero live-handler call sites"
+    );
+    assert!(
+        !production_repos.contains("drain_pending_ref_transitions"),
+        "deleted per-ref drain functions must have zero live-handler call sites"
     );
 }

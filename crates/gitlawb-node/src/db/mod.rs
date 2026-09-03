@@ -2979,11 +2979,9 @@ impl Db {
     }
 
     /// Read a single `receive_pack_requests` row by id. Used by
-    /// `durable_outbox::derive_one` to look up the request's
-    /// `accepted_ordinal` so the push-event identity is anchored to
-    /// the request rather than the per-ref `first_ref_name` rewrite
-    /// the v30 migration dropped.
-    #[allow(dead_code)] // step-3 drain-side caller; round-trip test pins the contract
+    /// `durable_outbox::apply_request_effects` to load the
+    /// request's state, `accepted_ordinal`, and parsed report
+    /// before re-deriving per-ref artifacts.
     pub async fn get_receive_pack_request(
         &self,
         request_id: &str,
@@ -3056,10 +3054,7 @@ impl Db {
 
     /// `outcomes_committed → effects_pending`. Step 3's effect
     /// executor calls this when the drain picked up a request and
-    /// scheduled a retry. Step 2 introduces the helper but does
-    /// not call it; the contract is pinned by the step-3 tests
-    /// that will land in the same series.
-    #[allow(dead_code)] // step 3 owns the call site
+    /// scheduled a retry.
     pub async fn mark_request_effects_pending(
         &self,
         request_id: &str,
@@ -3083,9 +3078,7 @@ impl Db {
     }
 
     /// `effects_pending → complete`. Step 3 calls this after a
-    /// successful effects run. Step 2 introduces the helper but
-    /// does not call it; the contract is pinned by step-3 tests.
-    #[allow(dead_code)] // step 3 owns the call site
+    /// successful effects run.
     pub async fn mark_request_complete(&self, request_id: &str) -> Result<u64> {
         let res = sqlx::query(
             r#"UPDATE receive_pack_requests
@@ -3104,10 +3097,7 @@ impl Db {
 
     /// Drain-side read. Returns every request whose state is
     /// `outcomes_committed` or `effects_pending` and whose
-    /// `next_attempt_at` is null or in the past. Step 3 owns the
-    /// call site; step 2 introduces the helper for the same
-    /// contract-pin reason as the state-flip helpers above.
-    #[allow(dead_code)] // step 3 owns the call site
+    /// `next_attempt_at` is null or in the past.
     pub async fn list_receive_pack_requests_due(
         &self,
         limit: i64,
@@ -3132,10 +3122,31 @@ impl Db {
         Ok(rows.into_iter().map(row_to_receive_pack_request).collect())
     }
 
-    /// Backoff helper for the step-3 effect executor. Step 2
-    /// introduces it but does not call it; the contract is pinned
-    /// by step-3 tests.
-    #[allow(dead_code)] // step 3 owns the call site
+    /// Residual-backlog check for the per-request drain. Returns
+    /// the count of requests in `outcomes_committed` or
+    /// `effects_pending` with a due `next_attempt_at`. The drain's
+    /// `drain_receive_pack_requests_all` uses this after the
+    /// residual pass to decide whether to log a warning.
+    pub async fn count_receive_pack_requests_due(&self) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as(
+            r#"SELECT COUNT(*)::BIGINT FROM receive_pack_requests
+               WHERE state IN ($1, $2)
+                 AND (next_attempt_at IS NULL OR next_attempt_at < $3)"#,
+        )
+        .bind(request_state::OUTCOMES_COMMITTED)
+        .bind(request_state::EFFECTS_PENDING)
+        .bind(Utc::now().to_rfc3339())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    /// Backoff helper for the step-3 effect executor. Step 3
+    /// introduces the helper but does not call it; a future
+    /// refinement (per-attempt exponential backoff) will land the
+    /// call site. Pinning the contract here means the helper cannot
+    /// drift away from what the next slice will use.
+    #[allow(dead_code)] // call site lands in a follow-up; the helper signature is pinned here
     pub async fn update_request_attempt(
         &self,
         request_id: &str,
@@ -3523,6 +3534,34 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected())
+    }
+
+    /// Return every child of `request_id` in ordinal order. The step-3
+    /// effect executor calls this after loading the request row to
+    /// re-derive the per-ref cert and anchor writes. The accepted
+    /// child is the one whose `ref_name` is in the parsed report's
+    /// ok set; the executor re-derives that set from
+    /// `req.parsed_report`, so this helper returns the full ordered
+    /// list and lets the caller filter.
+    pub async fn list_pending_ref_transitions_for_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<PendingRefTransition>> {
+        let rows = sqlx::query(
+            r#"SELECT id, request_id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did,
+                       signature_header, signature_input, content_digest, state, created_at,
+                       applied_at, cancelled_at, ordinal, git_target_kind
+               FROM pending_ref_transitions
+               WHERE request_id = $1
+               ORDER BY ordinal ASC, id ASC"#,
+        )
+        .bind(request_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(row_to_pending_ref_transition)
+            .collect())
     }
 
     /// Flip every `prepared` row attached to `request_id` to `uncertain`.

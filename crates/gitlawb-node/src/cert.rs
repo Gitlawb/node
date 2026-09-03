@@ -45,6 +45,7 @@ use crate::state::AppState;
 ///   only updates other fields when `issued_at` is strictly newer)
 ///   is a no-op for an equal-`issued_at` re-run and a refresh for
 ///   a strictly-newer one.
+#[allow(dead_code)] // round-trip test in db/mod.rs pins the upsert contract; the live path and the drain use issue_ref_certificate_with_issued_at
 pub async fn issue_ref_certificate(
     state: &AppState,
     repo_id: &str,
