@@ -448,7 +448,19 @@ pub async fn pin_new_objects(
                 // future is cancelled. The warn names the arm through the error's own
                 // Display and the site keeps its existing behavior: the pair is still
                 // returned, and the row may or may not exist.
-                if let Err(e) = crate::ipfs_pin::db_bounded(
+                // Round 10 P2: a closed/failed DB write means the
+                // (sha, cid) pair is not durable; we suppress the
+                // `pinned.push` for this sha so the reconcile cannot
+                // count a Pinata gap as filled when no row exists.
+                // The autocommit timeout case (the `BoundedDbError`
+                // other than `Elapsed`) is genuinely unknown, so we
+                // keep the previous single-statement reasoning and
+                // push in that case. The source-record failure arms
+                // are also a hard failure (multi-statement
+                // transaction never committed) and suppress the push
+                // in the same way.
+                let mut db_record_durable = false;
+                match crate::ipfs_pin::db_bounded(
                     crate::ipfs_pin::db_record_deadline(deadline),
                     crate::ipfs_pin::retry_db_record(|| {
                         // P2 (reviewer round 9): Pinata's POST is
@@ -464,7 +476,27 @@ pub async fn pin_new_objects(
                 )
                 .await
                 {
-                    tracing::warn!(sha = %sha, err = %e, "failed to record pinata_cid in DB");
+                    Ok(()) => db_record_durable = true,
+                    Err(crate::ipfs_pin::BoundedDbError::Elapsed) => {
+                        // Autocommit: statement may have committed.
+                        // Treat as unknown-but-persisted, keep the
+                        // old behavior (push the pair).
+                        tracing::warn!(
+                            sha = %sha,
+                            "record_pinata_cid deadline elapsed for autocommit upsert; \
+                             the row may or may not exist (the previous comment's reasoning)"
+                        );
+                        db_record_durable = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            sha = %sha,
+                            err = %e,
+                            "failed to record pinata_cid in DB; suppressing the (sha, cid) push \
+                             so the reconcile cannot count this gap as filled"
+                        );
+                        // db_record_durable stays false → push suppressed
+                    }
                 }
                 // F1 (#173 round 8): also record the first pinner in pin_repo_sources.
                 // U3: an exhausted retry marks the set incomplete so the resolver keeps
@@ -480,9 +512,9 @@ pub async fn pin_new_objects(
                     // wraps `record_pin_source`, an explicit transaction, so a timed-out
                     // call definitely never committed and the source is definitely
                     // missing. Mark the set incomplete rather than leaving it incomplete
-                    // and unmarked. Note the contrast with `record_pinata_cid` a few
-                    // lines up: that one is a single autocommit statement, so its
-                    // timeout genuinely is an unknown outcome and it is warn-only.
+                    // and unmarked. Round 10 P2: also suppress the (sha, cid) push
+                    // because the durable record set is now incomplete; the next pass
+                    // re-offers the gap.
                     Err(e @ crate::ipfs_pin::BoundedDbError::Elapsed) => {
                         tracing::warn!(
                             sha = %sha,
@@ -499,6 +531,7 @@ pub async fn pin_new_objects(
                         {
                             tracing::warn!(sha = %sha, err = %e, "failed to mark pin sources incomplete");
                         }
+                        db_record_durable = false;
                     }
                     Err(e) => {
                         tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
@@ -510,9 +543,12 @@ pub async fn pin_new_objects(
                         {
                             tracing::warn!(sha = %sha, err = %e, "failed to mark pin sources incomplete");
                         }
+                        db_record_durable = false;
                     }
                 }
-                pinned.push((sha, cid));
+                if db_record_durable {
+                    pinned.push((sha, cid));
+                }
             }
             Ok(_) => {}
             Err(e) => {
