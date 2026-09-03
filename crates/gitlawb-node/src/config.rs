@@ -729,6 +729,19 @@ pub struct Config {
         value_parser = clap::builder::RangedU64ValueParser::<i64>::new().range(1..=100_000)
     )]
     pub queue_purge_batch: i64,
+
+    /// #26 Split PR 1 step 5 — effects-executor retry bound. The
+    /// drain flips a request to `quarantined` after this many
+    /// `EffectsOutcome::Retry` returns, closing the
+    /// infinite-retry DoS window. Default 8 matches the spec; set
+    /// lower in tests.
+    #[arg(
+        long,
+        env = "GITLAWB_EFFECTS_MAX_ATTEMPTS",
+        default_value_t = 8,
+        value_parser = clap::builder::RangedU64ValueParser::<i32>::new().range(1..=1000)
+    )]
+    pub effects_max_attempts: i32,
 }
 
 impl Config {

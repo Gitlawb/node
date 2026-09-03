@@ -317,6 +317,16 @@ pub mod request_state {
     /// reconcile step (the children remain in `prepared`).
     #[allow(dead_code)]
     pub const REJECTED_AT_GIT: &str = "rejected_at_git";
+    /// Operator-attended terminal state. The reconcile gates on
+    /// the git-side marker (see `durable_outbox::reconcile_prepared_page`)
+    /// and quarantines the request if the marker is missing or
+    /// hash-mismatched. The drain's `effects_max_attempts` bound
+    /// also flips retry-stuck requests here. No auto-recovery; an
+    /// operator inspects and reclassifies to `complete` or
+    /// `rejected_at_git` after manual inspection. Never purged
+    /// by the step-4 bounded retirement policy.
+    #[allow(dead_code)]
+    pub const QUARANTINED: &str = "quarantined";
 }
 
 /// SHA-256 hex of an arbitrary tuple, used as the deterministic id for the
@@ -1564,6 +1574,27 @@ const MIGRATIONS: &[Migration] = &[
             // column` form leaves a discoverable note for anyone
             // reading the schema in psql.
             "COMMENT ON COLUMN pending_ref_transitions.ordinal IS 'v30: ordinal position in the parsed ref_updates list, 0-indexed. The drain and the effect executor read in ORDER BY request_id, ordinal to reproduce the live path'",
+        ],
+    },
+    Migration {
+        // #26 Split PR 1 — step 5. The `quarantined` state is the
+        // operator-attended terminal state for requests whose
+        // git-side marker is missing or hash-mismatched (or whose
+        // attempt_count exceeds the configured bound). The schema
+        // does not need a CHECK constraint change because the
+        // `state` column is TEXT; this migration is a comment +
+        // index.
+        version: 31,
+        name: "receive_pack_requests_quarantined",
+        stmts: &[
+            // Operator-attended state. Pinned in a comment so a
+            // reader of the schema in psql finds the convention.
+            "COMMENT ON TABLE receive_pack_requests IS 'v31: added quarantined state for marker-mismatch / reflog-ambiguity / max-attempts; operator reclassifies to complete or rejected_at_git'",
+            // Operator queries (e.g. `SELECT … WHERE state =
+            // 'quarantined' ORDER BY created_at`) need an index. A
+            // partial index on a low-cardinality state column is
+            // small and cheap.
+            "CREATE INDEX IF NOT EXISTS idx_receive_pack_requests_quarantined ON receive_pack_requests (created_at) WHERE state = 'quarantined'",
         ],
     },
 ];
@@ -3050,6 +3081,89 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected())
+    }
+
+    /// #26 Split PR 1 step 5 — flip any non-terminal state to
+    /// `quarantined`. The reconcile calls this when the marker
+    /// ref is missing or hash-mismatched; the drain's
+    /// `effects_max_attempts` bound calls this when a request
+    /// has been retry-stuck for too long. Operator-attended: the
+    /// drain never picks up `quarantined` rows.
+    ///
+    /// The state gate is intentionally permissive: any non-terminal
+    /// state can be quarantined. The caller decides which state
+    /// the row was in before the flip.
+    pub async fn mark_request_quarantined(&self, request_id: &str, reason: &str) -> Result<u64> {
+        let res = sqlx::query(
+            r#"UPDATE receive_pack_requests
+               SET state = $2, last_error = $3, completed_at = $4
+               WHERE id = $1
+                 AND state IN ($5, $6, $7, $8)"#,
+        )
+        .bind(request_id)
+        .bind(request_state::QUARANTINED)
+        .bind(reason)
+        .bind(Utc::now().to_rfc3339())
+        .bind(request_state::RECEIVED)
+        .bind(request_state::OUTCOMES_COMMITTED)
+        .bind(request_state::EFFECTS_PENDING)
+        .bind(request_state::REJECTED_AT_GIT)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// #26 Split PR 1 step 5 — when a request moves to
+    /// `quarantined`, its `prepared` children are reclassified to
+    /// `cancelled` so the drain's residual scan doesn't keep
+    /// picking them up. The `cancelled_at` is stamped at the
+    /// parent's quarantine time so a future operator reclassifying
+    /// the parent can recover the timing.
+    pub async fn mark_children_rejected_for_quarantined_parent(
+        &self,
+        request_id: &str,
+    ) -> Result<u64> {
+        let now = Utc::now().to_rfc3339();
+        let res = sqlx::query(
+            r#"UPDATE pending_ref_transitions
+               SET state = $2, cancelled_at = $3
+               WHERE request_id = $1 AND state = $4"#,
+        )
+        .bind(request_id)
+        .bind(pending_state::CANCELLED)
+        .bind(&now)
+        .bind(pending_state::PREPARED)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// #26 Split PR 1 step 5 — batch-load receive_pack_requests by
+    /// id. The reconcile calls this once per page to avoid N+1
+    /// queries when the marker gate checks every row's parent
+    /// request. Returns a HashMap so the per-row check is a
+    /// O(1) lookup.
+    pub async fn get_receive_pack_requests_by_ids(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, ReceivePackRequest>> {
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let rows = sqlx::query(
+            r#"SELECT id, repo_id, pusher_did, node_did, request_bytes, request_bytes_hash,
+                       state, git_exit_ok, parsed_report, accepted_ordinal, attempt_count,
+                       last_error, next_attempt_at, created_at, completed_at
+               FROM receive_pack_requests WHERE id = ANY($1)"#,
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(row_to_receive_pack_request)
+            .map(|r| (r.id.clone(), r))
+            .collect())
     }
 
     /// `outcomes_committed → effects_pending`. Step 3's effect

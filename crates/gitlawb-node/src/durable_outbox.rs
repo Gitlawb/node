@@ -134,6 +134,21 @@ async fn reconcile_prepared_page(
     if rows.is_empty() {
         return Ok((0, None));
     }
+    // #26 Split PR 1 step 5 — load the parent request rows once
+    // per page so the marker gate (per-row, O(1) lookup) doesn't
+    // N+1 the DB. Distinct request ids; the HashMap omits requests
+    // that have been purged by the step-4 bounded retirement or
+    // are missing for any other reason.
+    let distinct_request_ids: Vec<String> = rows
+        .iter()
+        .map(|r| r.request_id.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let requests_by_id: std::collections::HashMap<String, crate::db::ReceivePackRequest> = state
+        .db
+        .get_receive_pack_requests_by_ids(&distinct_request_ids)
+        .await?;
     // Taken BEFORE any promotion, from the last row of the page as it
     // was READ: the walk advances over examined rows, not over promoted
     // ones. A short page means there is nothing behind it.
@@ -278,6 +293,74 @@ async fn reconcile_prepared_page(
                     "reconcile: the ref sits at the row's new_sha but no reflog entry proves THIS \
                      transition landed (a coincidental tip, or a repo without \
                      core.logAllRefUpdates); staying prepared (human-attended recovery)"
+                );
+                continue;
+            }
+            // #26 Split PR 1 step 5 — the marker gate. Reads
+            // `refs/gitlawb/requests/<request_id>` and compares its
+            // value to the request's `request_bytes_hash`. A
+            // missing or mismatched marker quarantines the
+            // request; the row stays `prepared` (operator-attended,
+            // not auto-promoted).
+            let request = match requests_by_id.get(&row.request_id) {
+                Some(r) => r,
+                None => {
+                    // Parent missing (purged or never written).
+                    // Skip; the row stays prepared.
+                    continue;
+                }
+            };
+            let marker_ref = format!("refs/gitlawb/requests/{}", row.request_id);
+            let marker_ok = match crate::git::store::read_ref(disk_path, &marker_ref) {
+                Ok(Some(value)) => match crate::git::store::marker_value_for(
+                    disk_path,
+                    &request.request_bytes_hash,
+                ) {
+                    Ok(expected) => value == expected,
+                    Err(e) => {
+                        tracing::warn!(
+                            err = %e,
+                            request_id = %row.request_id,
+                            "reconcile: marker_value_for failed; staying prepared"
+                        );
+                        false
+                    }
+                },
+                Ok(None) => false,
+                Err(e) => {
+                    tracing::warn!(
+                        err = %e,
+                        request_id = %row.request_id,
+                        "reconcile: marker read failed; staying prepared"
+                    );
+                    false
+                }
+            };
+            if !marker_ok {
+                let reason = match crate::git::store::read_ref(disk_path, &marker_ref) {
+                    Ok(Some(_)) => "marker hash mismatch",
+                    _ => "missing marker ref",
+                };
+                if let Err(e) = state
+                    .db
+                    .mark_request_quarantined(&row.request_id, reason)
+                    .await
+                {
+                    tracing::warn!(
+                        err = %e,
+                        request_id = %row.request_id,
+                        "reconcile: mark_request_quarantined failed"
+                    );
+                    continue;
+                }
+                let _ = state
+                    .db
+                    .mark_children_rejected_for_quarantined_parent(&row.request_id)
+                    .await;
+                tracing::warn!(
+                    request_id = %row.request_id,
+                    ref_name = %row.ref_name,
+                    "reconcile: marker gate failed; request quarantined"
                 );
                 continue;
             }
@@ -510,7 +593,49 @@ where
             Ok(EffectsOutcome::Retry { last_error }) => {
                 let next_attempt_at =
                     (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
-                if let Err(e) = state
+                // #26 Split PR 1 step 5 — the bound check. After
+                // this retry, the request's `attempt_count` will
+                // become `current + 1` (the helper increments).
+                // If that exceeds `effects_max_attempts`, the
+                // request goes to `quarantined` instead of
+                // `effects_pending` to close the infinite-retry
+                // DoS window.
+                let bound = state.config.effects_max_attempts;
+                let over_bound = match state.db.get_receive_pack_request(&request_id).await {
+                    Ok(Some(r)) => r.attempt_count + 1 > bound,
+                    Ok(None) => {
+                        // Row missing — the next startup's purge
+                        // will sweep up. Treat as over-bound so
+                        // the drain moves on.
+                        true
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            err = %e,
+                            request_id = %request_id,
+                            "drain: bound-check get_receive_pack_request failed; proceeding with retry"
+                        );
+                        false
+                    }
+                };
+                if over_bound {
+                    if let Err(e) = state
+                        .db
+                        .mark_request_quarantined(&request_id, &last_error)
+                        .await
+                    {
+                        tracing::warn!(
+                            err = %e,
+                            request_id = %request_id,
+                            "drain: mark_request_quarantined failed; will retry next startup"
+                        );
+                    } else {
+                        let _ = state
+                            .db
+                            .mark_children_rejected_for_quarantined_parent(&request_id)
+                            .await;
+                    }
+                } else if let Err(e) = state
                     .db
                     .mark_request_effects_pending(&request_id, &next_attempt_at, &last_error)
                     .await
@@ -919,6 +1044,7 @@ mod drain_tests {
     use crate::db::Db;
     use crate::db::PendingRefTransition;
     use chrono::Utc;
+    use std::path::Path;
 
     async fn _db(pool: sqlx::PgPool) -> Db {
         let db = Db::for_testing(pool);
@@ -1072,6 +1198,78 @@ mod drain_tests {
                 "ok": ok,
             })).collect::<Vec<_>>(),
         })
+    }
+
+    /// #26 Split PR 1 step 5 — write the per-request marker ref via
+    /// `git update-ref`. The marker's value is the 40-char SHA-1 hex
+    /// of a blob whose bytes are the first 20 bytes of the request's
+    /// `request_bytes_hash` (32-byte SHA-256). `git update-ref`
+    /// rejects arbitrary 64-char hex and only accepts 40-char SHA-1
+    /// that resolves to an existing object; `marker_value_for` does
+    /// the `hash-object -w` half so the value is content-addressed.
+    /// The reconcile's `read_ref` reads it back and compares hex
+    /// strings via the same helper.
+    ///
+    /// The live handler in `api/repos.rs` follows the same scheme.
+    ///
+    /// Tests that intentionally exercise the missing-marker path skip
+    /// this helper.
+    async fn stage_marker(repo_path: &Path, request_id: &str, request_bytes_hash: &[u8]) {
+        let marker_ref = format!("refs/gitlawb/requests/{request_id}");
+        let marker_value = crate::git::store::marker_value_for(repo_path, request_bytes_hash)
+            .expect("marker_value_for");
+        let out = tokio::process::Command::new("git")
+            .args(["update-ref", &marker_ref, &marker_value])
+            .arg("--no-deref")
+            .current_dir(repo_path)
+            .output()
+            .await
+            .expect("git update-ref");
+        assert!(
+            out.status.success(),
+            "git update-ref for marker failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// #26 Split PR 1 step 5 — the marker gate's positive path
+    /// requires both a parent `receive_pack_requests` row AND a
+    /// matching marker ref on disk. Insert the parent row in
+    /// `received` state with the given hash (so the reconcile's
+    /// `get_receive_pack_requests_by_ids` lookup hits and the gate
+    /// has something to verify). Tests call `stage_marker` after
+    /// this to write the matching ref.
+    async fn seed_parent_request(
+        db: &Db,
+        request_id: &str,
+        repo_id: &str,
+        request_bytes_hash: Vec<u8>,
+    ) {
+        sqlx::query(
+            r#"INSERT INTO receive_pack_requests
+               (id, repo_id, pusher_did, node_did, request_bytes, request_bytes_hash,
+                state, git_exit_ok, parsed_report, accepted_ordinal, attempt_count,
+                last_error, next_attempt_at, created_at, completed_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"#,
+        )
+        .bind(request_id)
+        .bind(repo_id)
+        .bind("did:key:z6pusher")
+        .bind("did:key:z6node")
+        .bind(Vec::<u8>::new())
+        .bind(&request_bytes_hash)
+        .bind(crate::db::request_state::RECEIVED)
+        .bind(Option::<bool>::None)
+        .bind(Option::<serde_json::Value>::None)
+        .bind(Option::<i32>::None)
+        .bind(0_i32)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Utc::now().to_rfc3339())
+        .bind(Option::<String>::None)
+        .execute(db.pool())
+        .await
+        .expect("seed parent receive_pack_requests row");
     }
 
     /// The reviewer's proof at the durable-outbox layer. Stage a
@@ -1402,6 +1600,12 @@ mod drain_tests {
         let mut row = make_row(&repo_id, "refs/heads/main", &"0".repeat(40), &on_disk_sha);
         row.state = pending_state::PREPARED.to_string();
         row.applied_at = None;
+        // #26 Split PR 1 step 5 — the reconcile's marker gate requires
+        // both a parent `receive_pack_requests` row AND a matching
+        // marker ref on disk. Seed the parent (so the gate has
+        // something to verify) and write the matching marker.
+        seed_parent_request(&state.db, &row.request_id, &repo_id, vec![0xab; 32]).await;
+        stage_marker(&bare, &row.request_id, &[0xab; 32]).await;
         state
             .db
             .insert_pending_ref_transition_for_test(&row)
@@ -1569,6 +1773,9 @@ mod drain_tests {
         let mut row = make_row(&repo_id, "refs/heads/main", &"0".repeat(40), &on_disk_sha);
         row.state = pending_state::PREPARED.to_string();
         row.applied_at = None;
+        // #26 Split PR 1 step 5 — seed parent + marker for the gate.
+        seed_parent_request(&state.db, &row.request_id, &repo_id, vec![0xcd; 32]).await;
+        stage_marker(&bare, &row.request_id, &[0xcd; 32]).await;
         state
             .db
             .insert_pending_ref_transition_for_test(&row)
@@ -1698,6 +1905,9 @@ mod drain_tests {
         let mut row = make_row(&repo_id, "refs/heads/main", &"0".repeat(40), &on_disk_sha);
         row.state = pending_state::PREPARED.to_string();
         row.applied_at = None;
+        // #26 Split PR 1 step 5 — seed parent + marker for the gate.
+        seed_parent_request(&state.db, &row.request_id, &repo_id, vec![0x11; 32]).await;
+        stage_marker(&bare, &row.request_id, &[0x11; 32]).await;
         state
             .db
             .insert_pending_ref_transition_for_test(&row)
@@ -1786,6 +1996,9 @@ mod drain_tests {
         let mut row = make_row(&repo_id, "refs/heads/main", &"0".repeat(40), &on_disk_sha);
         row.state = pending_state::PREPARED.to_string();
         row.applied_at = None;
+        // #26 Split PR 1 step 5 — seed parent + marker for the gate.
+        seed_parent_request(&state.db, &row.request_id, &repo_id, vec![0x22; 32]).await;
+        stage_marker(&bare, &row.request_id, &[0x22; 32]).await;
         state
             .db
             .insert_pending_ref_transition_for_test(&row)
@@ -1920,6 +2133,9 @@ mod drain_tests {
         let mut row = make_row(&repo_id, "refs/heads/doomed", &doomed_sha, ZERO_SHA);
         row.state = pending_state::PREPARED.to_string();
         row.applied_at = None;
+        // #26 Split PR 1 step 5 — seed parent + marker for the gate.
+        seed_parent_request(&state.db, &row.request_id, &repo_id, vec![0x33; 32]).await;
+        stage_marker(&bare, &row.request_id, &[0x33; 32]).await;
         state
             .db
             .insert_pending_ref_transition_for_test(&row)
@@ -1973,6 +2189,9 @@ mod drain_tests {
                 &row.old_sha,
                 &row.new_sha,
             ]);
+            // #26 Split PR 1 step 5 — seed parent + marker for the gate.
+            seed_parent_request(&state.db, &row.request_id, &repo_id, vec![0x44; 32]).await;
+            stage_marker(&bare, &row.request_id, &[0x44; 32]).await;
             state
                 .db
                 .insert_pending_ref_transition_for_test(&row)
@@ -2044,6 +2263,9 @@ mod drain_tests {
         good.state = pending_state::PREPARED.to_string();
         good.applied_at = None;
         good.id = crate::db::deterministic_id(&["pending_ref_transition", "req-good"]);
+        // #26 Split PR 1 step 5 — seed parent + marker for the gate.
+        seed_parent_request(&state.db, &good.request_id, &repo_id, vec![0x55; 32]).await;
+        stage_marker(&bare, &good.request_id, &[0x55; 32]).await;
         state
             .db
             .insert_pending_ref_transition_for_test(&good)
@@ -3020,5 +3242,434 @@ mod drain_tests {
 
         let after = db.get_receive_pack_request("r-now").await.unwrap();
         assert!(after.is_some(), "r-now must survive the 7-day window");
+    }
+
+    // ----- #26 Split PR 1 step 5 — failure-matrix tests -----
+    //
+    // The mark gate (`reconcile_prepared_page`'s third barrier)
+    // quarantines a request whose on-disk marker is missing or
+    // hash-mismatched, and the drain's `effects_max_attempts`
+    // bound quarantines a request that retries past the bound.
+    // These tests pin each cell of that matrix.
+
+    /// The marker is absent (the live handler never wrote it, or a
+    /// cleanup ran): reconcile quarantines the request and cancels
+    /// the child. The `reconcile_prepared_from_disk` return value
+    /// is the count of PROMOTED rows, so an absent marker means
+    /// the row is not promoted (the gate quarantined the parent
+    /// before the child could reach `applied`).
+    #[sqlx::test]
+    async fn cell_marker_missing_quarantines_request(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        crate::git::store::init_bare(&bare).expect("init_bare");
+        let on_disk_sha = seed_ref_on_bare(&bare, "refs/heads/main");
+
+        let repo_id = seed_repo_row(&state, bare.to_str().unwrap()).await;
+        // Seed the parent receive_pack_requests row WITHOUT calling
+        // stage_marker — that's the "missing" half of this cell.
+        seed_parent_request(&state.db, "req-marker-missing", &repo_id, vec![0xa1; 32]).await;
+        let mut row = make_row(&repo_id, "refs/heads/main", &"0".repeat(40), &on_disk_sha);
+        row.request_id = "req-marker-missing".to_string();
+        row.state = pending_state::PREPARED.to_string();
+        row.applied_at = None;
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row)
+            .await
+            .unwrap();
+
+        let n = reconcile_prepared_from_disk(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "no row promoted when the marker is missing");
+
+        // Parent quarantined.
+        let parent = state
+            .db
+            .get_receive_pack_request("req-marker-missing")
+            .await
+            .unwrap()
+            .expect("parent row exists");
+        assert_eq!(
+            parent.state,
+            request_state::QUARANTINED,
+            "missing marker quarantines the request"
+        );
+
+        // Child cancelled.
+        let child = state
+            .db
+            .list_pending_ref_transitions_for_request("req-marker-missing")
+            .await
+            .unwrap();
+        assert_eq!(child.len(), 1, "the child exists");
+        assert_eq!(
+            child[0].state,
+            pending_state::CANCELLED,
+            "missing marker cancels the child"
+        );
+        assert!(child[0].cancelled_at.is_some(), "cancelled_at is stamped");
+    }
+
+    /// The marker is present but the value mismatches the parent's
+    /// `request_bytes_hash`. Reconcile quarantines the request and
+    /// stamps `last_error` with the mismatch reason.
+    #[sqlx::test]
+    async fn cell_marker_hash_mismatch_quarantines_request(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        crate::git::store::init_bare(&bare).expect("init_bare");
+        let on_disk_sha = seed_ref_on_bare(&bare, "refs/heads/main");
+
+        let repo_id = seed_repo_row(&state, bare.to_str().unwrap()).await;
+        seed_parent_request(&state.db, "req-marker-mismatch", &repo_id, vec![0xa2; 32]).await;
+        // Stage a marker with a WRONG hex — all zeros — that does
+        // not match the parent's hash. The reconcile's read_ref
+        // comparison will see the mismatch and quarantine.
+        stage_marker(&bare, "req-marker-mismatch", &[0x00; 32]).await;
+
+        let mut row = make_row(&repo_id, "refs/heads/main", &"0".repeat(40), &on_disk_sha);
+        row.request_id = "req-marker-mismatch".to_string();
+        row.state = pending_state::PREPARED.to_string();
+        row.applied_at = None;
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row)
+            .await
+            .unwrap();
+
+        let n = reconcile_prepared_from_disk(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "no row promoted when the marker mismatches");
+
+        let parent = state
+            .db
+            .get_receive_pack_request("req-marker-mismatch")
+            .await
+            .unwrap()
+            .expect("parent row exists");
+        assert_eq!(
+            parent.state,
+            request_state::QUARANTINED,
+            "mismatched marker quarantines the request"
+        );
+        assert_eq!(
+            parent.last_error.as_deref(),
+            Some("marker hash mismatch"),
+            "last_error names the mismatch reason"
+        );
+    }
+
+    /// Happy path: marker is present and the value matches the
+    /// parent's `request_bytes_hash`. The row promotes to
+    /// `applied`; the parent stays in its current state (the
+    /// handler flips it later, after `outcomes_committed` writes).
+    #[sqlx::test]
+    async fn cell_marker_present_promotes_request(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        crate::git::store::init_bare(&bare).expect("init_bare");
+        let on_disk_sha = seed_ref_on_bare(&bare, "refs/heads/main");
+
+        let repo_id = seed_repo_row(&state, bare.to_str().unwrap()).await;
+        seed_parent_request(&state.db, "req-marker-ok", &repo_id, vec![0xa3; 32]).await;
+        stage_marker(&bare, "req-marker-ok", &[0xa3; 32]).await;
+
+        let mut row = make_row(&repo_id, "refs/heads/main", &"0".repeat(40), &on_disk_sha);
+        row.request_id = "req-marker-ok".to_string();
+        row.state = pending_state::PREPARED.to_string();
+        row.applied_at = None;
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row)
+            .await
+            .unwrap();
+
+        let n = reconcile_prepared_from_disk(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "marker ok: row is promoted to applied");
+
+        let applied = state
+            .db
+            .list_pending_ref_transitions_applied(100)
+            .await
+            .unwrap();
+        assert_eq!(applied.len(), 1, "the row is in applied");
+        assert_eq!(applied[0].id, row.id);
+
+        // The parent is NOT touched by the reconcile (it stays in
+        // `received` for the live handler to flip later).
+        let parent = state
+            .db
+            .get_receive_pack_request("req-marker-ok")
+            .await
+            .unwrap()
+            .expect("parent row exists");
+        assert_eq!(
+            parent.state,
+            request_state::RECEIVED,
+            "reconcile leaves the parent in its current state"
+        );
+    }
+
+    /// Drain's `EffectsOutcome::Retry` arm flips to `quarantined`
+    /// once `attempt_count + 1 > effects_max_attempts`. With bound
+    /// = 2 and `attempt_count` = 2, the next retry puts the row
+    /// over the bound.
+    #[sqlx::test]
+    async fn cell_retry_stuck_request_goes_to_quarantined(pool: sqlx::PgPool) {
+        // Lower the bound so the test exercises the over-bound path.
+        // `test_state_with` builds the AppState with a clone of the
+        // config so the test can pin the bound rather than rely on the
+        // default.
+        let state = crate::test_support::test_state_with(pool, |cfg| {
+            cfg.effects_max_attempts = 2;
+        })
+        .await;
+
+        // Stage a request in `effects_pending` with attempt_count = 2.
+        // The drain will pick it up via list_receive_pack_requests_due,
+        // run the closure (returning Retry), then check the bound.
+        let request_id = "req-retry-stuck";
+        let repo_id = "repo-retry-stuck";
+        sqlx::query(
+            r#"INSERT INTO receive_pack_requests
+               (id, repo_id, pusher_did, node_did, request_bytes, request_bytes_hash,
+                state, git_exit_ok, parsed_report, accepted_ordinal, attempt_count,
+                last_error, next_attempt_at, created_at, completed_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"#,
+        )
+        .bind(request_id)
+        .bind(repo_id)
+        .bind("did:key:z6pusher")
+        .bind("did:key:z6node")
+        .bind(Vec::<u8>::new())
+        .bind(vec![0u8; 32])
+        .bind(request_state::EFFECTS_PENDING)
+        .bind(Some(true))
+        .bind(Some(
+            serde_json::json!({"unpack_ok": true, "ref_results": []}),
+        ))
+        .bind(Some(0_i32))
+        .bind(2_i32)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Utc::now().to_rfc3339())
+        .bind(Option::<String>::None)
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+
+        // Add a child row (the drain's quarantine path also flips the
+        // child to `cancelled`).
+        let mut child_row = make_row(repo_id, "refs/heads/main", &"0".repeat(40), &"a".repeat(40));
+        child_row.request_id = request_id.to_string();
+        child_row.state = pending_state::PREPARED.to_string();
+        child_row.applied_at = None;
+        child_row.id = crate::db::deterministic_id(&[
+            "pending_ref_transition",
+            request_id,
+            repo_id,
+            &child_row.ref_name,
+            &child_row.old_sha,
+            &child_row.new_sha,
+        ]);
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&child_row)
+            .await
+            .unwrap();
+
+        // The drain closure returns Retry unconditionally. Bound = 2,
+        // attempt_count = 2 → 2 + 1 = 3 > 2 → quarantined.
+        let state_for_closure = state.clone();
+        let (processed, examined) =
+            drain_receive_pack_requests_with(state.clone(), 100, move |_s, req_id| {
+                let st = state_for_closure.clone();
+                async move {
+                    if req_id == request_id {
+                        Ok(EffectsOutcome::Retry {
+                            last_error: "injected retry-stuck".to_string(),
+                        })
+                    } else {
+                        apply_request_effects(&st, &req_id).await
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(processed, 0, "Retry over-bound does not count as Done");
+        assert_eq!(examined, 1, "the loop examined the request");
+
+        let after = state
+            .db
+            .get_receive_pack_request(request_id)
+            .await
+            .unwrap()
+            .expect("request row exists");
+        assert_eq!(
+            after.state,
+            request_state::QUARANTINED,
+            "over-bound Retry quarantines the request"
+        );
+        assert_eq!(
+            after.last_error.as_deref(),
+            Some("injected retry-stuck"),
+            "last_error carries the Retry reason"
+        );
+
+        let child = state
+            .db
+            .list_pending_ref_transitions_for_request(request_id)
+            .await
+            .unwrap();
+        assert_eq!(child.len(), 1);
+        assert_eq!(
+            child[0].state,
+            pending_state::CANCELLED,
+            "quarantined parent cancels the child"
+        );
+    }
+
+    /// Under-bound Retry stays in `effects_pending`. With bound = 2
+    /// and `attempt_count` = 1, the next retry puts the row at
+    /// `2 + 1 = 3`? No — the helper increments AFTER its
+    /// `attempt_count + 1 > bound` check. The check sees
+    /// `1 + 1 = 2 > 2 == false`, so the request stays in
+    /// `effects_pending` with attempt_count = 2.
+    #[sqlx::test]
+    async fn cell_retry_under_bound_stays_in_effects_pending(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state_with(pool, |cfg| {
+            cfg.effects_max_attempts = 2;
+        })
+        .await;
+
+        let request_id = "req-retry-under";
+        let repo_id = "repo-retry-under";
+        // The drain's `mark_request_effects_pending` only flips from
+        // `outcomes_committed`, so the test starts in that state and
+        // picks `attempt_count = 1`. The under-bound Retry keeps the
+        // row in `effects_pending` and increments `attempt_count` to 2.
+        sqlx::query(
+            r#"INSERT INTO receive_pack_requests
+               (id, repo_id, pusher_did, node_did, request_bytes, request_bytes_hash,
+                state, git_exit_ok, parsed_report, accepted_ordinal, attempt_count,
+                last_error, next_attempt_at, created_at, completed_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"#,
+        )
+        .bind(request_id)
+        .bind(repo_id)
+        .bind("did:key:z6pusher")
+        .bind("did:key:z6node")
+        .bind(Vec::<u8>::new())
+        .bind(vec![0u8; 32])
+        .bind(request_state::OUTCOMES_COMMITTED)
+        .bind(Some(true))
+        .bind(Some(
+            serde_json::json!({"unpack_ok": true, "ref_results": []}),
+        ))
+        .bind(Some(0_i32))
+        .bind(1_i32)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Utc::now().to_rfc3339())
+        .bind(Option::<String>::None)
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+
+        let state_for_closure = state.clone();
+        let (processed, examined) =
+            drain_receive_pack_requests_with(state.clone(), 100, move |_s, req_id| {
+                let st = state_for_closure.clone();
+                async move {
+                    if req_id == request_id {
+                        Ok(EffectsOutcome::Retry {
+                            last_error: "under-bound".to_string(),
+                        })
+                    } else {
+                        apply_request_effects(&st, &req_id).await
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(processed, 0, "Retry under-bound does not count as Done");
+        assert_eq!(examined, 1, "the loop examined the request");
+
+        let after = state
+            .db
+            .get_receive_pack_request(request_id)
+            .await
+            .unwrap()
+            .expect("request row exists");
+        assert_eq!(
+            after.state,
+            request_state::EFFECTS_PENDING,
+            "under-bound Retry stays in effects_pending"
+        );
+        assert_eq!(
+            after.attempt_count, 2,
+            "attempt_count incremented by the under-bound Retry"
+        );
+    }
+
+    /// A child whose parent request has been PURGED (e.g. the
+    /// step-4 bounded retirement swept it) cannot be quarantined
+    /// because the parent is no longer in the table. The gate
+    /// logs a warning and the child stays `prepared`.
+    #[sqlx::test]
+    async fn cell_purged_request_orphans_children(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        crate::git::store::init_bare(&bare).expect("init_bare");
+        let on_disk_sha = seed_ref_on_bare(&bare, "refs/heads/main");
+
+        let repo_id = seed_repo_row(&state, bare.to_str().unwrap()).await;
+
+        // Insert the CHILD only — no parent receive_pack_requests
+        // row, modelling the "parent purged" case.
+        let mut row = make_row(&repo_id, "refs/heads/main", &"0".repeat(40), &on_disk_sha);
+        row.request_id = "req-purged-parent".to_string();
+        row.state = pending_state::PREPARED.to_string();
+        row.applied_at = None;
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row)
+            .await
+            .unwrap();
+
+        let n = reconcile_prepared_from_disk(state.clone(), 100)
+            .await
+            .unwrap();
+        // The parent-missing path skips — the row stays prepared
+        // because the reconcile's "if matches { ... } continue"
+        // short-circuits BEFORE promotion when the parent is gone.
+        assert_eq!(
+            n, 0,
+            "child stays prepared when its parent is purged (no parent to check)"
+        );
+        let still_prepared = state
+            .db
+            .list_pending_ref_transitions_prepared(100)
+            .await
+            .unwrap();
+        assert_eq!(still_prepared.len(), 1, "the child stays prepared");
+        assert_eq!(
+            still_prepared[0].state,
+            pending_state::PREPARED,
+            "no parent → no quarantine; the child waits for human-attended recovery"
+        );
     }
 }

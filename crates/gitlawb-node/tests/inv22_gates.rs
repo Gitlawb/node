@@ -712,3 +712,116 @@ fn inv26_step4_queue_lifecycle_purge_is_wired() {
         "Config must expose queue_purge_batch"
     );
 }
+
+/// #26 Split PR 1 step 5 — the marker gate and the retry-bound
+/// quarantine are wired end-to-end. A missing or hash-mismatched
+/// marker on disk quarantines the request; a Retry over the bound
+/// does too. This gate pins every load-bearing seam, against the
+/// production half of each file (the test modules name the same
+/// identifiers in their own harnesses).
+///
+/// Assertions:
+/// 1. `reconcile_prepared_page` calls `mark_request_quarantined`
+///    and `mark_children_rejected_for_quarantined_parent` on
+///    marker-gate failure.
+/// 2. The drain's `EffectsOutcome::Retry` arm checks
+///    `effects_max_attempts`.
+/// 3. `git::store::read_ref` exists in `git/store.rs`.
+/// 4. `db::mark_request_quarantined`,
+///    `db::mark_children_rejected_for_quarantined_parent`,
+///    `db::get_receive_pack_requests_by_ids`, and
+///    `db::request_state::QUARANTINED` all exist.
+/// 5. The handler writes the marker ref BEFORE calling
+///    `smart_http::receive_pack_raw` (the durability window).
+#[test]
+fn inv26_step5_marker_quarantine_and_bound_are_wired() {
+    let outbox = src("durable_outbox.rs");
+    let store = src("git/store.rs");
+    let db = src("db/mod.rs");
+    let repos = src("api/repos.rs");
+
+    // Split at the TEST MODULE for the production-only assertions.
+    let production_outbox = outbox
+        .split("\nmod drain_tests {")
+        .next()
+        .expect("split always yields a first chunk");
+    let production_repos = repos
+        .split("\nmod tests {")
+        .next()
+        .expect("split always yields a first chunk");
+
+    // (1) The reconcile's marker gate quarantines via the DB helpers.
+    assert!(
+        production_outbox.contains("mark_request_quarantined"),
+        "reconcile_prepared_page must call mark_request_quarantined on marker-gate failure"
+    );
+    assert!(
+        production_outbox.contains("mark_children_rejected_for_quarantined_parent"),
+        "reconcile_prepared_page must call mark_children_rejected_for_quarantined_parent \
+         so quarantined parents cancel their children"
+    );
+
+    // The gate reads the marker ref and compares against the parent's
+    // `request_bytes_hash` via `git::store::read_ref` /
+    // `git::store::marker_value_for`. Reverting either reintroduces
+    // the DoS window the marker gate exists to close.
+    assert!(
+        production_outbox.contains("git::store::read_ref"),
+        "reconcile_prepared_page must read the marker ref via git::store::read_ref"
+    );
+    assert!(
+        production_outbox.contains("marker_value_for"),
+        "reconcile_prepared_page must compute the expected marker value via \
+         git::store::marker_value_for"
+    );
+
+    // (2) The drain's `EffectsOutcome::Retry` arm checks the bound.
+    assert!(
+        production_outbox.contains("effects_max_attempts"),
+        "drain_receive_pack_requests_with must consult effects_max_attempts on Retry"
+    );
+
+    // (3) `git::store::read_ref` is the read seam the gate depends on.
+    assert!(
+        store.contains("pub fn read_ref("),
+        "git::store::read_ref must exist; the marker gate reads through it"
+    );
+    assert!(
+        store.contains("pub fn marker_value_for("),
+        "git::store::marker_value_for must exist; the marker gate computes the expected \
+         value with it (and the live handler writes the value via the same helper)"
+    );
+
+    // (4) DB-side seams the gate depends on.
+    assert!(
+        db.contains("pub async fn mark_request_quarantined"),
+        "Db::mark_request_quarantined must exist"
+    );
+    assert!(
+        db.contains("pub async fn mark_children_rejected_for_quarantined_parent"),
+        "Db::mark_children_rejected_for_quarantined_parent must exist"
+    );
+    assert!(
+        db.contains("pub async fn get_receive_pack_requests_by_ids"),
+        "Db::get_receive_pack_requests_by_ids must exist (avoids N+1 in the marker gate)"
+    );
+    assert!(
+        db.contains("pub const QUARANTINED: &str = \"quarantined\""),
+        "request_state::QUARANTINED must be defined"
+    );
+
+    // (5) The handler writes the marker ref BEFORE the durability
+    // boundary (smart_http::receive_pack_raw). Severing the
+    // ordering re-opens the marker-gate DoS window for live pushes.
+    let marker_write = production_repos
+        .find("git::store::marker_value_for")
+        .expect("U5 gate stale: the live handler no longer computes the marker value");
+    let receive_raw = production_repos
+        .find("smart_http::receive_pack_raw(")
+        .expect("U5 gate stale: git_receive_pack no longer calls smart_http::receive_pack_raw");
+    assert!(
+        marker_write < receive_raw,
+        "U5 gate bypassed: the marker ref must be written BEFORE receive_pack_raw so the \
+         reconcile's gate has evidence of the live push"
+    );
+}

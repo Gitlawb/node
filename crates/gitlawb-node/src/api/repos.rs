@@ -2351,6 +2351,53 @@ pub async fn git_receive_pack(
         ));
     }
 
+    // #26 Split PR 1 step 5 — write the per-request marker ref
+    // BEFORE calling `git receive-pack`. The marker's value is
+    // derived from `request_bytes_hash` via `marker_value_for`,
+    // which `git hash-object -w`s the first 20 bytes (yielding a
+    // 40-char SHA-1, the only thing `git update-ref` will accept).
+    // The reconcile reads it back via `git::store::read_ref` and
+    // compares against the request row via the same helper.
+    // Failure is non-fatal: the reconcile's marker gate will see no
+    // marker and quarantine the request; an operator can reclassify.
+    let marker_ref_name = format!("refs/gitlawb/requests/{request_id}");
+    match crate::git::store::marker_value_for(&disk_path, &req_row.request_bytes_hash) {
+        Ok(marker_value) => {
+            let marker_write = std::process::Command::new("git")
+                .args(["update-ref", &marker_ref_name, &marker_value])
+                .arg("--no-deref")
+                .current_dir(&disk_path)
+                .output();
+            match marker_write {
+                Ok(out) if !out.status.success() => {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        repo = %name,
+                        stderr = %String::from_utf8_lossy(&out.stderr),
+                        "marker write returned non-zero; reconcile will quarantine this request"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        err = %e,
+                        request_id = %request_id,
+                        repo = %name,
+                        "marker write failed to spawn; reconcile will quarantine this request"
+                    );
+                }
+                _ => {}
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                err = %e,
+                request_id = %request_id,
+                repo = %name,
+                "marker value computation failed; reconcile will quarantine this request"
+            );
+        }
+    }
+
     // P1 (reviewer-1/2 round 3): use receive_pack_raw to get the raw
     // stdout (which contains the report-status with per-ref ok/ng
     // results) and the process exit status. This allows us to:

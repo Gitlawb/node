@@ -249,6 +249,82 @@ pub fn list_refs(repo_path: &Path) -> Result<Vec<(String, String)>> {
     Ok(refs)
 }
 
+/// #26 Split PR 1 step 5 — read a single ref's value. Returns
+/// `Ok(None)` for absent refs (git's exit code is 1; we treat that
+/// as "not present" rather than a hard error). The value is the
+/// full hex SHA — for a marker ref, that hex is the marker value
+/// the live handler (or a test) wrote via `update-ref`, which is
+/// a 40-char SHA-1 hex string. The reconcile compares two hex
+/// strings.
+pub fn read_ref(repo_path: &Path, ref_name: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(["show-ref", "--verify", "--hash", ref_name])
+        .current_dir(repo_path)
+        .output()
+        .context("failed to run git show-ref")?;
+    if !output.status.success() {
+        // `git show-ref --verify` returns 1 when the ref is absent
+        // and non-zero (often 128) on other errors. We can't
+        // distinguish without inspecting stderr; the safe choice
+        // is to treat any non-zero as "absent" and let the caller
+        // (the reconcile gate) treat that as a quarantine signal.
+        return Ok(None);
+    }
+    let sha = String::from_utf8(output.stdout)
+        .context("git show-ref output is not utf-8")?
+        .trim()
+        .to_string();
+    if sha.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(sha))
+}
+
+/// #26 Split PR 1 step 5 — compute the marker ref value for a
+/// `request_bytes_hash`. Git's `update-ref` rejects arbitrary
+/// 64-char hex; it only accepts 40-char SHA-1 hex that resolves
+/// to an existing object. We sidestep both halves by feeding the
+/// first 20 bytes of the 32-byte SHA-256 through `git
+/// hash-object -w` (a blob object is content-addressed, so the
+/// resulting 40-char SHA-1 is the marker value). The live
+/// handler writes this; the reconcile's `read_ref` reads it
+/// back; the gate compares hex strings.
+///
+/// `repo_path` is the bare repo the marker ref lives in. The
+/// blob is stored in the repo's object database so a later
+/// `git show-ref --verify --hash` resolves cleanly.
+pub fn marker_value_for(repo_path: &Path, request_bytes_hash: &[u8]) -> Result<String> {
+    let mut content = Vec::with_capacity(20);
+    let n = 20.min(request_bytes_hash.len());
+    content.extend_from_slice(&request_bytes_hash[..n]);
+    let mut child = Command::new("git")
+        .args(["hash-object", "-w", "--stdin"])
+        .current_dir(repo_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to spawn git hash-object")?;
+    use std::io::Write;
+    child
+        .stdin
+        .as_mut()
+        .context("stdin pipe")?
+        .write_all(&content)
+        .context("write to git hash-object stdin")?;
+    let out = child.wait_with_output().context("git hash-object wait")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git hash-object failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(String::from_utf8(out.stdout)
+        .context("git hash-object output not utf-8")?
+        .trim()
+        .to_string())
+}
+
 /// Read the current HEAD commit hash of a repository.
 /// Returns None if the repo is empty (no commits yet).
 pub fn head_commit(repo_path: &Path) -> Result<Option<String>> {
