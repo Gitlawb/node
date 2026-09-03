@@ -375,6 +375,13 @@ pub(crate) fn run_bounded_git(
 /// every reachable blob and tree OID is inserted with an empty
 /// path, and `withheld_from_pairs` withholds by OID.
 const MAX_TREE_WALK_DEPTH: usize = 64;
+/// Round 10 P2: cap on `ls-tree` child-process invocations across a
+/// single walk. The previous wall-clock bound could not bound a
+/// wide shallow tree that spawns one `ls-tree` per subtree well
+/// inside the depth cap; expiry was the only stop. With
+/// `MAX_TREE_WALK_INVOCATIONS` the walker fails closed at a
+/// structural cost ceiling, not at the scheduler's mercy.
+const MAX_TREE_WALK_INVOCATIONS: usize = 50_000;
 
 /// Walk a tree OID recursively via bounded `git ls-tree -z` and
 /// insert every reachable blob and tree OID into `out` with an
@@ -384,8 +391,11 @@ const MAX_TREE_WALK_DEPTH: usize = 64;
 /// tip's child blobs, so the empty-path OID is the only correct
 /// shape for the phase-2 catch-all.
 ///
-/// Bounded by `deadline` and `MAX_TREE_WALK_DEPTH` so a malicious
-/// or malformed tree cannot exhaust the walk.
+/// Bounded by `deadline`, `MAX_TREE_WALK_DEPTH`, and
+/// `MAX_TREE_WALK_INVOCATIONS` so a malicious or malformed tree
+/// cannot exhaust the walk. The invocation cap closes the
+/// "wide shallow tree spawns one ls-tree per subtree" hole the
+/// previous wall-clock-only bound left (round 10 P2).
 fn walk_tree_oids_bounded(
     repo_path: &Path,
     git_bin: &str,
@@ -393,7 +403,26 @@ fn walk_tree_oids_bounded(
     deadline: Instant,
     out: &mut HashSet<(String, String)>,
 ) -> Result<()> {
-    walk_tree_oids_inner(repo_path, git_bin, root_tree_oid, 0, deadline, out)
+    // Round 10 P2: memo of already-walked tree OIDs so a tree
+    // reachable from N ref tips is walked once, not N times.
+    // Without this, a ref with two tags pointing at the same
+    // tree paid for the ls-tree child process twice.
+    let mut walked: HashSet<String> = HashSet::new();
+    // Round 10 P2: a structural invocation cap. The wall-clock
+    // deadline cannot bound a wide shallow tree that spawns one
+    // `ls-tree` per subtree well inside the depth cap; this
+    // counter is the cost ceiling that actually closes the hole.
+    let mut invocations: usize = 0;
+    walk_tree_oids_inner(
+        repo_path,
+        git_bin,
+        root_tree_oid,
+        0,
+        deadline,
+        out,
+        &mut walked,
+        &mut invocations,
+    )
 }
 
 fn walk_tree_oids_inner(
@@ -403,6 +432,8 @@ fn walk_tree_oids_inner(
     depth: usize,
     deadline: Instant,
     out: &mut HashSet<(String, String)>,
+    walked: &mut HashSet<String>,
+    invocations: &mut usize,
 ) -> Result<()> {
     if depth > MAX_TREE_WALK_DEPTH {
         anyhow::bail!(
@@ -410,6 +441,19 @@ fn walk_tree_oids_inner(
              refusing to recurse into a malicious or malformed tree chain"
         );
     }
+    // Memo: a tree reachable from multiple ref tips or from
+    // multiple parents (rare but legal in git) is walked once.
+    if !walked.insert(tree_oid.to_string()) {
+        return Ok(());
+    }
+    if *invocations >= MAX_TREE_WALK_INVOCATIONS {
+        anyhow::bail!(
+            "tree walk exceeded {MAX_TREE_WALK_INVOCATIONS} ls-tree invocations \
+             (rooted at {tree_oid}); refusing to recurse into a wide or \
+             densely-referenced tree graph"
+        );
+    }
+    *invocations += 1;
     // The tree itself enters the withheld set keyed on OID. The
     // filtered pack serves trees by OID, so omitting the tree
     // would let a withheld subtree leak its parent.
@@ -462,7 +506,16 @@ fn walk_tree_oids_inner(
                 out.insert((child_oid.to_string(), String::new()));
             }
             "tree" => {
-                walk_tree_oids_inner(repo_path, git_bin, child_oid, depth + 1, deadline, out)?;
+                walk_tree_oids_inner(
+                    repo_path,
+                    git_bin,
+                    child_oid,
+                    depth + 1,
+                    deadline,
+                    out,
+                    walked,
+                    invocations,
+                )?;
             }
             _ => {
                 // Submodule commits (kind="commit") are covered
