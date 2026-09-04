@@ -1658,10 +1658,18 @@ mod tests {
         drop(lock);
 
         upload.assert_async().await;
+        // Round 10 P2: a successful upload with the post-upload
+        // source record timing out no longer returns the (sha, cid)
+        // pair. The reconcile contract is "filled iff durable": when
+        // any post-upload DB write fails, the push is suppressed
+        // and the gap is re-offered. Prior to the round 10 fix, the
+        // push fired regardless of the source-record outcome, and
+        // the next pass would re-offer the same gap.
         assert_eq!(
             pinned.len(),
-            1,
-            "the upload succeeded, so this lane still returns the pair: {pinned:?}"
+            0,
+            "record_pin_source timed out (pin_repo_sources locked); the push must be \
+             suppressed so the reconcile does not count a non-durable pair as filled: {pinned:?}"
         );
         assert!(
             elapsed < Duration::from_secs(8),
