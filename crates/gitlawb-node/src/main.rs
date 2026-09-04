@@ -1956,42 +1956,92 @@ mod identity_key_storage_tests {
         println!("identity-key-umask: asserted did={}", kp.did());
     }
 
-    /// A pre-existing directory that grants access beyond the owner is
-    /// tightened on the next start, which is the INV-23(a) half issue #231
-    /// names. Write on the directory is what lets another user replace a
-    /// 0600 PEM; 0755 is tightened too, but is not replacement authority.
+    /// GITLAWB_KEY names a PEM file, not a dedicated key directory. An existing
+    /// 0755 parent is usable (no group/world write) and must not be chmodded.
     #[cfg(unix)]
     #[test]
-    fn existing_identity_key_directory_is_tightened() {
+    fn existing_identity_parent_is_not_chmodded() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for parent_name in [".gitlawb", "shared"] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let dir = base.path().join(parent_name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let key = dir.join("identity.pem");
+            load_or_create_keypair_at(&key).expect("first boot into an existing 0755 parent");
+
+            let mode = std::fs::symlink_metadata(&dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(
+                mode, 0o755,
+                "{parent_name}: an existing 0755 identity parent must stay 0755, found {mode:04o}"
+            );
+            assert_eq!(
+                std::fs::symlink_metadata(&key)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o600,
+                "the identity key must be owner-only"
+            );
+        }
+    }
+
+    /// A parent this process creates is still pinned to 0700. That is the
+    /// missing-directory path, not an adopt of an operator-owned tree.
+    #[cfg(unix)]
+    #[test]
+    fn missing_identity_parent_is_created_0700() {
         use std::os::unix::fs::PermissionsExt;
 
         let base = tempfile::tempdir().unwrap();
         std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let dir = base.path().join(".gitlawb");
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-
         let key = dir.join("identity.pem");
-        load_or_create_keypair_at(&key).expect("first boot into a loose directory");
-
+        load_or_create_keypair_at(&key).expect("first boot creates the identity parent");
         let mode = std::fs::symlink_metadata(&dir)
             .unwrap()
             .permissions()
             .mode()
             & 0o7777;
-        assert_eq!(
-            mode, 0o700,
-            "a loose identity key directory must be tightened"
+        assert_eq!(mode, 0o700, "a parent this process created must be 0700");
+    }
+
+    /// Group/world write on the parent is replacement authority over a 0600
+    /// key. Refuse, and leave the directory untouched.
+    #[cfg(unix)]
+    #[test]
+    fn writable_identity_parent_is_refused_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = base.path().join("tmp");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let key = dir.join("identity.pem");
+        let Err(err) = load_or_create_keypair_at(&key) else {
+            panic!("a world-writable identity parent must be refused");
+        };
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("writable") || text.contains("replace"),
+            "the refusal must name the write-authority problem, got: {text}"
         );
-        assert_eq!(
-            std::fs::symlink_metadata(&key)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o7777,
-            0o600,
-            "the identity key must be owner-only"
-        );
+        let mode = std::fs::symlink_metadata(&dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o777, "a refusal must not chmod the parent");
+        assert!(!key.exists(), "a refusal must not publish the identity key");
     }
 
     /// An existing key is loaded, never rewritten and never chmodded: the
@@ -2288,7 +2338,10 @@ mod identity_key_storage_tests {
     #[cfg(unix)]
     #[test]
     fn identity_symlink_key_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
         let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let real = base.path().join("real.pem");
         let created = load_or_create_keypair_at(&real).expect("create the symlink target");
         std::os::unix::fs::symlink(&real, base.path().join("identity.pem")).unwrap();

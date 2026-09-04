@@ -823,7 +823,7 @@ impl Config {
             // failure stops the node, so it must not decide anything about
             // live filesystem objects. Storage faults belong to the load path,
             // which degrades instead of exiting.
-            crate::p2p::validate_p2p_key_config(&p2p_key_path, Some(&self.p2p_key_path))
+            let _ = crate::p2p::validate_p2p_key_config(&p2p_key_path, Some(&self.p2p_key_path))
                 .map_err(|e| e.to_string())?;
         }
 
@@ -1654,6 +1654,24 @@ mod tests {
                 expect: Expect::Rejected("must name a key file"),
                 needs_home: true,
             },
+            Row {
+                port: 7546,
+                path: "/data/keys/.",
+                expect: Expect::Rejected("must name a key file"),
+                needs_home: false,
+            },
+            Row {
+                port: 7546,
+                path: "/data/keys/./.",
+                expect: Expect::Rejected("must name a key file"),
+                needs_home: false,
+            },
+            Row {
+                port: 7546,
+                path: "~/.gitlawb/.",
+                expect: Expect::Rejected("must name a key file"),
+                needs_home: true,
+            },
         ];
 
         let have_home = dirs_next::home_dir().is_some();
@@ -1934,5 +1952,20 @@ mod tests {
             err.contains("must name a key file"),
             "trailing `/` must be rejected before chmod, got: {err}"
         );
+    }
+
+    /// A terminal `.` is a directory-valued spelling. Rust's Path drops it, so
+    /// `/data/keys/.` would otherwise be stored as the file `keys` under `/data`.
+    #[test]
+    fn p2p_key_path_terminal_dot_is_rejected() {
+        for path in ["/data/keys/.", "/data/keys/./.", "/data/keys/.//."] {
+            let err = config_with_p2p_key(path)
+                .validate()
+                .expect_err("a terminal `.` must be rejected as a directory");
+            assert!(
+                err.contains("must name a key file"),
+                "{path:?} must be refused before Path can retarget it, got: {err}"
+            );
+        }
     }
 }

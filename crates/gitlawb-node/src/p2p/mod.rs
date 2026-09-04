@@ -670,13 +670,30 @@ fn walk_dir_open_flags() -> libc::c_int {
     // Traversal needs search/execute, not directory-list. `O_RDONLY` on a
     // directory additionally requires read permission, so a safe 0111 ancestor
     // would fail before the ownership/write-authority predicate ran.
+    let common = libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC
+        libc::O_PATH | common
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+    ))]
     {
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC
+        libc::O_SEARCH | common
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+    )))]
+    {
+        libc::O_RDONLY | common
     }
 }
 
@@ -873,13 +890,36 @@ fn walk_component_error(e: std::io::Error, key_dir: &Path, component: &Path) -> 
     }
 }
 
+/// Whether a configured spelling names a directory rather than a key file.
+///
+/// Inspects the stored string, not `Path::file_name`. Rust's `Path` drops a
+/// final `.` component, so `/data/keys/.` would otherwise be stored as the
+/// file `keys` under `/data`.
+fn spelling_denotes_a_directory(spelling: &str) -> bool {
+    if spelling == "~/" || spelling.ends_with('/') || spelling.ends_with('\\') {
+        return true;
+    }
+    let last = spelling
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(spelling);
+    last == "." || last == ".."
+}
+
 /// Whether the configured path names a directory rather than a key file.
 ///
-/// Checked lexically (`~/`, a trailing `/`) and against an existing path on
-/// disk, before any directory is created or chmodded.
+/// Checked lexically (`~/`, a trailing `/`, a final `.` or `..` component)
+/// before any directory is created or chmodded. The Path is consulted only
+/// as a backstop for callers that pass no raw spelling: the OsStr still
+/// carries the operator's `.` even after `components()` has dropped it.
 fn path_denotes_a_directory(key_path: &Path, configured_raw: Option<&str>) -> bool {
     if let Some(raw) = configured_raw {
-        if raw == "~/" || raw.ends_with('/') {
+        if spelling_denotes_a_directory(raw) {
+            return true;
+        }
+    }
+    if let Some(stored) = key_path.to_str() {
+        if spelling_denotes_a_directory(stored) {
             return true;
         }
     }
@@ -909,10 +949,19 @@ fn path_denotes_a_directory(key_path: &Path, configured_raw: Option<&str>) -> bo
 #[error("{0}")]
 pub(crate) struct P2pKeyConfigError(String);
 
+/// Directory plus leaf name of a validated p2p key path. Later storage must
+/// consume this pair rather than asking `Path` again, because `Path` drops a
+/// final `.` and would retarget `/data/keys/.` as the file `keys` under `/data`.
+#[derive(Debug, Clone)]
+pub(crate) struct P2pKeyTarget {
+    pub dir: PathBuf,
+    pub leaf: std::ffi::OsString,
+}
+
 pub(crate) fn validate_p2p_key_config(
     key_path: &Path,
     configured_raw: Option<&str>,
-) -> Result<(), P2pKeyConfigError> {
+) -> Result<P2pKeyTarget, P2pKeyConfigError> {
     let display = configured_raw.unwrap_or_else(|| key_path.to_str().unwrap_or("<invalid utf-8>"));
 
     if names_no_usable_directory(key_path) {
@@ -944,7 +993,18 @@ pub(crate) fn validate_p2p_key_config(
     // non-regular file, and the leaf openat gives ELOOP or ENOTDIR through
     // `describe_unusable_key_dir`. Deciding them here made the same fault
     // fatal or degradable depending only on which layer noticed it first.
-    Ok(())
+    let leaf = key_path
+        .file_name()
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| {
+            P2pKeyConfigError(format!(
+                "GITLAWB_P2P_KEY ({display}) must name a key file, not a directory"
+            ))
+        })?;
+    Ok(P2pKeyTarget {
+        dir: key_parent(key_path).to_path_buf(),
+        leaf: leaf.to_os_string(),
+    })
 }
 
 /// Load the node's persistent libp2p identity from `key_path`, generating and
@@ -979,23 +1039,11 @@ pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> 
     // inspective — the checks below re-establish everything it observed on the
     // actual opened objects, so this exists for early, precise errors rather
     // than for safety.
-    validate_p2p_key_config(key_path, None).map_err(|e| anyhow::anyhow!(e))?;
+    let target = validate_p2p_key_config(key_path, None).map_err(|e| anyhow::anyhow!(e))?;
 
-    // Validation rejected paths without a final component, so `file_name` is
-    // present from here on; the error is a backstop, not a reachable path for
-    // a validated config.
-    let key_name = key_path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("GITLAWB_P2P_KEY ({}) names no file", key_path.display()))?
-        .to_os_string();
+    let dir = ensure_key_dir(&target.dir)?;
 
-    // Runs on both the load and the create path: the directory guards the key
-    // just as much as the key's own mode does, and an existing directory keeps
-    // whatever mode it was made with. The returned handle is the anchor every
-    // later operation goes through.
-    let dir = ensure_key_dir(key_parent(key_path))?;
-
-    if let Some(file) = open_existing_key(&dir, &key_name, key_path)? {
+    if let Some(file) = open_existing_key(&dir, &target.leaf, key_path)? {
         return read_p2p_keypair_from(file, key_path);
     }
 
@@ -1008,7 +1056,7 @@ pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> 
             .map_err(|e| anyhow::anyhow!("failed to serialize p2p key: {e}"))?,
     );
 
-    match write_key_atomically(&dir, &key_name, &bytes) {
+    match write_key_atomically(&dir, &target.leaf, &bytes) {
         Ok(()) => {
             info!(
                 path = %key_path.display(),
@@ -1021,7 +1069,7 @@ pub fn load_or_create_p2p_keypair(key_path: &Path) -> Result<identity::Keypair> 
         // between the open above and the atomic publish. Adopt its key,
         // through the same handle, so both processes converge on one PeerId.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let file = open_existing_key(&dir, &key_name, key_path)?.ok_or_else(|| {
+            let file = open_existing_key(&dir, &target.leaf, key_path)?.ok_or_else(|| {
                 anyhow::anyhow!(
                     "p2p key at {} vanished after another process published it; \
                      refusing to guess which identity this node should have",
@@ -1081,9 +1129,9 @@ impl KeyDirHandle {
     }
 
     /// Publish into an already-existing directory without creating or chmodding
-    /// it. The working-directory case for a bare node-identity filename uses
-    /// this so the p2p key's named-directory contract (pin to 0700) is not
-    /// imported onto `GITLAWB_KEY=identity.pem`. Write-authority is still
+    /// it. Identity-key paths use this for cwd, `/`, and any nominated parent
+    /// that already exists, so the p2p key's dedicated-directory contract (pin
+    /// to 0700) is not imported onto `GITLAWB_KEY`. Write-authority is still
     /// checked: a 0600 key is unprotected if this directory is group/world
     /// writable, so [`pin::verify_trusted_parent`] runs on the held descriptor
     /// before the handle is returned.
@@ -1448,13 +1496,24 @@ fn ensure_key_dir(dir: &Path) -> Result<KeyDirHandle> {
             anyhow::bail!(err);
         }
 
-        // Read the full permission word, not `& 0o777`: an inherited setgid bit
-        // makes a 2700 directory compare unequal to 0700, and judging the two
-        // on different bit widths would skip the repair and then fail the
-        // verify.
+        // Owner rwx is required to use the directory. Group/world bits and
+        // special bits (setgid 2700, sticky 1700) are repairable and are
+        // normalized to 0700. Missing owner bits are over-closed: refuse,
+        // do not widen.
         let mode = md.permissions().mode() & 0o7777;
-        if mode & 0o077 != 0 {
+        if mode & 0o700 != 0o700 {
+            anyhow::bail!(
+                "p2p key directory {} has mode {:04o}, which this node cannot use; it is not \
+                 widened automatically because a directory closed on purpose is an operator \
+                 decision. Run `chmod 700 {}` if the node should own it.",
+                dir.display(),
+                mode,
+                dir.display()
+            );
+        }
+        if mode != 0o700 {
             let writable = dir_mode_allows_untrusted_replace(mode);
+            let extra_access = mode & 0o077 != 0;
             warn!(
                 dir = %dir.display(),
                 mode = format!("{mode:04o}"),
@@ -1462,8 +1521,10 @@ fn ensure_key_dir(dir: &Path) -> Result<KeyDirHandle> {
                 "{}",
                 if writable {
                     "key directory is writable beyond its owner; tightening it to 0700. Treat a key that was sitting there as possibly exposed"
-                } else {
+                } else if extra_access {
                     "key directory grants access beyond its owner; tightening it to 0700"
+                } else {
+                    "key directory carries special mode bits; normalizing it to 0700"
                 }
             );
             // `fchmod` through the handle: the directory whose mode changes is
@@ -1500,21 +1561,6 @@ fn ensure_key_dir(dir: &Path) -> Result<KeyDirHandle> {
                     after
                 );
             }
-        } else if mode != 0o700 {
-            // Over-closed, and deliberately NOT widened. Granting owner-write
-            // back to a directory an operator froze would override their
-            // intent, and it would fire the "a loose key directory was
-            // tightened, treat the key as exposed" advice for a case where
-            // nothing was ever exposed. Refuse with the remedy instead, which
-            // is how an over-closed key FILE is already handled.
-            anyhow::bail!(
-                "p2p key directory {} has mode {:04o}, which this node cannot use; it is not \
-                 widened automatically because a directory closed on purpose is an operator \
-                 decision. Run `chmod 700 {}` if the node should own it.",
-                dir.display(),
-                mode,
-                dir.display()
-            );
         }
     }
 
@@ -1621,22 +1667,13 @@ pub(crate) fn load_identity_pem_if_present(key_path: &Path) -> Result<Option<Str
     Ok(Some(pem))
 }
 
-/// Create `key_path`'s directory pinned to 0700 and publish `bytes` into it at
-/// a verified 0600, using the same scratch-then-link path the p2p key uses.
+/// Publish `bytes` as a 0600 key at `key_path` through the same scratch-then-link
+/// path the p2p key uses.
 ///
-/// Exposed for the node identity PEM in `main.rs`, which lives in the same
-/// `~/.gitlawb` directory and had its own creation flow: `create_dir_all` with
-/// no mode, then `write`, then `set_permissions`. That is the sequence INV-23
-/// prohibits, and it left the directory world-writable under a permissive
-/// umask and unopenable under a restrictive one, which took the node down
-/// before any p2p code ran.
-///
-/// Deliberately NOT the full `ensure_key_dir`: that carries the ancestor
-/// trust walk, and importing its refusals onto a path that never had them
-/// would turn an unsafe-but-working deployment into a boot failure on
-/// upgrade. Only the immediate parent is created through the pin helper, which
-/// verifies the grandparent it is about to chmod a child of; ancestors above
-/// that keep today's `create_dir_all` behavior.
+/// If the immediate parent is missing it is created pinned to 0700. If it
+/// already exists it is used without chmod: `GITLAWB_KEY` is a file path, not
+/// a dedicated-directory setting. Write-authority on that parent is still
+/// required. Deliberately NOT the full `ensure_key_dir` ancestor walk.
 #[cfg(unix)]
 pub(crate) fn create_pinned_dir_and_publish(key_path: &Path, bytes: &[u8]) -> Result<()> {
     use std::os::fd::AsRawFd;
@@ -1665,8 +1702,30 @@ pub(crate) fn create_pinned_dir_and_publish(key_path: &Path, bytes: &[u8]) -> Re
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("{} names no final directory component", dir.display()))?;
 
+    // An existing nominated parent is used as-is. GITLAWB_KEY is a file path,
+    // not a dedicated-directory setting, so this must not chmod `/etc` or a
+    // shared 0755 volume. Write-authority still refuses a group/world-writable
+    // parent. A missing parent is created at 0700 below.
+    match open_dir_with_flags(dir, leaf_dir_open_flags()) {
+        Ok(existing) => {
+            let handle = KeyDirHandle::from_existing_dir(existing, dir, key_path)?;
+            write_key_atomically(&handle, file_name, bytes).with_context(|| {
+                format!("failed to write identity key to {}", key_path.display())
+            })?;
+            return Ok(());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!(
+                "failed to open {} for the identity key (a symlink here is refused rather than followed)",
+                dir.display()
+            )));
+        }
+    }
+
     // Ancestors above the key directory keep the existing behavior; only the
-    // directory that actually holds the secret is pinned.
+    // directory that actually holds the secret is pinned, and only when this
+    // process creates it.
     if let Some(grandparent) = dir.parent() {
         if !grandparent.as_os_str().is_empty() {
             std::fs::create_dir_all(grandparent).with_context(|| {
@@ -1690,37 +1749,12 @@ pub(crate) fn create_pinned_dir_and_publish(key_path: &Path, bytes: &[u8]) -> Re
                 anyhow::Error::new(e)
                     .context(format!("failed to create key directory {}", dir.display()))
             })?;
-    let handle = KeyDirHandle::from_pinned_fd(pinned, dir);
-
-    // An adopted directory is tightened when it grants access beyond the owner,
-    // the same rule the p2p key directory follows, so an existing 0755
-    // `~/.gitlawb` stops being world-traversable on the next start.
-    if !created {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = handle
-            .metadata()
-            .with_context(|| format!("failed to stat key directory {}", dir.display()))?
-            .permissions()
-            .mode()
-            & 0o7777;
-        if mode & 0o077 != 0 {
-            let writable = dir_mode_allows_untrusted_replace(mode);
-            warn!(
-                dir = %dir.display(),
-                mode = format!("{mode:04o}"),
-                writable,
-                "{}",
-                if writable {
-                    "identity key directory is writable beyond its owner; tightening it to 0700"
-                } else {
-                    "identity key directory grants access beyond its owner; tightening it to 0700"
-                }
-            );
-            handle
-                .tighten_to_0700()
-                .with_context(|| format!("failed to tighten key directory {}", dir.display()))?;
-        }
-    }
+    let handle = if created {
+        KeyDirHandle::from_pinned_fd(pinned, dir)
+    } else {
+        // Lost the mkdir race: use the winner without chmodding it.
+        KeyDirHandle::from_existing_dir(std::fs::File::from(pinned.into_inner()), dir, key_path)?
+    };
 
     write_key_atomically(&handle, file_name, bytes)
         .with_context(|| format!("failed to write identity key to {}", key_path.display()))?;
@@ -3098,22 +3132,26 @@ mod tests {
             assert_eq!(after, 0o700, "loose {loose:04o} must be tightened to 0700");
         }
 
-        // An inherited setgid bit must be repaired, not refused: 2700 compares
-        // unequal to 0700 on the full word, and judging the predicate on 0o777
-        // while verifying on 0o7777 would skip the repair and then fail.
-        {
+        // Repairable: owner rwx is present, and group/world or special bits are
+        // stripped to 0700. 2700 (setgid only) is the control-flow hole the
+        // 0o077 predicate misses; 2750 still has to keep working.
+        for repairable in [0o700u32, 0o2700, 0o1700, 0o2750] {
             let base = key_base_0700();
             let keys = base.path().join("keys");
             std::fs::create_dir(&keys).unwrap();
-            std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o2750)).unwrap();
-            load_or_create_p2p_keypair(&keys.join("p2p.key"))
-                .expect("a setgid key directory is repaired rather than refused");
+            std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(repairable)).unwrap();
+            load_or_create_p2p_keypair(&keys.join("p2p.key")).unwrap_or_else(|e| {
+                panic!("mode {repairable:04o} must boot and land at 0700, got: {e:#}")
+            });
             let after = std::fs::metadata(&keys).unwrap().permissions().mode() & 0o7777;
-            assert_eq!(after, 0o700, "setgid 2750 must be tightened to 0700");
+            assert_eq!(
+                after, 0o700,
+                "{repairable:04o} must be left/normalized to 0700, found {after:04o}"
+            );
         }
 
         // Too closed: refused, named, and left exactly as the operator set it.
-        for closed in [0o500u32, 0o100, 0o600] {
+        for closed in [0o500u32, 0o100, 0o600, 0o000] {
             let base = key_base_0700();
             let keys = base.path().join("keys");
             std::fs::create_dir(&keys).unwrap();
@@ -3506,6 +3544,9 @@ mod tests {
             ("keys/", "must include a directory"),
             ("p2p.key", "must include a directory"),
             ("a/../p2p.key", "must include a directory"),
+            ("/data/keys/.", "must name a key file"),
+            ("/data/keys/./.", "must name a key file"),
+            ("~/.gitlawb/.", "must name a key file"),
         ] {
             let err = validate_p2p_key_config(Path::new(raw), Some(raw))
                 .expect_err("a lexically invalid key path must be refused");
@@ -4366,7 +4407,17 @@ mod tests {
     /// list permission would refuse a path the ownership/write-authority
     /// predicate already accepts. The next component must already exist:
     /// 0111 has no owner-write, so the walk cannot mkdirat through it.
-    #[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+        )
+    ))]
     #[test]
     fn ancestor_walk_accepts_search_only_ancestor() {
         use std::os::unix::fs::PermissionsExt;
