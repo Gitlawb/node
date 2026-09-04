@@ -456,21 +456,28 @@ pub(crate) async fn get_claimable_task(
         return Ok(None);
     };
     let (repos_by_id, rules_by_repo) = match task.repo_id.as_deref() {
-        Some(repo_id) if !repo_id.contains('/') => {
-            let ids = [repo_id.to_string()];
-            let repos = db.list_repos_deduped_by_ids(&ids).await?;
-            match repos.into_iter().find(|r| r.id == repo_id) {
-                Some(record) => {
-                    let rules = db.list_visibility_rules(&record.id).await?;
-                    (
-                        HashMap::from([(record.id.clone(), record)]),
-                        HashMap::from([(repo_id.to_string(), rules)]),
-                    )
+        Some(repo_id) => {
+            if db.is_repo_quarantined(repo_id).await? {
+                return Ok(None);
+            }
+            if !repo_id.contains('/') {
+                let ids = [repo_id.to_string()];
+                let repos = db.list_repos_deduped_by_ids(&ids).await?;
+                match repos.into_iter().find(|r| r.id == repo_id) {
+                    Some(record) => {
+                        let rules = db.list_visibility_rules(&record.id).await?;
+                        (
+                            HashMap::from([(record.id.clone(), record)]),
+                            HashMap::from([(repo_id.to_string(), rules)]),
+                        )
+                    }
+                    None => (HashMap::new(), HashMap::new()),
                 }
-                None => (HashMap::new(), HashMap::new()),
+            } else {
+                (HashMap::new(), HashMap::new())
             }
         }
-        _ => (HashMap::new(), HashMap::new()),
+        None => (HashMap::new(), HashMap::new()),
     };
     Ok(task_claimable(&task, caller, &repos_by_id, &rules_by_repo).then_some(task))
 }
@@ -2174,7 +2181,8 @@ mod visible_tasks_tests {
             .await
             .unwrap_err();
         assert_eq!(
-            task_write_conflict(sql_err, "conflict").to_string(),
+            task_write_conflict(sql_err, "task not claimable: not found or already claimed")
+                .to_string(),
             "conflict: task not claimable: not found or already claimed",
             "SQL guard must reject hostile claim with not-claimable conflict"
         );
