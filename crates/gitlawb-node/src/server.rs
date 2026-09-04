@@ -967,7 +967,41 @@ mod tests {
             "unauthenticated WS must not disclose private task: {unauth_resp}"
         );
 
-        // 2. Signed WS connection authenticates caller and retrieves the private task
+        // 2. Forged signature claiming the delegator DID must be rejected at handshake
+        let attacker_keypair = gitlawb_core::identity::Keypair::generate();
+        let attacker_signed =
+            gitlawb_core::http_sig::sign_request(&attacker_keypair, "GET", "/graphql/ws", b"");
+        let forged_sig_input = attacker_signed
+            .signature_input
+            .replace(&attacker_keypair.did().to_string(), &delegator_did);
+        let mut forged_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let forged_req = format!(
+            "GET /graphql/ws HTTP/1.1\r\n\
+             Host: {}\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Protocol: graphql-transport-ws\r\n\
+             content-digest: {}\r\n\
+             signature-input: {}\r\n\
+             signature: {}\r\n\r\n",
+            addr, attacker_signed.content_digest, forged_sig_input, attacker_signed.signature
+        );
+        forged_stream
+            .write_all(forged_req.as_bytes())
+            .await
+            .unwrap();
+        forged_stream.flush().await.unwrap();
+        let mut forged_buf = [0u8; 1024];
+        let n = forged_stream.read(&mut forged_buf).await.unwrap();
+        let forged_resp = String::from_utf8_lossy(&forged_buf[..n]);
+        assert!(
+            forged_resp.starts_with("HTTP/1.1 401 Unauthorized"),
+            "forged WS signature must be rejected with 401: {forged_resp}"
+        );
+
+        // 3. Signed WS connection authenticates caller and retrieves the private task
         let mut auth_stream = connect_ws_signed(addr, &keypair).await;
         ws_send_text(&mut auth_stream, query).await;
         let auth_frames = ws_recv_op_frames(&mut auth_stream, "1").await;
