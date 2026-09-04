@@ -1931,16 +1931,13 @@ impl Db {
     /// atomically. Returns the number of rows touched (0 if no such repo).
     /// A failure in either statement rolls back both.
     ///
-    /// Round 10 P1: acquire the in-process per-repo policy mutex
-    /// for the duration of the transaction. The sweep's
-    /// `PolicyFence` holds the same mutex from capture through
-    /// drop, so a quarantine narrow blocks until the in-flight
-    /// pin batch finishes. This closes the "narrow commits
-    /// between the fence's epoch read and the upload's POST"
-    /// window. Multi-process is a known gap (round 10 P1 follow-up).
+    /// The narrow never blocks behind a pin batch: it commits immediately and
+    /// bumps `policy_epoch`, and the batch's next `PolicyFence::is_current`
+    /// check aborts before the next upload. The fenced DB record takes the
+    /// repos row lock only for its own short transaction, never across a
+    /// network POST.
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn set_repo_quarantine(&self, repo_id: &str, quarantined: bool) -> Result<u64> {
-        let _lock = crate::ipfs_pin::PolicyMutexes::lock(repo_id).await;
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query("UPDATE repos SET quarantined = $1 WHERE id = $2")
             .bind(quarantined)
@@ -4804,10 +4801,6 @@ impl Db {
         reader_dids: &[String],
         created_by: &str,
     ) -> Result<()> {
-        // Round 10 P1: acquire the per-repo policy mutex so a
-        // sweep's `PolicyFence` (which holds the same lock from
-        // capture through drop) blocks until this commit lands.
-        let _lock = crate::ipfs_pin::PolicyMutexes::lock(repo_id).await;
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let readers = serde_json::to_string(reader_dids).unwrap_or_else(|_| "[]".to_string());
@@ -4841,8 +4834,6 @@ impl Db {
 
     /// Remove a visibility rule and bump the repo's policy epoch atomically.
     pub async fn remove_visibility_rule(&self, repo_id: &str, path_glob: &str) -> Result<()> {
-        // Round 10 P1: see set_visibility_rule. Same lock + comment.
-        let _lock = crate::ipfs_pin::PolicyMutexes::lock(repo_id).await;
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM visibility_rules WHERE repo_id = $1 AND path_glob = $2")
             .bind(repo_id)
@@ -5934,7 +5925,9 @@ mod migration_tests {
     /// has_ipfs_cid / filter_ipfs_pinned_oids predicates must classify:
     ///
     ///   (1) cid IS NOT NULL, pinata_cid IS NULL              → has_ipfs = true
-    ///   (2) cid IS NOT NULL, cid != pinata_cid              → has_ipfs = true
+    ///   (2) cid IS NOT NULL, cid != pinata_cid              → has_ipfs = false
+    ///       (ambiguous pre-v30; the strict backfill leaves it out and the
+    ///       next sweep pass re-derives by re-pinning)
     ///   (3) cid IS NOT NULL, cid = pinata_cid (legacy)      → has_ipfs = false
     ///
     /// Legacy row (3) stops being a special case because migration v27 clears
@@ -5959,7 +5952,7 @@ mod migration_tests {
             .execute(&db.pool)
             .await
             .unwrap();
-        for m in MIGRATIONS.iter().take_while(|m| m.version < 12) {
+        for m in MIGRATIONS.iter().take_while(|m| m.version < 32) {
             sqlx::query(
                 "INSERT INTO schema_migrations (version, name, applied_at)
                  VALUES ($1, $2, $3)",
@@ -6014,7 +6007,7 @@ mod migration_tests {
         .await
         .unwrap();
 
-        // ── Apply migration v12 ────────────────────────────────────────
+        // ── Apply migration v32 ────────────────────────────────────────
         db.migrate().await.unwrap();
 
         // ── Assertions ─────────────────────────────────────────────────
@@ -6027,7 +6020,7 @@ mod migration_tests {
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        assert_eq!(nullable, "YES", "cid must be nullable after v12");
+        assert_eq!(nullable, "YES", "cid must be nullable after v32");
 
         // Classification: has_ipfs_cid.
         //
@@ -6071,7 +6064,7 @@ mod migration_tests {
             "non-null pinata_cid means has_pinata = true (legacy row)"
         );
 
-        // ── Pinata-only INSERT (new post-v12 row) ──────────────────────
+        // ── Pinata-only INSERT (new post-v32 row) ──────────────────────
         db.record_pinata_cid(
             "sha_pinata_only",
             "QmPinataOnly",

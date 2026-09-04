@@ -702,13 +702,15 @@ async fn run_pass(
         // silently skipped every pass — empty `to_pin` behind a warn.
 
         // ── Phase 1: Public-object pinning (IPFS + Pinata) ────────────────
-        // Wrapped in `if has_public_work` so an empty public set
-        // (post-scan or post-refilter) still lets phase 2 run
-        // (round 10 P1). The `recheck_public_pin` and the
-        // mid-pass refilter inside this block BOTH have early
-        // `continue` paths that would otherwise skip phase 2
-        // entirely; we replaced the second with the flag flip
-        // above.
+        // Gated on `has_public_work` (round 10 P1) so an empty
+        // post-scan public set skips phase 1 but still reaches phase 2
+        // below. The flag is computed pre-refilter, so it governs only
+        // the post-scan empty case. The two `continue`s inside this
+        // block are unchanged and intentional: a FAILED recheck or a
+        // FAILED refilter (`None`) is a fail-closed skip of the whole
+        // repo iteration, while a SUCCESSFUL refilter that yields an
+        // empty list falls through — every downstream stage no-ops on
+        // empty missing sets and phase 2 still runs.
         if has_public_work {
             // Re-check quarantine AND visibility right now (fresh rules + repo row),
             // then re-derive the allowed set from those fresh rules so a path-scoped
@@ -745,11 +747,12 @@ async fn run_pass(
             if object_list.is_empty() {
                 // #218 review round 10 (P1): a mid-pass visibility
                 // narrowing can leave the public set empty while
-                // withheld recipients are still non-empty. The
-                // IPFS/Pinata dispatch arms below already no-op on an
-                // empty `ipfs_missing`/`pinata_missing` (the lists the
-                // block fills in), so we only need to skip the offset
-                // bookkeeping and let phase 2 run.
+                // withheld recipients are still non-empty. Nothing is
+                // skipped here: the offset loads, missing-set filters,
+                // and dispatch arms below all no-op on empty lists, and
+                // `next_offset_write(true, false, None)` resolves to
+                // `Drained`, clearing the per-backend cursor (correct:
+                // nothing is outstanding). Phase 2 then runs.
                 tracing::debug!(repo = %repo_slug, "refiltered public set is empty; encrypted recovery still runs");
             }
 
@@ -2134,6 +2137,153 @@ mod tests {
             !db.has_ipfs_cid(&secret_blob).await.unwrap(),
             "withheld blob must never be pinned to a public backend in cleartext"
         );
+    }
+
+    /// #218 round 10 P1 (`has_public_work`): a path-scoped repo whose only
+    /// reachable object is a direct blob ref yields an EMPTY public list — the
+    /// anonymous classifier denies the empty-path catch-all entry — while
+    /// `withheld_blob_recipients_bounded` still assigns that blob to the owner
+    /// recovery set. The pre-fix early `continue` on an empty list skipped the
+    /// whole repo iteration, so a lost/failed encrypted copy was never
+    /// repaired. This pins both directions: no public work is attempted
+    /// (gaps/filled are 0, exactly one POST lands — the seal envelope, never
+    /// a cleartext upload) AND the encrypted recovery copy is sealed and
+    /// recorded.
+    #[sqlx::test]
+    async fn sweep_seals_withheld_blob_when_public_list_is_empty(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        // A repo with NO commits: the only object is a loose blob named by a
+        // non-branch ref. `git rev-list --all` silently skips it, so the
+        // path-annotated phase finds no commits while the catch-all phases
+        // surface the blob with an empty path on both the allow side (denied)
+        // and the withheld side (withheld to the owner). A branch ref cannot
+        // express this shape — git refuses non-commit objects under
+        // refs/heads — so the ref lives outside refs/heads.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().to_path_buf();
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo_path)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.email", "t@t"]);
+        run_git(&["config", "user.name", "t"]);
+        let blob = {
+            use std::io::Write;
+            let mut child = std::process::Command::new("git")
+                .args(["hash-object", "-w", "--stdin"])
+                .current_dir(&repo_path)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"direct secret\n")
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run_git(&["update-ref", "refs/direct/blob", &blob]);
+
+        // The owner must be a real resolvable did:key: `plan_seal` fail-closes
+        // on any unresolvable recipient, and the owner is always in the
+        // recipient set, so a fixture-string owner would SkipUnresolvable and
+        // the seal under test would never run.
+        let owner_did = gitlawb_core::identity::Keypair::generate()
+            .did()
+            .to_string();
+        let rec = seed_repo(
+            &owner_did,
+            "sweep-empty-public",
+            &repo_path.display().to_string(),
+        );
+        db.create_repo(&rec).await.unwrap();
+
+        // Path-scoped rule: required twice over. It makes the repo a
+        // path-scoped repo (the phase-2 `has_path_scoped_rule` gate), and it
+        // documents the deny the empty-path entries are additionally subject
+        // to on the allow side.
+        db.set_visibility_rule(
+            &rec.id,
+            "/secret/**",
+            crate::db::VisibilityMode::B,
+            &[],
+            &owner_did,
+        )
+        .await
+        .unwrap();
+
+        // Exactly one POST may land: the encrypted seal envelope. Any
+        // cleartext public upload would be a second hit and fail the mock.
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
+            .expect(1)
+            .with_status(200)
+            .with_body(r#"{"Hash":"QmEmptyPublicMockCid"}"#)
+            .create_async()
+            .await;
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            &server.url(),
+        ]);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let (_tx, mut rx) = watch::channel(false);
+        let mut cursor = None;
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        let (scanned, gaps, filled) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(scanned, 1, "the direct-blob repo reaches the per-repo loop");
+        assert_eq!(
+            gaps, 0,
+            "an empty public list is not a gap: nothing was offered to a backend"
+        );
+        assert_eq!(filled, 0, "no public pin work was attempted");
+        assert!(
+            !db.has_ipfs_cid(&blob).await.unwrap(),
+            "the direct blob must never be pinned in cleartext"
+        );
+        assert!(
+            db.encrypted_blob_cid(&rec.id, &blob)
+                .await
+                .unwrap()
+                .is_some(),
+            "encrypted recovery must run despite the empty public list"
+        );
+        m.assert_async().await;
     }
 
     /// The final-page proxy must be the lookahead, not `batch.len() < page`

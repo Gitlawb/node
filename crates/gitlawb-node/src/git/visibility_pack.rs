@@ -3945,9 +3945,15 @@ esac\n";
              not return Ok with a partial withheld set (review round 10 P1)"
         );
 
-        // Peeled-tag case: same input, but the walker has to peel
-        // the annotated tag before recursing. The same fail-closed
-        // invariant must hold.
+        // Peeled-tag case: the direct-tree ref is deleted first so this
+        // call walks ONLY the annotated tag ref. Otherwise both calls
+        // would share one clone, the walk would fail closed on the direct
+        // ref first, and the peel arm would never run in either call —
+        // a regression in the tag-of-tree shape would not be caught
+        // (review round 11 P3). With only the tag ref left, an Err
+        // proves the walker peeled the tag to the tree and hit the
+        // non-UTF-8 child through that path.
+        run(&["update-ref", "-d", "refs/tags/direct-tree"], &bare);
         let peeled = withheld_blob_oids(&bare, &rules, true, OWNER, None);
         assert!(
             peeled.is_err(),
