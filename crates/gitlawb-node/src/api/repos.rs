@@ -2292,12 +2292,17 @@ pub async fn git_receive_pack(
         h.update(&body);
         h.finalize().to_vec()
     };
+    // Durable intent is minimal: only the digest is consumed by
+    // recovery (marker correlation). The raw pack is never replayed
+    // by this split, so it is not copied into the shared database —
+    // every request lookup would otherwise re-materialize up to the
+    // route's 2 GiB body as BYTEA/WAL/backup amplification.
     let req_row = crate::db::ReceivePackRequest {
         id: request_id.clone(),
         repo_id: record.id.clone(),
         pusher_did: auth.0.to_string(),
         node_did: state.node_did.to_string(),
-        request_bytes: body.to_vec(),
+        request_bytes: Vec::new(),
         request_bytes_hash,
         state: crate::db::request_state::RECEIVED.to_string(),
         git_exit_ok: None,
@@ -2308,25 +2313,17 @@ pub async fn git_receive_pack(
         next_attempt_at: None,
         created_at: now.clone(),
         completed_at: None,
+        signature_header: Some(signature_header.clone()),
+        signature_input: Some(signature_input.clone()),
+        content_digest: Some(content_digest.clone()),
     };
-    if let Err(e) = state.db.insert_receive_pack_request(&req_row).await {
-        // A durable-intent write failure here means we cannot
-        // guarantee recovery for the upcoming git apply. Refuse the
-        // push with 503 rather than risk a ref landing with no
-        // recovery record.
-        tracing::error!(
-            err = %e,
-            repo = %name,
-            "failed to persist receive-pack request row; refusing push"
-        );
-        return Err(AppError::Overloaded(
-            "durable intent write failed, retry shortly".into(),
-        ));
-    }
+    // Atomic parent+children: either the full intent exists or none
+    // of it does, so a refused pre-Git request cannot strand a
+    // payload-only parent.
     if let Err(e) = state
         .db
-        .insert_pending_ref_transitions(
-            &request_id,
+        .insert_receive_pack_request_with_children(
+            &req_row,
             &record.id,
             &state.node_did.to_string(),
             auth.0.as_str(),
@@ -2405,12 +2402,21 @@ pub async fn git_receive_pack(
     //    uncertain outcomes on error.
     // 2. On success, write effects and then DELETE outbox rows so they
     //    don't replay on restart.
-    let (receive_raw, exit_ok) = match smart_http::receive_pack_raw(
+    //
+    // The reflog action binds the Git ref transaction to this request
+    // id so startup reconcile has request-specific landing proof
+    // (not just a tuple that a later request could recreate).
+    // Also ensure the marker namespace stays hidden for repos that
+    // predate the init_bare hideRefs config.
+    crate::git::store::ensure_marker_hidden(&disk_path);
+    let reflog_action = format!("gitlawb-request:{request_id}");
+    let (receive_raw, exit_ok) = match smart_http::receive_pack_raw_with_reflog(
         &state.git_bin,
         &disk_path,
         body,
         git_timeout,
         Some(admission),
+        Some(&reflog_action),
     )
     .await
     {
@@ -2512,12 +2518,17 @@ pub async fn git_receive_pack(
         }
     };
 
-    // Per-ref state flip. Rows go to `applied`, `cancelled`, or
-    // `uncertain` based on the report. The previous bulk helper
-    // `mark_pending_ref_transitions_applied(request_id)` marked
-    // EVERY row `applied` regardless of which refs git actually
-    // accepted — that is the bug that issued certs for rejected
-    // refs.
+    // Per-ref outcome, committed atomically with the parent request
+    // row in one transaction (see
+    // `commit_request_outcomes_atomically`). The previous code flipped
+    // children and stamped the parent in separate writes, so a crash
+    // between them left applied children attached to a `received`
+    // parent the drain never schedules. The normalized `parsed_report`
+    // is the single accepted-ref authority the executor consumes:
+    // parsed reports are stored verbatim, implicit-ok stores a
+    // synthetic all-ok report (never null), and the indeterminate
+    // no-report/non-zero path stores no report and moves the parent
+    // to `rejected_at_git` for fail-closed reconcile.
     let pending_ref_names: Vec<&str> = ref_updates.iter().map(|u| u.ref_name.as_str()).collect();
 
     // #26 Split PR 1: the push event id is keyed on
@@ -2533,35 +2544,43 @@ pub async fn git_receive_pack(
         .position(|u| ok_set.contains(u.ref_name.as_str()))
         .map(|i| i as i32);
 
-    if !unpack_ok && report.is_some() {
-        // Unpack failed explicitly — every row is proven not to have
-        // landed. Mark all prepared rows for this request as
-        // `cancelled` (the only state from which reconcile and drain
-        // both refuse to promote). The drain will not pick these up;
-        // the next startup's reconcile will not promote them.
-        if let Err(e) = state
-            .db
-            .mark_pending_ref_transitions_cancelled_for_names(&request_id, &pending_ref_names)
-            .await
-        {
-            tracing::warn!(
-                err = %e,
-                request_id = %request_id,
-                repo = %name,
-                "failed to mark pending ref transitions cancelled (unpack fail)"
-            );
+    // Build the atomic outcome inputs.
+    #[allow(clippy::type_complexity)]
+    let (unpack_failed, ok_names, ng_names, uncertain_names, parsed_json_opt, rejected_reason): (
+        bool,
+        Vec<&str>,
+        Vec<&str>,
+        Vec<&str>,
+        Option<serde_json::Value>,
+        Option<String>,
+    ) = if !unpack_ok {
+        if let Some(parsed) = &report {
+            let parsed_json = serde_json::json!({
+                "unpack_ok": parsed.0,
+                "ref_results": parsed.1.iter().map(|(n, ok)| serde_json::json!({
+                    "ref_name": n,
+                    "ok": ok,
+                })).collect::<Vec<_>>(),
+            });
+            (true, Vec::new(), Vec::new(), Vec::new(), Some(parsed_json), None)
+        } else {
+            // Unpack flag false without a parsed report (defensive):
+            // treat as indeterminate.
+            (
+                false,
+                Vec::new(),
+                Vec::new(),
+                pending_ref_names.clone(),
+                None,
+                Some("unpack failed without parseable report".to_string()),
+            )
         }
-    } else if report.is_some() {
-        // Report parsed. Split rows by per-ref ok/ng, with anything
-        // NOT in the report (defensive: report is a subset of the
-        // pushed refs in some edge cases) falling to `uncertain`.
+    } else if let Some(parsed) = &report {
         let mut ok_names: Vec<&str> = Vec::new();
         let mut ng_names: Vec<&str> = Vec::new();
         let mut unmentioned: Vec<&str> = Vec::new();
-        let reported: std::collections::HashSet<&str> = report
-            .as_ref()
-            .map(|(_, rs)| rs.iter().map(|(n, _)| n.as_str()).collect())
-            .unwrap_or_default();
+        let reported: std::collections::HashSet<&str> =
+            parsed.1.iter().map(|(n, _)| n.as_str()).collect();
         for name in &pending_ref_names {
             if !reported.contains(name) {
                 unmentioned.push(*name);
@@ -2579,97 +2598,6 @@ pub async fn git_receive_pack(
                 "git report-status: some refs rejected; durable effects will skip them"
             );
         }
-        if !ok_names.is_empty() {
-            if let Err(e) = state
-                .db
-                .mark_pending_ref_transitions_applied_for_names(&request_id, &ok_names)
-                .await
-            {
-                tracing::error!(
-                    err = %e,
-                    request_id = %request_id,
-                    repo = %name,
-                    "failed to mark pending ref transitions applied; recovery will re-derive"
-                );
-            }
-        }
-        if !ng_names.is_empty() {
-            if let Err(e) = state
-                .db
-                .mark_pending_ref_transitions_cancelled_for_names(&request_id, &ng_names)
-                .await
-            {
-                tracing::warn!(
-                    err = %e,
-                    request_id = %request_id,
-                    repo = %name,
-                    "failed to mark pending ref transitions cancelled (per-ref ng)"
-                );
-            }
-        }
-        if !unmentioned.is_empty() {
-            if let Err(e) = state
-                .db
-                .mark_pending_ref_transitions_uncertain_for_names(&request_id, &unmentioned)
-                .await
-            {
-                tracing::warn!(
-                    err = %e,
-                    request_id = %request_id,
-                    repo = %name,
-                    "failed to mark pending ref transitions uncertain (unmentioned in report)"
-                );
-            }
-        }
-    } else if ok_set.len() == pending_ref_names.len() && !pending_ref_names.is_empty() {
-        // Implicit-ok path: report was absent but the process exit
-        // was zero, so every pushed ref is treated as landed. Mark
-        // all prepared rows `applied` so the drain (and the live
-        // per-ref effects below) can run.
-        if let Err(e) = state
-            .db
-            .mark_pending_ref_transitions_applied(&request_id)
-            .await
-        {
-            tracing::error!(
-                err = %e,
-                request_id = %request_id,
-                repo = %name,
-                "failed to mark pending ref transitions applied (implicit ok, no report)"
-            );
-        }
-    } else {
-        // No report at all AND non-zero exit — every ref's fate is
-        // uncertain. The next startup reconcile will use the
-        // reflog proof to promote only those whose transition
-        // actually landed.
-        if let Err(e) = state
-            .db
-            .mark_pending_ref_transitions_uncertain(&request_id)
-            .await
-        {
-            tracing::warn!(
-                err = %e,
-                request_id = %request_id,
-                repo = %name,
-                "failed to mark pending ref transitions uncertain (no report)"
-            );
-        }
-    }
-
-    // #26 Split PR 1: transition the request row to
-    // `outcomes_committed` (with `parsed_report` and
-    // `accepted_ordinal` stamped) or `rejected_at_git` (when git
-    // returned non-zero with no parseable report). The drain
-    // (step 3) reads `outcomes_committed` rows; today the live
-    // path also runs the per-ref effects inline below so the
-    // request moves to `complete` is step-3 territory.
-    //
-    // The transition runs as a side-effect of the four-branch
-    // flip above: a parseable report always lands in
-    // `outcomes_committed`; the no-report non-zero-exit branch
-    // (the implicit `None =>` else) lands in `rejected_at_git`.
-    if let Some(parsed) = &report {
         let parsed_json = serde_json::json!({
             "unpack_ok": parsed.0,
             "ref_results": parsed.1.iter().map(|(n, ok)| serde_json::json!({
@@ -2677,56 +2605,57 @@ pub async fn git_receive_pack(
                 "ok": ok,
             })).collect::<Vec<_>>(),
         });
-        if let Err(e) = state
-            .db
-            .mark_request_outcomes_committed(&request_id, exit_ok, &parsed_json, accepted_ordinal)
-            .await
-        {
-            tracing::warn!(
-                err = %e,
-                request_id = %request_id,
-                repo = %name,
-                "failed to stamp request outcomes; the request row stays in `received` and the drain will not see it"
-            );
-        }
-    } else if !exit_ok {
-        // No report AND non-zero exit: request goes to
-        // `rejected_at_git`. Children stay in `prepared` for the
-        // reconcile step to decide via on-disk SHA + reflog proof.
-        if let Err(e) = state
-            .db
-            .mark_request_rejected_at_git(
-                &request_id,
-                Some("git returned non-zero exit with no parseable report"),
-            )
-            .await
-        {
-            tracing::warn!(
-                err = %e,
-                request_id = %request_id,
-                repo = %name,
-                "failed to mark request rejected_at_git; the request row stays in `received` and the drain will not see it"
-            );
-        }
+        (false, ok_names, ng_names, unmentioned, Some(parsed_json), None)
+    } else if exit_ok {
+        // Implicit-ok: no report but zero exit. Every pushed ref is
+        // treated as landed, with a synthetic all-ok report so the
+        // executor's single `parsed_report` authority is preserved
+        // (never null). Empty pushes synthesize an empty ok set.
+        let ok_names: Vec<&str> = pending_ref_names.clone();
+        let synthetic = serde_json::json!({
+            "unpack_ok": true,
+            "ref_results": ref_updates.iter().map(|u| serde_json::json!({
+                "ref_name": u.ref_name,
+                "ok": true,
+            })).collect::<Vec<_>>(),
+            "synthetic": "implicit-ok",
+        });
+        (false, ok_names, Vec::new(), Vec::new(), Some(synthetic), None)
     } else {
-        // No report but exit zero (implicit-ok): every ref
-        // accepted. The per-ref state flip above already marked
-        // every child `applied`; the request row goes to
-        // `outcomes_committed` with `parsed_report = null` and
-        // `accepted_ordinal = Some(0)`.
-        let parsed_json = serde_json::Value::Null;
-        if let Err(e) = state
-            .db
-            .mark_request_outcomes_committed(&request_id, exit_ok, &parsed_json, accepted_ordinal)
-            .await
-        {
-            tracing::warn!(
-                err = %e,
-                request_id = %request_id,
-                repo = %name,
-                "failed to stamp request outcomes (implicit-ok); the request row stays in `received`"
-            );
-        }
+        // No report and non-zero exit: indeterminate. Every ref is
+        // uncertain; the parent goes to `rejected_at_git` for
+        // fail-closed reconcile.
+        (
+            false,
+            Vec::new(),
+            Vec::new(),
+            pending_ref_names.clone(),
+            None,
+            Some("git returned non-zero exit with no parseable report".to_string()),
+        )
+    };
+
+    if let Err(e) = state
+        .db
+        .commit_request_outcomes_atomically(
+            &request_id,
+            &ok_names,
+            &ng_names,
+            &uncertain_names,
+            unpack_failed,
+            exit_ok,
+            parsed_json_opt.as_ref(),
+            accepted_ordinal,
+            rejected_reason.as_deref(),
+        )
+        .await
+    {
+        tracing::warn!(
+            err = %e,
+            request_id = %request_id,
+            repo = %name,
+            "failed to commit request outcomes atomically; reconcile will repair"
+        );
     }
 
     // On non-zero exit, return an error to the caller. The outbox
@@ -2905,18 +2834,31 @@ pub async fn git_receive_pack(
             }
         }
         Ok(crate::durable_outbox::EffectsOutcome::Retry { last_error }) => {
-            let next_attempt_at = (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
-            if let Err(e) = state
+            // Same centralized policy as the drain: exponential backoff,
+            // valid from both executable states, loud on zero-row.
+            let backoff_secs = match state.db.get_receive_pack_request(&request_id).await {
+                Ok(Some(r)) => 60_i64.saturating_mul(1_i64 << (r.attempt_count.clamp(0, 6) as u32)),
+                _ => 60,
+            };
+            let next_attempt_at =
+                (Utc::now() + chrono::Duration::seconds(backoff_secs)).to_rfc3339();
+            match state
                 .db
                 .mark_request_effects_pending(&request_id, &next_attempt_at, &last_error)
                 .await
             {
-                tracing::warn!(
+                Ok(0) => tracing::warn!(
+                    request_id = %request_id,
+                    repo = %name,
+                    "live path: mark_request_effects_pending affected 0 rows; drain will retry"
+                ),
+                Err(e) => tracing::warn!(
                     err = %e,
                     request_id = %request_id,
                     repo = %name,
                     "live path: mark_request_effects_pending failed; drain will retry"
-                );
+                ),
+                _ => {}
             }
         }
         Err(e) => {
@@ -6972,7 +6914,13 @@ mod tests {
                         "203.0.113.83:5000".parse::<SocketAddr>().unwrap(),
                     )),
                     axum::http::HeaderMap::new(),
-                    axum::body::Bytes::from_static(b"0000"),
+                    // Request-level gate defines success as
+                    // `exit_ok && any_ref_ok`: a bare `0000` flush
+                    // carries no ref command, so `ok_set` is empty
+                    // and the push correctly skips the Tigris upload.
+                    // Send one accepted ref so this positive control
+                    // exercises the upload path.
+                    ref_update_body("1111111111111111111111111111111111111111"),
                 ),
             )
             .await
@@ -10506,7 +10454,23 @@ mod tests {
         let log = tmp.join("git.log");
         let git_bin = match git_body {
             Some(body) => write_fake_git(tmp, body),
-            None => f2a_logging_git(tmp, &log),
+            // Default shim: fake `receive-pack` success (drain stdin,
+            // exit 0, no report-status so the handler takes the
+            // implicit-ok path with a synthetic all-ok outcome) while
+            // logging every invocation and delegating all other git
+            // commands to real git. A bare `0000` flush carries no ref
+            // command, so `ok_set` is empty and the request-level gate
+            // (`exit_ok && any_ref_ok`) correctly spawns no tail —
+            // `p2_push` therefore sends one accepted ref.
+            None => {
+                let body = format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\n\
+                     case \"$1\" in receive-pack) cat >/dev/null 2>/dev/null; exit 0 ;; esac\n\
+                     exec git \"$@\"\n",
+                    log.display()
+                );
+                write_fake_git(tmp, &body)
+            }
         };
         let repos_dir = tmp.join("repos");
         std::fs::create_dir_all(&repos_dir).unwrap();
@@ -10556,13 +10520,19 @@ mod tests {
         use axum::extract::{Path, State};
         use axum::Extension;
         use std::net::SocketAddr;
+        // One accepted ref: the request-level gate (`exit_ok &&
+        // any_ref_ok`) needs a landed ref to spawn the replication
+        // tail and reach the Tigris upload; a bare `0000` flush is
+        // correctly a no-op.
+        let line = format!("{ZERO_SHA} 1111111111111111111111111111111111111111 refs/heads/main");
+        let body = axum::body::Bytes::from(format!("{:04x}{}0000", line.len() + 4, line));
         git_receive_pack(
             State(state.clone()),
             Path((owner.to_string(), name.to_string())),
             Extension(crate::auth::AuthenticatedDid(format!("did:key:{owner}"))),
             crate::rate_limit::PeerAddr(Some("203.0.113.90:5000".parse::<SocketAddr>().unwrap())),
             axum::http::HeaderMap::new(),
-            axum::body::Bytes::from_static(b"0000"),
+            body,
         )
     }
 

@@ -280,6 +280,13 @@ pub struct ReceivePackRequest {
     pub next_attempt_at: Option<String>,
     pub created_at: String,
     pub completed_at: Option<String>,
+    /// Verified RFC 9421 authorization envelope, copied from the
+    /// authenticated request headers at intent time so recovery can
+    /// prove the named pusher authorized the exact body digest.
+    /// Nullable for rows written before v32; new rows always set it.
+    pub signature_header: Option<String>,
+    pub signature_input: Option<String>,
+    pub content_digest: Option<String>,
 }
 
 /// #26 Split PR 1 — request-level state vocabulary. The `received` →
@@ -1595,6 +1602,23 @@ const MIGRATIONS: &[Migration] = &[
             // partial index on a low-cardinality state column is
             // small and cheap.
             "CREATE INDEX IF NOT EXISTS idx_receive_pack_requests_quarantined ON receive_pack_requests (created_at) WHERE state = 'quarantined'",
+        ],
+    },
+    Migration {
+        // #26 Split PR 1 — durable authorization proof on the
+        // request aggregate. Children carry the verified RFC 9421
+        // headers but are deleted after effects; without a
+        // request-level copy the only proof is retired before its
+        // declared downstream consumer (cert/anchor in PR #386)
+        // can use it. Nullable so pre-v32 rows remain valid; new
+        // intents always populate all three.
+        version: 32,
+        name: "receive_pack_requests_proof",
+        stmts: &[
+            "ALTER TABLE receive_pack_requests ADD COLUMN IF NOT EXISTS signature_header TEXT",
+            "ALTER TABLE receive_pack_requests ADD COLUMN IF NOT EXISTS signature_input TEXT",
+            "ALTER TABLE receive_pack_requests ADD COLUMN IF NOT EXISTS content_digest TEXT",
+            "COMMENT ON COLUMN receive_pack_requests.signature_header IS 'v32: verified RFC 9421 Signature header copied at intent time; bound to request_bytes_hash'",
         ],
     },
 ];
@@ -2976,18 +3000,19 @@ impl Db {
     /// step (already on this branch) handles via on-disk SHA + reflog
     /// proof.
     ///
-    /// The insert is single-row; the matching children are written by
-    /// the handler's existing `insert_pending_ref_transitions` call in
-    /// the SAME transaction boundary. Step 2 does not introduce a
-    /// "with-children" wrapper — the handler's call ordering is the
-    /// contract, and the tests pin the two writes as a pair.
+    /// Prefer [`Db::insert_receive_pack_request_with_children`] for new
+    /// code: it writes the parent and all children in one transaction
+    /// so a refused pre-Git request cannot strand a payload-only
+    /// parent.
+    #[allow(dead_code)]
     pub async fn insert_receive_pack_request(&self, req: &ReceivePackRequest) -> Result<()> {
         sqlx::query(
             r#"INSERT INTO receive_pack_requests
                (id, repo_id, pusher_did, node_did, request_bytes, request_bytes_hash,
                 state, git_exit_ok, parsed_report, accepted_ordinal, attempt_count,
-                last_error, next_attempt_at, created_at, completed_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"#,
+                last_error, next_attempt_at, created_at, completed_at,
+                signature_header, signature_input, content_digest)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)"#,
         )
         .bind(&req.id)
         .bind(&req.repo_id)
@@ -3004,9 +3029,118 @@ impl Db {
         .bind(req.next_attempt_at.as_deref())
         .bind(&req.created_at)
         .bind(req.completed_at.as_deref())
+        .bind(req.signature_header.as_deref())
+        .bind(req.signature_input.as_deref())
+        .bind(req.content_digest.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Atomic durable-intent write: parent request plus all ordered
+    /// ref children in one transaction. Either all exist or none
+    /// exist, so the reconcile/executor never sees a payload-only
+    /// parent. New handler code must use this instead of the two
+    /// separate inserts.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_receive_pack_request_with_children(
+        &self,
+        req: &ReceivePackRequest,
+        repo_id: &str,
+        node_did: &str,
+        pusher_did: &str,
+        ref_updates: &[crate::api::repos::RefUpdate],
+        signature_header: &str,
+        signature_input: &str,
+        content_digest: &str,
+    ) -> Result<Vec<PendingRefTransition>> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"INSERT INTO receive_pack_requests
+               (id, repo_id, pusher_did, node_did, request_bytes, request_bytes_hash,
+                state, git_exit_ok, parsed_report, accepted_ordinal, attempt_count,
+                last_error, next_attempt_at, created_at, completed_at,
+                signature_header, signature_input, content_digest)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)"#,
+        )
+        .bind(&req.id)
+        .bind(&req.repo_id)
+        .bind(&req.pusher_did)
+        .bind(&req.node_did)
+        .bind(&req.request_bytes)
+        .bind(&req.request_bytes_hash)
+        .bind(&req.state)
+        .bind(req.git_exit_ok)
+        .bind(req.parsed_report.as_ref())
+        .bind(req.accepted_ordinal)
+        .bind(req.attempt_count)
+        .bind(req.last_error.as_deref())
+        .bind(req.next_attempt_at.as_deref())
+        .bind(&req.created_at)
+        .bind(req.completed_at.as_deref())
+        .bind(req.signature_header.as_deref())
+        .bind(req.signature_input.as_deref())
+        .bind(req.content_digest.as_deref())
+        .execute(&mut *tx)
+        .await?;
+        let now = req.created_at.clone();
+        let mut out = Vec::with_capacity(ref_updates.len());
+        for (ordinal, update) in ref_updates.iter().enumerate() {
+            let ordinal_i32 = ordinal as i32;
+            let id = deterministic_id(&[
+                "pending_ref_transition",
+                &req.id,
+                repo_id,
+                &update.ref_name,
+                &update.old_sha,
+                &update.new_sha,
+            ]);
+            sqlx::query(
+                r#"INSERT INTO pending_ref_transitions
+                   (id, request_id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did,
+                    signature_header, signature_input, content_digest, state, created_at,
+                    ordinal, git_target_kind)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"#,
+            )
+            .bind(&id)
+            .bind(&req.id)
+            .bind(repo_id)
+            .bind(&update.ref_name)
+            .bind(&update.old_sha)
+            .bind(&update.new_sha)
+            .bind(pusher_did)
+            .bind(node_did)
+            .bind(signature_header)
+            .bind(signature_input)
+            .bind(content_digest)
+            .bind(pending_state::PREPARED)
+            .bind(&now)
+            .bind(ordinal_i32)
+            .bind(Option::<String>::None)
+            .execute(&mut *tx)
+            .await?;
+            out.push(PendingRefTransition {
+                id,
+                request_id: req.id.clone(),
+                repo_id: repo_id.to_string(),
+                ref_name: update.ref_name.clone(),
+                old_sha: update.old_sha.clone(),
+                new_sha: update.new_sha.clone(),
+                pusher_did: pusher_did.to_string(),
+                node_did: node_did.to_string(),
+                signature_header: signature_header.to_string(),
+                signature_input: signature_input.to_string(),
+                content_digest: content_digest.to_string(),
+                state: pending_state::PREPARED.to_string(),
+                created_at: now.clone(),
+                applied_at: None,
+                cancelled_at: None,
+                ordinal: ordinal_i32,
+                git_target_kind: None,
+            });
+        }
+        tx.commit().await?;
+        Ok(out)
     }
 
     /// Read a single `receive_pack_requests` row by id. Used by
@@ -3020,8 +3154,9 @@ impl Db {
         let row = sqlx::query(
             r#"SELECT id, repo_id, pusher_did, node_did, request_bytes, request_bytes_hash,
                        state, git_exit_ok, parsed_report, accepted_ordinal, attempt_count,
-                       last_error, next_attempt_at, created_at, completed_at
-               FROM receive_pack_requests WHERE id = $1"#,
+                       last_error, next_attempt_at, created_at, completed_at,
+                       signature_header, signature_input, content_digest
+                FROM receive_pack_requests WHERE id = $1"#,
         )
         .bind(request_id)
         .fetch_optional(&self.pool)
@@ -3034,6 +3169,7 @@ impl Db {
     /// ordinal of the first ref the report proves landed. The state
     /// gate in the WHERE clause means a concurrent drain cannot
     /// re-flip a row the handler is mid-update.
+    #[allow(dead_code)]
     pub async fn mark_request_outcomes_committed(
         &self,
         request_id: &str,
@@ -3062,6 +3198,7 @@ impl Db {
     /// returned non-zero with no parseable report. The children
     /// stay in `prepared` and the reconcile step decides their
     /// fate via on-disk SHA + reflog proof.
+    #[allow(dead_code)]
     pub async fn mark_request_rejected_at_git(
         &self,
         request_id: &str,
@@ -3114,11 +3251,11 @@ impl Db {
     }
 
     /// #26 Split PR 1 step 5 — when a request moves to
-    /// `quarantined`, its `prepared` children are reclassified to
+    /// `quarantined`, its non-terminal children are reclassified to
     /// `cancelled` so the drain's residual scan doesn't keep
-    /// picking them up. The `cancelled_at` is stamped at the
-    /// parent's quarantine time so a future operator reclassifying
-    /// the parent can recover the timing.
+    /// picking them up. Covers both `prepared` and `uncertain`:
+    /// quarantine is an aggregate transition, and an uncertain child
+    /// of a quarantined parent has no executable owner otherwise.
     pub async fn mark_children_rejected_for_quarantined_parent(
         &self,
         request_id: &str,
@@ -3127,12 +3264,13 @@ impl Db {
         let res = sqlx::query(
             r#"UPDATE pending_ref_transitions
                SET state = $2, cancelled_at = $3
-               WHERE request_id = $1 AND state = $4"#,
+               WHERE request_id = $1 AND state IN ($4, $5)"#,
         )
         .bind(request_id)
         .bind(pending_state::CANCELLED)
         .bind(&now)
         .bind(pending_state::PREPARED)
+        .bind(pending_state::UNCERTAIN)
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected())
@@ -3153,8 +3291,9 @@ impl Db {
         let rows = sqlx::query(
             r#"SELECT id, repo_id, pusher_did, node_did, request_bytes, request_bytes_hash,
                        state, git_exit_ok, parsed_report, accepted_ordinal, attempt_count,
-                       last_error, next_attempt_at, created_at, completed_at
-               FROM receive_pack_requests WHERE id = ANY($1)"#,
+                       last_error, next_attempt_at, created_at, completed_at,
+                       signature_header, signature_input, content_digest
+                FROM receive_pack_requests WHERE id = ANY($1)"#,
         )
         .bind(ids)
         .fetch_all(&self.pool)
@@ -3166,9 +3305,14 @@ impl Db {
             .collect())
     }
 
-    /// `outcomes_committed → effects_pending`. Step 3's effect
-    /// executor calls this when the drain picked up a request and
-    /// scheduled a retry.
+    /// `outcomes_committed → effects_pending` and
+    /// `effects_pending → effects_pending` (retry progression). The
+    /// first failure moves `outcomes_committed` to `effects_pending`;
+    /// every later failure must re-arm the same row, bump
+    /// `attempt_count`, and push `next_attempt_at` forward, otherwise
+    /// the bound check never advances and a poisoned request retries
+    /// forever. Returns rows affected; callers must fail loudly on
+    /// zero when the request was expected to exist.
     pub async fn mark_request_effects_pending(
         &self,
         request_id: &str,
@@ -3179,13 +3323,14 @@ impl Db {
             r#"UPDATE receive_pack_requests
                SET state = $2, attempt_count = attempt_count + 1,
                    next_attempt_at = $3, last_error = $4
-               WHERE id = $1 AND state = $5"#,
+               WHERE id = $1 AND state IN ($5, $6)"#,
         )
         .bind(request_id)
         .bind(request_state::EFFECTS_PENDING)
         .bind(next_attempt_at)
         .bind(last_error)
         .bind(request_state::OUTCOMES_COMMITTED)
+        .bind(request_state::EFFECTS_PENDING)
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected())
@@ -3220,12 +3365,13 @@ impl Db {
         let rows = sqlx::query(
             r#"SELECT id, repo_id, pusher_did, node_did, request_bytes, request_bytes_hash,
                        state, git_exit_ok, parsed_report, accepted_ordinal, attempt_count,
-                       last_error, next_attempt_at, created_at, completed_at
-               FROM receive_pack_requests
-               WHERE state IN ($1, $2)
-                 AND (next_attempt_at IS NULL OR next_attempt_at < $3)
-               ORDER BY created_at ASC, id ASC
-               LIMIT $4"#,
+                       last_error, next_attempt_at, created_at, completed_at,
+                       signature_header, signature_input, content_digest
+                FROM receive_pack_requests
+                WHERE state IN ($1, $2)
+                  AND (next_attempt_at IS NULL OR next_attempt_at < $3)
+                ORDER BY created_at ASC, id ASC
+                LIMIT $4"#,
         )
         .bind(request_state::OUTCOMES_COMMITTED)
         .bind(request_state::EFFECTS_PENDING)
@@ -3294,13 +3440,29 @@ impl Db {
     /// (built by v30) keeps this scan cheap. PostgreSQL does not
     /// accept `LIMIT` directly inside a `DELETE`, so the limit is
     /// applied via a subquery selecting the ids to delete.
+    #[allow(dead_code)]
     pub async fn purge_completed_receive_pack_requests(
         &self,
         older_than_iso: &str,
         limit: i64,
     ) -> Result<u64> {
+        let ids = self
+            .purge_completed_receive_pack_requests_returning(older_than_iso, limit)
+            .await?;
+        Ok(ids.len() as u64)
+    }
+
+    /// Same as [`Db::purge_completed_receive_pack_requests`] but
+    /// returns the deleted `(request_id, repo_id)` pairs so the caller
+    /// can retire Git-side marker refs for the same requests. Keeps
+    /// SQL and Git-side retention from diverging.
+    pub async fn purge_completed_receive_pack_requests_returning(
+        &self,
+        older_than_iso: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>> {
         let limit = limit.max(1);
-        let res = sqlx::query(
+        let rows: Vec<(String, String)> = sqlx::query_as(
             r#"DELETE FROM receive_pack_requests
                WHERE id IN (
                    SELECT id FROM receive_pack_requests
@@ -3308,24 +3470,31 @@ impl Db {
                      AND completed_at IS NOT NULL
                      AND completed_at < $3
                    LIMIT $4
-               )"#,
+               )
+               RETURNING id, repo_id"#,
         )
         .bind(request_state::COMPLETE)
         .bind(request_state::REJECTED_AT_GIT)
         .bind(older_than_iso)
         .bind(limit)
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(res.rows_affected())
+        Ok(rows)
     }
 
     /// #26 Split PR 1 step 4 — bounded retirement. Deletes
     /// `pending_ref_transitions` children whose parent request is
-    /// in `complete` or `rejected_at_git` AND whose
+    /// terminal (`complete` or `rejected_at_git`) AND whose
     /// `applied_at` (for accepted children) or `cancelled_at` (for
     /// rejected children) is older than `older_than_iso`. Children
     /// in `prepared` / `uncertain` are NEVER purged — those are
     /// the reconcile walk's responsibility.
+    ///
+    /// Parent terminality is enforced in the query itself via a
+    /// join, not by call order: an old `applied` child under a
+    /// still-executable `outcomes_committed`/`effects_pending`
+    /// parent is never eligible, and the startup purge racing the
+    /// reconcile cannot delete live work.
     ///
     /// Callers MUST purge the parent requests first so this scan
     /// has a clear contract. The `purge_request_queue` helper in
@@ -3339,10 +3508,12 @@ impl Db {
         let res = sqlx::query(
             r#"DELETE FROM pending_ref_transitions
                WHERE id IN (
-                   SELECT id FROM pending_ref_transitions
-                   WHERE state IN ($1, $2)
-                     AND ((state = $1 AND applied_at IS NOT NULL AND applied_at < $3)
-                       OR (state = $2 AND cancelled_at IS NOT NULL AND cancelled_at < $3))
+                   SELECT c.id FROM pending_ref_transitions c
+                   JOIN receive_pack_requests p ON p.id = c.request_id
+                   WHERE c.state IN ($1, $2)
+                     AND p.state IN ($5, $6)
+                     AND ((c.state = $1 AND c.applied_at IS NOT NULL AND c.applied_at < $3)
+                       OR (c.state = $2 AND c.cancelled_at IS NOT NULL AND c.cancelled_at < $3))
                    LIMIT $4
                )"#,
         )
@@ -3350,9 +3521,211 @@ impl Db {
         .bind(pending_state::CANCELLED)
         .bind(older_than_iso)
         .bind(limit)
+        .bind(request_state::COMPLETE)
+        .bind(request_state::REJECTED_AT_GIT)
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected())
+    }
+
+    /// Reconcile promotion of the request aggregate: `received` or
+    /// `rejected_at_git` → `outcomes_committed` with the normalized
+    /// accepted-ref outcome the executor consumes. Called by startup
+    /// reconcile after on-disk proof promotes children; without this
+    /// the child is `applied` but the parent can never schedule
+    /// effects. Returns rows affected (0 means the parent already
+    /// moved on — the caller must not treat that as success).
+    pub async fn promote_reconciled_request_outcomes(
+        &self,
+        request_id: &str,
+        git_exit_ok: bool,
+        parsed_report: &serde_json::Value,
+        accepted_ordinal: Option<i32>,
+    ) -> Result<u64> {
+        let res = sqlx::query(
+            r#"UPDATE receive_pack_requests
+               SET state = $2, git_exit_ok = $3, parsed_report = $4,
+                   accepted_ordinal = $5
+               WHERE id = $1 AND state IN ($6, $7)"#,
+        )
+        .bind(request_id)
+        .bind(request_state::OUTCOMES_COMMITTED)
+        .bind(git_exit_ok)
+        .bind(parsed_report)
+        .bind(accepted_ordinal)
+        .bind(request_state::RECEIVED)
+        .bind(request_state::REJECTED_AT_GIT)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Requests stuck with applied children but a non-executable
+    /// parent (`received` or `rejected_at_git`). Covers the crash gap
+    /// where the child flip committed but the parent outcomes commit
+    /// did not, plus Git landing a ref after the parent went
+    /// `rejected_at_git`. Bounded by `limit`.
+    pub async fn list_stuck_request_aggregates(&self, limit: i64) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            r#"SELECT DISTINCT c.request_id
+               FROM pending_ref_transitions c
+               JOIN receive_pack_requests p ON p.id = c.request_id
+               WHERE p.state IN ($1, $2)
+                 AND c.state = $3
+               LIMIT $4"#,
+        )
+        .bind(request_state::RECEIVED)
+        .bind(request_state::REJECTED_AT_GIT)
+        .bind(pending_state::APPLIED)
+        .bind(limit.max(1))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// Competing-claimant check for reconcile: does another request
+    /// claim the same `(repo, ref, old, new)` tuple? When two rows
+    /// claim the same landing, current repository state plus an
+    /// intent marker cannot establish which request caused it —
+    /// fail closed and leave both for attended recovery.
+    pub async fn has_competing_claimant(
+        &self,
+        repo_id: &str,
+        ref_name: &str,
+        old_sha: &str,
+        new_sha: &str,
+        exclude_request_id: &str,
+    ) -> Result<bool> {
+        let row: (i64,) = sqlx::query_as(
+            r#"SELECT COUNT(*)::BIGINT FROM pending_ref_transitions
+               WHERE repo_id = $1 AND ref_name = $2
+                 AND old_sha = $3 AND new_sha = $4
+                 AND request_id != $5
+                 AND state IN ($6, $7, $8)"#,
+        )
+        .bind(repo_id)
+        .bind(ref_name)
+        .bind(old_sha)
+        .bind(new_sha)
+        .bind(exclude_request_id)
+        .bind(pending_state::PREPARED)
+        .bind(pending_state::UNCERTAIN)
+        .bind(pending_state::APPLIED)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0 > 0)
+    }
+
+    /// Atomic post-Git outcome commit: child flips plus the parent
+    /// `received → outcomes_committed` (or `rejected_at_git` when
+    /// `outcomes` is None) in one transaction. Crash-safety: the
+    /// live path never leaves applied children attached to a
+    /// `received` parent, which is the gap reconcile used to have to
+    /// repair. On `rejected` the parent goes terminal and children
+    /// are left for reconcile/attended recovery per the existing
+    /// contract.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_request_outcomes_atomically(
+        &self,
+        request_id: &str,
+        ok_names: &[&str],
+        ng_names: &[&str],
+        uncertain_names: &[&str],
+        unpack_failed: bool,
+        git_exit_ok: bool,
+        parsed_report: Option<&serde_json::Value>,
+        accepted_ordinal: Option<i32>,
+        rejected_reason: Option<&str>,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let now = Utc::now().to_rfc3339();
+        if unpack_failed {
+            sqlx::query(
+                r#"UPDATE pending_ref_transitions
+                   SET state = $1, cancelled_at = $2
+                   WHERE request_id = $3 AND state = $4"#,
+            )
+            .bind(pending_state::CANCELLED)
+            .bind(&now)
+            .bind(request_id)
+            .bind(pending_state::PREPARED)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            if !ok_names.is_empty() {
+                sqlx::query(
+                    r#"UPDATE pending_ref_transitions
+                       SET state = $1, applied_at = $2
+                       WHERE request_id = $3 AND state = $4 AND ref_name = ANY($5)"#,
+                )
+                .bind(pending_state::APPLIED)
+                .bind(&now)
+                .bind(request_id)
+                .bind(pending_state::PREPARED)
+                .bind(ok_names)
+                .execute(&mut *tx)
+                .await?;
+            }
+            if !ng_names.is_empty() {
+                sqlx::query(
+                    r#"UPDATE pending_ref_transitions
+                       SET state = $1, cancelled_at = $2
+                       WHERE request_id = $3 AND state = $4 AND ref_name = ANY($5)"#,
+                )
+                .bind(pending_state::CANCELLED)
+                .bind(&now)
+                .bind(request_id)
+                .bind(pending_state::PREPARED)
+                .bind(ng_names)
+                .execute(&mut *tx)
+                .await?;
+            }
+            if !uncertain_names.is_empty() {
+                sqlx::query(
+                    r#"UPDATE pending_ref_transitions
+                       SET state = $1
+                       WHERE request_id = $2 AND state = $3 AND ref_name = ANY($4)"#,
+                )
+                .bind(pending_state::UNCERTAIN)
+                .bind(request_id)
+                .bind(pending_state::PREPARED)
+                .bind(uncertain_names)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        if let Some(report) = parsed_report {
+            sqlx::query(
+                r#"UPDATE receive_pack_requests
+                   SET state = $2, git_exit_ok = $3, parsed_report = $4,
+                       accepted_ordinal = $5
+                   WHERE id = $1 AND state = $6"#,
+            )
+            .bind(request_id)
+            .bind(request_state::OUTCOMES_COMMITTED)
+            .bind(git_exit_ok)
+            .bind(report)
+            .bind(accepted_ordinal)
+            .bind(request_state::RECEIVED)
+            .execute(&mut *tx)
+            .await?;
+        } else if let Some(reason) = rejected_reason {
+            sqlx::query(
+                r#"UPDATE receive_pack_requests
+                   SET state = $2, git_exit_ok = FALSE, last_error = $3,
+                       completed_at = $4
+                   WHERE id = $1 AND state = $5"#,
+            )
+            .bind(request_id)
+            .bind(request_state::REJECTED_AT_GIT)
+            .bind(reason)
+            .bind(&now)
+            .bind(request_state::RECEIVED)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Flip every `prepared` row attached to `request_id` to `applied`.
@@ -5581,6 +5954,9 @@ fn row_to_receive_pack_request(r: sqlx::postgres::PgRow) -> ReceivePackRequest {
         next_attempt_at: r.get("next_attempt_at"),
         created_at: r.get("created_at"),
         completed_at: r.get("completed_at"),
+        signature_header: r.try_get("signature_header").ok().flatten(),
+        signature_input: r.try_get("signature_input").ok().flatten(),
+        content_digest: r.try_get("content_digest").ok().flatten(),
     }
 }
 

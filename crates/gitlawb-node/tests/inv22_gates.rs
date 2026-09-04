@@ -415,7 +415,7 @@ fn f3_second_writer_leased_until_reap() {
          NOT RepoWriteGuard (which drops at the disconnect instant, reopening F3).",
     );
     let receive = repos_production
-        .find("smart_http::receive_pack_raw(")
+        .find("smart_http::receive_pack_raw")
         .expect("F3 gate stale: git_receive_pack no longer calls smart_http::receive_pack_raw");
     assert!(
         lease_acquire < with_lease && with_lease < receive,
@@ -817,7 +817,7 @@ fn inv26_step5_marker_quarantine_and_bound_are_wired() {
         .find("git::store::marker_value_for")
         .expect("U5 gate stale: the live handler no longer computes the marker value");
     let receive_raw = production_repos
-        .find("smart_http::receive_pack_raw(")
+        .find("smart_http::receive_pack_raw")
         .expect("U5 gate stale: git_receive_pack no longer calls smart_http::receive_pack_raw");
     assert!(
         marker_write < receive_raw,

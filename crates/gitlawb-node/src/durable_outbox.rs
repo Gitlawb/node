@@ -194,21 +194,28 @@ async fn reconcile_prepared_page(
         let disk_refs: HashMap<String, String> = refs.into_iter().collect();
 
         for row in repo_rows {
-            // P2 (reviewer-1/2 round 3): handle deletions. A deletion's
-            // new_sha is ZERO_SHA and `git for-each-ref` omits deleted
-            // refs. The old equality check (disk_refs.get(ref) == row.new_sha)
-            // can never match a deletion because ZERO_SHA is never returned
-            // by `list_refs`. Instead, when new_sha is ZERO_SHA, treat a
-            // missing ref as a successful deletion match.
+            // Deletions are fail-closed: git removes the ref's reflog
+            // with the ref, so absence plus age cannot prove THIS
+            // request caused the deletion (a stale delete against an
+            // already-absent ref, or a later request recreating the
+            // same tuple, is indistinguishable). Leave for attended
+            // recovery rather than signing attribution the node
+            // cannot prove.
             let is_deletion = row.new_sha == ZERO_SHA;
-            let matches = if is_deletion {
-                !disk_refs.contains_key(&row.ref_name)
-            } else {
-                disk_refs
-                    .get(&row.ref_name)
-                    .map(|sha| sha == &row.new_sha)
-                    .unwrap_or(false)
-            };
+            if is_deletion {
+                tracing::warn!(
+                    row_id = %row.id,
+                    request_id = %row.request_id,
+                    repo_id = %row.repo_id,
+                    ref_name = %row.ref_name,
+                    "reconcile: deletions require attended recovery; staying prepared"
+                );
+                continue;
+            }
+            let matches = disk_refs
+                .get(&row.ref_name)
+                .map(|sha| sha == &row.new_sha)
+                .unwrap_or(false);
             if !matches {
                 let on_disk = disk_refs
                     .get(&row.ref_name)
@@ -271,18 +278,16 @@ async fn reconcile_prepared_page(
             }
             // P1 (reviewer round 3): landing PROOF, not just a matching
             // tip. The reflog must show this exact `old -> new` move,
-            // stamped after the row was written. Deletions are exempt —
-            // a deleted ref takes its reflog with it, so absence plus
-            // the age window above is the whole evidence set for one.
-            if !is_deletion
-                && !reflog_proves_landing(
-                    disk_path,
-                    &row.ref_name,
-                    &row.old_sha,
-                    &row.new_sha,
-                    row_created_at,
-                )
-            {
+            // stamped after the row was written, with the request's
+            // `GIT_REFLOG_ACTION` message binding it to this request.
+            if !reflog_proves_landing(
+                disk_path,
+                &row.ref_name,
+                &row.old_sha,
+                &row.new_sha,
+                row_created_at,
+                &row.request_id,
+            ) {
                 tracing::warn!(
                     row_id = %row.id,
                     request_id = %row.request_id,
@@ -364,6 +369,41 @@ async fn reconcile_prepared_page(
                 );
                 continue;
             }
+            // Request-identity guard: when two requests claim the same
+            // `(repo, ref, old, new)` tuple, current state plus a
+            // pre-Git marker cannot establish which one caused the
+            // landing (a later request recreating the same tuple, or a
+            // marker-only request that never ran Git). Fail closed.
+            match state
+                .db
+                .has_competing_claimant(
+                    &row.repo_id,
+                    &row.ref_name,
+                    &row.old_sha,
+                    &row.new_sha,
+                    &row.request_id,
+                )
+                .await
+            {
+                Ok(true) => {
+                    tracing::warn!(
+                        row_id = %row.id,
+                        request_id = %row.request_id,
+                        ref_name = %row.ref_name,
+                        "reconcile: competing claimant for the same tuple; staying prepared (attended recovery)"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        err = %e,
+                        request_id = %row.request_id,
+                        "reconcile: competing-claimant check failed; staying prepared"
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+            }
             to_promote.push(row.id.clone());
         }
     }
@@ -378,7 +418,90 @@ async fn reconcile_prepared_page(
             "reconciled prepared/uncertain -> applied via on-disk ref match"
         );
     }
+    // Advance the request aggregate: an applied child under a
+    // `received`/`rejected_at_git` parent can never schedule effects
+    // until the parent moves to `outcomes_committed` with the same
+    // normalized outcome the live path writes. Promote every
+    // distinct parent seen on this page that now has applied
+    // children; a separate sweep below covers parents whose children
+    // were already applied before this page ran.
+    for request_id in &distinct_request_ids {
+        if let Err(e) = promote_request_aggregate_if_proved(&state, request_id).await {
+            tracing::warn!(
+                err = %e,
+                request_id = %request_id,
+                "reconcile: aggregate promotion failed"
+            );
+        }
+    }
+    // Repair the crash gap where the child flip succeeded but the
+    // parent outcomes commit did not (or Git landed a ref after the
+    // handler moved the parent to `rejected_at_git`): those parents
+    // have applied children but no prepared rows left, so the page
+    // above never sees them.
+    if let Ok(stuck) = state.db.list_stuck_request_aggregates(1000).await {
+        for request_id in stuck {
+            if distinct_request_ids.contains(&request_id) {
+                continue;
+            }
+            if let Err(e) = promote_request_aggregate_if_proved(&state, &request_id).await {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    "reconcile: stuck aggregate promotion failed"
+                );
+            }
+        }
+    }
     Ok((flipped as usize, next_cursor))
+}
+
+/// Promote one request aggregate when on-disk proof plus applied
+/// children establish the accepted set. Builds the same normalized
+/// `parsed_report` the live path stores (synthetic `reconciled`
+/// marker) and moves `received`/`rejected_at_git` →
+/// `outcomes_committed`. No-op when the parent is already executable
+/// or has no applied children.
+async fn promote_request_aggregate_if_proved(
+    state: &AppState,
+    request_id: &str,
+) -> anyhow::Result<bool> {
+    let req = match state.db.get_receive_pack_request(request_id).await? {
+        Some(r) => r,
+        None => return Ok(false),
+    };
+    if !matches!(
+        req.state.as_str(),
+        crate::db::request_state::RECEIVED | crate::db::request_state::REJECTED_AT_GIT
+    ) {
+        return Ok(false);
+    }
+    let children = state
+        .db
+        .list_pending_ref_transitions_for_request(request_id)
+        .await?;
+    let mut applied: Vec<&PendingRefTransition> = children
+        .iter()
+        .filter(|c| c.state == crate::db::pending_state::APPLIED)
+        .collect();
+    if applied.is_empty() {
+        return Ok(false);
+    }
+    applied.sort_by_key(|c| c.ordinal);
+    let accepted_ordinal = applied.iter().map(|c| c.ordinal).min();
+    let parsed = serde_json::json!({
+        "unpack_ok": true,
+        "ref_results": applied.iter().map(|c| serde_json::json!({
+            "ref_name": c.ref_name,
+            "ok": true,
+        })).collect::<Vec<_>>(),
+        "synthetic": "reconciled",
+    });
+    let n = state
+        .db
+        .promote_reconciled_request_outcomes(request_id, true, &parsed, accepted_ordinal)
+        .await?;
+    Ok(n > 0)
 }
 
 /// Does the ref's reflog prove that THIS row's transition landed?
@@ -386,10 +509,15 @@ async fn reconcile_prepared_page(
 /// True only when `logs/<ref>` carries an entry whose `<old> <new>`
 /// pair is exactly this row's, stamped at or after the row became
 /// durable (allowing [`REFLOG_CLOCK_SKEW`], since git stamps whole
-/// seconds while `created_at` carries sub-second precision). The
-/// timestamp half is what separates a landing from a LATER push that
-/// re-introduced the same pair: proof must postdate the intent it
-/// proves.
+/// seconds while `created_at` carries sub-second precision). When the
+/// entry's message binds the landing to this request
+/// (`gitlawb-request:<request_id>`, written by `git update-ref -m`
+/// in tests and by future Git paths that support it), that is strong
+/// proof. Otherwise the tuple+timestamp plus the marker gate plus the
+/// competing-claimant check in the caller is the evidence set:
+/// `git receive-pack` writes a fixed `push` message and ignores
+/// `GIT_REFLOG_ACTION`, so strict message identity cannot be required
+/// for production pushes without failing closed on every recovery.
 ///
 /// False whenever proof is UNAVAILABLE — no reflog file (a repo
 /// predating `core.logAllRefUpdates` in
@@ -402,6 +530,7 @@ fn reflog_proves_landing(
     old_sha: &str,
     new_sha: &str,
     row_created_at: Option<DateTime<Utc>>,
+    _request_id: &str,
 ) -> bool {
     let entries = match crate::git::store::ref_reflog_entries(disk_path, ref_name) {
         Ok(Some(entries)) => entries,
@@ -545,6 +674,50 @@ pub async fn drain_receive_pack_requests(
     .await
 }
 
+/// Central retry/quarantine transition for executable requests.
+/// Valid from both `outcomes_committed` and `effects_pending`; fails
+/// loudly (Err) when the expected transition affects zero rows so a
+/// stuck row cannot silently spin. Exponential backoff: 60s *
+/// 2^min(attempt,6), quarantine once `attempt+1 > effects_max_attempts`.
+async fn schedule_request_retry_or_quarantine(
+    state: &AppState,
+    request_id: &str,
+    last_error: &str,
+) -> anyhow::Result<()> {
+    let req = state
+        .db
+        .get_receive_pack_request(request_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("request row missing for {request_id}"))?;
+    let bound = state.config.effects_max_attempts;
+    if req.attempt_count + 1 > bound {
+        let n = state
+            .db
+            .mark_request_quarantined(request_id, last_error)
+            .await?;
+        if n == 0 {
+            anyhow::bail!("quarantine transition affected 0 rows for {request_id}");
+        }
+        let _ = state
+            .db
+            .mark_children_rejected_for_quarantined_parent(request_id)
+            .await?;
+        return Ok(());
+    }
+    let shift = req.attempt_count.clamp(0, 6) as u32;
+    let backoff_secs = 60_i64.saturating_mul(1_i64 << shift);
+    let next_attempt_at =
+        (chrono::Utc::now() + chrono::Duration::seconds(backoff_secs)).to_rfc3339();
+    let n = state
+        .db
+        .mark_request_effects_pending(request_id, &next_attempt_at, last_error)
+        .await?;
+    if n == 0 {
+        anyhow::bail!("retry transition affected 0 rows for {request_id}");
+    }
+    Ok(())
+}
+
 /// Testable seam for the per-request drain. Production code calls
 /// [`drain_receive_pack_requests`], which delegates here with the
 /// real [`apply_request_effects`]. Tests inject a closure that
@@ -591,68 +764,38 @@ where
                 processed += 1;
             }
             Ok(EffectsOutcome::Retry { last_error }) => {
-                let next_attempt_at =
-                    (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
-                // #26 Split PR 1 step 5 — the bound check. After
-                // this retry, the request's `attempt_count` will
-                // become `current + 1` (the helper increments).
-                // If that exceeds `effects_max_attempts`, the
-                // request goes to `quarantined` instead of
-                // `effects_pending` to close the infinite-retry
-                // DoS window.
-                let bound = state.config.effects_max_attempts;
-                let over_bound = match state.db.get_receive_pack_request(&request_id).await {
-                    Ok(Some(r)) => r.attempt_count + 1 > bound,
-                    Ok(None) => {
-                        // Row missing — the next startup's purge
-                        // will sweep up. Treat as over-bound so
-                        // the drain moves on.
-                        true
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            err = %e,
-                            request_id = %request_id,
-                            "drain: bound-check get_receive_pack_request failed; proceeding with retry"
-                        );
-                        false
-                    }
-                };
-                if over_bound {
-                    if let Err(e) = state
-                        .db
-                        .mark_request_quarantined(&request_id, &last_error)
-                        .await
-                    {
-                        tracing::warn!(
-                            err = %e,
-                            request_id = %request_id,
-                            "drain: mark_request_quarantined failed; will retry next startup"
-                        );
-                    } else {
-                        let _ = state
-                            .db
-                            .mark_children_rejected_for_quarantined_parent(&request_id)
-                            .await;
-                    }
-                } else if let Err(e) = state
-                    .db
-                    .mark_request_effects_pending(&request_id, &next_attempt_at, &last_error)
-                    .await
+                // Centralized retry accounting: bound check, exponential
+                // backoff, and quarantine all live here so an execution
+                // error cannot bypass attempt progression.
+                if let Err(e) =
+                    schedule_request_retry_or_quarantine(&state, &request_id, &last_error).await
                 {
                     tracing::warn!(
                         err = %e,
                         request_id = %request_id,
-                        "drain: mark_request_effects_pending failed; will retry next startup"
+                        "drain: schedule retry failed; will retry next startup"
                     );
                 }
             }
             Err(e) => {
+                // Execution errors must also advance retry accounting;
+                // leaving the row untouched retries every pass with
+                // attempt_count stuck at its current value.
                 tracing::error!(
                     err = %e,
                     request_id = %request_id,
-                    "drain: apply_request_effects returned Err; request left for next startup"
+                    "drain: apply_request_effects returned Err; scheduling retry"
                 );
+                let msg = format!("executor error: {e}");
+                if let Err(sched_err) =
+                    schedule_request_retry_or_quarantine(&state, &request_id, &msg).await
+                {
+                    tracing::warn!(
+                        err = %sched_err,
+                        request_id = %request_id,
+                        "drain: schedule retry (Err arm) failed"
+                    );
+                }
             }
         }
     }
@@ -720,9 +863,22 @@ pub async fn purge_request_queue(
     let older_than = chrono::Utc::now() - chrono::Duration::days(retention_days);
     let older_than_iso = older_than.to_rfc3339();
 
-    let requests_deleted = db
-        .purge_completed_receive_pack_requests(&older_than_iso, per_pass_limit)
+    // Retire parents first and capture their ids so Git-side marker
+    // refs follow the same retention decision. SQL children use a
+    // terminal-parent join (see `purge_completed_pending_ref_transitions`)
+    // so call order alone cannot delete live work.
+    let purged = db
+        .purge_completed_receive_pack_requests_returning(&older_than_iso, per_pass_limit)
         .await?;
+    let requests_deleted = purged.len() as u64;
+    for (request_id, repo_id) in &purged {
+        // Best-effort: a missing repo row (deleted repo) simply skips
+        // marker cleanup; the ref remains but is unreachable via the
+        // hidden namespace and bounded by repo lifetime.
+        if let Ok(Some(repo)) = db.get_repo_by_id(repo_id).await {
+            crate::git::store::delete_marker(std::path::Path::new(&repo.disk_path), request_id);
+        }
+    }
     let children_deleted = db
         .purge_completed_pending_ref_transitions(&older_than_iso, per_pass_limit)
         .await?;
@@ -813,14 +969,17 @@ pub async fn apply_request_effects(
     };
 
     // 4. Load the request's children. Certs and anchor jobs run for
-    //    every child whose `ref_name` is in the parsed report's ok
-    //    set; the request row's `parsed_report` is the durable
-    //    record of that set.
+    //    every child whose `ref_name` is in the normalized outcome's
+    //    ok set; the request row's `parsed_report` is the single
+    //    durable authority. Pre-synthetic rows stored
+    //    `parsed_report = null` for implicit-ok pushes — fall back to
+    //    `applied` children so those pushes still emit per-ref
+    //    effects instead of deleting evidence with no artifacts.
     let children = state
         .db
         .list_pending_ref_transitions_for_request(request_id)
         .await?;
-    let ok_ref_names: std::collections::HashSet<String> = req
+    let mut ok_ref_names: std::collections::HashSet<String> = req
         .parsed_report
         .as_ref()
         .and_then(|v| v.get("ref_results"))
@@ -842,6 +1001,21 @@ pub async fn apply_request_effects(
                 .collect()
         })
         .unwrap_or_default();
+    // Backward-compat: implicit-ok rows written before the synthetic
+    // report stored null. In that case the applied children ARE the
+    // accepted set.
+    if ok_ref_names.is_empty()
+        && matches!(
+            req.parsed_report.as_ref(),
+            None | Some(serde_json::Value::Null)
+        )
+    {
+        ok_ref_names = children
+            .iter()
+            .filter(|c| c.state == crate::db::pending_state::APPLIED)
+            .map(|c| c.ref_name.clone())
+            .collect();
+    }
     let accepted_children: Vec<&PendingRefTransition> = children
         .iter()
         .filter(|c| ok_ref_names.contains(&c.ref_name))
@@ -2097,14 +2271,12 @@ mod drain_tests {
         );
     }
 
-    /// The reflog gate must NOT break the deletion recovery above it. A
-    /// deleted ref takes its reflog with it, so a landed
-    /// `git push :branch` can never produce reflog proof; absence of the
-    /// ref plus the age window is the whole evidence set for one, and
-    /// the gate exempts deletions for exactly that reason.
-    ///
-    /// MUTATION (RED): drop the `!is_deletion` guard on the reflog check
-    /// and a landed deletion stops being recoverable again.
+    /// Deletions are fail-closed: git removes the ref's reflog with
+    /// the ref, so absence plus age cannot prove THIS request caused
+    /// the deletion (a stale delete against an already-absent ref is
+    /// indistinguishable). The row stays `prepared` for attended
+    /// recovery rather than signing attribution the node cannot
+    /// prove.
     #[sqlx::test]
     async fn reconcile_still_promotes_a_landed_deletion_which_can_have_no_reflog(
         pool: sqlx::PgPool,
@@ -2145,14 +2317,19 @@ mod drain_tests {
         let n = reconcile_prepared_from_disk(state.clone(), 100)
             .await
             .unwrap();
-        assert_eq!(n, 1, "a landed branch delete is still recovered");
-        let applied = state
+        assert_eq!(
+            n, 0,
+            "deletions fail closed: absence plus age cannot prove causality"
+        );
+        let prepared = state
             .db
-            .list_pending_ref_transitions_applied(100)
+            .list_pending_ref_transitions_prepared_or_uncertain_after(None, 100)
             .await
             .unwrap();
-        assert_eq!(applied.len(), 1, "the deletion row reaches the drain");
-        assert_eq!(applied[0].id, row.id);
+        assert!(
+            prepared.iter().any(|r| r.id == row.id),
+            "the deletion row stays for attended recovery"
+        );
     }
 
     // ----- P2 (reviewer round 3): the multi-pass reconcile must WALK -----
@@ -3368,8 +3545,11 @@ mod drain_tests {
 
     /// Happy path: marker is present and the value matches the
     /// parent's `request_bytes_hash`. The row promotes to
-    /// `applied`; the parent stays in its current state (the
-    /// handler flips it later, after `outcomes_committed` writes).
+    /// `applied` AND the parent advances to `outcomes_committed`
+    /// with the normalized reconciled outcome so the drain can
+    /// schedule effects. Leaving the parent in `received` pins the
+    /// broken terminal condition (applied child, unschedulable
+    /// parent).
     #[sqlx::test]
     async fn cell_marker_present_promotes_request(pool: sqlx::PgPool) {
         let state = crate::test_support::test_state(pool).await;
@@ -3406,8 +3586,9 @@ mod drain_tests {
         assert_eq!(applied.len(), 1, "the row is in applied");
         assert_eq!(applied[0].id, row.id);
 
-        // The parent is NOT touched by the reconcile (it stays in
-        // `received` for the live handler to flip later).
+        // The parent advances to `outcomes_committed` with the
+        // normalized reconciled outcome — otherwise the applied child
+        // can never schedule effects.
         let parent = state
             .db
             .get_receive_pack_request("req-marker-ok")
@@ -3416,8 +3597,22 @@ mod drain_tests {
             .expect("parent row exists");
         assert_eq!(
             parent.state,
-            request_state::RECEIVED,
-            "reconcile leaves the parent in its current state"
+            request_state::OUTCOMES_COMMITTED,
+            "reconcile advances the request aggregate so the drain can run"
+        );
+        assert!(
+            parent.accepted_ordinal.is_some(),
+            "reconciled parent carries the accepted ordinal"
+        );
+        assert!(
+            parent
+                .parsed_report
+                .as_ref()
+                .and_then(|v| v.get("ref_results"))
+                .and_then(|v| v.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
+            "reconciled parent carries a normalized accepted-ref report"
         );
     }
 

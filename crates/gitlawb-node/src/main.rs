@@ -818,6 +818,12 @@ fn spawn_queue_lifecycle_sweep(state: &AppState, config: &Config) -> tokio::task
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Consume the immediate first tick: Tokio intervals fire
+        // immediately on creation, which would run the purge
+        // concurrently with startup reconcile/drain. The child purge
+        // is terminal-parent-gated in SQL, but delaying the first
+        // sweep a full period removes the race entirely.
+        interval.tick().await;
         loop {
             tokio::select! {
                 _ = interval.tick() => {

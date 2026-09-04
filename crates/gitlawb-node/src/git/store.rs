@@ -86,8 +86,70 @@ pub fn init_bare(path: &Path) -> Result<()> {
         Ok(_) => {}
     }
 
+    // Hide the internal marker namespace from clone/fetch
+    // advertisement. `refs/gitlawb/requests/*` carries request UUIDs
+    // and would otherwise leak per-push metadata to every client and
+    // grow advertisement cost with push count.
+    for (key, value) in [
+        ("uploadpack.hideRefs", "refs/gitlawb/requests/"),
+        ("transfer.hideRefs", "refs/gitlawb/requests/"),
+    ] {
+        let out = Command::new("git")
+            .args(["config", "--add", key, value])
+            .current_dir(path)
+            .output();
+        if let Ok(o) = out {
+            if !o.status.success() {
+                tracing::warn!(
+                    path = %path.display(),
+                    key = %key,
+                    stderr = %String::from_utf8_lossy(&o.stderr),
+                    "failed to hide internal marker namespace"
+                );
+            }
+        }
+    }
+
     tracing::info!("initialized bare repo at {}", path.display());
     Ok(())
+}
+
+/// Ensure an existing repo hides the internal marker namespace.
+/// Idempotent; used at push time for repos predating the `init_bare`
+/// hideRefs config so advertisement cannot diverge by repo age.
+pub fn ensure_marker_hidden(repo_path: &Path) {
+    for (key, value) in [
+        ("uploadpack.hideRefs", "refs/gitlawb/requests/"),
+        ("transfer.hideRefs", "refs/gitlawb/requests/"),
+    ] {
+        let current = Command::new("git")
+            .args(["config", "--get-all", key])
+            .current_dir(repo_path)
+            .output();
+        let already = current
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(|l| l.trim() == value)
+            })
+            .unwrap_or(false);
+        if !already {
+            let _ = Command::new("git")
+                .args(["config", "--add", key, value])
+                .current_dir(repo_path)
+                .output();
+        }
+    }
+}
+
+/// Delete a per-request marker ref. Best-effort; called on terminal
+/// retirement so SQL and Git-side retention cannot diverge.
+pub fn delete_marker(repo_path: &Path, request_id: &str) {
+    let ref_name = format!("refs/gitlawb/requests/{request_id}");
+    let _ = Command::new("git")
+        .args(["update-ref", "-d", &ref_name, "--no-deref"])
+        .current_dir(repo_path)
+        .output();
 }
 
 /// One parsed reflog entry: the `<old> <new>` pair a single ref update recorded,
@@ -103,6 +165,10 @@ pub struct ReflogEntry {
     pub new_sha: String,
     /// Seconds since the unix epoch, as git wrote them.
     pub at: i64,
+    /// Reflog message (after the TAB). The live handler sets
+    /// `GIT_REFLOG_ACTION=gitlawb-request:<request_id>` so recovery
+    /// can bind a landing to the exact request that caused it.
+    pub message: String,
 }
 
 /// How many bytes of the END of a reflog file are read. A reflog line is roughly
@@ -195,8 +261,11 @@ pub fn ref_reflog_entries(repo_path: &Path, ref_name: &str) -> Result<Option<Vec
     for line in raw.lines() {
         // The message after the TAB can contain anything, including spaces and
         // (in a `git commit -m` subject) tabs of its own, so split the header off
-        // at the FIRST tab and tokenize only that.
-        let header = line.split('\t').next().unwrap_or(line);
+        // at the FIRST tab and tokenize only that. The message itself is
+        // retained for request-identity binding (`GIT_REFLOG_ACTION`).
+        let mut split = line.splitn(2, '\t');
+        let header = split.next().unwrap_or(line);
+        let message = split.next().unwrap_or("").to_string();
         let tokens: Vec<&str> = header.split_whitespace().collect();
         // `<old> <new> <ident...> <ts> <tz>`: at minimum old, new, ts, tz.
         if tokens.len() < 4 {
@@ -210,6 +279,7 @@ pub fn ref_reflog_entries(repo_path: &Path, ref_name: &str) -> Result<Option<Vec
             old_sha: tokens[0].to_string(),
             new_sha: tokens[1].to_string(),
             at,
+            message,
         });
     }
     Ok(Some(out))

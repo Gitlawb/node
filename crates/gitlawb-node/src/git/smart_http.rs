@@ -250,6 +250,14 @@ pub async fn receive_pack(
 /// on a non-zero exit: the caller needs the stdout (which contains the
 /// report-status with per-ref ok/ng results) even when the process
 /// exits non-zero. A timeout still returns `Err`.
+///
+/// `reflog_action` (typically `gitlawb-request:<request_id>`) is
+/// exported as `GIT_REFLOG_ACTION` so the ref transaction writes
+/// request-bound landing evidence into the reflog. Recovery requires
+/// that evidence before auto-promoting a stranded row; without it a
+/// later request recreating the same old/new tuple is
+/// indistinguishable from the stranded one.
+#[allow(dead_code)]
 pub async fn receive_pack_raw(
     git_bin: &str,
     repo_path: &Path,
@@ -257,11 +265,26 @@ pub async fn receive_pack_raw(
     timeout: Duration,
     admission: Option<AdmissionGuard>,
 ) -> Result<(Vec<u8>, bool)> {
+    receive_pack_raw_with_reflog(git_bin, repo_path, request_body, timeout, admission, None).await
+}
+
+/// [`receive_pack_raw`] with explicit reflog binding.
+pub async fn receive_pack_raw_with_reflog(
+    git_bin: &str,
+    repo_path: &Path,
+    request_body: Bytes,
+    timeout: Duration,
+    admission: Option<AdmissionGuard>,
+    reflog_action: Option<&str>,
+) -> Result<(Vec<u8>, bool)> {
     let mut command = Command::new(git_bin);
     command
         .arg("receive-pack")
         .arg("--stateless-rpc")
         .arg(repo_path);
+    if let Some(action) = reflog_action {
+        command.env("GIT_REFLOG_ACTION", action);
+    }
     let (out, err, status, _admission) = drive_git_child_raw(
         command,
         request_body,
