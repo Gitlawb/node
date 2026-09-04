@@ -738,6 +738,23 @@ mod tests {
         String::from_utf8(payload).unwrap()
     }
 
+    async fn ws_recv_op_frames(stream: &mut tokio::net::TcpStream, op_id: &str) -> Vec<String> {
+        let mut frames = Vec::new();
+        loop {
+            let text = ws_recv_text(stream).await;
+            frames.push(text.clone());
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if v.get("id").and_then(|id| id.as_str()) == Some(op_id) {
+                    let msg_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    if msg_type == "complete" || msg_type == "error" {
+                        break;
+                    }
+                }
+            }
+        }
+        frames
+    }
+
     async fn connect_ws(addr: std::net::SocketAddr) -> tokio::net::TcpStream {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let req = format!(
@@ -786,7 +803,8 @@ mod tests {
         // Query with 6 aliased task fields (exceeding MAX_GRAPHQL_TASK_READS_PER_REQUEST = 5)
         let query = r#"{"id":"1","type":"subscribe","payload":{"query":"query { f1: tasks { items { id } } f2: tasks { items { id } } f3: tasks { items { id } } f4: tasks { items { id } } f5: tasks { items { id } } f6: tasks { items { id } } }"}}"#;
         ws_send_text(&mut stream, query).await;
-        let resp = ws_recv_text(&mut stream).await;
+        let frames = ws_recv_op_frames(&mut stream, "1").await;
+        let resp = frames.join("\n");
         assert!(
             resp.contains("rate limit exceeded"),
             "6th task field over WS must be braked: {resp}"
@@ -817,16 +835,52 @@ mod tests {
         // First task query succeeds (or returns valid data)
         let query1 = r#"{"id":"1","type":"subscribe","payload":{"query":"query { tasks { items { id } } }"}}"#;
         ws_send_text(&mut stream, query1).await;
-        let resp1 = ws_recv_text(&mut stream).await;
+        let frames1 = ws_recv_op_frames(&mut stream, "1").await;
+        let resp1 = frames1.join("\n");
         assert!(!resp1.contains("rate limit exceeded"));
 
         // Second task query on the same connection hits per-IP limiter
         let query2 = r#"{"id":"2","type":"subscribe","payload":{"query":"query { tasks { items { id } } }"}}"#;
         ws_send_text(&mut stream, query2).await;
-        let resp2 = ws_recv_text(&mut stream).await;
+        let frames2 = ws_recv_op_frames(&mut stream, "2").await;
+        let resp2 = frames2.join("\n");
         assert!(
             resp2.contains("rate limit exceeded"),
             "exceeded per-IP limiter over WS must return rate limit message: {resp2}"
         );
+    }
+
+    #[sqlx::test]
+    async fn graphql_ws_task_query_resets_field_budget_per_operation(pool: PgPool) {
+        let state = test_state(pool).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_router(state);
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut stream = connect_ws(addr).await;
+
+        // Execute 6 sequential 1-field queries on the same connection.
+        // Each operation must receive its own 5-field budget, so none are braked by the per-request limit.
+        for i in 1..=6 {
+            let id = i.to_string();
+            let query = format!(
+                r#"{{"id":"{id}","type":"subscribe","payload":{{"query":"query {{ tasks {{ items {{ id }} }} }}"}}}}"#
+            );
+            ws_send_text(&mut stream, &query).await;
+            let frames = ws_recv_op_frames(&mut stream, &id).await;
+            let resp = frames.join("\n");
+            assert!(
+                !resp.contains("rate limit exceeded"),
+                "operation {id} on the same WS connection must have a fresh field budget: {resp}"
+            );
+        }
     }
 }

@@ -98,6 +98,41 @@ pub(crate) fn graphql_finish_conflict(e: anyhow::Error) -> async_graphql::Error 
     ))
 }
 
+pub struct TaskReadBrakeExtension;
+
+impl async_graphql::extensions::ExtensionFactory for TaskReadBrakeExtension {
+    fn create(&self) -> Arc<dyn async_graphql::extensions::Extension> {
+        Arc::new(TaskReadBrakeExtensionImpl)
+    }
+}
+
+use async_graphql::async_trait::async_trait;
+
+struct TaskReadBrakeExtensionImpl;
+
+#[async_trait]
+impl async_graphql::extensions::Extension for TaskReadBrakeExtensionImpl {
+    async fn prepare_request(
+        &self,
+        ctx: &async_graphql::extensions::ExtensionContext<'_>,
+        mut request: async_graphql::Request,
+        next: async_graphql::extensions::NextPrepareRequest<'_>,
+    ) -> async_graphql::ServerResult<async_graphql::Request> {
+        if let Some(session_brake) = ctx
+            .session_data
+            .get(&std::any::TypeId::of::<crate::rate_limit::TaskReadBrake>())
+            .and_then(|d| d.downcast_ref::<crate::rate_limit::TaskReadBrake>())
+        {
+            request = request.data(crate::rate_limit::TaskReadBrake {
+                limiter: session_brake.limiter.clone(),
+                key: session_brake.key.clone(),
+                request_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            });
+        }
+        next.run(ctx, request).await
+    }
+}
+
 pub fn build_schema(
     db: Arc<Db>,
     ref_update_tx: tokio::sync::broadcast::Sender<RefUpdateBroadcast>,
@@ -109,6 +144,7 @@ pub fn build_schema(
         .data(ref_update_tx)
         .data(task_event_tx)
         .data(task_cursor_key)
+        .extension(TaskReadBrakeExtension)
         .finish()
 }
 

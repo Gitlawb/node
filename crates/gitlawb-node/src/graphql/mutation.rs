@@ -361,9 +361,24 @@ mod tests {
             .await;
         assert!(resp.errors.is_empty(), "first claim: {}", errors(&resp));
 
-        // The rival loses the race: an expected conflict, not an outage.
+        // The rival loses the race: ineligible caller receives opaque not-found.
         let resp = schema
             .execute(Request::new(claim(rival)).data(AuthenticatedDid(rival.into())))
+            .await;
+        let errs = errors(&resp);
+        assert!(
+            errs.contains("task not found"),
+            "ineligible caller after task is claimed must receive opaque not-found: {errs}"
+        );
+        assert!(
+            !errs.contains(crate::graphql::GRAPHQL_DB_ERROR_MESSAGE),
+            "ineligible claim is not a database failure: {errs}"
+        );
+
+        // A second claim that reaches the conditional SQL write (e.g. assignee claiming
+        // again on an already-claimed task) exercises the conflict mapper:
+        let resp = schema
+            .execute(Request::new(claim(assignee)).data(AuthenticatedDid(assignee.into())))
             .await;
         let errs = errors(&resp);
         assert!(
