@@ -1496,7 +1496,9 @@ impl PolicyMutexes {
     > {
         use std::sync::OnceLock;
         static REG: OnceLock<
-            std::sync::Mutex<std::collections::HashMap<&'static str, &'static tokio::sync::Mutex<()>>>,
+            std::sync::Mutex<
+                std::collections::HashMap<&'static str, &'static tokio::sync::Mutex<()>>,
+            >,
         > = OnceLock::new();
         REG.get_or_init(|| std::sync::Mutex::new(Default::default()))
     }
@@ -1509,7 +1511,9 @@ impl PolicyMutexes {
         // distinct repos ever observed.
         let repo_id_static: &'static str = Box::leak(repo_id.to_string().into_boxed_str());
         let mu: &'static tokio::sync::Mutex<()> = {
-            let mut g = Self::registry().lock().expect("policy mutex registry poisoned");
+            let mut g = Self::registry()
+                .lock()
+                .expect("policy mutex registry poisoned");
             g.entry(repo_id_static).or_insert_with(|| {
                 let m = std::sync::Arc::new(tokio::sync::Mutex::new(()));
                 Box::leak(Box::new(m))

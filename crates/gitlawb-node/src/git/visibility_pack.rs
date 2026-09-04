@@ -425,6 +425,11 @@ fn walk_tree_oids_bounded(
     )
 }
 
+// Round 10 P2 threaded the `walked` memo and the `invocations`
+// counter through the recursion, taking the signature from 6 to
+// 8 args. A `WalkState` struct would be cleaner; for one
+// recursive call site the `allow` is the smaller change.
+#[allow(clippy::too_many_arguments)]
 fn walk_tree_oids_inner(
     repo_path: &Path,
     git_bin: &str,
@@ -3909,13 +3914,13 @@ esac\n";
         )
         .trim()
         .to_string();
-        run(
-            &["update-ref", "refs/tags/direct-tree", &tree_oid],
-            &work,
-        );
+        run(&["update-ref", "refs/tags/direct-tree", &tree_oid], &work);
         // Peeled tag-of-tree: an annotated tag whose target is the same tree.
         // The walker has to peel the tag before it reaches the tree.
-        run(&["tag", "-a", "-m", "tagged", "tag-of-tree", &tree_oid], &work);
+        run(
+            &["tag", "-a", "-m", "tagged", "tag-of-tree", &tree_oid],
+            &work,
+        );
         // Push both to the bare clone so the walker exercises the
         // post-clone refs.
         run(
