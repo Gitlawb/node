@@ -454,3 +454,49 @@ fn port_zero_does_no_key_storage_io_at_all() {
         );
     }
 }
+
+/// A terminal `.` is a directory-valued spelling. Path drops it, so the load
+/// path would otherwise chmod the parent and publish a file named `keys`.
+#[test]
+fn terminal_dot_key_path_is_fatal_and_does_not_mutate() {
+    // Absent leaf: `/data/keys/.` must not create `keys` as a file or chmod `/data`.
+    {
+        let row = Row::new();
+        let data = row.tree().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let key = format!("{}/keys/.", data.display());
+        let cwd = row.home.path().to_path_buf();
+        assert_fatal_before_bind(&row, &key, &cwd);
+        let mode = std::fs::metadata(&data).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o755, "rejection must not chmod the parent");
+        assert!(
+            !data.join("keys").exists(),
+            "rejection must not create a file named keys"
+        );
+    }
+
+    // Existing directory at the would-be leaf: still boot-fatal, directory untouched.
+    {
+        let row = Row::new();
+        let data = row.tree().join("data");
+        let keys = data.join("keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let key = format!("{}/.", keys.display());
+        let cwd = row.home.path().to_path_buf();
+        assert_fatal_before_bind(&row, &key, &cwd);
+        assert!(
+            keys.is_dir(),
+            "the existing keys directory must remain a directory"
+        );
+        let data_mode = std::fs::metadata(&data).unwrap().permissions().mode() & 0o7777;
+        let keys_mode = std::fs::metadata(&keys).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(data_mode, 0o755, "rejection must not chmod the parent");
+        assert_eq!(
+            keys_mode, 0o700,
+            "rejection must not chmod the existing keys dir"
+        );
+    }
+}
