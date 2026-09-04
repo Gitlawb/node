@@ -2147,8 +2147,8 @@ mod visible_tasks_tests {
             .unwrap();
         assert_eq!(
             stranger_resp.status(),
-            StatusCode::CONFLICT,
-            "a stranger must not claim a task pre-assigned to someone else"
+            StatusCode::NOT_FOUND,
+            "a stranger must receive opaque not-found when attempting to claim a task pre-assigned to someone else"
         );
         let stranger_body = body_json(stranger_resp).await;
         assert!(!stranger_body.to_string().contains(SECRET_UCAN));
@@ -2165,6 +2165,20 @@ mod visible_tasks_tests {
             "hostile claim must leave the designated assignee in place"
         );
 
+        // Lower-layer SQL guard: even if an ineligible claim reached the database
+        // layer, the atomic SQL predicate `(assignee_did IS NULL OR ...)` refuses
+        // to overwrite the designated assignee.
+        let sql_err = state
+            .db
+            .claim_task("preassigned", STRANGER)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            task_write_conflict(sql_err, "conflict").to_string(),
+            "conflict: task not claimable: not found or already claimed",
+            "SQL guard must reject hostile claim with not-claimable conflict"
+        );
+
         let assignee_resp = full_task_router(state.clone())
             .oneshot(signed_request_as(
                 ASSIGNEE,
@@ -2179,7 +2193,7 @@ mod visible_tasks_tests {
         assert_eq!(claimed["status"], "claimed");
         assert_eq!(claimed["assignee_did"], ASSIGNEE);
 
-        let second_resp = full_task_router(state)
+        let second_resp = full_task_router(state.clone())
             .oneshot(signed_request_as(
                 STRANGER,
                 Method::POST,
@@ -2190,8 +2204,23 @@ mod visible_tasks_tests {
             .unwrap();
         assert_eq!(
             second_resp.status(),
+            StatusCode::NOT_FOUND,
+            "an ineligible claimant after the task is claimed must still receive opaque not-found"
+        );
+
+        let second_assignee_resp = full_task_router(state)
+            .oneshot(signed_request_as(
+                ASSIGNEE,
+                Method::POST,
+                "/api/v1/tasks/preassigned/claim",
+                Body::from(format!(r#"{{"assignee_did":"{ASSIGNEE}"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            second_assignee_resp.status(),
             StatusCode::CONFLICT,
-            "a second claim after the assignee took the task must be refused"
+            "a second claim after the task is already claimed must return 409 conflict"
         );
     }
 
