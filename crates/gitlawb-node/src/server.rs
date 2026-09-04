@@ -993,9 +993,16 @@ mod tests {
             .await
             .unwrap();
         forged_stream.flush().await.unwrap();
-        let mut forged_buf = [0u8; 1024];
-        let n = forged_stream.read(&mut forged_buf).await.unwrap();
-        let forged_resp = String::from_utf8_lossy(&forged_buf[..n]);
+        let mut forged_bytes = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !forged_bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = forged_stream.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            forged_bytes.extend_from_slice(&chunk[..n]);
+        }
+        let forged_resp = String::from_utf8_lossy(&forged_bytes);
         assert!(
             forged_resp.starts_with("HTTP/1.1 401 Unauthorized"),
             "forged WS signature must be rejected with 401: {forged_resp}"
