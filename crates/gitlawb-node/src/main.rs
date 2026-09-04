@@ -1405,6 +1405,19 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
 /// The node identity key's load-or-create, taken by path so the storage
 /// contract can be tested without building a whole `Config`.
 fn load_or_create_keypair_at(key_path: &std::path::Path) -> Result<Keypair> {
+    if p2p::path_denotes_a_directory(key_path, None)
+        || key_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        anyhow::bail!(
+            "GITLAWB_KEY ({}) must name a key file, not a directory; a trailing separator, \
+             a final `.` or `..` component, and `..` traversal are refused so the path \
+             cannot retarget a parent",
+            key_path.display()
+        );
+    }
+
     #[cfg(unix)]
     if let Some(pem) = p2p::load_identity_pem_if_present(key_path)? {
         let kp = Keypair::from_pem(&pem).map_err(|e| anyhow::anyhow!("invalid PEM key: {e}"))?;
@@ -2437,6 +2450,40 @@ mod identity_key_storage_tests {
         assert!(
             !std::path::Path::new("/identity.pem").exists(),
             "the probe must not leave /identity.pem behind"
+        );
+    }
+
+    /// A terminal `.` is a directory spelling. Path drops it, so this would
+    /// otherwise publish a 0600 file named `keys` under `data`.
+    #[cfg(unix)]
+    #[test]
+    fn identity_terminal_dot_path_is_refused_without_retargeting() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let data = base.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let spelling = format!("{}/keys/.", data.display());
+        let key = std::path::Path::new(&spelling);
+        let Err(err) = load_or_create_keypair_at(key) else {
+            panic!("a terminal `.` identity path must be refused");
+        };
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("must name a key file") || text.contains("directory"),
+            "the refusal must name the directory spelling, got: {text}"
+        );
+        let mode = std::fs::symlink_metadata(&data)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o755, "rejection must not chmod the parent");
+        assert!(
+            !data.join("keys").exists(),
+            "rejection must not create a file named keys"
         );
     }
 }

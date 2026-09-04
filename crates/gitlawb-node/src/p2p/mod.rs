@@ -918,10 +918,7 @@ fn spelling_denotes_a_directory(spelling: &str) -> bool {
     if spelling == "~/" || spelling.ends_with('/') || spelling.ends_with('\\') {
         return true;
     }
-    let last = spelling
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(spelling);
+    let last = spelling.rsplit(['/', '\\']).next().unwrap_or(spelling);
     last == "." || last == ".."
 }
 
@@ -931,7 +928,7 @@ fn spelling_denotes_a_directory(spelling: &str) -> bool {
 /// before any directory is created or chmodded. The Path is consulted only
 /// as a backstop for callers that pass no raw spelling: the OsStr still
 /// carries the operator's `.` even after `components()` has dropped it.
-fn path_denotes_a_directory(key_path: &Path, configured_raw: Option<&str>) -> bool {
+pub(crate) fn path_denotes_a_directory(key_path: &Path, configured_raw: Option<&str>) -> bool {
     if let Some(raw) = configured_raw {
         if spelling_denotes_a_directory(raw) {
             return true;

@@ -724,8 +724,11 @@ impl Config {
     /// Resolve ~ in key_path
     pub fn resolved_key_path(&self) -> PathBuf {
         if self.key_path.starts_with("~/") {
-            if let Some(home) = dirs_next::home_dir() {
-                return home.join(&self.key_path[2..]);
+            let suffix = &self.key_path[2..];
+            if !crate::p2p::tilde_suffix_escapes_home(suffix) {
+                if let Some(home) = dirs_next::home_dir() {
+                    return home.join(suffix);
+                }
             }
         }
         PathBuf::from(&self.key_path)
@@ -769,6 +772,42 @@ impl Config {
                 self.max_concurrent_git_pushes,
                 Self::DB_POOL_APP_HEADROOM,
                 floor
+            ));
+        }
+
+        // Identity is always loaded, so a directory-valued or escaping spelling
+        // is boot-fatal here. Bare `identity.pem` stays legal; the p2p "must
+        // include a dedicated directory" rule is not imported.
+        if self.key_path.starts_with("~/") {
+            let suffix = &self.key_path[2..];
+            if crate::p2p::tilde_suffix_escapes_home(suffix) {
+                return Err(format!(
+                    "GITLAWB_KEY ({}) must stay inside the home directory after `~/` \
+                     expansion; rooted suffixes such as `~//etc/identity.pem`, drive-prefixed \
+                     suffixes, and `..` traversal are refused",
+                    self.key_path
+                ));
+            }
+        }
+        let identity_key_path = self.resolved_key_path();
+        if self.key_path.starts_with("~/") && identity_key_path == Path::new(&self.key_path) {
+            return Err(format!(
+                "GITLAWB_KEY ({}) starts with `~/` but no home directory could be resolved, \
+                 so it would name a literal `~` directory relative to the working directory. \
+                 Set an absolute path such as /data/keys/identity.pem.",
+                self.key_path
+            ));
+        }
+        if crate::p2p::path_denotes_a_directory(&identity_key_path, Some(&self.key_path))
+            || identity_key_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "GITLAWB_KEY ({}) must name a key file, not a directory; a trailing separator, \
+                 a final `.` or `..` component, and `..` traversal are refused so the path \
+                 cannot retarget a parent",
+                self.key_path
             ));
         }
 
@@ -1533,6 +1572,10 @@ mod tests {
         Config::parse_from(["gitlawb-node", "--p2p-key-path", path])
     }
 
+    fn config_with_key(path: &str) -> Config {
+        Config::parse_from(["gitlawb-node", "--key-path", path])
+    }
+
     fn config_with_p2p_port_and_key(port: u16, path: &str) -> Config {
         Config::parse_from([
             "gitlawb-node",
@@ -1967,5 +2010,76 @@ mod tests {
                 "{path:?} must be refused before Path can retarget it, got: {err}"
             );
         }
+    }
+
+    /// Identity allows a bare filename; it does not allow a directory spelling
+    /// that Path would retarget onto a parent.
+    #[test]
+    fn identity_key_path_terminal_dot_is_rejected() {
+        for path in ["/data/keys/.", "/data/keys/./.", "/data/keys/.//."] {
+            let err = config_with_key(path)
+                .validate()
+                .expect_err("a terminal `.` must be rejected as a directory");
+            assert!(
+                err.contains("GITLAWB_KEY") && err.contains("must name a key file"),
+                "{path:?} must be refused before Path can retarget it, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_key_path_trailing_directory_separator_is_rejected() {
+        let err = config_with_key("/data/keys/")
+            .validate()
+            .expect_err("a trailing directory separator must be rejected");
+        assert!(
+            err.contains("must name a key file"),
+            "trailing `/` must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_key_path_tilde_directory_is_rejected() {
+        let err = config_with_key("~/")
+            .validate()
+            .expect_err("`~/` must name a key file, not a directory");
+        assert!(
+            err.contains("must name a key file"),
+            "`~/` must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_key_path_tilde_escape_is_rejected() {
+        let err = config_with_key("~//etc/identity.pem")
+            .validate()
+            .expect_err("a `~/` spelling that escapes home must be rejected");
+        assert!(
+            err.contains("must stay inside the home directory"),
+            "tilde escape must be refused, got: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_key_path_parent_dir_component_is_rejected() {
+        let err = config_with_key("/data/keys/../identity.pem")
+            .validate()
+            .expect_err("`..` in an identity path must be rejected");
+        assert!(
+            err.contains("..") || err.contains("must name a key file"),
+            "`..` must be refused so the parent cannot retarget, got: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_key_path_bare_filename_is_accepted() {
+        for path in ["identity.pem", "./identity.pem", "/identity.pem"] {
+            config_with_key(path)
+                .validate()
+                .unwrap_or_else(|e| panic!("{path:?} is a legal identity path, got: {e}"));
+        }
+        Config::parse_from(["gitlawb-node"])
+            .validate()
+            .expect("the shipped default identity path must validate");
     }
 }
