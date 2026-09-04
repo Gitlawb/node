@@ -1064,11 +1064,15 @@ async fn call_tool(
             // 200-row server page cap returns what was asked for instead of a
             // silently truncated page, and reports an explicit incomplete
             // result when a guard or the node's scan ceiling stops it (#327).
+            let limit = match args.get("limit") {
+                None | Some(Value::Null) => 50,
+                Some(val) => val.as_i64().context("invalid limit: expected an integer")?,
+            };
             let result = crate::task::fetch_tasks(
                 &client,
                 args.get("status").and_then(|v| v.as_str()),
                 args.get("assignee_did").and_then(|v| v.as_str()),
-                args["limit"].as_i64().unwrap_or(50),
+                limit,
                 args.get("cursor").and_then(|v| v.as_str()),
             )
             .await?;
@@ -2307,6 +2311,47 @@ mod tests {
         .await
         .expect_err("must error without an identity");
         assert!(err.to_string().contains("no identity found"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_task_list_invalid_limit_rejected() {
+        let server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        let err = call_tool(
+            "task_list",
+            json!({"limit": "50"}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .expect_err("string limit must be rejected");
+        assert!(
+            err.to_string()
+                .contains("invalid limit: expected an integer"),
+            "got: {err}"
+        );
+
+        let err_float = call_tool(
+            "task_list",
+            json!({"limit": 50.5}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .expect_err("float limit must be rejected");
+        assert!(
+            err_float
+                .to_string()
+                .contains("invalid limit: expected an integer"),
+            "got: {err_float}"
+        );
     }
 
     #[test]

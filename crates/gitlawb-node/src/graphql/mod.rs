@@ -129,6 +129,13 @@ impl async_graphql::extensions::Extension for TaskReadBrakeExtensionImpl {
                 request_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             });
         }
+        if let Some(did) = ctx
+            .session_data
+            .get(&std::any::TypeId::of::<crate::auth::AuthenticatedDid>())
+            .and_then(|d| d.downcast_ref::<crate::auth::AuthenticatedDid>())
+        {
+            request = request.data(did.clone());
+        }
         next.run(ctx, request).await
     }
 }

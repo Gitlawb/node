@@ -54,10 +54,14 @@ async fn graphql_ws_handler(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     rate_limit::PeerAddr(peer): rate_limit::PeerAddr,
+    auth: Option<axum::Extension<auth::AuthenticatedDid>>,
     protocol: GraphQLProtocol,
     upgrade: WebSocketUpgrade,
 ) -> axum::response::Response {
     let mut data = async_graphql::Data::default();
+    if let Some(axum::Extension(did)) = auth {
+        data.insert(did);
+    }
     data.insert(rate_limit::TaskReadBrake {
         limiter: state.task_read_rate_limiter.clone(),
         key: rate_limit::client_key(&headers, peer, state.push_limiter_trust),
@@ -98,11 +102,9 @@ pub fn build_router(state: AppState) -> Router {
     // ── GraphQL routes ─────────────────────────────────────────────────────
     let graphql_routes = Router::new()
         .route("/graphql", get(graphql_playground).post(graphql_handler))
-        // Attach the verified DID to /graphql when a signature is present. The
-        // layer covers only routes added before it, so /graphql/ws (added after,
-        // read-only subscriptions) stays open.
-        .layer(middleware::from_fn(auth::optional_signature))
-        .route("/graphql/ws", get(graphql_ws_handler));
+        .route("/graphql/ws", get(graphql_ws_handler))
+        // Attach the verified DID to /graphql and /graphql/ws when a signature is present.
+        .layer(middleware::from_fn(auth::optional_signature));
 
     // ── Task routes (write — require HTTP Signature) ───────────────────────
     let task_write_routes = add_auth_layers(
@@ -882,5 +884,97 @@ mod tests {
                 "operation {id} on the same WS connection must have a fresh field budget: {resp}"
             );
         }
+    }
+
+    async fn connect_ws_signed(
+        addr: std::net::SocketAddr,
+        keypair: &gitlawb_core::identity::Keypair,
+    ) -> tokio::net::TcpStream {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let signed = gitlawb_core::http_sig::sign_request(keypair, "GET", "/graphql/ws", b"");
+        let req = format!(
+            "GET /graphql/ws HTTP/1.1\r\n\
+             Host: {}\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Protocol: graphql-transport-ws\r\n\
+             content-digest: {}\r\n\
+             signature-input: {}\r\n\
+             signature: {}\r\n\r\n",
+            addr, signed.content_digest, signed.signature_input, signed.signature
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp.starts_with("HTTP/1.1 101 Switching Protocols"));
+
+        // Init connection
+        ws_send_text(&mut stream, r#"{"type":"connection_init"}"#).await;
+        let ack = ws_recv_text(&mut stream).await;
+        assert!(ack.contains("connection_ack"));
+
+        stream
+    }
+
+    #[sqlx::test]
+    async fn graphql_ws_authenticated_query_accesses_private_task(pool: PgPool) {
+        let state = test_state(pool).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_router(state.clone());
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let keypair = gitlawb_core::identity::Keypair::generate();
+        let delegator_did = keypair.did().to_string();
+
+        let task = crate::db::AgentTask {
+            id: "ws-auth-task-01".into(),
+            repo_id: None,
+            delegator_did: delegator_did.clone(),
+            kind: "test".into(),
+            capability: "read".into(),
+            status: "pending".into(),
+            assignee_did: Some(delegator_did.clone()),
+            ucan_token: None,
+            payload: None,
+            result: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            deadline: None,
+        };
+        state.db.create_task(&task).await.unwrap();
+
+        // 1. Unauthenticated WS connection cannot see the private task
+        let mut unauth_stream = connect_ws(addr).await;
+        let query = r#"{"id":"1","type":"subscribe","payload":{"query":"query { tasks { items { id } } }"}}"#;
+        ws_send_text(&mut unauth_stream, query).await;
+        let unauth_frames = ws_recv_op_frames(&mut unauth_stream, "1").await;
+        let unauth_resp = unauth_frames.join("\n");
+        assert!(
+            !unauth_resp.contains("ws-auth-task-01"),
+            "unauthenticated WS must not disclose private task: {unauth_resp}"
+        );
+
+        // 2. Signed WS connection authenticates caller and retrieves the private task
+        let mut auth_stream = connect_ws_signed(addr, &keypair).await;
+        ws_send_text(&mut auth_stream, query).await;
+        let auth_frames = ws_recv_op_frames(&mut auth_stream, "1").await;
+        let auth_resp = auth_frames.join("\n");
+        assert!(
+            auth_resp.contains("ws-auth-task-01"),
+            "signed WS must authenticate delegator and return private task: {auth_resp}"
+        );
     }
 }
