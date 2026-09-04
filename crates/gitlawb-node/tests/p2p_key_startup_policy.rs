@@ -119,9 +119,19 @@ impl Row {
     }
 
     fn spawn(&self, p2p_key: &str, p2p_port: &str, cwd: &Path) -> ChildGuard {
+        self.spawn_env(p2p_key, p2p_port, cwd, &[])
+    }
+
+    fn spawn_env(
+        &self,
+        p2p_key: &str,
+        p2p_port: &str,
+        cwd: &Path,
+        extra: &[(&str, &str)],
+    ) -> ChildGuard {
         let repos = self.home.path().join("repos");
-        Command::new(env!("CARGO_BIN_EXE_gitlawb-node"))
-            .env_clear()
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_gitlawb-node"));
+        cmd.env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             // The subscriber is built from the default env filter, so with a
             // cleared environment the node logs nothing at all and every
@@ -142,10 +152,11 @@ impl Row {
             .env("GITLAWB_METRICS_ADDR", "")
             .current_dir(cwd)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map(ChildGuard)
-            .expect("spawn gitlawb-node")
+            .stderr(Stdio::piped());
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        cmd.spawn().map(ChildGuard).expect("spawn gitlawb-node")
     }
 }
 
@@ -499,4 +510,128 @@ fn terminal_dot_key_path_is_fatal_and_does_not_mutate() {
             "rejection must not chmod the existing keys dir"
         );
     }
+}
+
+/// GITLAWB_KEY has the same Path-retarget hole as GITLAWB_P2P_KEY: a terminal
+/// `.` would publish a file named `keys` under `data`. Fatal before bind, and
+/// the parent tree is unchanged. p2p is off so it cannot chmod a shared dir.
+#[test]
+fn identity_terminal_dot_is_fatal_and_does_not_mutate() {
+    let row = Row::new();
+    let data = row.home.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let key = format!("{}/keys/.", data.display());
+    let cwd = row.home.path().to_path_buf();
+    let mut child = row.spawn_env("p2p.key", "0", &cwd, &[("GITLAWB_KEY", key.as_str())]);
+    let (status, err) = wait_for_exit(&mut child);
+    assert!(
+        !status.success(),
+        "GITLAWB_KEY={key:?} must exit non-zero\n--- stderr ---\n{err}"
+    );
+    assert!(
+        err.contains("invalid configuration"),
+        "GITLAWB_KEY={key:?} must fail as invalid configuration\n--- stderr ---\n{err}"
+    );
+    assert!(
+        !err.contains("binding HTTP listener"),
+        "GITLAWB_KEY={key:?} must be refused BEFORE the listener binds\n--- stderr ---\n{err}"
+    );
+    let mode = std::fs::metadata(&data).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o755, "rejection must not chmod the parent");
+    assert!(
+        !data.join("keys").exists(),
+        "rejection must not create a file named keys"
+    );
+}
+
+/// An existing 0755 identity parent is usable and must not be chmodded. p2p is
+/// off so a default `~/.gitlawb/p2p.key` cannot tighten the same directory.
+#[test]
+fn identity_existing_0755_parent_is_not_chmodded_on_boot() {
+    let row = Row::new();
+    let iddir = row.home.path().join("idparent");
+    std::fs::create_dir(&iddir).unwrap();
+    std::fs::set_permissions(&iddir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let key = iddir.join("identity.pem");
+    let cwd = row.home.path().to_path_buf();
+    let mut child = row.spawn_env(
+        "p2p.key",
+        "0",
+        &cwd,
+        &[("GITLAWB_KEY", key.to_str().unwrap())],
+    );
+    let (found, log) = read_until(&mut child, "degraded HTTP server ready");
+    assert!(
+        found,
+        "a 0755 identity parent must still boot\n--- stderr ---\n{log}"
+    );
+    drop(child);
+    let mode = std::fs::metadata(&iddir).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(
+        mode, 0o755,
+        "boot must not chmod the existing identity parent"
+    );
+    assert_eq!(
+        std::fs::metadata(&key).unwrap().permissions().mode() & 0o7777,
+        0o600,
+        "the identity key must be owner-only"
+    );
+}
+
+/// Creating into a world-writable identity parent is refused before bind, and
+/// the directory is left untouched.
+#[test]
+fn identity_writable_parent_is_fatal_and_unchanged() {
+    let row = Row::new();
+    let iddir = row.home.path().join("idparent");
+    std::fs::create_dir(&iddir).unwrap();
+    std::fs::set_permissions(&iddir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let key = iddir.join("identity.pem");
+    let cwd = row.home.path().to_path_buf();
+    let mut child = row.spawn_env(
+        "p2p.key",
+        "0",
+        &cwd,
+        &[("GITLAWB_KEY", key.to_str().unwrap())],
+    );
+    let (status, err) = wait_for_exit(&mut child);
+    assert!(
+        !status.success(),
+        "a writable identity parent must exit non-zero\n--- stderr ---\n{err}"
+    );
+    assert!(
+        !err.contains("binding HTTP listener"),
+        "a writable identity parent must be refused BEFORE the listener binds\n--- stderr ---\n{err}"
+    );
+    let mode = std::fs::metadata(&iddir).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o777, "refusal must not chmod the parent");
+    assert!(!key.exists(), "refusal must not publish the identity key");
+}
+
+/// A 2700 (setgid, owner rwx) p2p key directory is repairable: boot, tighten
+/// to 0700, HTTP still comes up.
+#[test]
+fn p2p_setgid_key_directory_is_tightened_and_http_comes_up() {
+    let row = Row::new();
+    let keys = row.tree().join("keys");
+    std::fs::create_dir(&keys).unwrap();
+    std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o2700)).unwrap();
+    let key = keys.join("p2p.key");
+    let cwd = row.home.path().to_path_buf();
+    let mut child = row.spawn(key.to_str().unwrap(), "7546", &cwd);
+    let (found, log) = read_until_all(
+        &mut child,
+        &["degraded HTTP server ready", "generated new p2p identity"],
+    );
+    assert!(
+        found,
+        "a 2700 key directory must boot and generate a key\n--- stderr ---\n{log}"
+    );
+    drop(child);
+    let mode = std::fs::metadata(&keys).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(
+        mode, 0o700,
+        "2700 must be normalized to 0700, found {mode:04o}"
+    );
 }
