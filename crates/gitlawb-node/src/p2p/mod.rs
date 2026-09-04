@@ -638,6 +638,25 @@ pub(crate) mod pin {
     }
 }
 
+/// Non-unix publication has no mode pin, so `Pinned` is only a wrapper that
+/// lets the shared scratch-then-link writer type-check. The unix module above
+/// stays helper-only: this constructor is not compiled there.
+#[cfg(not(unix))]
+pub(crate) mod pin {
+    #[derive(Debug)]
+    pub(crate) struct Pinned<T>(T);
+
+    impl<T> Pinned<T> {
+        pub(crate) fn wrap(inner: T) -> Self {
+            Self(inner)
+        }
+
+        pub(crate) fn get_mut(&mut self) -> &mut T {
+            &mut self.0
+        }
+    }
+}
+
 /// Descriptor-anchored ancestor walk from a trusted anchor to the key
 /// directory's parent.
 ///
@@ -1349,10 +1368,11 @@ impl KeyDirHandle {
         &self,
         name: &std::ffi::OsStr,
     ) -> std::io::Result<pin::Pinned<std::fs::File>> {
-        std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(self.path.join(name))
+            .open(self.path.join(name))?;
+        Ok(pin::Pinned::wrap(file))
     }
 
     fn publish(&self, from: &std::ffi::OsStr, to: &std::ffi::OsStr) -> std::io::Result<()> {
