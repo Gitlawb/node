@@ -687,6 +687,28 @@ fn leaf_dir_open_flags() -> libc::c_int {
     libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC
 }
 
+/// Open `path` as a directory without following a symlink in the final
+/// position. `flags` is either the walk set (`O_PATH` on Linux) or the leaf
+/// set (`O_RDONLY`).
+#[cfg(unix)]
+fn open_dir_with_flags(path: &Path, flags: libc::c_int) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} contains an interior NUL byte", path.display()),
+        )
+    })?;
+    // SAFETY: `open` returns a new descriptor we own on success.
+    let fd = unsafe { libc::open(cpath.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
 #[cfg(unix)]
 fn verify_and_create_ancestor_chain(dir: &Path, euid: u32) -> Result<std::os::fd::OwnedFd> {
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -1537,6 +1559,68 @@ fn ensure_key_dir(dir: &Path) -> Result<KeyDirHandle> {
     Ok(handle)
 }
 
+/// Load an existing identity PEM without following a symlink at the key path
+/// or at its immediate parent. Missing parent or missing file is `Ok(None)`
+/// so the caller can create. A symlink, or any other non-regular object, is
+/// an error. Write-authority on the parent is not judged here: an existing
+/// key must still load after upgrade even if its directory is one we would
+/// refuse to create into.
+#[cfg(unix)]
+pub(crate) fn load_identity_pem_if_present(key_path: &Path) -> Result<Option<String>> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let file_name = key_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{} names no key file", key_path.display()))?;
+    let parent = key_parent(key_path);
+    let dir = match open_dir_with_flags(parent, leaf_dir_open_flags()) {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "failed to open {} to read the identity key (a symlink here is refused rather than followed)",
+                    parent.display()
+                )
+            });
+        }
+    };
+    let cname = std::ffi::CString::new(file_name.as_bytes())
+        .map_err(|_| anyhow::anyhow!("{} contains an interior NUL byte", key_path.display()))?;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    // SAFETY: openat relative to the directory descriptor we hold; O_NOFOLLOW
+    // refuses a symlink in the final position instead of reading through it.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), cname.as_ptr(), flags) };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(err).with_context(|| {
+            format!(
+                "failed to open identity key at {} (a symlink here is refused rather than followed)",
+                key_path.display()
+            )
+        });
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let md = file
+        .metadata()
+        .with_context(|| format!("failed to stat identity key at {}", key_path.display()))?;
+    if !md.is_file() {
+        anyhow::bail!(
+            "identity key at {} must be a regular file; directories, FIFOs, and special files are refused",
+            key_path.display()
+        );
+    }
+    let mut pem = String::new();
+    file.read_to_string(&mut pem)
+        .with_context(|| format!("failed to read key from {}", key_path.display()))?;
+    Ok(Some(pem))
+}
+
 /// Create `key_path`'s directory pinned to 0700 and publish `bytes` into it at
 /// a verified 0600, using the same scratch-then-link path the p2p key uses.
 ///
@@ -1556,24 +1640,21 @@ fn ensure_key_dir(dir: &Path) -> Result<KeyDirHandle> {
 #[cfg(unix)]
 pub(crate) fn create_pinned_dir_and_publish(key_path: &Path, bytes: &[u8]) -> Result<()> {
     use std::os::fd::AsRawFd;
-    use std::os::unix::fs::OpenOptionsExt;
 
     let file_name = key_path
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("{} names no key file", key_path.display()))?;
 
-    // A bare filename (`identity.pem`) or `./identity.pem` publishes into the
-    // working directory. That form is legal for GITLAWB_KEY and illegal for
-    // GITLAWB_P2P_KEY; this helper must not chmod cwd as if it were a nominated
-    // key directory.
+    // A bare filename (`identity.pem` / `./identity.pem`) or a root-adjacent
+    // path (`/identity.pem`) publishes into an already-nominated directory.
+    // That form is legal for GITLAWB_KEY and illegal for GITLAWB_P2P_KEY; this
+    // helper must not chmod cwd or `/` as if they were a nominated key
+    // directory.
     let parent = key_parent(key_path);
-    if parent == Path::new(".") {
-        let cwd = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
-            .open(".")
-            .with_context(|| "failed to open the working directory for the identity key")?;
-        let handle = KeyDirHandle::from_existing_dir(cwd, Path::new("."), key_path)?;
+    if parent.file_name().is_none() {
+        let cwd = open_dir_with_flags(parent, leaf_dir_open_flags())
+            .with_context(|| format!("failed to open {} for the identity key", parent.display()))?;
+        let handle = KeyDirHandle::from_existing_dir(cwd, parent, key_path)?;
         write_key_atomically(&handle, file_name, bytes)
             .with_context(|| format!("failed to write identity key to {}", key_path.display()))?;
         return Ok(());
@@ -1595,8 +1676,12 @@ pub(crate) fn create_pinned_dir_and_publish(key_path: &Path, bytes: &[u8]) -> Re
     }
     let grandparent = dir.parent().filter(|g| !g.as_os_str().is_empty());
     let gp_path = grandparent.unwrap_or_else(|| Path::new("."));
-    let gp = std::fs::File::open(gp_path)
-        .with_context(|| format!("failed to open {}", gp_path.display()))?;
+    let gp = open_dir_with_flags(gp_path, walk_dir_open_flags()).map_err(|e| {
+        anyhow::Error::new(e).context(format!(
+            "failed to open {} (a symlink here is refused rather than followed)",
+            gp_path.display()
+        ))
+    })?;
 
     let euid = effective_uid();
     let (pinned, created) =

@@ -1405,39 +1405,47 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
 /// The node identity key's load-or-create, taken by path so the storage
 /// contract can be tested without building a whole `Config`.
 fn load_or_create_keypair_at(key_path: &std::path::Path) -> Result<Keypair> {
+    #[cfg(unix)]
+    if let Some(pem) = p2p::load_identity_pem_if_present(key_path)? {
+        let kp = Keypair::from_pem(&pem).map_err(|e| anyhow::anyhow!("invalid PEM key: {e}"))?;
+        info!(path = %key_path.display(), "loaded existing identity");
+        return Ok(kp);
+    }
+
+    #[cfg(not(unix))]
     if key_path.exists() {
         let pem = std::fs::read_to_string(key_path)
             .with_context(|| format!("failed to read key from {}", key_path.display()))?;
         let kp = Keypair::from_pem(&pem).map_err(|e| anyhow::anyhow!("invalid PEM key: {e}"))?;
         info!(path = %key_path.display(), "loaded existing identity");
-        Ok(kp)
-    } else {
-        let kp = Keypair::generate();
-        let pem = kp
-            .to_pem()
-            .map_err(|e| anyhow::anyhow!("failed to serialize key: {e}"))?;
-
-        // The directory is created pinned to 0700 and the PEM is published
-        // through the same scratch-then-link path the p2p key uses, at a
-        // verified 0600. The previous flow (create_dir_all with no mode, then
-        // write, then set_permissions) is the sequence INV-23 prohibits: it
-        // left the directory world-writable under a permissive umask, and
-        // under a restrictive one it could not be opened at all, which failed
-        // the whole node here, before the listener binds.
-        #[cfg(unix)]
-        p2p::create_pinned_dir_and_publish(key_path, pem.as_bytes())?;
-
-        #[cfg(not(unix))]
-        {
-            if let Some(parent) = key_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(key_path, pem.as_bytes())?;
-        }
-
-        info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
-        Ok(kp)
+        return Ok(kp);
     }
+
+    let kp = Keypair::generate();
+    let pem = kp
+        .to_pem()
+        .map_err(|e| anyhow::anyhow!("failed to serialize key: {e}"))?;
+
+    // The directory is created pinned to 0700 and the PEM is published
+    // through the same scratch-then-link path the p2p key uses, at a
+    // verified 0600. The previous flow (create_dir_all with no mode, then
+    // write, then set_permissions) is the sequence INV-23 prohibits: it
+    // left the directory world-writable under a permissive umask, and
+    // under a restrictive one it could not be opened at all, which failed
+    // the whole node here, before the listener binds.
+    #[cfg(unix)]
+    p2p::create_pinned_dir_and_publish(key_path, pem.as_bytes())?;
+
+    #[cfg(not(unix))]
+    {
+        if let Some(parent) = key_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(key_path, pem.as_bytes())?;
+    }
+
+    info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
+    Ok(kp)
 }
 
 #[cfg(test)]
@@ -2248,5 +2256,134 @@ mod identity_key_storage_tests {
             .mode()
             & 0o7777;
         assert_eq!(cwd_mode, 0o777, "cwd must stay 0777");
+    }
+
+    /// An existing key in a writable directory still loads. Create is refused
+    /// there; turning that into a boot failure on upgrade would strand nodes
+    /// that already have a key.
+    #[cfg(unix)]
+    #[test]
+    fn existing_identity_in_a_writable_dir_still_loads() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let key = base.path().join("identity.pem");
+        let created = load_or_create_keypair_at(&key).expect("create under 0755");
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let reloaded = load_or_create_keypair_at(&key)
+            .expect("an existing identity in a writable directory must still load");
+        assert_eq!(created.did(), reloaded.did());
+        assert_eq!(
+            std::fs::symlink_metadata(base.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o777,
+            "load must not chmod the writable directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_symlink_key_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real.pem");
+        let created = load_or_create_keypair_at(&real).expect("create the symlink target");
+        std::os::unix::fs::symlink(&real, base.path().join("identity.pem")).unwrap();
+        let err = match load_or_create_keypair_at(&base.path().join("identity.pem")) {
+            Ok(kp) => panic!(
+                "a symlink at the identity path must be refused, not followed; loaded did={}",
+                kp.did()
+            ),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("symlink") || err.to_lowercase().contains("too many levels"),
+            "symlink refusal must name the link, got: {err}"
+        );
+        let reread = load_or_create_keypair_at(&real).expect("target still loads by its real path");
+        assert_eq!(
+            created.did(),
+            reread.did(),
+            "the symlink target must be unchanged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_symlinked_grandparent_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let key = link.join("keys").join("identity.pem");
+        let err = match load_or_create_keypair_at(&key) {
+            Ok(_) => panic!("a symlinked grandparent must be refused, not followed"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("symlink")
+                || err.to_lowercase().contains("too many levels")
+                || err.contains("loop"),
+            "symlinked grandparent refusal must name the link, got: {err}"
+        );
+        assert!(
+            !real.join("keys").exists(),
+            "symlink target must be untouched"
+        );
+    }
+
+    /// 0111 grandparent cannot mkdir, so the key directory must already exist.
+    /// Opening that grandparent must not require directory-list permission.
+    #[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+    #[test]
+    fn identity_search_only_grandparent_publishes_into_existing_key_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let gp = base.path().join("searchonly");
+        let keys = gp.join("keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&gp, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let key = keys.join("identity.pem");
+        let created = match load_or_create_keypair_at(&key) {
+            Ok(kp) => kp,
+            Err(e) => {
+                let _ = std::fs::set_permissions(&gp, std::fs::Permissions::from_mode(0o700));
+                panic!("search-only grandparent must be enough to publish into an existing 0700 key dir: {e:#}");
+            }
+        };
+        let reloaded = load_or_create_keypair_at(&key);
+        std::fs::set_permissions(&gp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let reloaded = reloaded.expect("reload");
+        assert_eq!(created.did(), reloaded.did());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_root_adjacent_path_is_not_the_empty_component_error() {
+        if std::path::Path::new("/identity.pem").exists() {
+            return;
+        }
+        let err = match load_or_create_keypair_at(std::path::Path::new("/identity.pem")) {
+            Ok(_) => panic!("creating /identity.pem as a non-root user must not succeed"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            !err.contains("names no final directory component"),
+            "root-adjacent identity create must reach the filesystem, got: {err}"
+        );
+        assert!(
+            !std::path::Path::new("/identity.pem").exists(),
+            "the probe must not leave /identity.pem behind"
+        );
     }
 }
