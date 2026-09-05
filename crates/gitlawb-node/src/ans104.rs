@@ -47,8 +47,8 @@
 //!
 //! ## Deep-hash (the signing input)
 //!
-//! The signing input is a 7-element recursive deep-hash (per the
-//! spec's `getSignatureData` / §2.2):
+//! The signing input matches `arbundles@0.10.x` `getSignatureData`
+//! (`ar-data-base.js`): an 8-element recursive deep-hash:
 //!
 //! ```text
 //! deepHash(blob)  = SHA384( SHA384("blob" || dec(len(blob))) || SHA384(blob) )
@@ -57,30 +57,27 @@
 //! deepHashItem(item) = deepHash([
 //!     "dataitem",
 //!     "1",
-//!     signature_type,        // raw 2-byte little-endian
-//!     owner_raw,             // raw bytes (NOT base64url-decoded)
-//!     target_raw,            // empty buffer if absent
-//!     anchor_raw,            // empty buffer if absent
-//!     tags,                  // NESTED [[name, value], ...] (NOT pre-hashed)
-//!     data_raw,              // raw bytes
+//!     signature_type_ascii, // e.g. b"2" for Ed25519
+//!     owner_raw,            // canonical owner_size(sigtype) bytes
+//!     target_raw,           // empty buffer if absent
+//!     anchor_raw,           // empty buffer if absent
+//!     tags_serialized,      // Avro tag-array buffer as a flat blob
+//!     data_raw,             // raw bytes
 //! ])
 //! ```
 //!
 //! The signature is over the raw 48-byte deep-hash output. `tags` is
-//! the nested `[[name, value], ...]` form, NOT pre-hashed — the
-//! deep-hash primitive walks the tree recursively via
-//! [`deep_hash_chunk`].
+//! the serialized Avro buffer (the same bytes the binary frame
+//! carries), folded as a single blob via [`deep_hash_chunk`].
 //!
-//! The round-2 implementation (8-element fold with pre-hashed tags)
-//! was wrong against this spec: items signed under it did not verify
-//! on a standard bundler/gateway. The pin for the corrected shape
-//! is the test `dataitem_matches_arbundles_golden_vector` against an
-//! `arbundles` 0.10.x fixture captured in
-//! `scripts/ans104_golden.mjs`.
+//! The pin for this shape is the test
+//! `dataitem_matches_arbundles_golden_vector` against a real
+//! `arbundles`-signed Ed25519 item captured in
+//! `scripts/ans104_golden_ed25519.mjs`.
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey, PUBLIC_KEY_LENGTH};
+use ed25519_dalek::{Signature, VerifyingKey, PUBLIC_KEY_LENGTH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha384};
 
@@ -179,10 +176,12 @@ impl DataItem {
         tags: Vec<(&[u8], &[u8])>,
         data: Vec<u8>,
     ) -> Self {
-        // ANS-104 owner field: 32-byte pubkey || 32-byte zero pad, base64url.
-        let mut owner_bytes = [0u8; 64];
-        owner_bytes[..PUBLIC_KEY_LENGTH].copy_from_slice(owner_pubkey);
-        let owner = URL_SAFE_NO_PAD.encode(owner_bytes);
+        // ANS-104 owner field: canonical 32-byte pubkey, base64url.
+        // The wire frame carries exactly `owner_size(sigtype)` bytes
+        // (32 for Ed25519); the deep-hash folds those same bytes, so
+        // the signature computed in memory belongs to the frame that
+        // gets published.
+        let owner = URL_SAFE_NO_PAD.encode(owner_pubkey);
 
         let data_b64 = URL_SAFE_NO_PAD.encode(&data);
         let tags = tags
@@ -275,35 +274,51 @@ impl DataItem {
     /// the signature field cleared. The signature is computed over
     /// these raw 48 bytes (Ed25519 with signature_type = 2).
     ///
-    /// The fold is the spec's 7-element shape:
+    /// The fold matches `arbundles@0.10.x` `getSignatureData`
+    /// (`ar-data-base.js`): an 8-element list
     ///
     /// ```text
     /// deepHash([
     ///   "dataitem",
     ///   "1",
-    ///   signature_type_bytes,   // raw 2-byte LE
-    ///   owner_raw,
-    ///   target_raw,             // empty if absent
-    ///   anchor_raw,             // empty if absent
-    ///   [[name, value], ...],   // nested list, NOT pre-hashed
+    ///   signature_type_ascii, // e.g. b"2" for Ed25519
+    ///   owner_raw,            // canonical owner_size(sigtype) bytes
+    ///   target_raw,           // empty if absent
+    ///   anchor_raw,           // empty if absent
+    ///   tags_serialized,      // Avro-serialized tag buffer as a flat blob
     ///   data_raw,
     /// ])
     /// ```
     ///
-    /// `tags` is passed as the nested `[[name, value], ...]` shape;
-    /// the deep-hash primitive walks the tree via [`deep_hash_chunk`].
-    /// The previous (round-2) implementation pre-hashed each
-    /// `[name, value]` pair to 48 bytes and then folded those 48-byte
-    /// blobs, which double-hashed the tag bytes. That fold is wrong
-    /// against the spec; items signed under it do not verify on a
-    /// standard bundler/gateway.
+    /// `tags_serialized` is the Avro tag-array buffer (the same bytes
+    /// `to_binary`/`from_binary` carry as the tags payload), folded
+    /// as a single blob — NOT a nested `[[name, value], ...]` list.
     pub fn deep_hash(&self) -> Result<[u8; 48]> {
         // Decode the JSON projection back to raw bytes for each
         // field. `deep_hash_chunk` borrows into these owned buffers
         // for the duration of the call.
-        let owner: Vec<u8> = URL_SAFE_NO_PAD
+        let owner_full: Vec<u8> = URL_SAFE_NO_PAD
             .decode(self.owner.as_bytes())
             .with_context(|| "decoding owner for deep-hash")?;
+        let need = owner_size(self.signature_type);
+        if need == 0 {
+            bail!(
+                "ANS-104 deep-hash: unknown signature_type {} (no owner length)",
+                self.signature_type
+            );
+        }
+        if owner_full.len() < need {
+            bail!(
+                "ANS-104 owner is {} bytes, expected at least {} for sigtype {}",
+                owner_full.len(),
+                need,
+                self.signature_type
+            );
+        }
+        // Canonical owner: exactly owner_size(sigtype) bytes. A
+        // legacy 64-byte owner (32 pubkey + 32 zero pad) truncates
+        // to the first 32; the wire frame carries the same prefix.
+        let owner: Vec<u8> = owner_full[..need].to_vec();
         let data: Vec<u8> = URL_SAFE_NO_PAD
             .decode(self.data.as_bytes())
             .with_context(|| "decoding data for deep-hash")?;
@@ -332,36 +347,31 @@ impl DataItem {
         let anchor: Vec<u8> = if self.anchor.is_empty() {
             Vec::new()
         } else {
-            URL_SAFE_NO_PAD
-                .decode(self.anchor.as_bytes())
-                .with_context(|| "decoding anchor for deep-hash")?
+            // The DataItem projection stores the anchor's raw bytes
+            // base64url-encoded (see `from_binary`/`to_binary`); the
+            // deep-hash folds those raw bytes. A caller that passed a
+            // plain UTF-8 anchor to `new_unsigned` would have stored
+            // it verbatim, which is not valid base64url — fall back
+            // to the verbatim bytes so the fold stays defined rather
+            // than erroring on a legacy shape.
+            match URL_SAFE_NO_PAD.decode(self.anchor.as_bytes()) {
+                Ok(b) => b,
+                Err(_) => self.anchor.as_bytes().to_vec(),
+            }
         };
 
-        // 7-element nested fold. The tags slot is a List of 2-tuples;
-        // the deep-hash primitive walks the full tree recursively.
-        let tags_chunk: Vec<DeepHashChunk> = raw_tags
-            .into_iter()
-            .map(|(n, v)| DeepHashChunk::List(vec![DeepHashChunk::Blob(n), DeepHashChunk::Blob(v)]))
-            .collect();
+        // 8-element fold matching arbundles. The tags slot is the
+        // serialized Avro buffer as a flat blob.
+        let tags_block = encode_tags_block(&raw_tags);
 
         let fields: Vec<DeepHashChunk> = vec![
-            // 7-element list per ANS-104 spec — no signatureType.
-            // The folded list is `["dataitem", "1", owner, target,
-            // anchor, [[name, value], ...], data]`. The tags slot
-            // is a nested flat array of 2-tuples; the deep-hash
-            // primitive walks the full tree recursively (a list
-            // node is `deep_hash_list`, a blob leaf is
-            // `deep_hash_blob`). Including the signature type
-            // here was a round-2 bug — the agent's `dataitem_matches_arbundles_golden_vector`
-            // test pinned a Python-stdlib reference against the
-            // wrong 8-element shape. Items signed under that
-            // shape do not verify on a standard bundler/gateway.
             DeepHashChunk::Blob(b"dataitem".to_vec()),
             DeepHashChunk::Blob(b"1".to_vec()),
+            DeepHashChunk::Blob(self.signature_type.to_string().into_bytes()),
             DeepHashChunk::Blob(owner),
             DeepHashChunk::Blob(target),
             DeepHashChunk::Blob(anchor),
-            DeepHashChunk::List(tags_chunk),
+            DeepHashChunk::Blob(tags_block),
             DeepHashChunk::Blob(data),
         ];
 
@@ -460,10 +470,12 @@ impl DataItem {
     }
 
     /// Encode the data item to the ANS-104 binary wire frame. The
-    /// inverse of [`DataItem::from_binary`]. The signature slot is
-    /// zeroed (a fresh, unsigned binary) so that
-    /// `to_binary -> from_binary -> deep_hash` is deterministic
-    /// regardless of whether the caller has populated `signature`.
+    /// inverse of [`DataItem::from_binary`]. The populated signature
+    /// is serialized into the signature slot, and the canonical
+    /// `owner_size(sigtype)` owner prefix is written, so
+    /// `sign -> to_binary -> from_binary -> verify` preserves a valid
+    /// signature without re-signing after parse. An unsigned item
+    /// (empty `signature`) encodes a zeroed slot as a placeholder.
     #[allow(dead_code)] // consumed by `arweave_v2` and the golden-vector test in the next slice
     pub fn to_binary(&self) -> Result<Vec<u8>> {
         let sig_len = signature_size(self.signature_type);
@@ -477,6 +489,30 @@ impl DataItem {
         let owner_bytes = URL_SAFE_NO_PAD
             .decode(self.owner.as_bytes())
             .with_context(|| "decoding owner for to_binary")?;
+        if owner_bytes.len() < own_len {
+            bail!(
+                "ANS-104 to_binary: owner is {} bytes, expected at least {}",
+                owner_bytes.len(),
+                own_len
+            );
+        }
+        // Signature slot: the populated signature when signed, zeros
+        // as an unsigned placeholder.
+        let sig_bytes: Vec<u8> = if self.signature.is_empty() {
+            vec![0u8; sig_len]
+        } else {
+            let b = URL_SAFE_NO_PAD
+                .decode(self.signature.as_bytes())
+                .with_context(|| "decoding signature for to_binary")?;
+            if b.len() != sig_len {
+                bail!(
+                    "ANS-104 to_binary: signature is {} bytes, expected {}",
+                    b.len(),
+                    sig_len
+                );
+            }
+            b
+        };
         if owner_bytes.len() < own_len {
             bail!(
                 "ANS-104 to_binary: owner is {} bytes, expected at least {}",
@@ -500,9 +536,10 @@ impl DataItem {
         let anchor_bytes = if self.anchor.is_empty() {
             Vec::new()
         } else {
-            URL_SAFE_NO_PAD
-                .decode(self.anchor.as_bytes())
-                .with_context(|| "decoding anchor for to_binary")?
+            match URL_SAFE_NO_PAD.decode(self.anchor.as_bytes()) {
+                Ok(b) => b,
+                Err(_) => self.anchor.as_bytes().to_vec(),
+            }
         };
         if !anchor_bytes.is_empty() && anchor_bytes.len() != 32 {
             bail!(
@@ -544,9 +581,7 @@ impl DataItem {
             + data_bytes.len();
         let mut out = Vec::with_capacity(len);
         out.extend_from_slice(&(self.signature_type as u16).to_le_bytes());
-        // Signature slot — zeroed (the signature goes over the
-        // deep-hash, not over the binary with a populated signature).
-        out.extend(std::iter::repeat_n(0u8, sig_len));
+        out.extend_from_slice(&sig_bytes);
         out.extend_from_slice(&owner_bytes[..own_len]);
         out.push(if target_bytes.is_empty() { 0 } else { 1 });
         out.extend_from_slice(&target_bytes);
@@ -567,22 +602,51 @@ impl DataItem {
 /// the block contains the right number of items.
 #[allow(dead_code)] // only used inside `from_binary`; clippy sees no caller at the bin-build level
 fn decode_tags(payload: &[u8], expected_count: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    // Empty payload is the arbundles encoding for zero tags:
+    // `serializeTags` returns an empty buffer when there are no tags,
+    // so the frame carries tag_bytes_len == 0.
+    if payload.is_empty() {
+        if expected_count != 0 {
+            bail!(
+                "ANS-104 tag count mismatch: frame header said {}, Avro block said 0 (empty payload)",
+                expected_count
+            );
+        }
+        return Ok(Vec::new());
+    }
     let mut pos = 0usize;
     let mut tags: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     while pos < payload.len() {
         // First VInt: block item count (signed). 0 = terminator.
-        let (block_count, p) = read_zigzag_vint(payload, pos)?;
+        // A negative count is the valid size-prefixed Avro form:
+        // `-count` followed by the block's byte length, then `count`
+        // items.
+        let (block_count_raw, p) = read_zigzag_vint(payload, pos)?;
         pos = p;
-        if block_count == 0 {
+        if block_count_raw == 0 {
             break;
         }
-        if block_count < 0 {
-            bail!(
-                "ANS-104 Avro tag block count is negative ({}) — only the \
-                 no-size variant is supported here",
-                block_count
-            );
-        }
+        let (block_count, block_end) = if block_count_raw < 0 {
+            let count = (-block_count_raw) as usize;
+            if count == 0 {
+                bail!("ANS-104 Avro tag block count is zero after negation");
+            }
+            let (block_size_i, p) = read_zigzag_vint(payload, pos)?;
+            pos = p;
+            if block_size_i < 0 {
+                bail!(
+                    "ANS-104 Avro tag block byte length is negative ({})",
+                    block_size_i
+                );
+            }
+            let block_size = block_size_i as usize;
+            if block_size > payload.len().saturating_sub(pos) {
+                bail!("ANS-104 Avro tag block byte length overruns payload");
+            }
+            (count, Some(pos + block_size))
+        } else {
+            (block_count_raw as usize, None)
+        };
         for _ in 0..block_count {
             let (name_len_i, p) = read_zigzag_vint(payload, pos)?;
             pos = p;
@@ -611,6 +675,15 @@ fn decode_tags(payload: &[u8], expected_count: usize) -> Result<Vec<(Vec<u8>, Ve
             pos += value_len;
             tags.push((name, value));
         }
+        // For the size-prefixed form, the block must consume exactly
+        // its declared byte length.
+        if let Some(end) = block_end {
+            if pos != end {
+                bail!(
+                    "ANS-104 Avro tag block size mismatch: declared end {end}, consumed to {pos}"
+                );
+            }
+        }
     }
     if tags.len() != expected_count {
         bail!(
@@ -622,12 +695,16 @@ fn decode_tags(payload: &[u8], expected_count: usize) -> Result<Vec<(Vec<u8>, Ve
     Ok(tags)
 }
 
-/// Encode the `(name, value)` tag pairs into a single Avro array
-/// block followed by a zero-count terminator. arbundles writes a
-/// single non-negative block whose count equals `tags.len()`; we
-/// match that shape for round-trip compatibility.
+/// Encode the `(name, value)` tag pairs into the Avro array buffer
+/// `arbundles` (`tags.js` `serializeTags`) produces: empty tags encode
+/// as an empty buffer (zero tag bytes in the frame), otherwise a
+/// single block whose count equals `tags.len()` followed by a
+/// zero-count terminator.
 #[allow(dead_code)] // only used inside `to_binary`; clippy sees no caller at the bin-build level
 fn encode_tags_block(tags: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    if tags.is_empty() {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     // Block count (positive = no leading size field).
     write_zigzag_vint(&mut out, tags.len() as i64);
@@ -813,7 +890,7 @@ pub fn verify_data_item(item: &DataItem, expected_pubkey: &[u8; PUBLIC_KEY_LENGT
         .with_context(|| "decoding owner public key as Ed25519 verifying key")?;
 
     let hash = item.deep_hash()?;
-    vk.verify(&hash, &sig)
+    vk.verify_strict(&hash, &sig)
         .map_err(|e| anyhow!("ANS-104 signature failed Ed25519 verify: {e}"))
 }
 
@@ -920,9 +997,9 @@ mod tests {
     }
 
     /// A binary wire-shape round-trip: build, `to_binary`,
-    /// `from_binary`, JSON round-trip. Pins the spec-correct binary
-    /// parser/encoder against a freshly built item. The signature
-    /// slot is zeroed in `to_binary`, so the deep-hash is stable.
+    /// `from_binary`, verify without re-signing. Pins that the
+    /// signature slot, canonical owner, target, anchor, tags, and
+    /// data survive the binary round-trip with the signature intact.
     #[test]
     fn binary_round_trip() {
         let kp = Keypair::generate();
@@ -945,21 +1022,24 @@ mod tests {
         let parsed: DataItem = serde_json::from_str(&json).unwrap();
         verify_data_item(&parsed, &pk).expect("JSON round-trip verify");
 
-        // Round-trip the binary form. The signature is zeroed in
-        // the binary form, so re-sign against the parsed item to
-        // confirm the shape (signature slot, owner, target,
-        // anchor, tags, data) survived the binary round-trip.
-        // The deep-hash will differ across the round-trip because
-        // the binary form stores owner as the canonical signature
-        // pubkey length (32 for Ed25519) while the in-memory
-        // struct stores 64 bytes (32 pubkey + 32 zero pad). That
-        // is a documented gitlawb convention; the binary form is
-        // the wire-canonical representation.
+        // Round-trip the binary form and verify WITHOUT re-signing:
+        // the signature, owner, target, anchor, tags, and data must
+        // survive intact. Re-signing after parse would hide an owner
+        // width or signature-slot mismatch.
         let bin = item.to_binary().expect("to_binary");
-        let mut parsed_bin = DataItem::from_binary(&bin).expect("from_binary");
-        sign_data_item(&mut parsed_bin, &kp).expect("re-sign parsed bin");
+        let parsed_bin = DataItem::from_binary(&bin).expect("from_binary");
+        assert_eq!(
+            parsed_bin.signature, item.signature,
+            "signature must survive the binary round-trip"
+        );
+        assert_eq!(
+            parsed_bin.owner, item.owner,
+            "owner must survive the binary round-trip"
+        );
         verify_data_item(&parsed_bin, &pk)
             .expect("binary round-trip must verify (signature, owner, target, anchor, tags, data round-trip)");
+        let bin2 = parsed_bin.to_binary().expect("to_binary again");
+        assert_eq!(bin2, bin, "binary re-encode must be stable");
     }
 
     /// The deep-hash is stable: two items with the same payload, tags,
@@ -1014,56 +1094,38 @@ mod tests {
         );
     }
 
-    /// #26 split 2 (P1, reviewer round 3) — `DataItem::from_binary`
-    /// and `DataItem::deep_hash` against an EXTERNAL `arbundles`
-    /// 0.10.x golden vector.
+    /// #26 split 2 — `DataItem::from_binary`, `deep_hash`,
+    /// `verify_data_item`, and `to_binary` against a REAL signed
+    /// `arbundles@0.10.x` Ed25519 vector.
     ///
-    /// The round-2 test (`dataitem_deep_hash_matches_external_reference`)
-    /// pinned the wrong 8-element fold against a Python stdlib
-    /// replication. Items signed under that fold do not verify on a
-    /// standard bundler/gateway — the in-module round-trip was
-    /// symmetric to itself and hid the bug. This test pins the
-    /// 7-element spec-correct fold against an actual
-    /// `arbundles`-signed item.
+    /// The fixture was captured by
+    /// `scripts/ans104_golden_ed25519.mjs` (deterministic seed
+    /// `0x01 * 32` via `SolanaSigner`, which carries sigtype 2):
+    ///   data     = `"hello gitlawb ed25519 golden"`
+    ///   tags     = `[{name:"App-Name",value:"gitlawb"},
+    ///               {name:"Schema",value:"gitlawb/ref-update/v1"}]`
+    ///   target   = absent, anchor = absent
     ///
-    /// The fixture was captured by `scripts/ans104_golden.mjs`:
-    ///   data     = `"abcdef…\`~"` (the printable-ASCII set minus
-    ///             space, plus a few delimiters)
-    ///   tags     = `[{name:"tag1",value:"value1"},
-    ///               {name:"tag2",value:"value2"}]`
-    ///   anchor   = `"thisSentenceIs32BytesLongTrustMe"` (32 bytes ASCII)
-    ///   target   = base64url-decode("OXcT1sVRSA5eGwt2k6Yuz8-3e3g9WJi5uSE99CWqsBs")
-    ///   signer   = EthereumSigner("8da4ef21b864d2cc526dbdb2a120bd2874c36c9d0a1fb7f8c63d7f7a8b41de8f")
-    ///
-    /// `arbundles`' `createData` does not actually populate a real
-    /// signature for a placeholder EthereumSigner when no private key
-    /// is available, so the captured signature is the all-zeros
-    /// placeholder; the published id is `sha256(zeros[0..65])` —
-    /// still a deterministic pin for the deep-hash, signature_size
-    /// lookup, owner_size lookup, target/anchor parsing, tag Avro
-    /// block, and data slice.
+    /// The script calls `await item.sign(signer)` so the signature
+    /// is real; `item.isValid()` returns true on the JS side. The
+    /// Rust side parses the binary, checks the deep-hash against the
+    /// JS `getSignatureData` output, verifies the Ed25519 signature
+    /// WITHOUT re-signing, and round-trips the binary byte-exact.
     #[test]
     fn dataitem_matches_arbundles_golden_vector() {
-        let binary_hex = "0300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004d11e94912283d217fd98be5ad59c659aede69bbef0e72a2213edf0fbd8de3cc95030d006b137e22b89e738e5565766b83d12c438fe970e3e729532fcfafad2a701397713d6c551480e5e1b0b7693a62ecfcfb77b783d5898b9b9213df425aab01b017468697353656e74656e63654973333242797465734c6f6e6754727573744d6502000000000000001a000000000000000408746167310c76616c75653108746167320c76616c756532006162636465666768696a6b6c6d6e6f707172737475767778797a4142434445464748494a4b4c4d4e4f505152535455565758595a3031323334353637383921402324255e262a28295f2b2d3d5b5d7b7d3b273a222c2e2f3c3e3f607e";
+        let binary_hex = "0200da41825fd44ca3b2705af18fce86ed6d04d0204331965d9af5d5cb1a740fcc6587ee81501b1d7928c54c0f174fde8893560d785db4d988a3161113b10a2028038a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c00000200000000000000300000000000000004104170702d4e616d650e6769746c6177620c536368656d612a6769746c6177622f7265662d7570646174652f76310068656c6c6f206769746c617762206564323535313920676f6c64656e";
         let binary = hex::decode(binary_hex).expect("golden binary hex decodes");
-        assert_eq!(binary.len(), 332, "golden binary length");
+        assert_eq!(binary.len(), 192, "golden binary length");
         let item = DataItem::from_binary(&binary).expect("from_binary on golden vector");
 
-        // Shape pin: signature_type preserved across the wire.
-        assert_eq!(item.signature_type, SIGNATURE_TYPE_ETHEREUM);
-        // Owner is the Ethereum uncompressed-pubkey length.
+        // Shape pin: Ed25519 signature type.
+        assert_eq!(item.signature_type, SIGNATURE_TYPE_ED25519);
+        // Owner is the Ed25519 32-byte pubkey.
         let owner_bytes = item.owner_pubkey().expect("owner_pubkey");
-        assert_eq!(owner_bytes.len(), 65);
-        // Target / anchor are present, 32 bytes each.
-        let target_bytes = URL_SAFE_NO_PAD
-            .decode(item.target.as_bytes())
-            .expect("target b64");
-        let anchor_bytes = URL_SAFE_NO_PAD
-            .decode(item.anchor.as_bytes())
-            .expect("anchor b64");
-        assert_eq!(target_bytes.len(), 32);
-        assert_eq!(anchor_bytes.len(), 32);
-        assert_eq!(&anchor_bytes[..], b"thisSentenceIs32BytesLongTrustMe");
+        assert_eq!(owner_bytes.len(), 32);
+        // Target / anchor absent.
+        assert!(item.target.is_empty(), "golden has no target");
+        assert!(item.anchor.is_empty(), "golden has no anchor");
         // Two tags, in order.
         assert_eq!(item.tags.len(), 2);
         let t0n = URL_SAFE_NO_PAD
@@ -1078,53 +1140,69 @@ mod tests {
         let t1v = URL_SAFE_NO_PAD
             .decode(item.tags[1].value.as_bytes())
             .unwrap();
-        assert_eq!(&t0n[..], b"tag1");
-        assert_eq!(&t0v[..], b"value1");
-        assert_eq!(&t1n[..], b"tag2");
-        assert_eq!(&t1v[..], b"value2");
+        assert_eq!(&t0n[..], b"App-Name");
+        assert_eq!(&t0v[..], b"gitlawb");
+        assert_eq!(&t1n[..], b"Schema");
+        assert_eq!(&t1v[..], b"gitlawb/ref-update/v1");
         // Data round-trips.
         let data = item.data_bytes().expect("data_bytes");
-        let expected_data: &[u8] =
-            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=[]{};':\",./<>?`~";
-        assert_eq!(&data[..], expected_data);
+        assert_eq!(&data[..], b"hello gitlawb ed25519 golden");
 
         // Artifact identity: sha256(signature) base64url == published id.
-        let expected_id = "mM5C3u9R1AJp1UL1MUvvLHRo1AGtXYUWi_q0wBCPdfc";
+        let expected_id = "SGrcBs-ITTyzvd7eIB5kk2GdBWoxB_iTi9iJ6KOe_RE";
         assert_eq!(item.id().expect("id"), expected_id);
 
-        // Deep-hash pin against the spec-correct 7-element fold.
-        // The expected bytes were re-derived in Python after the
-        // round-3 review fixed the fold shape: the spec at
-        // https://github.com/ArweaveTeam/arweave-standards/blob/master/ans/ANS-104.md
-        // is `["dataitem", "1", owner, target, anchor, [[name, value], ...], data]`
-        // with NO signatureType, and tags is a NESTED flat array
-        // of 2-tuples (the deep-hash primitive walks the tree
-        // recursively). Round 2's reference was a Python
-        // replication of the wrong 8-element shape; round 3
-        // anchors against the spec directly. The hash bytes:
-        //   3ad967a77c4b40a0b6462845a493d3c96e7cf255b01ffa91d2a793e422184b6df786d2fd4fa9f39fd63dc005d9e1311b
-        // Re-derive via /tmp/spec_correct_7element.py if you
-        // intentionally change the fold.
+        // Deep-hash pin against arbundles' `getSignatureData` output
+        // for this vector (the 8-element fold: "dataitem", "1",
+        // sigtype ASCII, owner, target, anchor, serialized tags as a
+        // flat blob, data):
+        //   f15c82431767f14ac9e66ab8e995a8cd08e094be3773245163b53c12feb50aefc55d9f8c1098fabcfbf11a462706d347
         let dh = item.deep_hash().expect("deep_hash on golden vector");
         let expected: [u8; 48] = [
-            0x3a, 0xd9, 0x67, 0xa7, 0x7c, 0x4b, 0x40, 0xa0, 0xb6, 0x46, 0x28, 0x45, 0xa4, 0x93,
-            0xd3, 0xc9, 0x6e, 0x7c, 0xf2, 0x55, 0xb0, 0x1f, 0xfa, 0x91, 0xd2, 0xa7, 0x93, 0xe4,
-            0x22, 0x18, 0x4b, 0x6d, 0xf7, 0x86, 0xd2, 0xfd, 0x4f, 0xa9, 0xf3, 0x9f, 0xd6, 0x3d,
-            0xc0, 0x05, 0xd9, 0xe1, 0x31, 0x1b,
+            0xf1, 0x5c, 0x82, 0x43, 0x17, 0x67, 0xf1, 0x4a, 0xc9, 0xe6, 0x6a, 0xb8, 0xe9, 0x95,
+            0xa8, 0xcd, 0x08, 0xe0, 0x94, 0xbe, 0x37, 0x73, 0x24, 0x51, 0x63, 0xb5, 0x3c, 0x12,
+            0xfe, 0xb5, 0x0a, 0xef, 0xc5, 0x5d, 0x9f, 0x8c, 0x10, 0x98, 0xfa, 0xbc, 0xfb, 0xf1,
+            0x1a, 0x46, 0x27, 0x06, 0xd3, 0x47,
         ];
         assert_eq!(
             dh, expected,
-            "DataItem::deep_hash disagrees with the Python stdlib reference. \
-             This is the regression the reviewer round 3 demanded: the old \
-             8-element fold (with signatureType) is wrong against the ANS-104 \
-             spec. If you intentionally changed the fold, re-derive the \
-             expected bytes via the reference script before updating the \
-             fixture."
+            "DataItem::deep_hash disagrees with arbundles getSignatureData. \
+             The fold must be the 8-element arbundles shape."
         );
 
-        // The binary form must round-trip back to the same bytes.
+        // Ed25519 verify WITHOUT re-signing: the signature came from
+        // arbundles, not from this module.
+        let owner_pk = item.owner_pubkey_ed25519().expect("ed25519 owner");
+        verify_data_item(&item, &owner_pk).expect("arbundles-signed golden must verify");
+
+        // The binary form must round-trip back to the same bytes
+        // (signature slot preserved, not zeroed).
         let bin2 = item.to_binary().expect("to_binary on parsed golden");
         assert_eq!(bin2, binary, "binary round-trip mismatch on golden vector");
+    }
+
+    /// Size-prefixed Avro tag block form: a negative block count
+    /// followed by the block byte length must parse. This is the
+    /// legal encoding `arbundles`' `readTags` accepts
+    /// (`if (n < 0) { n = -n; skipLong(); }`).
+    #[test]
+    fn decode_tags_accepts_negative_block_count_with_size() {
+        // One tag ("A" -> "B") encoded as block count -1, block size
+        // 4, then the tag bytes, then terminator 0. Tag bytes: name
+        // len 1 (one VInt byte), "A", value len 1 (one VInt byte),
+        // "B" = 4 bytes total.
+        let mut payload = Vec::new();
+        write_zigzag_vint(&mut payload, -1);
+        write_zigzag_vint(&mut payload, 4);
+        write_zigzag_vint(&mut payload, 1);
+        payload.extend_from_slice(b"A");
+        write_zigzag_vint(&mut payload, 1);
+        payload.extend_from_slice(b"B");
+        write_zigzag_vint(&mut payload, 0);
+        let tags = decode_tags(&payload, 1).expect("size-prefixed block must parse");
+        assert_eq!(tags.len(), 1);
+        assert_eq!(&tags[0].0[..], b"A");
+        assert_eq!(&tags[0].1[..], b"B");
     }
 }
 

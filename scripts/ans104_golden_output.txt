@@ -1,27 +1,37 @@
-ANS-104 golden vector, captured from arbundles 0.10.x via scripts/ans104_golden.mjs.
+ANS-104 golden vectors, captured from arbundles 0.10.x.
 
-Inputs (match scripts/ans104_golden.mjs):
-  data     = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=[]{};':\",./<>?`~"
-  tags     = [{name:"tag1",value:"value1"},{name:"tag2",value:"value2"}]
-  anchor   = "thisSentenceIs32BytesLongTrustMe" (32 bytes ASCII)
-  target   = base64url-decode("OXcT1sVRSA5eGwt2k6Yuz8-3e3g9WJi5uSE99CWqsBs")
-  signer   = EthereumSigner("8da4ef21b864d2cc526dbdb2a120bd2874c36c9d0a1fb7f8c63d7f7a8b41de8f")
+Ed25519 vector (the interop pin used by
+`ans104::tests::dataitem_matches_arbundles_golden_vector`):
+  captured by  = scripts/ans104_golden_ed25519.mjs (deterministic seed
+                 0x01 * 32 via SolanaSigner, sigtype 2, `await item.sign`)
+  data         = "hello gitlawb ed25519 golden"
+  tags         = [{name:"App-Name",value:"gitlawb"},
+                  {name:"Schema",value:"gitlawb/ref-update/v1"}]
+  target       = absent
+  anchor       = absent
 
 Outputs:
-  signature_type = 3 (Ethereum)
-  signature_len  = 65 bytes
-  owner_len      = 512 bytes (RSA pubkey padded to 512)
-  binary_len     = 332 bytes
-  id             = mM5C3u9R1AJp1UL1MUvvLHRo1AGtXYUWi_q0wBCPdfc (base64url of sha256(signature))
+  signature_type = 2 (Ed25519)
+  signature_len  = 64 bytes
+  owner_len      = 32 bytes
+  binary_len     = 192 bytes
+  id             = SGrcBs-ITTyzvd7eIB5kk2GdBWoxB_iTi9iJ6KOe_RE (base64url of sha256(signature))
+  deephash_hex   = f15c82431767f14ac9e66ab8e995a8cd08e094be3773245163b53c12feb50aefc55d9f8c1098fabcfbf11a462706d347
+                   (arbundles `getSignatureData` 8-element fold)
 
 binary_hex:
-030000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004d11e94912283d217fd98be5ad59c659aede69bbef0e72a2213edf0fbd8de3cc95030d006b137e22b89e738e5565766b83d12c438fe970e3e729532fcfafad2a701397713d6c551480e5e1b0b7693a62ecfcfb77b783d5898b9b9213df425aab01b017468697353656e74656e63654973333242797465734c6f6e6754727573744d6502000000000000001a000000000000000408746167310c76616c75653108746167320c76616c756532006162636465666768696a6b6c6d6e6f707172737475767778797a4142434445464748494a4b4c4d4e4f505152535455565758595a3031323334353637383921402324255e262a28295f2b2d3d5b5d7b7d3b273a222c2e2f3c3e3f607e
+0200da41825fd44ca3b2705af18fce86ed6d04d0204331965d9af5d5cb1a740fcc6587ee81501b1d7928c54c0f174fde8893560d785db4d988a3161113b10a2028038a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c00000200000000000000300000000000000004104170702d4e616d650e6769746c6177620c536368656d612a6769746c6177622f7265662d7570646174652f76310068656c6c6f206769746c617762206564323535313920676f6c64656e
 
 The Rust side will:
 1. Parse binary via DataItem::from_binary (signature_type, signature,
    owner, target, anchor, tags, data).
-2. Compute deep_hash via DataItem::deep_hash (the 7-element fold with
-   nested tags, per the ANS-104 spec).
-3. Assert sha256(signature_bytes) base64url-encodes to the captured id.
-4. (Optionally) re-derive signature via Ed25519/other signer and
-   confirm arbundles' verify accepts the Rust-built binary.
+2. Compute deep_hash via DataItem::deep_hash (the 8-element arbundles
+   fold) and compare to deephash_hex above.
+3. Verify the Ed25519 signature via DataItem::verify_data_item WITHOUT
+   re-signing.
+4. Assert sha256(signature_bytes) base64url-encodes to the captured id.
+5. Assert to_binary round-trips byte-exact (signature slot preserved).
+
+Legacy Ethereum script (scripts/ans104_golden.mjs) now signs before
+capture as well; its output is illustrative only — the node verifies
+Ed25519 (sigtype 2) on the verify path.

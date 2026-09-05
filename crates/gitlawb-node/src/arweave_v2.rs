@@ -111,37 +111,60 @@ pub async fn probe_anchor_item(
         Err(_) => return (ProbeOutcome::Indeterminate, None),
     };
 
-    // v1 detection: a body carrying `schema: "gitlawb/ref-update/v1"`
-    // is the legacy raw-JSON shape the live path on this branch
-    // writes. The probe returns Present so the v1 dispatch in
-    // `verify_anchor` runs; the field-equality check there is the
-    // v1 integrity guarantee. A body that is valid JSON but does
-    // not carry that schema falls through to the v2 attempt.
+    // Legacy v1 shape (`schema: "gitlawb/ref-update/v1"`) carries no
+    // signature and no item/content binding: anyone can mint matching
+    // JSON. It must never report `verified`, so classify it as
+    // `Indeterminate` here rather than routing it into a verifying
+    // path.
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
         if v.get("schema").and_then(|s| s.as_str()) == Some("gitlawb/ref-update/v1") {
-            return (ProbeOutcome::Present, Some(bytes));
+            return (ProbeOutcome::Indeterminate, None);
         }
+    }
+
+    // v2: accept the binary ANS-104 frame first (what a gateway
+    // serving a verifiable envelope returns), then the JSON DataItem
+    // projection used by the tests. Raw content alone (neither frame)
+    // is `Indeterminate`: without the envelope there is no signature
+    // to verify.
+    if let Ok(item) = DataItem::from_binary(&bytes) {
+        return probe_item(item, req);
     }
 
     let item: DataItem = match serde_json::from_slice(&bytes) {
         Ok(i) => i,
-        Err(_) => return (ProbeOutcome::Indeterminate, Some(bytes)),
+        Err(_) => return (ProbeOutcome::Indeterminate, None),
     };
 
+    probe_item(item, req)
+}
+
+/// Shared v2 classification for a parsed `DataItem`: owner binding
+/// plus Ed25519 verification against the expected key. Any failure is
+/// `Indeterminate`, never a proof of absence.
+fn probe_item(item: DataItem, req: &ProbeRequest) -> (ProbeOutcome, Option<Vec<u8>>) {
     let owner_pk = match item.owner_pubkey() {
         Ok(p) => p,
-        Err(_) => return (ProbeOutcome::Indeterminate, Some(bytes)),
+        Err(_) => return (ProbeOutcome::Indeterminate, None),
     };
 
     if let Some(expected) = req.expected_owner_pk {
         if owner_pk != expected {
-            return (ProbeOutcome::Indeterminate, Some(bytes));
+            return (ProbeOutcome::Indeterminate, None);
         }
         if ans104::verify_data_item(&item, &expected).is_err() {
-            return (ProbeOutcome::Indeterminate, Some(bytes));
+            return (ProbeOutcome::Indeterminate, None);
         }
     }
 
+    // Re-encode the verified item for the `Present` consumer so
+    // `verify_anchor` does not need a second GET. The bytes handed
+    // back are the canonical binary frame when the gateway served
+    // binary, else the JSON projection.
+    let bytes = item.to_binary().unwrap_or_default();
+    if bytes.is_empty() {
+        return (ProbeOutcome::Indeterminate, None);
+    }
     (ProbeOutcome::Present, Some(bytes))
 }
 
@@ -242,17 +265,13 @@ pub struct AnchorVerifyResult {
     pub outcome: ProbeOutcome,
 }
 
-/// Persisted anchor fields used by the dual-format v1 + v2 verify.
-/// The HTTP handler fetches the row from `arweave_anchors` and
-/// passes these in; the verify path uses them to (a) identify the
-/// v1 raw-JSON shape (the live path on this branch writes v1, not
-/// v2) and (b) check the v1 fields match what the gateway serves.
+/// Persisted anchor fields used by the verify path. The HTTP handler
+/// fetches the row from `arweave_anchors` and passes the persisted
+/// `node_did` in; the v2 path compares it against the DID derived
+/// from the verified envelope's owner. Legacy v1 fields are not
+/// carried: v1 has no cryptographic proof either way.
 #[derive(Debug, Clone)]
 pub struct PersistedAnchorFields<'a> {
-    pub repo: &'a str,
-    pub ref_name: &'a str,
-    pub old_sha: &'a str,
-    pub new_sha: &'a str,
     pub node_did: &'a str,
 }
 
@@ -262,25 +281,22 @@ pub struct PersistedAnchorFields<'a> {
 /// `expected_owner_pk` is the persisted `node_did` of the anchor,
 /// decoded as a 32-byte Ed25519 public key.
 ///
-/// `persisted` carries the row's `repo`, `ref_name`, `old_sha`,
-/// `new_sha`, `node_did` so the verify path can match the v1
-/// raw-JSON format (the live path on this branch writes v1) and
-/// the v2 artifact-identity check.
+/// `persisted` carries the row's `node_did` for the v2
+/// artifact-identity check and for the legacy-v1 indeterminate reason.
 ///
-/// The verify path accepts BOTH formats:
+/// The verify path accepts the v2 ANS-104 envelope only:
+/// parse as `DataItem` (binary frame first, then the JSON
+/// projection), verify the Ed25519 signature against
+/// `expected_owner_pk`, derive the protocol id via `DataItem::id()`
+/// and require equality with `item_id`. A stale or malicious mirror
+/// serving a different valid same-owner item is the attack the
+/// artifact-id check closes.
 ///
-///   - **v2 (ANS-104)**: parse as `DataItem`, verify the Ed25519
-///     signature against `expected_owner_pk`, derive the protocol
-///     id via `DataItem::id()` and require equality with `item_id`.
-///     A stale or malicious mirror serving a different valid
-///     same-owner item is the attack the artifact-id check closes;
-///     the team memory `verify-against-artifact-id-not-signer.md`
-///     is the policy.
-///   - **v1 (raw JSON)**: parse as `serde_json::Value`, require
-///     `schema == "gitlawb/ref-update/v1"`, then field-equality
-///     check `repo`, `ref_name`, `old_sha`, `new_sha`, `node_did`
-///     against the persisted row. v1 has no signature; the Irys
-///     storage plus the JSON parse are the integrity guarantee.
+/// The legacy v1 raw-JSON shape (`schema ==
+/// "gitlawb/ref-update/v1"`) has no signature and no item/content
+/// binding, so it is `Indeterminate` by construction — never
+/// `verified`. A copied set of row fields is forgeable by any
+/// gateway.
 ///
 /// On any failure along either path, returns a result with
 /// `verified: false` and a populated `error`. The caller (the
@@ -327,19 +343,14 @@ pub async fn verify_anchor(
                 }
             };
 
-            // Format detection: v1 first, by structural schema field.
-            // The v1 raw-JSON shape carries `schema: gitlawb/ref-update/v1`
-            // — a field the v2 ANS-104 DataItem projection never
-            // includes. A v1 body parses as `serde_json::Value`
-            // because DataItem deserialization is lenient about
-            // unknown fields; trying v2 first would silently route
-            // v1 anchors into the v2 path, which would then fail the
-            // signature check (the v1 body has no signature) and
-            // classify every v1 anchor as `Indeterminate`. The team
-            // memory `self-roundtrip-tests-do-not-prove-interop.md`
-            // is the broader reason: format detection is structural
-            // and the structural signal must win over the parse
-            // convenience.
+            // The probe hands back the canonical binary frame (or the
+            // JSON projection when the gateway served JSON). Prefer the
+            // binary envelope: a real signed v2 anchor's payload alone
+            // has no signature to verify. A v1 JSON body reaching here
+            // is legacy without cryptographic proof — indeterminate.
+            if let Ok(item) = DataItem::from_binary(&bytes) {
+                return verify_v2(item, item_id, expected_owner_pk, persisted);
+            }
             let v: serde_json::Value = match serde_json::from_slice(&bytes) {
                 Ok(v) => v,
                 Err(_) => {
@@ -348,7 +359,9 @@ pub async fn verify_anchor(
                         verified: false,
                         data_payload: None,
                         owner_did: None,
-                        error: Some("the gateway response is not valid JSON".to_string()),
+                        error: Some(
+                            "the gateway response is not a verifiable ANS-104 envelope".to_string(),
+                        ),
                         outcome: ProbeOutcome::Indeterminate,
                     });
                 }
@@ -387,21 +400,17 @@ pub async fn verify_anchor(
             outcome: ProbeOutcome::DefinitivelyAbsent,
         }),
         ProbeOutcome::Indeterminate => {
-            // Re-fetch to give a more specific error reason, but
-            // bound the cost — fall back to the classification.
-            let url = format!("{}/{}", gateway_url.trim_end_matches('/'), item_id);
-            let reason = match client.get(&url).send().await {
-                Ok(r) => format!("gateway status {}", r.status()),
-                Err(e) => format!("transport: {e}"),
-            };
+            // No second fetch: the probe already spent one outbound
+            // request, and a second GET per indeterminate verify is
+            // anonymous amplification. Return the classification.
             Ok(AnchorVerifyResult {
                 item_id: item_id.to_string(),
                 verified: false,
                 data_payload: None,
                 owner_did: None,
-                error: Some(format!(
-                    "verification is indeterminate: the gateway response is ambiguous ({reason})"
-                )),
+                error: Some(
+                    "verification is indeterminate: the gateway response is ambiguous".to_string(),
+                ),
                 outcome: ProbeOutcome::Indeterminate,
             })
         }
@@ -500,19 +509,24 @@ fn verify_v2(
         }
     };
 
-    // Derive the owner DID from the public key for the API
-    // response. (v2 stores the public key; the persisted
-    // `node_did` is a string, but the verify path can reconstruct
-    // it from the key.)
+    // Derive the owner DID from the ITEM's actual owner — not from
+    // the expected key — so the comparison below contrasts two
+    // different sources (gateway envelope vs persisted row). The
+    // signature check above already bound the item's owner to
+    // `expected_owner_pk`; this names that signer for the response
+    // and refuses a stale row.
     let owner_did = {
-        let vk = ed25519_dalek::VerifyingKey::from_bytes(expected_owner_pk)
+        let owner_pk = item
+            .owner_pubkey_ed25519()
+            .map_err(|e| anyhow!("decoding item owner as Ed25519 for DID derivation: {e}"))?;
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&owner_pk)
             .map_err(|e| anyhow!("decoding verifying key: {e}"))?;
         gitlawb_core::did::Did::from_verifying_key(&vk).to_string()
     };
 
-    // Compare the persisted row's `node_did` with the one
-    // derived from the verified public key. A mismatch means
-    // someone re-keyed and the row is stale; refuse.
+    // Compare the persisted row's `node_did` with the DID derived
+    // from the verified item. A mismatch means someone re-keyed and
+    // the row is stale; refuse.
     if owner_did != persisted.node_did {
         return Ok(AnchorVerifyResult {
             item_id: item_id.to_string(),
@@ -528,7 +542,6 @@ fn verify_v2(
         });
     }
 
-    let _ = persisted; // suppress unused-warning when no other field is read below
     Ok(AnchorVerifyResult {
         item_id: item_id.to_string(),
         verified: true,
@@ -539,12 +552,11 @@ fn verify_v2(
     })
 }
 
-/// v1 verify path. The v1 raw-JSON shape (used by the live path on
-/// this branch) has no signature; the integrity guarantee is the
-/// Irys storage plus a field-equality check against the persisted
-/// row. A v1 item with all five fields matching the persisted row
-/// is `Present`; a missing schema or any field mismatch is
-/// `Indeterminate`.
+/// v1 verify path. The v1 raw-JSON shape has no signature and no
+/// item/content binding: five copied row fields never prove the
+/// persisted artifact. Every v1 response is `Indeterminate` — never
+/// `verified` — so a stale or hostile gateway cannot make the
+/// endpoint attest a ref update that was not proven.
 fn verify_v1(
     v: serde_json::Value,
     item_id: &str,
@@ -586,43 +598,24 @@ fn verify_v1(
         });
     }
 
-    // Field-equality check: each persisted field must match the
-    // gateway's payload. A mismatch is `Indeterminate` because the
-    // gateway served something that was NOT the anchor the node
-    // recorded.
-    let checks: &[(&str, &str)] = &[
-        ("repo", persisted.repo),
-        ("ref_name", persisted.ref_name),
-        ("old_sha", persisted.old_sha),
-        ("new_sha", persisted.new_sha),
-        ("node_did", persisted.node_did),
-    ];
-    for (key, expected) in checks {
-        let actual = obj.get(*key).and_then(|s| s.as_str());
-        if actual != Some(*expected) {
-            return Ok(AnchorVerifyResult {
-                item_id: item_id.to_string(),
-                verified: false,
-                data_payload: None,
-                owner_did: None,
-                error: Some(format!(
-                    "v1 verify failed: gateway field {key:?} does not match the \
-                     persisted row (expected {expected:?}, got {actual:?})"
-                )),
-                outcome: ProbeOutcome::Indeterminate,
-            });
-        }
-    }
-
+    // Even when every copied field matches, v1 has no signature and
+    // no binding to the requested `item_id`: a stale or hostile
+    // gateway can serve different JSON with the same five public
+    // values at the requested URL. Report `Indeterminate`, never
+    // `verified`.
+    let _ = persisted;
     Ok(AnchorVerifyResult {
         item_id: item_id.to_string(),
-        verified: true,
-        // The v1 payload IS the data payload the caller wants;
-        // surface the parsed JSON so the handler can echo it.
-        data_payload: Some(v),
-        owner_did: Some(persisted.node_did.to_string()),
-        error: None,
-        outcome: ProbeOutcome::Present,
+        verified: false,
+        data_payload: None,
+        owner_did: None,
+        error: Some(
+            "v1 legacy anchor has no cryptographic proof: the gateway served \
+             unsigned JSON without an item/content binding, so verification is \
+             indeterminate"
+                .to_string(),
+        ),
+        outcome: ProbeOutcome::Indeterminate,
     })
 }
 
@@ -879,10 +872,6 @@ mod tests {
         let kp = Keypair::generate();
         let pk = kp.verifying_key().to_bytes();
         let persisted = PersistedAnchorFields {
-            repo: "alice/r",
-            ref_name: "refs/heads/main",
-            old_sha: "0000",
-            new_sha: "1111",
             node_did: "did:key:z6node",
         };
         let r = verify_anchor(
@@ -912,10 +901,6 @@ mod tests {
         let kp = Keypair::generate();
         let pk = kp.verifying_key().to_bytes();
         let persisted = PersistedAnchorFields {
-            repo: "alice/r",
-            ref_name: "refs/heads/main",
-            old_sha: "0000",
-            new_sha: "1111",
             node_did: "did:key:z6node",
         };
         let r = verify_anchor(
@@ -955,13 +940,7 @@ mod tests {
             .await;
 
         let persisted = PersistedAnchorFields {
-            repo: "alice/r",
-            ref_name: "refs/heads/main",
-            old_sha: "0000",
-            new_sha: "1111",
             // The persisted `node_did` must match the DID derived
-            // from the verified public key, so build it from the
-            // keypair.
             node_did: &gitlawb_core::did::Did::from_verifying_key(&kp.verifying_key()).to_string(),
         };
         let r = verify_anchor(
@@ -1012,10 +991,6 @@ mod tests {
         // signed by the expected owner) but the artifact identity
         // does not match.
         let persisted = PersistedAnchorFields {
-            repo: "alice/r",
-            ref_name: "refs/heads/main",
-            old_sha: "0000",
-            new_sha: "1111",
             node_did: &gitlawb_core::did::Did::from_verifying_key(&kp.verifying_key()).to_string(),
         };
         let r = verify_anchor(
@@ -1037,11 +1012,10 @@ mod tests {
         );
     }
 
-    /// v1 raw-JSON anchor: when the gateway returns the v1 shape
-    /// with all five persisted fields matching, the verify is
-    /// `Present` and the parsed JSON is the data payload. The
-    /// v1 path has no signature — the Irys storage plus the
-    /// field-equality check are the integrity guarantee.
+    /// v1 raw-JSON anchor — even with all five persisted fields
+    /// matching — is `Indeterminate`, never `verified`. The v1 shape
+    /// has no signature and no item/content binding, so copied fields
+    /// never prove the persisted artifact.
     #[tokio::test]
     async fn verify_anchor_v1_recognized_with_matching_fields() {
         let kp = Keypair::generate();
@@ -1070,10 +1044,6 @@ mod tests {
             .await;
 
         let persisted = PersistedAnchorFields {
-            repo: "alice/r",
-            ref_name: "refs/heads/main",
-            old_sha: "0000",
-            new_sha: "1111",
             node_did: &node_did,
         };
         let r = verify_anchor(
@@ -1085,17 +1055,22 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(r.verified, "v1 with matching fields is Present");
-        assert_eq!(r.outcome, ProbeOutcome::Present);
-        let payload = r.data_payload.unwrap();
-        assert_eq!(payload["schema"], "gitlawb/ref-update/v1");
-        assert_eq!(payload["repo"], "alice/r");
+        assert!(
+            !r.verified,
+            "v1 is never verified: no signature, no binding"
+        );
+        assert_eq!(r.outcome, ProbeOutcome::Indeterminate);
+        assert!(r.data_payload.is_none(), "no payload on Indeterminate");
+        let err = r.error.unwrap();
+        assert!(
+            err.contains("indeterminate"),
+            "expected indeterminate error for legacy v1, got: {err}"
+        );
     }
 
-    /// A v1 payload with a single field mismatch is `Indeterminate`,
-    /// not `Present`. The integrity guarantee is the
-    /// field-equality check; any mismatch means the gateway served
-    /// something that is NOT the anchor the node recorded.
+    /// A v1 payload with a single field mismatch is also
+    /// `Indeterminate` — for the same reason as a matching one: the
+    /// shape carries no proof either way.
     #[tokio::test]
     async fn verify_anchor_v1_field_mismatch_is_indeterminate() {
         let node_did = "did:key:z6node".to_string();
@@ -1120,10 +1095,6 @@ mod tests {
         let kp = Keypair::generate();
         let pk = kp.verifying_key().to_bytes();
         let persisted = PersistedAnchorFields {
-            repo: "alice/r", // does NOT match v1_body
-            ref_name: "refs/heads/main",
-            old_sha: "0000",
-            new_sha: "1111",
             node_did: &node_did,
         };
         let r = verify_anchor(
@@ -1139,8 +1110,29 @@ mod tests {
         assert_eq!(r.outcome, ProbeOutcome::Indeterminate);
         let err = r.error.unwrap();
         assert!(
-            err.contains("repo") && err.contains("does not match"),
-            "expected field-equality error mentioning 'repo', got: {err}"
+            err.contains("indeterminate"),
+            "expected indeterminate error for legacy v1, got: {err}"
         );
+    }
+
+    /// Direct unit pin: `verify_v1` never reports `verified`, even
+    /// when every copied field matches. A forged gateway response
+    /// with the same five public values must not attest.
+    #[test]
+    fn verify_v1_never_reports_verified() {
+        let node_did = "did:key:z6node";
+        let persisted = PersistedAnchorFields { node_did };
+        let v = serde_json::json!({
+            "schema": "gitlawb/ref-update/v1",
+            "repo": "alice/r",
+            "ref_name": "refs/heads/main",
+            "old_sha": "0000",
+            "new_sha": "1111",
+            "node_did": node_did,
+        });
+        let r = verify_v1(v, "v1-item-id", &persisted).unwrap();
+        assert!(!r.verified);
+        assert_eq!(r.outcome, ProbeOutcome::Indeterminate);
+        assert!(r.error.unwrap().contains("no cryptographic proof"));
     }
 }

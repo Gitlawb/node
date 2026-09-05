@@ -126,7 +126,15 @@ pub async fn verify_anchor(
         .ok_or_else(|| AppError::RepoNotFound(VERIFY_DENY_MSG.to_string()))?;
     crate::api::authorize_repo_read(&state, owner, name, caller, "/")
         .await
-        .map_err(|_| AppError::RepoNotFound(VERIFY_DENY_MSG.to_string()))?;
+        .map_err(|e| match e {
+            // Denials (no repo, quarantined, visibility deny) collapse
+            // to the opaque 404 so existence is not revealed. Any
+            // other error (notably `Db`, which maps to 503) propagates
+            // unchanged — a connection failure must not become
+            // "anchor not found".
+            AppError::RepoNotFound(_) => AppError::RepoNotFound(VERIFY_DENY_MSG.to_string()),
+            other => other,
+        })?;
 
     // 3. Resolve the persisted node_did to raw Ed25519 public key
     //    bytes for the signature check (v2 only — v1 has no
@@ -147,10 +155,6 @@ pub async fn verify_anchor(
     //    the protocol id and compares it to the requested
     //    `item_id` (artifact-identity check).
     let persisted = arweave_v2::PersistedAnchorFields {
-        repo: &row.repo,
-        ref_name: &row.ref_name,
-        old_sha: &row.old_sha,
-        new_sha: &row.new_sha,
         node_did: &row.node_did,
     };
     let result = arweave_v2::verify_anchor(
@@ -477,8 +481,6 @@ mod verify_anchor_tests {
     async fn verify_endpoint_public_repo_anonymous_200(pool: PgPool) {
         let kp = Keypair::generate();
         let node_did = did_of(&kp);
-        let item_id = "item_public_anon";
-        seed_anchor(&pool, &node_did, item_id).await;
 
         let data = br#"{"repo":"alice/r","ref":"refs/heads/main","old":"0000","new":"1111"}"#;
         let mut item = DataItem::new_unsigned(
@@ -489,6 +491,10 @@ mod verify_anchor_tests {
             data.to_vec(),
         );
         crate::ans104::sign_data_item(&mut item, &kp).unwrap();
+        // The artifact-identity check binds the URL id to the derived
+        // protocol id; seed the row with the real id.
+        let item_id = item.id().unwrap();
+        seed_anchor(&pool, &node_did, &item_id).await;
         let body = serde_json::to_string(&item).unwrap();
 
         let mut server = mockito::Server::new_async().await;
@@ -529,6 +535,144 @@ mod verify_anchor_tests {
             resp.status(),
             StatusCode::OK,
             "public repo + anonymous caller: 200 with payload"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["status"], "verified");
+        assert_eq!(v["verified"], true);
+        assert_eq!(v["data_payload"]["new"], "1111");
+    }
+
+    /// The verify route is reachable through the production
+    /// `build_router` mount (route present, `optional_signature`
+    /// layer, `IpRateLimiter` extension, layer order). Removing the
+    /// merge or the limiter extension must turn this red.
+    #[sqlx::test]
+    async fn verify_endpoint_reachable_through_build_router(pool: PgPool) {
+        let kp = Keypair::generate();
+        let node_did = did_of(&kp);
+        let mut item = DataItem::new_unsigned(
+            &kp.verifying_key().to_bytes(),
+            "",
+            "",
+            vec![(b"App-Name", b"gitlawb")],
+            br#"{"repo":"alice/r","ref":"refs/heads/main","old":"0000","new":"1111"}"#.to_vec(),
+        );
+        crate::ans104::sign_data_item(&mut item, &kp).unwrap();
+        let item_id = item.id().unwrap();
+        seed_anchor(&pool, &node_did, &item_id).await;
+        let body = serde_json::to_string(&item).unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.config = std::sync::Arc::new({
+            let mut c = (*state.config).clone();
+            c.arweave_gateway_url = server.url();
+            c
+        });
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/arweave/anchors/verify/{item_id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["status"], "verified");
+        assert_eq!(v["verified"], true);
+    }
+
+    /// An authenticated non-collaborator is denied on a private repo
+    /// through the same opaque 404 as the anonymous path. This drives
+    /// the gate's authenticated arm, which the anonymous-only suite
+    /// never exercised.
+    #[sqlx::test]
+    async fn verify_endpoint_private_repo_authenticated_stranger_404(pool: PgPool) {
+        let kp = Keypair::generate();
+        let node_did = did_of(&kp);
+        let item_id = "item_private_authed_stranger";
+
+        let db = crate::db::Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+        let now = chrono::Utc::now();
+        db.create_repo(&crate::db::RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "r".into(),
+            owner_did: "alice".into(),
+            description: None,
+            is_public: false,
+            default_branch: "main".into(),
+            created_at: now,
+            updated_at: now,
+            disk_path: "/tmp/r-authed-stranger".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO arweave_anchors
+               (id, repo, owner_did, ref_name, old_sha, new_sha, cid, irys_tx_id, arweave_url, node_did, anchored_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"#,
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind("alice/r")
+        .bind("alice")
+        .bind("refs/heads/main")
+        .bind("0".repeat(40))
+        .bind("1".repeat(40))
+        .bind(Option::<String>::None)
+        .bind(item_id)
+        .bind(format!("https://arweave.net/{item_id}"))
+        .bind(&node_did)
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = crate::test_support::test_state(pool).await;
+        let stranger = Keypair::generate();
+        let stranger_did = did_of(&stranger);
+        let req = crate::test_support::signed_request_as(
+            &stranger_did,
+            axum::http::Method::GET,
+            &format!("/api/v1/arweave/anchors/verify/{item_id}"),
+            axum::body::Body::empty(),
+        );
+        let resp = Router::new()
+            .route(
+                "/api/v1/arweave/anchors/verify/{item_id}",
+                axum::routing::get(verify_anchor),
+            )
+            .with_state(state)
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "repo_not_found");
+        assert_eq!(
+            v["message"],
+            format!("repository '{}' not found", VERIFY_DENY_MSG)
         );
     }
 

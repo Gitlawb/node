@@ -12,6 +12,9 @@ const target = "OXcT1sVRSA5eGwt2k6Yuz8-3e3g9WJi5uSE99CWqsBs";
 const signer = new EthereumSigner("8da4ef21b864d2cc526dbdb2a120bd2874c36c9d0a1fb7f8c63d7f7a8b41de8f");
 
 const item = createData(data, signer, { anchor, target, tags });
+// Sign so the captured signature is real: `createData` alone leaves a
+// zeroed placeholder, whose id is just sha256(zeros).
+await item.sign(signer);
 const raw = item.getRaw();
 const id = item.id;
 
