@@ -311,7 +311,7 @@ metadata        local disk / optional S3
 | DID | A user, agent, or node identity derived from an Ed25519 public key. |
 | HTTP Signature | RFC 9421 signature proving control of the DID key for write requests. |
 | Ref certificate | Signed record of a ref update. Useful for audit and replication. |
-| Ref certificate versioning | The wire format is versioned; v2 certs (the current issuance) require `gl cert show <id> --verify --expect-node <did>`, and the queried node's self-reported DID is **not** accepted as a trust anchor. The v1 path remains the only signature shape currently produced; the v2 stamp is the issuer's forward-compat claim. |
+| Ref certificate versioning | The wire format is versioned; new certificates are currently issued as v1. `gl cert show <id> --verify` requires `--expect-node <did>`, and the queried node's self-reported DID is **not** accepted as a trust anchor. v2 is reserved for a future payload shape that carries the version inside the signed bytes; this client refuses to verify v2+ rather than guessing. |
 | UCAN | Delegation token for future capability-based workflows. |
 | Peer announce | Node-to-node HTTP announcement of DID + public URL. |
 | Gossipsub | libp2p topic for ref-update events. |

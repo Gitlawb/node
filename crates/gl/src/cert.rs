@@ -207,9 +207,10 @@ async fn cmd_show(
         // signed payload is the 7-field canonical form with no
         // `version` key — see gitlawb-node/src/cert.rs. A future
         // v2+ cert has a different signed payload shape (the
-        // version field becomes part of the JSON and the field
-        // order changes), so a v2+ cert from a server this client
-        // does not know about must NOT be silently verified as v1.
+        // version field becomes part of the signed JSON per
+        // `v2_signing_payload`), so a v2+ cert from a server this
+        // client does not know about must NOT be silently verified
+        // as v1.
         // Reviewer 2: refuse rather than guess; the client and
         // server must agree on the version.
         // parse_cert_version admits exactly one Ok value: 1 (missing key and
@@ -269,7 +270,10 @@ async fn cmd_show(
 
     if require_valid {
         if let Err(reason) = verdict {
-            anyhow::bail!("certificate signature did not verify: {reason}");
+            // Round 3: do not claim the signature failed when it was
+            // never checked. A version refusal means the payload
+            // shape is unknown, so no signature verification ran.
+            anyhow::bail!("certificate could not be verified: {reason}");
         }
         // A valid signature proves internal consistency only: the payload was
         // signed by whatever key the certificate itself names. A hostile

@@ -20,9 +20,13 @@ use crate::state::AppState;
 /// Field order and key set are fixed: a default `serde_json::Value`
 /// serializes `Map<String, Value>` with sorted keys, so any change to
 /// the literal is observable as a different byte sequence on the
-/// wire. Adding a key (in particular `version`) for v2+ will break
-/// the v1 verify path, which is exactly the contract the version
-/// field exists to enforce.
+/// wire.
+///
+/// v1 is the unversioned legacy shape: no `version` key in the signed
+/// JSON. From v2 onward the version belongs INSIDE the signed bytes
+/// (see `v2_signing_payload`): leaving it as an unsigned sibling
+/// would let a future v2 cert be downgraded to v1 and still verify
+/// cleanly, since the bytes would be identical.
 pub(crate) fn v1_signing_payload(
     repo_id: &str,
     ref_name: &str,
@@ -40,6 +44,38 @@ pub(crate) fn v1_signing_payload(
         "pusher":  pusher_did,
         "node":    node_did,
         "ts":      issued_at,
+    })
+}
+
+/// Build the v2 signing payload — the future shape for versioned
+/// certs. Identical to v1 except the wire `version` is part of the
+/// signed bytes, so stripping or flipping the `version` column
+/// invalidates the signature instead of verifying cleanly under the
+/// other version's path.
+///
+/// NOT yet issued: `issue_ref_certificate` still stamps v1 because
+/// the shipped `gl` verifier only supports v1. This builder exists
+/// to pin the downgrade-resistant shape now, before any v2 cert is
+/// ever signed.
+#[allow(dead_code)]
+pub(crate) fn v2_signing_payload(
+    repo_id: &str,
+    ref_name: &str,
+    old_sha: &str,
+    new_sha: &str,
+    pusher_did: &str,
+    node_did: &str,
+    issued_at: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "repo_id": repo_id,
+        "ref":     ref_name,
+        "old":     old_sha,
+        "new":     new_sha,
+        "pusher":  pusher_did,
+        "node":    node_did,
+        "ts":      issued_at,
+        "version": 2,
     })
 }
 
@@ -78,19 +114,18 @@ pub async fn issue_ref_certificate(
         node_did,
         signature,
         issued_at,
-        // #26 Split PR 3: the wire-format version. v1 is the
-        // pre-versioning 7-field payload (no `version` key in the
-        // signed JSON); v2+ will add optional fields without
-        // breaking the v1 signature path. Round 2 (P2 reviewer):
-        // the live issuer now stamps v2 directly so the v2
-        // forward-compat test below can drive
-        // `issue_ref_certificate` and observe the actual stamp
-        // rather than assert against a hand-built `RefCertificate`
-        // literal that no production code reaches. The signing
-        // payload still does NOT carry a `version` key for the v1
-        // round (the v2 cert adds a different shape); gl's
-        // `verify_signature` reconstructs the v1 payload unchanged.
-        version: 2,
+        // #26 Split PR 3: the wire-format version. New certs stamp
+        // v1 — the pre-versioning 7-field payload with no `version`
+        // key in the signed JSON — because the shipped `gl`
+        // verifier only supports v1. Stamping v2 here would issue
+        // certificates the shipped client refuses (round-3
+        // finding: node pinned `version == 2` while gl pinned
+        // "2 is refused", with nothing exercising the
+        // composition). v2 is reserved for the future shape
+        // defined by `v2_signing_payload`, which carries the
+        // version INSIDE the signed bytes; land the v2 verify
+        // path before stamping v2.
+        version: 1,
     };
 
     // Persist and return the row as it exists in the database (on a
@@ -116,7 +151,7 @@ mod v1_payload_tests {
     //! previously held two separate `serde_json::json!` literals,
     //! so a regression in the signer could not fail this test.
     //! Both now go through the shared `v1_signing_payload` builder.
-    use super::v1_signing_payload;
+    use super::{v1_signing_payload, v2_signing_payload};
     use crate::db::RefCertificate;
     use gitlawb_core::identity::Keypair;
 
@@ -168,7 +203,8 @@ mod v1_payload_tests {
             &node_did,
             "2026-07-22T00:00:00+00:00",
         );
-        let sig = kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
+        let payload_bytes = serde_json::to_vec(&payload).unwrap();
+        let sig = kp.sign_b64(&payload_bytes);
         let cert = RefCertificate {
             id: "cert-id".into(),
             repo_id: "repo-1".into(),
@@ -179,9 +215,9 @@ mod v1_payload_tests {
             node_did: node_did.clone(),
             signature: sig.clone(),
             issued_at: "2026-07-22T00:00:00+00:00".into(),
-            version: 2,
+            version: 1,
         };
-        assert_eq!(cert.version, 2, "v2 cert carries version: 2");
+        assert_eq!(cert.version, 1, "new certs carry version: 1");
         // The signed payload reconstructs identically: gl's
         // verify_signature would build the same JSON, hash the
         // same bytes, and verify the same signature.
@@ -195,12 +231,28 @@ mod v1_payload_tests {
             &cert.issued_at,
         );
         let reconstructed_bytes = serde_json::to_vec(&reconstructed).unwrap();
-        let payload_bytes = serde_json::to_vec(&payload).unwrap();
         assert_eq!(
             reconstructed_bytes, payload_bytes,
             "the round-trip serialization must be byte-identical; \
              this is what makes gl's verify_signature succeed"
         );
+        // Round 3 (P3 reviewer): byte-equality alone never calls
+        // `identity::verify`, so a bad signature helper would pass.
+        // Verify the computed signature against the reconstructed
+        // bytes — the same check gl performs.
+        let vk = node_did
+            .parse::<gitlawb_core::did::Did>()
+            .unwrap()
+            .to_verifying_key()
+            .unwrap();
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let sig_bytes: [u8; 64] = URL_SAFE_NO_PAD
+            .decode(&cert.signature)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        gitlawb_core::identity::verify(&vk, &reconstructed_bytes, &sig_bytes)
+            .expect("well-formed v1 cert signature must verify");
     }
 
     /// Reviewer 1 finding: the live signer must share the
@@ -237,11 +289,70 @@ mod v1_payload_tests {
         assert_eq!(actual, expected, "v1 payload key set is frozen");
     }
 
-    /// The v1 RefCertificate shape with version: 2 is a
-    /// forward-compat hole: a v1 client reading a v2 cert
-    /// reconstructs the wrong payload. The gl client refuses
-    /// to verify v2 certs explicitly; this test pins that the version the
-    /// ISSUING PATH claims agrees with the payload shape it actually signs.
+    /// Round 3 (P2 reviewer): from v2 onward the version belongs
+    /// INSIDE the signed bytes. v1 stays the unversioned legacy
+    /// shape; v2 carries `"version": 2` in the payload so a
+    /// version flip without re-signing invalidates the signature
+    /// instead of verifying cleanly under the other path.
+    #[test]
+    fn v2_signing_payload_binds_version_and_resists_downgrade() {
+        let kp = Keypair::generate();
+        let node_did = kp.did().as_str().to_string();
+        let ts = "2026-07-22T00:00:00+00:00";
+        let v1 = v1_signing_payload(
+            "repo-1",
+            "refs/heads/main",
+            "oldsha",
+            "newsha",
+            "did:key:z6MkPusher",
+            &node_did,
+            ts,
+        );
+        let v2 = v2_signing_payload(
+            "repo-1",
+            "refs/heads/main",
+            "oldsha",
+            "newsha",
+            "did:key:z6MkPusher",
+            &node_did,
+            ts,
+        );
+        let v2_obj = v2.as_object().expect("v2 payload is a JSON object");
+        assert_eq!(
+            v2_obj.get("version"),
+            Some(&serde_json::json!(2)),
+            "v2 payload must carry the version inside the signed bytes"
+        );
+        let v1_bytes = serde_json::to_vec(&v1).unwrap();
+        let v2_bytes = serde_json::to_vec(&v2).unwrap();
+        assert_ne!(
+            v1_bytes, v2_bytes,
+            "v1 and v2 payloads must differ, otherwise a version flip is cryptographically invisible"
+        );
+
+        // A signature over v1 must NOT verify as v2 and vice versa.
+        let vk = node_did
+            .parse::<gitlawb_core::did::Did>()
+            .unwrap()
+            .to_verifying_key()
+            .unwrap();
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let sig_v1 = kp.sign_b64(&v1_bytes);
+        let sig_v1_bytes: [u8; 64] = URL_SAFE_NO_PAD.decode(&sig_v1).unwrap().try_into().unwrap();
+        assert!(
+            gitlawb_core::identity::verify(&vk, &v1_bytes, &sig_v1_bytes).is_ok(),
+            "v1 signature must verify under v1 bytes"
+        );
+        assert!(
+            gitlawb_core::identity::verify(&vk, &v2_bytes, &sig_v1_bytes).is_err(),
+            "a v1 signature presented as v2 (downgrade/upgrade flip) must not verify"
+        );
+    }
+
+    /// The live issuer stamps the version the shipped client can
+    /// verify. The gl client refuses to verify v2 certs explicitly;
+    /// this test pins that the version the ISSUING PATH claims
+    /// agrees with the payload shape it actually signs.
     ///
     /// Round 2: the prior form built a `RefCertificate` literal with
     /// `version: 1` and asserted `version == 1` — true no matter what the
@@ -250,9 +361,15 @@ mod v1_payload_tests {
     /// `issue_ref_certificate` so a regression in the issuer flips the test.
     /// The DB row is created against `test_support::test_state`, which
     /// gives us a real `AppState` with a real node keypair.
+    ///
+    /// Round 3: the issuer stamps v1 because the shipped `gl`
+    /// verifier only supports v1 (stamping v2 shipped certs the
+    /// client refuses). The binding to the live issuer is kept —
+    /// flipping the stamp still turns this test red — without
+    /// changing what production issues.
     #[sqlx::test]
     #[allow(clippy::async_yields_async)]
-    async fn issuer_stamps_v2_over_v1_payload(pool: sqlx::PgPool) {
+    async fn issuer_stamps_v1_over_v1_payload(pool: sqlx::PgPool) {
         let state = crate::test_support::test_state(pool.clone()).await;
         let repo_id = "repo-issuer-observe";
         let ref_name = "refs/heads/main";
@@ -260,9 +377,9 @@ mod v1_payload_tests {
         let new = "a".repeat(40);
         let pusher = "did:key:z6MkPusher";
 
-        // Drive the live issuer. The function generates a UUID
-        // for the cert id, so the test reads the row back by
-        // (repo_id, ref_name) to verify the issuer's claim.
+        // Drive the live issuer and read the persisted row back by
+        // id, so the test covers the stored `version` column and
+        // not just the in-process return value.
         let cert =
             crate::cert::issue_ref_certificate(&state, repo_id, ref_name, &old, &new, pusher)
                 .await
@@ -274,13 +391,26 @@ mod v1_payload_tests {
         assert_eq!(cert.ref_name, ref_name);
 
         // Cross-check 1: the issuer's claimed version must match
-        // what the live function stamps. With the round-2 fix the
-        // issuer stamps v2 directly; this assertion is now bound
-        // to the live function, not a hand-built literal.
+        // what the live function stamps. This assertion is bound
+        // to the live function, not a hand-built literal:
+        // flipping the stamp in `issue_ref_certificate` breaks it
+        // through the actual call path.
         assert_eq!(
-            cert.version, 2,
-            "the live issuer must stamp v2; flipping cert.rs:87 to 1 or 3 \
-             breaks this assertion through the actual call path"
+            cert.version, 1,
+            "the live issuer must stamp v1 until a v2 verifier ships; \
+             flipping the stamp breaks this assertion through the actual call path"
+        );
+
+        // Cross-check 1b: the persisted row carries the same stamp.
+        let stored = state
+            .db
+            .get_ref_certificate(&cert.id)
+            .await
+            .expect("persisted cert must be readable")
+            .expect("persisted cert must exist");
+        assert_eq!(
+            stored.version, cert.version,
+            "the stored version column must match the issued claim"
         );
 
         // Cross-check 2: the signature on the cert must verify
@@ -289,7 +419,7 @@ mod v1_payload_tests {
         // what gl's `verify_signature` does for a v1 cert: rebuild
         // the payload from the cert's own fields and verify the
         // signature. If the issuer ever signs a different shape
-        // while still claiming v2, every shipped client breaks —
+        // while still claiming v1, every shipped client breaks —
         // and so does this.
         let rebuilt = v1_signing_payload(
             &cert.repo_id,
@@ -313,15 +443,14 @@ mod v1_payload_tests {
             .try_into()
             .unwrap();
         gitlawb_core::identity::verify(&vk, &serde_json::to_vec(&rebuilt).unwrap(), &sig_bytes)
-            .expect("a v2 cert's signature must verify against the v1 payload shape");
+            .expect("a v1 cert's signature must verify against the v1 payload shape");
 
         // Cross-check 3: the v1 signed payload must NOT contain a
-        // version key — v2 is defined as the shape that adds one.
-        // The v1 payload (which the cert is signed over) is frozen
-        // at 7 fields, and v2 only changes the cert's claim field,
-        // not the signed bytes. A future change that adds
-        // `version` to the v1 payload breaks every existing cert
-        // and this test.
+        // version key — v2 is the future shape that adds one inside
+        // the signed bytes (see `v2_signing_payload`). The v1
+        // payload (which the cert is signed over) is frozen at 7
+        // fields. A change that adds `version` to the v1 payload
+        // breaks every existing cert and this test.
         let obj = rebuilt
             .as_object()
             .expect("rebuilt v1 payload is a JSON object");

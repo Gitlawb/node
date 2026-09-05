@@ -1138,13 +1138,16 @@ const MIGRATIONS: &[Migration] = &[
             // ref-cert wire format is versioned so future fields can
             // be added without breaking old clients (which ignore
             // the field) or old servers (which default the column
-            // to 1). The current version is 1, which is byte-for-byte
-            // identical to the pre-versioning shape: an old client
-            // reading a v1 cert from a new server sees the same
-            // payload, the same signature, and the same Ed25519
-            // verify path. A new client reading an old server sees
-            // `version` defaulted to 1 and verifies against the v1
-            // payload shape.
+            // to 1). New certificates are currently issued as v1,
+            // which is byte-for-byte identical to the pre-versioning
+            // shape: an old client reading a v1 cert from a new
+            // server sees the same payload, the same signature, and
+            // the same Ed25519 verify path. A new client reading an
+            // old server sees `version` defaulted to 1 and verifies
+            // against the v1 payload shape. v2 is reserved for a
+            // future shape that carries the version inside the
+            // signed bytes; it must not be stamped until a v2
+            // verifier ships.
             //
             // DEFAULT 1 so an existing row reads as v1 without a
             // backfill migration. NOT NULL so a missing value is a
