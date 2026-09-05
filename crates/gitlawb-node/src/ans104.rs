@@ -137,6 +137,16 @@ pub struct DataItem {
     /// carries the byte.
     #[serde(default = "default_signature_type")]
     pub signature_type: u8,
+    /// Original Avro tag-array payload bytes when parsed from the
+    /// binary frame. The deep-hash folds these exact bytes (arbundles
+    /// hashes `rawTags` as a flat blob), and `to_binary` re-emits
+    /// them, so multi-block or size-prefixed encodings survive the
+    /// parse/hash/encode path instead of being normalized by
+    /// re-encoding. `None` for items built locally or from JSON,
+    /// which encode via `encode_tags_block`. Skipped by serde: the
+    /// JSON projection carries tags, not the Avro bytes.
+    #[serde(skip)]
+    pub raw_tags: Option<Vec<u8>>,
 }
 
 fn default_signature_type() -> u8 {
@@ -200,6 +210,7 @@ impl DataItem {
             tags,
             data: data_b64,
             signature_type: SIGNATURE_TYPE_ED25519,
+            raw_tags: None,
         }
     }
 
@@ -361,8 +372,13 @@ impl DataItem {
         };
 
         // 8-element fold matching arbundles. The tags slot is the
-        // serialized Avro buffer as a flat blob.
-        let tags_block = encode_tags_block(&raw_tags);
+        // serialized Avro buffer as a flat blob: the original payload
+        // when parsed from binary, otherwise the single-block encoding
+        // of the local tags.
+        let tags_block: Vec<u8> = match &self.raw_tags {
+            Some(raw) => raw.clone(),
+            None => encode_tags_block(&raw_tags),
+        };
 
         let fields: Vec<DeepHashChunk> = vec![
             DeepHashChunk::Blob(b"dataitem".to_vec()),
@@ -466,6 +482,10 @@ impl DataItem {
                 .collect(),
             data: URL_SAFE_NO_PAD.encode(&data_bytes),
             signature_type,
+            // Preserve the original Avro payload so the deep-hash
+            // folds the exact bytes the signer hashed and `to_binary`
+            // re-emits them byte-exact.
+            raw_tags: Some(tags_payload.to_vec()),
         })
     }
 
@@ -551,21 +571,28 @@ impl DataItem {
             .decode(self.data.as_bytes())
             .with_context(|| "decoding data for to_binary")?;
 
-        // Build the Avro tag block.
-        let tag_pairs: Vec<(Vec<u8>, Vec<u8>)> = self
-            .tags
-            .iter()
-            .map(|t| -> Result<(Vec<u8>, Vec<u8>)> {
-                let n = URL_SAFE_NO_PAD
-                    .decode(t.name.as_bytes())
-                    .with_context(|| "decoding tag name for to_binary")?;
-                let v = URL_SAFE_NO_PAD
-                    .decode(t.value.as_bytes())
-                    .with_context(|| "decoding tag value for to_binary")?;
-                Ok((n, v))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let tags_block = encode_tags_block(&tag_pairs);
+        // Tag block: re-emit the original Avro payload when the item
+        // was parsed from binary (multi-block or size-prefixed forms
+        // survive byte-exact); otherwise encode the single-block form.
+        let tags_block: Vec<u8> = match &self.raw_tags {
+            Some(raw) => raw.clone(),
+            None => {
+                let tag_pairs: Vec<(Vec<u8>, Vec<u8>)> = self
+                    .tags
+                    .iter()
+                    .map(|t| -> Result<(Vec<u8>, Vec<u8>)> {
+                        let n = URL_SAFE_NO_PAD
+                            .decode(t.name.as_bytes())
+                            .with_context(|| "decoding tag name for to_binary")?;
+                        let v = URL_SAFE_NO_PAD
+                            .decode(t.value.as_bytes())
+                            .with_context(|| "decoding tag value for to_binary")?;
+                        Ok((n, v))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                encode_tags_block(&tag_pairs)
+            }
+        };
 
         // Length computation.
         let len = 2
@@ -627,7 +654,12 @@ fn decode_tags(payload: &[u8], expected_count: usize) -> Result<Vec<(Vec<u8>, Ve
             break;
         }
         let (block_count, block_end) = if block_count_raw < 0 {
-            let count = (-block_count_raw) as usize;
+            // `unsigned_abs` (not negation): `i64::MIN` has no
+            // positive counterpart and `-i64::MIN` overflows.
+            let count_u = block_count_raw.unsigned_abs();
+            let count = usize::try_from(count_u).map_err(|_| {
+                anyhow!("ANS-104 Avro tag block count {count_u} does not fit in usize")
+            })?;
             if count == 0 {
                 bail!("ANS-104 Avro tag block count is zero after negation");
             }
@@ -645,7 +677,10 @@ fn decode_tags(payload: &[u8], expected_count: usize) -> Result<Vec<(Vec<u8>, Ve
             }
             (count, Some(pos + block_size))
         } else {
-            (block_count_raw as usize, None)
+            let count = usize::try_from(block_count_raw).map_err(|_| {
+                anyhow!("ANS-104 Avro tag block count {block_count_raw} does not fit in usize")
+            })?;
+            (count, None)
         };
         for _ in 0..block_count {
             let (name_len_i, p) = read_zigzag_vint(payload, pos)?;
@@ -1171,9 +1206,24 @@ mod tests {
         );
 
         // Ed25519 verify WITHOUT re-signing: the signature came from
-        // arbundles, not from this module.
-        let owner_pk = item.owner_pubkey_ed25519().expect("ed25519 owner");
-        verify_data_item(&item, &owner_pk).expect("arbundles-signed golden must verify");
+        // arbundles, not from this module. The expected key is pinned
+        // independently (the fixture's owner for seed `0x01 * 32`,
+        // per `scripts/ans104_golden_ed25519.mjs`), NOT extracted
+        // from the item — extracting it from the item would make the
+        // owner-equality check vacuous.
+        let expected_owner_b64 = "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w";
+        assert_eq!(
+            item.owner, expected_owner_b64,
+            "golden owner must match the pinned seed pubkey"
+        );
+        let expected_owner_bytes = URL_SAFE_NO_PAD
+            .decode(expected_owner_b64.as_bytes())
+            .expect("pinned owner b64 decodes");
+        let expected_pk: [u8; PUBLIC_KEY_LENGTH] = expected_owner_bytes
+            .as_slice()
+            .try_into()
+            .expect("pinned owner is 32 bytes");
+        verify_data_item(&item, &expected_pk).expect("arbundles-signed golden must verify");
 
         // The binary form must round-trip back to the same bytes
         // (signature slot preserved, not zeroed).
@@ -1203,6 +1253,98 @@ mod tests {
         assert_eq!(tags.len(), 1);
         assert_eq!(&tags[0].0[..], b"A");
         assert_eq!(&tags[0].1[..], b"B");
+    }
+
+    /// Signed binary parse-and-verify over non-canonical tag blocks.
+    /// A multi-block encoding and a size-prefixed (negative-count)
+    /// encoding carry the same two tags as the canonical single
+    /// block but as different bytes. The deep-hash must fold the
+    /// ORIGINAL payload bytes, so an item parsed from either form,
+    /// signed, and re-parsed verifies WITHOUT re-signing, and
+    /// `to_binary` re-emits the original payload byte-exact
+    /// (signature slot excepted). Re-encoding before hashing would
+    /// normalize both forms to one digest the signer never hashed.
+    #[test]
+    fn signed_binary_parse_and_verify_multi_block_and_negative_count() {
+        fn entry(n: &[u8], v: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            write_zigzag_vint(&mut out, n.len() as i64);
+            out.extend_from_slice(n);
+            write_zigzag_vint(&mut out, v.len() as i64);
+            out.extend_from_slice(v);
+            out
+        }
+        fn unsigned_frame(
+            owner_pk: &[u8; 32],
+            tag_count: u64,
+            tags_payload: &[u8],
+            data: &[u8],
+        ) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&(SIGNATURE_TYPE_ED25519 as u16).to_le_bytes());
+            out.extend(std::iter::repeat_n(
+                0u8,
+                signature_size(SIGNATURE_TYPE_ED25519),
+            ));
+            out.extend_from_slice(owner_pk);
+            out.push(0); // no target
+            out.push(0); // no anchor
+            out.extend_from_slice(&tag_count.to_le_bytes());
+            out.extend_from_slice(&(tags_payload.len() as u64).to_le_bytes());
+            out.extend_from_slice(tags_payload);
+            out.extend_from_slice(data);
+            out
+        }
+
+        let kp = Keypair::generate();
+        let pk = kp.verifying_key().to_bytes();
+        let data = b"multi-block interop".to_vec();
+        let e1 = entry(b"App-Name", b"gitlawb");
+        let e2 = entry(b"Schema", b"gitlawb/ref-update/v1");
+
+        // Two blocks of one tag each, then the terminator.
+        let mut multi = Vec::new();
+        write_zigzag_vint(&mut multi, 1);
+        multi.extend_from_slice(&e1);
+        write_zigzag_vint(&mut multi, 1);
+        multi.extend_from_slice(&e2);
+        write_zigzag_vint(&mut multi, 0);
+
+        // One size-prefixed block of two tags, then the terminator.
+        let mut neg = Vec::new();
+        write_zigzag_vint(&mut neg, -2);
+        let body_len: i64 = (e1.len() + e2.len())
+            .try_into()
+            .expect("tag body fits in i64");
+        write_zigzag_vint(&mut neg, body_len);
+        neg.extend_from_slice(&e1);
+        neg.extend_from_slice(&e2);
+        write_zigzag_vint(&mut neg, 0);
+
+        for payload in [multi, neg] {
+            let frame = unsigned_frame(&pk, 2, &payload, &data);
+            let mut item = DataItem::from_binary(&frame).expect("from_binary");
+            // Tags decode identically in both forms.
+            assert_eq!(item.tags.len(), 2);
+            // The original payload is preserved for hashing/encoding.
+            assert_eq!(item.raw_tags.as_deref(), Some(payload.as_slice()));
+            // Sign over the original payload bytes, then verify.
+            sign_data_item(&mut item, &kp).expect("sign");
+            verify_data_item(&item, &pk).expect("verify without re-signing");
+            // Re-encoding preserves the original payload byte-exact;
+            // only the signature slot changes (zeros -> real sig).
+            let sig_len = signature_size(SIGNATURE_TYPE_ED25519);
+            let bin2 = item.to_binary().expect("to_binary");
+            assert_eq!(bin2.len(), frame.len());
+            let sig_bytes = URL_SAFE_NO_PAD
+                .decode(item.signature.as_bytes())
+                .expect("sig decodes");
+            assert_eq!(&bin2[2..2 + sig_len], &sig_bytes[..]);
+            assert_eq!(&bin2[2 + sig_len..], &frame[2 + sig_len..]);
+            // A fresh parse of the signed frame verifies directly.
+            let parsed = DataItem::from_binary(&bin2).expect("re-parse");
+            verify_data_item(&parsed, &pk).expect("signed re-parse verifies");
+        }
     }
 }
 
