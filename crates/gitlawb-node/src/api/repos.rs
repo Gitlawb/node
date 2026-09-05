@@ -2214,6 +2214,16 @@ pub async fn git_receive_pack(
     tracing::debug!(repo = %name, path = %disk_path.display(), "running git receive-pack");
     let body_len = body.len();
     let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+    // Recovery upgrade invariant: before the first durable intent or
+    // marker relies on reflogs/hidden refs, idempotently enable and
+    // verify them for new and upgraded repos. Failures refuse the push
+    // rather than being discovered only after an interrupted push.
+    if let Err(e) = crate::git::store::verify_recovery_prereqs(&disk_path) {
+        tracing::error!(err = %e, repo = %name, "recovery prereqs unavailable; refusing push");
+        return Err(AppError::Overloaded(
+            "repository recovery config unavailable, retry shortly".into(),
+        ));
+    }
     // Move both admission permits into the guard so they release only after the spawned
     // receive-pack process group is reaped, on complete/timeout/disconnect — not the
     // instant a disconnect drops this future while the detached reaper runs (#174 P1-a).
@@ -2348,41 +2358,29 @@ pub async fn git_receive_pack(
         ));
     }
 
-    // #26 Split PR 1 step 5 — write the per-request marker ref
-    // BEFORE calling `git receive-pack`. The marker's value is
-    // derived from `request_bytes_hash` via `marker_value_for`,
-    // which `git hash-object -w`s the first 20 bytes (yielding a
-    // 40-char SHA-1, the only thing `git update-ref` will accept).
-    // The reconcile reads it back via `git::store::read_ref` and
-    // compares against the request row via the same helper.
-    // Failure is non-fatal: the reconcile's marker gate will see no
-    // marker and quarantine the request; an operator can reclassify.
-    let marker_ref_name = format!("refs/gitlawb/requests/{request_id}");
+    // Marker namespace is already verified hidden by
+    // `verify_recovery_prereqs` above (which refuses the push on
+    // failure), so no advertisement window exists before the first
+    // marker. Write the per-request marker through the bounded runner
+    // using the configured git binary. Failure is non-fatal for Git
+    // progress but reconcile will quarantine on a missing marker.
     match crate::git::store::marker_value_for(&disk_path, &req_row.request_bytes_hash) {
         Ok(marker_value) => {
-            let marker_write = std::process::Command::new("git")
-                .args(["update-ref", &marker_ref_name, &marker_value])
-                .arg("--no-deref")
-                .current_dir(&disk_path)
-                .output();
-            match marker_write {
-                Ok(out) if !out.status.success() => {
-                    tracing::warn!(
-                        request_id = %request_id,
-                        repo = %name,
-                        stderr = %String::from_utf8_lossy(&out.stderr),
-                        "marker write returned non-zero; reconcile will quarantine this request"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        err = %e,
-                        request_id = %request_id,
-                        repo = %name,
-                        "marker write failed to spawn; reconcile will quarantine this request"
-                    );
-                }
-                _ => {}
+            if let Err(e) = crate::git::store::write_marker_bounded(
+                &state.git_bin,
+                &disk_path,
+                &request_id,
+                &marker_value,
+                std::time::Duration::from_secs(10),
+            )
+            .await
+            {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    repo = %name,
+                    "bounded marker write failed; reconcile will quarantine this request"
+                );
             }
         }
         Err(e) => {
@@ -2407,8 +2405,9 @@ pub async fn git_receive_pack(
     // id so startup reconcile has request-specific landing proof
     // (not just a tuple that a later request could recreate).
     // Also ensure the marker namespace stays hidden for repos that
-    // predate the init_bare hideRefs config.
-    crate::git::store::ensure_marker_hidden(&disk_path);
+    // The reflog action is best-effort binding (receive-pack writes a
+    // fixed `push` message and ignores GIT_REFLOG_ACTION); causality
+    // still relies on marker + tuple/timestamp + history guards.
     let reflog_action = format!("gitlawb-request:{request_id}");
     let (receive_raw, exit_ok) = match smart_http::receive_pack_raw_with_reflog(
         &state.git_bin,
@@ -2546,13 +2545,22 @@ pub async fn git_receive_pack(
 
     // Build the atomic outcome inputs.
     #[allow(clippy::type_complexity)]
-    let (unpack_failed, ok_names, ng_names, uncertain_names, parsed_json_opt, rejected_reason): (
+    let (
+        unpack_failed,
+        ok_names,
+        ng_names,
+        uncertain_names,
+        parsed_json_opt,
+        rejected_reason,
+        terminal_no_effects,
+    ): (
         bool,
         Vec<&str>,
         Vec<&str>,
         Vec<&str>,
         Option<serde_json::Value>,
         Option<String>,
+        bool,
     ) = if !unpack_ok {
         if let Some(parsed) = &report {
             let parsed_json = serde_json::json!({
@@ -2562,7 +2570,15 @@ pub async fn git_receive_pack(
                     "ok": ok,
                 })).collect::<Vec<_>>(),
             });
-            (true, Vec::new(), Vec::new(), Vec::new(), Some(parsed_json), None)
+            (
+                true,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Some(parsed_json),
+                None,
+                false,
+            )
         } else {
             // Unpack flag false without a parsed report (defensive):
             // treat as indeterminate.
@@ -2573,6 +2589,7 @@ pub async fn git_receive_pack(
                 pending_ref_names.clone(),
                 None,
                 Some("unpack failed without parseable report".to_string()),
+                false,
             )
         }
     } else if let Some(parsed) = &report {
@@ -2590,22 +2607,60 @@ pub async fn git_receive_pack(
                 ng_names.push(*name);
             }
         }
-        if !ng_names.is_empty() {
+        // Syntactic completeness (flush) is enforced in
+        // `strip_sideband`; command-set completeness is enforced here:
+        // a parsed report that omits declared refs is not
+        // authoritative. Persist the whole request as indeterminate so
+        // reconciliation produces a fresh normalized outcome before
+        // anything is retired. Otherwise a partial prefix would commit
+        // one ok child as applied, leave siblings uncertain, and the
+        // executor would delete the unresolved evidence on completion.
+        if !unmentioned.is_empty() {
             tracing::warn!(
                 request_id = %request_id,
                 repo = %name,
-                rejected_refs = ?ng_names,
-                "git report-status: some refs rejected; durable effects will skip them"
+                unmentioned = ?unmentioned,
+                "report-status omits declared refs; persisting as indeterminate"
             );
+            (
+                false,
+                Vec::new(),
+                Vec::new(),
+                pending_ref_names.clone(),
+                None,
+                Some("incomplete report-status: omitted declared refs".to_string()),
+                false,
+            )
+        } else {
+            if !ng_names.is_empty() {
+                tracing::warn!(
+                    request_id = %request_id,
+                    repo = %name,
+                    rejected_refs = ?ng_names,
+                    "git report-status: some refs rejected; durable effects will skip them"
+                );
+            }
+            let parsed_json = serde_json::json!({
+                "unpack_ok": parsed.0,
+                "ref_results": parsed.1.iter().map(|(n, ok)| serde_json::json!({
+                    "ref_name": n,
+                    "ok": ok,
+                })).collect::<Vec<_>>(),
+            });
+            // All refs rejected with exit zero: terminal with no
+            // effects. The startup drain must have nothing executable
+            // to revisit and retention must be able to purge.
+            let terminal = ok_names.is_empty() && !pending_ref_names.is_empty();
+            (
+                false,
+                ok_names,
+                ng_names,
+                unmentioned,
+                Some(parsed_json),
+                None,
+                terminal,
+            )
         }
-        let parsed_json = serde_json::json!({
-            "unpack_ok": parsed.0,
-            "ref_results": parsed.1.iter().map(|(n, ok)| serde_json::json!({
-                "ref_name": n,
-                "ok": ok,
-            })).collect::<Vec<_>>(),
-        });
-        (false, ok_names, ng_names, unmentioned, Some(parsed_json), None)
     } else if exit_ok {
         // Implicit-ok: no report but zero exit. Every pushed ref is
         // treated as landed, with a synthetic all-ok report so the
@@ -2620,7 +2675,15 @@ pub async fn git_receive_pack(
             })).collect::<Vec<_>>(),
             "synthetic": "implicit-ok",
         });
-        (false, ok_names, Vec::new(), Vec::new(), Some(synthetic), None)
+        (
+            false,
+            ok_names,
+            Vec::new(),
+            Vec::new(),
+            Some(synthetic),
+            None,
+            false,
+        )
     } else {
         // No report and non-zero exit: indeterminate. Every ref is
         // uncertain; the parent goes to `rejected_at_git` for
@@ -2632,6 +2695,7 @@ pub async fn git_receive_pack(
             pending_ref_names.clone(),
             None,
             Some("git returned non-zero exit with no parseable report".to_string()),
+            false,
         )
     };
 
@@ -2647,6 +2711,7 @@ pub async fn git_receive_pack(
             parsed_json_opt.as_ref(),
             accepted_ordinal,
             rejected_reason.as_deref(),
+            terminal_no_effects,
         )
         .await
     {

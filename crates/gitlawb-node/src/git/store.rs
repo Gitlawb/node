@@ -117,7 +117,12 @@ pub fn init_bare(path: &Path) -> Result<()> {
 /// Ensure an existing repo hides the internal marker namespace.
 /// Idempotent; used at push time for repos predating the `init_bare`
 /// hideRefs config so advertisement cannot diverge by repo age.
+#[allow(dead_code)]
 pub fn ensure_marker_hidden(repo_path: &Path) {
+    let _ = ensure_marker_hidden_checked(repo_path);
+}
+
+pub fn ensure_marker_hidden_checked(repo_path: &Path) -> Result<()> {
     for (key, value) in [
         ("uploadpack.hideRefs", "refs/gitlawb/requests/"),
         ("transfer.hideRefs", "refs/gitlawb/requests/"),
@@ -125,21 +130,109 @@ pub fn ensure_marker_hidden(repo_path: &Path) {
         let current = Command::new("git")
             .args(["config", "--get-all", key])
             .current_dir(repo_path)
-            .output();
-        let already = current
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .any(|l| l.trim() == value)
-            })
-            .unwrap_or(false);
+            .output()
+            .context("git config --get-all hideRefs failed")?;
+        let already = String::from_utf8_lossy(&current.stdout)
+            .lines()
+            .any(|l| l.trim() == value);
         if !already {
-            let _ = Command::new("git")
+            let out = Command::new("git")
                 .args(["config", "--add", key, value])
                 .current_dir(repo_path)
-                .output();
+                .output()
+                .context("git config --add hideRefs failed")?;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "git config --add {key} failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
         }
     }
+    Ok(())
+}
+
+/// Verify recovery prerequisites before the first durable intent or
+/// marker relies on them: `core.logAllRefUpdates=always` plus both
+/// hideRefs. Idempotently enables missing config; failures are
+/// surfaced so the handler refuses the push rather than discovering
+/// the gap only after an interrupted push.
+pub fn verify_recovery_prereqs(repo_path: &Path) -> Result<()> {
+    let get = Command::new("git")
+        .args(["config", "--get", "core.logAllRefUpdates"])
+        .current_dir(repo_path)
+        .output()
+        .context("git config --get logAllRefUpdates failed")?;
+    let cur = String::from_utf8_lossy(&get.stdout).trim().to_string();
+    if cur != "always" {
+        let out = Command::new("git")
+            .args(["config", "core.logAllRefUpdates", "always"])
+            .current_dir(repo_path)
+            .output()
+            .context("git config logAllRefUpdates failed")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "enabling core.logAllRefUpdates=always failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+    ensure_marker_hidden_checked(repo_path)
+}
+
+/// Bounded marker write through the configured git binary with timeout.
+/// Used on the live path (which holds the write lease); failures are
+/// returned so the handler can refuse rather than create unprotected
+/// metadata.
+pub async fn write_marker_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    request_id: &str,
+    marker_value: &str,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    use tokio::process::Command as AsyncCommand;
+    let ref_name = format!("refs/gitlawb/requests/{request_id}");
+    let fut = async {
+        AsyncCommand::new(git_bin)
+            .args(["update-ref", &ref_name, marker_value, "--no-deref"])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .context("marker update-ref spawn failed")
+    };
+    let out = tokio::time::timeout(timeout, fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("marker update-ref timed out"))??;
+    if !out.status.success() {
+        anyhow::bail!(
+            "marker update-ref failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Bounded idempotent marker deletion; returns Ok(true) when the ref is
+/// gone, Ok(false) on failure (caller retains tombstone and retries).
+pub async fn delete_marker_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    request_id: &str,
+    timeout: std::time::Duration,
+) -> Result<bool> {
+    use tokio::process::Command as AsyncCommand;
+    let ref_name = format!("refs/gitlawb/requests/{request_id}");
+    let fut = AsyncCommand::new(git_bin)
+        .args(["update-ref", "-d", &ref_name, "--no-deref"])
+        .current_dir(repo_path)
+        .output();
+    let out = match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(e).context("marker delete spawn failed"),
+        Err(_) => return Ok(false),
+    };
+    Ok(out.status.success())
 }
 
 /// Delete a per-request marker ref. Best-effort; called on terminal

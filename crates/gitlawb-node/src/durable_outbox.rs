@@ -203,12 +203,37 @@ async fn reconcile_prepared_page(
             // cannot prove.
             let is_deletion = row.new_sha == ZERO_SHA;
             if is_deletion {
+                // Deletions are fail-closed with a terminating attended
+                // lifecycle: quarantine the parent (cancelling prepared
+                // + uncertain siblings) so automatic reconcile stops
+                // revisiting it, and expose an operator resolve/reject
+                // transition. Do not restore absence-plus-age inference.
+                // A deletion interrupted after the ref disappears either
+                // carries request-bound evidence in a future split or
+                // remains in this stable attended state.
+                if let Err(e) = state
+                    .db
+                    .mark_request_quarantined(
+                        &row.request_id,
+                        "deletion requires attended recovery",
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        err = %e,
+                        request_id = %row.request_id,
+                        "reconcile: quarantine deletion failed"
+                    );
+                    continue;
+                }
+                let _ = state
+                    .db
+                    .mark_children_rejected_for_quarantined_parent(&row.request_id)
+                    .await;
                 tracing::warn!(
                     row_id = %row.id,
                     request_id = %row.request_id,
-                    repo_id = %row.repo_id,
-                    ref_name = %row.ref_name,
-                    "reconcile: deletions require attended recovery; staying prepared"
+                    "reconcile: deletion quarantined for attended recovery"
                 );
                 continue;
             }
@@ -374,6 +399,10 @@ async fn reconcile_prepared_page(
             // pre-Git marker cannot establish which one caused the
             // landing (a later request recreating the same tuple, or a
             // marker-only request that never ran Git). Fail closed.
+            // Two guards: live competing rows, plus retained landing
+            // history (survives B's child cleanup, closing the A/B hole
+            // where A is interrupted before Git, B lands the same tuple
+            // and completes, then A sees B's tip/reflog/marker).
             match state
                 .db
                 .has_competing_claimant(
@@ -399,6 +428,57 @@ async fn reconcile_prepared_page(
                         err = %e,
                         request_id = %row.request_id,
                         "reconcile: competing-claimant check failed; staying prepared"
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+            }
+            match state
+                .db
+                .has_landed_tuple_by_other_request(
+                    &row.repo_id,
+                    &row.ref_name,
+                    &row.old_sha,
+                    &row.new_sha,
+                    &row.request_id,
+                )
+                .await
+            {
+                Ok(true) => {
+                    // Another request already proved and effected this
+                    // tuple. Quarantine for attended recovery rather than
+                    // signing duplicate attribution for this pusher.
+                    if let Err(e) = state
+                        .db
+                        .mark_request_quarantined(
+                            &row.request_id,
+                            "tuple already landed by another request",
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            err = %e,
+                            request_id = %row.request_id,
+                            "reconcile: quarantine on landed-history hit failed"
+                        );
+                        continue;
+                    }
+                    let _ = state
+                        .db
+                        .mark_children_rejected_for_quarantined_parent(&row.request_id)
+                        .await;
+                    tracing::warn!(
+                        row_id = %row.id,
+                        request_id = %row.request_id,
+                        "reconcile: landed-history hit; quarantined"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        err = %e,
+                        request_id = %row.request_id,
+                        "reconcile: landed-history check failed; staying prepared"
                     );
                     continue;
                 }
@@ -839,11 +919,10 @@ pub async fn drain_receive_pack_requests_all(
 /// older than `retention_days`. Runs as a periodic task from
 /// `main.rs` (one per cluster per day is the spec's target rate).
 ///
-/// Deletion order matters: purge the parent requests first, then
-/// the orphaned children. The parent delete is bounded by the
-/// partial index `idx_receive_pack_requests_completed_at` (built
-/// by v30); the children delete is bounded by the same predicate
-/// on `applied_at` / `cancelled_at`.
+/// Children are deleted before/with their terminal parent in one
+/// database transaction (`purge_terminal_batch`); marker tombstones
+/// are enqueued in the same txn and drained until bounded Git deletion
+/// succeeds, so SQL and Git-side retention cannot diverge.
 ///
 /// `quarantined` rows are NEVER purged by this path — the spec
 /// reserves those for operator inspection. Step 5 introduces the
@@ -863,25 +942,18 @@ pub async fn purge_request_queue(
     let older_than = chrono::Utc::now() - chrono::Duration::days(retention_days);
     let older_than_iso = older_than.to_rfc3339();
 
-    // Retire parents first and capture their ids so Git-side marker
-    // refs follow the same retention decision. SQL children use a
-    // terminal-parent join (see `purge_completed_pending_ref_transitions`)
-    // so call order alone cannot delete live work.
-    let purged = db
-        .purge_completed_receive_pack_requests_returning(&older_than_iso, per_pass_limit)
+    let (purged, children_deleted) = db
+        .purge_terminal_batch(&older_than_iso, per_pass_limit)
         .await?;
     let requests_deleted = purged.len() as u64;
+    // Best-effort synchronous marker sweep for the direct-call path
+    // (tests, one-off runs). The background tombstone worker owns
+    // retries; failures retain the tombstone.
     for (request_id, repo_id) in &purged {
-        // Best-effort: a missing repo row (deleted repo) simply skips
-        // marker cleanup; the ref remains but is unreachable via the
-        // hidden namespace and bounded by repo lifetime.
         if let Ok(Some(repo)) = db.get_repo_by_id(repo_id).await {
             crate::git::store::delete_marker(std::path::Path::new(&repo.disk_path), request_id);
         }
     }
-    let children_deleted = db
-        .purge_completed_pending_ref_transitions(&older_than_iso, per_pass_limit)
-        .await?;
 
     if requests_deleted > 0 || children_deleted > 0 {
         tracing::info!(
@@ -893,6 +965,57 @@ pub async fn purge_request_queue(
         );
     }
     Ok((requests_deleted, children_deleted))
+}
+
+/// Drain marker tombstones with the bounded deleter. Retains the
+/// tombstone until `git update-ref -d` succeeds; only then is the
+/// final owner removed. Repository lookup failures also retain.
+pub async fn drain_marker_cleanup_queue(
+    state: &AppState,
+    limit: i64,
+    git_timeout: std::time::Duration,
+) -> anyhow::Result<(usize, usize)> {
+    let due = state.db.list_marker_cleanup_due(limit).await?;
+    let mut ok = 0;
+    let examined = due.len();
+    for item in due {
+        let repo = match state.db.get_repo_by_id(&item.repo_id).await {
+            Ok(Some(r)) => r,
+            Ok(None) | Err(_) => {
+                let _ = state
+                    .db
+                    .mark_marker_cleanup_attempt(&item.request_id, Some("repo lookup failed"))
+                    .await;
+                continue;
+            }
+        };
+        match crate::git::store::delete_marker_bounded(
+            &state.git_bin,
+            std::path::Path::new(&repo.disk_path),
+            &item.request_id,
+            git_timeout,
+        )
+        .await
+        {
+            Ok(true) => {
+                let _ = state.db.delete_marker_cleanup(&item.request_id).await;
+                ok += 1;
+            }
+            Ok(false) => {
+                let _ = state
+                    .db
+                    .mark_marker_cleanup_attempt(&item.request_id, Some("git delete failed"))
+                    .await;
+            }
+            Err(e) => {
+                let _ = state
+                    .db
+                    .mark_marker_cleanup_attempt(&item.request_id, Some(&e.to_string()))
+                    .await;
+            }
+        }
+    }
+    Ok((ok, examined))
 }
 
 /// Outcome of a single `apply_request_effects` call. The caller (live
@@ -1076,7 +1199,10 @@ pub async fn apply_request_effects(
 
     // 8. Per-ref certs and anchor jobs. Each accepted child gets one
     //    of each. Failures are accumulated; the first one is
-    //    returned as the Retry reason.
+    //    returned as the Retry reason. Anchor identity is by occurrence
+    //    (request_id + ordinal) so recurrence yields distinct handoffs;
+    //    landing history is recorded for A/B disambiguation and survives
+    //    child cleanup.
     let mut first_error: Option<String> = None;
     for child in &accepted_children {
         let cert_id = crate::db::ref_cert_id_for(&req.id, child.ordinal);
@@ -1102,7 +1228,9 @@ pub async fn apply_request_effects(
             continue;
         }
 
-        let anchor_id = crate::db::anchor_job_id_for(
+        let anchor_id = crate::db::anchor_job_id_for_occurrence(
+            &req.id,
+            child.ordinal,
             &req.repo_id,
             &child.ref_name,
             &child.old_sha,
@@ -1117,6 +1245,8 @@ pub async fn apply_request_effects(
             pusher_did: req.pusher_did.clone(),
             created_at: chrono::Utc::now().to_rfc3339(),
             claimed_at: None,
+            request_id: Some(req.id.clone()),
+            request_ordinal: Some(child.ordinal),
         };
         if let Err(e) = state.db.insert_anchor_job_idempotent(&job).await {
             tracing::warn!(
@@ -1126,18 +1256,43 @@ pub async fn apply_request_effects(
                 "apply_request_effects: anchor insert failed; child left for drain retry"
             );
             first_error.get_or_insert_with(|| format!("anchor {}: {e}", child.ref_name));
+            continue;
         }
+        // Landing history survives child deletion for future A/B checks.
+        let _ = state
+            .db
+            .insert_landing_history_idempotent(&crate::db::RefLanding {
+                request_id: req.id.clone(),
+                ordinal: child.ordinal,
+                repo_id: req.repo_id.clone(),
+                ref_name: child.ref_name.clone(),
+                old_sha: child.old_sha.clone(),
+                new_sha: child.new_sha.clone(),
+                landed_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await;
     }
 
     if let Some(err) = first_error {
         return Ok(EffectsOutcome::Retry { last_error: err });
     }
 
-    // 9. All artifacts landed — clean up the children and let the
-    //    caller move the request to `complete`.
+    // Proof must exist before effects are considered durable; ack it so
+    // retention knows the downstream handoff owns a verifiable reference.
+    // If the proof row is missing (pre-v33 legacy), proceed but do not
+    // block — the request-level columns still carry the envelope.
+    if state.db.get_request_proof(&req.id).await?.is_some() {
+        let _ = state.db.ack_request_proof(&req.id).await;
+    }
+
+    // 9. All accepted artifacts landed — clean up only those children.
+    //    Uncertain/prepared siblings are reconciliation evidence and must
+    //    survive; if any remain, keep the request executable for a later
+    //    pass rather than completing with evidence deleted.
+    let accepted_ids: Vec<String> = accepted_children.iter().map(|c| c.id.clone()).collect();
     if let Err(e) = state
         .db
-        .delete_pending_ref_transitions_by_request_id(request_id)
+        .delete_pending_ref_transitions_by_ids(&accepted_ids)
         .await
     {
         tracing::warn!(
@@ -1147,6 +1302,18 @@ pub async fn apply_request_effects(
         );
         // Don't fail the request — the artifacts are in place and a
         // future pass is harmless.
+    }
+    let remaining = state
+        .db
+        .list_pending_ref_transitions_for_request(request_id)
+        .await?;
+    if remaining
+        .iter()
+        .any(|c| c.state != crate::db::pending_state::CANCELLED)
+    {
+        return Ok(EffectsOutcome::Retry {
+            last_error: "unresolved siblings remain for reconcile".to_string(),
+        });
     }
 
     // 10. Webhooks — best-effort, per landed ref. Same shape as the
@@ -2271,12 +2438,12 @@ mod drain_tests {
         );
     }
 
-    /// Deletions are fail-closed: git removes the ref's reflog with
-    /// the ref, so absence plus age cannot prove THIS request caused
-    /// the deletion (a stale delete against an already-absent ref is
-    /// indistinguishable). The row stays `prepared` for attended
-    /// recovery rather than signing attribution the node cannot
-    /// prove.
+    /// Deletions are fail-closed with a terminating attended
+    /// lifecycle: git removes the ref's reflog with the ref, so
+    /// absence plus age cannot prove THIS request caused the deletion.
+    /// The parent is quarantined (cancelling siblings) so reconcile
+    /// stops revisiting it, and an operator resolve/reject transition
+    /// owns the terminal step.
     #[sqlx::test]
     async fn reconcile_still_promotes_a_landed_deletion_which_can_have_no_reflog(
         pool: sqlx::PgPool,
@@ -2321,14 +2488,26 @@ mod drain_tests {
             n, 0,
             "deletions fail closed: absence plus age cannot prove causality"
         );
-        let prepared = state
+        let parent = state
             .db
-            .list_pending_ref_transitions_prepared_or_uncertain_after(None, 100)
+            .get_receive_pack_request(&row.request_id)
             .await
-            .unwrap();
-        assert!(
-            prepared.iter().any(|r| r.id == row.id),
-            "the deletion row stays for attended recovery"
+            .unwrap()
+            .expect("parent exists");
+        assert_eq!(
+            parent.state,
+            crate::db::request_state::QUARANTINED,
+            "deletion is quarantined with a terminating attended lifecycle"
+        );
+        // Operator can resolve the attended request terminally.
+        assert_eq!(
+            state
+                .db
+                .resolve_attended_request(&row.request_id, "reject", Some("operator reviewed"))
+                .await
+                .unwrap(),
+            1,
+            "operator reject transition terminates attended deletion"
         );
     }
 

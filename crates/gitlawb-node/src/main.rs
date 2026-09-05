@@ -587,6 +587,8 @@ async fn main() -> Result<()> {
 
     let _legacy_cid_sweep = spawn_legacy_cid_sweep(&state, &config);
     let _queue_lifecycle_sweep = spawn_queue_lifecycle_sweep(&state, &config);
+    let _due_request_worker = spawn_due_request_worker(&state);
+    let _marker_cleanup_worker = spawn_marker_cleanup_worker(&state);
 
     let router = server::build_router(state.clone());
     // Re-register the socket bound at startup — same fd, so there was never a
@@ -811,9 +813,10 @@ fn spawn_legacy_cid_sweep(state: &AppState, config: &Config) -> tokio::task::Joi
 /// budget so a 1000-row purge pass takes roughly the same time as
 /// a 1000-row drain pass.
 fn spawn_queue_lifecycle_sweep(state: &AppState, config: &Config) -> tokio::task::JoinHandle<()> {
-    let db = state.db.clone();
+    let app_state = state.clone();
     let retention_days = config.queue_retention_days;
     let batch = config.queue_purge_batch;
+    let git_timeout = std::time::Duration::from_secs(config.git_service_timeout_secs.min(30));
     let mut shutdown_rx = state.subscribe_shutdown();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
@@ -828,16 +831,86 @@ fn spawn_queue_lifecycle_sweep(state: &AppState, config: &Config) -> tokio::task
             tokio::select! {
                 _ = interval.tick() => {
                     if let Err(e) = durable_outbox::purge_request_queue(
-                        &db,
+                        &app_state.db,
                         retention_days,
                         batch,
                     ).await {
                         tracing::warn!(err = %e, "queue lifecycle purge failed; will retry on next tick");
                     }
+                    // Drain marker tombstones with the bounded deleter;
+                    // failures retain the tombstone for the next tick.
+                    if let Err(e) = durable_outbox::drain_marker_cleanup_queue(
+                        &app_state,
+                        batch,
+                        git_timeout,
+                    ).await {
+                        tracing::warn!(err = %e, "marker cleanup drain failed");
+                    }
                 }
                 _ = shutdown_rx.changed() => {
                     break;
                 }
+            }
+        }
+    })
+}
+
+/// Shutdown-aware background due-request loop. The startup drain runs
+/// once; without this, `effects_pending` rows with a future
+/// `next_attempt_at` would wait until the next process restart.
+/// Polls the indexed due query with bounded batches and failure
+/// isolation (one request's error never aborts the batch).
+fn spawn_due_request_worker(state: &AppState) -> tokio::task::JoinHandle<()> {
+    let app_state = state.clone();
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    match durable_outbox::drain_receive_pack_requests(
+                        app_state.clone(),
+                        durable_outbox::DRAIN_PER_PASS_LIMIT,
+                    )
+                    .await
+                    {
+                        Ok((0, _)) => {}
+                        Ok((n, _)) => tracing::info!(n, "due request worker drained"),
+                        Err(e) => tracing::warn!(err = %e, "due request worker drain failed"),
+                    }
+                }
+                _ = shutdown_rx.changed() => break,
+            }
+        }
+    })
+}
+
+/// Dedicated marker-tombstone worker at a shorter cadence than the
+/// daily purge, so external Git refs do not linger a full period
+/// after their SQL owner is gone.
+fn spawn_marker_cleanup_worker(state: &AppState) -> tokio::task::JoinHandle<()> {
+    let app_state = state.clone();
+    let git_timeout =
+        std::time::Duration::from_secs(app_state.config.git_service_timeout_secs.min(30));
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(e) = durable_outbox::drain_marker_cleanup_queue(
+                        &app_state,
+                        durable_outbox::DRAIN_PER_PASS_LIMIT,
+                        git_timeout,
+                    )
+                    .await
+                    {
+                        tracing::warn!(err = %e, "marker cleanup worker failed");
+                    }
+                }
+                _ = shutdown_rx.changed() => break,
             }
         }
     })

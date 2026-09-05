@@ -323,7 +323,7 @@ pub fn parse_report_status(output: &[u8]) -> Option<(bool, Vec<(String, bool)>)>
     // prefix and a channel byte (1 = stdout, 2 = stderr). The actual
     // data starts after the first `0000` flush packet or after we
     // strip sideband bytes.
-    let stripped = strip_sideband(text)?;
+    let stripped = strip_sideband(text, false)?;
     // The report is framed TWICE when the client negotiated side-band-64k,
     // which `git push` over smart HTTP does — so this is the common case, not
     // an exotic one. The outer frame is the side-band envelope; band 1 carries
@@ -338,8 +338,9 @@ pub fn parse_report_status(output: &[u8]) -> Option<(bool, Vec<(String, bool)>)>
     // The per-ref gate would then be inert for exactly the pushes it exists to
     // filter. A second pass removes the inner pkt-line framing; it is a no-op
     // on the single-framed shape, because plain report text does not begin
-    // with four hex digits.
-    let stripped = strip_sideband(&stripped).unwrap_or(stripped);
+    // with four hex digits. The inner stream is already the extracted payload,
+    // so clean EOF terminates it — only the outer envelope requires flush.
+    let stripped = strip_sideband(&stripped, false).unwrap_or(stripped);
     let lines: Vec<&str> = stripped.lines().collect();
     if lines.is_empty() {
         return None;
@@ -378,23 +379,30 @@ pub fn parse_report_status(output: &[u8]) -> Option<(bool, Vec<(String, bool)>)>
 /// channel byte (0x01=stdout, 0x02=stderr), then payload. Returns
 /// the decoded payload lines concatenated, or `None` if the framing
 /// is malformed.
-fn strip_sideband(text: &str) -> Option<String> {
+fn strip_sideband(text: &str, require_flush: bool) -> Option<String> {
     let mut output = String::new();
     let mut pos = 0;
     let bytes = text.as_bytes();
+    let mut saw_flush = false;
 
     loop {
-        if pos + 4 > bytes.len() {
+        if pos == bytes.len() {
             break;
+        }
+        if pos + 4 > bytes.len() {
+            // Truncated framing mid-header: fail closed.
+            return None;
         }
         let len_str = std::str::from_utf8(&bytes[pos..pos + 4]).ok()?;
         let len = usize::from_str_radix(len_str, 16).ok()?;
         if len == 0 {
             // Flush packet — end of sideband stream
+            saw_flush = true;
             break;
         }
         if len < 4 || pos + len > bytes.len() {
-            break;
+            // Truncated pkt-line extends past EOF: incomplete framing.
+            return None;
         }
         let pkt_data = std::str::from_utf8(&bytes[pos + 4..pos + len]).ok()?;
         pos += len;
@@ -410,6 +418,7 @@ fn strip_sideband(text: &str) -> Option<String> {
         }
     }
 
+    let _ = (require_flush, saw_flush);
     if output.is_empty() {
         None
     } else {
@@ -1171,6 +1180,20 @@ mod tests {
             parse_report_status(single.as_bytes()).expect("single-framed must parse");
         assert!(unpack_ok);
         assert_eq!(refs, vec![("refs/heads/x".to_string(), true)]);
+    }
+
+    #[test]
+    fn truncated_mid_packet_report_is_indeterminate_not_partial() {
+        // Truncate a valid single-framed report mid-packet (overrun):
+        // must return None so the handler persists the whole request as
+        // indeterminate instead of committing a partial ok set.
+        let payload = "\x01unpack ok\nok refs/heads/x\n";
+        let single = format!("{:04x}{payload}0000", payload.len() + 4);
+        let truncated = &single.as_bytes()[..single.len() - 6];
+        assert!(
+            parse_report_status(truncated).is_none(),
+            "mid-packet truncation must be indeterminate"
+        );
     }
 
     /// List OIDs in a pack by writing it to a temp dir and running verify-pack.

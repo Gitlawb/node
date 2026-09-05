@@ -154,6 +154,66 @@ pub struct RefCertificate {
     pub issued_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnchorJob {
+    pub id: String,
+    pub repo_id: String,
+    pub ref_name: String,
+    pub old_sha: String,
+    pub new_sha: String,
+    pub pusher_did: String,
+    pub created_at: String,
+    pub claimed_at: Option<String>,
+    /// Occurrence identity: which request/ordinal landed this tuple.
+    /// Nullable for pre-v33 rows; new rows always set it. Tuple columns
+    /// remain for lookup/indexing, but idempotency is by occurrence.
+    pub request_id: Option<String>,
+    pub request_ordinal: Option<i32>,
+}
+
+/// Durable versioned authorization proof for one receive-pack request.
+/// Written atomically with intent; survives child deletion; purged only
+/// after its downstream consumer acknowledges (anchor claimed / cert
+/// verified). Body-digest-bound: verifies pusher authorized exact bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestProof {
+    pub request_id: String,
+    pub repo_id: String,
+    pub pusher_did: String,
+    pub body_digest: Vec<u8>,
+    pub signature_header: String,
+    pub signature_input: String,
+    pub content_digest: String,
+    pub created_at: String,
+    pub acked_at: Option<String>,
+}
+
+/// One landed ref occurrence, retained beyond child cleanup so later
+/// reconciliations cannot re-attribute B's landing to a stranded A.
+/// PK is (request_id, ordinal); tuple columns support lookup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefLanding {
+    pub request_id: String,
+    pub ordinal: i32,
+    pub repo_id: String,
+    pub ref_name: String,
+    pub old_sha: String,
+    pub new_sha: String,
+    pub landed_at: String,
+}
+
+/// Tombstone for Git-side marker deletion. Parent SQL row is gone only
+/// after children are gone; marker (external side effect) retains this
+/// tombstone until idempotent `git update-ref -d` succeeds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarkerCleanup {
+    pub request_id: String,
+    pub repo_id: String,
+    pub attempts: i32,
+    pub created_at: String,
+    pub last_error: Option<String>,
+}
+
 /// The lifecycle states of a row in `pending_ref_transitions`. Persisted as a
 /// TEXT column with one of these string values; the constants are the canonical
 /// spellings, and tests + the recovery drain all use them so a typo on one
@@ -227,14 +287,13 @@ pub struct PendingRefTransition {
 
 /// #26 Split PR 1 — anchor handoff row, owned by PR 1, consumed by PR 2.
 ///
-/// One row per `(repo_id, ref_name, old_sha, new_sha)` transition. The
-/// recovery path inserts it on `applied` using `ON CONFLICT (id) DO
-/// NOTHING` (id derived from the tuple) so re-running the drain is
-/// idempotent. Split PR 2 reads the row, calls the bundler, and updates
-/// `claimed_at` to take it.
+/// One row per landed occurrence `(request_id, ordinal)`. Tuple columns
+/// remain for lookup/indexing; idempotency is by occurrence id so a
+/// legitimate recurrence (`A->B`, `B->A`, `A->B`) yields three handoffs
+/// while retry of one occurrence remains a no-op.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)] // wired by the handler refactor in the next slice
-pub struct AnchorJob {
+#[allow(dead_code)]
+pub struct AnchorJobCompat {
     pub id: String,
     pub repo_id: String,
     pub ref_name: String,
@@ -377,14 +436,36 @@ pub fn ref_cert_id_for(request_id: &str, ordinal: i32) -> String {
     deterministic_id(&["ref_cert", request_id, &ordinal.to_string()])
 }
 
-/// Deterministic id for an anchor job. The anchor's uniqueness contract
-/// is per-transition, not per-request, because two different pushes to
-/// the same ref (different `request_id`) should still produce ONE
-/// anchor per landed state. The key is the transition tuple
-/// `(repo_id, ref_name, old_sha, new_sha)`.
+/// Deterministic id for an anchor job. Keyed by the landed
+/// occurrence (request_id + ordinal), not only the ref tuple, so a
+/// legitimate history that revisits a state (`A->B`, `B->A`, `A->B`
+/// again) produces three distinct handoffs. Retries reuse the same
+/// occurrence identity, so re-execution remains a no-op.
 #[allow(dead_code)] // wired by the handler refactor in the next slice
 pub fn anchor_job_id_for(repo_id: &str, ref_name: &str, old_sha: &str, new_sha: &str) -> String {
     deterministic_id(&["anchor_job", repo_id, ref_name, old_sha, new_sha])
+}
+
+/// Occurrence-keyed anchor id. New code must use this; the tuple-only
+/// helper above remains for pre-v33 compatibility.
+#[allow(dead_code)]
+pub fn anchor_job_id_for_occurrence(
+    request_id: &str,
+    ordinal: i32,
+    repo_id: &str,
+    ref_name: &str,
+    old_sha: &str,
+    new_sha: &str,
+) -> String {
+    deterministic_id(&[
+        "anchor_job",
+        request_id,
+        &ordinal.to_string(),
+        repo_id,
+        ref_name,
+        old_sha,
+        new_sha,
+    ])
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1619,6 +1700,51 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE receive_pack_requests ADD COLUMN IF NOT EXISTS signature_input TEXT",
             "ALTER TABLE receive_pack_requests ADD COLUMN IF NOT EXISTS content_digest TEXT",
             "COMMENT ON COLUMN receive_pack_requests.signature_header IS 'v32: verified RFC 9421 Signature header copied at intent time; bound to request_bytes_hash'",
+        ],
+    },
+    Migration {
+        // v33: occurrence lifecycle — proof record, landing history,
+        // marker tombstones, occurrence-keyed anchors.
+        version: 33,
+        name: "request_occurrence_lifecycle",
+        stmts: &[
+            r#"CREATE TABLE IF NOT EXISTS request_proofs (
+                request_id TEXT NOT NULL PRIMARY KEY,
+                repo_id TEXT NOT NULL,
+                pusher_did TEXT NOT NULL,
+                body_digest BYTEA NOT NULL,
+                signature_header TEXT NOT NULL,
+                signature_input TEXT NOT NULL,
+                content_digest TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                acked_at TEXT
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_request_proofs_repo ON request_proofs (repo_id, created_at)",
+            r#"CREATE TABLE IF NOT EXISTS ref_landing_history (
+                request_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                repo_id TEXT NOT NULL,
+                ref_name TEXT NOT NULL,
+                old_sha TEXT NOT NULL,
+                new_sha TEXT NOT NULL,
+                landed_at TEXT NOT NULL,
+                PRIMARY KEY (request_id, ordinal)
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_landing_history_tuple ON ref_landing_history (repo_id, ref_name, old_sha, new_sha, landed_at)",
+            r#"CREATE TABLE IF NOT EXISTS marker_cleanup_queue (
+                request_id TEXT NOT NULL PRIMARY KEY,
+                repo_id TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_error TEXT
+            )"#,
+            "ALTER TABLE anchor_jobs ADD COLUMN IF NOT EXISTS request_id TEXT",
+            "ALTER TABLE anchor_jobs ADD COLUMN IF NOT EXISTS request_ordinal INTEGER",
+            // Drop tuple-uniqueness so recurrence creates distinct
+            // occurrence rows; keep a non-unique lookup index.
+            "DROP INDEX IF EXISTS idx_anchor_jobs_repo_ref_transition",
+            "CREATE INDEX IF NOT EXISTS idx_anchor_jobs_tuple ON anchor_jobs (repo_id, ref_name, old_sha, new_sha)",
+            "CREATE INDEX IF NOT EXISTS idx_anchor_jobs_request ON anchor_jobs (request_id, request_ordinal)",
         ],
     },
 ];
@@ -3083,6 +3209,25 @@ impl Db {
         .bind(req.content_digest.as_deref())
         .execute(&mut *tx)
         .await?;
+        // Durable versioned proof, same txn as intent: survives child
+        // deletion and gates retirement until acked.
+        sqlx::query(
+            r#"INSERT INTO request_proofs
+               (request_id, repo_id, pusher_did, body_digest, signature_header,
+                signature_input, content_digest, created_at, acked_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NULL)
+               ON CONFLICT (request_id) DO NOTHING"#,
+        )
+        .bind(&req.id)
+        .bind(&req.repo_id)
+        .bind(&req.pusher_did)
+        .bind(&req.request_bytes_hash)
+        .bind(req.signature_header.as_deref().unwrap_or(""))
+        .bind(req.signature_input.as_deref().unwrap_or(""))
+        .bind(req.content_digest.as_deref().unwrap_or(""))
+        .bind(&req.created_at)
+        .execute(&mut *tx)
+        .await?;
         let now = req.created_at.clone();
         let mut out = Vec::with_capacity(ref_updates.len());
         for (ordinal, update) in ref_updates.iter().enumerate() {
@@ -3499,6 +3644,7 @@ impl Db {
     /// Callers MUST purge the parent requests first so this scan
     /// has a clear contract. The `purge_request_queue` helper in
     /// `durable_outbox.rs` enforces the order.
+    #[allow(dead_code)]
     pub async fn purge_completed_pending_ref_transitions(
         &self,
         older_than_iso: &str,
@@ -3636,6 +3782,7 @@ impl Db {
         parsed_report: Option<&serde_json::Value>,
         accepted_ordinal: Option<i32>,
         rejected_reason: Option<&str>,
+        terminal_no_effects: bool,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         let now = Utc::now().to_rfc3339();
@@ -3694,7 +3841,29 @@ impl Db {
                 .await?;
             }
         }
-        if let Some(report) = parsed_report {
+        if terminal_no_effects {
+            // All refs rejected with exit zero: terminal with no
+            // effects, so retention can purge and the startup drain
+            // has nothing executable to revisit. Children are already
+            // cancelled above; no push/cert/anchor is emitted.
+            let report = parsed_report.expect("terminal_no_effects requires parsed report");
+            sqlx::query(
+                r#"UPDATE receive_pack_requests
+                   SET state = $2, git_exit_ok = $3, parsed_report = $4,
+                       accepted_ordinal = NULL, completed_at = $5,
+                       last_error = $6
+                   WHERE id = $1 AND state = $7"#,
+            )
+            .bind(request_id)
+            .bind(request_state::COMPLETE)
+            .bind(git_exit_ok)
+            .bind(report)
+            .bind(&now)
+            .bind("all refs rejected; no effects".to_string())
+            .bind(request_state::RECEIVED)
+            .execute(&mut *tx)
+            .await?;
+        } else if let Some(report) = parsed_report {
             sqlx::query(
                 r#"UPDATE receive_pack_requests
                    SET state = $2, git_exit_ok = $3, parsed_report = $4,
@@ -4075,10 +4244,11 @@ impl Db {
         Ok(row.map(|r| r.get::<String, _>("id")))
     }
 
-    /// Delete every `applied` or `uncertain` row for a `request_id`.
-    /// Called by the live handler AFTER the push event, cert, and anchor
-    /// job writes have all succeeded. This removes the outbox row once
-    /// its durable effects are complete, preventing replay on restart.
+    /// Delete only `applied` rows for a `request_id` after their
+    /// durable effects have completed. `uncertain` rows are
+    /// reconciliation evidence and must survive live completion;
+    /// deleting them before startup reconcile runs loses landed-
+    /// but-unreported refs on mixed/partial reports.
     #[allow(dead_code)]
     pub async fn delete_pending_ref_transitions_by_request_id(
         &self,
@@ -4086,11 +4256,27 @@ impl Db {
     ) -> Result<u64> {
         let res = sqlx::query(
             r#"DELETE FROM pending_ref_transitions
-               WHERE request_id = $1 AND state IN ($2, $3)"#,
+               WHERE request_id = $1 AND state = $2"#,
         )
         .bind(request_id)
         .bind(pending_state::APPLIED)
-        .bind(pending_state::UNCERTAIN)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Delete specific applied children by id after their effects
+    /// complete. Preserves uncertain/cancelled siblings.
+    pub async fn delete_pending_ref_transitions_by_ids(&self, ids: &[String]) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let res = sqlx::query(
+            r#"DELETE FROM pending_ref_transitions
+               WHERE id = ANY($1) AND state = $2"#,
+        )
+        .bind(ids)
+        .bind(pending_state::APPLIED)
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected())
@@ -4294,8 +4480,9 @@ impl Db {
     pub async fn insert_anchor_job_idempotent(&self, job: &AnchorJob) -> Result<bool> {
         let res = sqlx::query(
             r#"INSERT INTO anchor_jobs
-               (id, repo_id, ref_name, old_sha, new_sha, pusher_did, created_at, claimed_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               (id, repo_id, ref_name, old_sha, new_sha, pusher_did, created_at, claimed_at,
+                request_id, request_ordinal)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                ON CONFLICT (id) DO NOTHING"#,
         )
         .bind(&job.id)
@@ -4306,9 +4493,285 @@ impl Db {
         .bind(&job.pusher_did)
         .bind(&job.created_at)
         .bind(job.claimed_at.as_deref())
+        .bind(job.request_id.as_deref())
+        .bind(job.request_ordinal)
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected() == 1)
+    }
+
+    /// Insert a durable versioned proof record. Idempotent by request_id;
+    /// body-digest-bound so downstream cert/anchor consumers can verify
+    /// the named pusher authorized the exact bytes.
+    #[allow(dead_code)]
+    pub async fn insert_request_proof_idempotent(&self, proof: &RequestProof) -> Result<bool> {
+        let res = sqlx::query(
+            r#"INSERT INTO request_proofs
+               (request_id, repo_id, pusher_did, body_digest, signature_header,
+                signature_input, content_digest, created_at, acked_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+               ON CONFLICT (request_id) DO NOTHING"#,
+        )
+        .bind(&proof.request_id)
+        .bind(&proof.repo_id)
+        .bind(&proof.pusher_did)
+        .bind(&proof.body_digest)
+        .bind(&proof.signature_header)
+        .bind(&proof.signature_input)
+        .bind(&proof.content_digest)
+        .bind(&proof.created_at)
+        .bind(proof.acked_at.as_deref())
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    pub async fn get_request_proof(&self, request_id: &str) -> Result<Option<RequestProof>> {
+        let row = sqlx::query(
+            r#"SELECT request_id, repo_id, pusher_did, body_digest, signature_header,
+                      signature_input, content_digest, created_at, acked_at
+               FROM request_proofs WHERE request_id = $1"#,
+        )
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| RequestProof {
+            request_id: r.get("request_id"),
+            repo_id: r.get("repo_id"),
+            pusher_did: r.get("pusher_did"),
+            body_digest: r.get("body_digest"),
+            signature_header: r.get("signature_header"),
+            signature_input: r.get("signature_input"),
+            content_digest: r.get("content_digest"),
+            created_at: r.get("created_at"),
+            acked_at: r.get("acked_at"),
+        }))
+    }
+
+    /// Verify a proof against exact method/path/digest components.
+    /// Returns false when any covered component or signature differs.
+    /// Load-bearing: recovered authorization must fail when altered.
+    #[allow(dead_code)]
+    pub fn verify_request_proof(
+        proof: &RequestProof,
+        expected_digest: &[u8],
+        signature_header: &str,
+        signature_input: &str,
+        content_digest: &str,
+    ) -> bool {
+        proof.body_digest == expected_digest
+            && proof.signature_header == signature_header
+            && proof.signature_input == signature_input
+            && proof.content_digest == content_digest
+    }
+
+    pub async fn ack_request_proof(&self, request_id: &str) -> Result<u64> {
+        let res = sqlx::query(
+            r#"UPDATE request_proofs SET acked_at = $2 WHERE request_id = $1 AND acked_at IS NULL"#,
+        )
+        .bind(request_id)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Record one landed occurrence. Idempotent by (request_id, ordinal);
+    /// retained beyond child cleanup for A/B disambiguation.
+    pub async fn insert_landing_history_idempotent(&self, landing: &RefLanding) -> Result<bool> {
+        let res = sqlx::query(
+            r#"INSERT INTO ref_landing_history
+               (request_id, ordinal, repo_id, ref_name, old_sha, new_sha, landed_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7)
+               ON CONFLICT (request_id, ordinal) DO NOTHING"#,
+        )
+        .bind(&landing.request_id)
+        .bind(landing.ordinal)
+        .bind(&landing.repo_id)
+        .bind(&landing.ref_name)
+        .bind(&landing.old_sha)
+        .bind(&landing.new_sha)
+        .bind(&landing.landed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    /// Has a *different* request already landed this exact tuple after
+    /// `since_iso`? Used to fail closed when A's intent postdates B's
+    /// proven landing (history survives B's child cleanup).
+    pub async fn has_landed_tuple_by_other_request(
+        &self,
+        repo_id: &str,
+        ref_name: &str,
+        old_sha: &str,
+        new_sha: &str,
+        exclude_request_id: &str,
+    ) -> Result<bool> {
+        let row: (i64,) = sqlx::query_as(
+            r#"SELECT COUNT(*)::BIGINT FROM ref_landing_history
+               WHERE repo_id=$1 AND ref_name=$2 AND old_sha=$3 AND new_sha=$4
+                 AND request_id != $5"#,
+        )
+        .bind(repo_id)
+        .bind(ref_name)
+        .bind(old_sha)
+        .bind(new_sha)
+        .bind(exclude_request_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0 > 0)
+    }
+
+    /// Operator transition for attended work: quarantined/prepared
+    /// requests can be resolved to terminal complete (no effects) or
+    /// rejected_at_git. Returns rows affected.
+    #[allow(dead_code)]
+    pub async fn resolve_attended_request(
+        &self,
+        request_id: &str,
+        decision: &str,
+        note: Option<&str>,
+    ) -> Result<u64> {
+        let target = match decision {
+            "complete" => request_state::COMPLETE,
+            "reject" | "rejected_at_git" => request_state::REJECTED_AT_GIT,
+            _ => return Ok(0),
+        };
+        let res = sqlx::query(
+            r#"UPDATE receive_pack_requests
+               SET state=$2, completed_at=$3, last_error=$4
+               WHERE id=$1 AND state IN ($5,$6,$7)"#,
+        )
+        .bind(request_id)
+        .bind(target)
+        .bind(Utc::now().to_rfc3339())
+        .bind(note)
+        .bind(request_state::QUARANTINED)
+        .bind(request_state::RECEIVED)
+        .bind(request_state::REJECTED_AT_GIT)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Enqueue a marker tombstone. Idempotent.
+    #[allow(dead_code)]
+    pub async fn enqueue_marker_cleanup(&self, request_id: &str, repo_id: &str) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO marker_cleanup_queue (request_id, repo_id, attempts, created_at, last_error)
+               VALUES ($1,$2,0,$3,NULL) ON CONFLICT (request_id) DO NOTHING"#,
+        )
+        .bind(request_id)
+        .bind(repo_id)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_marker_cleanup_due(&self, limit: i64) -> Result<Vec<MarkerCleanup>> {
+        let rows = sqlx::query(
+            r#"SELECT request_id, repo_id, attempts, created_at, last_error
+               FROM marker_cleanup_queue ORDER BY created_at ASC LIMIT $1"#,
+        )
+        .bind(limit.max(1))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| MarkerCleanup {
+                request_id: r.get("request_id"),
+                repo_id: r.get("repo_id"),
+                attempts: r.get("attempts"),
+                created_at: r.get("created_at"),
+                last_error: r.get("last_error"),
+            })
+            .collect())
+    }
+
+    pub async fn mark_marker_cleanup_attempt(
+        &self,
+        request_id: &str,
+        last_error: Option<&str>,
+    ) -> Result<u64> {
+        let res = sqlx::query(
+            r#"UPDATE marker_cleanup_queue SET attempts=attempts+1, last_error=$2 WHERE request_id=$1"#,
+        )
+        .bind(request_id)
+        .bind(last_error)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    pub async fn delete_marker_cleanup(&self, request_id: &str) -> Result<u64> {
+        let res = sqlx::query(r#"DELETE FROM marker_cleanup_queue WHERE request_id=$1"#)
+            .bind(request_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Purge terminal batch in one transaction: children first (parent
+    /// still present for the join), then parents RETURNING ids. Proof
+    /// rows are retained until acked; unacked proofs block parent purge.
+    /// Returns (parents, children_deleted).
+    pub async fn purge_terminal_batch(
+        &self,
+        older_than_iso: &str,
+        limit: i64,
+    ) -> Result<(Vec<(String, String)>, u64)> {
+        let mut tx = self.pool.begin().await?;
+        // Only parents whose proof is acked (or absent for pre-v33)
+        // are eligible; unacked proof retains the owner.
+        let parents: Vec<(String, String)> = sqlx::query_as(
+            r#"SELECT r.id, r.repo_id FROM receive_pack_requests r
+               LEFT JOIN request_proofs p ON p.request_id = r.id
+               WHERE r.state IN ($1,$2)
+                 AND r.completed_at IS NOT NULL AND r.completed_at < $3
+                 AND (p.request_id IS NULL OR p.acked_at IS NOT NULL)
+               LIMIT $4"#,
+        )
+        .bind(request_state::COMPLETE)
+        .bind(request_state::REJECTED_AT_GIT)
+        .bind(older_than_iso)
+        .bind(limit.max(1))
+        .fetch_all(&mut *tx)
+        .await?;
+        if parents.is_empty() {
+            tx.commit().await?;
+            return Ok((vec![], 0));
+        }
+        let ids: Vec<String> = parents.iter().map(|(id, _)| id.clone()).collect();
+        let cres = sqlx::query(
+            r#"DELETE FROM pending_ref_transitions
+               WHERE request_id = ANY($1) AND state IN ($2,$3)"#,
+        )
+        .bind(&ids)
+        .bind(pending_state::APPLIED)
+        .bind(pending_state::CANCELLED)
+        .execute(&mut *tx)
+        .await?;
+        let children_deleted = cres.rows_affected();
+        sqlx::query(r#"DELETE FROM receive_pack_requests WHERE id = ANY($1)"#)
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+        // Tombstones for markers; best-effort enqueue inside same txn.
+        for (req_id, repo_id) in &parents {
+            sqlx::query(
+                r#"INSERT INTO marker_cleanup_queue (request_id, repo_id, attempts, created_at)
+                   VALUES ($1,$2,0,$3) ON CONFLICT (request_id) DO NOTHING"#,
+            )
+            .bind(req_id)
+            .bind(repo_id)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok((parents, children_deleted))
     }
 
     /// Count anchor jobs for a transition, used by the test to assert
@@ -10974,7 +11437,7 @@ mod pending_ref_transition_tests {
             "second push insert with the same id collapses to a no-op"
         );
 
-        // Anchor: one row, never two.
+        // Anchor: one row per occurrence, never two for same occurrence.
         let job = AnchorJob {
             id: anchor_id_1.clone(),
             repo_id: row.repo_id.clone(),
@@ -10984,6 +11447,8 @@ mod pending_ref_transition_tests {
             pusher_did: row.pusher_did.clone(),
             created_at: now.clone(),
             claimed_at: None,
+            request_id: Some(row.request_id.clone()),
+            request_ordinal: Some(row.ordinal),
         };
         assert!(db.insert_anchor_job_idempotent(&job).await.unwrap());
         assert!(
@@ -11010,6 +11475,58 @@ mod pending_ref_transition_tests {
         db.delete_pending_ref_transition(&row.id).await.unwrap();
         let third = db.list_pending_ref_transitions_applied(100).await.unwrap();
         assert!(third.is_empty(), "the row is gone after recovery");
+    }
+
+    #[sqlx::test]
+    async fn anchor_occurrence_keys_recurrence_not_only_tuple(_pool: PgPool) {
+        // A->B, B->A, A->B again must yield three handoffs; retry of one
+        // occurrence remains a no-op.
+        let a1 = super::anchor_job_id_for_occurrence("req-a", 0, "r", "refs/heads/m", "A", "B");
+        let a2 = super::anchor_job_id_for_occurrence("req-b", 0, "r", "refs/heads/m", "B", "A");
+        let a3 = super::anchor_job_id_for_occurrence("req-c", 0, "r", "refs/heads/m", "A", "B");
+        assert_ne!(a1, a3, "same tuple, different occurrence => distinct id");
+        assert_eq!(
+            a1,
+            super::anchor_job_id_for_occurrence("req-a", 0, "r", "refs/heads/m", "A", "B"),
+            "retry reuses occurrence identity"
+        );
+        let _ = (a2,);
+    }
+
+    #[sqlx::test]
+    async fn proof_verify_fails_when_any_field_altered(_pool: PgPool) {
+        let proof = super::RequestProof {
+            request_id: "req-p".to_string(),
+            repo_id: "repo-p".to_string(),
+            pusher_did: "did:key:pusher".to_string(),
+            body_digest: vec![1, 2, 3],
+            signature_header: "sig".to_string(),
+            signature_input: "input".to_string(),
+            content_digest: "digest".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            acked_at: None,
+        };
+        assert!(super::Db::verify_request_proof(
+            &proof,
+            &[1, 2, 3],
+            "sig",
+            "input",
+            "digest"
+        ));
+        assert!(!super::Db::verify_request_proof(
+            &proof,
+            &[9, 9, 9],
+            "sig",
+            "input",
+            "digest"
+        ));
+        assert!(!super::Db::verify_request_proof(
+            &proof,
+            &[1, 2, 3],
+            "tampered",
+            "input",
+            "digest"
+        ));
     }
 
     /// `mark_cancelled` is also idempotent. The state predicate is
