@@ -231,7 +231,37 @@ pub fn build_router(state: AppState) -> Router {
         .merge(Router::new().route("/api/v1/ipfs/pins", get(ipfs::list_pins)));
 
     // ── Arweave permanent anchors ──────────────────────────────────────────
+    //
+    // The list endpoint stays public (issue #134 tracks surfacing
+    // visibility rules on list). The verify endpoint is gated on
+    // repo read: a caller must be able to read the persisted row's
+    // repo to fetch its data payload (which carries the row's
+    // `repo`, `ref_name`, `old_sha`, `new_sha`). The team memory
+    // `axum-layer-vs-merge-pitfall.md` is the constraint — apply
+    // `optional_signature` to the verify route BEFORE the merge,
+    // so the layer covers the route. The two are built as separate
+    // `Router`s so `list_anchors` (ungated) and `verify_anchor`
+    // (gated) get different layer stacks.
     let arweave_routes = Router::new().route("/api/v1/arweave/anchors", get(arweave::list_anchors));
+
+    // Per-IP admission limit on the verify route. Layer order
+    // matters: `rate_limit_by_ip` is OUTERMOST so an over-limit
+    // caller is shed with 429 BEFORE auth burns CPU. The
+    // invariant lives in `rate_limit.rs:746-760`; the IPFS path
+    // at `:226-231` is the template. The `IpRateLimiter`
+    // extension must be present or `rate_limit_by_ip` silently
+    // no-ops (see the comment at the IPFS mount).
+    let arweave_verify_routes = Router::new()
+        .route(
+            "/api/v1/arweave/anchors/verify/{item_id}",
+            get(arweave::verify_anchor),
+        )
+        .layer(middleware::from_fn(crate::auth::optional_signature))
+        .layer(middleware::from_fn(crate::rate_limit::rate_limit_by_ip))
+        .layer(axum::Extension(crate::rate_limit::IpRateLimiter {
+            limiter: state.arweave_verify_rate_limiter.clone(),
+            trust: state.push_limiter_trust,
+        }));
 
     // ── Bounty routes (write — require HTTP Signature) ─────────────────
     let bounty_write_routes = add_auth_layers(
@@ -489,6 +519,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(sync_trigger_routes)
         .merge(ipfs_routes)
         .merge(arweave_routes)
+        .merge(arweave_verify_routes)
         .merge(meta_routes)
         .layer(
             TraceLayer::new_for_http()

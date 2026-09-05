@@ -89,6 +89,13 @@ pub struct AppState {
     /// same bucket is admitted at the route and falsely shed mid-request (#173 round-10,
     /// R6). Keyed by `push_limiter_trust`.
     pub ipfs_rate_limiter: RateLimiter,
+    /// Per-IP request-rate cap on the anonymous-callable
+    /// `/api/v1/arweave/anchors/verify/{item_id}` route. The
+    /// route can issue one or more outbound HTTP requests to the
+    /// gateway per call, and a flood of anonymous verifies would
+    /// hold request tasks and amplify gateway egress. Keyed by
+    /// `push_limiter_trust`.
+    pub arweave_verify_rate_limiter: RateLimiter,
     /// Per-client-IP WORK-budget limiter for the `GET /ipfs/{cid}` resolver's internal
     /// fan-out: charged per legacy (NULL-provenance) PROBE (`acquire` + `cat-file`) and
     /// per provenance-path WALK, and peeked non-consuming before the O(repos) legacy
@@ -346,6 +353,7 @@ impl AppState {
         self.ipfs_work_rate_limiter.cleanup().await;
         self.sync_trigger_rate_limiter.cleanup().await;
         self.peer_write_rate_limiter.cleanup().await;
+        self.arweave_verify_rate_limiter.cleanup().await;
     }
 
     /// Trigger graceful shutdown. Idempotent — calling more than once

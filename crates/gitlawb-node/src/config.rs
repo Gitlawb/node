@@ -134,6 +134,17 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_IRYS_URL", default_value = "")]
     pub irys_url: String,
 
+    /// Arweave gateway URL for the public verify endpoint and the
+    /// three-outcome recovery probe. Defaults to `https://arweave.net`
+    /// because that is the protocol's public gateway. Set to a
+    /// private mirror in production if one is operated.
+    #[arg(
+        long,
+        env = "GITLAWB_ARWEAVE_GATEWAY_URL",
+        default_value = "https://arweave.net"
+    )]
+    pub arweave_gateway_url: String,
+
     /// Base L2 DID registry contract address (0x...)
     #[arg(long, env = "GITLAWB_CONTRACT_DID_REGISTRY", default_value = "")]
     pub contract_did_registry: String,
@@ -669,6 +680,19 @@ pub struct Config {
     /// disables that derived bucket too.
     #[arg(long, env = "GITLAWB_IPFS_RATE_LIMIT", default_value_t = 600)]
     pub ipfs_rate_limit: usize,
+
+    /// Per-IP requests-per-window cap on `GET
+    /// /api/v1/arweave/anchors/verify/{item_id}`.
+    ///
+    /// The verify endpoint is anonymous-callable and can issue one
+    /// (post round-3 refactor; two pre round-3) outbound HTTP
+    /// requests to the gateway per call. Unlike the comparable
+    /// public IPFS path, it had no IP admission limit prior to
+    /// the round-3 review, leaving the route open to anonymous
+    /// amplification. `0` disables the limit (NOT recommended in
+    /// production).
+    #[arg(long, env = "GITLAWB_ARWEAVE_VERIFY_RATE_LIMIT", default_value_t = 120)]
+    pub arweave_verify_rate_limit: usize,
 
     /// Rows the legacy provider-CID repair sweep reads per batch (U4, #173).
     ///
