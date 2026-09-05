@@ -33,7 +33,8 @@ use crate::ans104::{self, DataItem};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeOutcome {
     /// 2xx, body parses as ANS-104, signature verifies against the
-    /// expected owner. No re-upload allowed.
+    /// expected owner, and the derived id matches the requested
+    /// `item_id`. No re-upload allowed.
     Present,
     /// 404 with a protocol-defined body shape. Authorizes re-upload.
     DefinitivelyAbsent,
@@ -139,9 +140,14 @@ pub async fn probe_anchor_item(
     probe_item(item, req)
 }
 
-/// Shared v2 classification for a parsed `DataItem`: owner binding
-/// plus Ed25519 verification against the expected key. Any failure is
-/// `Indeterminate`, never a proof of absence.
+/// Shared v2 classification for a parsed `DataItem`: owner binding,
+/// Ed25519 verification against the expected key, and artifact-identity
+/// binding to the requested `item_id`. Any failure is `Indeterminate`,
+/// never a proof of absence. The id check must live here, not only in
+/// `verify_v2`: direct `probe_anchor_item` consumers (the split-1
+/// recovery drain) never reach `verify_v2`, and without it a gateway
+/// answering `GET /wrong-id` with any other valid same-owner item
+/// would report `Present`.
 fn probe_item(item: DataItem, req: &ProbeRequest) -> (ProbeOutcome, Option<Vec<u8>>) {
     let owner_pk = match item.owner_pubkey() {
         Ok(p) => p,
@@ -157,10 +163,18 @@ fn probe_item(item: DataItem, req: &ProbeRequest) -> (ProbeOutcome, Option<Vec<u
         }
     }
 
+    // Artifact-identity check: the derived protocol id must equal the
+    // requested `item_id`. A valid signature only proves who signed
+    // the response, not that it is the item the caller asked about.
+    match item.id() {
+        Ok(derived) if derived == req.item_id => {}
+        _ => return (ProbeOutcome::Indeterminate, None),
+    }
+
     // Re-encode the verified item for the `Present` consumer so
     // `verify_anchor` does not need a second GET. The bytes handed
-    // back are the canonical binary frame when the gateway served
-    // binary, else the JSON projection.
+    // back are the canonical binary frame (the original Avro tag
+    // payload included).
     let bytes = item.to_binary().unwrap_or_default();
     if bytes.is_empty() {
         return (ProbeOutcome::Indeterminate, None);
@@ -708,8 +722,46 @@ mod tests {
 
         let mut req = req_for(server.url());
         req.expected_owner_pk = Some(pk);
+        // Bind the request to the served item's real derived id: the
+        // probe enforces artifact identity, so a placeholder id would
+        // (correctly) classify as `Indeterminate`.
+        req.item_id = item.id().unwrap();
         let (outcome, _) = probe_anchor_item(&reqwest::Client::new(), &req).await;
         assert_eq!(outcome, ProbeOutcome::Present);
+    }
+
+    /// A valid signed item served under the WRONG requested id is
+    /// `Indeterminate`: the signature proves the signer, not that the
+    /// gateway served the item the caller asked about. This is the
+    /// probe-level artifact-identity check direct `probe_anchor_item`
+    /// consumers (the split-1 recovery drain) rely on.
+    #[tokio::test]
+    async fn probe_2xx_with_valid_signed_item_under_wrong_id_is_indeterminate() {
+        let kp = Keypair::generate();
+        let pk = kp.verifying_key().to_bytes();
+        let mut item =
+            DataItem::new_unsigned(&pk, "", "", vec![(b"App-Name", b"gitlawb")], b"{}".to_vec());
+        ans104::sign_data_item(&mut item, &kp).unwrap();
+        let body = serde_json::to_string(&item).unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        // Deliberately request an id that is NOT the served item's
+        // derived id. The signature is valid and the owner matches,
+        // but the artifact identity does not.
+        let mut req = req_for(server.url());
+        req.item_id = "this-is-not-the-items-actual-id".to_string();
+        req.expected_owner_pk = Some(pk);
+        let (outcome, bytes) = probe_anchor_item(&reqwest::Client::new(), &req).await;
+        assert_eq!(outcome, ProbeOutcome::Indeterminate);
+        assert!(bytes.is_none(), "no bytes on Indeterminate");
     }
 
     #[tokio::test]
@@ -967,6 +1019,9 @@ mod tests {
     /// necessary but not sufficient. A stale or malicious mirror
     /// serving a different valid same-owner item for `<requested-id>`
     /// would otherwise attest that substitute payload as verified.
+    /// The probe enforces this before `verify_v2` (whose own check
+    /// remains as defense-in-depth), so the reason here is the
+    /// probe-level indeterminate classification.
     #[tokio::test]
     async fn verify_anchor_id_mismatch_is_indeterminate() {
         let kp = Keypair::generate();
@@ -1007,8 +1062,8 @@ mod tests {
         assert!(r.data_payload.is_none(), "no payload on Indeterminate");
         let err = r.error.unwrap();
         assert!(
-            err.contains("artifact id mismatch"),
-            "expected artifact-identity error, got: {err}"
+            err.contains("indeterminate"),
+            "expected indeterminate error on id mismatch, got: {err}"
         );
     }
 
