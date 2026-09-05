@@ -57,10 +57,10 @@ impl ProbeOutcome {
 #[derive(Debug, Clone)]
 pub struct ProbeRequest {
     pub item_id: String,
-    /// Optional: the node's public key, for signature verification.
-    /// A `None` here skips the verify step but still enforces
-    /// 2xx/404/indeterminate classification and the 2xx body
-    /// shape.
+    /// The node's public key, for signature verification. `Present`
+    /// requires proof, so a `None` here can never report `Present`:
+    /// it still enforces 2xx/404/indeterminate classification and the
+    /// 2xx body shape, but a 2xx match stays `Indeterminate`.
     pub expected_owner_pk: Option<[u8; PUBLIC_KEY_LENGTH]>,
     /// The gateway base URL, e.g. `https://arweave.net`. The probe
     /// GETs `<gateway>/<item_id>`.
@@ -147,20 +147,24 @@ pub async fn probe_anchor_item(
 /// `verify_v2`: direct `probe_anchor_item` consumers (the split-1
 /// recovery drain) never reach `verify_v2`, and without it a gateway
 /// answering `GET /wrong-id` with any other valid same-owner item
-/// would report `Present`.
+/// would report `Present`. Likewise `Present` requires an expected
+/// owner: with `None` there is no signature to check, so an anonymous
+/// probe stays `Indeterminate` even on id match rather than attesting
+/// presence with no cryptographic proof.
 fn probe_item(item: DataItem, req: &ProbeRequest) -> (ProbeOutcome, Option<Vec<u8>>) {
+    let Some(expected) = req.expected_owner_pk else {
+        return (ProbeOutcome::Indeterminate, None);
+    };
     let owner_pk = match item.owner_pubkey() {
         Ok(p) => p,
         Err(_) => return (ProbeOutcome::Indeterminate, None),
     };
 
-    if let Some(expected) = req.expected_owner_pk {
-        if owner_pk != expected {
-            return (ProbeOutcome::Indeterminate, None);
-        }
-        if ans104::verify_data_item(&item, &expected).is_err() {
-            return (ProbeOutcome::Indeterminate, None);
-        }
+    if owner_pk != expected {
+        return (ProbeOutcome::Indeterminate, None);
+    }
+    if ans104::verify_data_item(&item, &expected).is_err() {
+        return (ProbeOutcome::Indeterminate, None);
     }
 
     // Artifact-identity check: the derived protocol id must equal the
@@ -759,6 +763,41 @@ mod tests {
         let mut req = req_for(server.url());
         req.item_id = "this-is-not-the-items-actual-id".to_string();
         req.expected_owner_pk = Some(pk);
+        let (outcome, bytes) = probe_anchor_item(&reqwest::Client::new(), &req).await;
+        assert_eq!(outcome, ProbeOutcome::Indeterminate);
+        assert!(bytes.is_none(), "no bytes on Indeterminate");
+    }
+
+    /// Without an expected owner there is no signature to check: even
+    /// an id-matching envelope must be `Indeterminate`, never
+    /// `Present`. The item below carries a random 64-byte signature
+    /// (no valid signature over its content) whose derived id equals
+    /// the requested id — before the proof requirement this reported
+    /// confirmed presence with no cryptographic proof.
+    #[tokio::test]
+    async fn probe_2xx_without_expected_owner_is_indeterminate_on_id_match() {
+        let kp = Keypair::generate();
+        let pk = kp.verifying_key().to_bytes();
+        let mut item =
+            DataItem::new_unsigned(&pk, "", "", vec![(b"App-Name", b"gitlawb")], b"{}".to_vec());
+        item.signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xABu8; 64]);
+        let item_id = item.id().unwrap();
+        let body = serde_json::to_string(&item).unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let req = ProbeRequest {
+            item_id,
+            expected_owner_pk: None,
+            gateway_url: server.url(),
+        };
         let (outcome, bytes) = probe_anchor_item(&reqwest::Client::new(), &req).await;
         assert_eq!(outcome, ProbeOutcome::Indeterminate);
         assert!(bytes.is_none(), "no bytes on Indeterminate");
