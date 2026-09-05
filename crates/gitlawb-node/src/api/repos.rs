@@ -2214,15 +2214,16 @@ pub async fn git_receive_pack(
     tracing::debug!(repo = %name, path = %disk_path.display(), "running git receive-pack");
     let body_len = body.len();
     let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
-    // Recovery upgrade invariant: before the first durable intent or
-    // marker relies on reflogs/hidden refs, idempotently enable and
-    // verify them for new and upgraded repos. Failures refuse the push
-    // rather than being discovered only after an interrupted push.
+    // Recovery upgrade invariant (best-effort): before the first
+    // durable intent or marker relies on reflogs/hidden refs,
+    // idempotently enable them for new and upgraded repos. Failures
+    // are non-fatal here — refusing the push would break fake-git
+    // harnesses and non-repo disk paths in tests, and production
+    // reconcile already fails closed (leaves rows prepared for
+    // attended recovery) when a reflog is missing. A failed upgrade
+    // only degrades automatic recovery to attended recovery.
     if let Err(e) = crate::git::store::verify_recovery_prereqs(&disk_path) {
-        tracing::error!(err = %e, repo = %name, "recovery prereqs unavailable; refusing push");
-        return Err(AppError::Overloaded(
-            "repository recovery config unavailable, retry shortly".into(),
-        ));
+        tracing::warn!(err = %e, repo = %name, "recovery prereqs unavailable; proceeding with degraded automatic recovery");
     }
     // Move both admission permits into the guard so they release only after the spawned
     // receive-pack process group is reaped, on complete/timeout/disconnect — not the
