@@ -1,5 +1,6 @@
-use async_graphql_axum::{GraphQLRequest, GraphQLResponse, GraphQLSubscription};
-use axum::extract::DefaultBodyLimit;
+use async_graphql::http::ALL_WEBSOCKET_PROTOCOLS;
+use async_graphql_axum::{GraphQLProtocol, GraphQLRequest, GraphQLResponse, GraphQLWebSocket};
+use axum::extract::{DefaultBodyLimit, WebSocketUpgrade};
 use axum::{
     extract::State,
     middleware,
@@ -23,6 +24,8 @@ use crate::state::AppState;
 async fn graphql_handler(
     State(state): State<AppState>,
     auth: Option<axum::Extension<crate::auth::AuthenticatedDid>>,
+    headers: axum::http::HeaderMap,
+    rate_limit::PeerAddr(peer): rate_limit::PeerAddr,
     req: GraphQLRequest,
 ) -> GraphQLResponse {
     // `optional_signature` attaches the verified DID when a signature is present.
@@ -32,7 +35,47 @@ async fn graphql_handler(
     if let Some(axum::Extension(did)) = auth {
         inner = inner.data(did);
     }
+    // The anonymous `tasks`/`task` resolvers run the same #268 visibility gate
+    // as the REST read routes and cost the node the same queries, so they carry
+    // the same per-IP brake. It rides as request data rather than a router layer
+    // because /graphql is one endpoint for every operation — see `TaskReadBrake`
+    // (#327 review). It debits before the gate runs, but unlike the REST layer
+    // it sits inside `optional_signature`, so it brakes the gate's query cost
+    // and not signature verification.
+    inner = inner.data(rate_limit::TaskReadBrake {
+        limiter: state.task_read_rate_limiter.clone(),
+        key: rate_limit::client_key(&headers, peer, state.push_limiter_trust),
+        request_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    });
     state.graphql_schema.execute(inner).await.into()
+}
+
+async fn graphql_ws_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    rate_limit::PeerAddr(peer): rate_limit::PeerAddr,
+    auth: Option<axum::Extension<auth::AuthenticatedDid>>,
+    protocol: GraphQLProtocol,
+    upgrade: WebSocketUpgrade,
+) -> axum::response::Response {
+    let mut data = async_graphql::Data::default();
+    if let Some(axum::Extension(did)) = auth {
+        data.insert(did);
+    }
+    data.insert(rate_limit::TaskReadBrake {
+        limiter: state.task_read_rate_limiter.clone(),
+        key: rate_limit::client_key(&headers, peer, state.push_limiter_trust),
+        request_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    });
+    let schema = state.graphql_schema.as_ref().clone();
+    upgrade
+        .protocols(ALL_WEBSOCKET_PROTOCOLS)
+        .on_upgrade(move |stream| {
+            GraphQLWebSocket::new(stream, schema, protocol)
+                .with_data(data)
+                .serve()
+        })
+        .into_response()
 }
 
 async fn graphql_playground() -> impl IntoResponse {
@@ -57,14 +100,11 @@ fn add_auth_layers(router: Router<AppState>, state: AppState) -> Router<AppState
 
 pub fn build_router(state: AppState) -> Router {
     // ── GraphQL routes ─────────────────────────────────────────────────────
-    let schema = state.graphql_schema.as_ref().clone();
     let graphql_routes = Router::new()
         .route("/graphql", get(graphql_playground).post(graphql_handler))
-        // Attach the verified DID to /graphql when a signature is present. The
-        // layer covers only routes added before it, so /graphql/ws (added after,
-        // read-only subscriptions) stays open.
-        .layer(middleware::from_fn(auth::optional_signature))
-        .route_service("/graphql/ws", GraphQLSubscription::new(schema));
+        .route("/graphql/ws", get(graphql_ws_handler))
+        // Attach the verified DID to /graphql and /graphql/ws when a signature is present.
+        .layer(middleware::from_fn(auth::optional_signature));
 
     // ── Task routes (write — require HTTP Signature) ───────────────────────
     let task_write_routes = add_auth_layers(
@@ -76,10 +116,28 @@ pub fn build_router(state: AppState) -> Router {
         state.clone(),
     );
 
-    // ── Task routes (read — open) ──────────────────────────────────────────
+    // ── Task routes (read — open, but scoped) ──────────────────────────────
+    // `optional_signature` attaches the verified DID when a signature is present
+    // so the handlers can identify the caller; the routes stay anonymous-reachable,
+    // but each task/row is gated to its delegator, its assignee, or (for a
+    // repo-scoped task) whoever can read that repo (#268 — these routes previously
+    // carried no gate and no identity at all).
+    // Both routes also carry a per-IP flood brake, mirroring `/ipfs/{cid}`: they are
+    // anon-reachable and the gate above costs a task lookup plus deduped-repo and
+    // visibility-rule queries *before* the opaque 404, so a prober pays nothing and
+    // the node pays per request. The limiter is the outermost layer so a flood is
+    // rejected before signature verification and the visibility queries run. The
+    // extension MUST be attached or `rate_limit_by_ip` is a silent no-op.
+    let task_read_limiter = rate_limit::IpRateLimiter {
+        limiter: state.task_read_rate_limiter.clone(),
+        trust: state.push_limiter_trust,
+    };
     let task_read_routes = Router::new()
         .route("/api/v1/tasks", get(tasks::list_tasks))
-        .route("/api/v1/tasks/{id}", get(tasks::get_task));
+        .route("/api/v1/tasks/{id}", get(tasks::get_task))
+        .layer(middleware::from_fn(auth::optional_signature))
+        .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+        .layer(axum::Extension(task_read_limiter));
 
     // ── Rate-limited creation routes — require HTTP Signature, plus a per-DID
     // throttle AND a per-IP flood brake. The per-DID limiter (inner) caps a
@@ -617,5 +675,347 @@ async fn p2p_info(State(state): State<AppState>) -> Json<serde_json::Value> {
             }))
         }
         None => Json(json!({ "enabled": false })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::test_state;
+    use sqlx::PgPool;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn ws_send_text(stream: &mut tokio::net::TcpStream, text: &str) {
+        let payload = text.as_bytes();
+        let len = payload.len();
+        let mut frame = Vec::new();
+        frame.push(0x81);
+        let mask = [0x12, 0x34, 0x56, 0x78];
+        if len <= 125 {
+            frame.push(0x80 | (len as u8));
+        } else if len <= 65535 {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&(len as u16).to_be_bytes());
+        } else {
+            frame.push(0x80 | 127);
+            frame.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+        frame.extend_from_slice(&mask);
+        for (i, b) in payload.iter().enumerate() {
+            frame.push(b ^ mask[i % 4]);
+        }
+        stream.write_all(&frame).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    async fn ws_recv_text(stream: &mut tokio::net::TcpStream) -> String {
+        let mut header = [0u8; 2];
+        stream.read_exact(&mut header).await.unwrap();
+        let b1 = header[1];
+        let masked = (b1 & 0x80) != 0;
+        let mut len = (b1 & 0x7f) as usize;
+        if len == 126 {
+            let mut ext = [0u8; 2];
+            stream.read_exact(&mut ext).await.unwrap();
+            len = u16::from_be_bytes(ext) as usize;
+        } else if len == 127 {
+            let mut ext = [0u8; 8];
+            stream.read_exact(&mut ext).await.unwrap();
+            len = u64::from_be_bytes(ext) as usize;
+        }
+        let mask = if masked {
+            let mut m = [0u8; 4];
+            stream.read_exact(&mut m).await.unwrap();
+            Some(m)
+        } else {
+            None
+        };
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).await.unwrap();
+        if let Some(m) = mask {
+            for (i, b) in payload.iter_mut().enumerate() {
+                *b ^= m[i % 4];
+            }
+        }
+        String::from_utf8(payload).unwrap()
+    }
+
+    async fn ws_recv_op_frames(stream: &mut tokio::net::TcpStream, op_id: &str) -> Vec<String> {
+        let mut frames = Vec::new();
+        loop {
+            let text = ws_recv_text(stream).await;
+            frames.push(text.clone());
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if v.get("id").and_then(|id| id.as_str()) == Some(op_id) {
+                    let msg_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    if msg_type == "complete" || msg_type == "error" {
+                        break;
+                    }
+                }
+            }
+        }
+        frames
+    }
+
+    async fn connect_ws(addr: std::net::SocketAddr) -> tokio::net::TcpStream {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "GET /graphql/ws HTTP/1.1\r\n\
+             Host: {}\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Protocol: graphql-transport-ws\r\n\r\n",
+            addr
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp.starts_with("HTTP/1.1 101 Switching Protocols"));
+
+        // Init connection
+        ws_send_text(&mut stream, r#"{"type":"connection_init"}"#).await;
+        let ack = ws_recv_text(&mut stream).await;
+        assert!(ack.contains("connection_ack"));
+
+        stream
+    }
+
+    #[sqlx::test]
+    async fn graphql_ws_task_query_enforces_per_request_field_limit(pool: PgPool) {
+        let state = test_state(pool).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_router(state);
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut stream = connect_ws(addr).await;
+
+        // Query with 6 aliased task fields (exceeding MAX_GRAPHQL_TASK_READS_PER_REQUEST = 5)
+        let query = r#"{"id":"1","type":"subscribe","payload":{"query":"query { f1: tasks { items { id } } f2: tasks { items { id } } f3: tasks { items { id } } f4: tasks { items { id } } f5: tasks { items { id } } f6: tasks { items { id } } }"}}"#;
+        ws_send_text(&mut stream, query).await;
+        let frames = ws_recv_op_frames(&mut stream, "1").await;
+        let resp = frames.join("\n");
+        assert!(
+            resp.contains("rate limit exceeded"),
+            "6th task field over WS must be braked: {resp}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn graphql_ws_task_query_enforces_per_ip_rate_limit(pool: PgPool) {
+        let mut state = test_state(pool).await;
+        // Restrict task read rate limiter to 1 request per 60s
+        state.task_read_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, std::time::Duration::from_secs(60));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_router(state);
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut stream = connect_ws(addr).await;
+
+        // First task query succeeds (or returns valid data)
+        let query1 = r#"{"id":"1","type":"subscribe","payload":{"query":"query { tasks { items { id } } }"}}"#;
+        ws_send_text(&mut stream, query1).await;
+        let frames1 = ws_recv_op_frames(&mut stream, "1").await;
+        let resp1 = frames1.join("\n");
+        assert!(!resp1.contains("rate limit exceeded"));
+
+        // Second task query on the same connection hits per-IP limiter
+        let query2 = r#"{"id":"2","type":"subscribe","payload":{"query":"query { tasks { items { id } } }"}}"#;
+        ws_send_text(&mut stream, query2).await;
+        let frames2 = ws_recv_op_frames(&mut stream, "2").await;
+        let resp2 = frames2.join("\n");
+        assert!(
+            resp2.contains("rate limit exceeded"),
+            "exceeded per-IP limiter over WS must return rate limit message: {resp2}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn graphql_ws_task_query_resets_field_budget_per_operation(pool: PgPool) {
+        let state = test_state(pool).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_router(state);
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut stream = connect_ws(addr).await;
+
+        // Execute 6 sequential 1-field queries on the same connection.
+        // Each operation must receive its own 5-field budget, so none are braked by the per-request limit.
+        for i in 1..=6 {
+            let id = i.to_string();
+            let query = format!(
+                r#"{{"id":"{id}","type":"subscribe","payload":{{"query":"query {{ tasks {{ items {{ id }} }} }}"}}}}"#
+            );
+            ws_send_text(&mut stream, &query).await;
+            let frames = ws_recv_op_frames(&mut stream, &id).await;
+            let resp = frames.join("\n");
+            assert!(
+                !resp.contains("rate limit exceeded"),
+                "operation {id} on the same WS connection must have a fresh field budget: {resp}"
+            );
+        }
+    }
+
+    async fn connect_ws_signed(
+        addr: std::net::SocketAddr,
+        keypair: &gitlawb_core::identity::Keypair,
+    ) -> tokio::net::TcpStream {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let signed = gitlawb_core::http_sig::sign_request(keypair, "GET", "/graphql/ws", b"");
+        let req = format!(
+            "GET /graphql/ws HTTP/1.1\r\n\
+             Host: {}\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Protocol: graphql-transport-ws\r\n\
+             content-digest: {}\r\n\
+             signature-input: {}\r\n\
+             signature: {}\r\n\r\n",
+            addr, signed.content_digest, signed.signature_input, signed.signature
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp.starts_with("HTTP/1.1 101 Switching Protocols"));
+
+        // Init connection
+        ws_send_text(&mut stream, r#"{"type":"connection_init"}"#).await;
+        let ack = ws_recv_text(&mut stream).await;
+        assert!(ack.contains("connection_ack"));
+
+        stream
+    }
+
+    #[sqlx::test]
+    async fn graphql_ws_authenticated_query_accesses_private_task(pool: PgPool) {
+        let state = test_state(pool).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_router(state.clone());
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let keypair = gitlawb_core::identity::Keypair::generate();
+        let delegator_did = keypair.did().to_string();
+
+        let task = crate::db::AgentTask {
+            id: "ws-auth-task-01".into(),
+            repo_id: None,
+            delegator_did: delegator_did.clone(),
+            kind: "test".into(),
+            capability: "read".into(),
+            status: "pending".into(),
+            assignee_did: Some(delegator_did.clone()),
+            ucan_token: None,
+            payload: None,
+            result: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            deadline: None,
+        };
+        state.db.create_task(&task).await.unwrap();
+
+        // 1. Unauthenticated WS connection cannot see the private task
+        let mut unauth_stream = connect_ws(addr).await;
+        let query = r#"{"id":"1","type":"subscribe","payload":{"query":"query { tasks { items { id } } }"}}"#;
+        ws_send_text(&mut unauth_stream, query).await;
+        let unauth_frames = ws_recv_op_frames(&mut unauth_stream, "1").await;
+        let unauth_resp = unauth_frames.join("\n");
+        assert!(
+            !unauth_resp.contains("ws-auth-task-01"),
+            "unauthenticated WS must not disclose private task: {unauth_resp}"
+        );
+
+        // 2. Forged signature claiming the delegator DID must be rejected at handshake
+        let attacker_keypair = gitlawb_core::identity::Keypair::generate();
+        let attacker_signed =
+            gitlawb_core::http_sig::sign_request(&attacker_keypair, "GET", "/graphql/ws", b"");
+        let forged_sig_input = attacker_signed
+            .signature_input
+            .replace(&attacker_keypair.did().to_string(), &delegator_did);
+        let mut forged_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let forged_req = format!(
+            "GET /graphql/ws HTTP/1.1\r\n\
+             Host: {}\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Protocol: graphql-transport-ws\r\n\
+             content-digest: {}\r\n\
+             signature-input: {}\r\n\
+             signature: {}\r\n\r\n",
+            addr, attacker_signed.content_digest, forged_sig_input, attacker_signed.signature
+        );
+        forged_stream
+            .write_all(forged_req.as_bytes())
+            .await
+            .unwrap();
+        forged_stream.flush().await.unwrap();
+        let mut forged_bytes = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !forged_bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = forged_stream.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            forged_bytes.extend_from_slice(&chunk[..n]);
+        }
+        let forged_resp = String::from_utf8_lossy(&forged_bytes);
+        assert!(
+            forged_resp.starts_with("HTTP/1.1 401 Unauthorized"),
+            "forged WS signature must be rejected with 401: {forged_resp}"
+        );
+
+        // 3. Signed WS connection authenticates caller and retrieves the private task
+        let mut auth_stream = connect_ws_signed(addr, &keypair).await;
+        ws_send_text(&mut auth_stream, query).await;
+        let auth_frames = ws_recv_op_frames(&mut auth_stream, "1").await;
+        let auth_resp = auth_frames.join("\n");
+        assert!(
+            auth_resp.contains("ws-auth-task-01"),
+            "signed WS must authenticate delegator and return private task: {auth_resp}"
+        );
     }
 }

@@ -83,10 +83,12 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
     let node_did = keypair.did();
     let (ref_tx, _) = tokio::sync::broadcast::channel(1);
     let (task_tx, _) = tokio::sync::broadcast::channel(1);
+    let task_cursor_key = crate::api::task_cursor::TaskCursorKey::derive(&keypair.to_seed());
     let schema = Arc::new(graphql::build_schema(
         db.clone(),
         ref_tx.clone(),
         task_tx.clone(),
+        task_cursor_key.clone(),
     ));
     AppState {
         config: Arc::new(Config::parse_from(["gitlawb-node"])),
@@ -98,6 +100,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         ref_update_tx: ref_tx,
         task_event_tx: task_tx,
         graphql_schema: schema,
+        task_cursor_key,
         machine_id: None,
         repo_store: crate::git::repo_store::RepoStore::for_testing(PathBuf::from("/tmp"), pool),
         rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
@@ -134,6 +137,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         git_ipfs_walk_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(
             16,
         ),
+        task_read_rate_limiter: RateLimiter::new(1200, Duration::from_secs(3600)),
         git_bin: "git".to_string(),
     }
 }
@@ -681,11 +685,11 @@ mod tests {
         let assignee = "did:key:zTASKASSIGNEEBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
         let stranger = "did:key:zTASKSTRANGERCCCCCCCCCCCCCCCCCCCCCCCCCCC";
         let state = test_state(pool).await;
-        state
-            .db
-            .create_task(&seed_task("task-1", delegator))
-            .await
-            .expect("seed task");
+        let repo = seed_repo(delegator, "task-pub-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let mut t1 = seed_task("task-1", delegator);
+        t1.repo_id = Some(repo.id);
+        state.db.create_task(&t1).await.expect("seed task");
         // Assignee claims it: pending -> claimed, assignee_did = assignee.
         state
             .db
@@ -704,8 +708,25 @@ mod tests {
         let uri = "/api/v1/tasks/task-1/complete";
         let body = || Body::from("{}");
 
-        // Stranger (not the assignee) is rejected by the authorization gate, even
-        // with the empty body that previously bypassed the binding. Exact 403.
+        // Stranger on an invisible (repo-less) task receives opaque 404 (no existence leak).
+        let inv_task = seed_task("task-inv", delegator);
+        state.db.create_task(&inv_task).await.unwrap();
+        let inv_resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::POST,
+                "/api/v1/tasks/task-inv/complete",
+                body(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            inv_resp.status(),
+            StatusCode::NOT_FOUND,
+            "an invisible task must 404 so existence is not leaked"
+        );
+
+        // Stranger on a visible task is rejected by the authorization gate with exact 403.
         let resp = router()
             .oneshot(signed_request_as(stranger, Method::POST, uri, body()))
             .await

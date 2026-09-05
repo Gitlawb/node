@@ -1123,6 +1123,45 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE pin_repair_sweep ADD COLUMN IF NOT EXISTS discovery_cursor_id TEXT NOT NULL DEFAULT ''",
         ],
     },
+    Migration {
+        version: 27,
+        name: "agent_tasks_assignee_key_didkey_aware",
+        stmts: &[
+            // Filtering agent_tasks by assignee normalizes did:key values via
+            // ASSIGNEE_DID_CASE_SQL, making the raw idx_agent_tasks_assignee
+            // index unusable. Swap the index: drop the raw column index and
+            // build the matching expression index so list queries use an Index Cond.
+            // The CASE must stay byte-identical to ASSIGNEE_DID_CASE_SQL so
+            // Postgres matches it.
+            "DROP INDEX IF EXISTS idx_agent_tasks_assignee",
+            // Keep byte-identical to ASSIGNEE_DID_CASE_SQL so Postgres uses the index.
+            "CREATE INDEX IF NOT EXISTS idx_agent_tasks_assignee_key ON agent_tasks ((CASE WHEN assignee_did LIKE 'did:key:%' AND position(':' in substr(assignee_did, 9)) = 0 THEN substr(assignee_did, 9) ELSE assignee_did END))",
+        ],
+    },
+    Migration {
+        version: 28,
+        name: "agent_tasks_keyset_order_indexes",
+        stmts: &[
+            // list_tasks_keyset pages ORDER BY created_at DESC, id DESC with LIMIT.
+            // The v1 status/repo indexes and v27 assignee expression index do not
+            // lead with that order, so Postgres can sort a growing match set before
+            // applying the batch LIMIT. MAX_TASK_SCAN_CANDIDATES then only bounds
+            // the Rust loop. One index per supported filter domain, each ending in
+            // the keyset order, so the LIMIT is an Index Cond stop. Column order
+            // and DESC are load-bearing and must match the query. The CASE in the
+            // assignee indexes must stay byte-identical to ASSIGNEE_DID_CASE_SQL.
+            //
+            // Drop the single-column idx_agent_tasks_assignee_key from v27 and
+            // idx_agent_tasks_status from v1 so the planner never picks a
+            // non-keyset index that requires an in-memory Sort before LIMIT.
+            "DROP INDEX IF EXISTS idx_agent_tasks_assignee_key",
+            "DROP INDEX IF EXISTS idx_agent_tasks_status",
+            "CREATE INDEX IF NOT EXISTS idx_agent_tasks_created_at_id ON agent_tasks (created_at DESC, id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_agent_tasks_status_created_at_id ON agent_tasks (status, created_at DESC, id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_agent_tasks_assignee_key_created_at_id ON agent_tasks ((CASE WHEN assignee_did LIKE 'did:key:%' AND position(':' in substr(assignee_did, 9)) = 0 THEN substr(assignee_did, 9) ELSE assignee_did END), created_at DESC, id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_agent_tasks_status_assignee_key_created_at_id ON agent_tasks (status, (CASE WHEN assignee_did LIKE 'did:key:%' AND position(':' in substr(assignee_did, 9)) = 0 THEN substr(assignee_did, 9) ELSE assignee_did END), created_at DESC, id DESC)",
+        ],
+    },
 ];
 
 /// Max distinct source repos recorded per pinned object (F1, #173 jatmn round 8).
@@ -1148,6 +1187,45 @@ const OWNER_KEY_CASE_SQL: &str = "CASE WHEN owner_did LIKE 'did:key:%' AND posit
 /// SQL CASE expression byte-identical to `normalize_owner_key`, but for columns
 /// named `did` (like in agent_profiles) instead of `owner_did`.
 const PROFILE_DID_CASE_SQL: &str = "CASE WHEN did LIKE 'did:key:%' AND position(':' in substr(did, 9)) = 0 THEN substr(did, 9) ELSE did END";
+
+/// SQL CASE expression byte-identical to `normalize_owner_key`, but for the
+/// `assignee_did` column on `agent_tasks`.
+const ASSIGNEE_DID_CASE_SQL: &str = "CASE WHEN assignee_did LIKE 'did:key:%' AND position(':' in substr(assignee_did, 9)) = 0 THEN substr(assignee_did, 9) ELSE assignee_did END";
+
+const TASK_KEYSET_SELECT: &str = "SELECT id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline FROM agent_tasks";
+
+/// Dedicated SQL for one `list_tasks_keyset` filter domain.
+///
+/// Optional `($n IS NULL OR col = $n)` predicates prevent the planner from
+/// using the v28 keyset indexes, so each supported domain is its own query
+/// with only the predicates that domain actually uses. Bind order is status,
+/// assignee key, after `(created_at, id)`, then LIMIT.
+fn list_tasks_keyset_sql(has_status: bool, has_assignee: bool, has_after: bool) -> String {
+    let mut n = 1u32;
+    let mut predicates = Vec::new();
+    if has_status {
+        predicates.push(format!("status = ${n}"));
+        n += 1;
+    }
+    if has_assignee {
+        predicates.push(format!("({key}) = ${n}", key = ASSIGNEE_DID_CASE_SQL));
+        n += 1;
+    }
+    if has_after {
+        predicates.push(format!(
+            "(created_at, id) < (${left}, ${right})",
+            left = n,
+            right = n + 1
+        ));
+        n += 2;
+    }
+    let where_sql = if predicates.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", predicates.join(" AND "))
+    };
+    format!("{TASK_KEYSET_SELECT} {where_sql} ORDER BY created_at DESC, id DESC LIMIT ${n}")
+}
 
 #[cfg(test)]
 mod normalize_owner_key_tests {
@@ -1179,6 +1257,11 @@ mod normalize_owner_key_tests {
             normalize_owner_key("did:web:example.com:alice"),
             "did:web:example.com:alice"
         );
+    }
+
+    #[test]
+    fn leaves_single_residual_web_did_intact() {
+        assert_eq!(normalize_owner_key("did:web:z6Mkfoo"), "did:web:z6Mkfoo");
     }
 
     #[test]
@@ -1426,11 +1509,13 @@ impl Db {
 
     /// Shared dedup CTE: collapses the mirror row and the canonical row of one
     /// logical repo into a single survivor. `$1` is an optional owner filter
-    /// (NULL = all rows). Grouping collapses on a did:key-aware owner key: strip a
-    /// `did:key:` prefix (8 chars, so `substr(owner_did, 9)`) only when the
-    /// remainder is a bare id with no `:`, otherwise keep the full DID. That is the
-    /// exact normalization in `crate::api::did_matches`, so `did:key:X` and a bare
-    /// `X` collapse while distinct DID methods (`did:gitlawb:X`) never merge. The
+    /// (NULL = all rows). `$2` optionally scopes the work to the logical groups
+    /// containing the supplied repo ids. Grouping collapses on a did:key-aware
+    /// owner key: strip a `did:key:` prefix (8 chars, so
+    /// `substr(owner_did, 9)`) only when the remainder is a bare id with no `:`,
+    /// otherwise keep the full DID. That is the exact normalization in
+    /// `crate::api::did_matches`, so `did:key:X` and a bare `X` collapse while
+    /// distinct DID methods (`did:gitlawb:X`) never merge. The
     /// CASE is repeated verbatim in `count_repos_deduped` and the v7 index and must
     /// stay byte-identical or Postgres stops using the index.
     /// The canonical row wins (mirror rows carry a slash-form `id` written only by
@@ -1440,7 +1525,12 @@ impl Db {
     /// `crate::api::repos::dedupe_canonical_repos` must stay in sync.
     fn dedup_cte() -> String {
         format!(
-            "WITH deduped AS (
+            "WITH requested_groups AS (
+                 SELECT DISTINCT {key} AS owner_key, name
+                 FROM repos
+                 WHERE $2::text[] IS NOT NULL AND id = ANY($2)
+             ),
+             deduped AS (
                  SELECT DISTINCT ON ({key}, name)
                      id, name, owner_did, description, is_public, default_branch,
                      created_at,
@@ -1459,6 +1549,11 @@ impl Db {
                  -- Quarantined mirrors (admitted but unvalidated by the iCaptcha
                  -- propagation gate) are withheld from every listing surface.
                  WHERE quarantined = FALSE AND ($1::text IS NULL OR ({key}) = $1)
+                   AND ($2::text[] IS NULL OR EXISTS (
+                       SELECT 1 FROM requested_groups requested
+                       WHERE requested.owner_key = ({key})
+                         AND requested.name = repos.name
+                   ))
                  ORDER BY {key}, name,
                      -- mirror rows carry a slash-form id (\"{{owner_short}}/{{name}}\"),
                      -- written only by upsert_mirror_repo; canonical ids are UUIDs.
@@ -1506,6 +1601,7 @@ impl Db {
         );
         let rows = sqlx::query(&sql)
             .bind(owner_key)
+            .bind(None::<&[String]>)
             .fetch_all(&self.pool)
             .await?;
 
@@ -1534,6 +1630,32 @@ impl Db {
         );
         let rows = sqlx::query(&sql)
             .bind(None::<&str>)
+            .bind(None::<&[String]>)
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows.into_iter().map(row_to_repo).collect())
+    }
+
+    /// Resolve only the requested repository ids through the same canonical
+    /// survivor and quarantine rules as `list_all_repos_deduped`.
+    pub async fn list_repos_deduped_by_ids(&self, repo_ids: &[String]) -> Result<Vec<RepoRecord>> {
+        if repo_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "{}
+             SELECT d.id, d.name, d.owner_did, d.description, d.is_public,
+                 d.default_branch, d.created_at, d.updated_at, d.disk_path,
+                 d.forked_from, d.machine_id
+             FROM deduped d
+             WHERE d.id = ANY($2)
+             ORDER BY d.updated_at DESC",
+            Self::dedup_cte()
+        );
+        let rows = sqlx::query(&sql)
+            .bind(None::<&str>)
+            .bind(repo_ids)
             .fetch_all(&self.pool)
             .await?;
 
@@ -3697,61 +3819,52 @@ impl Db {
         Ok(row.map(row_to_task))
     }
 
-    pub async fn list_tasks(
+    pub async fn list_tasks_keyset(
         &self,
         status: Option<&str>,
         assignee_did: Option<&str>,
         limit: i64,
+        after: Option<(&str, &str)>,
     ) -> Result<Vec<AgentTask>> {
-        let rows = match (status, assignee_did) {
-            (Some(s), Some(a)) => sqlx::query(
-                "SELECT id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline
-                 FROM agent_tasks WHERE status=$1 AND assignee_did=$2 ORDER BY created_at DESC LIMIT $3",
-            )
-            .bind(s)
-            .bind(a)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?,
-            (Some(s), None) => sqlx::query(
-                "SELECT id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline
-                 FROM agent_tasks WHERE status=$1 ORDER BY created_at DESC LIMIT $2",
-            )
-            .bind(s)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?,
-            (None, Some(a)) => sqlx::query(
-                "SELECT id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline
-                 FROM agent_tasks WHERE assignee_did=$1 ORDER BY created_at DESC LIMIT $2",
-            )
-            .bind(a)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?,
-            (None, None) => sqlx::query(
-                "SELECT id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline
-                 FROM agent_tasks ORDER BY created_at DESC LIMIT $1",
-            )
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?,
-        };
+        // create_task stores the supplied assignee form unchanged. Compare the
+        // did:key short form so a `did:key:z...` filter matches a bare `z...`
+        // row (and the reverse), matching `did_matches` on the read path.
+        let assignee_key = assignee_did.map(normalize_owner_key);
+        let sql = list_tasks_keyset_sql(status.is_some(), assignee_key.is_some(), after.is_some());
+        let mut q = sqlx::query(&sql);
+        if let Some(status) = status {
+            q = q.bind(status);
+        }
+        if let Some(key) = assignee_key {
+            q = q.bind(key);
+        }
+        if let Some((created_at, id)) = after {
+            q = q.bind(created_at).bind(id);
+        }
+        let rows = q.bind(limit).fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(row_to_task).collect())
     }
 
     pub async fn claim_task(&self, id: &str, assignee_did: &str) -> Result<AgentTask> {
         let now = Utc::now().to_rfc3339();
-        let row = sqlx::query(
+        // Bind the presented DID for the write, and the normalized key for the
+        // pre-assignment guard. A designated assignee stored as a bare key
+        // must still be able to claim when the signer presents `did:key:...`.
+        let assignee_key = normalize_owner_key(assignee_did);
+        let sql = format!(
             "UPDATE agent_tasks SET status='claimed', assignee_did=$2, updated_at=$3
              WHERE id=$1 AND status='pending'
+               AND (assignee_did IS NULL OR ({key}) = $4)
              RETURNING id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline",
-        )
-        .bind(id)
-        .bind(assignee_did)
-        .bind(&now)
-        .fetch_optional(&self.pool)
-        .await?;
+            key = ASSIGNEE_DID_CASE_SQL
+        );
+        let row = sqlx::query(&sql)
+            .bind(id)
+            .bind(assignee_did)
+            .bind(&now)
+            .bind(assignee_key)
+            .fetch_optional(&self.pool)
+            .await?;
         row.map(row_to_task)
             .ok_or_else(|| anyhow::anyhow!("task not claimable: not found or already claimed"))
     }
@@ -4994,6 +5107,151 @@ mod migration_tests {
     }
 
     #[sqlx::test]
+    async fn migration_v27_creates_assignee_expression_index(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        // Roll back: drop the expression index, restore the raw index, forget v27.
+        sqlx::query("DROP INDEX IF EXISTS idx_agent_tasks_assignee_key")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_agent_tasks_assignee ON agent_tasks(assignee_did)",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 27")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Re-run migration.
+        db.migrate().await.unwrap();
+
+        let idx_exists: (bool,) = sqlx::query_as(
+            "SELECT EXISTS(
+                SELECT 1 FROM pg_indexes
+                WHERE tablename = 'agent_tasks' AND indexname = 'idx_agent_tasks_assignee_key'
+            )",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(idx_exists.0, "idx_agent_tasks_assignee_key must exist");
+
+        let old_idx_exists: (bool,) = sqlx::query_as(
+            "SELECT EXISTS(
+                SELECT 1 FROM pg_indexes
+                WHERE tablename = 'agent_tasks' AND indexname = 'idx_agent_tasks_assignee'
+            )",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            !old_idx_exists.0,
+            "idx_agent_tasks_assignee must be dropped"
+        );
+
+        let recorded: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 27")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded.0, 1, "v27 must be recorded as applied");
+
+        // Idempotent re-run.
+        db.migrate().await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn migration_v28_creates_task_keyset_indexes(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        for name in [
+            "idx_agent_tasks_created_at_id",
+            "idx_agent_tasks_status_created_at_id",
+            "idx_agent_tasks_assignee_key_created_at_id",
+            "idx_agent_tasks_status_assignee_key_created_at_id",
+        ] {
+            let exists: (bool,) = sqlx::query_as(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pg_indexes
+                    WHERE tablename = 'agent_tasks' AND indexname = $1
+                )",
+            )
+            .bind(name)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert!(exists.0, "{name} must exist");
+        }
+
+        for old_name in ["idx_agent_tasks_assignee_key", "idx_agent_tasks_status"] {
+            let exists: (bool,) = sqlx::query_as(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pg_indexes
+                    WHERE tablename = 'agent_tasks' AND indexname = $1
+                )",
+            )
+            .bind(old_name)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert!(!exists.0, "{old_name} must be dropped by v28");
+        }
+
+        sqlx::query("DROP INDEX IF EXISTS idx_agent_tasks_created_at_id")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP INDEX IF EXISTS idx_agent_tasks_status_created_at_id")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP INDEX IF EXISTS idx_agent_tasks_assignee_key_created_at_id")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP INDEX IF EXISTS idx_agent_tasks_status_assignee_key_created_at_id")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 28")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        db.migrate().await.unwrap();
+
+        let recorded: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 28")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded.0, 1, "v28 must be recorded as applied");
+        let exists: (bool,) = sqlx::query_as(
+            "SELECT EXISTS(
+                SELECT 1 FROM pg_indexes
+                WHERE tablename = 'agent_tasks'
+                  AND indexname = 'idx_agent_tasks_created_at_id'
+            )",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            exists.0,
+            "v28 must recreate the unfiltered keyset index on an upgrading node"
+        );
+
+        db.migrate().await.unwrap();
+    }
+
+    #[sqlx::test]
     async fn dequeue_stamps_attempted_at_on_every_row_it_hands_out(pool: sqlx::PgPool) {
         // The stamp is what stops a deferred row from holding the window, and
         // it happens here rather than at the deferral branches so no call site
@@ -5259,6 +5517,36 @@ mod dedup_db_tests {
             ts("2026-03-01T00:00:00Z"),
             "survivor inherits the group's MAX(updated_at)"
         );
+    }
+
+    #[sqlx::test]
+    async fn deduped_id_lookup_returns_only_requested_repo(pool: PgPool) {
+        let db = db(pool).await;
+        let requested = rec(
+            "requested",
+            "did:key:z6MkRequested",
+            "requested",
+            "requested",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        let unrelated = rec(
+            "unrelated",
+            "did:key:z6MkUnrelated",
+            "unrelated",
+            "unrelated",
+            "2026-01-02T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+        );
+        db.create_repo(&requested).await.unwrap();
+        db.create_repo(&unrelated).await.unwrap();
+
+        let out = db
+            .list_repos_deduped_by_ids(std::slice::from_ref(&requested.id))
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, requested.id);
     }
 
     /// A PRIVATE canonical repo and a PUBLIC mirror row for the same
@@ -5954,6 +6242,7 @@ mod dedup_db_tests {
             "z6Mkfoo",
             "did:gitlawb:z6Mkfoo",
             "did:web:example.com:alice",
+            "did:web:z6Mkfoo",
             "did:key:did:gitlawb:z6Mkfoo",
             "",
             "did:key:",
@@ -6000,6 +6289,7 @@ mod dedup_db_tests {
             "z6Mkfoo",
             "did:gitlawb:z6Mkfoo",
             "did:web:example.com:alice",
+            "did:web:z6Mkfoo",
             "did:key:did:gitlawb:z6Mkfoo",
             "",
             "did:key:",
@@ -6032,6 +6322,220 @@ mod dedup_db_tests {
                 "PROFILE_DID_CASE_SQL(\"{val}\") mismatch: Rust = \"{rust_result}\", SQL CASE = \"{sql_result}\""
             );
         }
+    }
+
+    /// Verify that `ASSIGNEE_DID_CASE_SQL` (which aliases `assignee_did`) also
+    /// agrees with Rust `normalize_owner_key` across the full boundary matrix.
+    #[sqlx::test]
+    async fn assignee_did_case_sql_matches_normalize_owner_key(pool: PgPool) {
+        let boundary_values = [
+            "did:key:z6Mkfoo",
+            "z6Mkfoo",
+            "did:gitlawb:z6Mkfoo",
+            "did:web:example.com:alice",
+            "did:web:z6Mkfoo",
+            "did:key:did:gitlawb:z6Mkfoo",
+            "",
+            "did:key:",
+            "DID:KEY:z6Mkfoo",
+        ];
+
+        let values_sql: String = boundary_values
+            .iter()
+            .map(|v| format!("('{}'::text)", v))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "WITH data(assignee_did) AS (VALUES {values_sql})
+             SELECT assignee_did, ({key}) AS normalized FROM data ORDER BY assignee_did",
+            key = super::ASSIGNEE_DID_CASE_SQL
+        );
+
+        let rows: Vec<(String, String)> = sqlx::query_as(&sql).fetch_all(&pool).await.unwrap();
+
+        assert_eq!(
+            rows.len(),
+            boundary_values.len(),
+            "every boundary value must produce a row"
+        );
+
+        for (val, sql_result) in &rows {
+            let rust_result = super::normalize_owner_key(val);
+            assert_eq!(
+                sql_result, rust_result,
+                "ASSIGNEE_DID_CASE_SQL(\"{val}\") mismatch: Rust = \"{rust_result}\", SQL CASE = \"{sql_result}\""
+            );
+        }
+    }
+}
+
+/// #327: the candidate ceiling must bound database work, not only the Rust
+/// loop. Each supported keyset domain has to continue in created_at/id order
+/// without sorting a growing match set before LIMIT.
+#[cfg(test)]
+mod list_tasks_keyset_plan_tests {
+    use super::{list_tasks_keyset_sql, Db};
+    use serde_json::Value;
+    use sqlx::PgPool;
+
+    const POPULATED_ROWS: i32 = 4000;
+    const BATCH: i64 = 50;
+
+    fn plan_walk(plan: &Value, visit: &mut impl FnMut(&Value)) {
+        visit(plan);
+        if let Some(children) = plan.get("Plans").and_then(Value::as_array) {
+            for child in children {
+                plan_walk(child, visit);
+            }
+        }
+    }
+
+    fn assert_keyset_plan(plan: &Value, domain: &str) {
+        let mut saw_sort = false;
+        let mut saw_limit = false;
+        let mut saw_index = false;
+        let mut saw_seqscan = false;
+        plan_walk(plan, &mut |node| {
+            let node_type = node.get("Node Type").and_then(Value::as_str).unwrap_or("");
+            match node_type {
+                "Sort" => saw_sort = true,
+                "Limit" => saw_limit = true,
+                "Seq Scan" => saw_seqscan = true,
+                other if other.contains("Index") => saw_index = true,
+                _ => {}
+            }
+        });
+        assert!(saw_limit, "{domain}: plan must keep LIMIT: {plan}");
+        assert!(
+            !saw_sort,
+            "{domain}: ORDER BY created_at DESC, id DESC must not sort a growing match set before LIMIT: {plan}"
+        );
+        assert!(
+            saw_index && !saw_seqscan,
+            "{domain}: the agent_tasks scan must be index-backed, not a seq scan: {plan}"
+        );
+    }
+
+    async fn seed_populated_tasks(pool: &PgPool) {
+        sqlx::query(
+            "INSERT INTO agent_tasks (
+                 id, kind, status, delegator_did, assignee_did, capability,
+                 payload, created_at, updated_at
+             )
+             SELECT
+                 'plan-' || g,
+                 'test',
+                 CASE WHEN g % 2 = 0 THEN 'pending' ELSE 'claimed' END,
+                 'did:key:zDelegator',
+                 CASE WHEN g % 3 = 0 THEN 'did:key:zAssigneeA' ELSE 'zAssigneeB' END,
+                 'cap',
+                 '{}',
+                 to_char(
+                     timestamptz '2020-01-01 00:00:00+00' + make_interval(secs => g),
+                     'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'
+                 ),
+                 to_char(
+                     timestamptz '2020-01-01 00:00:00+00' + make_interval(secs => g),
+                     'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'
+                 )
+             FROM generate_series(1, $1) AS g",
+        )
+        .bind(POPULATED_ROWS)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("ANALYZE agent_tasks")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn explain_domain(
+        pool: &PgPool,
+        has_status: bool,
+        has_assignee: bool,
+        has_after: bool,
+        status: Option<&str>,
+        assignee: Option<&str>,
+        after: Option<(&str, &str)>,
+    ) -> Value {
+        let sql = format!(
+            "EXPLAIN (FORMAT JSON) {}",
+            list_tasks_keyset_sql(has_status, has_assignee, has_after)
+        );
+        let mut q = sqlx::query_scalar::<_, Value>(&sql);
+        if let Some(status) = status {
+            q = q.bind(status);
+        }
+        if let Some(assignee) = assignee {
+            q = q.bind(assignee);
+        }
+        if let Some((created_at, id)) = after {
+            q = q.bind(created_at).bind(id);
+        }
+        let explained = q.bind(BATCH).fetch_one(pool).await.unwrap();
+        let root = match &explained {
+            Value::Array(arr) => arr.first().cloned(),
+            Value::String(s) => serde_json::from_str(s).ok(),
+            other => Some(other.clone()),
+        };
+        root.as_ref()
+            .and_then(|obj| obj.get("Plan"))
+            .cloned()
+            .expect("EXPLAIN (FORMAT JSON) returns [{\"Plan\": ...}]")
+    }
+
+    #[sqlx::test]
+    async fn keyset_plans_use_indexes_for_every_filter_domain(pool: PgPool) {
+        let db = Db::for_testing(pool.clone());
+        db.migrate().await.unwrap();
+        seed_populated_tasks(&pool).await;
+
+        let first = db.list_tasks_keyset(None, None, 1, None).await.unwrap();
+        let after = first
+            .first()
+            .map(|t| (t.created_at.as_str(), t.id.as_str()));
+
+        let domains = [
+            ("unfiltered", false, false, None, None),
+            ("status", true, false, Some("pending"), None),
+            ("assignee", false, true, None, Some("did:key:zAssigneeA")),
+            (
+                "status+assignee",
+                true,
+                true,
+                Some("pending"),
+                Some("zAssigneeB"),
+            ),
+        ];
+
+        for (name, has_status, has_assignee, status, assignee) in domains {
+            for (label, has_after, after) in
+                [("first-page", false, None), ("continuation", true, after)]
+            {
+                let domain = format!("{name}/{label}");
+                let plan = explain_domain(
+                    &pool,
+                    has_status,
+                    has_assignee,
+                    has_after,
+                    status,
+                    assignee,
+                    after,
+                )
+                .await;
+                assert_keyset_plan(&plan, &domain);
+            }
+        }
+
+        let page = db
+            .list_tasks_keyset(Some("pending"), Some("did:key:zAssigneeA"), BATCH, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.len() as i64, BATCH,
+            "populated pending+assignee stream must fill a batch so the plan is not a tiny one-row special case"
+        );
     }
 }
 

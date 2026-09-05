@@ -43,7 +43,6 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 use crate::http::NodeClient;
-use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
 pub struct McpArgs {
@@ -512,7 +511,8 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "status": { "type": "string", "description": "Filter by status: pending, claimed, completed, failed" },
                     "assignee_did": { "type": "string", "description": "Filter by assignee DID" },
-                    "limit": { "type": "integer", "description": "Max results (default: 50)", "default": 50 }
+                    "limit": { "type": "integer", "minimum": 1, "description": "Total results to return (default: 50). Must be positive; a non-positive limit is rejected rather than answered with an empty list. Values above the node's 200-row page cap are gathered by following continuation tokens.", "default": 50 },
+                    "cursor": { "type": "string", "description": "Resume from a previous call's next_cursor. Must be paired with the same status/assignee_did filter that produced it." }
                 }
             }
         },
@@ -636,7 +636,7 @@ async fn call_tool(
     node: &str,
     dir: Option<&std::path::Path>,
 ) -> Result<String> {
-    let keypair = load_keypair_from_dir(dir).ok();
+    let keypair = crate::identity::load_optional_keypair(dir)?;
     let client = NodeClient::new(node, keypair.clone());
 
     match name {
@@ -1060,16 +1060,27 @@ async fn call_tool(
 
         // ── Task tools ────────────────────────────────────────────────────
         "task_list" => {
-            let limit = args["limit"].as_i64().unwrap_or(50);
-            let mut path = format!("/api/v1/tasks?limit={limit}");
-            if let Some(s) = args.get("status").and_then(|v| v.as_str()) {
-                path.push_str(&format!("&status={}", urlencoding::encode(s)));
+            // Follows the node's opaque `next_cursor` so a limit above the
+            // 200-row server page cap returns what was asked for instead of a
+            // silently truncated page, and reports an explicit incomplete
+            // result when a guard or the node's scan ceiling stops it (#327).
+            let limit = match args.get("limit") {
+                None | Some(Value::Null) => 50,
+                Some(val) => val.as_i64().context("invalid limit: expected an integer")?,
+            };
+            let result = crate::task::fetch_tasks(
+                &client,
+                args.get("status").and_then(|v| v.as_str()),
+                args.get("assignee_did").and_then(|v| v.as_str()),
+                limit,
+                args.get("cursor").and_then(|v| v.as_str()),
+            )
+            .await?;
+            let mut out = result.to_json();
+            if let Some(warning) = result.truncation_warning() {
+                out["warning"] = Value::String(warning);
             }
-            if let Some(a) = args.get("assignee_did").and_then(|v| v.as_str()) {
-                path.push_str(&format!("&assignee_did={}", urlencoding::encode(a)));
-            }
-            let resp: Value = client.get(&path).await?.json().await?;
-            Ok(serde_json::to_string_pretty(&resp)?)
+            Ok(serde_json::to_string_pretty(&out)?)
         }
 
         "task_create" => {
@@ -1085,7 +1096,12 @@ async fn call_tool(
                 "deadline": args.get("deadline").and_then(|v| v.as_str()),
                 "delegator_did": delegator_did,
             }))?;
-            let resp: Value = client.post("/api/v1/tasks", &body).await?.json().await?;
+            let resp: Value = client
+                .post("/api/v1/tasks", &body)
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1097,6 +1113,7 @@ async fn call_tool(
             let resp: Value = client
                 .post(&format!("/api/v1/tasks/{id}/claim"), &body)
                 .await?
+                .error_for_status()?
                 .json()
                 .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
@@ -1113,6 +1130,7 @@ async fn call_tool(
             let resp: Value = client
                 .post(&format!("/api/v1/tasks/{id}/complete"), &body)
                 .await?
+                .error_for_status()?
                 .json()
                 .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
@@ -1590,7 +1608,7 @@ mod tests {
             )
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"tasks":[{"id":"t1","kind":"test","status":"pending"}]}"#)
+            .with_body(r#"{"tasks":[{"id":"t1","kind":"test","status":"pending"}],"has_more":false,"incomplete":false,"next_cursor":null}"#)
             .create_async()
             .await;
 
@@ -1604,6 +1622,275 @@ mod tests {
         .unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["tasks"][0]["id"], "t1");
+        assert_eq!(parsed["complete"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn test_task_list_via_mcp_uses_loaded_identity() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()),
+            )
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"tasks":[{"id":"t1"}],"has_more":false,"incomplete":false,"next_cursor":null}"#,
+            )
+            .create_async()
+            .await;
+
+        let result = call_tool("task_list", json!({}), &server.url(), Some(dir.path()))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["tasks"][0]["id"], "t1");
+        assert_eq!(parsed["complete"], json!(true));
+    }
+
+    /// #327 review: MCP `task_list` issued one request and exposed no
+    /// continuation, so a limit above the node's 200-row page cap returned a
+    /// silently truncated result the model had no way to detect. It now
+    /// follows cursors and, when a guard stops it, says so in the payload.
+    #[tokio::test]
+    async fn test_task_list_via_mcp_follows_cursors() {
+        let mut server = mockito::Server::new_async().await;
+        let first = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/tasks\?limit=200$".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"tasks":[{"id":"t1"}],"has_more":true,"incomplete":false,"next_cursor":"c1"}"#,
+            )
+            .create_async()
+            .await;
+        let second = server
+            .mock("GET", mockito::Matcher::Regex(r"cursor=c1".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[{"id":"t2"}],"has_more":false,"next_cursor":null}"#)
+            .create_async()
+            .await;
+
+        let result = call_tool("task_list", json!({"limit": 500}), &server.url(), None)
+            .await
+            .unwrap();
+        first.assert_async().await;
+        second.assert_async().await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["count"], 2);
+        assert_eq!(parsed["tasks"][1]["id"], "t2");
+        assert_eq!(parsed["complete"], json!(true));
+        assert!(parsed.get("warning").is_none());
+    }
+
+    /// A truncated MCP result must carry an explicit warning and a resume
+    /// cursor, so the model cannot read it as the whole answer.
+    #[tokio::test]
+    async fn test_task_list_via_mcp_flags_incomplete_results() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"tasks":[{"id":"t1"}],"has_more":true,"incomplete":true,"next_cursor":"resume-me"}"#,
+            )
+            .create_async()
+            .await;
+
+        let result = call_tool("task_list", json!({"limit": 1}), &server.url(), None)
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["complete"], json!(false));
+        assert_eq!(parsed["incomplete"], json!(true));
+        assert_eq!(parsed["next_cursor"], "resume-me");
+        assert!(
+            parsed["warning"]
+                .as_str()
+                .unwrap()
+                .contains("result incomplete"),
+            "{parsed}"
+        );
+    }
+
+    /// A legacy response without pagination metadata is reported as incomplete via MCP.
+    #[tokio::test]
+    async fn test_task_list_via_mcp_legacy_response_is_incomplete() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[{"id":"t1"}],"count":1}"#)
+            .create_async()
+            .await;
+
+        let result = call_tool("task_list", json!({"limit": 50}), &server.url(), None)
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["complete"], json!(false));
+        assert_eq!(parsed["incomplete"], json!(true));
+        assert!(parsed["next_cursor"].is_null());
+        assert!(
+            parsed["warning"]
+                .as_str()
+                .unwrap()
+                .contains("node does not support pagination metadata"),
+            "{parsed}"
+        );
+    }
+
+    /// A legacy response with limit > 200 stops after 1 page and does not claim completeness via MCP.
+    #[tokio::test]
+    async fn test_task_list_via_mcp_legacy_limit_above_page_cap() {
+        let mut server = mockito::Server::new_async().await;
+        let ids: Vec<String> = (0..200).map(|i| format!("t{i}")).collect();
+        let tasks_json: Vec<Value> = ids.iter().map(|id| json!({ "id": id })).collect();
+        let body = json!({ "tasks": tasks_json, "count": 200 }).to_string();
+
+        let m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/tasks\?limit=200$".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = call_tool("task_list", json!({"limit": 500}), &server.url(), None)
+            .await
+            .unwrap();
+        m.assert_async().await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["count"], 200);
+        assert_eq!(parsed["complete"], json!(false));
+        assert_eq!(parsed["incomplete"], json!(true));
+        assert!(parsed["next_cursor"].is_null());
+        assert!(
+            parsed["warning"]
+                .as_str()
+                .unwrap()
+                .contains("node does not support pagination metadata"),
+            "{parsed}"
+        );
+    }
+
+    /// A cursor the model passes back must reach the node.
+    #[tokio::test]
+    async fn test_task_list_via_mcp_forwards_cursor_argument() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"cursor=given-cursor".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[],"has_more":false,"incomplete":false,"next_cursor":null}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        call_tool(
+            "task_list",
+            json!({"cursor": "given-cursor"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .unwrap();
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_task_list_via_mcp_returns_http_errors() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()),
+            )
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"failed"}"#)
+            .create_async()
+            .await;
+
+        let err = call_tool("task_list", json!({}), &server.url(), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"));
+    }
+
+    /// Malformed server responses fail visibly in MCP.
+    #[tokio::test]
+    async fn test_task_list_via_mcp_malformed_response_errors() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":"not-an-array"}"#)
+            .create_async()
+            .await;
+
+        let err = call_tool("task_list", json!({}), &server.url(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("malformed") || err.to_string().contains("invalid JSON"),
+            "{err}"
+        );
+    }
+
+    /// #327 review: a model that sends `limit: 0` used to get an empty list
+    /// marked complete, which reads as "this node has no tasks". The shared
+    /// helper rejects it, so the model sees an invalid argument instead.
+    #[tokio::test]
+    async fn test_task_list_via_mcp_rejects_non_positive_limit() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[],"has_more":false,"incomplete":false,"next_cursor":null}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let err = call_tool("task_list", json!({"limit": 0}), &server.url(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("limit must be a positive"),
+            "{err}"
+        );
+        m.assert_async().await;
     }
 
     #[tokio::test]
@@ -2024,6 +2311,47 @@ mod tests {
         .await
         .expect_err("must error without an identity");
         assert!(err.to_string().contains("no identity found"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_task_list_invalid_limit_rejected() {
+        let server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        let err = call_tool(
+            "task_list",
+            json!({"limit": "50"}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .expect_err("string limit must be rejected");
+        assert!(
+            err.to_string()
+                .contains("invalid limit: expected an integer"),
+            "got: {err}"
+        );
+
+        let err_float = call_tool(
+            "task_list",
+            json!({"limit": 50.5}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .expect_err("float limit must be rejected");
+        assert!(
+            err_float
+                .to_string()
+                .contains("invalid limit: expected an integer"),
+            "got: {err_float}"
+        );
     }
 
     #[test]

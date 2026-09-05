@@ -60,6 +60,7 @@ pub(crate) fn graphql_app_err(e: crate::error::AppError) -> async_graphql::Error
         // Curated client-safe variants — `Display` is intentional API text.
         safe @ (crate::error::AppError::RepoNotFound(_)
         | crate::error::AppError::RepoExists(_)
+        | crate::error::AppError::Conflict(_)
         | crate::error::AppError::NotFound(_)
         | crate::error::AppError::Unauthorized(_)
         | crate::error::AppError::Forbidden(_)
@@ -76,15 +77,81 @@ pub(crate) fn graphql_app_err(e: crate::error::AppError) -> async_graphql::Error
     }
 }
 
+/// Classify a failed `claim_task` for GraphQL exactly as REST's claim handler
+/// classifies it: a lost race is a client-safe conflict, a real sqlx fault
+/// stays opaque. Lives here rather than at the three call sites so the
+/// classification cannot drift between transports (#327 review), and so
+/// `every_graphql_map_err_uses_opaque_helpers` can keep whitelisting by name.
+pub(crate) fn graphql_claim_conflict(e: anyhow::Error) -> async_graphql::Error {
+    graphql_app_err(crate::api::tasks::task_write_conflict(
+        e,
+        "task not claimable: not found or already claimed",
+    ))
+}
+
+/// The `finish_task` half of [`graphql_claim_conflict`], covering both
+/// `completeTask` and `failTask`.
+pub(crate) fn graphql_finish_conflict(e: anyhow::Error) -> async_graphql::Error {
+    graphql_app_err(crate::api::tasks::task_write_conflict(
+        e,
+        "task not found or not in claimed state",
+    ))
+}
+
+pub struct TaskReadBrakeExtension;
+
+impl async_graphql::extensions::ExtensionFactory for TaskReadBrakeExtension {
+    fn create(&self) -> Arc<dyn async_graphql::extensions::Extension> {
+        Arc::new(TaskReadBrakeExtensionImpl)
+    }
+}
+
+use async_graphql::async_trait::async_trait;
+
+struct TaskReadBrakeExtensionImpl;
+
+#[async_trait]
+impl async_graphql::extensions::Extension for TaskReadBrakeExtensionImpl {
+    async fn prepare_request(
+        &self,
+        ctx: &async_graphql::extensions::ExtensionContext<'_>,
+        mut request: async_graphql::Request,
+        next: async_graphql::extensions::NextPrepareRequest<'_>,
+    ) -> async_graphql::ServerResult<async_graphql::Request> {
+        if let Some(session_brake) = ctx
+            .session_data
+            .get(&std::any::TypeId::of::<crate::rate_limit::TaskReadBrake>())
+            .and_then(|d| d.downcast_ref::<crate::rate_limit::TaskReadBrake>())
+        {
+            request = request.data(crate::rate_limit::TaskReadBrake {
+                limiter: session_brake.limiter.clone(),
+                key: session_brake.key.clone(),
+                request_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            });
+        }
+        if let Some(did) = ctx
+            .session_data
+            .get(&std::any::TypeId::of::<crate::auth::AuthenticatedDid>())
+            .and_then(|d| d.downcast_ref::<crate::auth::AuthenticatedDid>())
+        {
+            request = request.data(did.clone());
+        }
+        next.run(ctx, request).await
+    }
+}
+
 pub fn build_schema(
     db: Arc<Db>,
     ref_update_tx: tokio::sync::broadcast::Sender<RefUpdateBroadcast>,
     task_event_tx: tokio::sync::broadcast::Sender<TaskEventBroadcast>,
+    task_cursor_key: crate::api::task_cursor::TaskCursorKey,
 ) -> GitlawbSchema {
     Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
         .data(db)
         .data(ref_update_tx)
         .data(task_event_tx)
+        .data(task_cursor_key)
+        .extension(TaskReadBrakeExtension)
         .finish()
 }
 
@@ -161,8 +228,10 @@ mod tests {
     }
 
     /// Every `.map_err(` in the GraphQL query/mutation resolvers must route
-    /// through the opaque helpers, or discard the error (`|_|`). Same source-
-    /// scrape pattern as `api::authz_guard` (#255 review).
+    /// through one of the curated helpers in this module, or discard the error
+    /// (`|_|`). Same source-scrape pattern as `api::authz_guard` (#255
+    /// review). The list is deliberately a whitelist of names rather than a
+    /// prefix match, so adding a new mapper is a decision a reviewer sees.
     #[test]
     fn every_graphql_map_err_uses_opaque_helpers() {
         for (file, src) in [
@@ -177,6 +246,8 @@ mod tests {
                 let after = code[idx + ".map_err(".len()..].trim_start();
                 let ok = after.starts_with("crate::graphql::graphql_db_err")
                     || after.starts_with("crate::graphql::graphql_app_err")
+                    || after.starts_with("crate::graphql::graphql_claim_conflict")
+                    || after.starts_with("crate::graphql::graphql_finish_conflict")
                     || after.starts_with("|_|")
                     || after.starts_with("|_ ");
                 assert!(
