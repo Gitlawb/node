@@ -4469,6 +4469,11 @@ esac\n";
         // objects, so a dangling blob or tag seeded pre-clone would
         // never arrive. `make_blob` writes straight into the bare
         // object store, which is exactly the dangling shape.
+        // Annotated tags need a committer identity, and the bare
+        // clone carries no config (CI has no global git identity),
+        // so configure it here like the workdir above.
+        run(&["config", "user.email", "t@t"], &bare);
+        run(&["config", "user.name", "t"], &bare);
         let dangling = make_blob(&bare, b"dangling, referenced by nothing\n");
         // An annotated tag of a blob: exercises the peel arm and the
         // tag-object collection.
