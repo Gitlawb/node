@@ -1,5 +1,5 @@
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Upper bound on `git_service_timeout_secs`, `ipfs_request_budget_secs`, and
 /// `ipfs_resolve_budget_secs`, in seconds (100 years).
@@ -119,6 +119,18 @@ pub struct Config {
     /// libp2p QUIC/UDP port (0 = disabled)
     #[arg(long, env = "GITLAWB_P2P_PORT", default_value_t = 7546)]
     pub p2p_port: u16,
+
+    /// Path to the persistent libp2p identity key. A value that cannot name a
+    /// securable key file (a bare filename, `..` traversal, a trailing
+    /// separator, the filesystem root, or a `~/` path that escapes home) is
+    /// refused before the node binds. A problem with the storage itself leaves
+    /// p2p off while HTTP keeps serving, logged as p2p_identity_key_load_failed.
+    /// With a relative path the node verifies the working directory (ownership
+    /// and write permissions) before using it. A 0755 key directory is tightened
+    /// on start; rotate the key only if the directory was group/world-writable
+    /// or the key was group/world-readable.
+    #[arg(long, env = "GITLAWB_P2P_KEY", default_value = "~/.gitlawb/p2p.key")]
+    pub p2p_key_path: String,
 
     /// libp2p bootstrap multiaddrs (comma-separated)
     /// Example: /ip4/1.2.3.4/udp/7546/quic-v1/p2p/12D3KooW...
@@ -712,11 +724,27 @@ impl Config {
     /// Resolve ~ in key_path
     pub fn resolved_key_path(&self) -> PathBuf {
         if self.key_path.starts_with("~/") {
-            if let Some(home) = dirs_next::home_dir() {
-                return home.join(&self.key_path[2..]);
+            let suffix = &self.key_path[2..];
+            if !crate::p2p::tilde_suffix_escapes_home(suffix) {
+                if let Some(home) = dirs_next::home_dir() {
+                    return home.join(suffix);
+                }
             }
         }
         PathBuf::from(&self.key_path)
+    }
+
+    /// Resolve ~ in p2p_key_path
+    pub fn resolved_p2p_key_path(&self) -> PathBuf {
+        if self.p2p_key_path.starts_with("~/") {
+            let suffix = &self.p2p_key_path[2..];
+            if !crate::p2p::tilde_suffix_escapes_home(suffix) {
+                if let Some(home) = dirs_next::home_dir() {
+                    return home.join(suffix);
+                }
+            }
+        }
+        PathBuf::from(&self.p2p_key_path)
     }
 
     /// DB connections reserved for everything other than held write-locks: auth
@@ -746,6 +774,98 @@ impl Config {
                 floor
             ));
         }
+
+        // Identity is always loaded, so a directory-valued or escaping spelling
+        // is boot-fatal here. Bare `identity.pem` stays legal; the p2p "must
+        // include a dedicated directory" rule is not imported.
+        if self.key_path.starts_with("~/") {
+            let suffix = &self.key_path[2..];
+            if crate::p2p::tilde_suffix_escapes_home(suffix) {
+                return Err(format!(
+                    "GITLAWB_KEY ({}) must stay inside the home directory after `~/` \
+                     expansion; rooted suffixes such as `~//etc/identity.pem`, drive-prefixed \
+                     suffixes, and `..` traversal are refused",
+                    self.key_path
+                ));
+            }
+        }
+        let identity_key_path = self.resolved_key_path();
+        if self.key_path.starts_with("~/") && identity_key_path == Path::new(&self.key_path) {
+            return Err(format!(
+                "GITLAWB_KEY ({}) starts with `~/` but no home directory could be resolved, \
+                 so it would name a literal `~` directory relative to the working directory. \
+                 Set an absolute path such as /data/keys/identity.pem.",
+                self.key_path
+            ));
+        }
+        if crate::p2p::path_denotes_a_directory(&identity_key_path, Some(&self.key_path))
+            || identity_key_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "GITLAWB_KEY ({}) must name a key file, not a directory; a trailing separator, \
+                 a final `.` or `..` component, and `..` traversal are refused so the path \
+                 cannot retarget a parent",
+                self.key_path
+            ));
+        }
+
+        // P2P is optional: an HTTP-only node with GITLAWB_P2P_PORT=0 never loads
+        // or creates this key, so refusing startup on an unused path would be a
+        // silent outage with no security benefit.
+        if self.p2p_port > 0 {
+            // A p2p key path naming no directory puts the node's private key in
+            // whatever directory the process was started from. The node cannot
+            // protect that: `ensure_key_dir` would have to chmod a directory the
+            // operator never nominated as a key directory, and a directory it
+            // cannot secure is one where any local user with write access can
+            // replace the key and choose the node's libp2p identity. Refuse it here,
+            // where the denial actually stops the process, rather than in the p2p
+            // start path, where main.rs logs the error and keeps serving with a
+            // green /health.
+            //
+            // Decided lexically on the resolved path: `canonicalize` would fail on a
+            // parent that does not exist yet (the shipped `~/.gitlawb` default, and
+            // every container's first boot), and comparing against the process
+            // working directory would reject `/data/p2p.key` under the image's
+            // WORKDIR, an absolute directory the operator did name.
+            // `resolved_p2p_key_path` expands a leading `~/` only when a home
+            // directory is resolvable, and otherwise hands back the literal string.
+            // That would leave the shipped default naming a directory called `~`
+            // relative to wherever the process started, which is a real directory
+            // the node would create and chmod, and whose location moves with the
+            // working directory. It passes the check below because `~` is an
+            // ordinary path component, so it has to be caught separately.
+            if self.p2p_key_path.starts_with("~/") {
+                let suffix = &self.p2p_key_path[2..];
+                if crate::p2p::tilde_suffix_escapes_home(suffix) {
+                    return Err(format!(
+                        "GITLAWB_P2P_KEY ({}) must stay inside the home directory after `~/` \
+                         expansion; rooted suffixes such as `~//etc/p2p.key`, drive-prefixed \
+                         suffixes, and `..` traversal are refused",
+                        self.p2p_key_path
+                    ));
+                }
+            }
+            let p2p_key_path = self.resolved_p2p_key_path();
+            if self.p2p_key_path.starts_with("~/") && p2p_key_path == Path::new(&self.p2p_key_path)
+            {
+                return Err(format!(
+                    "GITLAWB_P2P_KEY ({}) starts with `~/` but no home directory could be resolved, \
+                     so it would name a literal `~` directory relative to the working directory. \
+                     Set an absolute path such as /data/keys/p2p.key.",
+                    self.p2p_key_path
+                ));
+            }
+            // Lexical only: this runs before the listener binds and its
+            // failure stops the node, so it must not decide anything about
+            // live filesystem objects. Storage faults belong to the load path,
+            // which degrades instead of exiting.
+            let _ = crate::p2p::validate_p2p_key_config(&p2p_key_path, Some(&self.p2p_key_path))
+                .map_err(|e| e.to_string())?;
+        }
+
         Ok(())
     }
 }
@@ -1446,5 +1566,520 @@ mod tests {
         assert!(
             Config::parse_from(["gitlawb-node", "--enforce-owner-push", "true"]).enforce_owner_push
         );
+    }
+
+    fn config_with_p2p_key(path: &str) -> Config {
+        Config::parse_from(["gitlawb-node", "--p2p-key-path", path])
+    }
+
+    fn config_with_key(path: &str) -> Config {
+        Config::parse_from(["gitlawb-node", "--key-path", path])
+    }
+
+    fn config_with_p2p_port_and_key(port: u16, path: &str) -> Config {
+        Config::parse_from([
+            "gitlawb-node",
+            "--p2p-port",
+            &port.to_string(),
+            "--p2p-key-path",
+            path,
+        ])
+    }
+
+    /// The configuration half of the key-storage contract matrix: enabled
+    /// versus disabled p2p, crossed with the path spellings the contract
+    /// rules on. The filesystem-object half (which objects at and around the
+    /// key path boot or are refused) lives in `p2p::tests::
+    /// p2p_key_storage_contract_matrix`; nothing there runs unless this gate
+    /// lets a config through.
+    ///
+    /// Rule 1 is proven through its own rejections: every disabled row uses a
+    /// path that an enabled row shows to be invalid, so `Ok` on the disabled
+    /// row is direct evidence the validator never resolved or inspected the
+    /// unused key storage.
+    #[test]
+    fn p2p_key_storage_contract_config_matrix() {
+        enum Expect {
+            Accepted,
+            Rejected(&'static str),
+        }
+
+        struct Row {
+            port: u16,
+            path: &'static str,
+            expect: Expect,
+            /// Skip when no home directory resolves: the row's outcome is
+            /// about `~/` expansion, which then legitimately fails earlier
+            /// with the no-home error instead.
+            needs_home: bool,
+        }
+
+        let rows = [
+            // Rule 1: disabled p2p leaves its unused key storage alone.
+            Row {
+                port: 0,
+                path: "p2p.key",
+                expect: Expect::Accepted,
+                needs_home: false,
+            },
+            Row {
+                port: 0,
+                path: "~/",
+                expect: Expect::Accepted,
+                needs_home: false,
+            },
+            Row {
+                port: 0,
+                path: "~//etc/p2p.key",
+                expect: Expect::Accepted,
+                needs_home: false,
+            },
+            Row {
+                port: 0,
+                path: "~/../etc/p2p.key",
+                expect: Expect::Accepted,
+                needs_home: false,
+            },
+            Row {
+                port: 0,
+                path: "",
+                expect: Expect::Accepted,
+                needs_home: false,
+            },
+            // Enabled: ordinary absolute and home-relative paths pass, a
+            // doubled separator in an absolute path is harmless (it does not
+            // re-root anything), and the shipped default resolves beneath
+            // home (asserted separately below).
+            Row {
+                port: 7546,
+                path: "/data/keys/p2p.key",
+                expect: Expect::Accepted,
+                needs_home: false,
+            },
+            Row {
+                port: 7546,
+                path: "/data//keys/p2p.key",
+                expect: Expect::Accepted,
+                needs_home: false,
+            },
+            Row {
+                port: 7546,
+                path: "~/.gitlawb/p2p.key",
+                expect: Expect::Accepted,
+                needs_home: true,
+            },
+            // Rule 2: a `~/` suffix that would re-root or walk out of home is
+            // refused at parse time, before any join. These fire whether or
+            // not a home directory resolves, because the suffix is judged
+            // before expansion.
+            Row {
+                port: 7546,
+                path: "~//etc/p2p.key",
+                expect: Expect::Rejected("inside the home directory"),
+                needs_home: false,
+            },
+            Row {
+                port: 7546,
+                path: "~/../etc/p2p.key",
+                expect: Expect::Rejected("inside the home directory"),
+                needs_home: false,
+            },
+            // Rule 3's lexical pre-checks, still gated on the port.
+            Row {
+                port: 7546,
+                path: "p2p.key",
+                expect: Expect::Rejected("directory"),
+                needs_home: false,
+            },
+            Row {
+                port: 7546,
+                path: "~/",
+                expect: Expect::Rejected("must name a key file"),
+                needs_home: true,
+            },
+            Row {
+                port: 7546,
+                path: "/data/keys/.",
+                expect: Expect::Rejected("must name a key file"),
+                needs_home: false,
+            },
+            Row {
+                port: 7546,
+                path: "/data/keys/./.",
+                expect: Expect::Rejected("must name a key file"),
+                needs_home: false,
+            },
+            Row {
+                port: 7546,
+                path: "~/.gitlawb/.",
+                expect: Expect::Rejected("must name a key file"),
+                needs_home: true,
+            },
+        ];
+
+        let have_home = dirs_next::home_dir().is_some();
+        for row in rows {
+            if row.needs_home && !have_home {
+                continue;
+            }
+            let result = config_with_p2p_port_and_key(row.port, row.path).validate();
+            match row.expect {
+                Expect::Accepted => assert!(
+                    result.is_ok(),
+                    "[port={} path={:?}] must be accepted, got: {result:?}",
+                    row.port,
+                    row.path
+                ),
+                Expect::Rejected(needle) => {
+                    let err = result.expect_err(&format!(
+                        "[port={} path={:?}] must be rejected",
+                        row.port, row.path
+                    ));
+                    assert!(
+                        err.contains(needle),
+                        "[port={} path={:?}] rejection must mention {needle:?}, got: {err}",
+                        row.port,
+                        row.path
+                    );
+                }
+            }
+        }
+    }
+
+    /// Rule 1's absence-of-IO half against a real on-disk trap: a disabled
+    /// node pointed at a key path whose parent is a symlink — a shape the
+    /// enabled path refuses and must never chmod — validates clean and leaves
+    /// the trap directory exactly as it was.
+    #[cfg(unix)]
+    #[test]
+    fn p2p_disabled_key_storage_is_never_inspected_or_mutated() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("real");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = base.path().join("keys");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let key_path = link.join("p2p.key");
+
+        let config = Config::parse_from([
+            "gitlawb-node",
+            "--p2p-port",
+            "0",
+            "--p2p-key-path",
+            key_path.to_str().unwrap(),
+        ]);
+        assert!(
+            config.validate().is_ok(),
+            "a disabled node must not validate the unused key path"
+        );
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "the symlink target's mode must stay unchanged");
+        assert_eq!(
+            std::fs::read_dir(&target).unwrap().count(),
+            0,
+            "nothing may be created behind the symlink"
+        );
+    }
+
+    /// The other half of the scoping pair: p2p ENABLED, hostile resource on
+    /// disk, and `validate` still passes.
+    ///
+    /// This is the finding-2 boundary. A symlinked parent, a regular file
+    /// where the key directory should be, and an unreadable parent are live
+    /// storage facts, not properties of the configured value, so they belong
+    /// to the load path, which degrades. Deciding them here made the node exit
+    /// before binding for exactly the cases README and `.env.example` promise
+    /// leave HTTP up. Each row also proves validate touched nothing: an
+    /// inspection is still an observation, and the port-zero test above is the
+    /// disabled half of the same pair.
+    #[cfg(unix)]
+    #[test]
+    fn enabled_p2p_does_not_treat_live_storage_faults_as_configuration_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn snapshot(root: &std::path::Path) -> Vec<String> {
+            let mut out = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(root) {
+                for e in entries.flatten() {
+                    let md = std::fs::symlink_metadata(e.path()).unwrap();
+                    out.push(format!(
+                        "{} dir={} link={} mode={:04o}",
+                        e.path().display(),
+                        md.is_dir(),
+                        md.is_symlink(),
+                        md.permissions().mode() & 0o7777
+                    ));
+                }
+            }
+            out.sort();
+            out
+        }
+
+        /// Builds a trap under `base` and returns the key path inside it.
+        type BuildTrap = Box<dyn Fn(&std::path::Path) -> std::path::PathBuf>;
+
+        // (label, build the trap, the key path inside it)
+        let cases: Vec<(&str, BuildTrap)> = vec![
+            (
+                "symlinked parent",
+                Box::new(|base: &std::path::Path| {
+                    let target = base.join("real");
+                    std::fs::create_dir(&target).unwrap();
+                    let link = base.join("keys");
+                    std::os::unix::fs::symlink(&target, &link).unwrap();
+                    link.join("p2p.key")
+                }),
+            ),
+            (
+                "regular file as the key directory",
+                Box::new(|base: &std::path::Path| {
+                    let file = base.join("keys");
+                    std::fs::write(&file, b"not a directory").unwrap();
+                    file.join("p2p.key")
+                }),
+            ),
+            (
+                "unreadable parent",
+                Box::new(|base: &std::path::Path| {
+                    let locked = base.join("locked");
+                    std::fs::create_dir(&locked).unwrap();
+                    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+                        .unwrap();
+                    locked.join("keys").join("p2p.key")
+                }),
+            ),
+        ];
+
+        for (label, build) in cases {
+            let base = tempfile::tempdir().unwrap();
+            let key_path = build(base.path());
+            let before = snapshot(base.path());
+
+            let config = Config::parse_from([
+                "gitlawb-node",
+                "--p2p-port",
+                "7546",
+                "--p2p-key-path",
+                key_path.to_str().unwrap(),
+            ]);
+            let verdict = config.validate();
+            assert!(
+                verdict.is_ok(),
+                "{label}: a live storage fault is not a configuration error, got: {verdict:?}"
+            );
+            assert_eq!(
+                snapshot(base.path()),
+                before,
+                "{label}: validation must not mutate the key tree"
+            );
+
+            // Leave the tempdir removable.
+            let locked = base.path().join("locked");
+            if locked.exists() {
+                let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+
+    /// Rule 2's positive direction: the shipped `~/` default resolves to a
+    /// path beneath the selected home, and suffixes that would escape are
+    /// left unexpanded (and then rejected by `validate`, as the matrix above
+    /// asserts) rather than joined and repaired after.
+    #[test]
+    fn p2p_tilde_expansion_stays_beneath_home() {
+        let Some(home) = dirs_next::home_dir() else {
+            return;
+        };
+
+        let resolved = config_with_p2p_key("~/.gitlawb/p2p.key").resolved_p2p_key_path();
+        assert!(
+            resolved.starts_with(&home),
+            "the resolved default must stay beneath home"
+        );
+        assert!(
+            resolved.ends_with(".gitlawb/p2p.key"),
+            "the resolved default must keep the configured suffix"
+        );
+
+        for path in ["~//etc/p2p.key", "~/../etc/p2p.key"] {
+            assert_eq!(
+                config_with_p2p_key(path).resolved_p2p_key_path(),
+                Path::new(path),
+                "an escaping suffix must never be joined onto home"
+            );
+        }
+    }
+
+    /// A p2p key path that names no directory component would put the node's
+    /// private key in whatever directory the process happens to be started from,
+    /// which `ensure_key_dir` cannot protect without tightening a directory the
+    /// operator never nominated. Reject it at boot instead.
+    #[test]
+    fn p2p_key_path_without_a_directory_component_is_rejected() {
+        for path in [
+            // No directory component at all.
+            "p2p.key",
+            "./p2p.key",
+            "././p2p.key",
+            "p2p.key/",
+            "",
+            // Looks like it names a directory and does not: each of these
+            // resolves back to the working directory or above it, so accepting
+            // them would defeat the check and chmod an unnominated directory.
+            "a/../p2p.key",
+            "./keys/../p2p.key",
+            "../p2p.key",
+            // Absolute too: the lexical parent is what gets chmodded, so these
+            // would tighten /data and / rather than the named directory.
+            "/data/keys/../p2p.key",
+            "/data/../p2p.key",
+        ] {
+            let err = config_with_p2p_key(path)
+                .validate()
+                .expect_err(&format!("{path:?} names no directory and must be rejected"));
+            assert!(
+                err.contains("directory"),
+                "{path:?} must be rejected for naming no directory, got: {err}"
+            );
+        }
+    }
+
+    /// The mirror of the above, and the case that stops the predicate widening
+    /// into "reject every relative path". The shipped default is included on
+    /// purpose: a predicate that rejects it is a boot failure for every node.
+    #[test]
+    fn p2p_key_path_naming_a_directory_is_accepted() {
+        for path in [
+            "keys/p2p.key",
+            "./keys/p2p.key",
+            "/data/keys/p2p.key",
+            "/data/p2p.key",
+            "~/.gitlawb/p2p.key",
+        ] {
+            assert!(
+                config_with_p2p_key(path).validate().is_ok(),
+                "{path:?} names a directory and must be accepted"
+            );
+        }
+
+        Config::parse_from(["gitlawb-node"])
+            .validate()
+            .expect("the shipped default p2p key path must validate");
+    }
+
+    /// `~/` expands to the home directory itself, which is a directory rather
+    /// than a key file, so it must be rejected before its parent is chmodded.
+    #[test]
+    fn p2p_key_path_is_checked_after_tilde_expansion() {
+        if dirs_next::home_dir().is_none() {
+            panic!("this test needs a home directory to distinguish raw from resolved");
+        }
+        let err = config_with_p2p_key("~/")
+            .validate()
+            .expect_err("`~/` must name a key file, not a directory");
+        assert!(
+            err.contains("must name a key file"),
+            "`~/` must be rejected before chmodding its parent, got: {err}"
+        );
+    }
+
+    #[test]
+    fn p2p_key_path_trailing_directory_separator_is_rejected() {
+        let err = config_with_p2p_key("/data/keys/")
+            .validate()
+            .expect_err("a trailing directory separator must be rejected");
+        assert!(
+            err.contains("must name a key file"),
+            "trailing `/` must be rejected before chmod, got: {err}"
+        );
+    }
+
+    /// A terminal `.` is a directory-valued spelling. Rust's Path drops it, so
+    /// `/data/keys/.` would otherwise be stored as the file `keys` under `/data`.
+    #[test]
+    fn p2p_key_path_terminal_dot_is_rejected() {
+        for path in ["/data/keys/.", "/data/keys/./.", "/data/keys/.//."] {
+            let err = config_with_p2p_key(path)
+                .validate()
+                .expect_err("a terminal `.` must be rejected as a directory");
+            assert!(
+                err.contains("must name a key file"),
+                "{path:?} must be refused before Path can retarget it, got: {err}"
+            );
+        }
+    }
+
+    /// Identity allows a bare filename; it does not allow a directory spelling
+    /// that Path would retarget onto a parent.
+    #[test]
+    fn identity_key_path_terminal_dot_is_rejected() {
+        for path in ["/data/keys/.", "/data/keys/./.", "/data/keys/.//."] {
+            let err = config_with_key(path)
+                .validate()
+                .expect_err("a terminal `.` must be rejected as a directory");
+            assert!(
+                err.contains("GITLAWB_KEY") && err.contains("must name a key file"),
+                "{path:?} must be refused before Path can retarget it, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_key_path_trailing_directory_separator_is_rejected() {
+        let err = config_with_key("/data/keys/")
+            .validate()
+            .expect_err("a trailing directory separator must be rejected");
+        assert!(
+            err.contains("must name a key file"),
+            "trailing `/` must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_key_path_tilde_directory_is_rejected() {
+        let err = config_with_key("~/")
+            .validate()
+            .expect_err("`~/` must name a key file, not a directory");
+        assert!(
+            err.contains("must name a key file"),
+            "`~/` must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_key_path_tilde_escape_is_rejected() {
+        let err = config_with_key("~//etc/identity.pem")
+            .validate()
+            .expect_err("a `~/` spelling that escapes home must be rejected");
+        assert!(
+            err.contains("must stay inside the home directory"),
+            "tilde escape must be refused, got: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_key_path_parent_dir_component_is_rejected() {
+        let err = config_with_key("/data/keys/../identity.pem")
+            .validate()
+            .expect_err("`..` in an identity path must be rejected");
+        assert!(
+            err.contains("..") || err.contains("must name a key file"),
+            "`..` must be refused so the parent cannot retarget, got: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_key_path_bare_filename_is_accepted() {
+        for path in ["identity.pem", "./identity.pem", "/identity.pem"] {
+            config_with_key(path)
+                .validate()
+                .unwrap_or_else(|e| panic!("{path:?} is a legal identity path, got: {e}"));
+        }
+        Config::parse_from(["gitlawb-node"])
+            .validate()
+            .expect("the shipped default identity path must validate");
     }
 }

@@ -391,6 +391,7 @@ Important node settings:
 | `GITLAWB_P2P_PORT` | libp2p QUIC/UDP port. Use `0` to disable. |
 | `GITLAWB_BOOTSTRAP_PEERS` | Comma-separated HTTP peer URLs. |
 | `GITLAWB_P2P_BOOTSTRAP` | Comma-separated libp2p multiaddrs. |
+| `GITLAWB_P2P_KEY` | Path to the node's persistent libp2p identity key file, which fixes the PeerId across restarts. Must name a key file inside a directory, such as `/data/keys/p2p.key` or `./keys/p2p.key`. Two kinds of problem are handled differently. A value that cannot name a securable key file at all (a bare filename, `..` traversal, a trailing `/`, the filesystem root, or a `~/` path that escapes home) is refused before the node binds, so the process exits. Anything wrong with the storage itself (a symlinked or non-directory parent, an unsafe ancestor or working directory, an unreadable or malformed key) leaves p2p off while HTTP keeps serving; the node logs it at error level as `p2p_identity_key_load_failed` and sets the `gitlawb_p2p_identity_key_load_failed` metric to 1. Note that `/health` still reports healthy in that state, so alert on the log event or the metric rather than on the health check. Correcting the storage and restarting restores the same PeerId. On Unix a new key is created `0600` inside a `0700` directory. A key directory that grants access beyond its owner is tightened to `0700` on start; one that is closed too far is refused with a `chmod 700` remedy rather than widened, since a directory locked down on purpose is an operator decision. Rotate the key only when the node logs that the directory was group- or world-writable (or the key file itself was group- or world-readable). An ordinary `0755` directory is tightened too, but others could not read a `0600` key or replace its directory entry. An existing key file is never modified: one with group or other bits set is rejected (`chmod 600`), and so is one this node cannot read. On other platforms no permissions are enforced. Default `~/.gitlawb/p2p.key`; point it at a persistent volume when running in a container. |
 | `GITLAWB_BOOTSTRAP_DISABLE_SEEDS` | Disable embedded seed peers for isolated dev/test networks. |
 | `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` | Require signed peer announce/sync writes. Defaults to `false` during the staged rollout below. |
 | `GITLAWB_ENFORCE_OWNER_PUSH` | Require the authenticated pusher to be the repo owner on `git-receive-pack`. **Defaults to `true`.** A `did:key` signature is authentication, not authorization — anyone can mint a key and sign — so with this off every signed caller may push to every repository, private ones included. Delegated and CI keys count as non-owners: a UCAN `git/push` capability is verified but not yet honored for authorization, so they cannot push while this is on. Set `false` only for a rolling upgrade; see [`docs/RUN-A-NODE.md`](docs/RUN-A-NODE.md). |
@@ -419,6 +420,28 @@ Important node settings:
 Production note: change the default Postgres password before exposing a node publicly.
 
 Legacy-pin window: releases before the CID-resolver work stored the provider CID (Kubo dag-pb / Pinata) as a pinned object's resolver key. The `/ipfs/{cid}` resolver now recomputes the raw-content CID from the object bytes and refuses to serve a key that does not match, so `GET /api/v1/ipfs/pins` can still advertise an unrepaired legacy CID that 404s. Such a row is repaired opportunistically the next time a push carries the object again (its key is rewritten to the raw CID, the old value kept in `legacy_provider_cid`), but git negotiation omits objects the node already has, so most legacy rows never re-enter a push delta. A deferred one-shot startup sweep, not this opportunistic path, is what fully retires the advertise-then-404 window. Rows whose object bytes are gone stay withheld.
+
+### Upgrading: the PeerId rotates once
+
+This node's libp2p identity is now a keypair generated on first start and kept
+at `GITLAWB_P2P_KEY`, rather than one derived from the node DID. Every node
+therefore gets a new PeerId once, on the first start after upgrading, and keeps
+it from then on as long as that key file survives (put it on a persistent volume
+in a container).
+
+Two things to check before upgrading:
+
+- Any `GITLAWB_P2P_BOOTSTRAP` multiaddr that pins a peer's old PeerId with a
+  `/p2p/<PeerId>` suffix stops matching once that peer upgrades. Update the
+  suffix, or drop it and let identify supply the current one. Addresses without
+  the suffix keep working untouched.
+- `GITLAWB_P2P_KEY` must name a key file inside a directory, such as
+  `/data/keys/p2p.key` or `./keys/p2p.key`. A bare filename is refused at
+  startup, since the node will not keep its identity key in the working
+  directory.
+
+Peers found over `GITLAWB_BOOTSTRAP_PEERS` and the embedded seed list are
+unaffected, since those are HTTP URLs and carry no PeerId.
 
 ---
 

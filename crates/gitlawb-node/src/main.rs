@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use gitlawb_core::http_sig::sign_request;
 use gitlawb_core::identity::Keypair;
@@ -187,6 +187,43 @@ async fn main() -> Result<()> {
         shutdown_tx.subscribe(),
     ));
 
+    // Resolve the p2p identity BEFORE the database connect, both arms of the
+    // port gate together.
+    //
+    // The key load is pure filesystem work with no database dependency, and
+    // its failure is deliberately non-fatal. Leaving it behind the DB connect
+    // meant the "HTTP up, p2p off" outcome and the port-zero no-IO guarantee
+    // were both unobservable whenever the database was unreachable, because
+    // `connect_db_with_retry` retries indefinitely and never falls through.
+    // Moving only the load would have left the disabled arm stranded, so the
+    // whole gate moves and just `p2p::start` stays behind the database.
+    let p2p_local_key = if config.p2p_port > 0 {
+        match p2p::load_or_create_p2p_keypair(&config.resolved_p2p_key_path()) {
+            Ok(local_key) => {
+                metrics::set_p2p_key_load_failed(false);
+                Some(local_key)
+            }
+            // Non-fatal by policy, and the cost is named rather than hidden:
+            // the node keeps serving HTTP with a green /health while it is off
+            // the p2p network entirely. Logged at error with a stable event
+            // name and mirrored into a metric, so the outage is alertable
+            // without reading startup logs by hand.
+            Err(e) => {
+                error!(
+                    err = %format!("{e:#}"),
+                    event = "p2p_identity_key_load_failed",
+                    "failed to load p2p identity key, continuing without p2p"
+                );
+                metrics::set_p2p_key_load_failed(true);
+                None
+            }
+        }
+    } else {
+        info!("p2p disabled (p2p_port = 0)");
+        metrics::set_p2p_key_load_failed(false);
+        None
+    };
+
     // Connect to PostgreSQL database. A transient outage or bad secret should
     // not crash-loop the process and hammer the database provider; permanent
     // misconfiguration surfaces through error-level logs and the /ready check.
@@ -250,36 +287,37 @@ async fn main() -> Result<()> {
     // Ensure repos directory exists
     std::fs::create_dir_all(&config.repos_dir).context("failed to create repos directory")?;
 
-    // Start libp2p swarm (if p2p_port > 0)
-    let p2p_handle = if config.p2p_port > 0 {
-        let bootstrap_addrs = config
-            .p2p_bootstrap
-            .iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        let shutdown_rx = shutdown_tx.subscribe();
-        match p2p::start(
-            &node_did.to_string(),
-            config.p2p_port,
-            bootstrap_addrs,
-            Arc::clone(&db),
-            config.auto_sync,
-            shutdown_rx,
-        )
-        .await
-        {
-            Ok(handle) => {
-                info!(port = config.p2p_port, peer_id = %handle.local_peer_id, "libp2p swarm started");
-                Some(Arc::new(handle))
-            }
-            Err(e) => {
-                tracing::warn!(err = %e, "failed to start libp2p swarm — continuing without p2p");
-                None
+    // The identity was resolved before the database connect; this is only the
+    // swarm start, which genuinely needs the database handle.
+    let p2p_handle = match p2p_local_key {
+        Some(local_key) => {
+            let bootstrap_addrs = config
+                .p2p_bootstrap
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            let shutdown_rx = shutdown_tx.subscribe();
+            match p2p::start(
+                local_key,
+                config.p2p_port,
+                bootstrap_addrs,
+                Arc::clone(&db),
+                config.auto_sync,
+                shutdown_rx,
+            )
+            .await
+            {
+                Ok(handle) => {
+                    info!(port = config.p2p_port, peer_id = %handle.local_peer_id, "libp2p swarm started");
+                    Some(Arc::new(handle))
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "failed to start libp2p swarm — continuing without p2p");
+                    None
+                }
             }
         }
-    } else {
-        info!("p2p disabled (p2p_port = 0)");
-        None
+        None => None,
     };
 
     // Shared no-redirect HTTP client. See build_http_client for the SSRF rationale.
@@ -1361,36 +1399,66 @@ async fn ping_peer_readiness_with_timeout(
 }
 
 fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
-    let key_path = config.resolved_key_path();
+    load_or_create_keypair_at(&config.resolved_key_path())
+}
 
+/// The node identity key's load-or-create, taken by path so the storage
+/// contract can be tested without building a whole `Config`.
+fn load_or_create_keypair_at(key_path: &std::path::Path) -> Result<Keypair> {
+    if p2p::path_denotes_a_directory(key_path, None)
+        || key_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        anyhow::bail!(
+            "GITLAWB_KEY ({}) must name a key file, not a directory; a trailing separator, \
+             a final `.` or `..` component, and `..` traversal are refused so the path \
+             cannot retarget a parent",
+            key_path.display()
+        );
+    }
+
+    #[cfg(unix)]
+    if let Some(pem) = p2p::load_identity_pem_if_present(key_path)? {
+        let kp = Keypair::from_pem(&pem).map_err(|e| anyhow::anyhow!("invalid PEM key: {e}"))?;
+        info!(path = %key_path.display(), "loaded existing identity");
+        return Ok(kp);
+    }
+
+    #[cfg(not(unix))]
     if key_path.exists() {
-        let pem = std::fs::read_to_string(&key_path)
+        let pem = std::fs::read_to_string(key_path)
             .with_context(|| format!("failed to read key from {}", key_path.display()))?;
         let kp = Keypair::from_pem(&pem).map_err(|e| anyhow::anyhow!("invalid PEM key: {e}"))?;
         info!(path = %key_path.display(), "loaded existing identity");
-        Ok(kp)
-    } else {
-        let kp = Keypair::generate();
-        let pem = kp
-            .to_pem()
-            .map_err(|e| anyhow::anyhow!("failed to serialize key: {e}"))?;
+        return Ok(kp);
+    }
 
+    let kp = Keypair::generate();
+    let pem = kp
+        .to_pem()
+        .map_err(|e| anyhow::anyhow!("failed to serialize key: {e}"))?;
+
+    // The directory is created pinned to 0700 and the PEM is published
+    // through the same scratch-then-link path the p2p key uses, at a
+    // verified 0600. The previous flow (create_dir_all with no mode, then
+    // write, then set_permissions) is the sequence INV-23 prohibits: it
+    // left the directory world-writable under a permissive umask, and
+    // under a restrictive one it could not be opened at all, which failed
+    // the whole node here, before the listener binds.
+    #[cfg(unix)]
+    p2p::create_pinned_dir_and_publish(key_path, pem.as_bytes())?;
+
+    #[cfg(not(unix))]
+    {
         if let Some(parent) = key_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::write(&key_path, pem.as_bytes())?;
-            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        #[cfg(not(unix))]
-        std::fs::write(&key_path, pem.as_bytes())?;
-
-        info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
-        Ok(kp)
+        std::fs::write(key_path, pem.as_bytes())?;
     }
+
+    info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
+    Ok(kp)
 }
 
 #[cfg(test)]
@@ -1827,5 +1895,595 @@ mod gossip_ssrf_tests {
     async fn ping_peer_readiness_reports_unready_on_connection_error() {
         let ok = ping_peer_readiness(&production_http_client(), "http://127.0.0.1:1").await;
         assert!(!ok, "a connection error must count as an unready peer");
+    }
+}
+
+#[cfg(test)]
+mod identity_key_storage_tests {
+    use super::*;
+
+    /// Fixture: create the node identity key under a hostile umask.
+    ///
+    /// `~/.gitlawb` holds BOTH keys, and `load_or_create_keypair` runs before
+    /// the listener binds, so a mask that strips owner bits here takes the
+    /// whole node down before any p2p code is reached. Double-gated like the
+    /// p2p fixtures: `#[ignore]` keeps it out of a normal run and the env check
+    /// keeps it inert under a bare `--ignored` sweep, which would otherwise set
+    /// a process-global umask inside the shared test process.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=identity-key-umask"]
+    fn fixture_identity_key_under_hostile_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("identity-key-umask") {
+            return;
+        }
+        let base = std::path::PathBuf::from(
+            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+        );
+        let umask_val =
+            u32::from_str_radix(&std::env::var("GITLAWB_TEST_UMASK").unwrap(), 8).unwrap();
+
+        // SAFETY: `umask` only reads and replaces the process-wide value, and
+        // this process exists solely for this probe. No restore: the value dies
+        // with the child.
+        unsafe { libc::umask(umask_val as libc::mode_t) };
+
+        let key = base.join(".gitlawb").join("identity.pem");
+        let kp = load_or_create_keypair_at(&key).unwrap_or_else(|e| {
+            let dir_mode = std::fs::symlink_metadata(key.parent().unwrap())
+                .map(|m| format!("{:04o}", m.permissions().mode() & 0o7777))
+                .unwrap_or_else(|_| "absent".into());
+            panic!(
+                "first boot must create the node identity, got: {e:#}\n  \
+                 dir {} achieved mode {}, requested 0700",
+                key.parent().unwrap().display(),
+                dir_mode
+            )
+        });
+
+        let dir_mode = std::fs::symlink_metadata(key.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "identity key directory achieved mode {dir_mode:04o}, requested 0700"
+        );
+        let key_mode = std::fs::symlink_metadata(&key)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            key_mode, 0o600,
+            "identity key achieved mode {key_mode:04o}, requested 0600"
+        );
+
+        // The identity must survive a reload, same as the p2p key.
+        let reloaded = load_or_create_keypair_at(&key).expect("reload the identity");
+        assert_eq!(kp.did(), reloaded.did(), "the identity must be stable");
+
+        println!("identity-key-umask: asserted did={}", kp.did());
+    }
+
+    /// GITLAWB_KEY names a PEM file, not a dedicated key directory. An existing
+    /// 0755 parent is usable (no group/world write) and must not be chmodded.
+    #[cfg(unix)]
+    #[test]
+    fn existing_identity_parent_is_not_chmodded() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for parent_name in [".gitlawb", "shared"] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let dir = base.path().join(parent_name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let key = dir.join("identity.pem");
+            load_or_create_keypair_at(&key).expect("first boot into an existing 0755 parent");
+
+            let mode = std::fs::symlink_metadata(&dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(
+                mode, 0o755,
+                "{parent_name}: an existing 0755 identity parent must stay 0755, found {mode:04o}"
+            );
+            assert_eq!(
+                std::fs::symlink_metadata(&key)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o600,
+                "the identity key must be owner-only"
+            );
+        }
+    }
+
+    /// A parent this process creates is still pinned to 0700. That is the
+    /// missing-directory path, not an adopt of an operator-owned tree.
+    #[cfg(unix)]
+    #[test]
+    fn missing_identity_parent_is_created_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = base.path().join(".gitlawb");
+        let key = dir.join("identity.pem");
+        load_or_create_keypair_at(&key).expect("first boot creates the identity parent");
+        let mode = std::fs::symlink_metadata(&dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o700, "a parent this process created must be 0700");
+    }
+
+    /// Group/world write on the parent is replacement authority over a 0600
+    /// key. Refuse, and leave the directory untouched.
+    #[cfg(unix)]
+    #[test]
+    fn writable_identity_parent_is_refused_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = base.path().join("tmp");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let key = dir.join("identity.pem");
+        let Err(err) = load_or_create_keypair_at(&key) else {
+            panic!("a world-writable identity parent must be refused");
+        };
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("writable") || text.contains("replace"),
+            "the refusal must name the write-authority problem, got: {text}"
+        );
+        let mode = std::fs::symlink_metadata(&dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o777, "a refusal must not chmod the parent");
+        assert!(!key.exists(), "a refusal must not publish the identity key");
+    }
+
+    /// An existing key is loaded, never rewritten and never chmodded: the
+    /// creation path is the only thing this change touches.
+    #[cfg(unix)]
+    #[test]
+    fn existing_identity_key_is_loaded_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let key = base.path().join(".gitlawb").join("identity.pem");
+
+        let created = load_or_create_keypair_at(&key).expect("first boot");
+        let before = std::fs::read(&key).unwrap();
+
+        // A deliberately odd but readable mode must survive: an existing key is
+        // the operator's, and this path does not repair it.
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let reloaded = load_or_create_keypair_at(&key).expect("reload");
+
+        assert_eq!(created.did(), reloaded.did(), "the identity must be stable");
+        assert_eq!(
+            std::fs::read(&key).unwrap(),
+            before,
+            "the key must not be rewritten"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&key)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o400,
+            "an existing key's mode must not be changed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_key_storage_is_umask_independent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for umask in ["0000", "0022", "0777"] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+            let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+            cmd.args([
+                "identity_key_storage_tests::fixture_identity_key_under_hostile_umask",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("GITLAWB_TEST_FIXTURE", "identity-key-umask")
+            .env("GITLAWB_TEST_BASE", base.path())
+            .env("GITLAWB_TEST_UMASK", umask);
+            let output = cmd.output().expect("spawn the identity-key fixture");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            assert!(
+                output.status.success(),
+                "umask={umask}: the identity-key fixture must pass\n\
+                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            );
+            // A filter matching nothing exits 0, and the fixture's env gate
+            // returns early as a passing test, so neither alone is proof.
+            assert!(
+                stdout.contains("1 passed"),
+                "umask={umask}: filter must select one passing test\n{stdout}"
+            );
+            assert!(
+                stdout.contains("identity-key-umask: asserted did="),
+                "umask={umask}: fixture must print its sentinel\n{stdout}"
+            );
+        }
+    }
+
+    /// Bare `GITLAWB_KEY=identity.pem` (and `./identity.pem`) must still create
+    /// the identity in the working directory. The p2p key refuses that form on
+    /// purpose; the node identity has always allowed it.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=identity-key-bare"]
+    fn fixture_bare_identity_key_in_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("identity-key-bare") {
+            return;
+        }
+        let cwd = std::path::PathBuf::from(
+            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+        );
+        std::env::set_current_dir(&cwd).expect("chdir into isolated tempdir");
+        let cwd_mode_before = std::fs::symlink_metadata(".").unwrap().permissions().mode() & 0o7777;
+
+        let name = std::env::var("GITLAWB_TEST_KEY_NAME").expect("GITLAWB_TEST_KEY_NAME");
+        let kp = load_or_create_keypair_at(std::path::Path::new(&name))
+            .unwrap_or_else(|e| panic!("bare identity path {name:?} must create, got: {e:#}"));
+        assert!(
+            std::path::Path::new(&name).exists() || std::path::Path::new("identity.pem").exists(),
+            "the key must land in the working directory"
+        );
+        let key = if std::path::Path::new(&name).exists() {
+            std::path::PathBuf::from(&name)
+        } else {
+            std::path::PathBuf::from("identity.pem")
+        };
+        assert_eq!(
+            std::fs::symlink_metadata(&key)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600,
+            "the identity key must be owner-only"
+        );
+        let cwd_mode_after = std::fs::symlink_metadata(".").unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            cwd_mode_before, cwd_mode_after,
+            "creating a bare identity key must not chmod the working directory"
+        );
+        let reloaded = load_or_create_keypair_at(std::path::Path::new(&name)).expect("reload");
+        assert_eq!(kp.did(), reloaded.did(), "the identity must be stable");
+        println!("identity-key-bare: asserted did={}", kp.did());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bare_identity_key_path_creates_in_cwd_without_chmodding_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for name in ["identity.pem", "./identity.pem"] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+            cmd.args([
+                "identity_key_storage_tests::fixture_bare_identity_key_in_cwd",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("GITLAWB_TEST_FIXTURE", "identity-key-bare")
+            .env("GITLAWB_TEST_BASE", base.path())
+            .env("GITLAWB_TEST_KEY_NAME", name);
+            let output = cmd.output().expect("spawn the bare-identity fixture");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "name={name}: bare identity path must create\n\
+                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            );
+            assert!(
+                stdout.contains("1 passed"),
+                "name={name}: filter must select one passing test\n{stdout}"
+            );
+            assert!(
+                stdout.contains("identity-key-bare: asserted did="),
+                "name={name}: fixture must print its sentinel\n{stdout}"
+            );
+            let cwd_mode = std::fs::symlink_metadata(base.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(
+                cwd_mode, 0o755,
+                "name={name}: the parent test must also see cwd left at 0755"
+            );
+        }
+    }
+
+    /// A 0600 identity file is not protected if cwd is group/world-writable:
+    /// another local user can unlink or replace the entry. Creating into that
+    /// cwd must fail, and must not leave a key behind. Do not chmod cwd.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=identity-key-bare-writable"]
+    fn fixture_bare_identity_key_in_writable_cwd_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref()
+            != Some("identity-key-bare-writable")
+        {
+            return;
+        }
+        let cwd = std::path::PathBuf::from(
+            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+        );
+        std::env::set_current_dir(&cwd).expect("chdir into isolated tempdir");
+        std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let cwd_mode_before = std::fs::symlink_metadata(".").unwrap().permissions().mode() & 0o7777;
+
+        let Err(err) = load_or_create_keypair_at(std::path::Path::new("identity.pem")) else {
+            panic!("a bare identity path under a writable cwd must be refused");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("writable beyond its owner") || msg.contains("0777"),
+            "the refusal must name the writable-parent reason, got: {msg}"
+        );
+        assert!(
+            !std::path::Path::new("identity.pem").exists(),
+            "a refused cwd must not have identity.pem created"
+        );
+        let cwd_mode_after = std::fs::symlink_metadata(".").unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            cwd_mode_before, cwd_mode_after,
+            "refusing a writable cwd must not chmod it"
+        );
+        println!("identity-key-bare-writable: asserted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bare_identity_key_path_refuses_a_writable_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+        cmd.args([
+            "identity_key_storage_tests::fixture_bare_identity_key_in_writable_cwd_is_refused",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("GITLAWB_TEST_FIXTURE", "identity-key-bare-writable")
+        .env("GITLAWB_TEST_BASE", base.path());
+        let output = cmd
+            .output()
+            .expect("spawn the writable-cwd identity fixture");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "writable cwd must refuse the bare identity path\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "filter must select one passing test\n{stdout}"
+        );
+        assert!(
+            stdout.contains("identity-key-bare-writable: asserted"),
+            "fixture must print its sentinel\n{stdout}"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(base.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "parent must also see no identity.pem, found: {leftovers:?}"
+        );
+        let cwd_mode = std::fs::symlink_metadata(base.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(cwd_mode, 0o777, "cwd must stay 0777");
+    }
+
+    /// An existing key in a writable directory still loads. Create is refused
+    /// there; turning that into a boot failure on upgrade would strand nodes
+    /// that already have a key.
+    #[cfg(unix)]
+    #[test]
+    fn existing_identity_in_a_writable_dir_still_loads() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let key = base.path().join("identity.pem");
+        let created = load_or_create_keypair_at(&key).expect("create under 0755");
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let reloaded = load_or_create_keypair_at(&key)
+            .expect("an existing identity in a writable directory must still load");
+        assert_eq!(created.did(), reloaded.did());
+        assert_eq!(
+            std::fs::symlink_metadata(base.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o777,
+            "load must not chmod the writable directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_symlink_key_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let real = base.path().join("real.pem");
+        let created = load_or_create_keypair_at(&real).expect("create the symlink target");
+        std::os::unix::fs::symlink(&real, base.path().join("identity.pem")).unwrap();
+        let err = match load_or_create_keypair_at(&base.path().join("identity.pem")) {
+            Ok(kp) => panic!(
+                "a symlink at the identity path must be refused, not followed; loaded did={}",
+                kp.did()
+            ),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("symlink") || err.to_lowercase().contains("too many levels"),
+            "symlink refusal must name the link, got: {err}"
+        );
+        let reread = load_or_create_keypair_at(&real).expect("target still loads by its real path");
+        assert_eq!(
+            created.did(),
+            reread.did(),
+            "the symlink target must be unchanged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_symlinked_grandparent_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let key = link.join("keys").join("identity.pem");
+        let err = match load_or_create_keypair_at(&key) {
+            Ok(_) => panic!("a symlinked grandparent must be refused, not followed"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("symlink")
+                || err.to_lowercase().contains("too many levels")
+                || err.contains("loop"),
+            "symlinked grandparent refusal must name the link, got: {err}"
+        );
+        assert!(
+            !real.join("keys").exists(),
+            "symlink target must be untouched"
+        );
+    }
+
+    /// 0111 grandparent cannot mkdir, so the key directory must already exist.
+    /// Opening that grandparent must not require directory-list permission.
+    #[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+    #[test]
+    fn identity_search_only_grandparent_publishes_into_existing_key_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let gp = base.path().join("searchonly");
+        let keys = gp.join("keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&gp, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let key = keys.join("identity.pem");
+        let created = match load_or_create_keypair_at(&key) {
+            Ok(kp) => kp,
+            Err(e) => {
+                let _ = std::fs::set_permissions(&gp, std::fs::Permissions::from_mode(0o700));
+                panic!("search-only grandparent must be enough to publish into an existing 0700 key dir: {e:#}");
+            }
+        };
+        let reloaded = load_or_create_keypair_at(&key);
+        std::fs::set_permissions(&gp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let reloaded = reloaded.expect("reload");
+        assert_eq!(created.did(), reloaded.did());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_root_adjacent_path_is_not_the_empty_component_error() {
+        if std::path::Path::new("/identity.pem").exists() {
+            return;
+        }
+        let err = match load_or_create_keypair_at(std::path::Path::new("/identity.pem")) {
+            Ok(_) => panic!("creating /identity.pem as a non-root user must not succeed"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            !err.contains("names no final directory component"),
+            "root-adjacent identity create must reach the filesystem, got: {err}"
+        );
+        assert!(
+            !std::path::Path::new("/identity.pem").exists(),
+            "the probe must not leave /identity.pem behind"
+        );
+    }
+
+    /// A terminal `.` is a directory spelling. Path drops it, so this would
+    /// otherwise publish a 0600 file named `keys` under `data`.
+    #[cfg(unix)]
+    #[test]
+    fn identity_terminal_dot_path_is_refused_without_retargeting() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let data = base.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let spelling = format!("{}/keys/.", data.display());
+        let key = std::path::Path::new(&spelling);
+        let Err(err) = load_or_create_keypair_at(key) else {
+            panic!("a terminal `.` identity path must be refused");
+        };
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("must name a key file") || text.contains("directory"),
+            "the refusal must name the directory spelling, got: {text}"
+        );
+        let mode = std::fs::symlink_metadata(&data)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o755, "rejection must not chmod the parent");
+        assert!(
+            !data.join("keys").exists(),
+            "rejection must not create a file named keys"
+        );
     }
 }
