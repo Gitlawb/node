@@ -5,6 +5,14 @@ use std::process::Command;
 /// Initialize a new bare git repository with SHA-1 object format (default).
 ///
 /// SHA-1 is used for maximum compatibility with standard git clients.
+///
+/// P1 (reviewer-2 round 4): `git config core.logAllRefUpdates true`
+/// logs only `refs/heads/` and `refs/remotes/` — tag pushes
+/// (`refs/tags/v1`) produce no reflog, and the reconcile gate at
+/// `durable_outbox::reconcile_prepared_from_disk` requires a
+/// reflog-entry proof to promote a row. Setting it to `always`
+/// makes git log every ref update regardless of namespace, which is
+/// what the recovery gate assumes.
 pub fn init_bare(path: &Path) -> Result<()> {
     if path.exists() {
         bail!("repository already exists at {}", path.display());
@@ -25,8 +33,349 @@ pub fn init_bare(path: &Path) -> Result<()> {
     // Write a default HEAD pointing to main
     std::fs::write(path.join("HEAD"), "ref: refs/heads/main\n")?;
 
+    // #26 Split PR 1: turn reflogs ON for this bare repo. `core.logAllRefUpdates`
+    // defaults to FALSE for bare repositories, so without this a bare repo keeps no
+    // record of what a ref did — only what it currently points at.
+    //
+    // The durable post-receive outbox's startup reconcile needs exactly that record.
+    // Its job is to decide whether a `prepared` transition (old -> new) actually
+    // LANDED after a crash, and the current SHA alone cannot answer that: a row
+    // claiming B -> A also "matches" a ref that was already sitting at A for some
+    // unrelated reason, and promoting it would write a push event, a certificate,
+    // and an anchor for a transition that never happened. The reflog is git's own
+    // per-ref landing record — one line per update carrying `<old> <new>` plus the
+    // time it happened — so [`ref_reflog_entries`] can prove the ref moved the way
+    // the row claims, and prove it moved AFTER the row was written.
+    //
+    // P1 (reviewer-2 round 4): the value MUST be `always`, not `true`.
+    // Under `true`, git logs only `refs/heads/` and `refs/remotes/` —
+    // tag pushes (`refs/tags/v1`) produce no reflog, and the
+    // reconcile gate can never promote a `refs/tags/*` row. The
+    // value `always` makes git log every ref update regardless of
+    // namespace, which is what the recovery gate assumes. I
+    // confirmed by execution in a bare repo: with `true`, an
+    // `update-ref refs/tags/v1 <sha>` produced no `logs/refs/tags/`
+    // entry; with `always` it did.
+    //
+    // Failure is non-fatal on purpose: a repo without reflogs still serves every
+    // git operation, it only loses AUTOMATIC crash recovery for its outbox rows
+    // (the reconcile leaves those rows `prepared` for human-attended recovery
+    // rather than promoting something it cannot prove).
+    let config = Command::new("git")
+        .args(["config", "core.logAllRefUpdates", "always"])
+        .current_dir(path)
+        .output();
+    match config {
+        Ok(out) if !out.status.success() => {
+            tracing::warn!(
+                path = %path.display(),
+                stderr = %String::from_utf8_lossy(&out.stderr),
+                "failed to enable core.logAllRefUpdates=always; durable-outbox reconcile \
+                 will not be able to prove ref landings for this repo (tag pushes will \
+                 never auto-recover)"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                err = %e,
+                "failed to run git config core.logAllRefUpdates=always; durable-outbox \
+                 reconcile will not be able to prove ref landings for this repo"
+            );
+        }
+        Ok(_) => {}
+    }
+
+    // Hide the internal marker namespace from clone/fetch
+    // advertisement. `refs/gitlawb/requests/*` carries request UUIDs
+    // and would otherwise leak per-push metadata to every client and
+    // grow advertisement cost with push count.
+    for (key, value) in [
+        ("uploadpack.hideRefs", "refs/gitlawb/requests/"),
+        ("transfer.hideRefs", "refs/gitlawb/requests/"),
+    ] {
+        let out = Command::new("git")
+            .args(["config", "--add", key, value])
+            .current_dir(path)
+            .output();
+        if let Ok(o) = out {
+            if !o.status.success() {
+                tracing::warn!(
+                    path = %path.display(),
+                    key = %key,
+                    stderr = %String::from_utf8_lossy(&o.stderr),
+                    "failed to hide internal marker namespace"
+                );
+            }
+        }
+    }
+
     tracing::info!("initialized bare repo at {}", path.display());
     Ok(())
+}
+
+/// Ensure an existing repo hides the internal marker namespace.
+/// Idempotent; used at push time for repos predating the `init_bare`
+/// hideRefs config so advertisement cannot diverge by repo age.
+#[allow(dead_code)]
+pub fn ensure_marker_hidden(repo_path: &Path) {
+    let _ = ensure_marker_hidden_checked(repo_path);
+}
+
+pub fn ensure_marker_hidden_checked(repo_path: &Path) -> Result<()> {
+    for (key, value) in [
+        ("uploadpack.hideRefs", "refs/gitlawb/requests/"),
+        ("transfer.hideRefs", "refs/gitlawb/requests/"),
+    ] {
+        let current = Command::new("git")
+            .args(["config", "--get-all", key])
+            .current_dir(repo_path)
+            .output()
+            .context("git config --get-all hideRefs failed")?;
+        let already = String::from_utf8_lossy(&current.stdout)
+            .lines()
+            .any(|l| l.trim() == value);
+        if !already {
+            let out = Command::new("git")
+                .args(["config", "--add", key, value])
+                .current_dir(repo_path)
+                .output()
+                .context("git config --add hideRefs failed")?;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "git config --add {key} failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Verify recovery prerequisites before the first durable intent or
+/// marker relies on them: `core.logAllRefUpdates=always` plus both
+/// hideRefs. Idempotently enables missing config; failures are
+/// surfaced so the handler refuses the push rather than discovering
+/// the gap only after an interrupted push.
+pub fn verify_recovery_prereqs(repo_path: &Path) -> Result<()> {
+    let get = Command::new("git")
+        .args(["config", "--get", "core.logAllRefUpdates"])
+        .current_dir(repo_path)
+        .output()
+        .context("git config --get logAllRefUpdates failed")?;
+    let cur = String::from_utf8_lossy(&get.stdout).trim().to_string();
+    if cur != "always" {
+        let out = Command::new("git")
+            .args(["config", "core.logAllRefUpdates", "always"])
+            .current_dir(repo_path)
+            .output()
+            .context("git config logAllRefUpdates failed")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "enabling core.logAllRefUpdates=always failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+    ensure_marker_hidden_checked(repo_path)
+}
+
+/// Bounded marker write through the configured git binary with timeout.
+/// Used on the live path (which holds the write lease); failures are
+/// returned so the handler can refuse rather than create unprotected
+/// metadata.
+pub async fn write_marker_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    request_id: &str,
+    marker_value: &str,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    use tokio::process::Command as AsyncCommand;
+    let ref_name = format!("refs/gitlawb/requests/{request_id}");
+    let fut = async {
+        AsyncCommand::new(git_bin)
+            .args(["update-ref", &ref_name, marker_value, "--no-deref"])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .context("marker update-ref spawn failed")
+    };
+    let out = tokio::time::timeout(timeout, fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("marker update-ref timed out"))??;
+    if !out.status.success() {
+        anyhow::bail!(
+            "marker update-ref failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Bounded idempotent marker deletion; returns Ok(true) when the ref is
+/// gone, Ok(false) on failure (caller retains tombstone and retries).
+pub async fn delete_marker_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    request_id: &str,
+    timeout: std::time::Duration,
+) -> Result<bool> {
+    use tokio::process::Command as AsyncCommand;
+    let ref_name = format!("refs/gitlawb/requests/{request_id}");
+    let fut = AsyncCommand::new(git_bin)
+        .args(["update-ref", "-d", &ref_name, "--no-deref"])
+        .current_dir(repo_path)
+        .output();
+    let out = match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(e).context("marker delete spawn failed"),
+        Err(_) => return Ok(false),
+    };
+    Ok(out.status.success())
+}
+
+/// Delete a per-request marker ref. Best-effort; called on terminal
+/// retirement so SQL and Git-side retention cannot diverge.
+pub fn delete_marker(repo_path: &Path, request_id: &str) {
+    let ref_name = format!("refs/gitlawb/requests/{request_id}");
+    let _ = Command::new("git")
+        .args(["update-ref", "-d", &ref_name, "--no-deref"])
+        .current_dir(repo_path)
+        .output();
+}
+
+/// One parsed reflog entry: the `<old> <new>` pair a single ref update recorded,
+/// plus the unix timestamp git stamped it with.
+///
+/// This is the unit of PER-REF LANDING PROOF the durable-outbox reconcile runs on.
+/// A row that claims `old -> new` is only promoted when the ref's reflog carries an
+/// entry with the same pair, stamped at or after the row was written; see
+/// [`crate::durable_outbox::reconcile_prepared_from_disk`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReflogEntry {
+    pub old_sha: String,
+    pub new_sha: String,
+    /// Seconds since the unix epoch, as git wrote them.
+    pub at: i64,
+    /// Reflog message (after the TAB). The live handler sets
+    /// `GIT_REFLOG_ACTION=gitlawb-request:<request_id>` so recovery
+    /// can bind a landing to the exact request that caused it.
+    pub message: String,
+}
+
+/// How many bytes of the END of a reflog file are read. A reflog line is roughly
+/// 150 bytes, so this window holds on the order of two thousand of the most recent
+/// updates to a single ref.
+///
+/// The bound costs nothing in proving power, because of what the caller asks. The
+/// gate only ever accepts an entry stamped at or after
+/// `created_at - REFLOG_CLOCK_SKEW`, i.e. within about a minute of a row that is
+/// itself inside `MAX_RECONCILE_AGE`; reflogs are append-ordered oldest-first, so
+/// every entry that could possibly qualify is at the tail. What the window buys is
+/// a ceiling: a reflog grows one line per ref update and how often a ref is updated
+/// is PUSHER-controlled, so an unbounded read is an attacker-sized allocation taken
+/// once per stranded row, at startup, which is the moment the node can least absorb
+/// it.
+const REFLOG_TAIL_BYTES: u64 = 256 * 1024;
+
+/// Read the tail of one ref's reflog in a bare repository, newest entry LAST.
+///
+/// Reads `logs/<ref_name>` directly rather than shelling out to `git reflog`: the
+/// file format is stable and documented, the reconcile may call this once per
+/// stranded row at startup, and a plain file read cannot be defeated by the ref's
+/// reflog having been expired out of the `git reflog show` default window.
+///
+/// Only the last [`REFLOG_TAIL_BYTES`] are read, and only whole lines within that
+/// window: when the file is longer, the bytes before the first newline inside the
+/// window are a PARTIAL record and are discarded, so a record sliced mid-SHA can
+/// never be tokenized into a bogus `old -> new` pair. An entry older than the
+/// window reads as absent, which is the safe direction — the caller treats
+/// "no matching entry" as unproven and leaves the row where it is, rather than
+/// promoting it.
+///
+/// Returns `Ok(None)` when the repo keeps no reflog for that ref — either because
+/// `core.logAllRefUpdates` was off when the ref moved (repos created before
+/// [`init_bare`] started enabling it) or because the ref was deleted (git removes a
+/// deleted ref's reflog with it). `None` is NOT evidence that nothing landed; it is
+/// the absence of evidence, and callers must treat it as "unproven", never as
+/// "proven false".
+///
+/// Line format (`git-check-ref-format`/`refs` docs):
+/// `<old-sha> <new-sha> <committer name> <email> <unix-ts> <tz>\t<message>`
+pub fn ref_reflog_entries(repo_path: &Path, ref_name: &str) -> Result<Option<Vec<ReflogEntry>>> {
+    // Refuse anything that could climb out of `logs/`. Ref names are validated at
+    // the push edge, but this function takes a name off a DB row, so it re-checks
+    // rather than trusting the row.
+    if ref_name.is_empty()
+        || ref_name.contains("..")
+        || ref_name.starts_with('/')
+        || !ref_name.starts_with("refs/")
+    {
+        bail!("refusing to read a reflog for a non-refs/ ref name: {ref_name}");
+    }
+    let path = repo_path.join("logs").join(ref_name);
+    let mut file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("failed to open reflog"),
+    };
+    let len = file.metadata().context("failed to stat reflog")?.len();
+    let truncated = len > REFLOG_TAIL_BYTES;
+    if truncated {
+        use std::io::Seek;
+        file.seek(std::io::SeekFrom::Start(len - REFLOG_TAIL_BYTES))
+            .context("failed to seek to the reflog tail")?;
+    }
+    let mut buf = Vec::with_capacity(REFLOG_TAIL_BYTES.min(len) as usize);
+    {
+        use std::io::Read;
+        // Cap the read itself, not just the seek: the file can grow between the
+        // stat and the read, and the allocation must stay bounded either way.
+        file.take(REFLOG_TAIL_BYTES)
+            .read_to_end(&mut buf)
+            .context("failed to read reflog")?;
+    }
+    // A window into the middle of the file almost certainly starts mid-record.
+    // Drop everything before the first newline so only whole lines are parsed;
+    // a reflog is one record per line, so the first full record starts there.
+    let window: &[u8] = if truncated {
+        match buf.iter().position(|b| *b == b'\n') {
+            Some(i) => &buf[i + 1..],
+            // No newline in the whole window: every byte is part of one partial
+            // record, so there is nothing whole to parse.
+            None => &[],
+        }
+    } else {
+        &buf
+    };
+    let raw = String::from_utf8_lossy(window);
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        // The message after the TAB can contain anything, including spaces and
+        // (in a `git commit -m` subject) tabs of its own, so split the header off
+        // at the FIRST tab and tokenize only that. The message itself is
+        // retained for request-identity binding (`GIT_REFLOG_ACTION`).
+        let mut split = line.splitn(2, '\t');
+        let header = split.next().unwrap_or(line);
+        let message = split.next().unwrap_or("").to_string();
+        let tokens: Vec<&str> = header.split_whitespace().collect();
+        // `<old> <new> <ident...> <ts> <tz>`: at minimum old, new, ts, tz.
+        if tokens.len() < 4 {
+            continue;
+        }
+        let at = match tokens[tokens.len() - 2].parse::<i64>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        out.push(ReflogEntry {
+            old_sha: tokens[0].to_string(),
+            new_sha: tokens[1].to_string(),
+            at,
+            message,
+        });
+    }
+    Ok(Some(out))
 }
 
 /// Check if a path contains a valid bare git repository.
@@ -61,6 +410,82 @@ pub fn list_refs(repo_path: &Path) -> Result<Vec<(String, String)>> {
         .collect();
 
     Ok(refs)
+}
+
+/// #26 Split PR 1 step 5 — read a single ref's value. Returns
+/// `Ok(None)` for absent refs (git's exit code is 1; we treat that
+/// as "not present" rather than a hard error). The value is the
+/// full hex SHA — for a marker ref, that hex is the marker value
+/// the live handler (or a test) wrote via `update-ref`, which is
+/// a 40-char SHA-1 hex string. The reconcile compares two hex
+/// strings.
+pub fn read_ref(repo_path: &Path, ref_name: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(["show-ref", "--verify", "--hash", ref_name])
+        .current_dir(repo_path)
+        .output()
+        .context("failed to run git show-ref")?;
+    if !output.status.success() {
+        // `git show-ref --verify` returns 1 when the ref is absent
+        // and non-zero (often 128) on other errors. We can't
+        // distinguish without inspecting stderr; the safe choice
+        // is to treat any non-zero as "absent" and let the caller
+        // (the reconcile gate) treat that as a quarantine signal.
+        return Ok(None);
+    }
+    let sha = String::from_utf8(output.stdout)
+        .context("git show-ref output is not utf-8")?
+        .trim()
+        .to_string();
+    if sha.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(sha))
+}
+
+/// #26 Split PR 1 step 5 — compute the marker ref value for a
+/// `request_bytes_hash`. Git's `update-ref` rejects arbitrary
+/// 64-char hex; it only accepts 40-char SHA-1 hex that resolves
+/// to an existing object. We sidestep both halves by feeding the
+/// first 20 bytes of the 32-byte SHA-256 through `git
+/// hash-object -w` (a blob object is content-addressed, so the
+/// resulting 40-char SHA-1 is the marker value). The live
+/// handler writes this; the reconcile's `read_ref` reads it
+/// back; the gate compares hex strings.
+///
+/// `repo_path` is the bare repo the marker ref lives in. The
+/// blob is stored in the repo's object database so a later
+/// `git show-ref --verify --hash` resolves cleanly.
+pub fn marker_value_for(repo_path: &Path, request_bytes_hash: &[u8]) -> Result<String> {
+    let mut content = Vec::with_capacity(20);
+    let n = 20.min(request_bytes_hash.len());
+    content.extend_from_slice(&request_bytes_hash[..n]);
+    let mut child = Command::new("git")
+        .args(["hash-object", "-w", "--stdin"])
+        .current_dir(repo_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to spawn git hash-object")?;
+    use std::io::Write;
+    child
+        .stdin
+        .as_mut()
+        .context("stdin pipe")?
+        .write_all(&content)
+        .context("write to git hash-object stdin")?;
+    let out = child.wait_with_output().context("git hash-object wait")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git hash-object failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(String::from_utf8(out.stdout)
+        .context("git hash-object output not utf-8")?
+        .trim()
+        .to_string())
 }
 
 /// Read the current HEAD commit hash of a repository.
@@ -881,6 +1306,235 @@ mod tests {
     use super::branch_diff_names;
     use std::path::Path;
     use std::process::Command;
+
+    /// #26 split 1/4: a bare repo this node creates must KEEP REFLOGS, because
+    /// the durable-outbox reconcile has no other way to prove that a stranded
+    /// transition actually landed. `core.logAllRefUpdates` defaults to false for
+    /// bare repos, so without the explicit config a crashed push is unrecoverable
+    /// — the reconcile can see where a ref points, never how it got there.
+    ///
+    /// MUTATION (RED): drop the `git config core.logAllRefUpdates` call in
+    /// `init_bare` and no `logs/refs/heads/main` file appears.
+    #[test]
+    fn init_bare_keeps_reflogs_so_a_landing_can_be_proven() {
+        let td = tempfile::TempDir::new().unwrap();
+        let bare = td.path().join("repo.git");
+        super::init_bare(&bare).unwrap();
+
+        // Build a commit and move a ref onto it, the way receive-pack would.
+        let run = |args: &[&str]| -> String {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&bare)
+                .stdin(std::process::Stdio::null())
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let tree = run(&["mktree"]);
+        let commit = run(&["commit-tree", &tree, "-m", "root"]);
+        run(&["update-ref", "refs/heads/main", &commit]);
+
+        let entries = super::ref_reflog_entries(&bare, "refs/heads/main")
+            .unwrap()
+            .expect("a repo created by init_bare keeps a reflog for its refs");
+        assert_eq!(entries.len(), 1, "one update, one entry");
+        assert_eq!(
+            entries[0].old_sha, "0000000000000000000000000000000000000000",
+            "the entry records where the ref came FROM — the half a current-SHA \
+             check can never recover"
+        );
+        assert_eq!(entries[0].new_sha, commit);
+        assert!(
+            entries[0].at > 0,
+            "the entry is timestamped, so proof can be required to postdate the intent"
+        );
+    }
+
+    /// One reflog record. Fixed-width `i` and timestamp keep every filler line the
+    /// same length, so the test below can place the window boundary on an exact
+    /// byte.
+    fn reflog_line(old: &str, new: &str, at: i64, msg: &str) -> String {
+        format!("{old} {new} tester <tester@example.com> {at} +0000\tpush: {msg}\n")
+    }
+
+    fn filler_line(i: usize, pad: usize) -> String {
+        reflog_line(
+            &format!("{:040x}", i),
+            &format!("{:040x}", i + 1),
+            1_600_000_000,
+            &format!("filler {i:06}{}", "x".repeat(pad)),
+        )
+    }
+
+    /// The bound is a ceiling on the READ, not on the proof: a ref hammered with
+    /// far more updates than the tail window can hold still yields its recent
+    /// entries, which is the only region the landing gate ever accepts from. And
+    /// the record the window CUTS THROUGH must be discarded whole, never
+    /// half-parsed.
+    ///
+    /// The file is laid out so the window boundary lands 20 bytes into a record's
+    /// old SHA — the hazardous alignment, where the surviving suffix still has
+    /// enough fields to tokenize and would yield a 20-character "old SHA" as a
+    /// bogus `old -> new` pair. Landing proof is an exact pair match, so a bogus
+    /// pair is a fabricated proof.
+    ///
+    /// MUTATION (RED): read the first `REFLOG_TAIL_BYTES` instead of the last and
+    /// the recent entry disappears; keep the leading partial line instead of
+    /// discarding it and the 20-character SHA appears.
+    #[test]
+    fn ref_reflog_entries_reads_whole_records_from_the_recent_tail() {
+        let td = tempfile::TempDir::new().unwrap();
+        let bare = td.path().join("repo.git");
+        super::init_bare(&bare).unwrap();
+
+        let window = super::REFLOG_TAIL_BYTES as usize;
+        // The record the boundary will slice, and the recent one a reconcile
+        // would actually be looking for.
+        let hazard = reflog_line(&"a".repeat(40), &"b".repeat(40), 1_700_000_000, "hazard");
+        let recent = reflog_line(&"c".repeat(40), &"d".repeat(40), 1_700_009_999, "recent");
+
+        // Everything from the hazard record to EOF must measure exactly
+        // `window + 20`, so the read starts 20 bytes into the hazard's old SHA.
+        let tail_target = window + 20;
+        let needed = tail_target - hazard.len() - recent.len();
+        let base = filler_line(0, 0).len();
+        assert!(needed > 2 * base, "layout math needs room for filler");
+        let full = needed / base - 1;
+        let pad = needed - (full + 1) * base;
+        let mut tail = hazard.clone();
+        for i in 0..full {
+            tail.push_str(&filler_line(i, 0));
+        }
+        tail.push_str(&filler_line(full, pad));
+        tail.push_str(&recent);
+        assert_eq!(
+            tail.len(),
+            tail_target,
+            "the tail must measure exactly window + 20 for the boundary to land \
+             inside the hazard record's old SHA"
+        );
+
+        // Anything before the hazard record is outside the window entirely.
+        let mut body = String::new();
+        for i in 0..8 {
+            body.push_str(&filler_line(1_000 + i, 0));
+        }
+        let lead = body.len();
+        body.push_str(&tail);
+
+        let log_path = bare.join("logs/refs/heads/busy");
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        std::fs::write(&log_path, &body).unwrap();
+        assert_eq!(
+            body.len() - window,
+            lead + 20,
+            "the read must begin 20 bytes into the hazard record"
+        );
+
+        let entries = super::ref_reflog_entries(&bare, "refs/heads/busy")
+            .unwrap()
+            .expect("the reflog exists");
+
+        // The tail is what got read.
+        let last = entries.last().expect("the window holds whole records");
+        assert_eq!(
+            (last.old_sha.as_str(), last.new_sha.as_str(), last.at),
+            (
+                "c".repeat(40).as_str(),
+                "d".repeat(40).as_str(),
+                1_700_009_999
+            ),
+            "the newest entry — the only region the landing gate accepts — survives \
+             the bound intact"
+        );
+        assert!(
+            entries.len() < body.lines().count(),
+            "the read is bounded: not every record in the file is parsed"
+        );
+
+        // And the sliced record was dropped rather than half-parsed. Both halves
+        // matter: no truncated SHA may appear, and the hazard's pair must not be
+        // reconstructed from a partial line either.
+        for e in &entries {
+            assert_eq!(
+                e.old_sha.len(),
+                40,
+                "a partial record was parsed into a bogus old SHA: {e:?}"
+            );
+            assert_eq!(e.new_sha.len(), 40, "a partial record was parsed: {e:?}");
+        }
+        assert!(
+            !entries.iter().any(|e| e.new_sha == "b".repeat(40)),
+            "the record the window cut through must not contribute a pair at all"
+        );
+    }
+
+    /// The safe direction of the same bound. An entry that sits only in the
+    /// discarded older region reads as absent, and absent means UNPROVEN — the
+    /// reconcile leaves such a row where it is instead of promoting it, which is
+    /// the failure mode a bounded read is allowed to have.
+    #[test]
+    fn an_entry_older_than_the_reflog_tail_reads_as_unproven() {
+        let td = tempfile::TempDir::new().unwrap();
+        let bare = td.path().join("repo.git");
+        super::init_bare(&bare).unwrap();
+
+        // The sought pair is written FIRST, then buried under enough later
+        // updates to push it clear out of the window.
+        let buried = ("c".repeat(40), "d".repeat(40), 1_650_000_000i64);
+        let log_path = bare.join("logs/refs/heads/buried");
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        let mut body = reflog_line(&buried.0, &buried.1, buried.2, "the buried landing");
+        let mut i = 0;
+        while body.len() <= super::REFLOG_TAIL_BYTES as usize * 2 {
+            body.push_str(&filler_line(i, 0));
+            i += 1;
+        }
+        std::fs::write(&log_path, &body).unwrap();
+
+        let entries = super::ref_reflog_entries(&bare, "refs/heads/buried")
+            .unwrap()
+            .expect("the reflog exists");
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.old_sha == buried.0 && e.new_sha == buried.1),
+            "an entry outside the tail window is simply not seen — the caller then \
+             treats the landing as unproven and leaves the row alone, never the \
+             other way round"
+        );
+    }
+
+    /// A ref with no reflog reads as `None` — "no evidence", which callers must
+    /// treat as unproven rather than as proof of nothing having happened.
+    #[test]
+    fn ref_reflog_entries_is_none_when_the_repo_kept_no_log() {
+        let td = tempfile::TempDir::new().unwrap();
+        let bare = td.path().join("repo.git");
+        super::init_bare(&bare).unwrap();
+        assert!(
+            super::ref_reflog_entries(&bare, "refs/heads/never-existed")
+                .unwrap()
+                .is_none(),
+            "a missing reflog is None, not an empty proof set"
+        );
+        // A name that could climb out of `logs/` is refused outright.
+        assert!(
+            super::ref_reflog_entries(&bare, "../../etc/passwd").is_err(),
+            "reflog lookups take a ref name off a DB row, so the path is re-checked"
+        );
+    }
 
     #[test]
     fn branch_diff_names_lists_changed_paths() {

@@ -5,6 +5,7 @@ mod bootstrap;
 mod cert;
 mod config;
 mod db;
+mod durable_outbox;
 mod encrypted_pin;
 mod error;
 mod git;
@@ -585,6 +586,9 @@ async fn main() -> Result<()> {
     }
 
     let _legacy_cid_sweep = spawn_legacy_cid_sweep(&state, &config);
+    let _queue_lifecycle_sweep = spawn_queue_lifecycle_sweep(&state, &config);
+    let _due_request_worker = spawn_due_request_worker(&state);
+    let _marker_cleanup_worker = spawn_marker_cleanup_worker(&state);
 
     let router = server::build_router(state.clone());
     // Re-register the socket bound at startup — same fd, so there was never a
@@ -676,6 +680,58 @@ async fn main() -> Result<()> {
     let grace = std::time::Duration::from_secs(config.shutdown_grace_secs);
     info!(grace_secs = config.shutdown_grace_secs, "axum server ready");
 
+    // #26 Split PR 1: drain any `applied` rows left by a previous
+    // process that crashed after Git applied a ref but before the
+    // bookkeeping landed. Runs once, BEFORE the server accepts new
+    // pushes, so a recovery re-derivation does not race a fresh push.
+    // Non-fatal: a transient drain failure is logged and the rows
+    // remain `applied` for the next startup to pick up.
+    //
+    // P1-A: the reconcile step runs FIRST and promotes any `prepared`
+    // or `uncertain` row whose target SHA actually landed on disk.
+    // This is the path that recovers a ref when the post-receive
+    // `mark_pending_ref_transitions_applied` call errored or was
+    // interrupted after `receive_pack` returned Ok, or when
+    // receive-pack returned Err but some refs may have landed
+    // (the `uncertain` state). Without this step, the drain (gated
+    // on `state = 'applied'`) would never see those rows.
+    //
+    // P2 (reviewer-1/2 round 3): use the multi-pass reconcile so
+    // prepared/uncertain rows beyond the first 1000-row page are
+    // processed in the same startup, rather than waiting for the
+    // next restart (where they might age out of MAX_RECONCILE_AGE).
+    match durable_outbox::reconcile_prepared_from_disk_all(
+        state.clone(),
+        durable_outbox::DRAIN_PER_PASS_LIMIT,
+        durable_outbox::DRAIN_MAX_PASSES,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(
+            n,
+            "reconciled prepared/uncertain -> applied via on-disk ref match"
+        ),
+        Err(e) => warn!(
+            err = %e,
+            "pending ref transition reconcile failed at startup (non-fatal; will retry on next start)"
+        ),
+    }
+    match durable_outbox::drain_receive_pack_requests_all(
+        state.clone(),
+        durable_outbox::DRAIN_PER_PASS_LIMIT,
+        durable_outbox::DRAIN_MAX_PASSES,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(n, "drained pending ref transitions from prior run"),
+        Err(e) => warn!(
+            err = %e,
+            "pending ref transition drain failed at startup (non-fatal; will retry on next start)"
+        ),
+    }
+
     // `into_make_service_with_connect_info` exposes the socket peer address as
     // `ConnectInfo<SocketAddr>` so the push limiter can key on the real client
     // when no trusted proxy header applies (see `rate_limit::client_key`).
@@ -742,6 +798,120 @@ fn spawn_legacy_cid_sweep(state: &AppState, config: &Config) -> tokio::task::Joi
             // Shutdown mid-walk simply drops the run; the persisted cursor means the
             // next boot picks up where this one stopped.
             _ = shutdown_rx.changed() => {}
+        }
+    })
+}
+
+/// #26 Split PR 1 step 4 — periodic queue-lifecycle purge. Runs on
+/// the same detached task pattern as `spawn_legacy_cid_sweep`:
+/// tokio::spawn with a shutdown watcher, never on the boot path. The
+/// interval is fixed at 24 hours (the spec calls for "one per
+/// cluster per day"); the inter-batch delay is implicit in the
+/// batch size plus the wall-clock cost of each pass. The drain
+/// (`drain_receive_pack_requests_all`) and the purge
+/// (`purge_request_queue`) share the same `DRAIN_PER_PASS_LIMIT`
+/// budget so a 1000-row purge pass takes roughly the same time as
+/// a 1000-row drain pass.
+fn spawn_queue_lifecycle_sweep(state: &AppState, config: &Config) -> tokio::task::JoinHandle<()> {
+    let app_state = state.clone();
+    let retention_days = config.queue_retention_days;
+    let batch = config.queue_purge_batch;
+    let git_timeout = std::time::Duration::from_secs(config.git_service_timeout_secs.min(30));
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Consume the immediate first tick: Tokio intervals fire
+        // immediately on creation, which would run the purge
+        // concurrently with startup reconcile/drain. The child purge
+        // is terminal-parent-gated in SQL, but delaying the first
+        // sweep a full period removes the race entirely.
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(e) = durable_outbox::purge_request_queue(
+                        &app_state.db,
+                        retention_days,
+                        batch,
+                    ).await {
+                        tracing::warn!(err = %e, "queue lifecycle purge failed; will retry on next tick");
+                    }
+                    // Drain marker tombstones with the bounded deleter;
+                    // failures retain the tombstone for the next tick.
+                    if let Err(e) = durable_outbox::drain_marker_cleanup_queue(
+                        &app_state,
+                        batch,
+                        git_timeout,
+                    ).await {
+                        tracing::warn!(err = %e, "marker cleanup drain failed");
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    break;
+                }
+            }
+        }
+    })
+}
+
+/// Shutdown-aware background due-request loop. The startup drain runs
+/// once; without this, `effects_pending` rows with a future
+/// `next_attempt_at` would wait until the next process restart.
+/// Polls the indexed due query with bounded batches and failure
+/// isolation (one request's error never aborts the batch).
+fn spawn_due_request_worker(state: &AppState) -> tokio::task::JoinHandle<()> {
+    let app_state = state.clone();
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    match durable_outbox::drain_receive_pack_requests(
+                        app_state.clone(),
+                        durable_outbox::DRAIN_PER_PASS_LIMIT,
+                    )
+                    .await
+                    {
+                        Ok((0, _)) => {}
+                        Ok((n, _)) => tracing::info!(n, "due request worker drained"),
+                        Err(e) => tracing::warn!(err = %e, "due request worker drain failed"),
+                    }
+                }
+                _ = shutdown_rx.changed() => break,
+            }
+        }
+    })
+}
+
+/// Dedicated marker-tombstone worker at a shorter cadence than the
+/// daily purge, so external Git refs do not linger a full period
+/// after their SQL owner is gone.
+fn spawn_marker_cleanup_worker(state: &AppState) -> tokio::task::JoinHandle<()> {
+    let app_state = state.clone();
+    let git_timeout =
+        std::time::Duration::from_secs(app_state.config.git_service_timeout_secs.min(30));
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(e) = durable_outbox::drain_marker_cleanup_queue(
+                        &app_state,
+                        durable_outbox::DRAIN_PER_PASS_LIMIT,
+                        git_timeout,
+                    )
+                    .await
+                    {
+                        tracing::warn!(err = %e, "marker cleanup worker failed");
+                    }
+                }
+                _ = shutdown_rx.changed() => break,
+            }
         }
     })
 }

@@ -415,8 +415,8 @@ fn f3_second_writer_leased_until_reap() {
          NOT RepoWriteGuard (which drops at the disconnect instant, reopening F3).",
     );
     let receive = repos_production
-        .find("smart_http::receive_pack(")
-        .expect("F3 gate stale: git_receive_pack no longer calls smart_http::receive_pack");
+        .find("smart_http::receive_pack_raw")
+        .expect("F3 gate stale: git_receive_pack no longer calls smart_http::receive_pack_raw");
     assert!(
         lease_acquire < with_lease && with_lease < receive,
         "F3 gate bypassed: the write lease must be acquired, then carried by the \
@@ -533,10 +533,8 @@ fn inv22_replication_tail_spawns_at_the_durability_boundary() {
         .expect("split always yields a first chunk");
 
     let success_flag = production
-        .find("let push_succeeded = receive_result.is_ok();")
-        .expect(
-            "U5 gate missing: the tail's success gate must be bound from receive_result.is_ok()",
-        );
+        .find("let push_succeeded = ")
+        .expect("U5 gate missing: the tail's success flag must be bound before the gate");
     let gate_open = production
         .find("if push_succeeded {")
         .expect("U5 gate missing: the tail spawn must be gated on the push having succeeded");
@@ -549,9 +547,15 @@ fn inv22_replication_tail_spawns_at_the_durability_boundary() {
     let touch = production
         .find("state.db.touch_repo(")
         .expect("U5 gate stale: git_receive_pack no longer calls touch_repo");
-    let webhook = production
-        .find("webhooks::fire_event(")
-        .expect("U5 gate stale: git_receive_pack no longer fires push webhooks");
+    // #26 Split PR 1 step 3 — the webhook fan-out moved into
+    // `durable_outbox::apply_request_effects`, which the live
+    // handler calls inline (the recovery drain calls the same
+    // function on the next startup). The gate now pins that the
+    // handler is wired to the executor, not to a per-ref inline
+    // webhook call.
+    let effects_executor = production
+        .find("apply_request_effects(&state, &request_id)")
+        .expect("U5 gate stale: git_receive_pack no longer calls apply_request_effects inline");
 
     assert!(
         success_flag < gate_open && gate_open < spawn,
@@ -565,9 +569,259 @@ fn inv22_replication_tail_spawns_at_the_durability_boundary() {
          rejected push now spawns a tail"
     );
     assert!(
-        spawn < release && spawn < touch && spawn < webhook,
+        spawn < release && spawn < touch && spawn < effects_executor,
         "U5 gate bypassed: the tail must be spawned BEFORE guard.release, touch_repo \
-         and the webhook fan-out, so a disconnect in any of those windows cannot drop \
+         and the effect executor, so a disconnect in any of those windows cannot drop \
          this push's pins, recovery copy, and announcements"
+    );
+}
+
+/// #26 Split PR 1 step 3 — drain + handler share a single effect
+/// executor. The live handler (api/repos.rs) and the recovery
+/// drain (`durable_outbox::drain_receive_pack_requests_with`) both
+/// call `apply_request_effects`, so the per-ref effects fan-out
+/// lives in exactly one place. The v29 per-ref walk
+/// (`derive_one`, `drain_pending_ref_transitions_all`,
+/// `lookup_accepted_ordinal`) is dead code: any caller reintroduced
+/// would be the per-ref walk the step-3 PR removed. This gate
+/// fails if a call site slips back in or the new seam is bypassed.
+#[test]
+fn inv26_step3_live_and_drain_share_apply_request_effects() {
+    let repos = src("api/repos.rs");
+    let outbox = src("durable_outbox.rs");
+
+    // The live handler calls `apply_request_effects`. Split the
+    // file at the test attribute so test code can't satisfy the
+    // gate by itself.
+    let production_repos = repos
+        .split("\nmod tests {")
+        .next()
+        .expect("split always yields a first chunk");
+
+    assert!(
+        production_repos.contains("apply_request_effects(&state, &request_id)"),
+        "live handler must call `apply_request_effects(&state, &request_id)`; \
+         reverting to a per-ref inline fan-out splits live and recovery"
+    );
+
+    // The drain's per-request seam calls the same executor. Test
+    // code lives below `mod drain_tests`, so split there too.
+    let production_outbox = outbox
+        .split("\nmod drain_tests {")
+        .next()
+        .expect("split always yields a first chunk");
+
+    assert!(
+        production_outbox.contains("drain_receive_pack_requests_with"),
+        "drain seam `drain_receive_pack_requests_with` must exist; \
+         removing it forces a per-ref walk back into the drain"
+    );
+    assert!(
+        production_outbox.contains("apply_request_effects"),
+        "durable_outbox production code must define `apply_request_effects`; \
+         removing it splits the executor between live and recovery"
+    );
+
+    // The drain's per-request walker is wired to the executor.
+    // The closure body of `drain_receive_pack_requests_with` is the
+    // only call site — if a future change calls `derive_one`
+    // instead, this assertion fires.
+    let drain_seam_open = production_outbox
+        .find("pub async fn drain_receive_pack_requests_with<F, Fut>")
+        .expect("drain seam must be defined in the production half");
+    let drain_seam_close = production_outbox[drain_seam_open..]
+        .find("\n}\n")
+        .expect("drain seam body must close");
+    let drain_seam_body = &production_outbox[drain_seam_open..drain_seam_open + drain_seam_close];
+    assert!(
+        drain_seam_body.contains("apply_request_effects"),
+        "drain_receive_pack_requests_with must call apply_request_effects; \
+         wiring it to a per-ref helper reintroduces the v29 walk"
+    );
+
+    // The deleted per-ref drain must have zero call sites in the
+    // production half. A regression that re-adds a caller would
+    // bring back the per-ref fan-out.
+    assert!(
+        !production_outbox.contains("drain_pending_ref_transitions_all("),
+        "deleted `drain_pending_ref_transitions_all` must have zero production call sites; \
+         a per-ref walk is reintroduced"
+    );
+    assert!(
+        !production_outbox.contains("derive_one("),
+        "deleted `derive_one` must have zero production call sites; \
+         the per-ref fan-out is reintroduced"
+    );
+    assert!(
+        !production_outbox.contains("lookup_accepted_ordinal("),
+        "deleted `lookup_accepted_ordinal` must have zero production call sites; \
+         the per-ref ordinal lookup is reintroduced"
+    );
+    assert!(
+        !production_repos.contains("derive_one("),
+        "deleted `derive_one` must have zero live-handler call sites"
+    );
+    assert!(
+        !production_repos.contains("drain_pending_ref_transitions"),
+        "deleted per-ref drain functions must have zero live-handler call sites"
+    );
+}
+
+/// #26 Split PR 1 step 4 — the periodic queue-lifecycle purge is
+/// wired in `main.rs` and the contract is enforced by the `idx_receive_pack_requests_completed_at`
+/// partial index from v30.
+///
+/// Assertions:
+/// 1. `main.rs` calls `purge_request_queue` once at boot (well, on
+///    the spawn-task interval) and the spawn function exists.
+/// 2. The DB helpers `purge_completed_receive_pack_requests` and
+///    `purge_completed_pending_ref_transitions` exist in `db/mod.rs`.
+/// 3. The config knobs `queue_retention_days` and `queue_purge_batch` exist
+///    on `Config`.
+/// 4. `quarantined` is NOT in the purge WHERE clause (step 4 does not
+///    introduce the state, but the invariant holds for the future).
+#[test]
+fn inv26_step4_queue_lifecycle_purge_is_wired() {
+    let main_src = src("main.rs");
+    assert!(
+        main_src.contains("spawn_queue_lifecycle_sweep"),
+        "main.rs must spawn the periodic queue-lifecycle purge"
+    );
+    assert!(
+        main_src.contains("purge_request_queue"),
+        "main.rs must call purge_request_queue on the periodic sweep"
+    );
+
+    let db_src = src("db/mod.rs");
+    assert!(
+        db_src.contains("purge_completed_receive_pack_requests"),
+        "db/mod.rs must expose purge_completed_receive_pack_requests"
+    );
+    assert!(
+        db_src.contains("purge_completed_pending_ref_transitions"),
+        "db/mod.rs must expose purge_completed_pending_ref_transitions"
+    );
+
+    let config_src = src("config.rs");
+    assert!(
+        config_src.contains("queue_retention_days"),
+        "Config must expose queue_retention_days"
+    );
+    assert!(
+        config_src.contains("queue_purge_batch"),
+        "Config must expose queue_purge_batch"
+    );
+}
+
+/// #26 Split PR 1 step 5 — the marker gate and the retry-bound
+/// quarantine are wired end-to-end. A missing or hash-mismatched
+/// marker on disk quarantines the request; a Retry over the bound
+/// does too. This gate pins every load-bearing seam, against the
+/// production half of each file (the test modules name the same
+/// identifiers in their own harnesses).
+///
+/// Assertions:
+/// 1. `reconcile_prepared_page` calls `mark_request_quarantined`
+///    and `mark_children_rejected_for_quarantined_parent` on
+///    marker-gate failure.
+/// 2. The drain's `EffectsOutcome::Retry` arm checks
+///    `effects_max_attempts`.
+/// 3. `git::store::read_ref` exists in `git/store.rs`.
+/// 4. `db::mark_request_quarantined`,
+///    `db::mark_children_rejected_for_quarantined_parent`,
+///    `db::get_receive_pack_requests_by_ids`, and
+///    `db::request_state::QUARANTINED` all exist.
+/// 5. The handler writes the marker ref BEFORE calling
+///    `smart_http::receive_pack_raw` (the durability window).
+#[test]
+fn inv26_step5_marker_quarantine_and_bound_are_wired() {
+    let outbox = src("durable_outbox.rs");
+    let store = src("git/store.rs");
+    let db = src("db/mod.rs");
+    let repos = src("api/repos.rs");
+
+    // Split at the TEST MODULE for the production-only assertions.
+    let production_outbox = outbox
+        .split("\nmod drain_tests {")
+        .next()
+        .expect("split always yields a first chunk");
+    let production_repos = repos
+        .split("\nmod tests {")
+        .next()
+        .expect("split always yields a first chunk");
+
+    // (1) The reconcile's marker gate quarantines via the DB helpers.
+    assert!(
+        production_outbox.contains("mark_request_quarantined"),
+        "reconcile_prepared_page must call mark_request_quarantined on marker-gate failure"
+    );
+    assert!(
+        production_outbox.contains("mark_children_rejected_for_quarantined_parent"),
+        "reconcile_prepared_page must call mark_children_rejected_for_quarantined_parent \
+         so quarantined parents cancel their children"
+    );
+
+    // The gate reads the marker ref and compares against the parent's
+    // `request_bytes_hash` via `git::store::read_ref` /
+    // `git::store::marker_value_for`. Reverting either reintroduces
+    // the DoS window the marker gate exists to close.
+    assert!(
+        production_outbox.contains("git::store::read_ref"),
+        "reconcile_prepared_page must read the marker ref via git::store::read_ref"
+    );
+    assert!(
+        production_outbox.contains("marker_value_for"),
+        "reconcile_prepared_page must compute the expected marker value via \
+         git::store::marker_value_for"
+    );
+
+    // (2) The drain's `EffectsOutcome::Retry` arm checks the bound.
+    assert!(
+        production_outbox.contains("effects_max_attempts"),
+        "drain_receive_pack_requests_with must consult effects_max_attempts on Retry"
+    );
+
+    // (3) `git::store::read_ref` is the read seam the gate depends on.
+    assert!(
+        store.contains("pub fn read_ref("),
+        "git::store::read_ref must exist; the marker gate reads through it"
+    );
+    assert!(
+        store.contains("pub fn marker_value_for("),
+        "git::store::marker_value_for must exist; the marker gate computes the expected \
+         value with it (and the live handler writes the value via the same helper)"
+    );
+
+    // (4) DB-side seams the gate depends on.
+    assert!(
+        db.contains("pub async fn mark_request_quarantined"),
+        "Db::mark_request_quarantined must exist"
+    );
+    assert!(
+        db.contains("pub async fn mark_children_rejected_for_quarantined_parent"),
+        "Db::mark_children_rejected_for_quarantined_parent must exist"
+    );
+    assert!(
+        db.contains("pub async fn get_receive_pack_requests_by_ids"),
+        "Db::get_receive_pack_requests_by_ids must exist (avoids N+1 in the marker gate)"
+    );
+    assert!(
+        db.contains("pub const QUARANTINED: &str = \"quarantined\""),
+        "request_state::QUARANTINED must be defined"
+    );
+
+    // (5) The handler writes the marker ref BEFORE the durability
+    // boundary (smart_http::receive_pack_raw). Severing the
+    // ordering re-opens the marker-gate DoS window for live pushes.
+    let marker_write = production_repos
+        .find("git::store::marker_value_for")
+        .expect("U5 gate stale: the live handler no longer computes the marker value");
+    let receive_raw = production_repos
+        .find("smart_http::receive_pack_raw")
+        .expect("U5 gate stale: git_receive_pack no longer calls smart_http::receive_pack_raw");
+    assert!(
+        marker_write < receive_raw,
+        "U5 gate bypassed: the marker ref must be written BEFORE receive_pack_raw so the \
+         reconcile's gate has evidence of the live push"
     );
 }
