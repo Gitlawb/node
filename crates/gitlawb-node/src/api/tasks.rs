@@ -126,14 +126,21 @@ pub async fn create_task(
     Ok((StatusCode::CREATED, Json(task_to_json(&task))))
 }
 
+const MAX_TASK_LIMIT: i64 = 200;
+
 /// GET /api/v1/tasks
 pub async fn list_tasks(
     State(state): State<AppState>,
     Query(q): Query<ListTasksQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Clamp client-provided limit before it reaches SQL. Negative values and
+    // absurdly large values are both bounded here to avoid DB errors and
+    // unbounded table scans / serialization.
+    let limit = q.limit.clamp(1, MAX_TASK_LIMIT);
+
     let tasks = state
         .db
-        .list_tasks(q.status.as_deref(), q.assignee_did.as_deref(), q.limit)
+        .list_tasks(q.status.as_deref(), q.assignee_did.as_deref(), limit)
         .await
         .map_err(|e| {
             (
@@ -296,4 +303,154 @@ pub async fn fail_task(
         at: Utc::now().to_rfc3339(),
     });
     Ok(Json(task_to_json(&task)))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::test_state;
+    use sqlx::PgPool;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use tower::ServiceExt;
+    use serde_json::Value;
+    use chrono::Utc;
+    use axum::Router;
+
+    const OWNER: &str = "did:key:zTASKOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    #[sqlx::test]
+    async fn tasks_negative_limit_clamped(pool: PgPool) {
+        let state = test_state(pool).await;
+        // seed two tasks to verify clamp to 1 instead of default 50
+        let now = Utc::now().to_rfc3339();
+        for id in &["task-negative-1", "task-negative-2"] {
+            state
+                .db
+                .create_task(&crate::db::AgentTask {
+                    id: (*id).to_string(),
+                    repo_id: None,
+                    kind: "build".to_string(),
+                    status: "pending".to_string(),
+                    delegator_did: OWNER.to_string(),
+                    assignee_did: None,
+                    capability: "repo:write".to_string(),
+                    ucan_token: None,
+                    payload: None,
+                    result: None,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                    deadline: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let router = Router::new()
+            .route("/api/v1/tasks", axum::routing::get(super::list_tasks))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/tasks?limit=-1")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["count"].as_u64().unwrap(), 1);
+        assert_eq!(body["tasks"].as_array().unwrap().len(), 1);
+    }
+
+    #[sqlx::test]
+    async fn tasks_limit_ceiling_clamped_to_200(pool: PgPool) {
+        let state = test_state(pool).await;
+        let now = Utc::now().to_rfc3339();
+        for i in 0..201 {
+            state
+                .db
+                .create_task(&crate::db::AgentTask {
+                    id: format!("task-ceil-{i}"),
+                    repo_id: None,
+                    kind: "build".to_string(),
+                    status: "pending".to_string(),
+                    delegator_did: OWNER.to_string(),
+                    assignee_did: None,
+                    capability: "repo:write".to_string(),
+                    ucan_token: None,
+                    payload: None,
+                    result: None,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                    deadline: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let router = Router::new()
+            .route("/api/v1/tasks", axum::routing::get(super::list_tasks))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/tasks?limit=9223372036854775807")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        // Should be clamped to 200
+        assert_eq!(body["tasks"].as_array().unwrap().len(), 200);
+        assert_eq!(body["count"].as_u64().unwrap(), 200);
+    }
+
+    #[sqlx::test]
+    async fn tasks_omitted_limit_defaults_to_50(pool: PgPool) {
+        let state = test_state(pool).await;
+        let now = Utc::now().to_rfc3339();
+        for i in 0..60 {
+            state
+                .db
+                .create_task(&crate::db::AgentTask {
+                    id: format!("task-default-{i}"),
+                    repo_id: None,
+                    kind: "build".to_string(),
+                    status: "pending".to_string(),
+                    delegator_did: OWNER.to_string(),
+                    assignee_did: None,
+                    capability: "repo:write".to_string(),
+                    ucan_token: None,
+                    payload: None,
+                    result: None,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                    deadline: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let router = Router::new()
+            .route("/api/v1/tasks", axum::routing::get(super::list_tasks))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/tasks")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["tasks"].as_array().unwrap().len(), 50);
+        assert_eq!(body["count"].as_u64().unwrap(), 50);
+    }
 }
