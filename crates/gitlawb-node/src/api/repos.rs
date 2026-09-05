@@ -1380,14 +1380,17 @@ async fn pin_new_objects_gated(
     db: &Arc<crate::db::Db>,
     repo_id: &str,
     batch_budget: std::time::Duration,
-) -> Vec<(String, String)> {
+) -> crate::ipfs_pin::PinBatchOutcome {
     // Nothing to pin: answer before taking a permit (#174 F2b). The permit bounds how
     // many pin loops run concurrently, and an empty list does no pinning, so parking
     // here would spend a global pin slot on no work. The pool DEFERS rather
     // than sheds, so those calls stall pins for every other repo. Empty is the normal
     // shape for a push whose walk failed or that may replicate nothing.
     if object_list.is_empty() {
-        return Vec::new();
+        return crate::ipfs_pin::PinBatchOutcome {
+            confirmed: Vec::new(),
+            last_attempted: None,
+        };
     }
     let _permit = pin_sem
         .clone()
@@ -1438,9 +1441,9 @@ async fn pin_and_encrypt_objects(
         crate::ipfs_pin::PIN_BATCH_BUDGET,
     )
     .await;
-    if !pinned.is_empty() {
-        tracing::info!(count = pinned.len(), "pinned git objects to IPFS");
-        for (sha, cid) in &pinned {
+    if !pinned.confirmed.is_empty() {
+        tracing::info!(count = pinned.confirmed.len(), "pinned git objects to IPFS");
+        for (sha, cid) in &pinned.confirmed {
             tracing::info!(sha = %sha, %cid, "pinned");
         }
     }
@@ -2746,15 +2749,27 @@ async fn post_receive_replication_tail(
                     .await,
                 )
             } else {
-                (false, Vec::new())
+                (
+                    false,
+                    crate::ipfs_pin::PinBatchOutcome {
+                        confirmed: Vec::new(),
+                        last_attempted: None,
+                    },
+                )
             };
 
-            if !pinned.is_empty() {
-                tracing::info!(count = pinned.len(), "pinned git objects to Pinata");
+            if !pinned.confirmed.is_empty() {
+                tracing::info!(
+                    count = pinned.confirmed.len(),
+                    "pinned git objects to Pinata"
+                );
             }
 
-            // Build sha→cid map from pinned objects
-            let cid_map: std::collections::HashMap<String, String> = pinned.into_iter().collect();
+            // Build sha→cid map from durably recorded pins only: an
+            // unconfirmed provider upload must not drive branch/gossip CID
+            // state for a row the resolver cannot serve.
+            let cid_map: std::collections::HashMap<String, String> =
+                pinned.confirmed.into_iter().collect();
 
             // Record branch→CID for each ref update and publish gossip
             for (ref_name, old_sha, new_sha) in &ref_updates_clone {
@@ -6969,7 +6984,7 @@ mod tests {
         )
         .await
         .expect("the pin loop completes once admission frees");
-        assert!(out.is_empty(), "an empty ipfs_api pins nothing");
+        assert!(out.confirmed.is_empty(), "an empty ipfs_api pins nothing");
     }
 
     /// #173 F3, at the layer that actually owns the permit. `pin_new_objects_gated`
@@ -6981,8 +6996,8 @@ mod tests {
     /// permit comes back, even though the table is still locked.
     ///
     /// The endpoint is a LIVE mockito server, not the `""` the sibling test above
-    /// uses. `ipfs_pin::pin_new_objects` returns `vec![]` immediately on an empty
-    /// `ipfs_api`, so an empty-string copy would never reach `is_pinned`, never touch
+    /// uses. `ipfs_pin::pin_new_objects` returns an empty outcome immediately on an
+    /// empty `ipfs_api`, so an empty-string copy would never reach `is_pinned`, never touch
     /// the locked table, and pass identically with the bound deleted. The mock is at
     /// `.expect(0)` because a stalled pinned-status check must not fall through to an
     /// add.
@@ -7044,7 +7059,10 @@ mod tests {
              budget",
         );
 
-        assert!(out.is_empty(), "a stalled pinned-status check pins nothing");
+        assert!(
+            out.confirmed.is_empty(),
+            "a stalled pinned-status check pins nothing"
+        );
         assert_eq!(
             pin_sem.available_permits(),
             1,
@@ -7091,7 +7109,7 @@ mod tests {
         )
         .await
         .expect("an empty object list must not wait on pin admission (#174 F2b)");
-        assert!(out.is_empty(), "and it pins nothing");
+        assert!(out.confirmed.is_empty(), "and it pins nothing");
         assert_eq!(
             pin_sem.available_permits(),
             0,

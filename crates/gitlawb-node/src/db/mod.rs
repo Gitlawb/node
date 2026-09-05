@@ -1216,7 +1216,7 @@ const MIGRATIONS: &[Migration] = &[
             // durability gap no other sweep pass would close.
             //
             // This migration adds a per-row boolean that ONLY the local
-            // IPFS writer sets. After v30 the durable contract is:
+            // IPFS writer sets. After v35 the durable contract is:
             //
             //   `local_ipfs_provenance = TRUE` ↔ this row was written by
             //   the local IPFS pin path (`record_pinned_cid_with_source`),
@@ -1230,30 +1230,27 @@ const MIGRATIONS: &[Migration] = &[
             // key — the new column is an internal durability signal and
             // never leaves the resolver / gap-filter boundary.
             //
-            // STRICT backfill (#218 review P1a): mark as locally pinned
-            // ONLY the rows that are unambiguously local IPFS — `cid`
-            // set and no Pinata CID. The permissive alternative
-            // `cid <> pinata_cid` was wrong because pre-v30
-            // `record_pinata_cid` deliberately produced exactly that
-            // shape (`cid = raw resolver key, pinata_cid = provider
-            // CID, cid != pinata_cid`) for ordinary Pinata-first
-            // uploads without a local Kubo push. The permissive
-            // backfill would mark those rows as locally pinned, the
-            // sweep would filter them as "already durable" via
-            // `has_ipfs_cid = FALSE -> filter excludes them`, and the
-            // operator enabling IPFS later would never get a local
-            // recovery copy. The strict rule leaves dual-shape rows
-            // at the safe default (`FALSE`); the next sweep pass
-            // re-derives by re-pinning, which is cheap and idempotent
-            // (Kubo is idempotent; `record_pinned_cid_with_source`
-            // upgrades the flag on the conflict branch).
+            // NO backfill to TRUE (unknown-migration): even the
+            // "unambiguous" shape (`cid` set, no Pinata CID) is NOT
+            // evidence of a Kubo write. Before the strict `Hash`
+            // response parsing, a 2xx Kubo response with no `Hash`
+            // (wrong-port health endpoint, HTML proxy, truncated body)
+            // fell back to the locally expected CID and wrote exactly
+            // that row with nothing proving the bytes reached the
+            // daemon. Marking it TRUE would let the sweep filter it as
+            // "already durable" forever. Every pre-v35 row therefore
+            // lands at the safe default (`FALSE`, i.e. unknown), the
+            // next sweep pass re-pins to establish provenance — cheap
+            // and idempotent (Kubo is idempotent;
+            // `record_pinned_cid_with_source` upgrades the flag on the
+            // conflict branch) — and a still-misconfigured endpoint
+            // simply fails the re-pin (strict parsing) instead of
+            // regenerating a phantom row. Pinata history is preserved
+            // untouched: `pinata_cid` values are never rewritten here.
             //
-            // NOT NULL DEFAULT FALSE so a pre-v30 row that somehow
-            // slips through the backfill WHERE reads as "Pinata-only"
-            // and gets the safe default; the next sweep pass
-            // re-derives provenance on a re-pin.
+            // NOT NULL DEFAULT FALSE so every pre-v35 row reads as
+            // unknown and gets re-derived on re-pin.
             "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS local_ipfs_provenance BOOLEAN NOT NULL DEFAULT FALSE",
-            "UPDATE pinned_cids SET local_ipfs_provenance = TRUE WHERE cid IS NOT NULL AND pinata_cid IS NULL",
             // Partial index — only ~all-true rows in steady state, but
             // partial because the gap filter (`filter_ipfs_pinned_oids`)
             // reads `local_ipfs_provenance = TRUE` and the planner will
@@ -1291,15 +1288,20 @@ const MIGRATIONS: &[Migration] = &[
             // Pinata and IPFS are independent writers with independent
             // failure modes, and a per-repo cursor would conflate the
             // two. PRIMARY KEY (repo_id, backend) keeps the writes
-            // O(1) per pass; the table grows with the number of repos
-            // the sweep has ever partially processed, which is bounded
-            // by the node's repo count and prunes back to zero on
-            // completion. `next_oid` is the LAST attempted OID (the
-            // rotation in `missing_oids` is "strictly greater than"),
-            // and `done` marks a previously-completed pass so a stale
-            // row never resumes after the missing set has emptied.
+            // O(1) per pass; the table holds only pairs with outstanding
+            // work — completion DELETES the row (absence is the fresh
+            // start), so no tombstone accumulates and no hourly
+            // rewrite touches a drained pair. `next_oid` is the LAST
+            // attempted OID (the rotation in `missing_oids` is
+            // "strictly greater than"). The `done` column is retained
+            // for tolerant reads of rows written before the
+            // delete-on-drain contract, but no writer sets it anymore.
+            // The foreign key ties cursor lifetime to the repo row:
+            // deleting a repo cascades its offsets so a recreated
+            // identity (always a fresh UUID) can never resume a stale
+            // continuation.
             "CREATE TABLE IF NOT EXISTS reconciliation_offset (
-                 repo_id    TEXT NOT NULL,
+                 repo_id    TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
                  backend    TEXT NOT NULL,
                  next_oid   TEXT NOT NULL,
                  done       BOOLEAN NOT NULL DEFAULT FALSE,
@@ -3071,9 +3073,11 @@ impl Db {
     }
 
     /// Persist a (repo, backend) continuation. `next_oid = None` means
-    /// "this pass completed; mark done". On a real continuation the row is
-    /// upserted with `done = FALSE` so the next pass resumes from the
-    /// stored OID.
+    /// "this pass completed" and DELETES the row: absence is the fresh
+    /// start, so completed state prunes back to zero instead of
+    /// refreshing a tombstone every hour. On a real continuation the
+    /// row is upserted with `done = FALSE` so the next pass resumes
+    /// from the stored OID.
     ///
     /// The `next_oid` value the caller hands in MUST be the LAST OID
     /// actually attempted this pass (i.e. the max OID in the truncated
@@ -3105,33 +3109,18 @@ impl Db {
                 .await?;
             }
             None => {
-                sqlx::query(
-                    "INSERT INTO reconciliation_offset (repo_id, backend, next_oid, done, updated_at)
-                     VALUES ($1, $2, '', TRUE, $3)
-                     ON CONFLICT (repo_id, backend) DO UPDATE SET
-                         next_oid = '',
-                         done = TRUE,
-                         updated_at = EXCLUDED.updated_at",
-                )
-                .bind(repo_id)
-                .bind(backend)
-                .bind(Utc::now().to_rfc3339())
-                .execute(&self.pool)
-                .await?;
+                self.clear_reconciliation_offset(repo_id, backend).await?;
             }
         }
         Ok(())
     }
 
-    /// Remove a (repo, backend) row entirely. Used when the sweep cannot
-    /// make progress on this pair (e.g. the repo disappeared from disk or
-    /// was quarantined mid-pass) so the next pass does not resume a stale
-    /// offset against a now-different missing set. Not currently called
-    /// from the sweep loop itself (the early-skip paths would add a DB
-    /// round-trip per skipped repo) but kept on `Db` as the durable
-    /// seam for future operational tooling that needs to invalidate a
-    /// persisted offset without going through a full pass.
-    #[allow(dead_code)]
+    /// Delete a (repo, backend) continuation row. Completion prunes
+    /// instead of tombstoning: absence already means "fresh start", so
+    /// a drained pair holds no row and a later empty pass writes
+    /// nothing. Also the invalidation seam when the sweep cannot make
+    /// progress on a pair — the next pass does not resume a stale
+    /// offset against a now-different missing set.
     pub async fn clear_reconciliation_offset(&self, repo_id: &str, backend: &str) -> Result<()> {
         sqlx::query("DELETE FROM reconciliation_offset WHERE repo_id = $1 AND backend = $2")
             .bind(repo_id)
@@ -4188,6 +4177,61 @@ impl Db {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Verify a Pinata record after its write timed out: true only if the
+    /// exact row exists AND the fence epoch still matches. A timed-out
+    /// `record_pinata_cid` is an explicit multi-statement transaction, so
+    /// cancellation before COMMIT wrote nothing and cancellation during
+    /// COMMIT is unknown — neither may count as durable on its own. This
+    /// read-after-timeout closes that: a row the timed-out attempt (or an
+    /// earlier identical attempt — content match, not causality) durably
+    /// landed still counts; anything else stays non-durable and the gap is
+    /// re-offered. Single statement, so the row and the epoch come from one
+    /// snapshot. Any error (including a stall of this read itself) is
+    /// returned and the caller treats it as unverified.
+    pub async fn verify_pinata_record(
+        &self,
+        sha256_hex: &str,
+        raw_cid: &str,
+        pinata_cid: &str,
+        repo_id: &str,
+        fence_epoch: i64,
+    ) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT c.cid AS cid, c.pinata_cid AS pinata_cid, r.policy_epoch AS epoch
+             FROM pinned_cids c JOIN repos r ON r.id = $2
+             WHERE c.sha256_hex = $1",
+        )
+        .bind(sha256_hex)
+        .bind(repo_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let stored_pinata: Option<String> = row.get("pinata_cid");
+        if stored_pinata.as_deref() != Some(pinata_cid) {
+            return Ok(false);
+        }
+        // Mirror the record shape: equal CIDs store cid NULL, distinct
+        // CIDs store the raw resolver key.
+        let stored_cid: Option<String> = row.get("cid");
+        let cid_ok = if raw_cid == pinata_cid {
+            stored_cid.is_none()
+        } else {
+            stored_cid.as_deref() == Some(raw_cid)
+        };
+        if !cid_ok {
+            return Ok(false);
+        }
+        if fence_epoch != i64::MAX {
+            let epoch: i64 = row.get("epoch");
+            if epoch != fence_epoch {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -6024,31 +6068,21 @@ mod migration_tests {
 
         // Classification: has_ipfs_cid.
         //
-        // (#218 review P1a) the v12 contract — "cid set, no pinata, OR cid
-        // != pinata" — was sufficient only as a v27-era approximation
-        // (after v27 cleared `cid = pinata_cid` rows). The v30 strict
-        // backfill replaces it: only `cid IS NOT NULL AND pinata_cid IS
-        // NULL` rows are real local IPFS pins. The "both distinct"
-        // shape is ambiguous pre-v30 (could be a real local pin
-        // followed by Pinata, or a Pinata-first upload that the writer
-        // happened to set cid=raw on) and the strict rule leaves it
-        // out of the IPFS-pinned set; the next sweep pass re-derives
-        // by re-pinning (cheap, idempotent). The new
+        // Unknown-migration (v35): EVERY pre-migration row reads FALSE,
+        // including the local-shaped `sha_real_only`. Column shape is
+        // not evidence of a Kubo write — the pre-fix writer produced
+        // exactly that shape on 2xx-without-`Hash` responses — so no
+        // backfill may promote any row to durable. The next sweep pass
+        // re-pins to establish provenance (see
+        // `sweep_rederives_legacy_unknown_row_by_repinning`); the
         // `local_ipfs_provenance` column is the authoritative
         // predicate and `has_ipfs_cid` keys on it.
-        assert!(
-            db.has_ipfs_cid("sha_real_only").await.unwrap(),
-            "real local IPFS CID must be classified as pinned"
-        );
-        assert!(
-            !db.has_ipfs_cid("sha_both_distinct").await.unwrap(),
-            "distinct-cid + pinata_cid row is ambiguous pre-v30 and the strict backfill \
-             leaves it out of the IPFS-pinned set; the next sweep pass re-derives"
-        );
-        assert!(
-            !db.has_ipfs_cid("sha_legacy_fallback").await.unwrap(),
-            "legacy equal-cid row must NOT be classified as having an IPFS CID"
-        );
+        for sha in ["sha_real_only", "sha_both_distinct", "sha_legacy_fallback"] {
+            assert!(
+                !db.has_ipfs_cid(sha).await.unwrap(),
+                "{sha} must read as unknown (FALSE) until a re-pin establishes provenance"
+            );
+        }
 
         // has_pinata_cid.
         assert!(
@@ -6185,14 +6219,13 @@ mod migration_tests {
     /// post-migration `has_ipfs_cid` / `filter_ipfs_pinned_oids`
     /// classification.
     #[sqlx::test]
-    async fn migration_v35_backfills_local_ipfs_provenance_heuristically(pool: sqlx::PgPool) {
+    async fn migration_v35_leaves_legacy_rows_unknown_for_rederivation(pool: sqlx::PgPool) {
         let db = super::Db::for_testing(pool.clone());
 
-        // Build a pre-v30 schema: every migration through v29 applied.
-        // Then simulate a v30 upgrade by removing the v30 record from
-        // schema_migrations, dropping the v30 column, and re-running
-        // `migrate()` so v30 lands on the seeded rows. The v12 test
-        // below uses the same pattern.
+        // Build a pre-v35 schema: every migration applied, then forget
+        // v35 (drop the column and index, delete the migration record)
+        // and re-run `migrate()` so v35 lands on the seeded rows. The
+        // v12 test below uses the same pattern.
         db.migrate().await.unwrap();
 
         // Reset to a pre-v35 schema: drop the v35 column and the
@@ -6210,7 +6243,7 @@ mod migration_tests {
             .await
             .unwrap();
 
-        // Sanity: pre-v30 — the column does not exist.
+        // Sanity: pre-v35 — the column does not exist.
         let col_pre: bool = sqlx::query_scalar(
             "SELECT EXISTS (
                SELECT 1 FROM information_schema.columns
@@ -6223,7 +6256,7 @@ mod migration_tests {
         .unwrap();
         assert!(
             !col_pre,
-            "pre-v30 schema must not have the local_ipfs_provenance column"
+            "pre-v35 schema must not have the local_ipfs_provenance column"
         );
 
         // Seed the four row shapes. The shapes are the same as the v12
@@ -6245,25 +6278,29 @@ mod migration_tests {
             .unwrap();
         };
 
-        // (1) Real local IPFS pin, no Pinata → provenance will backfill as TRUE.
+        // (1) Legacy local-shaped row: cid set, no Pinata. Genuine iff a
+        // Kubo add really stored the bytes — but the pre-fix writer also
+        // produced EXACTLY this shape on a 2xx response with no `Hash`
+        // (wrong-port health endpoint, HTML proxy, truncated body), so
+        // the column pattern cannot prove it. Unknown, not TRUE.
         seed("sha_v30_real_only", Some("QmRealLocalCid"), None).await;
-        // (2) Both CIDs present and distinct → provenance will backfill as TRUE.
+        // (2) Both CIDs present and distinct → unknown.
         seed(
             "sha_v30_both_distinct",
             Some("QmLocalForThisBlob"),
             Some("QmPinataForThisBlob"),
         )
         .await;
-        // (3) Pinata-only (post-v27 NULL cid, pinata_cid set) → provenance stays FALSE.
+        // (3) Pinata-only (post-v27 NULL cid, pinata_cid set) → FALSE.
         seed("sha_v30_pinata_only", None, Some("QmPinataOnlyCid")).await;
-        // (4) Pinata-only with a provider CID. Post-v27 schema makes
-        //     cid NULL, so the backfill leaves provenance at the default.
+        // (4) Pinata-only with a provider CID → FALSE.
         seed("sha_v30_pinata_provider", None, Some("QmPinataProviderCid")).await;
 
-        // Apply v30 by re-running `migrate()`. The runner sees v30
+        // Apply v35 by re-running `migrate()`. The runner sees v35
         // missing from `schema_migrations` and runs the migration body:
-        // the `ALTER TABLE` adds the column, the `UPDATE` backfills
-        // the rows seeded above, and the partial index is created.
+        // the `ALTER TABLE` adds the column (default FALSE) and the
+        // partial index is created. There is deliberately NO backfill
+        // UPDATE: no column pattern proves a Kubo write happened.
         db.migrate().await.unwrap();
 
         // The column now exists with the documented default.
@@ -6279,23 +6316,16 @@ mod migration_tests {
         .unwrap();
         assert!(
             col_exists,
-            "v30 migration must add the local_ipfs_provenance column"
+            "v35 migration must add the local_ipfs_provenance column"
         );
 
-        // The backfill is one UPDATE keyed on the STRICT rule
-        // `cid IS NOT NULL AND pinata_cid IS NULL`
-        // (#218 review P1a: the previous permissive `cid <> pinata_cid`
-        // clause mis-classified pre-v30 Pinata-first uploads as
-        // local IPFS pins, because `record_pinata_cid` deliberately
-        // produced exactly that shape for ordinary Pinata-first
-        // uploads without a local Kubo push):
-        //   sha_v30_real_only        → TRUE  (cid set, no Pinata)
-        //   sha_v30_both_distinct    → FALSE (cid set, Pinata set —
-        //                                ambiguous pre-v30, the strict
-        //                                backfill errs on the safe side
-        //                                and the sweep re-derives)
-        //   sha_v30_pinata_only      → FALSE (cid is NULL)
-        //   sha_v30_pinata_provider  → FALSE (cid is NULL)
+        // Unknown-migration: EVERY pre-v35 row reads FALSE, including
+        // the local-shaped (1). A genuine legacy pin and a phantom
+        // 2xx/no-Hash row are byte-identical in the table, so trusting
+        // either would let the sweep filter the phantom as "already
+        // durable" forever. The next sweep pass re-pins to establish
+        // provenance (cheap, idempotent); Pinata history is preserved
+        // untouched for (2)–(4).
         let provenance = |sha: &str| {
             let pool = pool.clone();
             let sha = sha.to_string();
@@ -6311,72 +6341,77 @@ mod migration_tests {
             }
         };
 
+        for sha in [
+            "sha_v30_real_only",
+            "sha_v30_both_distinct",
+            "sha_v30_pinata_only",
+            "sha_v30_pinata_provider",
+        ] {
+            assert_eq!(
+                provenance(sha).await,
+                Some(false),
+                "{sha} must migrate as unknown (FALSE), even the local-shaped row: \
+                 column shape is not evidence of a Kubo write"
+            );
+        }
+
+        // Pinata history survives the migration verbatim.
+        let pinata_of = |sha: &str| {
+            let pool = pool.clone();
+            let sha = sha.to_string();
+            async move {
+                let row: Option<String> =
+                    sqlx::query_scalar("SELECT pinata_cid FROM pinned_cids WHERE sha256_hex = $1")
+                        .bind(&sha)
+                        .fetch_optional(&pool)
+                        .await
+                        .unwrap();
+                row
+            }
+        };
         assert_eq!(
-            provenance("sha_v30_real_only").await,
-            Some(true),
-            "(1) real local IPFS pin must backfill as provenance = TRUE"
+            pinata_of("sha_v30_both_distinct").await.as_deref(),
+            Some("QmPinataForThisBlob"),
+            "dual-row provider history must survive the migration"
         );
         assert_eq!(
-            provenance("sha_v30_both_distinct").await,
-            Some(false),
-            "(2) both-CIDs-distinct row is ambiguous pre-v30 (could be a real local \
-             pin followed by Pinata, or a Pinata-first upload that the writer \
-             happened to set cid=raw on); the strict backfill errs on the safe \
-             side and the next sweep pass re-derives provenance on a re-pin"
-        );
-        assert_eq!(
-            provenance("sha_v30_pinata_only").await,
-            Some(false),
-            "(3) Pinata-only row (cid NULL) must stay provenance = FALSE"
-        );
-        assert_eq!(
-            provenance("sha_v30_pinata_provider").await,
-            Some(false),
-            "(4) Pinata-only provider-CID row (cid NULL) must stay provenance = FALSE"
+            pinata_of("sha_v30_pinata_only").await.as_deref(),
+            Some("QmPinataOnlyCid"),
+            "pinata-only provider history must survive the migration"
         );
 
         // The classification predicate `has_ipfs_cid` keys on
-        // `local_ipfs_provenance = TRUE`. Under the STRICT backfill:
-        // (1) is TRUE (cid set, no Pinata), (2) is FALSE (ambiguous
-        // pre-v30 dual shape, the strict rule leaves it Pinata-only
-        // and the sweep re-derives), (3) and (4) are FALSE (cid NULL).
-        // The integration test
-        // `sweep_promotes_pinata_only_to_local_ipfs_when_writer_invoked`
-        // covers the writer upgrade path that brings a Pinata-only
-        // row into the IPFS-pinned set on a later local IPFS push.
-        assert!(
-            db.has_ipfs_cid("sha_v30_real_only").await.unwrap(),
-            "(1) has_ipfs_cid must report TRUE for the backfilled real-IPFS row"
-        );
-        assert!(
-            !db.has_ipfs_cid("sha_v30_both_distinct").await.unwrap(),
-            "(2) has_ipfs_cid must report FALSE for an ambiguous pre-v30 dual row; the \
-             strict backfill errs on the safe side and the sweep re-derives"
-        );
-        assert!(
-            !db.has_ipfs_cid("sha_v30_pinata_only").await.unwrap(),
-            "(3) has_ipfs_cid must report FALSE for a Pinata-only row (cid NULL post-v27)"
-        );
-        assert!(
-            !db.has_ipfs_cid("sha_v30_pinata_provider").await.unwrap(),
-            "(4) has_ipfs_cid must report FALSE for a Pinata-only provider-CID row"
-        );
+        // `local_ipfs_provenance = TRUE`, so nothing is classified as
+        // locally pinned yet — not even the local-shaped row. The
+        // integration test
+        // `sweep_rederives_legacy_unknown_row_by_repinning`
+        // covers the writer path that brings such a row into the
+        // IPFS-pinned set on the next sweep pass.
+        for sha in [
+            "sha_v30_real_only",
+            "sha_v30_both_distinct",
+            "sha_v30_pinata_only",
+            "sha_v30_pinata_provider",
+        ] {
+            assert!(
+                !db.has_ipfs_cid(sha).await.unwrap(),
+                "{sha} must report FALSE until a re-pin establishes provenance"
+            );
+        }
 
         // The gap filter used by the sweep (`filter_ipfs_pinned_oids`)
-        // follows the same predicate.
+        // follows the same predicate: unknown rows are re-offered,
+        // never filtered as durable.
         let candidates = vec![
             "sha_v30_real_only".to_string(),
             "sha_v30_both_distinct".to_string(),
             "sha_v30_pinata_only".to_string(),
             "sha_v30_pinata_provider".to_string(),
         ];
-        let mut filtered = db.filter_ipfs_pinned_oids(&candidates).await.unwrap();
-        filtered.sort();
-        assert_eq!(
-            filtered,
-            vec!["sha_v30_real_only".to_string()],
-            "filter_ipfs_pinned_oids must return only the local-IPFS-provenance rows; \
-             under the strict backfill, only the cid-set-no-pinata row qualifies"
+        let filtered = db.filter_ipfs_pinned_oids(&candidates).await.unwrap();
+        assert!(
+            filtered.is_empty(),
+            "no migrated row may read as durable before re-derivation; got {filtered:?}"
         );
     }
 
@@ -10228,6 +10263,106 @@ mod policy_fence_tests {
         assert!(
             err.contains("policy epoch row missing"),
             "the abort message names the failure class, got: {err}"
+        );
+    }
+
+    /// `verify_pinata_record` is the read half of the timed-out-write
+    /// contract: true only for the exact row content with a matching fence
+    /// epoch. Covers the four unconfirmed shapes a timed-out
+    /// `record_pinata_cid` must not count as durable.
+    #[sqlx::test]
+    async fn verify_pinata_record_proves_exact_row_and_epoch(pool: PgPool) {
+        let db = db(pool).await;
+        let repo_id = seed_repo(&db).await;
+        let epoch = db.repo_policy_epoch(&repo_id).await.unwrap();
+        db.record_pinata_cid(
+            "sha-vrf-1",
+            "cid-raw-vrf-1",
+            "cid-prov-vrf-1",
+            Some(&repo_id),
+            epoch,
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.verify_pinata_record(
+                "sha-vrf-1",
+                "cid-raw-vrf-1",
+                "cid-prov-vrf-1",
+                &repo_id,
+                epoch
+            )
+            .await
+            .unwrap(),
+            "the exact row with a matching epoch verifies"
+        );
+        assert!(
+            !db.verify_pinata_record(
+                "sha-vrf-1",
+                "cid-raw-vrf-1",
+                "cid-other-provider",
+                &repo_id,
+                epoch
+            )
+            .await
+            .unwrap(),
+            "a different provider CID must not verify"
+        );
+        assert!(
+            !db.verify_pinata_record(
+                "sha-vrf-1",
+                "cid-other-raw",
+                "cid-prov-vrf-1",
+                &repo_id,
+                epoch
+            )
+            .await
+            .unwrap(),
+            "a different raw CID must not verify"
+        );
+        assert!(
+            !db.verify_pinata_record(
+                "sha-vrf-absent",
+                "cid-raw-vrf-1",
+                "cid-prov-vrf-1",
+                &repo_id,
+                epoch
+            )
+            .await
+            .unwrap(),
+            "a missing row must not verify"
+        );
+        // A narrow landing after the write must invalidate the proof even
+        // though the row is still present.
+        db.bump_repo_policy_epoch(&repo_id).await.unwrap();
+        assert!(
+            !db.verify_pinata_record(
+                "sha-vrf-1",
+                "cid-raw-vrf-1",
+                "cid-prov-vrf-1",
+                &repo_id,
+                epoch
+            )
+            .await
+            .unwrap(),
+            "a moved epoch must not verify against the captured one"
+        );
+        // Equal-CID shape stores cid NULL; verification matches that shape.
+        let epoch2 = db.repo_policy_epoch(&repo_id).await.unwrap();
+        db.record_pinata_cid("sha-vrf-2", "cid-same", "cid-same", Some(&repo_id), epoch2)
+            .await
+            .unwrap();
+        assert!(
+            db.verify_pinata_record("sha-vrf-2", "cid-same", "cid-same", &repo_id, epoch2)
+                .await
+                .unwrap(),
+            "the equal-CID NULL shape verifies against itself"
+        );
+        assert!(
+            db.verify_pinata_record("sha-vrf-2", "cid-same", "cid-same", &repo_id, i64::MAX)
+                .await
+                .unwrap(),
+            "the unfenced sentinel skips the epoch comparison"
         );
     }
 }

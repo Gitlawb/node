@@ -185,10 +185,13 @@ fn rev_list_delta(
 /// List every object in the repository via
 /// `git cat-file --batch-all-objects --batch-check='%(objectname)'`.
 ///
-/// This is the whole-repo enumeration the push path falls back to and the
-/// reconciliation sweep relies on. It returns *all* objects (including
-/// unreachable/dangling ones), which is what the sweep needs to catch
-/// stragglers — do not swap it for a reachability walk.
+/// This is the whole-repo enumeration the push path falls back to. It
+/// returns *all* objects (including unreachable/dangling ones), which is
+/// what the push path needs to catch stragglers — do not swap it for a
+/// reachability walk. The reconciliation sweep no longer uses it: sweep
+/// candidates come from the windowed walk (window commits plus walked
+/// pairs), which are reachable by construction, so dangling objects are
+/// absent rather than filtered.
 pub fn list_all_objects(repo_path: &Path, git_bin: &str, deadline: Instant) -> Result<Vec<String>> {
     let out = crate::git::visibility_pack::run_bounded_git(
         git_bin,
@@ -197,37 +200,6 @@ pub fn list_all_objects(repo_path: &Path, git_bin: &str, deadline: Instant) -> R
             "--batch-all-objects",
             "--batch-check=%(objectname)",
         ],
-        repo_path,
-        b"",
-        deadline,
-    )?;
-    let stdout = String::from_utf8_lossy(&out);
-    Ok(stdout
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect())
-}
-
-/// The set of objects reachable from any ref, via
-/// `git rev-list --all --objects --no-object-names`.
-///
-/// The full-object-database enumeration ([`list_all_objects`]) contains
-/// dangling commits, trees, and blobs (`git cat-file --batch-all-objects` lists
-/// loose objects from an aborted or still-running push). Blob candidates are
-/// already fail-closed against the reachable, visibility-allowed set — but
-/// commits and trees have no path scoping to fail closed against, so the sweep
-/// must bound them to ref-reachability or an unreferenced commit's message,
-/// author, and parent links (and any unreferenced tree) would be published to a
-/// public IPFS/Pinata endpoint. This is that reachability bound.
-pub fn reachable_object_oids(
-    repo_path: &Path,
-    git_bin: &str,
-    deadline: Instant,
-) -> Result<HashSet<String>> {
-    let out = crate::git::visibility_pack::run_bounded_git(
-        git_bin,
-        &["rev-list", "--all", "--objects", "--no-object-names"],
         repo_path,
         b"",
         deadline,

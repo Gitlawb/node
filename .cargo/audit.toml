@@ -44,6 +44,12 @@ ignore = [
     # release that bumps 0.16.x to a fixed version would let this
     # ignore retire for the 0.16 range. REMOVE only when BOTH
     # lockfile versions are fixed (or removed).
+    # Retirement owner: node maintainers, enforced by the weekly
+    # audit-schedule drift guard ("Fail if lru moved while its ignore
+    # remains"), which fails if either locked version moves or lru
+    # leaves the tree. No separate tracking issue exists; file one
+    # against the lru upgrade if this waiver needs discussion outside
+    # the schedule job.
     "RUSTSEC-2026-0253",
     #
     # Round-3 P2 (reviewer 2): the previous version of this file

@@ -1465,6 +1465,19 @@ pub const PIN_BATCH_BUDGET: Duration = Duration::from_secs(120);
 /// narrow's epoch bump) refuses to land the raced row as durable.
 /// Multi-process / multi-node narrows are ordered by the same epoch column;
 /// no in-process registry is involved.
+///
+/// Product decision (revocation model): prompt revocation wins over
+/// publication atomicity. The suite intentionally allows one provider
+/// upload already in flight when a rule narrows and requires every
+/// LATER object to stop (`encrypt_and_pin_stops_sealing_when_reader_
+/// removed_mid_batch`). A stronger contract — revocation commit
+/// linearizing against every concurrent publication, or compensation
+/// (unpin/delete) for an envelope that finishes after removal — is
+/// explicitly OUT of scope until decided and documented here. Do not
+/// reintroduce batch-spanning mutual exclusion to close the
+/// single-in-flight window without that decision: it trades one
+/// possibly-raced object for sealing the whole batch to a removed
+/// reader.
 #[derive(Clone)]
 pub struct PolicyFence {
     db: crate::db::Db,
@@ -1797,6 +1810,29 @@ pub(crate) fn batch_budget_gate(
 ///
 /// Returns a list of `(sha256_hex, cid)` pairs pinned AND durably recorded this
 /// call.
+/// What one `pin_new_objects` call (IPFS or Pinata twin) did, with the
+/// three backend states kept apart instead of inferred from each other:
+///
+/// - `confirmed`: `(sha, provider_cid)` pairs whose DB record durably
+///   landed. ONLY these may advance `gaps_filled`, branch/gossip CID
+///   state, or any "repaired" bookkeeping. A provider upload whose
+///   record timed out, failed, or was refused by the fence is absent
+///   here even though the bytes may sit on the provider.
+/// - `last_attempted`: the last OID whose loop body was entered — i.e.
+///   the backend did real work for it (reads, an upload attempt, or a
+///   skip-branch decision), whether that work succeeded, failed, or hit
+///   an unknown outcome. `None` when nothing was entered (empty input,
+///   immediate fence abort, or immediate budget gate). Durable
+///   continuation cursors advance to this, never to the tail of the
+///   planned vector: the tail may never have been visited, and
+///   promoting it would rotate an untouched suffix behind the backlog
+///   forever.
+#[derive(Debug)]
+pub struct PinBatchOutcome {
+    pub confirmed: Vec<(String, String)>,
+    pub last_attempted: Option<String>,
+}
+
 // Eight because #173's git seam (`git_bin`, `git_timeout`) and pin provenance
 // (`repo_id`) sit alongside #174's batch budget. All four callers pass every one, and
 // grouping them into a context struct would add a type whose only job is to be
@@ -1812,14 +1848,18 @@ pub async fn pin_new_objects(
     repo_id: &str,
     batch_budget: Duration,
     fence: Option<&PolicyFence>,
-) -> Vec<(String, String)> {
+) -> PinBatchOutcome {
     if ipfs_api.is_empty() {
-        return vec![];
+        return PinBatchOutcome {
+            confirmed: Vec::new(),
+            last_attempted: None,
+        };
     }
 
     let deadline = Instant::now() + batch_budget;
     let total = object_list.len();
     let mut pinned = Vec::new();
+    let mut last_attempted: Option<String> = None;
 
     for (attempted, sha) in object_list.into_iter().enumerate() {
         // Policy fence (R1-P1): a visibility narrow that lands after the caller
@@ -1843,6 +1883,11 @@ pub async fn pin_new_objects(
         if batch_budget_gate("IPFS", deadline, pinned.len(), total - attempted).is_none() {
             break;
         }
+        // Attempt progress (not a durability claim): from here the loop does
+        // real work for this OID — skip-branch reads, airgapped git reads,
+        // an upload attempt — whatever the outcome. The caller persists
+        // this as the continuation, never the planned vector's tail.
+        last_attempted = Some(sha.clone());
         // Skip if the object is ALREADY a real local IPFS pin, but first
         // backfill provenance if the existing pin has none. A legacy pin
         // (recorded before repo_id existed, #173, jatmn) is skipped here
@@ -2188,7 +2233,10 @@ pub async fn pin_new_objects(
         }
     }
 
-    pinned
+    PinBatchOutcome {
+        confirmed: pinned,
+        last_attempted,
+    }
 }
 
 #[cfg(test)]
@@ -2647,9 +2695,9 @@ mod tests {
         .expect("wedge guard: a 5.5s budget cannot take 30s");
 
         assert!(
-            (1..=3).contains(&pinned.len()),
+            (1..=3).contains(&pinned.confirmed.len()),
             "the batch must stop partway, not pin all five and not stall on the first: pinned {}",
-            pinned.len()
+            pinned.confirmed.len()
         );
         let text = logs.text();
         let warns: Vec<&str> = text
@@ -2671,9 +2719,52 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("the deadline warn must name the unattempted count: {text}"));
         assert!(
-            unattempted >= 1 && unattempted + pinned.len() <= 5,
+            unattempted >= 1 && unattempted + pinned.confirmed.len() <= 5,
             "unattempted={unattempted} with {} pinned is not a partial batch of five",
-            pinned.len()
+            pinned.confirmed.len()
+        );
+    }
+
+    /// The outcome reports the last object actually ENTERED, not the planned
+    /// tail: the first upload hangs 6s against a ~2s per-request timeout, so
+    /// it fails, and the loop-top gate breaks the batch before the second
+    /// object starts. `last_attempted` must be the first OID — the only one
+    /// the loop body entered — even though nothing was confirmed and two
+    /// OIDs were never visited. A cursor persisted from `to_pin.last()`
+    /// would rotate the untouched suffix behind the backlog forever.
+    #[sqlx::test]
+    async fn pin_new_objects_reports_last_attempted_not_planned_tail(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("attempted.git");
+        let oids = seed_loose_blobs(&repo_path, 3);
+        let endpoint = delaying_endpoint(vec![Duration::from_secs(6)]).await;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            pin_new_objects(
+                &endpoint,
+                &repo_path,
+                "git",
+                Duration::from_secs(30),
+                oids.clone(),
+                &db,
+                "repo-attempted",
+                Duration::from_secs(2),
+                None,
+            ),
+        )
+        .await
+        .expect("a 2s budget cannot take 30s");
+        assert_eq!(
+            outcome.last_attempted,
+            Some(oids[0].clone()),
+            "only the first object was entered; the planned tail was never visited"
+        );
+        assert!(
+            outcome.confirmed.is_empty(),
+            "the hung upload timed out, so nothing was confirmed"
         );
     }
 
@@ -2714,7 +2805,7 @@ mod tests {
         .await
         .expect("wedge guard: a 13s add plus an immediate one cannot take 60s");
         assert_eq!(
-            pinned.len(),
+            pinned.confirmed.len(),
             2,
             "a slow but progressing endpoint must pin both objects: an upload past the client's \
              10s default is not a dead endpoint"
@@ -2752,7 +2843,7 @@ mod tests {
         )
         .await
         .expect("a rejecting endpoint answers immediately, so this cannot take 30s");
-        assert!(pinned.is_empty(), "every add was rejected");
+        assert!(pinned.confirmed.is_empty(), "every add was rejected");
         assert_eq!(
             requests.load(std::sync::atomic::Ordering::SeqCst),
             4,
@@ -2856,7 +2947,7 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(
-            pinned.is_empty(),
+            pinned.confirmed.is_empty(),
             "a git that never answers cannot produce a pinned object: {pinned:?}"
         );
         assert!(
@@ -2948,7 +3039,7 @@ mod tests {
              that can only be spawned and reaped"
         );
         assert_eq!(
-            pinned.len(),
+            pinned.confirmed.len(),
             1,
             "the first object is inside the budget and must pin: {pinned:?}"
         );
@@ -3017,7 +3108,7 @@ mod tests {
 
         if genuinely_unreadable {
             assert!(
-                pinned.is_empty(),
+                pinned.confirmed.is_empty(),
                 "nothing can be pinned through a store that cannot be read: {pinned:?}"
             );
             assert_eq!(
@@ -3098,7 +3189,7 @@ mod tests {
                  must still be attempted, got {attempted} of {}",
                 oids.len()
             );
-            let pinned_shas: Vec<&String> = pinned.iter().map(|(sha, _)| sha).collect();
+            let pinned_shas: Vec<&String> = pinned.confirmed.iter().map(|(sha, _)| sha).collect();
             let expected: Vec<&String> = oids.iter().filter(|o| !tainted.contains(o)).collect();
             assert_eq!(
                 pinned_shas, expected,
@@ -3163,7 +3254,7 @@ mod tests {
             "an object-scoped fault must not stop the batch: every object must be read"
         );
         assert_eq!(
-            pinned.len(),
+            pinned.confirmed.len(),
             4,
             "one corrupt object must cost only itself: the other four must still pin"
         );
@@ -3397,7 +3488,7 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(
-            pinned.is_empty(),
+            pinned.confirmed.is_empty(),
             "a stalled pinned-status check cannot produce a pinned object: {pinned:?}"
         );
         assert!(
@@ -3468,7 +3559,7 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(
-            pinned.is_empty(),
+            pinned.confirmed.is_empty(),
             "an already-pinned object is skipped, never re-pinned: {pinned:?}"
         );
         assert!(
@@ -3531,7 +3622,10 @@ mod tests {
         .expect("three stalled objects must still cost one budget, not three");
         let elapsed = started.elapsed();
 
-        assert!(pinned.is_empty(), "nothing can pin against a stalled DB");
+        assert!(
+            pinned.confirmed.is_empty(),
+            "nothing can pin against a stalled DB"
+        );
         assert!(
             elapsed < Duration::from_secs(3),
             "three stalled objects must charge ONE budget (1.5s), not one each; got {elapsed:?}"
@@ -3554,7 +3648,7 @@ mod tests {
     ///
     /// The lock time is a MARGIN, not a boundary: taking it at 100ms left `is_pinned`
     /// racing it on a loaded box, and losing that race makes the read block, time out,
-    /// and break the batch, which fails on `pinned.len() == 1` for a reason that has
+    /// and break the batch, which fails on `pinned.confirmed.len() == 1` for a reason that has
     /// nothing to do with the floor. Any time between the `is_pinned` round trip and
     /// the add's 1.7s return proves the same thing.
     #[sqlx::test]
@@ -3605,7 +3699,7 @@ mod tests {
              nothing can resolve the CID"
         );
         assert_eq!(
-            pinned.len(),
+            pinned.confirmed.len(),
             1,
             "the durably recorded pin must be returned: {pinned:?}"
         );
@@ -3759,7 +3853,7 @@ mod tests {
         drop(sources_lock);
 
         assert!(
-            pinned.is_empty(),
+            pinned.confirmed.is_empty(),
             "an already-pinned object is skipped, never re-pinned: {pinned:?}"
         );
         assert!(

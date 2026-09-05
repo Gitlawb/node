@@ -170,14 +170,18 @@ pub async fn pin_new_objects(
     repo_id: &str,
     batch_budget: Duration,
     fence: Option<&crate::ipfs_pin::PolicyFence>,
-) -> Vec<(String, String)> {
+) -> crate::ipfs_pin::PinBatchOutcome {
     if jwt.is_empty() {
-        return vec![];
+        return crate::ipfs_pin::PinBatchOutcome {
+            confirmed: Vec::new(),
+            last_attempted: None,
+        };
     }
 
     let deadline = Instant::now() + batch_budget;
     let total = object_list.len();
     let mut pinned = Vec::new();
+    let mut last_attempted: Option<String> = None;
 
     for (attempted, sha) in object_list.into_iter().enumerate() {
         // Policy fence (R1-P1): a visibility narrow that lands after the caller
@@ -203,6 +207,10 @@ pub async fn pin_new_objects(
         {
             break;
         }
+        // Attempt progress (not a durability claim): same contract as the
+        // IPFS twin — the continuation persists this, never the planned
+        // vector's tail.
+        last_attempted = Some(sha.clone());
 
         // Every DB call from here to the end of the iteration is bounded by the
         // ABSOLUTE batch deadline (F3, #173), through the same `db_bounded` helper the
@@ -437,28 +445,29 @@ pub async fn pin_new_objects(
                 // runs under the shared client's own ceiling, so a successful one can
                 // return with ~0 of the batch budget left, and an unfloored bound would
                 // fail a write that today completes in milliseconds. That costs more on
-                // this side than on the twin: `pinned.push` below is UNCONDITIONAL, so
-                // `api/repos.rs` builds its `cid_map` from the pair either way and drives
+                // this side than on the twin: `pinned.push` below feeds
+                // `api/repos.rs`, which builds its `cid_map` from the pair and drives
                 // `upsert_branch_cid` plus the p2p `publish_ref_update` gossip from it. A
                 // dropped record therefore makes the node ADVERTISE a CID whose `/ipfs`
-                // read 404s. If the floored bound still fires, THIS site's outcome really
-                // is unknown, and unlike the source record below that is a property of
-                // the operation: `record_pinata_cid` is a single autocommit upsert, so
-                // the statement Postgres already started can still land after the client
-                // future is cancelled. The warn names the arm through the error's own
-                // Display and the site keeps its existing behavior: the pair is still
-                // returned, and the row may or may not exist.
-                // Round 10 P2: a closed/failed DB write means the
-                // (sha, cid) pair is not durable; we suppress the
-                // `pinned.push` for this sha so the reconcile cannot
-                // count a Pinata gap as filled when no row exists.
-                // The autocommit timeout case (the `BoundedDbError`
-                // other than `Elapsed`) is genuinely unknown, so we
-                // keep the previous single-statement reasoning and
-                // push in that case. The source-record failure arms
-                // are also a hard failure (multi-statement
-                // transaction never committed) and suppress the push
-                // in the same way.
+                // read 404s. Only durably recorded pairs are pushed, so the map never
+                // advertises an unconfirmed row.
+                //
+                // Round 10 P2: a closed/failed DB write means the (sha, cid)
+                // pair is not durable; we suppress the `pinned.push` for this
+                // sha so the reconcile cannot count a Pinata gap as filled
+                // when no row exists. The source-record failure arms are also
+                // hard failures (multi-statement transaction never committed)
+                // and suppress the push in the same way.
+                //
+                // `record_pinata_cid` is an explicit multi-statement
+                // transaction (row lock + insert + commit), NOT a single
+                // autocommit upsert, so a timed-out future proves nothing:
+                // cancellation before COMMIT wrote nothing, during COMMIT is
+                // unknown. The Elapsed arm therefore verifies by content
+                // (`verify_pinata_record`: exact row + unchanged fence epoch)
+                // under its own bound and pushes only on proof; anything
+                // else stays suppressed and the gap is re-offered.
+                let fence_epoch = fence.map(|f| f.captured_epoch()).unwrap_or(i64::MAX);
                 let mut db_record_durable = false;
                 match crate::ipfs_pin::db_bounded(
                     crate::ipfs_pin::db_record_deadline(deadline),
@@ -470,7 +479,6 @@ pub async fn pin_new_objects(
                         // `i64::MAX` sentinel tells the helper
                         // to skip the lock + comparison (the
                         // unfenced caller path).
-                        let fence_epoch = fence.map(|f| f.captured_epoch()).unwrap_or(i64::MAX);
                         db.record_pinata_cid(&sha, &raw_cid, &cid, Some(repo_id), fence_epoch)
                     }),
                 )
@@ -478,15 +486,41 @@ pub async fn pin_new_objects(
                 {
                     Ok(()) => db_record_durable = true,
                     Err(crate::ipfs_pin::BoundedDbError::Elapsed) => {
-                        // Autocommit: statement may have committed.
-                        // Treat as unknown-but-persisted, keep the
-                        // old behavior (push the pair).
                         tracing::warn!(
                             sha = %sha,
-                            "record_pinata_cid deadline elapsed for autocommit upsert; \
-                             the row may or may not exist (the previous comment's reasoning)"
+                            "record_pinata_cid deadline elapsed on a multi-statement transaction; \
+                             verifying the exact row before treating it as durable"
                         );
-                        db_record_durable = true;
+                        match crate::ipfs_pin::db_bounded(
+                            crate::ipfs_pin::db_record_deadline(deadline),
+                            db.verify_pinata_record(&sha, &raw_cid, &cid, repo_id, fence_epoch),
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                tracing::warn!(
+                                    sha = %sha,
+                                    "timed-out pinata record verified present with unchanged epoch; \
+                                     treating as durable"
+                                );
+                                db_record_durable = true;
+                            }
+                            Ok(false) => {
+                                tracing::warn!(
+                                    sha = %sha,
+                                    "timed-out pinata record has no matching row or the epoch moved; \
+                                     suppressing the push so the gap is re-offered"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    sha = %sha,
+                                    err = %e,
+                                    "pinata record verification did not complete; \
+                                     suppressing the push so the gap is re-offered"
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -557,7 +591,10 @@ pub async fn pin_new_objects(
         }
     }
 
-    pinned
+    crate::ipfs_pin::PinBatchOutcome {
+        confirmed: pinned,
+        last_attempted,
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -766,13 +803,13 @@ mod tests {
         .expect("wedge guard: a 5.5s budget cannot take 30s");
 
         assert!(
-            (1..=3).contains(&pinned.len()),
+            (1..=3).contains(&pinned.confirmed.len()),
             "the batch must stop partway, not pin all five and not stall on the first: pinned {}",
-            pinned.len()
+            pinned.confirmed.len()
         );
         assert_eq!(
             requests.load(std::sync::atomic::Ordering::SeqCst),
-            pinned.len(),
+            pinned.confirmed.len(),
             "no upload may be issued for an object the budget stopped short of"
         );
         let text = logs.text();
@@ -800,9 +837,9 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("the deadline warn must name the unattempted count: {text}"));
         assert!(
-            unattempted >= 1 && unattempted + pinned.len() <= 5,
+            unattempted >= 1 && unattempted + pinned.confirmed.len() <= 5,
             "unattempted={unattempted} with {} pinned is not a partial batch of five",
-            pinned.len()
+            pinned.confirmed.len()
         );
     }
 
@@ -862,7 +899,7 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(
-            pinned.is_empty(),
+            pinned.confirmed.is_empty(),
             "a git that never answers cannot produce a pinned object: {pinned:?}"
         );
         assert!(
@@ -952,7 +989,7 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(
-            pinned.is_empty(),
+            pinned.confirmed.is_empty(),
             "a git that never answers cannot produce a pinned object: {pinned:?}"
         );
         assert!(
@@ -1053,7 +1090,7 @@ mod tests {
 
         if genuinely_unreadable {
             assert!(
-                pinned.is_empty(),
+                pinned.confirmed.is_empty(),
                 "nothing can be pinned through a store that cannot be read: {pinned:?}"
             );
             assert_eq!(
@@ -1130,7 +1167,7 @@ mod tests {
             "an object-scoped fault must not stop the batch: every object must be read"
         );
         assert_eq!(
-            pinned.len(),
+            pinned.confirmed.len(),
             4,
             "one corrupt object must cost only itself: the other four must still pin"
         );
@@ -1176,8 +1213,12 @@ mod tests {
         .await
         .expect("an immediate endpoint and three healthy objects cannot take 30s");
 
-        assert_eq!(pinned.len(), 3, "every healthy object must pin: {pinned:?}");
-        for (i, (sha, cid)) in pinned.iter().enumerate() {
+        assert_eq!(
+            pinned.confirmed.len(),
+            3,
+            "every healthy object must pin: {pinned:?}"
+        );
+        for (i, (sha, cid)) in pinned.confirmed.iter().enumerate() {
             assert_eq!(sha, &oids[i], "the pairs must carry the objects' own oids");
             assert_eq!(cid, "QmPinataBatchTestCid");
             assert!(
@@ -1205,11 +1246,71 @@ mod tests {
         )
         .await
         .expect("a fully deduped batch cannot take 30s");
-        assert!(again.is_empty(), "already-recorded objects must be skipped");
+        assert!(
+            again.confirmed.is_empty(),
+            "already-recorded objects must be skipped"
+        );
         assert_eq!(
             requests.load(std::sync::atomic::Ordering::SeqCst),
             3,
             "the skip must happen before the upload, not after it"
+        );
+    }
+
+    /// The outcome reports the last object actually ENTERED, not the planned
+    /// tail (Pinata twin of the IPFS test above): the first upload takes 6s
+    /// against a 2s batch budget, so it still completes — the Pinata loop
+    /// has no per-request timeout — but the loop-top gate then breaks the
+    /// batch before the second object starts. `last_attempted` must be the
+    /// first OID even though two OIDs were never visited; the 6s server
+    /// sleep makes the break deterministic on any box.
+    #[sqlx::test]
+    async fn pin_new_objects_reports_last_attempted_not_planned_tail(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("attempted.git");
+        let oids = seed_loose_blobs(&repo_path, 3);
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let endpoint = delaying_pinata_endpoint(
+            vec![Duration::from_secs(6)],
+            std::sync::Arc::clone(&requests),
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            pin_new_objects(
+                &client,
+                &endpoint,
+                "test-jwt",
+                &repo_path,
+                "git",
+                Duration::from_secs(60),
+                oids.clone(),
+                &db,
+                "repo-attempted",
+                Duration::from_secs(2),
+                None,
+            ),
+        )
+        .await
+        .expect("one 6s upload plus bounded gates cannot take 60s");
+        assert_eq!(
+            outcome.last_attempted,
+            Some(oids[0].clone()),
+            "only the first object was entered; the planned tail was never visited"
+        );
+        assert_eq!(
+            outcome.confirmed.len(),
+            1,
+            "the slow first upload still completed and recorded"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one upload was attempted"
         );
     }
 
@@ -1260,7 +1361,7 @@ mod tests {
         .await
         .expect("an unconfigured sink returns immediately");
 
-        assert!(pinned.is_empty(), "an empty JWT pins nothing");
+        assert!(pinned.confirmed.is_empty(), "an empty JWT pins nothing");
         assert!(
             !log.exists(),
             "no git child may be spawned when the sink is not configured"
@@ -1371,7 +1472,7 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(
-            pinned.is_empty(),
+            pinned.confirmed.is_empty(),
             "a stalled pinata-status check cannot produce a pinned object: {pinned:?}"
         );
         assert!(
@@ -1468,7 +1569,7 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(
-            pinned.is_empty(),
+            pinned.confirmed.is_empty(),
             "an already-pinned object is skipped, never re-uploaded: {pinned:?}"
         );
         assert_eq!(
@@ -1512,7 +1613,7 @@ mod tests {
     ///
     /// The lock time is a MARGIN, not a boundary: taking it at 100ms left
     /// `has_pinata_cid` racing it on a loaded box, and losing that race makes the read
-    /// block, time out, and break the batch, which fails on `pinned.len() == 1` for a
+    /// block, time out, and break the batch, which fails on `pinned.confirmed.len() == 1` for a
     /// reason that has nothing to do with the floor. Any time between the
     /// `has_pinata_cid` round trip and the upload's 1.7s return proves the same thing.
     #[sqlx::test]
@@ -1576,7 +1677,7 @@ mod tests {
              record makes api/repos.rs advertise a CID the resolver cannot serve"
         );
         assert_eq!(
-            pinned.len(),
+            pinned.confirmed.len(),
             1,
             "the uploaded pin must still be returned: {pinned:?}"
         );
@@ -1666,7 +1767,7 @@ mod tests {
         // push fired regardless of the source-record outcome, and
         // the next pass would re-offer the same gap.
         assert_eq!(
-            pinned.len(),
+            pinned.confirmed.len(),
             0,
             "record_pin_source timed out (pin_repo_sources locked); the push must be \
              suppressed so the reconcile does not count a non-durable pair as filled: {pinned:?}"
@@ -1683,6 +1784,122 @@ mod tests {
              future never reaches `tx.commit()`, so the row definitely did not land, and \
              an incomplete-and-unmarked set is read as complete and 404s a copy this \
              repo would serve"
+        );
+    }
+
+    /// Hold a row-level lock on one repos row in an open transaction: plain
+    /// `SELECT`s (fence reads, skip checks) proceed, but any `SELECT ...
+    /// FOR UPDATE` on the row — exactly what the fenced record takes —
+    /// blocks until rollback. A table-level lock would also stall the
+    /// fence's own epoch reads and deadlock the loop under test, proving
+    /// nothing about the record arm.
+    async fn hold_repo_row_lock(
+        pool: &sqlx::PgPool,
+        repo_id: &str,
+    ) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::raw_sql("BEGIN").execute(&mut *conn).await.unwrap();
+        sqlx::query("SELECT policy_epoch FROM repos WHERE id = $1 FOR UPDATE")
+            .bind(repo_id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        conn
+    }
+
+    /// A timed-out `record_pinata_cid` with no verifiable row suppresses the
+    /// push: `record_pinata_cid` is an explicit transaction, so Elapsed proves
+    /// nothing, and the verify read finds no row, so nothing is proven that
+    /// way either. The upload mock still expects the POST — Pinata accepted
+    /// the bytes — but without a durable row the pair must not be returned,
+    /// or the reconcile counts a fill that never happened and the push path
+    /// advertises an unresolvable CID.
+    #[sqlx::test]
+    async fn pinata_post_upload_elapsed_record_without_row_suppresses_push(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool.clone());
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("pinata_elapsed_verify.git");
+        let oids = seed_loose_blobs(&repo_path, 1);
+        let sha = oids[0].clone();
+
+        // A real repo row: the fenced record's `FOR UPDATE` must have a row
+        // to block on. Against a missing row the predicate takes no lock and
+        // the record would sail through instead of stalling.
+        let repo_id = "repo-pinata-elapsed-verify";
+        let now = chrono::Utc::now();
+        db.create_repo(&crate::db::RepoRecord {
+            id: repo_id.to_string(),
+            name: "elapsed-verify".into(),
+            owner_did: "did:key:zElapsedVerifyOwner".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: now,
+            updated_at: now,
+            disk_path: repo_path.display().to_string(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+
+        // Capture the fence BEFORE locking: the capture itself is a plain
+        // epoch read and must succeed for the fenced record path to run.
+        let fence = crate::ipfs_pin::PolicyFence::capture(&db, repo_id)
+            .await
+            .expect("fence captures");
+
+        let mut server = mockito::Server::new_async().await;
+        let upload = server
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"data":{"cid":"QmElapsedVerifyProviderCid"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (_logs, _log_guard) = capture_logs();
+
+        // Stall only the fenced record's `FOR UPDATE`: fence reads and the
+        // skip check are plain SELECTs and proceed, the upload lands, then
+        // the record elapses. The verify read proceeds too and finds no row.
+        let mut lock = hold_repo_row_lock(&pool, repo_id).await;
+
+        let client = reqwest::Client::new();
+        let pinned = tokio::time::timeout(
+            Duration::from_secs(30),
+            pin_new_objects(
+                &client,
+                &server.url(),
+                "test-jwt",
+                &repo_path,
+                "git",
+                Duration::from_secs(30),
+                oids,
+                &db,
+                repo_id,
+                Duration::from_millis(1500),
+                Some(&fence),
+            ),
+        )
+        .await
+        .expect(
+            "record + verify ladders are each floored, so the call returns in seconds, \
+             never at the lock's lifetime",
+        );
+
+        rollback(&mut lock).await;
+        drop(lock);
+
+        upload.assert_async().await;
+        assert!(
+            pinned.confirmed.is_empty(),
+            "an unverified timed-out record must not return the pair: {pinned:?}"
+        );
+        assert!(
+            !db.has_pinata_cid(&sha).await.unwrap(),
+            "the cancelled record transaction must not have landed a row"
         );
     }
 

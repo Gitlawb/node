@@ -5457,7 +5457,7 @@ mod tests {
         );
         assert_eq!(stashed, None, "and nothing is stashed for it");
         assert_eq!(
-            pinned,
+            pinned.confirmed,
             vec![(fx.public_oid.clone(), "QmPinataUploaded".to_string())],
             "the pinata return still carries the provider CID for the announcement cid_map"
         );
@@ -6081,7 +6081,7 @@ mod tests {
         )
         .await;
         assert!(
-            !pinned.is_empty(),
+            !pinned.confirmed.is_empty(),
             "the object was pinned via the real pin path"
         );
         m.assert_async().await;
@@ -6149,7 +6149,7 @@ mod tests {
         .await;
 
         assert!(
-            pinned.is_empty(),
+            pinned.confirmed.is_empty(),
             "a pin with no durable index row must not be reported as pinned, got {pinned:?}"
         );
         // Exactly two adds: the first record failure did not break the batch.
@@ -6277,7 +6277,7 @@ mod tests {
              not leave it running (which would pin the coalescing key until process death)"
         );
         assert!(
-            pinned.is_empty(),
+            pinned.confirmed.is_empty(),
             "a wedged read pins nothing this pass; a later pass/push retries"
         );
     }
@@ -6399,7 +6399,7 @@ mod tests {
         .await;
 
         assert!(
-            pinned.is_empty(),
+            pinned.confirmed.is_empty(),
             "an already-pinned object is not re-pinned (no bytes returned)"
         );
         m.assert_async().await; // asserts /add was called 0 times

@@ -401,7 +401,8 @@ fn walk_tree_oids_bounded(
     git_bin: &str,
     root_tree_oid: &str,
     deadline: Instant,
-    out: &mut HashSet<(String, String)>,
+    blobs: &mut HashSet<(String, String)>,
+    trees: &mut HashSet<(String, String)>,
 ) -> Result<()> {
     // Round 10 P2: memo of already-walked tree OIDs so a tree
     // reachable from N ref tips is walked once, not N times.
@@ -419,7 +420,8 @@ fn walk_tree_oids_bounded(
         root_tree_oid,
         0,
         deadline,
-        out,
+        blobs,
+        trees,
         &mut walked,
         &mut invocations,
     )
@@ -436,7 +438,8 @@ fn walk_tree_oids_inner(
     tree_oid: &str,
     depth: usize,
     deadline: Instant,
-    out: &mut HashSet<(String, String)>,
+    blobs: &mut HashSet<(String, String)>,
+    trees: &mut HashSet<(String, String)>,
     walked: &mut HashSet<String>,
     invocations: &mut usize,
 ) -> Result<()> {
@@ -462,7 +465,7 @@ fn walk_tree_oids_inner(
     // The tree itself enters the withheld set keyed on OID. The
     // filtered pack serves trees by OID, so omitting the tree
     // would let a withheld subtree leak its parent.
-    out.insert((tree_oid.to_string(), String::new()));
+    trees.insert((tree_oid.to_string(), String::new()));
     let ls = run_bounded_git(
         git_bin,
         &["ls-tree", "-z", tree_oid],
@@ -508,7 +511,7 @@ fn walk_tree_oids_inner(
         };
         match kind {
             "blob" => {
-                out.insert((child_oid.to_string(), String::new()));
+                blobs.insert((child_oid.to_string(), String::new()));
             }
             "tree" => {
                 walk_tree_oids_inner(
@@ -517,7 +520,8 @@ fn walk_tree_oids_inner(
                     child_oid,
                     depth + 1,
                     deadline,
-                    out,
+                    blobs,
+                    trees,
                     walked,
                     invocations,
                 )?;
@@ -612,46 +616,76 @@ fn blob_paths(repo_path: &Path, git_bin: &str, timeout: Duration) -> Result<Vec<
         }
     }
 
-    // Phase 2: enumerate non-commit ref targets. `git rev-list --all`
-    // above SILENTLY SKIPS refs whose tip is not a commit (annotated
-    // tag-of-blob, tag-of-tree, raw blobref) — a real Git shape that
-    // `git push` allows through `receive-pack`. The deny-set caller
-    // (`smart_http.rs:611-635` `rev_list_keep`) enumerates with
-    // `git rev-list --objects --all`, which DOES include those
-    // non-commit targets, so without this phase the served set and
-    // the withheld set disagree: a blob only reachable via an
-    // annotated tag is served, not withheld. Insert each
-    // non-commit-reachable blob/tree with an EMPTY path — the
-    // deny-side caller (`withheld_from_pairs`, see below) treats
-    // empty paths as "withhold this exact OID", which is exactly
-    // the right policy for a tag-of-blob we cannot path-match.
-    //
-    // A similar `git for-each-ref` invocation lives at
-    // `reachable_commit_tag_oids_bounded` (for the tag-chain seed),
-    // so this is reusing a primitive the file already exercises.
-    //
-    // #218 review round 8 P1: the referent must be PEELED. `%(objecttype)`
-    // reports the type of the ref's OWN object, which for an annotated tag
-    // is `tag` — so a format of only `%(objectname) %(objecttype)` never
-    // shows the blob/tree the tag wraps, and a blob reachable ONLY through
-    // an annotated tag escaped the withheld set while `rev_list_keep`
-    // (`git rev-list --objects --all`, which DOES peel tags) still served
-    // it. `%(*objectname) %(*objecttype)` are for-each-ref's peeled atoms:
-    // empty for a ref whose tip is not a tag, one-level-peeled for a tag.
-    //
-    // Peel depth: measured against git 2.50, the `*` atoms peel the WHOLE
-    // chain — a tag-of-a-tag-of-a-tag-of-a-blob reports the blob, not the
-    // inner tag — so the `tag` peeled-type arm below does not fire on stock
-    // git today. P3 (reviewer round 9): the `tag` arm IS live on git
-    // 2.43 (the round's own fixture reports a peeled type of `tag`
-    // for nested tags), so each nested tag costs two extra git
-    // children (`rev-parse ^{}` and `cat-file -t`) with no ceiling on
-    // ref count. Both children are bounded by the walk's shared
-    // deadline, and both are reached only for a tag whose referent is
-    // still a tag — never on the common one-line-per-ref path. The
-    // `rev-parse ^{}` is recursive by definition and resolves the
-    // full chain in a single call, so a `tag peeled_oid tag` line on
-    // git 2.43 peels through every nested tag in one round trip.
+    // Phase 2: enumerate non-commit ref targets through the shared
+    // extractor below (typed blob/tree sets; tag objects ignored here —
+    // `blob_paths` feeds the deny side, which classifies by OID).
+    let nc = non_commit_ref_sets(repo_path, git_bin, deadline)?;
+    out.extend(nc.blobs);
+    out.extend(nc.trees);
+    Ok(out.into_iter().collect())
+}
+
+/// Non-commit ref targets, enumerated with their types plus the tag
+/// objects that name them. `git rev-list --all` SILENTLY SKIPS refs
+/// whose tip is not a commit (annotated tag-of-blob, tag-of-tree, raw
+/// blobref) — a real Git shape that `git push` allows through
+/// `receive-pack`. The deny-set caller (`smart_http.rs:611-635`
+/// `rev_list_keep`) enumerates with `git rev-list --objects --all`,
+/// which DOES include those non-commit targets, so without this phase
+/// the served set and the withheld set disagree: a blob only reachable
+/// via an annotated tag is served, not withheld. Each
+/// non-commit-reachable blob/tree enters with an EMPTY path — the
+/// deny-side caller (`withheld_from_pairs`, see below) treats
+/// empty paths as "withhold this exact OID", which is exactly
+/// the right policy for a tag-of-blob we cannot path-match.
+///
+/// A similar `git for-each-ref` invocation lives at
+/// `reachable_commit_tag_oids_bounded` (for the tag-chain seed),
+/// so this is reusing a primitive the file already exercises.
+///
+/// #218 review round 8 P1: the referent must be PEELED. `%(objecttype)`
+/// reports the type of the ref's OWN object, which for an annotated tag
+/// is `tag` — so a format of only `%(objectname) %(objecttype)` never
+/// shows the blob/tree the tag wraps, and a blob reachable ONLY through
+/// an annotated tag escaped the withheld set while `rev_list_keep`
+/// (`git rev-list --objects --all`, which DOES peel tags) still served
+/// it. `%(*objectname) %(*objecttype)` are for-each-ref's peeled atoms:
+/// empty for a ref whose tip is not a tag, one-level-peeled for a tag.
+///
+/// Peel depth: measured against git 2.50, the `*` atoms peel the WHOLE
+/// chain — a tag-of-a-tag-of-a-tag-of-a-blob reports the blob, not the
+/// inner tag — so the `tag` peeled-type arm below does not fire on stock
+/// git today. P3 (reviewer round 9): the `tag` arm IS live on git
+/// 2.43 (the round's own fixture reports a peeled type of `tag`
+/// for nested tags), so each nested tag costs two extra git
+/// children (`rev-parse ^{}` and `cat-file -t`) with no ceiling on
+/// ref count. Both children are bounded by the walk's shared
+/// deadline, and both are reached only for a tag whose referent is
+/// still a tag — never on the common one-line-per-ref path. The
+/// `rev-parse ^{}` is recursive by definition and resolves the
+/// full chain in a single call, so a `tag peeled_oid tag` line on
+/// git 2.43 peels through every nested tag in one round trip.
+///
+/// `tag_oids` collects every annotated-tag OBJECT at a ref tip (plus
+/// the tip of a nested-tag chain): structural metadata the sweep pins
+/// like commits. Deeper inner tag objects are not collected — the
+/// serve path still resolves them through `reachable_commit_tag_oids`,
+/// and the sweep's windowed enumeration must stay proportional to
+/// refs, not chains.
+pub(crate) struct NonCommitRefSets {
+    pub blobs: HashSet<ObjectPath>,
+    pub trees: HashSet<ObjectPath>,
+    pub tag_oids: Vec<String>,
+}
+
+pub(crate) fn non_commit_ref_sets(
+    repo_path: &Path,
+    git_bin: &str,
+    deadline: Instant,
+) -> Result<NonCommitRefSets> {
+    let mut blobs: HashSet<ObjectPath> = HashSet::new();
+    let mut trees: HashSet<ObjectPath> = HashSet::new();
+    let mut tag_oids: Vec<String> = Vec::new();
     let refs_out = run_bounded_git(
         git_bin,
         &[
@@ -680,11 +714,17 @@ fn blob_paths(repo_path: &Path, git_bin: &str, timeout: Duration) -> Result<Vec<
             }
             _ => anyhow::bail!("malformed for-each-ref line: {line:?}"),
         };
+        // An annotated tag object at the tip is structural metadata
+        // (pinned like a commit by sweep candidates); its referent is
+        // classified by the arms below.
+        if kind == "tag" {
+            tag_oids.push(oid.to_string());
+        }
         // Commit tips are already covered by the rev-list walk above.
         // Direct blob tips (lightweight tag of a blob, raw blobref) are
         // inserted as-is.
         if kind == "blob" {
-            out.insert((oid.to_string(), String::new()));
+            blobs.insert((oid.to_string(), String::new()));
         }
         // P1 (reviewer round 9): direct TREE tips must walk their
         // children. A bare `mktree` published as a raw ref tip (or
@@ -693,7 +733,7 @@ fn blob_paths(repo_path: &Path, git_bin: &str, timeout: Duration) -> Result<Vec<
         // to the deny-side `rev_list_keep`) but invisible to phase
         // 2 if phase 2 only inserts the tree OID. Walk it.
         if kind == "tree" {
-            walk_tree_oids_bounded(repo_path, git_bin, oid, deadline, &mut out)?;
+            walk_tree_oids_bounded(repo_path, git_bin, oid, deadline, &mut blobs, &mut trees)?;
         }
         if let Some((peeled_oid, peeled_kind)) = peeled {
             match peeled_kind {
@@ -701,12 +741,14 @@ fn blob_paths(repo_path: &Path, git_bin: &str, timeout: Duration) -> Result<Vec<
                 // `rev-list --objects --all` serves, so it is what must
                 // enter the withheld set (round-8 P1).
                 "blob" => {
-                    out.insert((peeled_oid.to_string(), String::new()));
+                    blobs.insert((peeled_oid.to_string(), String::new()));
                 }
                 // P1 (reviewer round 9): annotated-tag-of-tree must
                 // walk the tree the same way a direct tree tip does.
                 "tree" => {
-                    walk_tree_oids_bounded(repo_path, git_bin, peeled_oid, deadline, &mut out)?;
+                    walk_tree_oids_bounded(
+                        repo_path, git_bin, peeled_oid, deadline, &mut blobs, &mut trees,
+                    )?;
                 }
                 // A tag peeling to a commit contributes nothing new:
                 // `rev-list --all` peels tag chains to their commit and the
@@ -747,11 +789,11 @@ fn blob_paths(repo_path: &Path, git_bin: &str, timeout: Duration) -> Result<Vec<
                     let ty = String::from_utf8_lossy(&ty_out).trim().to_string();
                     match ty.as_str() {
                         "blob" => {
-                            out.insert((full_oid, String::new()));
+                            blobs.insert((full_oid, String::new()));
                         }
                         "tree" => {
                             walk_tree_oids_bounded(
-                                repo_path, git_bin, &full_oid, deadline, &mut out,
+                                repo_path, git_bin, &full_oid, deadline, &mut blobs, &mut trees,
                             )?;
                         }
                         _ => {}
@@ -763,7 +805,11 @@ fn blob_paths(repo_path: &Path, git_bin: &str, timeout: Duration) -> Result<Vec<
             }
         }
     }
-    Ok(out.into_iter().collect())
+    Ok(NonCommitRefSets {
+        blobs,
+        trees,
+        tag_oids,
+    })
 }
 
 /// All reachable blob and tree OIDs with their paths, derived from one bounded
@@ -785,23 +831,36 @@ fn blob_paths(repo_path: &Path, git_bin: &str, timeout: Duration) -> Result<Vec<
 /// arrive in phase 2 with no path, and the fail-closed filter still denies
 /// them — that is the right outcome for objects whose visibility cannot be
 /// determined.
-fn all_object_paths(
+/// One page of the repo's commit history in oldest-first topo order:
+/// `skip` commits already covered, at most `max_count` more. Output — not
+/// traversal — is what the page bounds: rev-list still walks skipped
+/// commits internally (CPU only, no allocation), while only the window is
+/// materialized and ls-tree'd. A short page (fewer than `max_count`) means
+/// the history is fully covered; an empty page on a non-empty repo means
+/// the cursor ran past a rewritten history and the caller must reset it.
+/// Deterministic for a fixed graph; a force-pushed history may repeat or
+/// skip commits across pages, which is safe (absence only ever withholds,
+/// never publishes). Oldest-first (not newest-first) so fresh tips extend
+/// the uncovered tail instead of hiding behind the cursor.
+/// Non-commit refs are silently skipped by rev-list itself, exactly as in
+/// the full walk; their targets are enumerated separately by
+/// [`non_commit_ref_sets`].
+///
+/// Ordering subtlety: `--reverse` reverses AFTER `--skip`/`--max-count`
+/// limit, so it cannot page oldest-first directly. Instead the page is
+/// computed from the end of the newest-first order: a `--count` call
+/// sizes the history (one number out, no allocation), then
+/// `--skip = remaining - take` selects the oldest `take` uncovered
+/// commits, reversed in code. The count traversal is CPU-only and fast;
+/// both calls include HEAD under the same condition so a detached HEAD
+/// is covered exactly once.
+pub(crate) fn rev_list_commit_window(
     repo_path: &Path,
     git_bin: &str,
     deadline: Instant,
-) -> Result<(Vec<ObjectPath>, Vec<ObjectPath>)> {
-    // #218 review P1 (non-commit ref acceptance): the previous code
-    // called `assert_all_refs_are_commits` here, which bailed on any
-    // ref that didn't peel to a commit (tag-of-tree, tag-of-blob).
-    // `git rev-list --all` already silently skips non-commit refs
-    // (they contribute nothing to a commit-reachable walk), so the
-    // assertion rejected repos for what was actually a supported
-    // Git shape (`ipfs_cid_tree_served_despite_non_commit_ref` is the
-    // in-repo example). The commit-reachable object set is exactly
-    // what the sweep needs to classify, so the all-refs gate is
-    // removed here. Unclassifiable ref targets still fail closed at
-    // a later layer: the cat-file catch-all enumerates them with no
-    // path, and the path-based allow filter drops empty-path entries.
+    skip: usize,
+    max_count: usize,
+) -> Result<Vec<String>> {
     let head_resolves = run_bounded_git(
         git_bin,
         &["rev-parse", "--verify", "HEAD"],
@@ -810,30 +869,66 @@ fn all_object_paths(
         deadline,
     )
     .is_ok();
-    let mut rev_args = vec!["rev-list", "--all"];
+    let mut count_args = vec!["rev-list", "--all", "--count"];
+    if head_resolves {
+        count_args.push("HEAD");
+    }
+    let count_out = run_bounded_git(git_bin, &count_args, repo_path, b"", deadline)?;
+    let total: usize = String::from_utf8_lossy(&count_out)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    let remaining = total.saturating_sub(skip);
+    if remaining == 0 {
+        return Ok(Vec::new());
+    }
+    let take = remaining.min(max_count);
+    let skip_arg = (remaining - take).to_string();
+    let take_arg = take.to_string();
+    let mut rev_args = vec![
+        "rev-list",
+        "--all",
+        "--topo-order",
+        "--skip",
+        skip_arg.as_str(),
+        "--max-count",
+        take_arg.as_str(),
+    ];
     if head_resolves {
         rev_args.push("HEAD");
     }
-    let commits_out = run_bounded_git(git_bin, &rev_args, repo_path, b"", deadline)?;
-    let commits_stdout = String::from_utf8_lossy(&commits_out);
-    let mut blob_set: HashSet<(String, String)> = HashSet::new();
-    let mut tree_set: HashSet<(String, String)> = HashSet::new();
-    // OID-only indexes for the phase 2 membership check below. Without
-    // these the catch-all branch does O(O×P) `blob_set.iter().any(...)`
-    // scans, which on a 50k-object repo runs hundreds of millions of
-    // string compares per pass (round 10 P2). Maintained alongside the
-    // path-pair sets so the OID is O(1) lookup, not O(P).
-    let mut blob_oids: HashSet<String> = HashSet::new();
-    let mut tree_oids: HashSet<String> = HashSet::new();
+    let out = run_bounded_git(git_bin, &rev_args, repo_path, b"", deadline)?;
+    let mut window: Vec<String> = String::from_utf8_lossy(&out)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    window.reverse();
+    Ok(window)
+}
+
+/// Path-annotated blob/tree enumeration for an EXPLICIT commit list: one
+/// bounded `git ls-tree -r -t -z` per commit. The git-invocation cost is
+/// exactly the list length, so a caller that pages commits (the sweep's
+/// discovery window) pays per pass only for its window, never the history.
+///
+/// Argument is the already-trimmed, non-empty commit list (not raw
+/// rev-list output): the caller owns ordering and paging, this function
+/// only walks. Fail-closed like the full walk: a non-UTF-8 listing or a
+/// child error aborts rather than producing a partial set.
+fn ls_tree_sets_for_commits(
+    repo_path: &Path,
+    git_bin: &str,
+    deadline: Instant,
+    commits: &[String],
+) -> Result<(HashSet<ObjectPath>, HashSet<ObjectPath>)> {
+    let mut blob_set: HashSet<ObjectPath> = HashSet::new();
+    let mut tree_set: HashSet<ObjectPath> = HashSet::new();
     // Phase 1: enumerate trees AND blobs with their paths via
     // `git ls-tree -r -t <commit>`. `-t` is the tree counterpart of `-r`:
     // without it, recursive listings emit only blob entries. Each line is
     // `<mode> SP <type> SP <oid> TAB <path>`, with NUL between records.
-    for commit in commits_stdout.lines() {
-        let commit = commit.trim();
-        if commit.is_empty() {
-            continue;
-        }
+    for commit in commits {
         // #218 review P1b: the root tree of each commit is no longer
         // assigned the synthetic path "/". A path-based check on "/"
         // would let the root tree slip into the allowed set even when
@@ -871,13 +966,11 @@ fn all_object_paths(
             match kind {
                 Some("blob") => {
                     if let Some(oid) = oid {
-                        blob_oids.insert(oid.to_string());
                         blob_set.insert((oid.to_string(), format!("/{path}")));
                     }
                 }
                 Some("tree") => {
                     if let Some(oid) = oid {
-                        tree_oids.insert(oid.to_string());
                         tree_set.insert((oid.to_string(), format!("/{path}")));
                     }
                 }
@@ -885,6 +978,54 @@ fn all_object_paths(
             }
         }
     }
+    Ok((blob_set, tree_set))
+}
+
+fn all_object_paths(
+    repo_path: &Path,
+    git_bin: &str,
+    deadline: Instant,
+) -> Result<(Vec<ObjectPath>, Vec<ObjectPath>)> {
+    // #218 review P1 (non-commit ref acceptance): the previous code
+    // called `assert_all_refs_are_commits` here, which bailed on any
+    // ref that didn't peel to a commit (tag-of-tree, tag-of-blob).
+    // `git rev-list --all` already silently skips non-commit refs
+    // (they contribute nothing to a commit-reachable walk), so the
+    // assertion rejected repos for what was actually a supported
+    // Git shape (`ipfs_cid_tree_served_despite_non_commit_ref` is the
+    // in-repo example). The commit-reachable object set is exactly
+    // what the sweep needs to classify, so the all-refs gate is
+    // removed here. Unclassifiable ref targets still fail closed at
+    // a later layer: the cat-file catch-all enumerates them with no
+    // path, and the path-based allow filter drops empty-path entries.
+    let head_resolves = run_bounded_git(
+        git_bin,
+        &["rev-parse", "--verify", "HEAD"],
+        repo_path,
+        b"",
+        deadline,
+    )
+    .is_ok();
+    let mut rev_args = vec!["rev-list", "--all"];
+    if head_resolves {
+        rev_args.push("HEAD");
+    }
+    let commits_out = run_bounded_git(git_bin, &rev_args, repo_path, b"", deadline)?;
+    let commits_stdout = String::from_utf8_lossy(&commits_out);
+    let commits: Vec<String> = commits_stdout
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let (mut blob_set, mut tree_set) =
+        ls_tree_sets_for_commits(repo_path, git_bin, deadline, &commits)?;
+    // OID-only indexes for the phase 2 membership check below. Without
+    // these the catch-all branch does O(O×P) `blob_set.iter().any(...)`
+    // scans, which on a 50k-object repo runs hundreds of millions of
+    // string compares per pass (round 10 P2). Rebuilt here in O(P) from
+    // the extracted walk so the OID is O(1) lookup, not O(P).
+    let mut blob_oids: HashSet<String> = blob_set.iter().map(|(oid, _)| oid.clone()).collect();
+    let mut tree_oids: HashSet<String> = tree_set.iter().map(|(oid, _)| oid.clone()).collect();
     // Phase 2: enumerate ALL reachable objects via cat-file --batch-all-objects.
     // This catches dangling objects and objects reachable only through non-commit
     // refs (tags, notes) that ls-tree misses. Objects found only here have no
@@ -933,6 +1074,49 @@ fn all_object_paths(
         blob_set.into_iter().collect(),
         tree_set.into_iter().collect(),
     ))
+}
+
+/// One discovery window's complete enumeration: the window commits plus
+/// every blob/tree pair and tag object reachable from them or from
+/// non-commit refs. The sweep classifies and replicates from exactly this
+/// set — never from a full-ODB listing — so per-pass git invocations and
+/// retained sets scale with the window, not the history. Unwalked commits
+/// are simply absent (fail-closed: absence withholds, never publishes);
+/// dangling objects are absent by construction (no batch-all catch-all).
+/// Non-commit ref targets (direct blob/tree refs, annotated tags) ride
+/// along every window via [`non_commit_ref_sets`] — they have no commit
+/// position to page by, and the for-each-ref pass is O(refs), not
+/// O(objects).
+pub(crate) struct WindowEnumeration {
+    pub commits: Vec<String>,
+    pub blob_pairs: Vec<ObjectPath>,
+    pub tree_pairs: Vec<ObjectPath>,
+    pub tag_oids: Vec<String>,
+}
+
+/// Enumerate one commit window: path-annotated pairs for exactly these
+/// commits plus the (window-independent) non-commit ref targets. The
+/// caller pages commits with [`rev_list_commit_window`]; this function
+/// never lists commits itself, so it cannot accidentally materialize
+/// the history it was given to bound.
+pub(crate) fn enumerate_commit_window(
+    repo_path: &Path,
+    git_bin: &str,
+    deadline: Instant,
+    commits: &[String],
+) -> Result<WindowEnumeration> {
+    let (blob_set, tree_set) = ls_tree_sets_for_commits(repo_path, git_bin, deadline, commits)?;
+    let nc = non_commit_ref_sets(repo_path, git_bin, deadline)?;
+    let mut blob_pairs: Vec<ObjectPath> = blob_set.into_iter().collect();
+    let mut tree_pairs: Vec<ObjectPath> = tree_set.into_iter().collect();
+    blob_pairs.extend(nc.blobs);
+    tree_pairs.extend(nc.trees);
+    Ok(WindowEnumeration {
+        commits: commits.to_vec(),
+        blob_pairs,
+        tree_pairs,
+        tag_oids: nc.tag_oids,
+    })
 }
 
 /// Blob OIDs the caller may not read. A blob is withheld only if visibility
@@ -1775,13 +1959,6 @@ pub fn reachable_commit_tag_oids_bounded(
 /// walk so the two are consistent and the walk cost is paid only once. Returns
 /// `(allowed_blobs, allowed_trees, all_blob_oids, all_tree_oids)`.
 ///
-/// #218 review P1b: enumerate every reachable commit's root tree OID so
-/// the structural entry-level check (`structurally_safe_root_tree`) can
-/// be applied to each. One `git rev-list --all` followed by one
-/// `git rev-parse <commit>^{tree}` per commit, both bounded by
-/// `deadline`; the cost is small (root-tree OIDs are tiny, one git
-/// invocation per commit) and pays for itself the first time the
-/// root tree would otherwise leak a denied subtree's name.
 /// A blob or tree is "allowed" if visibility permits it at *some* reachable
 /// path; a tree reachable at both an allowed and denied path is allowed (its
 /// metadata is public elsewhere). Commits and tags are not classified here —
@@ -1795,10 +1972,83 @@ pub fn allowed_blob_tree_sets_bounded(
     owner_did: &str,
 ) -> Result<BlobTreeSets> {
     let (blob_pairs, tree_pairs) = all_object_paths(repo_path, git_bin, deadline)?;
+    let commits = reachable_commit_oids(repo_path, git_bin, deadline)?;
+    classify_object_pairs(
+        repo_path,
+        git_bin,
+        deadline,
+        rules,
+        is_public,
+        owner_did,
+        &blob_pairs,
+        &tree_pairs,
+        &commits,
+    )
+}
+
+/// Windowed twin of [`allowed_blob_tree_sets_bounded`]: enumerate exactly
+/// these commits (plus the window-independent non-commit ref targets)
+/// and classify the result. Same policy, bounded listing — the sweep's
+/// re-derivations call this with the scan window so no authorization
+/// stage re-materializes the history the scan just bounded.
+pub(crate) fn allowed_blob_tree_sets_for_commits(
+    repo_path: &Path,
+    git_bin: &str,
+    deadline: Instant,
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    commits: &[String],
+) -> Result<BlobTreeSets> {
+    let window = enumerate_commit_window(repo_path, git_bin, deadline, commits)?;
+    classify_object_pairs(
+        repo_path,
+        git_bin,
+        deadline,
+        rules,
+        is_public,
+        owner_did,
+        &window.blob_pairs,
+        &window.tree_pairs,
+        &window.commits,
+    )
+}
+
+/// Shared allow/deny classification over an explicit pair listing: the
+/// allow loops, the structural tree checks, and the root-tree pass. The
+/// full walk ([`allowed_blob_tree_sets_bounded`]) and the windowed sweep
+/// ([`enumerate_commit_window`] + this) run the SAME policy over
+/// different listings, so a policy change cannot drift between them.
+/// `root_commits` are the commits whose root trees are evaluated at "/":
+/// the full reachable set for the whole-repo walk, the window for a
+/// windowed walk. Commits and tags are not classified here — the caller
+/// decides per type whether the allow-set applies.
+///
+/// #218 review P1b: enumerate every given commit's root tree OID so
+/// the structural entry-level check can be applied to each: one
+/// `git rev-parse <commit>^{tree}` per commit (via [`root_tree_oids`]),
+/// all bounded by `deadline`.
+/// Nine arguments: the walk seam (`repo_path`, `git_bin`, `deadline`),
+/// the policy tuple (`rules`, `is_public`, `owner_did`), and the three
+/// listing inputs (`blob_pairs`, `tree_pairs`, `root_commits`). A params
+/// struct would only rename values the two callers already hold
+/// separately.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn classify_object_pairs(
+    repo_path: &Path,
+    git_bin: &str,
+    deadline: Instant,
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    blob_pairs: &[ObjectPath],
+    tree_pairs: &[ObjectPath],
+    root_commits: &[String],
+) -> Result<BlobTreeSets> {
     let all_blob_oids: HashSet<String> = blob_pairs.iter().map(|(oid, _)| oid.clone()).collect();
     let all_tree_oids: HashSet<String> = tree_pairs.iter().map(|(oid, _)| oid.clone()).collect();
     let mut allowed_blobs = HashSet::new();
-    for (oid, path) in &blob_pairs {
+    for (oid, path) in blob_pairs {
         // #218 review round 9 (guidance #1): the empty-path
         // decision is now in `pair_decision` so this consumer and
         // `withheld_from_pairs` / `allowed_blob_set_for_caller_bounded`
@@ -1833,7 +2083,7 @@ pub fn allowed_blob_tree_sets_bounded(
         caller: None,
     };
     let mut allowed_trees: HashSet<String> = HashSet::new();
-    for (oid, path) in &tree_pairs {
+    for (oid, path) in tree_pairs {
         // #218 review round 9 (guidance #1): route through
         // `pair_decision` so this tree allow-set and the blob
         // allow-set above share the empty-path policy. The
@@ -1848,14 +2098,13 @@ pub fn allowed_blob_tree_sets_bounded(
             allowed_trees.insert(oid.clone());
         }
     }
-    // Root trees of reachable commits: they have no path in
+    // Root trees of `root_commits`: they have no path in
     // `tree_pairs` (ls-tree emits descendants only), so evaluate
     // them at "/" — the root tree is admitted iff every direct
     // entry is safe at the root and (for tree entries) the child
     // tree is itself structurally safe. The check is recursive, so
     // a denied subtree propagates up to the root.
-    let commits = reachable_commit_oids(repo_path, git_bin, deadline)?;
-    for root_oid in root_tree_oids(repo_path, git_bin, &commits, deadline)? {
+    for root_oid in root_tree_oids(repo_path, git_bin, root_commits, deadline)? {
         if visibility_check(rules, is_public, owner_did, None, "/") != Decision::Allow {
             continue;
         }
@@ -1925,9 +2174,26 @@ pub fn withheld_blob_recipients_bounded(
 ) -> Result<HashMap<String, BTreeSet<String>>> {
     // One history walk feeds both the withheld set and the recipient mapping.
     let pairs = blob_paths(repo_path, git_bin, timeout)?;
-    let withheld = withheld_from_pairs(&pairs, rules, is_public, owner_did, None);
+    Ok(recipients_from_pairs(&pairs, rules, is_public, owner_did))
+}
+
+/// Withheld-to-recipients mapping over an explicit pair listing: the same
+/// withheld computation and owner-plus-readers mapping as
+/// [`withheld_blob_recipients_bounded`], shared so the windowed sweep
+/// (which walks only its commit window) applies the identical recipient
+/// policy as the full-history receive-pack path. Least-privilege: a
+/// reader of one private subtree is not a recipient of an object that
+/// only lives elsewhere; an unclassifiable empty-path object grants a
+/// recovery copy to the owner only.
+pub(crate) fn recipients_from_pairs(
+    pairs: &[(String, String)],
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+) -> HashMap<String, BTreeSet<String>> {
+    let withheld = withheld_from_pairs(pairs, rules, is_public, owner_did, None);
     if withheld.is_empty() {
-        return Ok(HashMap::new());
+        return HashMap::new();
     }
     let mut candidates: BTreeSet<String> = BTreeSet::new();
     for r in rules {
@@ -1936,7 +2202,7 @@ pub fn withheld_blob_recipients_bounded(
         }
     }
     let mut out: HashMap<String, BTreeSet<String>> = HashMap::new();
-    for (oid, path) in &pairs {
+    for (oid, path) in pairs {
         if !withheld.contains(oid) {
             continue;
         }
@@ -1952,7 +2218,7 @@ pub fn withheld_blob_recipients_bounded(
             }
         }
     }
-    Ok(out)
+    out
 }
 
 #[cfg(test)]
@@ -3959,6 +4225,382 @@ esac\n";
             peeled.is_err(),
             "a peeled annotated-tag-of-tree with a non-UTF-8 child must \
              fail closed (Err), not return Ok with a partial withheld set"
+        );
+    }
+
+    /// Build a linear history of `n` commits (one root-level file each)
+    /// in a workdir repo and return (tempdir, bare clone, commit oids
+    /// oldest-first). Cloned --bare so the walk exercises post-clone refs.
+    fn linear_history(n: usize) -> (TempDir, std::path::PathBuf, Vec<String>) {
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        let run = |args: &[&str], dir: &Path| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        std::fs::create_dir_all(&work).unwrap();
+        run(&["init", "-q", "-b", "main"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        let mut oids = Vec::new();
+        for i in 0..n {
+            std::fs::write(work.join(format!("f{i:03}.txt")), format!("bytes {i}\n")).unwrap();
+            run(&["add", "."], &work);
+            run(&["commit", "-qm", &format!("commit {i}")], &work);
+            let out = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            oids.push(String::from_utf8_lossy(&out.stdout).trim().to_string());
+        }
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+        (td, bare, oids)
+    }
+
+    /// The discovery cursor pages oldest-first with a stable order: five
+    /// linear commits windowed two at a time yield [0,1], [2,3], [4], and
+    /// a short page means the history is covered.
+    #[test]
+    fn commit_window_pages_oldest_first_with_stable_order() {
+        let (_td, bare, oids) = linear_history(5);
+        let deadline = Instant::now() + WALK_TIMEOUT;
+        let w0 = rev_list_commit_window(&bare, "git", deadline, 0, 2).unwrap();
+        let w1 = rev_list_commit_window(&bare, "git", deadline, 2, 2).unwrap();
+        let w2 = rev_list_commit_window(&bare, "git", deadline, 4, 2).unwrap();
+        assert_eq!(w0, oids[0..2], "first window is the two oldest commits");
+        assert_eq!(w1, oids[2..4], "second window continues in order");
+        assert_eq!(w2, oids[4..5], "short page covers the tail");
+        let w3 = rev_list_commit_window(&bare, "git", deadline, 6, 2).unwrap();
+        assert!(
+            w3.is_empty(),
+            "a cursor past the history end reads empty (caller resets)"
+        );
+    }
+
+    /// Write a `git` wrapper that logs every argv line to `count_file`
+    /// then execs the real git. `run_bounded_git` spawns `git_bin` by
+    /// path, so no PATH mutation is needed and parallel tests are
+    /// unaffected: the wrapper is transparent apart from the log.
+    #[cfg(unix)]
+    fn counting_git(dir: &Path, count_file: &Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let real: String = {
+            let out = Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let p = dir.join("counting-git");
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {}\nexec {} \"$@\"\n",
+                count_file.display(),
+                real
+            ),
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&p, perm).unwrap();
+        p.to_str().unwrap().to_string()
+    }
+
+    /// Count argv lines starting with `argv0` in a counting-wrapper log.
+    #[cfg(unix)]
+    fn count_invocations(count_file: &Path, argv0: &str) -> usize {
+        std::fs::read_to_string(count_file)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.split_whitespace().next() == Some(argv0))
+            .count()
+    }
+
+    /// Per-pass git invocations scale with the WINDOW, not the history:
+    /// six commits enumerated two at a time cost two ls-trees, and six
+    /// more commits leave that count unchanged. The full-history
+    /// enumeration costs one ls-tree per commit. This is the property
+    /// that makes hourly sweep passes bounded on large histories.
+    #[cfg(unix)]
+    #[test]
+    fn windowed_enumeration_bounds_git_invocations() {
+        let (td, bare, oids) = linear_history(6);
+        let count_file = td.path().join("invocations.log");
+        let git = counting_git(td.path(), &count_file);
+        let deadline = Instant::now() + WALK_TIMEOUT;
+
+        let window = rev_list_commit_window(&bare, &git, deadline, 0, 2).unwrap();
+        assert_eq!(window, oids[0..2]);
+        std::fs::write(&count_file, "").unwrap();
+        let _ = enumerate_commit_window(&bare, &git, deadline, &window).unwrap();
+        assert_eq!(
+            count_invocations(&count_file, "ls-tree"),
+            2,
+            "one ls-tree per window commit, nothing per history commit"
+        );
+
+        // Full-history enumeration on the same repo for contrast.
+        std::fs::write(&count_file, "").unwrap();
+        let full = rev_list_commit_window(&bare, &git, deadline, 0, 100).unwrap();
+        assert_eq!(full.len(), 6);
+        let _ = enumerate_commit_window(&bare, &git, deadline, &full).unwrap();
+        assert_eq!(
+            count_invocations(&count_file, "ls-tree"),
+            6,
+            "unwindowed enumeration pays per history commit"
+        );
+
+        // Grow the history: the windowed cost must not move.
+        {
+            let work = td.path().join("work2");
+            let _ = std::fs::remove_dir_all(&work);
+            let run = |args: &[&str], dir: &Path| {
+                assert!(Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success());
+            };
+            run(
+                &[
+                    "clone",
+                    "-q",
+                    bare.to_str().unwrap(),
+                    work.to_str().unwrap(),
+                ],
+                td.path(),
+            );
+            run(&["config", "user.email", "t@t"], &work);
+            run(&["config", "user.name", "t"], &work);
+            for i in 6..12 {
+                std::fs::write(work.join(format!("g{i:03}.txt")), format!("more {i}\n")).unwrap();
+                run(&["add", "."], &work);
+                run(&["commit", "-qm", &format!("commit {i}")], &work);
+            }
+            run(&["push", "-q", "origin", "main"], &work);
+        }
+        let window2 = rev_list_commit_window(&bare, &git, deadline, 0, 2).unwrap();
+        std::fs::write(&count_file, "").unwrap();
+        let _ = enumerate_commit_window(&bare, &git, deadline, &window2).unwrap();
+        assert_eq!(
+            count_invocations(&count_file, "ls-tree"),
+            2,
+            "doubling the history must not move the windowed invocation count"
+        );
+    }
+
+    /// Windowed classification agrees with the full walk: the union of
+    /// per-window allow sets equals the whole-history allow sets, a
+    /// denied blob is denied in every window (fail-closed per window,
+    /// not just in union), a dangling blob is absent from the windowed
+    /// sets entirely (no batch-all catch-all feeds them), and an
+    /// annotated tag object is collected for structural pinning.
+    #[test]
+    fn windowed_union_matches_full_with_denied_dangling_and_tag() {
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        let run = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        std::fs::create_dir_all(work.join("public")).unwrap();
+        std::fs::create_dir_all(work.join("secret")).unwrap();
+        run(&["init", "-q", "-b", "main"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        // Four commits so two windows of two cover the history.
+        for i in 0..4 {
+            std::fs::write(
+                work.join(format!("public/p{i}.txt")),
+                format!("public {i}\n"),
+            )
+            .unwrap();
+            run(&["add", "."], &work);
+            run(&["commit", "-qm", &format!("commit {i}")], &work);
+        }
+        std::fs::write(work.join("secret/s.txt"), b"TOP SECRET\n").unwrap();
+        run(&["add", "."], &work);
+        run(&["commit", "-qm", "add secret"], &work);
+        let secret_blob = {
+            let out = Command::new("git")
+                .args(["rev-parse", "HEAD:secret/s.txt"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+        // Created AFTER the clone: `git clone` packs only reachable
+        // objects, so a dangling blob or tag seeded pre-clone would
+        // never arrive. `make_blob` writes straight into the bare
+        // object store, which is exactly the dangling shape.
+        let dangling = make_blob(&bare, b"dangling, referenced by nothing\n");
+        // An annotated tag of a blob: exercises the peel arm and the
+        // tag-object collection.
+        let tagged_blob = make_blob(&bare, b"tagged blob\n");
+        run(
+            &["tag", "-a", "-m", "tagged", "tagref", &tagged_blob],
+            &bare,
+        );
+        let tag_oid = {
+            let out = Command::new("git")
+                .args(["rev-parse", "tagref"])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let deadline = Instant::now() + WALK_TIMEOUT;
+        let rules = [rule("/secret/**", &[])];
+        // Full-history reference THROUGH the batch-all catch-all: the
+        // only path that enumerates the dangling blob.
+        let (full_blob_pairs, full_tree_pairs) = all_object_paths(&bare, "git", deadline).unwrap();
+        assert!(
+            full_blob_pairs.contains(&(dangling.clone(), String::new())),
+            "the full walk must contain the dangling blob (empty path) for this comparison to mean anything"
+        );
+        let full_commits = rev_list_commit_window(&bare, "git", deadline, 0, 100).unwrap();
+        assert_eq!(full_commits.len(), 5);
+        let full_sets = classify_object_pairs(
+            &bare,
+            "git",
+            deadline,
+            &rules,
+            true,
+            OWNER,
+            &full_blob_pairs,
+            &full_tree_pairs,
+            &full_commits,
+        )
+        .unwrap();
+        assert!(
+            !full_sets.0.contains(&secret_blob),
+            "reference: denied blob is denied in the full walk"
+        );
+        assert!(
+            !full_sets.0.contains(&dangling),
+            "reference: dangling blob is denied (not allowed) in the full walk"
+        );
+
+        // Two windows of two plus the one-commit tail.
+        let mut union_allowed_blobs: HashSet<String> = HashSet::new();
+        let mut union_allowed_trees: HashSet<String> = HashSet::new();
+        let mut union_all_blobs: HashSet<String> = HashSet::new();
+        let mut union_tags: HashSet<String> = HashSet::new();
+        let mut skip = 0usize;
+        loop {
+            let window = rev_list_commit_window(&bare, "git", deadline, skip, 2).unwrap();
+            if window.is_empty() {
+                break;
+            }
+            let e = enumerate_commit_window(&bare, "git", deadline, &window).unwrap();
+            let sets = classify_object_pairs(
+                &bare,
+                "git",
+                deadline,
+                &rules,
+                true,
+                OWNER,
+                &e.blob_pairs,
+                &e.tree_pairs,
+                &window,
+            )
+            .unwrap();
+            // Fail-closed per window, not just in union.
+            assert!(
+                !sets.0.contains(&secret_blob),
+                "denied blob must be denied in every window"
+            );
+            assert!(
+                !sets.2.contains(&dangling),
+                "dangling blob must be absent from every window"
+            );
+            union_allowed_blobs.extend(sets.0);
+            union_allowed_trees.extend(sets.1);
+            union_all_blobs.extend(sets.2);
+            union_tags.extend(e.tag_oids);
+            skip += window.len();
+            if window.len() < 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            union_allowed_blobs, full_sets.0,
+            "windowed allow sets union to the full allow set"
+        );
+        assert_eq!(
+            union_allowed_trees, full_sets.1,
+            "windowed tree allow sets union to the full tree allow set"
+        );
+        // The windowed all-blob set is the full one MINUS the dangling
+        // blob: the full walk's batch-all catch-all enumerates it (then
+        // denies it), the windowed walk never lists it at all — absent
+        // by construction rather than filtered.
+        let mut full_minus_dangling: HashSet<String> =
+            full_blob_pairs.iter().map(|(oid, _)| oid.clone()).collect();
+        assert!(
+            full_minus_dangling.remove(&dangling),
+            "the full walk must contain the dangling blob for this comparison to mean anything"
+        );
+        assert_eq!(
+            union_all_blobs, full_minus_dangling,
+            "windowed enumeration matches full enumeration except dangling objects"
+        );
+        assert!(
+            union_tags.contains(&tag_oid),
+            "the annotated tag object must be collected for structural pinning"
+        );
+        // Owner recovery sees the denied blob through the windowed pairs.
+        let mut window_pairs: Vec<(String, String)> = Vec::new();
+        for w in [0, 2, 4] {
+            let window = rev_list_commit_window(&bare, "git", deadline, w, 2).unwrap();
+            if window.is_empty() {
+                break;
+            }
+            let e = enumerate_commit_window(&bare, "git", deadline, &window).unwrap();
+            window_pairs.extend(e.blob_pairs);
+            window_pairs.extend(e.tree_pairs);
+        }
+        let recips = recipients_from_pairs(&window_pairs, &rules, true, OWNER);
+        assert!(
+            recips.get(&secret_blob).is_some_and(|s| s.contains(OWNER)),
+            "denied blob must reach the owner recovery set through windowed pairs"
         );
     }
 

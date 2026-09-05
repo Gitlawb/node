@@ -18,7 +18,21 @@ const REPOS_PER_PASS: usize = 100;
 /// Maximum objects to pin per backend per repo in a single pass — prevents one
 /// large repo from monopolizing the blocking pool or the hourly budget. Applied
 /// after filtering out already-pinned objects so the cap reflects actual work.
+/// This is an EFFECT cap (uploads per pass), not a discovery bound: discovery
+/// is bounded separately by [`SCAN_COMMIT_WINDOW`] before any candidate,
+/// pair, or reachable set is materialized, so the cap engages on work the
+/// pass actually did rather than on a graph it already buffered.
 const MAX_OBJECTS_PER_REPO: usize = 50_000;
+
+/// Maximum commits whose trees are enumerated per repo per pass. One
+/// `ls-tree` runs per window commit (plus bounded ref-target walks), so
+/// this is the ceiling on per-pass git invocations and on the retained
+/// blob/tree pair sets. A repo with more history is covered across
+/// passes via the per-repo skip cursor in `node_state`
+/// (`scan_cursor_key`); a repo within one window behaves exactly as
+/// before. Windows advance oldest-first, so fresh tips extend the
+/// uncovered tail rather than hiding behind the cursor.
+const SCAN_COMMIT_WINDOW: usize = 1000;
 
 /// Per-repo deadline for the blocking git scan (list_all_objects + visibility
 /// filter).  A pathological repo that stalls past this is skipped for the pass.
@@ -45,6 +59,41 @@ const PIN_PHASE_DEADLINE: Duration = Duration::from_secs(300);
 /// node_state key under which the sweep's keyset cursor is persisted across
 /// restarts (R2-P1).
 const CURSOR_KEY: &str = "reconciliation_sweep_cursor";
+
+/// node_state key prefix for the per-repo discovery cursor: how many
+/// commits (in oldest-first topo order) the sweep has already covered.
+/// Stored as a decimal skip count; absent or unparseable reads as zero
+/// (re-walk from the head — safe, since re-walking only re-pins what the
+/// gap filters still report missing). Deleted when a window covers the
+/// history end, so completed repos hold no row.
+fn scan_cursor_key(repo_id: &str) -> String {
+    format!("reconciliation_scan_skip/{repo_id}")
+}
+
+/// Load the discovery skip for a repo. Any failure (missing key, corrupt
+/// value, DB error) restarts the window at the head: fail-open to
+/// re-discovery is safe here because classification stays fail-closed
+/// (absence withholds) and pinning stays idempotent.
+async fn load_scan_cursor(db: &Db, repo_id: &str) -> usize {
+    match db.get_node_state(&scan_cursor_key(repo_id)).await {
+        Ok(Some(v)) => v.parse::<usize>().unwrap_or_else(|_| {
+            tracing::warn!(
+                repo = %repo_id,
+                value = %v,
+                "unparseable scan cursor, restarting discovery at the head"
+            );
+            0
+        }),
+        Ok(None) => 0,
+        Err(e) => {
+            tracing::warn!(
+                repo = %repo_id, err = %e,
+                "scan cursor unreadable, restarting discovery at the head"
+            );
+            0
+        }
+    }
+}
 
 /// Log message emitted when the Irys anchor call fails after a successful
 /// seal. The contract is one-shot: `plan_seal` returns `SkipUnchanged` on
@@ -80,8 +129,9 @@ pub(crate) enum ProgressState {
     /// rotates past `last_dispatched`, retrying everything
     /// beyond.
     Advanced { last_dispatched: String },
-    /// The missing set was empty. The cursor is cleared
-    /// (a future pass sees a fresh start).
+    /// The missing set was empty. The row is DELETED, never
+    /// tombstoned (a future pass sees a fresh start, and no hourly
+    /// rewrite touches the pair).
     Drained,
 }
 
@@ -264,26 +314,32 @@ async fn refilter_public_objects(
     is_public: bool,
     owner_did: &str,
     object_list: Vec<String>,
+    commits: &[String],
     deadline: Instant,
 ) -> Option<Vec<String>> {
     let disk_clone = disk.to_path_buf();
     let rules_clone = rules.to_vec();
     let owner_clone = owner_did.to_string();
+    let commits_clone = commits.to_vec();
 
     match tokio::time::timeout(
         deadline.saturating_duration_since(Instant::now()),
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
             // The shared deadline spans this whole re-filter
-            // (allowed_blob_tree_sets_bounded), so a slow walk is bounded as a
+            // (allowed_blob_tree_sets_for_commits), so a slow walk is bounded as a
             // unit rather than granting each git child a fresh timeout.
+            // Windowed on the scan's commits: re-deriving over the same
+            // universe the scan classified keeps every authorization stage
+            // inside the discovery bound.
             let (allowed, allowed_trees, all_blobs, all_trees) =
-                crate::git::visibility_pack::allowed_blob_tree_sets_bounded(
+                crate::git::visibility_pack::allowed_blob_tree_sets_for_commits(
                     &disk_clone,
                     "git",
                     deadline,
                     &rules_clone,
                     is_public,
                     &owner_clone,
+                    &commits_clone,
                 )?;
             Ok(crate::git::visibility_pack::replicable_objects_fail_closed(
                 object_list,
@@ -346,13 +402,23 @@ async fn pin_boundary_refilter(
     is_public: bool,
     owner_did: &str,
     object_list: Vec<String>,
+    commits: &[String],
     deadline: Instant,
 ) -> Option<Vec<String>> {
     #[cfg(test)]
     if FAIL_PIN_BOUNDARY_REDERIVE.with(|c| c.get()) {
         return None;
     }
-    refilter_public_objects(disk, rules, is_public, owner_did, object_list, deadline).await
+    refilter_public_objects(
+        disk,
+        rules,
+        is_public,
+        owner_did,
+        object_list,
+        commits,
+        deadline,
+    )
+    .await
 }
 
 /// Re-check quarantine AND root visibility immediately before an irreversible
@@ -397,6 +463,50 @@ async fn recheck_public_pin(
         tracing::warn!(repo = %repo_slug, "visibility narrowed, skipping pin");
         return None;
     }
+    Some((fresh, rules))
+}
+
+/// Phase-2 (encrypted recovery) recheck: quarantine + repo-exists + fresh
+/// rules, WITHOUT the anonymous-listability gate. Recovery copies are sealed
+/// to the owner (and rule readers), never served anonymously, so a repo that
+/// is unlistable at root — a "/"-denied repo, or a public repo whose only
+/// objects are unclassifiable empty-path direct refs — still has an owner
+/// recovery lane. Quarantine still skips everything: a quarantined repo is
+/// under investigation and gets no writes of any kind.
+async fn recheck_recovery_pin(
+    db: &Db,
+    repo_id: &str,
+    repo_slug: &str,
+) -> Option<(crate::db::RepoRecord, Vec<crate::db::VisibilityRule>)> {
+    match db.is_repo_quarantined(repo_id).await {
+        Ok(true) => {
+            tracing::warn!(repo = %repo_slug, "repo quarantined, skipping recovery pin");
+            return None;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(repo = %repo_slug, err = %e, "quarantine recheck failed, skipping recovery pin");
+            return None;
+        }
+    }
+    let rules = match db.list_visibility_rules(repo_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(repo = %repo_slug, err = %e, "visibility rules re-fetch failed, skipping recovery pin");
+            return None;
+        }
+    };
+    let fresh = match db.get_repo_by_id(repo_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            tracing::warn!(repo = %repo_slug, "repo disappeared from DB, skipping recovery pin");
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(repo = %repo_slug, err = %e, "repo re-fetch failed, skipping recovery pin");
+            return None;
+        }
+    };
     Some((fresh, rules))
 }
 
@@ -587,11 +697,17 @@ async fn run_pass(
             }
         };
 
-        if !crate::visibility::listable_at_root(&rules, repo.is_public, &repo.owner_did, None) {
-            continue;
-        }
+        // An unlistable repo has no PUBLIC work, but it may still have an
+        // owner recovery lane: withheld blobs include owner-only empty-path
+        // objects (direct refs) regardless of rule shape, and a "/"-denied
+        // repo withholds everything from anonymous while the owner set stays
+        // non-empty. Record that as an empty public list instead of skipping
+        // the iteration, so phase 2 decides from the actual recipient
+        // result. Quarantine above still skips everything.
+        let listable =
+            crate::visibility::listable_at_root(&rules, repo.is_public, &repo.owner_did, None);
 
-        // ── Full git scan (bounded) ─────────────────────────────────────
+        // ── Windowed git scan (bounded discovery) ─────────────────────────
         // One absolute deadline spans the whole scan. The mandatory visibility
         // re-filter below runs against its OWN fresh budget (`authz_deadline`),
         // NOT this spent deadline (R2-P1): a scan that legitimately consumes
@@ -601,64 +717,116 @@ async fn run_pass(
         // exists for. The pin-boundary re-derivations use the same fresh-
         // budget pattern per backend arm, so no later authorization stage can
         // be starved by the read phase's consumption.
+        //
+        // Discovery is windowed by commit, not just capped at the pin
+        // effect: `MAX_OBJECTS_PER_REPO` bounds uploads per pass, but the
+        // scan used to buffer the whole object/path graph (full
+        // `cat-file --batch-all-objects`, an ls-tree per commit, full
+        // rev-list sets) before that cap engaged. Now each pass walks at
+        // most `SCAN_COMMIT_WINDOW` commits: per-pass git invocations and
+        // retained sets scale with the window, and a persisted per-repo
+        // skip cursor carries coverage across passes (and restarts — the
+        // cursor lives in `node_state`, not memory). Unwalked commits are
+        // simply absent from this pass's list (fail-closed: absence
+        // withholds, never publishes); dangling objects are absent by
+        // construction (no full-ODB listing feeds candidates — every
+        // candidate is either a window commit, a walked pair, or a
+        // ref-tip tag, all reachable by construction).
         let scan_deadline = Instant::now() + REPO_SCAN_DEADLINE;
         let disk_clone = disk.clone();
         let owner_clone = repo.owner_did.clone();
         let rules_clone = rules.clone();
         let is_public = repo.is_public;
 
-        let object_list = tokio::time::timeout(
-            scan_deadline.saturating_duration_since(Instant::now()),
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
-                let all_objs =
-                    crate::git::push_delta::list_all_objects(&disk_clone, "git", scan_deadline)?;
-                let (allowed, allowed_trees, all_blobs, all_trees) =
-                    crate::git::visibility_pack::allowed_blob_tree_sets_bounded(
-                        &disk_clone,
-                        "git",
-                        scan_deadline,
-                        &rules_clone,
-                        is_public,
-                        &owner_clone,
-                    )?;
-                // Fail closed for blobs and denied trees (#172): the
-                // batch-all-objects enumeration carries dangling commits/trees
-                // from an aborted push, which have no path scoping to fail
-                // closed against. Requiring membership in the reachable object
-                // set keeps their messages, authors, parent links, and
-                // tree/file-name metadata off public pin backends (R2).
-                let reachable = crate::git::push_delta::reachable_object_oids(
-                    &disk_clone,
-                    "git",
-                    scan_deadline,
-                )?;
-                Ok(crate::git::visibility_pack::replicable_objects_fail_closed(
-                    all_objs,
-                    &allowed,
-                    &all_blobs,
-                    &allowed_trees,
-                    &all_trees,
-                )
-                .into_iter()
-                .filter(|oid| reachable.contains(oid))
-                .collect())
-            }),
-        )
-        .await;
+        // Unlistable repos skip discovery (nothing could be served)
+        // but still reach phase 2 below via the empty public list.
+        // `window_exhausted`/`window_commits` stay at their empty
+        // defaults and the scan cursor is left untouched.
+        let scan_skip = load_scan_cursor(db, &repo.id).await;
+        let mut window_exhausted = true;
+        let mut window_commits: Vec<String> = Vec::new();
+        // Discovery progress for THIS pass: decided after phase 1 from
+        // effect-side state (missing sets + dispatched markers) and
+        // persisted below. A failed scan leaves it false with the cursor
+        // untouched so the same window retries next pass.
+        let mut scan_advance = false;
+        let object_list: Vec<String> = if !listable {
+            Vec::new()
+        } else {
+            let object_list = tokio::time::timeout(
+                scan_deadline.saturating_duration_since(Instant::now()),
+                tokio::task::spawn_blocking(
+                    move || -> anyhow::Result<(Vec<String>, Vec<String>, bool)> {
+                        let window = crate::git::visibility_pack::rev_list_commit_window(
+                            &disk_clone,
+                            "git",
+                            scan_deadline,
+                            scan_skip,
+                            SCAN_COMMIT_WINDOW,
+                        )?;
+                        let exhausted = window.len() < SCAN_COMMIT_WINDOW;
+                        let enumeration = crate::git::visibility_pack::enumerate_commit_window(
+                            &disk_clone,
+                            "git",
+                            scan_deadline,
+                            &window,
+                        )?;
+                        let (allowed, allowed_trees, all_blobs, all_trees) =
+                            crate::git::visibility_pack::classify_object_pairs(
+                                &disk_clone,
+                                "git",
+                                scan_deadline,
+                                &rules_clone,
+                                is_public,
+                                &owner_clone,
+                                &enumeration.blob_pairs,
+                                &enumeration.tree_pairs,
+                                &window,
+                            )?;
+                        let mut candidates: Vec<String> = window.clone();
+                        candidates.extend(
+                            enumeration
+                                .blob_pairs
+                                .iter()
+                                .chain(enumeration.tree_pairs.iter())
+                                .map(|(oid, _)| oid.clone()),
+                        );
+                        candidates.extend(enumeration.tag_oids.iter().cloned());
+                        candidates.sort();
+                        candidates.dedup();
+                        let object_list =
+                            crate::git::visibility_pack::replicable_objects_fail_closed(
+                                candidates,
+                                &allowed,
+                                &all_blobs,
+                                &allowed_trees,
+                                &all_trees,
+                            );
+                        Ok((object_list, window, exhausted))
+                    },
+                ),
+            )
+            .await;
 
-        let object_list: Vec<String> = match object_list {
-            Ok(Ok(Ok(list))) => list,
-            Ok(Ok(Err(e))) => {
-                tracing::warn!(repo = %repo_slug, err = %e, "full-scan failed, skipping");
-                continue;
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(repo = %repo_slug, err = %e, "full-scan task panicked, skipping");
-                continue;
-            }
-            Err(_) => {
-                tracing::warn!(repo = %repo_slug, "full-scan deadline exceeded, skipping");
-                continue;
+            match object_list {
+                Ok(Ok(Ok((list, window, exhausted)))) => {
+                    window_exhausted = exhausted;
+                    scan_advance = exhausted;
+                    window_commits = window;
+                    list
+                }
+                Ok(Ok(Err(e))) => {
+                    tracing::warn!(repo = %repo_slug, err = %e, "windowed scan failed, skipping");
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(repo = %repo_slug, err = %e, "windowed scan task panicked, skipping");
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(repo = %repo_slug, "windowed scan deadline exceeded, skipping");
+                    continue;
+                }
             }
         };
 
@@ -677,18 +845,9 @@ async fn run_pass(
 
         // Backend enable flags live outside the `if has_public_work`
         // block because phase 2 (encrypted) consults `ipfs_enabled`
-        // and `_pin_permit` regardless of public-work state. Pulling
-        // them out of the inner block is a round 10 P1 follow-up:
-        // before that, an empty public list (which made
-        // `has_public_work` false) left these names out of scope
-        // for phase 2 and the build failed.
+        // regardless of public-work state.
         let ipfs_enabled = !config.ipfs_api.is_empty();
         let pinata_enabled = !config.pinata_jwt.is_empty();
-        // `_pin_permit` is set by the public phase when it had gaps
-        // to pin; phase 2 reuses it. When `has_public_work` is false
-        // the public phase never ran, so the permit starts as
-        // `None` and phase 2 acquires a fresh one.
-        let mut _pin_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
 
         // Fresh budget for the authorization-at-dispatch re-derivations (R1/R2):
         // the scan may have legitimately consumed its whole `scan_deadline`, and
@@ -737,6 +896,7 @@ async fn run_pass(
                 fresh_repo.is_public,
                 &fresh_repo.owner_did,
                 object_list,
+                &window_commits,
                 authz_deadline,
             )
             .await;
@@ -885,21 +1045,14 @@ async fn run_pass(
             // under a PolicyFence captured at ITS dispatch boundary, so a narrow that
             // lands mid-batch aborts the remaining uploads (R1-P1).
             //
-            // Acquire the same global pin permit the push path holds (R2-P2): the
-            // sweep's pin loops must not bypass `max_concurrent_pin_tasks`. Acquired
-            // only when there is actual pin work; the scan above holds no permit.
-            // The permit is held across the public pin loops AND the encrypted seal
-            // below (which also writes to IPFS) and dropped at the end of this repo's
-            // iteration.
-            // Reassign the outer `_pin_permit` (declared before this
-            // block so phase 2 can read it even when the public phase
-            // did not run) instead of shadowing with `let`.
-            _pin_permit = if !ipfs_missing.is_empty() || !pinata_missing.is_empty() {
-                let permit = pin_sem.clone().acquire_owned().await?;
-                Some(permit)
-            } else {
-                None
-            };
+            // Provider permits (R2-P2) are scoped to provider effects only:
+            // each backend arm acquires the global pin permit immediately
+            // before its upload loop and drops it right after. Fence
+            // captures, rechecks, refilters, offset writes, and the
+            // recipient walk all run WITHOUT the permit, so a stalled
+            // preparation phase never parks a global slot a normal push
+            // needs. The three arms never nest acquires, so pool size 1
+            // cannot deadlock.
             let ipfs_fence = if ipfs_enabled && !ipfs_missing.is_empty() {
                 crate::ipfs_pin::PolicyFence::capture(db, &repo.id).await
             } else {
@@ -911,14 +1064,14 @@ async fn run_pass(
                 None
             };
 
-            let pinned_ipfs: Vec<(String, String)> = if ipfs_enabled && !ipfs_missing.is_empty() {
+            let mut pinned_ipfs: Vec<(String, String)> = Vec::new();
+            if ipfs_enabled && !ipfs_missing.is_empty() {
                 match ipfs_fence {
                     None => {
                         tracing::warn!(repo = %repo_slug, "IPFS policy-epoch capture failed, skipping");
-                        Vec::new()
                     }
                     Some(fence) => match recheck_public_pin(db, &repo.id, &repo_slug).await {
-                        None => Vec::new(),
+                        None => {}
                         Some((fresh_repo, fresh_rules)) => {
                             let to_pin = match pin_boundary_refilter(
                                 &disk,
@@ -926,6 +1079,7 @@ async fn run_pass(
                                 fresh_repo.is_public,
                                 &fresh_repo.owner_did,
                                 ipfs_missing,
+                                &window_commits,
                                 Instant::now() + rederive_budget,
                             )
                             .await
@@ -936,21 +1090,11 @@ async fn run_pass(
                                     Vec::new()
                                 }
                             };
-                            if to_pin.is_empty() {
-                                Vec::new()
-                            } else {
-                                // Dispatch boundary (round-8 P2): from here the OIDs
-                                // in `to_pin` really are handed to the backend, so
-                                // the continuation may advance to the last of them.
-                                // Recorded BEFORE the call so a pin phase that times
-                                // out mid-batch still counts as dispatched — those
-                                // objects were attempted, and re-attempting them
-                                // ahead of the rest of the backlog is the starvation
-                                // the rotation exists to avoid. It is `to_pin`'s last
-                                // element, not the missing set's: an OID the
-                                // pin-boundary re-derivation dropped was never
-                                // offered to the backend.
-                                ipfs_dispatched = to_pin.last().cloned();
+                            if !to_pin.is_empty() {
+                                // Provider-effect permit: held only across
+                                // the upload loop, never across fence
+                                // captures, rechecks, or offset writes.
+                                let _ipfs_permit = pin_sem.clone().acquire_owned().await?;
                                 match tokio::time::timeout(
                                     PIN_PHASE_DEADLINE,
                                     crate::ipfs_pin::pin_new_objects(
@@ -967,30 +1111,35 @@ async fn run_pass(
                                 )
                                 .await
                                 {
-                                    Ok(v) => v,
+                                    Ok(outcome) => {
+                                        // Effect-side progress, not the plan:
+                                        // the backend reports the last OID it
+                                        // actually entered. A timed-out phase
+                                        // below leaves this untouched so the
+                                        // prefix retries at the head instead
+                                        // of rotating an unvisited suffix
+                                        // behind the backlog.
+                                        ipfs_dispatched = outcome.last_attempted;
+                                        pinned_ipfs = outcome.confirmed;
+                                    }
                                     Err(_) => {
                                         tracing::warn!(repo = %repo_slug, "IPFS pin phase timed out after {:?}", PIN_PHASE_DEADLINE);
-                                        Vec::new()
                                     }
                                 }
                             }
                         }
                     },
                 }
-            } else {
-                Vec::new()
-            };
+            }
 
-            let pinned_pinata: Vec<(String, String)> = if pinata_enabled
-                && !pinata_missing.is_empty()
-            {
+            let mut pinned_pinata: Vec<(String, String)> = Vec::new();
+            if pinata_enabled && !pinata_missing.is_empty() {
                 match pinata_fence {
                     None => {
                         tracing::warn!(repo = %repo_slug, "Pinata policy-epoch capture failed, skipping");
-                        Vec::new()
                     }
                     Some(fence) => match recheck_public_pin(db, &repo.id, &repo_slug).await {
-                        None => Vec::new(),
+                        None => {}
                         Some((fresh_repo, fresh_rules)) => {
                             // Own budget (R2-P1): the IPFS arm above may have
                             // consumed the whole shared deadline, and a reused
@@ -1003,6 +1152,7 @@ async fn run_pass(
                                 fresh_repo.is_public,
                                 &fresh_repo.owner_did,
                                 pinata_missing,
+                                &window_commits,
                                 Instant::now() + rederive_budget,
                             )
                             .await
@@ -1013,13 +1163,10 @@ async fn run_pass(
                                     Vec::new()
                                 }
                             };
-                            if to_pin.is_empty() {
-                                Vec::new()
-                            } else {
-                                // Dispatch boundary (round-8 P2); see the IPFS arm
-                                // above for why this is recorded here rather than
-                                // from the missing set before the fence.
-                                pinata_dispatched = to_pin.last().cloned();
+                            if !to_pin.is_empty() {
+                                // Provider-effect permit, same scoping as
+                                // the IPFS arm above; never nested.
+                                let _pinata_permit = pin_sem.clone().acquire_owned().await?;
                                 match tokio::time::timeout(
                                     PIN_PHASE_DEADLINE,
                                     crate::pinata::pin_new_objects(
@@ -1038,19 +1185,19 @@ async fn run_pass(
                                 )
                                 .await
                                 {
-                                    Ok(v) => v,
+                                    Ok(outcome) => {
+                                        pinata_dispatched = outcome.last_attempted;
+                                        pinned_pinata = outcome.confirmed;
+                                    }
                                     Err(_) => {
                                         tracing::warn!(repo = %repo_slug, "Pinata pin phase timed out after {:?}", PIN_PHASE_DEADLINE);
-                                        Vec::new()
                                     }
                                 }
                             }
                         }
                     },
                 }
-            } else {
-                Vec::new()
-            };
+            }
 
             // `pin_new_objects` returns only objects whose DB record was written
             // (R1-P3), so a backend that uploaded bytes but failed to persist is
@@ -1121,13 +1268,34 @@ async fn run_pass(
             //   - `Advanced { last_dispatched }`: a subset of the cap
             //     was dispatched. The next pass rotates past
             //     `last_dispatched`, retrying everything beyond.
-            //   - `Drained`: the missing set was empty. The cursor is
-            //     cleared (a future pass sees a fresh start).
+            //   - `Drained`: the missing set was empty. The row is
+            //     DELETED, not tombstoned (a future pass sees a fresh
+            //     start, and no hourly rewrite touches the pair).
             //
             // The two backends' cursors are independent: a drained
             // IPFS missing set clears the IPFS offset but does NOT
             // touch the Pinata offset, and vice versa. The write
             // site persists each backend's state without sharing.
+            //
+            // Discovery advance for the scan window, decided here
+            // (before the offset writes move the dispatched markers):
+            // move the cursor when this window needs no revisit —
+            // covered to the history end, nothing missing on either
+            // backend, or real dispatch happened on either backend.
+            // Attempted-but-unconfirmed work rotates forward; only a
+            // zero-dispatch transient failure retries the window.
+            // Trade-off, stated: a window whose uploads all fail to
+            // confirm (sustained record outage, poison objects)
+            // advances past unconfirmed OIDs, which then wait a full
+            // cycle instead of retrying hourly. The alternative —
+            // stalling discovery on any unconfirmed object — recreates
+            // window-granularity starvation behind one bad object, the
+            // class the per-backend rotation exists to kill. Stuck
+            // windows are loud (per-object warns every pass).
+            scan_advance = window_exhausted
+                || (!ipfs_had_work && !pinata_had_work)
+                || ipfs_dispatched.is_some()
+                || pinata_dispatched.is_some();
 
             if ipfs_enabled {
                 let next_wire =
@@ -1159,6 +1327,27 @@ async fn run_pass(
             }
         } // end of `if has_public_work { ... }` (round 10 P1)
 
+        // Persist discovery progress (phase 2 below re-derives its own
+        // window walk from the still-untouched cursor when the scan never
+        // ran). Unlistable repos never reach here with a decision: their
+        // cursor is left alone.
+        if listable && scan_advance {
+            if window_exhausted {
+                if let Err(e) = db.set_node_state(&scan_cursor_key(&repo.id), None).await {
+                    tracing::warn!(repo = %repo_slug, err = %e, "failed to clear finished scan cursor");
+                }
+            } else {
+                let next_skip = scan_skip + window_commits.len();
+                let next_value = next_skip.to_string();
+                if let Err(e) = db
+                    .set_node_state(&scan_cursor_key(&repo.id), Some(next_value.as_str()))
+                    .await
+                {
+                    tracing::warn!(repo = %repo_slug, err = %e, "failed to persist scan cursor");
+                }
+            }
+        }
+
         // ── Phase 2: Encrypted recovery-copy resealing (withheld blobs) ──
 
         // Fence the encrypted path from the point the recipients are derived:
@@ -1178,30 +1367,71 @@ async fn run_pass(
                 continue;
             }
         };
-        // Recheck quarantine AND root visibility before encrypted pinning, using
-        // FRESH repo identity (R1-P2): the batch snapshot may predate a narrow.
-        let (fresh_repo2, fresh_rules2) = match recheck_public_pin(db, &repo.id, &repo_slug).await {
+        // Recheck quarantine and repo existence before encrypted pinning,
+        // using FRESH repo identity (R1-P2): the batch snapshot may predate
+        // a narrow. Deliberately NOT the public listability gate: recovery
+        // copies are owner-sealed, never anonymously served, so an
+        // unlistable repo ("/"-denied, or only unclassifiable direct refs)
+        // still reaches its recovery lane here. What decides is the actual
+        // withheld-recipient result below, not the rule shape: the old
+        // `has_path_scoped_rule` shortcut assumed no path-scoped rule meant
+        // no withheld object, which the owner-only empty-path class broke.
+        // Running the walk unconditionally costs a deadline-bounded walk per
+        // repo per pass; an empty result seals nothing.
+        let (fresh_repo2, fresh_rules2) = match recheck_recovery_pin(db, &repo.id, &repo_slug).await
+        {
             Some(v) => v,
             None => continue,
         };
 
-        let has_path_scoped = crate::git::visibility_pack::has_path_scoped_rule(&fresh_rules2);
-        if has_path_scoped && ipfs_enabled {
+        if ipfs_enabled {
+            // Windowed recipients walk over the scan window (bounded
+            // discovery, same commits the scan classified — or, when the
+            // scan never ran for an unlistable repo, the same window
+            // re-derived here from the untouched cursor). The pair
+            // listing is rule-independent, so deriving it fresh under
+            // the fresh rules is consistent with the scan; unlisted
+            // objects stay absent (fail-closed) either way.
             let p = disk.clone();
             let owner = fresh_repo2.owner_did.clone();
             let r = fresh_rules2.clone();
             let is_public_2 = fresh_repo2.is_public;
+            let wcommits = window_commits.clone();
+            let wskip = scan_skip;
+            let listed = listable;
             let recipients = tokio::time::timeout(
                 REPO_SCAN_DEADLINE,
-                tokio::task::spawn_blocking(move || {
-                    crate::git::visibility_pack::withheld_blob_recipients_bounded(
-                        &p,
-                        "git",
-                        REPO_SCAN_DEADLINE,
+                tokio::task::spawn_blocking(move || -> anyhow::Result<
+                    std::collections::HashMap<String, std::collections::BTreeSet<String>>,
+                > {
+                    // Own deadline for the whole windowed walk (same
+                    // shape as the scan's: one absolute bound, not a
+                    // fresh budget per child).
+                    let deadline =
+                        std::time::Instant::now() + REPO_SCAN_DEADLINE;
+                    let window = if listed {
+                        wcommits
+                    } else {
+                        crate::git::visibility_pack::rev_list_commit_window(
+                            &p,
+                            "git",
+                            deadline,
+                            wskip,
+                            SCAN_COMMIT_WINDOW,
+                        )?
+                    };
+                    let enumeration =
+                        crate::git::visibility_pack::enumerate_commit_window(
+                            &p, "git", deadline, &window,
+                        )?;
+                    let mut pairs = enumeration.blob_pairs;
+                    pairs.extend(enumeration.tree_pairs);
+                    Ok(crate::git::visibility_pack::recipients_from_pairs(
+                        &pairs,
                         &r,
                         is_public_2,
                         &owner,
-                    )
+                    ))
                 }),
             )
             .await;
@@ -1232,35 +1462,35 @@ async fn run_pass(
             };
 
             if !rec.is_empty() {
-                // The encrypted seal writes to IPFS too, so it runs under the
-                // same global pin permit as the public loops (R2-P2). Reuse the
-                // permit `_pin_permit` already holds for this repo when the
-                // public phase had gaps; only acquire a fresh one when it did
-                // not. One permit per repo, never two (R2-P1): with
-                // `max_concurrent_pin_tasks = 1` a second acquire here would
-                // wait on the very permit this iteration holds and deadlock the
-                // sweep past its guard timeout.
-                let _enc_permit = match &_pin_permit {
-                    Some(_) => None,
-                    None => Some(pin_sem.clone().acquire_owned().await?),
+                // The encrypted seal writes to IPFS too, so it runs under
+                // the same global pin permit as the public loops (R2-P2) —
+                // acquired fresh here, scoped to the seal call only. The
+                // public arms above already dropped theirs, so this never
+                // nests: with `max_concurrent_pin_tasks = 1` a nested
+                // acquire would wait on the very permit this iteration
+                // holds and deadlock the sweep past its guard timeout.
+                // Manifest anchoring below runs WITHOUT the permit (no
+                // provider effect); the guard's scope ends with the seal.
+                let sealed = {
+                    let _enc_permit = pin_sem.clone().acquire_owned().await?;
+                    // Bound the seal+pin work (R1-P2): an unavailable backend must
+                    // not hold the sweep past the pin-phase budget.
+                    tokio::time::timeout(
+                        PIN_PHASE_DEADLINE,
+                        crate::encrypted_pin::encrypt_and_pin(
+                            &config.ipfs_api,
+                            &disk,
+                            db,
+                            &repo.id,
+                            node_seed,
+                            "git",
+                            crate::ipfs_pin::PIN_BATCH_BUDGET,
+                            &rec,
+                            Some(&enc_fence),
+                        ),
+                    )
+                    .await
                 };
-                // Bound the seal+pin work (R1-P2): an unavailable backend must
-                // not hold the sweep past the pin-phase budget.
-                let sealed = tokio::time::timeout(
-                    PIN_PHASE_DEADLINE,
-                    crate::encrypted_pin::encrypt_and_pin(
-                        &config.ipfs_api,
-                        &disk,
-                        db,
-                        &repo.id,
-                        node_seed,
-                        "git",
-                        crate::ipfs_pin::PIN_BATCH_BUDGET,
-                        &rec,
-                        Some(&enc_fence),
-                    ),
-                )
-                .await;
 
                 let sealed: Vec<(String, String)> = match sealed {
                     Ok(v) => v,
@@ -2214,10 +2444,10 @@ mod tests {
         );
         db.create_repo(&rec).await.unwrap();
 
-        // Path-scoped rule: required twice over. It makes the repo a
-        // path-scoped repo (the phase-2 `has_path_scoped_rule` gate), and it
-        // documents the deny the empty-path entries are additionally subject
-        // to on the allow side.
+        // Path-scoped rule: documents the deny the empty-path entries are
+        // additionally subject to on the allow side. Phase 2 no longer keys
+        // on rule shape (it runs on the actual recipient result), so this
+        // rule is illustrative rather than load-bearing for reaching it.
         db.set_visibility_rule(
             &rec.id,
             "/secret/**",
@@ -2286,6 +2516,279 @@ mod tests {
         m.assert_async().await;
     }
 
+    /// #218 review (empty-path recovery without path rules): a blob, tree, or
+    /// peeled-tag referent reachable only through a non-commit ref has an
+    /// empty path. That is correctly denied to anonymous replication, but the
+    /// owner recovery lane must not depend on any path-scoped rule existing:
+    /// with zero rules, or with only a root "/" rule, phase 2 still seals an
+    /// owner copy. Matrix over 3 ref shapes × 2 rule shapes (6 repos, one
+    /// pass): no blob or tree is pinned in cleartext, every blob — plus each
+    /// withheld tree, whose bytes name the denied child — gets an encrypted
+    /// copy, and a second pass after deleting the recovery rows recreates
+    /// every copy. The tag shape additionally pins its tag object publicly
+    /// (structural metadata, like commits) when the repo is listable — the
+    /// blob it points at still never goes public.
+    #[sqlx::test]
+    async fn sweep_recovers_direct_refs_without_path_rules(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        // The owner must be a real resolvable did:key (see the test above).
+        let owner_did = gitlawb_core::identity::Keypair::generate()
+            .did()
+            .to_string();
+
+        fn run_git(repo: &std::path::Path, args: &[&str]) -> String {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        fn hash_blob(repo: &std::path::Path, body: &[u8]) -> String {
+            use std::io::Write;
+            let mut child = std::process::Command::new("git")
+                .args(["hash-object", "-w", "--stdin"])
+                .current_dir(repo)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.as_mut().unwrap().write_all(body).unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        // Each fixture repo has NO commits: its only object(s) hang off one
+        // non-commit ref. `git rev-list --all` silently skips such refs, so
+        // the path-annotated phases find no commits while the catch-all and
+        // for-each-ref phases surface the referent with an empty path.
+        // Branch refs cannot hold non-commits, so the ref lives outside
+        // refs/heads (direct shapes) or under refs/tags (peeled shape).
+
+        // (repo dir guard, repo id, blob oid, tree oid or None, tag oid or None)
+        struct Case {
+            _td: tempfile::TempDir,
+            repo_id: String,
+            blob: String,
+            tree: Option<String>,
+            tag: Option<String>,
+        }
+        let mut cases: Vec<Case> = Vec::new();
+        for (shape, name) in [
+            ("blob", "direct-blob"),
+            ("tree", "direct-tree"),
+            ("tag", "tag-of-blob"),
+        ] {
+            for (rules, suffix) in [("none", "norules"), ("root", "rootrule")] {
+                let td = tempfile::TempDir::new().unwrap();
+                let path = td.path().to_path_buf();
+                run_git(&path, &["init", "-q", "-b", "main"]);
+                run_git(&path, &["config", "user.email", "t@t"]);
+                run_git(&path, &["config", "user.name", "t"]);
+                let blob = hash_blob(&path, format!("secret {shape} {suffix}\n").as_bytes());
+                let tag = if shape == "tag" {
+                    run_git(&path, &["tag", "-a", "-m", "tagged", "tagref", &blob]);
+                    Some(run_git(&path, &["rev-parse", "tagref"]))
+                } else {
+                    None
+                };
+                let tree = if shape == "tree" {
+                    let mut child = std::process::Command::new("git")
+                        .args(["mktree"])
+                        .current_dir(&path)
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    {
+                        use std::io::Write;
+                        child
+                            .stdin
+                            .as_mut()
+                            .unwrap()
+                            .write_all(format!("100644 blob {blob}\ttreed.txt\n").as_bytes())
+                            .unwrap();
+                    }
+                    let out = child.wait_with_output().unwrap();
+                    assert!(out.status.success());
+                    let tree = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    run_git(&path, &["update-ref", "refs/direct/tree", &tree]);
+                    Some(tree)
+                } else {
+                    if shape == "blob" {
+                        run_git(&path, &["update-ref", "refs/direct/blob", &blob]);
+                    }
+                    None
+                };
+                let rec = seed_repo(
+                    &owner_did,
+                    &format!("sweep-direct-{name}-{suffix}"),
+                    &path.display().to_string(),
+                );
+                db.create_repo(&rec).await.unwrap();
+                if rules == "root" {
+                    db.set_visibility_rule(
+                        &rec.id,
+                        "/",
+                        crate::db::VisibilityMode::B,
+                        &[],
+                        &owner_did,
+                    )
+                    .await
+                    .unwrap();
+                }
+                cases.push(Case {
+                    _td: td,
+                    repo_id: rec.id,
+                    blob,
+                    tree,
+                    tag,
+                });
+            }
+        }
+        // Keep the tempdirs alive: `cases` owns each `_td`.
+        assert_eq!(cases.len(), 6, "3 shapes x 2 rule shapes");
+
+        // Pass 1: 8 seals plus the one structural tag-object pin (the
+        // listable tag repo; the root-ruled tag repo skips its public
+        // scan). Each tree-shape repo seals TWO objects: the withheld tree
+        // itself enters the withheld set keyed on OID (its bytes name the
+        // denied child), plus its child blob. Any cleartext upload would
+        // exceed the count and fail the mock.
+        let mut server = mockito::Server::new_async().await;
+        let m1 = server
+            .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
+            .expect(9)
+            .with_status(200)
+            .with_body(r#"{"Hash":"QmDirectRefMockCid"}"#)
+            .create_async()
+            .await;
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            &server.url(),
+        ]);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let (_tx, mut rx) = watch::channel(false);
+        let mut cursor = None;
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        let (scanned, gaps, filled) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(scanned, 6, "all six fixture repos reach the per-repo loop");
+        assert_eq!(
+            gaps, 1,
+            "only the listable tag repo has public work: its structural tag object"
+        );
+        assert_eq!(filled, 1, "only the tag object is pinned publicly");
+        for c in &cases {
+            assert!(
+                !db.has_ipfs_cid(&c.blob).await.unwrap(),
+                "direct blob must never be pinned in cleartext"
+            );
+            assert!(
+                db.encrypted_blob_cid(&c.repo_id, &c.blob)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "owner recovery copy must exist with zero rules and with a root-only rule"
+            );
+            if let Some(tree) = &c.tree {
+                assert!(
+                    !db.has_ipfs_cid(tree).await.unwrap(),
+                    "direct tree must never be pinned in cleartext"
+                );
+                assert!(
+                    db.encrypted_blob_cid(&c.repo_id, tree)
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "withheld tree needs an owner recovery copy too: its bytes name the denied child"
+                );
+            }
+        }
+        // The listable tag object replicates as structural metadata; the
+        // root-ruled one is never scanned, so it stays unpinned.
+        let listable_tag = cases
+            .iter()
+            .find(|c| c.tag.is_some())
+            .expect("tag shape exists");
+        assert!(
+            db.has_ipfs_cid(listable_tag.tag.as_deref().unwrap())
+                .await
+                .unwrap(),
+            "structural tag object replicates publicly when listable"
+        );
+
+        m1.assert_async().await;
+        // Delete every recovery copy and prove the next sweep recreates each
+        // one: the backstop repairs lost copies, not just missing ones.
+        // Pass 2 posts only the 8 seals: the tag is already pinned, so the
+        // public phase has nothing to dispatch.
+        sqlx::query("DELETE FROM encrypted_blobs")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let m2 = server
+            .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
+            .expect(8)
+            .with_status(200)
+            .with_body(r#"{"Hash":"QmDirectRefMockCid"}"#)
+            .create_async()
+            .await;
+        let (scanned2, gaps2, filled2) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(scanned2, 6);
+        assert_eq!(
+            gaps2, 0,
+            "the tag is already pinned; nothing public remains"
+        );
+        assert_eq!(filled2, 0);
+        for c in &cases {
+            assert!(
+                db.encrypted_blob_cid(&c.repo_id, &c.blob)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "deleted recovery copy must be recreated on the next pass"
+            );
+        }
+        m2.assert_async().await;
+    }
+
     /// The final-page proxy must be the lookahead, not `batch.len() < page`
     /// (R1-P2): a key space ending on an exact page boundary looks "full" yet
     /// has no following row, so the cursor must be CLEARED, not persisted to a
@@ -2352,15 +2855,220 @@ mod tests {
         );
     }
 
+    /// Bounded discovery across passes: a history larger than one commit
+    /// window is covered oldest-first over successive passes, with the
+    /// skip cursor persisted in `node_state` (restart-safe: each pass
+    /// below runs with a FRESH in-memory cursor) and deleted on
+    /// completion. 1050 single-file commits exceed the 1000-commit
+    /// window, so pass 1 must persist skip "1000" with partial pins and
+    /// pass 2 must finish and clear the key, with every blob pinned
+    /// across the two passes (eventual coverage).
+    ///
+    /// Why this size proves the bound: the per-pass ceiling is the
+    /// window (walk-layer tests pin exact git-invocation counts and
+    /// size-independence there); here the cursor values prove each pass
+    /// walked exactly one window, and the union count proves no object
+    /// was skipped between windows. An unbounded scan would persist no
+    /// cursor and pin everything on pass 1.
+    #[sqlx::test]
+    async fn sweep_scan_cursor_pages_large_history_to_completion(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        // 1050 commits via one fast-import stream (one rewritten file
+        // each: distinct blob, tree, and commit per round).
+        const COMMITS: usize = 1050;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let work = tmp.path().join("bighist");
+        std::fs::create_dir_all(&work).unwrap();
+        {
+            let out = std::process::Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git init");
+        }
+        let mut stream = String::new();
+        for c in 0..COMMITS {
+            let body = format!("bighist {c:04}\n");
+            stream.push_str("commit refs/heads/main\n");
+            stream.push_str(&format!("mark :{}\n", c + 1));
+            stream.push_str("committer T <t@t> 1700000000 +0000\ndata 0\n");
+            if c > 0 {
+                stream.push_str(&format!("from :{c}\n"));
+            }
+            stream.push_str("M 100644 inline f.txt\n");
+            stream.push_str(&format!("data {}\n", body.len()));
+            stream.push_str(&body);
+        }
+        {
+            use std::io::Write;
+            let mut child = std::process::Command::new("git")
+                .args(["fast-import", "--quiet"])
+                .current_dir(&work)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(stream.as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "fast-import 1050 commits");
+        }
+
+        let owner = "did:key:zBigHistOwner";
+        let rec = seed_repo(owner, "big-hist", &work.display().to_string());
+        db.create_repo(&rec).await.unwrap();
+        let scan_key = super::scan_cursor_key(&rec.id);
+
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
+            .expect_at_least(1000)
+            .with_status(200)
+            .with_body(r#"{"Hash":"QmBigHistMockCid"}"#)
+            .create_async()
+            .await;
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            &server.url(),
+        ]);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        // Pass 1 with a fresh in-memory cursor: covers the first window.
+        let (_tx, mut rx) = watch::channel(false);
+        let mut cursor = None;
+        let (scanned, gaps, filled) = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            super::run_pass(
+                &db,
+                &config,
+                &http,
+                &node_seed,
+                &node_did,
+                &pin_sem,
+                super::REPO_SCAN_DEADLINE,
+                &mut cursor,
+                &mut rx,
+            ),
+        )
+        .await
+        .expect("pass 1 must return")
+        .expect("run_pass succeeds");
+        assert_eq!(scanned, 1, "one repo scanned");
+        assert!(gaps >= 1000, "the first window holds ~1000 commits of gaps");
+        assert!(filled >= 1000, "the first window pins");
+        let pinned_after_pass1: i64 = sqlx::query_scalar("SELECT count(*) FROM pinned_cids")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            pinned_after_pass1 >= 1000,
+            "pass 1 makes progress but cannot finish 1050 commits in one window"
+        );
+        assert_eq!(
+            db.get_node_state(&scan_key).await.unwrap(),
+            Some(super::SCAN_COMMIT_WINDOW.to_string()),
+            "pass 1 persists the windowed skip, proving it walked one window, not the history"
+        );
+
+        // Pass 2, again with a FRESH in-memory cursor: continuation comes
+        // from the persisted key alone (restart-equivalent), covers the
+        // tail, and deletes the key on completion.
+        let (_tx2, mut rx2) = watch::channel(false);
+        let mut cursor2 = None;
+        let (scanned2, _gaps2, filled2) = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            super::run_pass(
+                &db,
+                &config,
+                &http,
+                &node_seed,
+                &node_did,
+                &pin_sem,
+                super::REPO_SCAN_DEADLINE,
+                &mut cursor2,
+                &mut rx2,
+            ),
+        )
+        .await
+        .expect("pass 2 must return")
+        .expect("run_pass succeeds");
+        assert_eq!(scanned2, 1);
+        assert!(filled2 > 0, "the tail window pins on pass 2");
+        assert_eq!(
+            db.get_node_state(&scan_key).await.unwrap(),
+            None,
+            "covering the history end deletes the scan cursor"
+        );
+        // Convergence loop: under load, some pass-1 uploads may fail to
+        // confirm (bounded DB writes elapsing), and attempt-advance moves
+        // the cursor past them — they wait a full cycle rather than
+        // retrying hourly (documented at the advance site). Extra passes
+        // restart from the head (cursor deleted) and re-derive them, so
+        // the union still completes; each extra pass is bounded work.
+        // Blobs + commits only: root trees are never sweep-pinned (they
+        // carry no path, so the allow filter denies them — same as the
+        // pre-window full walk, whose batch-all catch-all gave them the
+        // same empty path; flat fixture has no subtrees to pin).
+        let mut pinned_total: i64 = sqlx::query_scalar("SELECT count(*) FROM pinned_cids")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let mut extra = 0;
+        while pinned_total < (COMMITS * 2) as i64 && extra < 3 {
+            extra += 1;
+            let (_txe, mut rxe) = watch::channel(false);
+            let mut cursore = None;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(300),
+                super::run_pass(
+                    &db,
+                    &config,
+                    &http,
+                    &node_seed,
+                    &node_did,
+                    &pin_sem,
+                    super::REPO_SCAN_DEADLINE,
+                    &mut cursore,
+                    &mut rxe,
+                ),
+            )
+            .await
+            .expect("healing pass must return")
+            .expect("run_pass succeeds");
+            pinned_total = sqlx::query_scalar("SELECT count(*) FROM pinned_cids")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            pinned_total,
+            (COMMITS * 2) as i64,
+            "every blob and commit is pinned across the passes (extra passes: {extra})"
+        );
+        m.assert_async().await;
+    }
+
     /// R2-P1 regression: with `max_concurrent_pin_tasks = 1` (a semaphore of
     /// one permit) a repo that has BOTH public gaps AND encrypted seal work must
-    /// still complete. The sweep holds one permit for the whole repo iteration
-    /// and must reuse it for the seal phase; acquiring a SECOND permit for the
-    /// same repo would wait on the very permit this iteration already holds,
-    /// deadlocking the pass past its guard timeout. The run is wrapped in a
-    /// timeout so a regression fails the test instead of hanging it.
+    /// still complete. Each phase acquires its permit scoped to its own
+    /// provider effects and drops it before the next phase acquires — never
+    /// nested — so the seal phase cannot wait on a permit the same
+    /// iteration still holds. The run is wrapped in a timeout so a
+    /// regression fails the test instead of hanging it.
     #[sqlx::test]
-    async fn run_pass_reuses_the_pin_permit_for_the_seal_at_pool_size_one(pool: sqlx::PgPool) {
+    async fn run_pass_scopes_pin_permits_without_deadlock_at_pool_size_one(pool: sqlx::PgPool) {
         let db = crate::db::Db::for_testing(pool);
         db.run_migrations().await.unwrap();
 
@@ -2438,6 +3146,209 @@ mod tests {
         _m.assert_async().await;
     }
 
+    /// The stored continuation is the last object actually ATTEMPTED, not the
+    /// planned tail: a public repo with three blobs, no rules, and a first
+    /// upload that takes 2s. A deny rule lands while that upload is in
+    /// flight (signalled by the server's first accept, so no timing
+    /// assumption beyond "a rule insert takes under 2s"): the in-flight
+    /// upload completes but its fenced record aborts on the moved epoch, and
+    /// the next loop-top fence check stops the batch. The persisted IPFS
+    /// offset must be the first-dispatched OID — the only one entered —
+    /// never `to_pin.last()`, which would rotate the untouched suffix
+    /// behind the backlog forever. A second pass then proves the suffix is
+    /// still ahead: the previously untouched blobs pin, the denied one
+    /// never does.
+    #[sqlx::test]
+    async fn sweep_persists_last_attempted_not_planned_tail_on_mid_batch_narrow(
+        pool: sqlx::PgPool,
+    ) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        let repo_on_disk = Repo::new();
+        repo_on_disk.commit_file("a.txt", "abort cursor a\n");
+        repo_on_disk.commit_file("b.txt", "abort cursor b\n");
+        repo_on_disk.commit_file("c.txt", "abort cursor c\n");
+        let blob_a = repo_on_disk.git(&["rev-parse", "HEAD:a.txt"]);
+        let blob_b = repo_on_disk.git(&["rev-parse", "HEAD:b.txt"]);
+        let blob_c = repo_on_disk.git(&["rev-parse", "HEAD:c.txt"]);
+        let commit = repo_on_disk.git(&["rev-parse", "HEAD"]);
+        let tree = repo_on_disk.git(&["rev-parse", "HEAD^{tree}"]);
+        let mut all = [blob_a.clone(), blob_b.clone(), blob_c.clone(), commit, tree];
+        all.sort();
+        let first = all[0].clone();
+
+        let owner = "did:key:zAbortCursorOwner";
+        let rec = seed_repo(
+            owner,
+            "abort-cursor",
+            &repo_on_disk.path.display().to_string(),
+        );
+        db.create_repo(&rec).await.unwrap();
+
+        // Kubo-shaped endpoint that signals the FIRST accept, then holds
+        // that upload 2s before answering; later uploads answer at once.
+        // The test inserts the deny rule on the signal, so the narrow is
+        // guaranteed to land mid-first-upload regardless of box speed.
+        let first_accept = std::sync::Arc::new(tokio::sync::Notify::new());
+        let notified = first_accept.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut seen = 0usize;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let this = seen;
+                seen += 1;
+                if this == 0 {
+                    notified.notify_waiters();
+                }
+                tokio::spawn(async move {
+                    let mut acc = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        acc.extend_from_slice(&buf[..n]);
+                        if let Some(hdr_end) =
+                            acc.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+                        {
+                            let headers = String::from_utf8_lossy(&acc[..hdr_end]).to_lowercase();
+                            let len: usize = headers
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse().ok())
+                                .unwrap_or(0);
+                            if acc.len() >= hdr_end + len {
+                                break;
+                            }
+                        }
+                    }
+                    if this == 0 {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    let body = br#"{"Hash":"QmAbortCursorMockCid"}"#;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            &endpoint,
+        ]);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let (_tx, rx) = watch::channel(false);
+        let mut cursor = None;
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        // Drive the pass in the background; the narrow lands on the first
+        // accept, strictly inside the first upload. Owned clones cross the
+        // spawn boundary; the repo-page cursor restarts fresh per pass
+        // (single-repo fixture, so nothing is lost).
+        let (pass_db, pass_config, pass_http, pass_seed, pass_did, pass_sem) = (
+            db.clone(),
+            config.clone(),
+            http.clone(),
+            node_seed,
+            node_did.clone(),
+            pin_sem.clone(),
+        );
+        let pass = tokio::spawn(async move {
+            let mut cursor1 = None;
+            let mut rx1 = rx;
+            super::run_pass(
+                &pass_db,
+                &pass_config,
+                &pass_http,
+                &pass_seed,
+                &pass_did,
+                &pass_sem,
+                super::REPO_SCAN_DEADLINE,
+                &mut cursor1,
+                &mut rx1,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(60), first_accept.notified())
+            .await
+            .expect("the first upload must start");
+        db.set_visibility_rule(&rec.id, "/b.txt", crate::db::VisibilityMode::B, &[], owner)
+            .await
+            .expect("mid-batch narrow commits");
+        let (scanned, gaps, filled) =
+            tokio::time::timeout(std::time::Duration::from_secs(120), pass)
+                .await
+                .expect("the aborted pass must return")
+                .expect("join")
+                .expect("run_pass succeeds");
+
+        assert_eq!(scanned, 1, "one repo scanned");
+        assert!(gaps >= 3, "all three blobs were missing pre-narrow");
+        assert_eq!(
+            filled, 0,
+            "the in-flight upload's fenced record must abort on the moved epoch"
+        );
+        assert_eq!(
+            db.load_reconciliation_offset(&rec.id, "IPFS")
+                .await
+                .unwrap(),
+            Some(first.clone()),
+            "the stored continuation is the entered OID, not the planned tail"
+        );
+        assert!(
+            !db.has_ipfs_cid(&blob_a).await.unwrap()
+                || !db.has_ipfs_cid(&blob_b).await.unwrap()
+                || !db.has_ipfs_cid(&blob_c).await.unwrap(),
+            "at most the attempted prefix could have recorded anything (it did not)"
+        );
+
+        // Second pass, no further narrowing: the fence is fresh, the rotated
+        // missing order starts past the first OID, and the untouched suffix
+        // pins while the denied blob never does.
+        let (_tx2, mut rx2) = watch::channel(false);
+        let (scanned2, gaps2, filled2) = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            super::run_pass(
+                &db,
+                &config,
+                &http,
+                &node_seed,
+                &node_did,
+                &pin_sem,
+                super::REPO_SCAN_DEADLINE,
+                &mut cursor,
+                &mut rx2,
+            ),
+        )
+        .await
+        .expect("the second pass must return")
+        .expect("run_pass succeeds");
+        assert_eq!(scanned2, 1);
+        assert!(gaps2 >= 2, "the untouched suffix is still missing");
+        assert!(filled2 >= 2, "the untouched suffix pins on the next pass");
+        assert!(
+            db.has_ipfs_cid(&blob_a).await.unwrap() || db.has_ipfs_cid(&blob_c).await.unwrap(),
+            "a previously unvisited healthy blob is attempted past the stored offset"
+        );
+        assert!(
+            !db.has_ipfs_cid(&blob_b).await.unwrap(),
+            "the denied blob never pins publicly"
+        );
+    }
+
     /// P2 regression: the mid-scan visibility re-filter must run against a
     /// FRESH deadline, not the spent `scan_deadline`. A spent deadline computes
     /// a zero remaining duration, `tokio::time::timeout` fires immediately, and
@@ -2457,6 +3368,8 @@ mod tests {
         // Empty rules + public repo: the blob is listable at root and passes the
         // re-derivation when it actually runs.
         let rules: Vec<crate::db::VisibilityRule> = Vec::new();
+        let head = repo_on_disk.git(&["rev-parse", "HEAD"]);
+        let commits = vec![head];
 
         // Spent deadline (the scan consumed its whole budget): the re-filter
         // times out immediately and returns None — the starvation class the fix
@@ -2469,6 +3382,7 @@ mod tests {
             true,
             "did:key:zStarvationOwner",
             vec![blob.clone()],
+            &commits,
             spent,
         )
         .await;
@@ -2486,6 +3400,7 @@ mod tests {
             true,
             "did:key:zStarvationOwner",
             vec![blob.clone()],
+            &commits,
             fresh,
         )
         .await;
@@ -2719,6 +3634,137 @@ mod tests {
         );
     }
 
+    /// Unknown-migration re-derivation: a pre-v35 local-shaped row (`cid`
+    /// set, no Pinata CID, `local_ipfs_provenance = FALSE`) must be
+    /// re-pinned by the sweep, not filtered as durable. The shape is
+    /// byte-identical whether Kubo really stored the bytes or a pre-fix
+    /// 2xx-without-`Hash` response fell back to the expected CID — so the
+    /// migration trusts neither, and this test proves the sweep repairs
+    /// the row instead of skipping it. Controls: a Pinata-only row and a
+    /// dual row keep their provider history verbatim through the pass
+    /// (no local write may rewrite provider evidence).
+    #[sqlx::test]
+    async fn sweep_rederives_legacy_unknown_row_by_repinning(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        let repo_on_disk = Repo::new();
+        repo_on_disk.commit_file("legacy.txt", "legacy unknown row\n");
+        repo_on_disk.commit_file("ponly.txt", "pinata only control\n");
+        repo_on_disk.commit_file("dual.txt", "dual control\n");
+        let blob_legacy = repo_on_disk.git(&["rev-parse", "HEAD:legacy.txt"]);
+        let blob_ponly = repo_on_disk.git(&["rev-parse", "HEAD:ponly.txt"]);
+        let blob_dual = repo_on_disk.git(&["rev-parse", "HEAD:dual.txt"]);
+        fn raw_cid_for(content: &[u8]) -> String {
+            gitlawb_core::cid::Cid::from_git_object_bytes(content).to_string()
+        }
+        let raw_legacy = raw_cid_for(b"legacy unknown row\n");
+        let raw_dual = raw_cid_for(b"dual control\n");
+        let prov_ponly = "QmLegacyUnknownPinataOnly";
+        let prov_dual = "QmLegacyUnknownDualProvider";
+
+        let owner = "did:key:zLegacyUnknownOwner";
+        let rec = seed_repo(
+            owner,
+            "legacy-unknown",
+            &repo_on_disk.path.display().to_string(),
+        );
+        db.create_repo(&rec).await.unwrap();
+
+        // The migrated unknown shape: production writers can no longer
+        // produce (`cid` set, no Pinata, FALSE) — the local writer sets
+        // TRUE, the Pinata writer always sets `pinata_cid` — so raw SQL
+        // documents that this row predates the provenance contract.
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid, repo_id, local_ipfs_provenance)
+             VALUES ($1, $2, $3, NULL, $4, FALSE)",
+        )
+        .bind(&blob_legacy)
+        .bind(&raw_legacy)
+        .bind("2026-07-01T00:00:00Z")
+        .bind(&rec.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        // Controls through the production writers.
+        db.record_pinata_cid(&blob_ponly, prov_ponly, prov_ponly, Some(&rec.id), i64::MAX)
+            .await
+            .unwrap();
+        db.record_pinata_cid(&blob_dual, &raw_dual, prov_dual, Some(&rec.id), i64::MAX)
+            .await
+            .unwrap();
+
+        // Pre-condition: nothing reads as locally durable.
+        for oid in [&blob_legacy, &blob_ponly, &blob_dual] {
+            assert!(
+                !db.has_ipfs_cid(oid).await.unwrap(),
+                "{oid} must start unknown, never durable"
+            );
+        }
+
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
+            .expect_at_least(3)
+            .with_status(200)
+            .with_body(r#"{"Hash":"QmLegacyRederiveMockCid"}"#)
+            .create_async()
+            .await;
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            &server.url(),
+        ]);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let (_tx, mut rx) = watch::channel(false);
+        let mut cursor = None;
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        let (scanned, gaps, filled) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(scanned, 1, "one repo scanned");
+        assert!(gaps >= 3, "all three control blobs start as gaps");
+        assert!(filled >= 3, "all three re-pin, including the unknown row");
+        // The unknown row was re-pinned, not filtered: provenance is now
+        // established by a real upload, not inferred from column shape.
+        assert!(
+            db.has_ipfs_cid(&blob_legacy).await.unwrap(),
+            "migrated unknown row must be re-derived by re-pinning"
+        );
+        // Provider history is preserved verbatim: the local re-pin must
+        // not rewrite provider evidence as local evidence or vice versa.
+        for (oid, prov) in [(&blob_ponly, prov_ponly), (&blob_dual, prov_dual)] {
+            let stored: Option<String> =
+                sqlx::query_scalar("SELECT pinata_cid FROM pinned_cids WHERE sha256_hex = $1")
+                    .bind(oid)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                stored.as_deref(),
+                Some(prov),
+                "{oid} provider history must survive the local re-pin"
+            );
+        }
+        m.assert_async().await;
+    }
+
     /// #218 review P2 regression: the per-(repo, backend) continuation
     /// offset lifecycle. A pass that attempted at least one OID (the
     /// normal "found a gap, pinned it" path) persists
@@ -2803,8 +3849,9 @@ mod tests {
         // Second pass: the OID is now IPFS-pinned (the gap filter
         // excludes it), so `ipfs_missing.is_empty()` and the offset
         // save call hands `next_oid = None` to `save_reconciliation_offset`,
-        // which marks the row `done = TRUE`. The load filters done
-        // rows out so subsequent passes see this as a fresh start.
+        // which DELETES the row. The load finds nothing, so subsequent
+        // passes see this as a fresh start — with no tombstone left
+        // behind for hourly rewrites.
         let (_scanned2, gaps2, _filled2) = super::run_pass(
             &db,
             &config,
@@ -2959,6 +4006,168 @@ mod tests {
             after_ok.as_deref(),
             Some(seeded.as_str()),
             "a pass that DID dispatch must advance the continuation past the seed"
+        );
+    }
+
+    /// Drained completions DELETE the continuation row instead of
+    /// refreshing a tombstone; a later empty pass recreates nothing;
+    /// and deleting a repo cascades its offsets so a recreated
+    /// identity (always a fresh UUID) can never resume them. Row
+    /// counts — not just `load`, which cannot tell "absent" from
+    /// "done tombstone" — carry the storage assertions.
+    #[sqlx::test]
+    async fn sweep_deletes_offset_on_drain_and_prunes_on_repo_delete(pool: sqlx::PgPool) {
+        async fn offset_rows(pool: &sqlx::PgPool, repo_id: &str) -> i64 {
+            sqlx::query_scalar("SELECT count(*) FROM reconciliation_offset WHERE repo_id = $1")
+                .bind(repo_id)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+
+        let db = crate::db::Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+
+        let repo_on_disk = Repo::new();
+        repo_on_disk.commit_file("a.txt", "drain pruning\n");
+        let rec = seed_repo(
+            "did:key:zDrainPruneOwner",
+            "drain-prune-repo",
+            &repo_on_disk.path.display().to_string(),
+        );
+        db.create_repo(&rec).await.unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
+            .expect_at_least(1)
+            .with_status(200)
+            .with_body(r#"{"Hash":"QmDrainPruneMockCid"}"#)
+            .create_async()
+            .await;
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            &server.url(),
+        ]);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let (_tx, mut rx) = watch::channel(false);
+        let mut cursor = None;
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        // Pass 1 pins the gap: an advanced (done = FALSE) row exists.
+        let (_s1, gaps1, filled1) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(gaps1 >= 1 && filled1 >= 1, "pass 1 must pin the gap");
+        assert_eq!(
+            offset_rows(&pool, &rec.id).await,
+            1,
+            "a dispatching pass persists exactly one continuation row"
+        );
+
+        // Pass 2 finds nothing missing: Drained must DELETE the row,
+        // not refresh a done=TRUE tombstone.
+        let (_s2, gaps2, _filled2) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(gaps2, 0, "pass 2 finds no gaps");
+        assert_eq!(
+            offset_rows(&pool, &rec.id).await,
+            0,
+            "a drained pass must delete the continuation row, not tombstone it"
+        );
+        assert!(
+            db.load_reconciliation_offset(&rec.id, "IPFS")
+                .await
+                .unwrap()
+                .is_none(),
+            "a drained pair reads as a fresh start"
+        );
+
+        // Pass 3, still empty: no row may be recreated for hourly
+        // WAL churn on a healthy pair.
+        let (_s3, _, _) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            offset_rows(&pool, &rec.id).await,
+            0,
+            "an empty pass must not recreate a tombstone"
+        );
+        m.assert_async().await;
+
+        // Lifecycle: an offset row cannot outlive its repo. Seed one
+        // directly, delete the repo row, and prove the cascade took it.
+        // (Production has no repo-delete path today; the foreign key is
+        // what enforces the invariant if one ever lands.)
+        let doomed = seed_repo("did:key:zDoomedOwner", "doomed-repo", "/nonexistent/doomed");
+        db.create_repo(&doomed).await.unwrap();
+        db.save_reconciliation_offset(&doomed.id, "IPFS", Some(&"f".repeat(64)))
+            .await
+            .unwrap();
+        assert_eq!(
+            offset_rows(&pool, &doomed.id).await,
+            1,
+            "seeded offset exists before the delete"
+        );
+        sqlx::query("DELETE FROM repos WHERE id = $1")
+            .bind(&doomed.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            offset_rows(&pool, &doomed.id).await,
+            0,
+            "deleting the repo must cascade its continuation rows"
+        );
+
+        // A recreated identity is a fresh UUID: it trivially carries no
+        // offset, and the assertion pins that nothing in the delete
+        // path resurrects one.
+        let reborn = seed_repo("did:key:zDoomedOwner", "doomed-repo", "/nonexistent/doomed");
+        db.create_repo(&reborn).await.unwrap();
+        assert_ne!(reborn.id, doomed.id, "recreate mints a fresh identity");
+        assert!(
+            db.load_reconciliation_offset(&reborn.id, "IPFS")
+                .await
+                .unwrap()
+                .is_none(),
+            "a recreated identity starts with no continuation"
         );
     }
 

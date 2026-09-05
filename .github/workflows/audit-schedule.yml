@@ -86,3 +86,28 @@ jobs:
             exit 1
           fi
           echo "No drift: ignore list is consistent with the pinned hickory-proto version."
+
+      # Drift guard: the RUSTSEC-2026-0253 (lru) ignore is only valid while
+      # the lockfile holds exactly the versions it was written for (0.12.5
+      # via aws-sdk-s3, 0.16.3 via alloy). Any move — an upgrade that may
+      # carry the upstream fix, or removal of either dependency — must
+      # revisit the ignore. Retirement owner: node maintainers, via this
+      # weekly job (no separate tracking issue; see the waiver comment in
+      # .cargo/audit.toml).
+      - name: Fail if lru moved while its ignore remains
+        run: |
+          set -euo pipefail
+          versions="$(grep -A1 'name = "lru"' Cargo.lock | grep '^version' | cut -d'"' -f2 | sort -u | tr '\n' ' ')"
+          echo "lru versions in Cargo.lock: ${versions:-not present}"
+          lru_ignore_present=false
+          if grep -q 'RUSTSEC-2026-0253' .cargo/audit.toml; then
+            lru_ignore_present=true
+          fi
+          # Drift = the lockfile no longer matches what the ignore assumes:
+          # either version moved (possible fix) or lru left the tree
+          # (dead ignore). Both must fail for explicit re-triage.
+          if [ "$lru_ignore_present" = true ] && [ "${versions}" != "0.12.5 0.16.3 " ]; then
+            echo "::error::lru versions are [${versions:-absent from Cargo.lock}] but the RUSTSEC-2026-0253 ignore is still in .cargo/audit.toml. Re-triage the waiver against the advisory's fixed range and either drop the ignore or update the pinned set."
+            exit 1
+          fi
+          echo "No drift: lru ignore is consistent with the pinned versions."
