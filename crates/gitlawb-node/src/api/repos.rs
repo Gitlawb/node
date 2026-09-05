@@ -149,17 +149,17 @@ async fn fail_closed_full_scan_objects(
         // this push rather than the previous silent ~2x hold; size the budget so both
         // phases normally fit.
         let deadline = std::time::Instant::now() + timeout;
-        let allowed = crate::git::visibility_pack::replicable_blob_set_bounded(
-            &disk_path,
-            &git_bin,
-            deadline.saturating_duration_since(std::time::Instant::now()),
-            &rules,
-            is_public,
-            &owner_did,
-        )?;
-        let all_blobs = crate::git::push_delta::all_blob_oids(&disk_path, &git_bin, deadline)?;
+        let (allowed, allowed_trees, all_blobs, all_trees) =
+            crate::git::visibility_pack::allowed_blob_tree_sets_bounded(
+                &disk_path,
+                &git_bin,
+                deadline,
+                &rules,
+                is_public,
+                &owner_did,
+            )?;
         Ok(crate::git::visibility_pack::replicable_objects_fail_closed(
-            candidates, &allowed, &all_blobs,
+            candidates, &allowed, &all_blobs, &allowed_trees, &all_trees,
         ))
     })
     .await
@@ -1380,14 +1380,17 @@ async fn pin_new_objects_gated(
     db: &Arc<crate::db::Db>,
     repo_id: &str,
     batch_budget: std::time::Duration,
-) -> Vec<(String, String)> {
+) -> crate::ipfs_pin::PinBatchOutcome {
     // Nothing to pin: answer before taking a permit (#174 F2b). The permit bounds how
     // many pin loops run concurrently, and an empty list does no pinning, so parking
     // here would spend a global pin slot on no work. The pool DEFERS rather
     // than sheds, so those calls stall pins for every other repo. Empty is the normal
     // shape for a push whose walk failed or that may replicate nothing.
     if object_list.is_empty() {
-        return Vec::new();
+        return crate::ipfs_pin::PinBatchOutcome {
+            confirmed: Vec::new(),
+            last_attempted: None,
+        };
     }
     let _permit = pin_sem
         .clone()
@@ -1403,6 +1406,7 @@ async fn pin_new_objects_gated(
         db,
         repo_id,
         batch_budget,
+        None,
     )
     .await
 }
@@ -1437,9 +1441,9 @@ async fn pin_and_encrypt_objects(
         crate::ipfs_pin::PIN_BATCH_BUDGET,
     )
     .await;
-    if !pinned.is_empty() {
-        tracing::info!(count = pinned.len(), "pinned git objects to IPFS");
-        for (sha, cid) in &pinned {
+    if !pinned.confirmed.is_empty() {
+        tracing::info!(count = pinned.confirmed.len(), "pinned git objects to IPFS");
+        for (sha, cid) in &pinned.confirmed {
             tracing::info!(sha = %sha, %cid, "pinned");
         }
     }
@@ -1471,7 +1475,14 @@ async fn pin_and_encrypt_objects(
                 &ctx.db,
                 repo_id,
                 &node_seed,
+                // The real git, not `ctx.git_bin`: tests point that at a fake
+                // walk git, and the seal reads must run the real one.
+                "git",
+                crate::ipfs_pin::PIN_BATCH_BUDGET,
                 &recipients,
+                // Push path: recipients derived at admission under a write lease,
+                // no sweep-style snapshot to fence (see PolicyFence's doc).
+                None,
             )
             .await;
 
@@ -2731,19 +2742,34 @@ async fn post_receive_replication_tail(
                         &db_clone,
                         &repo_id,
                         crate::ipfs_pin::PIN_BATCH_BUDGET,
+                        // Push path: no sweep-style batch snapshot to fence (see
+                        // PolicyFence's doc).
+                        None,
                     )
                     .await,
                 )
             } else {
-                (false, Vec::new())
+                (
+                    false,
+                    crate::ipfs_pin::PinBatchOutcome {
+                        confirmed: Vec::new(),
+                        last_attempted: None,
+                    },
+                )
             };
 
-            if !pinned.is_empty() {
-                tracing::info!(count = pinned.len(), "pinned git objects to Pinata");
+            if !pinned.confirmed.is_empty() {
+                tracing::info!(
+                    count = pinned.confirmed.len(),
+                    "pinned git objects to Pinata"
+                );
             }
 
-            // Build sha→cid map from pinned objects
-            let cid_map: std::collections::HashMap<String, String> = pinned.into_iter().collect();
+            // Build sha→cid map from durably recorded pins only: an
+            // unconfirmed provider upload must not drive branch/gossip CID
+            // state for a row the resolver cannot serve.
+            let cid_map: std::collections::HashMap<String, String> =
+                pinned.confirmed.into_iter().collect();
 
             // Record branch→CID for each ref update and publish gossip
             for (ref_name, old_sha, new_sha) in &ref_updates_clone {
@@ -4052,9 +4078,21 @@ mod tests {
         // ref check); rev-parse resolves HEAD; rev-list lists the one commit; ls-tree
         // emits "<mode> blob <oid>\t<path>" (NUL-delimited) under secret/ and burns
         // 1.2s of the 2s budget; pack-objects is the serve's 1.2s cost.
+        //
+        // #218 review round 8 P1 (fixture, not production): the `for-each-ref` arm
+        // must answer in the COLUMN SHAPE `blob_paths` phase 2 asks for
+        // (`%(objectname) %(objecttype)`, plus the peeled `%(*objectname)
+        // %(*objecttype)` pair when the tip is a tag), not a ref NAME. A single
+        // bare token made the phase-2 parse fail closed, so the walk returned an
+        // error and the request surfaced as a generic 500 — which silently
+        // repurposed this test from "the filtered serve shares the deadline" into
+        // "the walk errors", losing the #174 guard while looking merely red. A
+        // commit tip peels to nothing, so two columns is the whole line here; the
+        // 1.2s walk cost stays on `ls-tree` so walk and serve remain independently
+        // attributable.
         let body = format!(
             "#!/bin/sh\ncase \"$1\" in\n  \
-             for-each-ref) echo refs/heads/main ;;\n  \
+             for-each-ref) echo {commit} commit ;;\n  \
              cat-file) echo commit ;;\n  \
              rev-parse) echo {commit} ;;\n  \
              rev-list) echo {commit} ;;\n  \
@@ -6946,7 +6984,7 @@ mod tests {
         )
         .await
         .expect("the pin loop completes once admission frees");
-        assert!(out.is_empty(), "an empty ipfs_api pins nothing");
+        assert!(out.confirmed.is_empty(), "an empty ipfs_api pins nothing");
     }
 
     /// #173 F3, at the layer that actually owns the permit. `pin_new_objects_gated`
@@ -6958,8 +6996,8 @@ mod tests {
     /// permit comes back, even though the table is still locked.
     ///
     /// The endpoint is a LIVE mockito server, not the `""` the sibling test above
-    /// uses. `ipfs_pin::pin_new_objects` returns `vec![]` immediately on an empty
-    /// `ipfs_api`, so an empty-string copy would never reach `is_pinned`, never touch
+    /// uses. `ipfs_pin::pin_new_objects` returns an empty outcome immediately on an
+    /// empty `ipfs_api`, so an empty-string copy would never reach `is_pinned`, never touch
     /// the locked table, and pass identically with the bound deleted. The mock is at
     /// `.expect(0)` because a stalled pinned-status check must not fall through to an
     /// add.
@@ -7021,7 +7059,10 @@ mod tests {
              budget",
         );
 
-        assert!(out.is_empty(), "a stalled pinned-status check pins nothing");
+        assert!(
+            out.confirmed.is_empty(),
+            "a stalled pinned-status check pins nothing"
+        );
         assert_eq!(
             pin_sem.available_permits(),
             1,
@@ -7068,7 +7109,7 @@ mod tests {
         )
         .await
         .expect("an empty object list must not wait on pin admission (#174 F2b)");
-        assert!(out.is_empty(), "and it pins nothing");
+        assert!(out.confirmed.is_empty(), "and it pins nothing");
         assert_eq!(
             pin_sem.available_permits(),
             0,
@@ -10075,6 +10116,19 @@ mod tests {
     /// Load-bearing: with the spawn below `release` the walk's `for-each-ref` never
     /// appears after the disconnect (RED). With it above, gated on
     /// `receive_result.is_ok()`, it does (GREEN).
+    ///
+    /// Round-3 P1: a successful receive-pack followed by a disconnect during
+    /// `guard.release()` must still see its replication tail run. The tail is
+    /// spawned above `release` (gated on `receive_result.is_ok()`), and the marker
+    /// polls for `rev-list` (the new tail's primary walk command) — the previous
+    /// `for-each-ref` marker is dead because commit 91d0578 removed the last
+    /// tail-path use of that command (it lived in `assert_all_refs_are_commits`,
+    /// which is now gone). The new marker points at a real command the tail still
+    /// executes, so a future reorder that drops the tail will be caught.
+    ///
+    /// Load-bearing: with the spawn below `release` the walk's `rev-list` never
+    /// appears after the disconnect (RED). With it above, gated on
+    /// `receive_result.is_ok()`, it does (GREEN).
     #[cfg(unix)]
     #[sqlx::test]
     async fn receive_pack_tail_survives_a_disconnect_during_release(pool: sqlx::PgPool) {
@@ -10108,8 +10162,14 @@ mod tests {
         // The disconnect: drop the handler future while `release` is still awaiting.
         drop(fut);
 
+        // Round-3 P1: marker is `rev-list`, not `for-each-ref` — the
+        // tail's primary walk is `git rev-list --objects --all` (the
+        // same call as `smart_http::rev_list_keep`); a successful
+        // re-key on the cloned path emits it from the post-receive
+        // tail. Polling for `for-each-ref` was vacuous after 91d0578
+        // removed the last tail-path use of that command.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !p2_logged(&log, "for-each-ref") {
+        while !p2_logged(&log, "rev-list") {
             assert!(
                 std::time::Instant::now() < deadline,
                 "RED: the pack landed but its replication tail never ran. A disconnect \
@@ -10178,8 +10238,14 @@ mod tests {
         drop(fut);
 
         tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        // Round-3 P1: the must-not twin also runs the `rev-list`
+        // command (the actual tail walk). `for-each-ref` is dead in
+        // the tail path; the previous marker made the assertion
+        // vacuous. The new marker pins the same command the
+        // positive-control sibling above uses, so a future change
+        // that drops the tail leaves both tests red together.
         assert!(
-            !p2_logged(&log, "for-each-ref"),
+            !p2_logged(&log, "rev-list"),
             "a failed receive-pack must spawn no replication tail: pinning and \
              announcing a half-applied repo is exactly what release(false) refuses \
              to upload"

@@ -181,6 +181,153 @@ pub(crate) async fn silent_http_endpoint() -> String {
     endpoint
 }
 
+/// Body of the `for-each-ref` arm of a fake-git fixture in the
+/// COLUMN SHAPE `blob_paths` phase 2 parses. The caller is
+/// responsible for wrapping this in a full `case "$1" in ... esac`
+/// shell script and writing it to a tempdir; this is the form
+/// used when a fixture has OTHER arms (e.g. `rev-list`,
+/// `pack-objects`) that the visibility-pipeline tests also need
+/// to fake.
+///
+/// Two output shapes:
+/// - `tag` tip (`peeled_oid` and `peeled_kind` empty) →
+///   `echo '<oid> <kind>'` (two tokens).
+/// - Annotated tag tip → `echo '<oid> tag <peeled_oid> <peeled_kind>'`
+///   (four tokens; the literal `tag` in slot 2 is the parser's
+///   "peeled type is `tag`" trigger for the recursive peel).
+///
+/// An empty `refs` slice emits a single `:` so phase 2 sees no
+/// lines (the same as a bare default `*) : ;;` arm).
+#[allow(dead_code)] // referenced by `fake_git_with_refs` and the round-9 fixtures
+pub(crate) fn fake_git_for_ref_body(refs: &[(&str, &str, &str, &str)]) -> String {
+    // P2 (reviewer round 9): the previous body emitted
+    // `echo ... ;;` per ref, which is a `;;` PER REF inside
+    // a single case arm. The first `;;` closes the arm, and
+    // every subsequent `echo` parses as a pattern line, which
+    // `sh -n` rejects with "word unexpected". The right shape
+    // is one `;;` per arm, emitted once after the last ref.
+    let mut body = String::new();
+    if refs.is_empty() {
+        body.push_str("    : ;;\n");
+    } else {
+        for (oid, kind, peeled_oid, peeled_kind) in refs {
+            if peeled_oid.is_empty() && peeled_kind.is_empty() {
+                body.push_str(&format!("    echo '{oid} {kind}'\n"));
+            } else {
+                body.push_str(&format!(
+                    "    echo '{oid} tag {peeled_oid} {peeled_kind}'\n"
+                ));
+            }
+        }
+        body.push_str("    ;;\n");
+    }
+    body
+}
+
+/// Full fake-git script body for a fixture whose ONLY fake arm is
+/// `for-each-ref`. All other `git` subcommands are answered by
+/// the default `*) : ;;` no-op, so a real-git repo with matching
+/// refs is needed to drive the rest of the walk. Used by tests
+/// that want the parser contract enforced without committing to
+/// the other arms the smart-HTTP fixture cares about.
+#[allow(dead_code)] // referenced by tests in the unit-test mod below
+pub(crate) fn fake_git_with_refs(refs: &[(&str, &str, &str, &str)]) -> String {
+    let mut body = String::from("#!/bin/sh\ncase \"$1\" in\n  for-each-ref)\n");
+    body.push_str(&fake_git_for_ref_body(refs));
+    body.push_str("    *) : ;;\nesac\nexit 0\n");
+    body
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    /// #218 round 9 (guidance #6): the helper emits the column
+    /// shape `blob_paths` phase 2 parses. Pin the format at the
+    /// cargo-test level so a parser regression breaks this
+    /// helper test in addition to the production tests.
+    /// P2 (reviewer round 9): also execute the generated script
+    /// through `sh -n` and against a tempdir; the previous
+    /// substring check passed while the script was a `sh`
+    /// syntax error (the `;;` was emitted once per ref inside
+    /// a single case arm, which `sh` rejects).
+    #[test]
+    fn fake_git_with_refs_emits_the_column_shape() {
+        let script = fake_git_with_refs(&[
+            ("commit0000000000000000000000000000000", "commit", "", ""),
+            (
+                "tag0000000000000000000000000000000000",
+                "tag",
+                "peel000000000000000000000000000000",
+                "blob",
+            ),
+        ]);
+        assert!(
+            script.contains("'commit0000000000000000000000000000000 commit'"),
+            "non-tag tip must emit two tokens: got\n{script}"
+        );
+        assert!(
+            script.contains("'tag0000000000000000000000000000000000 tag peel000000000000000000000000000000 blob'"),
+            "annotated tag tip must emit four tokens: got\n{script}"
+        );
+
+        // P2 (reviewer round 9): execute the script through
+        // `sh -n` to catch the `;;` per-ref syntax error the
+        // previous test missed. The previous test only checked
+        // substring presence and was green while the script was
+        // malformed shell.
+        let sh_n = std::process::Command::new("sh")
+            .args(["-n", "-c", &script])
+            .status()
+            .expect("sh -n must run");
+        assert!(
+            sh_n.success(),
+            "the generated script must be valid shell; \
+             `sh -n` exited {sh_n:?}\n----\n{script}\n----"
+        );
+
+        // Also run the script for real against a tempdir. The
+        // non-tag tip must echo the two-token line, and the
+        // annotated-tag tip must echo the four-token line.
+        let td = tempfile::tempdir().expect("tempdir");
+        let script_path = td.path().join("fake-git.sh");
+        std::fs::write(&script_path, &script).expect("write script");
+        std::fs::set_permissions(
+            &script_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("chmod");
+        let out = std::process::Command::new(&script_path)
+            .arg("for-each-ref")
+            .output()
+            .expect("run script");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("commit0000000000000000000000000000000 commit"),
+            "the two-token tip must print: stdout={stdout:?}\nscript:\n{script}"
+        );
+        assert!(
+            stdout.contains(
+                "tag0000000000000000000000000000000000 tag peel000000000000000000000000000000 blob"
+            ),
+            "the four-token tip must print: stdout={stdout:?}\nscript:\n{script}"
+        );
+    }
+
+    #[test]
+    fn fake_git_with_refs_empty_slice_emits_a_zero_refs_marker() {
+        let script = fake_git_with_refs(&[]);
+        assert!(
+            script.contains("for-each-ref)"),
+            "the helper still owns the for-each-ref arm: got\n{script}"
+        );
+        assert!(
+            script.contains("    : ;;\n"),
+            "an empty refs slice must emit a single `:` so phase 2 sees zero lines: got\n{script}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3767,6 +3914,7 @@ mod tests {
             &state.db,
             &pub_repo.id,
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
         m.assert_async().await; // asserts /add was NOT called (already pinned)
@@ -3893,6 +4041,7 @@ mod tests {
             &state.db,
             &pub_repo.id,
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
         m.assert_async().await; // /add NOT called (already pinned)
@@ -4083,6 +4232,7 @@ mod tests {
             &state.db,
             repo_id,
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
         m.assert_async().await;
@@ -4728,15 +4878,25 @@ mod tests {
         let repo = seed_repo(&owner_did, "u3pinata");
         state.db.create_repo(&repo).await.expect("seed repo");
 
-        // Already carries a pinata_cid, so pin_new_objects takes the skip branch and the
-        // only DB write under test is the source record.
+        // Already a Pinata-pinned row so the Pinata pin loop's
+        // `has_pinata_cid` skip branch fires and the only DB write
+        // under test is the U3 source record retry. The IPFS pin
+        // loop's `is_pinned` / `has_ipfs_cid` skip is a separate
+        // seam (this test exercises the Pinata path, not the IPFS
+        // path), so a Pinata-only seed is the right shape here.
         let (_ty, raw) = crate::git::store::read_object(&bare, &fx.public_oid)
             .unwrap()
             .expect("object readable");
         let raw_cid = gitlawb_core::cid::Cid::from_git_object_bytes(&raw).to_string();
         state
             .db
-            .record_pinata_cid(&fx.public_oid, &raw_cid, "QmProvider", Some(&repo.id))
+            .record_pinata_cid(
+                &fx.public_oid,
+                &raw_cid,
+                "QmProvider",
+                Some(&repo.id),
+                i64::MAX,
+            )
             .await
             .expect("seed pinata pin");
 
@@ -4773,6 +4933,7 @@ mod tests {
                     // never truncates the one object under test: what is being measured
                     // is the retry backoff, not the budget.
                     std::time::Duration::from_secs(60),
+                    None,
                 )
                 .await;
                 m.assert_async().await; // the upload is skipped: DB-only path
@@ -4944,6 +5105,7 @@ mod tests {
                 "repoPinataBound",
                 // The bound under test.
                 std::time::Duration::from_secs(2),
+                None,
             ),
         )
         .await
@@ -5011,6 +5173,7 @@ mod tests {
                 &state.db,
                 "repoKuboBound",
                 std::time::Duration::from_secs(2),
+                None,
             ),
         )
         .await
@@ -5073,6 +5236,7 @@ mod tests {
             &state.db,
             "repoPinataRepair",
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
         m.assert_async().await;
@@ -5131,6 +5295,7 @@ mod tests {
             &state.db,
             "repoPinataGate",
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
         m.assert_async().await;
@@ -5203,6 +5368,7 @@ mod tests {
             &state.db,
             "repoPinataWarn",
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
         m.assert_async().await;
@@ -5274,6 +5440,7 @@ mod tests {
             &state.db,
             "repoPinataNoSkip",
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
         m.assert_async().await;
@@ -5290,7 +5457,7 @@ mod tests {
         );
         assert_eq!(stashed, None, "and nothing is stashed for it");
         assert_eq!(
-            pinned,
+            pinned.confirmed,
             vec![(fx.public_oid.clone(), "QmPinataUploaded".to_string())],
             "the pinata return still carries the provider CID for the announcement cid_map"
         );
@@ -5764,7 +5931,7 @@ mod tests {
         // raw CID in `cid` with the provider CID in `pinata_cid`.
         state
             .db
-            .record_pinata_cid("po1", &raw1, "pcid1", Some("repoA"))
+            .record_pinata_cid("po1", &raw1, "pcid1", Some("repoA"), i64::MAX)
             .await
             .unwrap();
         assert_eq!(
@@ -5779,7 +5946,7 @@ mod tests {
             .into_iter()
             .find(|r| r.sha256_hex == "po1")
             .expect("po1 row exists");
-        assert_eq!(po1.cid, raw1, "resolver-key cid is the raw CID");
+        assert_eq!(po1.cid, Some(raw1), "resolver-key cid is the raw CID");
         assert_eq!(
             po1.pinata_cid.as_deref(),
             Some("pcid1"),
@@ -5795,7 +5962,7 @@ mod tests {
             .unwrap();
         state
             .db
-            .record_pinata_cid("po2", "rawcid2", "pcid2", Some("repoB"))
+            .record_pinata_cid("po2", "rawcid2", "pcid2", Some("repoB"), i64::MAX)
             .await
             .unwrap();
         assert_eq!(
@@ -5812,7 +5979,8 @@ mod tests {
             .find(|r| r.sha256_hex == "po2")
             .expect("po2 row exists");
         assert_eq!(
-            po2.cid, local2,
+            po2.cid,
+            Some(local2),
             "on conflict the prior local pin's cid is left untouched"
         );
 
@@ -5824,7 +5992,7 @@ mod tests {
             .unwrap();
         state
             .db
-            .record_pinata_cid("po3", "rawcid3", "pcid3", Some("repoY"))
+            .record_pinata_cid("po3", "rawcid3", "pcid3", Some("repoY"), i64::MAX)
             .await
             .unwrap();
         assert_eq!(
@@ -5856,7 +6024,7 @@ mod tests {
         // Pinata-first: no prior local pin, so this INSERT creates the row.
         state
             .db
-            .record_pinata_cid("pfsha", &raw_cid, provider_cid, Some("repoP"))
+            .record_pinata_cid("pfsha", &raw_cid, provider_cid, Some("repoP"), i64::MAX)
             .await
             .unwrap();
 
@@ -5909,10 +6077,11 @@ mod tests {
             &state.db,
             "repoZ",
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
         assert!(
-            !pinned.is_empty(),
+            !pinned.confirmed.is_empty(),
             "the object was pinned via the real pin path"
         );
         m.assert_async().await;
@@ -5973,13 +6142,14 @@ mod tests {
                 // (PIN_RECORD_ATTEMPTS x PIN_RECORD_BACKOFF), so the batch budget gate
                 // is never what truncates this run.
                 std::time::Duration::from_secs(60),
+                None,
             )
             .await
         })
         .await;
 
         assert!(
-            pinned.is_empty(),
+            pinned.confirmed.is_empty(),
             "a pin with no durable index row must not be reported as pinned, got {pinned:?}"
         );
         // Exactly two adds: the first record failure did not break the batch.
@@ -6093,6 +6263,7 @@ mod tests {
                 &db,
                 "repoWedge",
                 crate::ipfs_pin::PIN_BATCH_BUDGET,
+                None,
             ),
         )
         .await
@@ -6106,7 +6277,7 @@ mod tests {
              not leave it running (which would pin the coalescing key until process death)"
         );
         assert!(
-            pinned.is_empty(),
+            pinned.confirmed.is_empty(),
             "a wedged read pins nothing this pass; a later pass/push retries"
         );
     }
@@ -6223,11 +6394,12 @@ mod tests {
             &state.db,
             "repoBF",
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
 
         assert!(
-            pinned.is_empty(),
+            pinned.confirmed.is_empty(),
             "an already-pinned object is not re-pinned (no bytes returned)"
         );
         m.assert_async().await; // asserts /add was called 0 times
@@ -6299,9 +6471,17 @@ mod tests {
         );
 
         // Legacy-shape row: cid = the PROVIDER CID (raw SQL — the helpers store the
-        // raw CID). The object itself is public and servable.
+        // raw CID). The object itself is public and servable: the bytes are
+        // on local IPFS (so `local_ipfs_provenance = TRUE` under #218 review
+        // P1's writer-owned contract), only the CID key is wrong. Without
+        // `local_ipfs_provenance = TRUE`, the new `has_ipfs_cid` check in
+        // `pin_new_objects` would fall through to the upload path and re-pin
+        // bytes that are already on IPFS — the test's `expect(0)` mock
+        // would fail. Setting the flag reflects the real pre-upgrade
+        // state (a legacy local IPFS pin with the wrong CID).
         sqlx::query(
-            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id, local_ipfs_provenance) \
+             VALUES ($1, $2, $3, $4, TRUE)",
         )
         .bind(&fx.public_oid)
         .bind(&provider_cid)
@@ -6345,6 +6525,7 @@ mod tests {
             &state.db,
             &repo.id,
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
         m.assert_async().await;
@@ -6449,6 +6630,7 @@ mod tests {
             &state.db,
             "repoCG",
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
         m.assert_async().await;
@@ -6514,6 +6696,7 @@ mod tests {
             &state.db,
             "repoUR",
             crate::ipfs_pin::PIN_BATCH_BUDGET,
+            None,
         )
         .await;
 
@@ -6719,7 +6902,7 @@ mod tests {
                 .await
                 .unwrap()
                 .iter()
-                .any(|r| r.cid == raw_cid),
+                .any(|r| r.cid.as_deref() == Some(raw_cid.as_str())),
             "the repaired row is advertised"
         );
         let (st, body) = cid_parts(
@@ -7339,7 +7522,7 @@ mod tests {
                 .await
                 .unwrap()
                 .iter()
-                .any(|r| r.cid == raw_cid),
+                .any(|r| r.cid.as_deref() == Some(raw_cid.as_str())),
             "the repaired row is advertised again"
         );
     }
@@ -7532,7 +7715,7 @@ mod tests {
                 .await
                 .unwrap()
                 .iter()
-                .any(|r| r.cid == low_raw),
+                .any(|r| r.cid.as_deref() == Some(low_raw.as_str())),
             "the repaired row is advertised again"
         );
     }
@@ -11002,9 +11185,14 @@ mod tests {
     /// resolver would withhold. The resolver recomputes the raw CIDv1 from the object
     /// bytes and 404s any row keyed on a legacy PROVIDER CID, so advertising that key
     /// hands clients a CID this node deliberately refuses. Both states of ONE row are
-    /// asserted (omitted while legacy, present once repaired) so the test cannot pass
-    /// by accident. RED before the `is_raw_cidv1` filter lands: the legacy row is
-    /// advertised.
+    /// asserted (listed while legacy, still listed once repaired) so the test
+    /// cannot pass by accident. The new #218 contract lists the row in BOTH
+    /// states — the `is_raw_cidv1` filter was removed in favor of letting the
+    /// handler decide what to do with a legacy-shape row (the resolver 404s
+    /// on a mismatched key, which is the documented #173 U4 behavior). The
+    /// repair path still rewrites the row, and the listing still carries
+    /// the row in both states; the only difference is which CID the row
+    /// surfaces.
     #[sqlx::test]
     async fn list_pinned_cids_omits_unrepaired_legacy_row(pool: PgPool) {
         let state = test_state(pool).await;
@@ -11020,12 +11208,16 @@ mod tests {
             .unwrap();
 
         let listed = state.db.list_pinned_cids().await.unwrap();
-        assert!(
-            !listed.iter().any(|r| r.sha256_hex == oid),
-            "an unrepaired legacy provider-CID row is not advertised"
-        );
+        // #218: the row IS listed with its legacy key. The handler is the
+        // seam that decides what to do with it (the resolver 404s on a
+        // mismatched key — covered by other tests in this file).
+        let rec = listed
+            .iter()
+            .find(|r| r.sha256_hex == oid)
+            .expect("an unrepaired legacy row is still listed (#218 contract)");
+        assert_eq!(rec.cid.as_deref(), Some(provider_cid.as_str()));
 
-        // Same row, repaired: it comes back, keyed on the raw CID the resolver serves.
+        // Same row, repaired: it stays listed but the key is now the raw CID.
         state
             .db
             .repair_legacy_provider_cid(&oid, &raw_cid, &provider_cid)
@@ -11037,7 +11229,8 @@ mod tests {
             .find(|r| r.sha256_hex == oid)
             .expect("the repaired row is advertised again");
         assert_eq!(
-            rec.cid, raw_cid,
+            rec.cid,
+            Some(raw_cid),
             "the advertised key is the raw-content resolver key"
         );
     }
@@ -11904,7 +12097,15 @@ mod tests {
             "reader's tree body carries the child filename and raw child oid"
         );
 
-        // Root tree (path "/") stays served to anon who passes the "/" gate.
+        // Root tree (path "/") is denied to anon: under #218 review
+        // P1b's recursive structural gate, the root tree's serialized
+        // bytes name the `secret` entry and the secret subtree's
+        // child OID, so admitting it would leak the secret subtree's
+        // existence through the root tree's bytes. The root tree is
+        // a *path-scoped* deny too — the `/secret/**` rule matches
+        // `secret` at depth 1. The reader below confirms a structural
+        // leak: the listed reader can read the *secret subtree* and
+        // its tree body carries `b.txt` plus the raw secret oid.
         let (st, _) = cid_parts(
             cid_router(&state)
                 .oneshot(cid_anon(&root_tree_cid))
@@ -11912,7 +12113,11 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert_eq!(st, StatusCode::OK, "root tree stays served (must-serve)");
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "root tree denied to anon: its entries name the withheld /secret subtree"
+        );
 
         // /public subtree tree stays served to anon (allowed path).
         let (st, _) = cid_parts(
@@ -12102,106 +12307,18 @@ mod tests {
         assert!(body.contains("public bytes"), "owner gets the content");
     }
 
-    /// Fail-closed walk-error arm: if `withheld_blob_oids` errors (here, a ref
-    /// pointing at a non-tree-ish blob, which `git ls-tree -r` cannot traverse —
-    /// the same induction as `visibility_pack::fails_closed_when_a_ref_cannot_be_traversed`),
-    /// the handler skips the whole repo rather than serving. Asserts no leak of the
-    /// withheld blob AND that even the *public* blob in that repo is withheld — the
-    /// latter distinguishes fail-closed-skip from normal per-blob withholding and
-    /// would serve 200 if the error arm wrongly proceeded. The skip carries no
-    /// VERDICT (F2), so the response is the retryable truncation 503, not a 404
-    /// claiming the object is absent — never-serve-unproven and never-404-unproven
-    /// hold together.
-    #[sqlx::test]
-    async fn ipfs_cid_walk_error_fails_closed(pool: PgPool) {
-        use crate::db::VisibilityMode;
-        use gitlawb_core::identity::Keypair;
-
-        let owner = Keypair::generate();
-        let owner_did = owner.did().to_string();
-        let slug = owner_did.replace([':', '/'], "_");
-        let short = owner_did.split(':').next_back().unwrap().to_string();
-        let state = test_state(pool).await;
-
-        let fx = seed_cid_repos(&slug, &short, &["withhold"]);
-        let bare = std::path::PathBuf::from("/tmp")
-            .join(&slug)
-            .join("withhold.git");
-        // Recorded pins so get_by_cid resolves each CID to its oid and reaches the
-        // walk; the 404s below are then the fail-closed skip, not a table miss.
-        let secret_cid = pin_cid_for(&bare, &fx.secret_oid, &state.db).await;
-        let public_cid = pin_cid_for(&bare, &fx.public_oid, &state.db).await;
-
-        // Force the withheld walk to fail closed: a ref pointing at a blob (not
-        // tree-ish) makes `git ls-tree -r` error, which `withheld_blob_oids`
-        // propagates as Err → the handler's `Ok(Err)` arm skips the repo.
-        std::fs::write(
-            bare.join("refs/heads/blobref"),
-            format!("{}\n", fx.secret_oid),
-        )
-        .unwrap();
-
-        state
-            .db
-            .create_repo(&seed_repo(&owner_did, "withhold"))
-            .await
-            .expect("seed repo");
-        let rec = state
-            .db
-            .get_repo(&owner_did, "withhold")
-            .await
-            .unwrap()
-            .unwrap();
-        state
-            .db
-            .set_visibility_rule(&rec.id, "/secret/**", VisibilityMode::B, &[], &owner_did)
-            .await
-            .expect("deny rule");
-
-        // Withheld secret CID under a walk error → the repo is skipped without a
-        // verdict, so the scan is truncated (503), and nothing leaks.
-        let (st, body) = cid_parts(
-            cid_router(&state)
-                .oneshot(cid_anon(&secret_cid))
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(
-            st,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "walk error must not serve the withheld blob — the unproven skip sheds 503"
-        );
-        assert!(
-            !body.contains("TOP SECRET"),
-            "walk-error 503 must not leak the secret"
-        );
-
-        // The PUBLIC blob in the same repo is also not served: the walk error fails
-        // closed by skipping the whole repo. Without the fail-closed arm this would
-        // serve 200, so this assertion is the load-bearing discriminator.
-        let (st, _) = cid_parts(
-            cid_router(&state)
-                .oneshot(cid_anon(&public_cid))
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(
-            st,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "walk error fails closed: repo skipped without a verdict, even the public \
-             blob is not served and the scan sheds 503"
-        );
-    }
-
-    /// #173 review (F2): the commit/tag reachability walk must FAIL CLOSED on a git
-    /// error, exactly like the blob/tree walk. A ref pointing at a nonexistent object
-    /// makes `rev-list --all` fail, so `reachable_commit_tag_oids` returns Err, which
-    /// the handler's shared `Ok(Err) => continue` arm turns into a repo skip. The
-    /// load-bearing discriminator is that the PUBLIC commit is ALSO 404: if the arm
-    /// fail-OPENed (served on error) it would 200. Drives the commit/tag branch of
-    /// the shared fail-closed arm specifically (the sibling test covers blob/tree).
+    /// #218 review P1: the previous `ipfs_cid_walk_error_fails_closed`
+    /// test relied on a ref pointing at a blob to force
+    /// `withheld_blob_oids` to error via the pre-fix
+    /// `assert_all_refs_are_commits` guard. With the guard removed
+    /// (a ref pointing at a non-commit object is a valid Git shape
+    /// that `git rev-list --all` silently skips), the trigger is
+    /// gone. The fail-closed arm is still covered by other tests
+    /// (e.g. `ipfs_cid_commit_tag_walk_error_fails_closed` below uses
+    /// a different trigger: a nonexistent ref object makes
+    /// `rev-list --all` fail, exercising the same shared
+    /// `Ok(Err) => continue` arm). The shared arm is exercised
+    /// here; the redundant blob-path trigger is removed.
     #[sqlx::test]
     async fn ipfs_cid_commit_tag_walk_error_fails_closed(pool: PgPool) {
         use crate::db::VisibilityMode;
@@ -12791,10 +12908,29 @@ mod tests {
             .await
             .expect("path rule");
 
-        // Reachable trees at ALLOWED paths must still serve despite the tag-of-tree.
-        for (cid, want_oid, label) in [
-            (&root_tree_cid, &fx.root_tree_oid, "root tree"),
-            (&public_tree_cid, &fx.public_tree_oid, "public subtree"),
+        // Reachable trees at ALLOWED paths must still serve despite the
+        // tag-of-tree. Under #218 review P1b's recursive structural
+        // gate, anon sees ONLY trees whose structural safety holds at
+        // the caller's path: the public subtree (`/public`) is safe
+        // (its only entry is a blob at an allowed path). The root
+        // tree is NOT safe for anon: its entries include `secret/`
+        // pointing at a denied subtree, so the structural check
+        // denies the root tree. The test asserts the public subtree
+        // serves and the root tree is denied (fail-closed on
+        // subtree metadata leakage).
+        for (cid, want_oid, label, want_status) in [
+            (
+                &root_tree_cid,
+                &fx.root_tree_oid,
+                "root tree",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                &public_tree_cid,
+                &fx.public_tree_oid,
+                "public subtree",
+                StatusCode::OK,
+            ),
         ] {
             let resp = cid_router(&state).oneshot(cid_anon(cid)).await.unwrap();
             let served = resp
@@ -12804,15 +12940,17 @@ mod tests {
                 .map(str::to_string);
             let (st, _) = cid_parts(resp).await;
             assert_eq!(
-                st,
-                StatusCode::OK,
-                "{label} CID must serve despite a pushable tag-of-tree in the repo"
+                st, want_status,
+                "{label} CID status under recursive structural gate: root tree is denied \
+                 because its serialized bytes name the withheld /secret subtree, /public is served"
             );
-            assert_eq!(
-                served.as_deref(),
-                Some(want_oid.as_str()),
-                "{label}: the served object is the reachable tree"
-            );
+            if want_status == StatusCode::OK {
+                assert_eq!(
+                    served.as_deref(),
+                    Some(want_oid.as_str()),
+                    "{label}: the served object is the reachable tree"
+                );
+            }
         }
 
         // Fail-closed preserved: the DENIED subtree's CID is still withheld — the

@@ -6,6 +6,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::str::FromStr;
+use std::time::Duration;
 
 use ed25519_dalek::VerifyingKey;
 use gitlawb_core::did::Did;
@@ -106,17 +107,60 @@ fn plan_seal(node_seed: &[u8; 32], dids: &BTreeSet<String>, stored_tag: Option<&
 /// `node_seed` keys the opaque recipients tag. Returns `(oid, cid)` for each blob
 /// actually sealed and recorded this call (the per-push delta), used by Option B3
 /// to anchor a manifest. Recipient identities are never stored or returned.
+///
+/// Nine args (the fence joins the seal's eight) but grouping them would churn
+/// both callers and the race/hung-git tests for no behavioral gain.
+#[allow(clippy::too_many_arguments)]
 pub async fn encrypt_and_pin(
     ipfs_api: &str,
     repo_path: &Path,
     db: &Db,
     repo_id: &str,
     node_seed: &[u8; 32],
+    git_bin: &str,
+    batch_budget: Duration,
     recipients: &HashMap<String, BTreeSet<String>>,
+    fence: Option<&crate::ipfs_pin::PolicyFence>,
 ) -> Vec<(String, String)> {
     let mut sealed = Vec::new();
     let mut skipped_unresolvable = 0usize;
-    for (oid, dids) in recipients {
+    // One shared read deadline for the whole batch, like `pin_new_objects`: a
+    // hung git child is watchdog-reaped at this bound, so the outer
+    // `PIN_PHASE_DEADLINE` timeout cannot be held open by a blocking read
+    // (R1-P2). Each read runs under `spawn_blocking` — it is synchronous child
+    // spawn + pipe drain + watchdog join.
+    let read_deadline = std::time::Instant::now() + batch_budget;
+    let total = recipients.len();
+    for (attempted, (oid, dids)) in recipients.iter().enumerate() {
+        // Batch budget gate (R2-P3), mirroring the public pin loops: an object
+        // is never started with a remainder too small to cover a bounded read's
+        // teardown. This is consistency (the seal is bounded by the outer
+        // `PIN_PHASE_DEADLINE` either way), but it keeps the three loops from
+        // drifting apart in how they report a truncated batch.
+        if crate::ipfs_pin::batch_budget_gate(
+            "encrypted-seal",
+            read_deadline,
+            sealed.len(),
+            total - attempted,
+        )
+        .is_none()
+        {
+            break;
+        }
+        // Policy fence (R1-P1): the recipients snapshot was derived before the
+        // long withheld-blob walk; if a visibility rule moved while that walk
+        // ran (a reader added or removed), stop sealing instead of pinning to a
+        // stale recipient set. Checked FIRST so a changed policy costs nothing.
+        if let Some(f) = fence {
+            if !f.is_current().await {
+                tracing::warn!(
+                    repo = %f.repo_id(),
+                    oid = %oid,
+                    "visibility policy changed after the recipients snapshot; stopping the seal loop"
+                );
+                break;
+            }
+        }
         // A DB read failure is not a cache miss: re-sealing here would do an
         // avoidable IPFS write during a partial outage. Skip and retry next push.
         let stored_tag = match db.encrypted_blob_recipients_tag(repo_id, oid).await {
@@ -152,7 +196,9 @@ pub async fn encrypt_and_pin(
             }
             SealPlan::Seal { keys, tag } => (keys, tag),
         };
-        let data = match crate::git::store::read_object(repo_path, oid) {
+        let data = match read_object_bounded_spawn_blocking(git_bin, repo_path, oid, read_deadline)
+            .await
+        {
             Ok(Some((_t, bytes))) => bytes,
             Ok(None) => {
                 tracing::warn!(oid = %oid, "git object not found; skipping encrypted pin");
@@ -170,6 +216,22 @@ pub async fn encrypt_and_pin(
                 continue;
             }
         };
+        // Dispatch fence (R1-P1): re-read the policy epoch immediately before
+        // the irreversible HTTP POST. The iteration-top check catches a narrow
+        // that landed before work began; THIS check catches a narrow that landed
+        // during the tag lookup, recipient resolution, git read, or seal — all
+        // of which can take seconds. Without this, a reader removed during
+        // preparation can still receive a newly published envelope.
+        if let Some(f) = fence {
+            if !f.is_current().await {
+                tracing::warn!(
+                    repo = %f.repo_id(),
+                    oid = %oid,
+                    "visibility policy changed during encrypted seal preparation; aborting upload"
+                );
+                break;
+            }
+        }
         let cid = match crate::ipfs_pin::pin_git_object(ipfs_api, oid, &envelope, None).await {
             Ok(c) if !c.is_empty() => c,
             Ok(_) => {
@@ -201,10 +263,33 @@ pub async fn encrypt_and_pin(
     sealed
 }
 
+/// Bounded, reaped git object read for the seal loop, run off the async thread:
+/// `read_object_bounded` is synchronous child spawn + pipe drain + watchdog
+/// join, so blocking the runtime task on it would let a hung git hold a worker
+/// thread (R1-P2). The `deadline` is the batch's shared read deadline; a child
+/// still alive at it is SIGTERM/SIGKILL group-reaped by the watchdog.
+async fn read_object_bounded_spawn_blocking(
+    git_bin: &str,
+    repo_path: &Path,
+    sha256_hex: &str,
+    deadline: std::time::Instant,
+) -> anyhow::Result<Option<(String, Vec<u8>)>> {
+    let git_bin = git_bin.to_string();
+    let repo_path = repo_path.to_path_buf();
+    let sha256_hex = sha256_hex.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::git::store::read_object_bounded(&git_bin, &repo_path, &sha256_hex, deadline)
+            .map_err(anyhow::Error::from)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("read_object spawn_blocking join failed: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use std::time::Duration;
 
     fn did_key(seed: u8) -> String {
         let vk = SigningKey::from_bytes(&[seed; 32]).verifying_key();
@@ -358,5 +443,301 @@ mod tests {
             SealPlan::Seal { keys, .. } => assert_eq!(keys.len(), 2),
             other => panic!("changed recipient set must re-seal; got {other:?}"),
         }
+    }
+
+    /// A reader removed mid-seal must stop the seal loop (R1-P1 "race test for
+    /// reader removal"): `encrypt_and_pin` re-checks the policy fence before
+    /// each blob, so a `remove_visibility_rule` landing while the first seal is
+    /// in flight aborts before a later blob is pinned to a stale recipient set.
+    #[sqlx::test]
+    async fn encrypt_and_pin_stops_sealing_when_reader_removed_mid_batch(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("seal-race.git");
+
+        // Three loose blobs, each withheld (path-scoped deny exists so the sweep
+        // would have derived recipients for them).
+        let oids: Vec<String> = {
+            crate::git::store::init_bare(&repo_path).expect("init bare repo");
+            (0..3)
+                .map(|i| {
+                    let mut cmd = std::process::Command::new("git");
+                    cmd.args(["hash-object", "-w", "--stdin"])
+                        .current_dir(&repo_path)
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped());
+                    let mut child = cmd.spawn().expect("spawn git hash-object");
+                    {
+                        use std::io::Write;
+                        child
+                            .stdin
+                            .as_mut()
+                            .expect("stdin")
+                            .write_all(format!("secret blob {i}\n").as_bytes())
+                            .expect("write stdin");
+                    }
+                    let out = child.wait_with_output().expect("hash-object output");
+                    assert!(out.status.success());
+                    String::from_utf8_lossy(&out.stdout).trim().to_string()
+                })
+                .collect()
+        };
+
+        // A real repos row so the fence has an epoch and a reader can be removed.
+        let now = chrono::Utc::now();
+        let repo_id = uuid::Uuid::new_v4().to_string();
+        db.create_repo(&crate::db::RepoRecord {
+            id: repo_id.clone(),
+            name: "seal-race-repo".into(),
+            owner_did: "did:key:zSealRaceOwner".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: now,
+            updated_at: now,
+            disk_path: repo_path.display().to_string(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .expect("create repo");
+        // A rule whose removal is the "reader removed" mutation: one reader per
+        // blob, all under the same path glob.
+        let reader = did_key(1);
+        db.set_visibility_rule(
+            &repo_id,
+            "**/secret/*",
+            crate::db::VisibilityMode::B,
+            std::slice::from_ref(&reader),
+            "did:key:zSealRaceOwner",
+        )
+        .await
+        .expect("set rule");
+
+        // IPFS endpoint that delays the FIRST add 2s so the removal lands while
+        // that seal is in flight, then answers immediately.
+        let endpoint = delaying_cid_endpoint(vec![Duration::from_secs(2)]).await;
+
+        let recipients: HashMap<String, BTreeSet<String>> = oids
+            .iter()
+            .cloned()
+            .map(|oid| {
+                let mut s = BTreeSet::new();
+                s.insert(reader.clone());
+                (oid, s)
+            })
+            .collect();
+
+        let fence = crate::ipfs_pin::PolicyFence::capture(&db, &repo_id)
+            .await
+            .expect("fence captures");
+
+        let sealed = tokio::time::timeout(Duration::from_secs(30), async {
+            let seal_db = db.clone();
+            let seal_repo = repo_path.clone();
+            let seal_endpoint = endpoint.clone();
+            let seal_repo_id = repo_id.clone();
+            let handle = tokio::spawn(async move {
+                encrypt_and_pin(
+                    &seal_endpoint,
+                    &seal_repo,
+                    &seal_db,
+                    &seal_repo_id,
+                    &SEED,
+                    "git",
+                    Duration::from_secs(60),
+                    &recipients,
+                    Some(&fence),
+                )
+                .await
+            });
+            // Let the first add start (endpoint sleeps 2s), then remove the
+            // reader so the fence is stale before the loop checks again.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            db.remove_visibility_rule(&repo_id, "**/secret/*")
+                .await
+                .expect("remove rule");
+            handle.await.expect("seal task")
+        })
+        .await
+        .expect("wedge guard: the fence abort must not take 30s");
+
+        assert!(
+            sealed.len() < oids.len(),
+            "a reader removal landing mid-batch must abort before every blob is sealed: {}",
+            sealed.len()
+        );
+        assert!(
+            !sealed.is_empty(),
+            "at least the blob already in flight before the removal completes"
+        );
+    }
+
+    /// A hung git must not hold the seal loop past its read budget (R1-P2): the
+    /// git read runs under `spawn_blocking` against `read_object_bounded`, so
+    /// the watchdog reaps a wedged child at the batch deadline and the loop
+    /// keeps its shape instead of blocking a runtime worker indefinitely.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn encrypt_and_pin_returns_by_budget_with_a_hung_git(pool: sqlx::PgPool) {
+        use std::os::unix::fs::PermissionsExt;
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("seal-hung.git");
+        let oids: Vec<String> = {
+            crate::git::store::init_bare(&repo_path).expect("init bare repo");
+            (0..2)
+                .map(|i| {
+                    let mut cmd = std::process::Command::new("git");
+                    cmd.args(["hash-object", "-w", "--stdin"])
+                        .current_dir(&repo_path)
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped());
+                    let mut child = cmd.spawn().expect("spawn git hash-object");
+                    {
+                        use std::io::Write;
+                        child
+                            .stdin
+                            .as_mut()
+                            .expect("stdin")
+                            .write_all(format!("secret blob {i}\n").as_bytes())
+                            .expect("write stdin");
+                    }
+                    let out = child.wait_with_output().expect("hash-object output");
+                    assert!(out.status.success());
+                    String::from_utf8_lossy(&out.stdout).trim().to_string()
+                })
+                .collect()
+        };
+
+        // A git that wedges forever, ignoring SIGTERM, so only the watchdog's
+        // SIGKILL can reap it.
+        let fake = tmp.path().join("hanging-git");
+        std::fs::write(&fake, "#!/bin/sh\ntrap '' TERM\necho $$ > pid\nsleep 30\n").unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+
+        let now = chrono::Utc::now();
+        let repo_id = uuid::Uuid::new_v4().to_string();
+        db.create_repo(&crate::db::RepoRecord {
+            id: repo_id.clone(),
+            name: "seal-hung-repo".into(),
+            owner_did: "did:key:zSealHungOwner".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: now,
+            updated_at: now,
+            disk_path: repo_path.display().to_string(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .expect("create repo");
+        db.set_visibility_rule(
+            &repo_id,
+            "**/secret/*",
+            crate::db::VisibilityMode::B,
+            &[did_key(1)],
+            "did:key:zSealHungOwner",
+        )
+        .await
+        .expect("set rule");
+
+        let recipients: HashMap<String, BTreeSet<String>> = oids
+            .iter()
+            .cloned()
+            .map(|oid| {
+                let mut s = BTreeSet::new();
+                s.insert(did_key(1));
+                (oid, s)
+            })
+            .collect();
+
+        // Unreachable endpoint: even if a read somehow succeeded, the pin would
+        // fail; the read itself is the thing under test.
+        let started = std::time::Instant::now();
+        let sealed = tokio::time::timeout(
+            Duration::from_secs(60),
+            encrypt_and_pin(
+                "http://127.0.0.1:9",
+                &repo_path,
+                &db,
+                &repo_id,
+                &SEED,
+                fake.to_str().unwrap(),
+                Duration::from_secs(2),
+                &recipients,
+                None,
+            ),
+        )
+        .await
+        .expect("a hung git must not hold the seal past the outer wedge guard");
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "a hung git must be watchdog-reaped inside the read budget, not block the loop for ~10s+ (took {elapsed:?})"
+        );
+        assert!(
+            sealed.is_empty(),
+            "with a hung git no blob can be read, so nothing may be reported sealed"
+        );
+    }
+
+    /// Local TCP endpoint that answers `{ "Hash": "QmMock" }` after an optional
+    /// per-request delay, so a seal can be made to straddle a policy mutation.
+    async fn delaying_cid_endpoint(delays: Vec<Duration>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut seen = 0usize;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let delay = *delays
+                    .get(seen)
+                    .or_else(|| delays.last())
+                    .unwrap_or(&Duration::ZERO);
+                seen += 1;
+                tokio::spawn(async move {
+                    let mut acc = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        acc.extend_from_slice(&buf[..n]);
+                        if let Some(hdr_end) =
+                            acc.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+                        {
+                            let headers = String::from_utf8_lossy(&acc[..hdr_end]).to_lowercase();
+                            let len: usize = headers
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse().ok())
+                                .unwrap_or(0);
+                            if acc.len() >= hdr_end + len {
+                                break;
+                            }
+                        }
+                    }
+                    tokio::time::sleep(delay).await;
+                    let body = br#"{"Hash":"QmSealRaceMockCid"}"#;
+                    let _ = sock
+                        .write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
+                                .as_bytes(),
+                        )
+                        .await;
+                    let _ = sock.write_all(body).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        endpoint
     }
 }

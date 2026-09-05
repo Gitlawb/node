@@ -2130,13 +2130,68 @@ async fn gate_and_serve(
 
 /// GET /api/v1/ipfs/pins
 ///
-/// Returns all CIDs that have been pinned to the local IPFS node from git
-/// objects received via push. Each entry includes the git SHA-256 hex, the
-/// CIDv1 string, and the timestamp when it was pinned.
+/// Returns all CIDs that have been pinned from git objects received via push.
+/// Each entry includes the git SHA-256 hex and the timestamp when it was
+/// pinned. The wire contract is nullable by design:
+///
+/// - `cid` / `local_cid` — node-local resolver keys: the raw CIDv1 the
+///   `GET /ipfs/{cid}` endpoint serves. Non-null ONLY when the stored value
+///   parses as a raw CIDv1 AND writer-owned local provenance confirms the
+///   bytes went through this node's IPFS daemon. Otherwise null, even when
+///   the database holds some other CID-shaped string for the row.
+/// - `pinata_cid` — the provider identifier Pinata returned (dag-pb/UnixFS,
+///   not a node resolver key). The only usable identifier for remote-only
+///   rows; `gl` consumers must read this field, never `cid`, for those.
+/// - `local_pinned` — `true` iff the local-IPFS writer path
+///   (`record_pinned_cid_with_source`) pushed the bytes into the local
+///   daemon. Writer-owned; never inferred from CID shape. A row can carry
+///   `local_pinned = true` with a null `cid` when its stored key predates
+///   the raw-key contract (legacy provider key awaiting repair).
+/// - `pinata_pinned` — `true` iff the row has a non-null `pinata_cid`.
+///
+/// Rows with neither a local nor a Pinata CID are omitted so the response
+/// only contains rows with at least one backend. Remote-only rows stay
+/// visible through `pinata_cid`/`pinata_pinned`; nothing is hidden.
+///
+/// #218 review P2: the response surfaces writer-owned provenance so a
+/// `gl` consumer can distinguish local-only, remote-only, and dual rows
+/// without re-inferring semantics from nullability.
 pub async fn list_pins(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
     // Bare `?` so connection-class sqlx failures downcast to `AppError::Db` and
     // map to 503 `db_unavailable` (not 500 via `.map_err(AppError::Internal)`) (#251).
     let pins = state.db.list_pinned_cids().await?;
+
+    let pins: Vec<serde_json::Value> = pins
+        .into_iter()
+        .filter(|p| p.cid.is_some() || p.pinata_cid.is_some())
+        .map(|p| {
+            // A stored `cid` is advertised as a node-local resolver key
+            // only when it passes the raw-CIDv1 contract AND local
+            // provenance is confirmed. The historical `cid` column has
+            // held more than one namespace (Kubo dag-pb, Pinata CIDv0),
+            // and the `/ipfs/{cid}` resolver recomputes the raw CID
+            // from object bytes and rejects anything else — so a
+            // legacy provider key in `cid`/`local_cid` would promise a
+            // local object the node immediately refuses to serve.
+            // Such rows stay listed (with their provenance flags) but
+            // carry no local key until repair rewrites them.
+            let local_key = match &p.cid {
+                Some(c) if gitlawb_core::cid::is_raw_cidv1(c) && p.local_ipfs_provenance => {
+                    Some(c.clone())
+                }
+                _ => None,
+            };
+            serde_json::json!({
+                "sha256_hex": p.sha256_hex,
+                "cid": local_key.clone(),
+                "local_cid": local_key,
+                "pinata_cid": p.pinata_cid,
+                "local_pinned": p.local_ipfs_provenance,
+                "pinata_pinned": p.pinata_cid.is_some(),
+                "pinned_at": p.pinned_at,
+            })
+        })
+        .collect();
 
     Ok(Json(serde_json::json!({
         "pins": pins,
@@ -2448,6 +2503,366 @@ mod closed_pool_tests {
                 "message": crate::error::DB_UNAVAILABLE_MESSAGE,
             })
         );
+    }
+
+    /// #218 review P2: the `list_pins` API response surfaces writer-owned
+    /// provenance (`local_pinned`, `pinata_pinned`) so a `gl` consumer
+    /// can distinguish local-only, remote-only, and dual rows without
+    /// re-inferring semantics from nullability. `cid`/`local_cid` carry a
+    /// value ONLY for rows whose stored key parses as a raw CIDv1 with
+    /// confirmed local provenance; anything else (Pinata-only rows,
+    /// legacy provider keys) exposes its usable identifier through
+    /// `pinata_cid` alone, and every non-null local key must resolve
+    /// through `GET /ipfs/{cid}`.
+    #[sqlx::test]
+    async fn list_pins_reports_writer_owned_provenance_for_all_shapes(pool: sqlx::PgPool) {
+        use sqlx::Row as _;
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let db = &state.db;
+
+        // Raw resolver keys must be REAL raw CIDv1 strings: the handler
+        // gates `cid`/`local_cid` on `is_raw_cidv1`, so placeholder text
+        // would fail the gate for the wrong reason. Provider CIDs stay
+        // opaque Qm… strings (never syntax-checked, only echoed).
+        fn raw_cid_for(content: &[u8]) -> String {
+            gitlawb_core::cid::Cid::from_git_object_bytes(content).to_string()
+        }
+
+        // Two real blobs on disk in one public repo, so the local and
+        // dual rows below can be followed through `GET /ipfs/{cid}`.
+        // The resolver locates repos through `repo_store.acquire`, not
+        // the row's `disk_path`, so the recipe overwrites the acquired
+        // bare path with a real clone: workdir commit of both files,
+        // cloned --bare into the store path, oids via rev-parse, raw
+        // keys recomputed from the file bytes exactly as the serve
+        // path does.
+        fn run_git(args: &[&str], cwd: &std::path::Path) {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let content1 = b"pins follow-through one\n";
+        let content2 = b"pins follow-through two\n";
+        let tmp = tempfile::TempDir::new().unwrap();
+        let work = tmp.path().join("work-pins-list");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("one.txt"), content1).unwrap();
+        std::fs::write(work.join("two.txt"), content2).unwrap();
+        run_git(
+            &["init", "-q", "--object-format=sha256", "-b", "main"],
+            &work,
+        );
+        run_git(&["config", "user.email", "t@t"], &work);
+        run_git(&["config", "user.name", "t"], &work);
+        run_git(&["add", "."], &work);
+        run_git(&["commit", "-qm", "seed"], &work);
+        let oid_of = |spec: &str| {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", spec])
+                .current_dir(&work)
+                .output()
+                .expect("git rev-parse runs");
+            assert!(out.status.success(), "rev-parse {spec} failed");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let sha_local = oid_of("HEAD:one.txt");
+        let sha_dual = oid_of("HEAD:two.txt");
+        let raw1 = raw_cid_for(content1);
+        let raw4 = raw_cid_for(content2);
+        db.upsert_mirror_repo(
+            "zPinsListOwner",
+            "pins-list",
+            "/unused-pins-list",
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let rec = db
+            .get_repo("zPinsListOwner", "pins-list")
+            .await
+            .unwrap()
+            .expect("mirror repo row");
+        let bare = state
+            .repo_store
+            .acquire(&rec.owner_did, &rec.name)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&bare).unwrap();
+        run_git(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            tmp.path(),
+        );
+
+        // The combination table for what the response must carry:
+        //
+        //   shape              | local_pinned | pinata_pinned | local_cid | pinata_cid
+        //   -------------------+--------------+---------------+-----------+-----------
+        //   local-only         | true         | false          | raw       | null
+        //   pinata-only (raw)  | false        | true           | null      | provider
+        //   pinata-only (null) | false        | true           | null      | raw(=provider)
+        //   dual               | true         | true           | raw       | provider
+        //   legacy provider key| true         | false          | null      | null
+        //
+        // The pinata-only (raw) row keeps a genuine raw key in the
+        // column but must NOT surface it: provenance is unconfirmed,
+        // so no local field may carry it. The legacy row predates the
+        // raw-key contract (dag-pb key, provenance claimed) and must
+        // surface no local key until repair rewrites it — while the
+        // row itself (and its `local_pinned` flag) stays visible.
+        //
+        // Distinct shas (the table is keyed on sha256_hex) keep the
+        // rows independent.
+
+        // (1) local-only: real local pin via the production writer.
+        db.record_pinned_cid_with_source(&sha_local, &raw1, &rec.id)
+            .await
+            .unwrap();
+
+        // (2) pinata-only (raw != provider): the post-v27/v30 row shape
+        // produced by `record_pinata_cid`. The stored raw key is genuine
+        // but local provenance is unconfirmed, so neither local field
+        // may carry it; the provider field is the usable identifier.
+        let sha_pinata_raw = "sha_p2_pinata_only_distinct_cids";
+        let raw2 = raw_cid_for(b"pins pinata-only bytes\n");
+        let pinata2 = "QmPinataProviderCidForRawOnlyRow";
+        assert_ne!(raw2, pinata2);
+        db.record_pinata_cid(
+            sha_pinata_raw,
+            &raw2,
+            pinata2,
+            Some("repo-p2-pinata-raw"),
+            i64::MAX,
+        )
+        .await
+        .unwrap();
+
+        // (3) pinata-only (raw == provider): `record_pinata_cid` stores
+        // `cid = NULL` so the resolver key isn't aliased to a dag-pb
+        // provider CID that doesn't hash to the raw bytes (#173).
+        let sha_pinata_null = "sha_p2_pinata_only_null_cid";
+        let same = "QmPinataOnlyCidRawEqualsProvider";
+        db.record_pinata_cid(
+            sha_pinata_null,
+            same,
+            same,
+            Some("repo-p2-pinata-null"),
+            i64::MAX,
+        )
+        .await
+        .unwrap();
+
+        // (4) dual: local first (sets the flag and `cid`), then Pinata
+        // (sets `pinata_cid` and preserves `cid` and `local_ipfs_provenance`).
+        let pinata4 = "QmPinataProviderCidForDualRow";
+        db.record_pinned_cid_with_source(&sha_dual, &raw4, &rec.id)
+            .await
+            .unwrap();
+        db.record_pinata_cid(&sha_dual, &raw4, pinata4, Some(&rec.id), i64::MAX)
+            .await
+            .unwrap();
+
+        // (5) legacy provider key: a pre-fix row whose `cid` is a dag-pb
+        // provider identifier with claimed local provenance. Production
+        // writers can no longer produce this shape, so it is seeded with
+        // raw SQL — the point is that the projection must not trust column
+        // shape as proof of a raw local key.
+        let sha_legacy = "sha_p2_legacy_provider_key";
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid, repo_id, local_ipfs_provenance)
+             VALUES ($1, $2, $3, NULL, $4, TRUE)",
+        )
+        .bind(sha_legacy)
+        .bind("QmLegacyProviderKeyPredatesRawContract")
+        .bind("2026-07-01T00:00:00Z")
+        .bind(&rec.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Hit the production handler end-to-end through a one-shot router
+        // request, so the test exercises the actual response shape
+        // (not a unit test on PinnedCidRecord fields).
+        let resp = Router::new()
+            .route("/api/v1/ipfs/pins", axum::routing::get(list_pins))
+            .with_state(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/ipfs/pins")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: Value = serde_json::from_slice(&bytes).expect("json body");
+        let pins = v
+            .get("pins")
+            .and_then(|p| p.as_array())
+            .expect("pins array");
+        assert_eq!(
+            pins.len(),
+            5,
+            "all five shapes must appear in the response (every row has at least one of cid/pinata_cid set)"
+        );
+
+        // Build a map sha -> pin object for ergonomic assertions.
+        let by_sha: std::collections::HashMap<String, &Value> = pins
+            .iter()
+            .map(|p| {
+                (
+                    p.get("sha256_hex")
+                        .and_then(|s| s.as_str())
+                        .unwrap()
+                        .to_string(),
+                    p,
+                )
+            })
+            .collect();
+
+        // Helper: assert a single pin's fields.
+        let assert_pin = |sha: &str,
+                          local_pinned: bool,
+                          pinata_pinned: bool,
+                          local_cid: Option<&str>,
+                          pinata_cid: Option<&str>| {
+            let pin = by_sha.get(sha).unwrap_or_else(|| {
+                panic!(
+                    "pin row for {sha} missing; got shas {:?}",
+                    by_sha.keys().collect::<Vec<_>>()
+                )
+            });
+            assert_eq!(
+                pin.get("local_pinned").and_then(|v| v.as_bool()),
+                Some(local_pinned),
+                "{sha}: local_pinned mismatch",
+            );
+            assert_eq!(
+                pin.get("pinata_pinned").and_then(|v| v.as_bool()),
+                Some(pinata_pinned),
+                "{sha}: pinata_pinned mismatch",
+            );
+            assert_eq!(
+                pin.get("local_cid").and_then(|v| v.as_str()),
+                local_cid,
+                "{sha}: local_cid mismatch",
+            );
+            assert_eq!(
+                pin.get("pinata_cid").and_then(|v| v.as_str()),
+                pinata_cid,
+                "{sha}: pinata_cid mismatch",
+            );
+            // Round-3 P2: `cid` is the LOCAL resolver key, full
+            // stop. It is the raw CID when the row has a local pin
+            // (local-only or dual shape) and `None` for Pinata-only
+            // rows. The previous contract aliased the Pinata provider
+            // CID into `cid` for Pinata-only rows, which made
+            // `gl ipfs list` advertise a CID the node's own
+            // `/ipfs/{cid}` resolver cannot serve (404). The
+            // provenance split is exposed via `local_cid`,
+            // `pinata_cid`, and the boolean `local_pinned` /
+            // `pinata_pinned` flags.
+            let cid_value = pin.get("cid").cloned().unwrap_or(serde_json::Value::Null);
+            let expected_cid = local_cid
+                .map(|s| serde_json::Value::String(s.to_string()))
+                .unwrap_or(serde_json::Value::Null);
+            assert_eq!(cid_value, expected_cid, "{sha}: cid mismatch");
+        };
+
+        // (1) local-only
+        assert_pin(&sha_local, true, false, Some(raw1.as_str()), None);
+        // (2) pinata-only (raw != provider): the stored raw key is
+        // genuine but provenance is unconfirmed, so NO local field may
+        // carry it — remote-only state is visible through `pinata_cid`
+        // alone.
+        assert_pin(sha_pinata_raw, false, true, None, Some(pinata2));
+        // (3) pinata-only (raw == provider) — cid NULL, pinata_cid set
+        assert_pin(sha_pinata_null, false, true, None, Some(same));
+        // (4) dual
+        assert_pin(&sha_dual, true, true, Some(raw4.as_str()), Some(pinata4));
+        // (5) legacy provider key: no local field carries the dag-pb
+        // key, but the row and its claimed provenance stay visible so
+        // the repair gap is observable rather than hidden.
+        assert_pin(sha_legacy, true, false, None, None);
+
+        // Sanity: the `local_ipfs_provenance` column itself is what
+        // powers `local_pinned`, so the response field must agree
+        // with the database column. Reading directly avoids any
+        // confusion if the writer path changes.
+        let rows = sqlx::query("SELECT sha256_hex, local_ipfs_provenance FROM pinned_cids")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let mut db_provenance: std::collections::HashMap<String, bool> = Default::default();
+        for r in rows {
+            let sha: String = r.get("sha256_hex");
+            let p: bool = r.get("local_ipfs_provenance");
+            db_provenance.insert(sha, p);
+        }
+        for (sha, expected) in [
+            (sha_local.as_str(), true),
+            (sha_pinata_raw, false),
+            (sha_pinata_null, false),
+            (sha_dual.as_str(), true),
+            (sha_legacy, true),
+        ] {
+            assert_eq!(
+                db_provenance.get(sha).copied(),
+                Some(expected),
+                "db column for {sha} does not match expected writer-owned provenance"
+            );
+        }
+
+        // Follow-through: every non-null local key in the response must
+        // resolve through `GET /ipfs/{cid}`. The local-only and dual rows
+        // above name real blobs on disk in a public repo, so both must
+        // serve their exact bytes; the Pinata-only and legacy rows carry
+        // no local key and have nothing to follow.
+        let follow_router = Router::new()
+            .route("/ipfs/{cid}", axum::routing::get(get_by_cid))
+            .with_state(state.clone());
+        for (raw, content) in [(&raw1, &content1[..]), (&raw4, &content2[..])] {
+            let resp = follow_router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!("/ipfs/{raw}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::OK,
+                "advertised local key {raw} must resolve"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            assert_eq!(
+                body.as_ref(),
+                content,
+                "resolved bytes for {raw} must match the pinned blob"
+            );
+        }
     }
 
     /// #251 / CodeRabbit nit: cover `get_by_cid`'s DB-error conversion path — a
