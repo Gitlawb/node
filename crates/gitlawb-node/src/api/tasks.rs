@@ -323,27 +323,29 @@ mod tests {
     #[sqlx::test]
     async fn tasks_negative_limit_clamped(pool: PgPool) {
         let state = test_state(pool).await;
-        // seed a task
+        // seed two tasks to verify clamp to 1 instead of default 50
         let now = Utc::now().to_rfc3339();
-        state
-            .db
-            .create_task(&crate::db::AgentTask {
-                id: "task-negative".to_string(),
-                repo_id: None,
-                kind: "build".to_string(),
-                status: "pending".to_string(),
-                delegator_did: OWNER.to_string(),
-                assignee_did: None,
-                capability: "repo:write".to_string(),
-                ucan_token: None,
-                payload: None,
-                result: None,
-                created_at: now.clone(),
-                updated_at: now,
-                deadline: None,
-            })
-            .await
-            .unwrap();
+        for id in &["task-negative-1", "task-negative-2"] {
+            state
+                .db
+                .create_task(&crate::db::AgentTask {
+                    id: (*id).to_string(),
+                    repo_id: None,
+                    kind: "build".to_string(),
+                    status: "pending".to_string(),
+                    delegator_did: OWNER.to_string(),
+                    assignee_did: None,
+                    capability: "repo:write".to_string(),
+                    ucan_token: None,
+                    payload: None,
+                    result: None,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                    deadline: None,
+                })
+                .await
+                .unwrap();
+        }
 
         let router = Router::new()
             .route("/api/v1/tasks", axum::routing::get(super::list_tasks))
@@ -360,7 +362,7 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["count"].as_u64().unwrap(), 1);
-        assert!(body["tasks"].as_array().unwrap().len() > 0);
+        assert_eq!(body["tasks"].as_array().unwrap().len(), 1);
     }
 
     #[sqlx::test]
@@ -395,7 +397,7 @@ mod tests {
 
         let req = Request::builder()
             .method(Method::GET)
-            .uri("/api/v1/tasks?limit=5000")
+            .uri("/api/v1/tasks?limit=9223372036854775807")
             .body(Body::empty())
             .unwrap();
 
