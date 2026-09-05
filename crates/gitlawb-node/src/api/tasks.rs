@@ -126,14 +126,17 @@ pub async fn create_task(
     Ok((StatusCode::CREATED, Json(task_to_json(&task))))
 }
 
+const MAX_TASK_LIMIT: i64 = 200;
+
 /// GET /api/v1/tasks
 pub async fn list_tasks(
     State(state): State<AppState>,
     Query(q): Query<ListTasksQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let limit = q.limit.clamp(1, MAX_TASK_LIMIT);
     let tasks = state
         .db
-        .list_tasks(q.status.as_deref(), q.assignee_did.as_deref(), q.limit)
+        .list_tasks(q.status.as_deref(), q.assignee_did.as_deref(), limit)
         .await
         .map_err(|e| {
             (
@@ -296,4 +299,18 @@ pub async fn fail_task(
         at: Utc::now().to_rfc3339(),
     });
     Ok(Json(task_to_json(&task)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_list_tasks_query_limit_clamping() {
+        assert_eq!((-1i64).clamp(1, MAX_TASK_LIMIT), 1);
+        assert_eq!((0i64).clamp(1, MAX_TASK_LIMIT), 1);
+        assert_eq!((50i64).clamp(1, MAX_TASK_LIMIT), 50);
+        assert_eq!((500i64).clamp(1, MAX_TASK_LIMIT), 200);
+        assert_eq!(i64::MAX.clamp(1, MAX_TASK_LIMIT), 200);
+    }
 }
