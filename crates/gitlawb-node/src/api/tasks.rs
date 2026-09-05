@@ -142,8 +142,13 @@ const MAX_VISIBLE_TASKS: i64 = 200;
 const MAX_TASK_SCAN_CANDIDATES: i64 = 1_000;
 
 /// Whether `task` should be visible to `caller` (`None` = anonymous).
+/// Whether `task` is readable by `caller`.
 ///
-/// The delegator and assignee can always read a task they are already party
+/// If `task.repo_id` names a quarantined repo, the task is withheld from
+/// every caller unconditionally — matching ref-update feeds and
+/// `get_claimable_task`.
+///
+/// The delegator and assignee can otherwise read a task they are already party
 /// to — they hold its `payload` (and held `ucan_token`, though reads never
 /// echo it back) from creating or being assigned it. Otherwise, a task naming
 /// a locally-hosted repo follows that repo's normal read gate, the same way
@@ -157,7 +162,13 @@ pub(crate) fn task_visible(
     caller: Option<&str>,
     repos_by_id: &HashMap<String, RepoRecord>,
     rules_by_repo: &HashMap<String, Vec<VisibilityRule>>,
+    quarantined_repos: &HashSet<String>,
 ) -> bool {
+    if let Some(repo_id) = task.repo_id.as_deref() {
+        if quarantined_repos.contains(repo_id) {
+            return false;
+        }
+    }
     if let Some(c) = caller {
         if crate::api::did_matches(c, &task.delegator_did) {
             return true;
@@ -273,6 +284,12 @@ pub(crate) async fn collect_visible_tasks(
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
+        let mut quarantined_repos = HashSet::new();
+        for repo_id in &referenced {
+            if db.is_repo_quarantined(repo_id).await? {
+                quarantined_repos.insert(repo_id.clone());
+            }
+        }
         let repos_by_id: HashMap<String, RepoRecord> = db
             .list_repos_deduped_by_ids(&referenced)
             .await?
@@ -291,7 +308,13 @@ pub(crate) async fn collect_visible_tasks(
             consumed += 1;
             let current_pos = TaskPosition::new(task.created_at.clone(), task.id.clone());
             examined = Some(current_pos.clone());
-            if task_visible(task, caller, &repos_by_id, &rules_by_repo) {
+            if task_visible(
+                task,
+                caller,
+                &repos_by_id,
+                &rules_by_repo,
+                &quarantined_repos,
+            ) {
                 visible.push(task.clone());
                 if visible.len() == bounded_limit {
                     resume_position_for_page = Some(current_pos);
@@ -387,8 +410,13 @@ pub(crate) async fn get_visible_task(
     let Some(task) = db.get_task(id).await? else {
         return Ok(None);
     };
-    let (repos_by_id, rules_by_repo) = match task.repo_id.as_deref() {
+    let (repos_by_id, rules_by_repo, quarantined_repos) = match task.repo_id.as_deref() {
         Some(repo_id) => {
+            let mut quarantined = HashSet::new();
+            if db.is_repo_quarantined(repo_id).await? {
+                quarantined.insert(repo_id.to_string());
+                return Ok(None);
+            }
             let ids = [repo_id.to_string()];
             let repos = db.list_repos_deduped_by_ids(&ids).await?;
             match repos.into_iter().find(|r| r.id == repo_id) {
@@ -397,14 +425,22 @@ pub(crate) async fn get_visible_task(
                     (
                         HashMap::from([(record.id.clone(), record)]),
                         HashMap::from([(repo_id.to_string(), rules)]),
+                        quarantined,
                     )
                 }
-                None => (HashMap::new(), HashMap::new()),
+                None => (HashMap::new(), HashMap::new(), quarantined),
             }
         }
-        None => (HashMap::new(), HashMap::new()),
+        None => (HashMap::new(), HashMap::new(), HashSet::new()),
     };
-    Ok(task_visible(&task, caller, &repos_by_id, &rules_by_repo).then_some(task))
+    Ok(task_visible(
+        &task,
+        caller,
+        &repos_by_id,
+        &rules_by_repo,
+        &quarantined_repos,
+    )
+    .then_some(task))
 }
 
 /// Whether `task` is eligible to be claimed by `caller`.
@@ -2555,5 +2591,115 @@ mod visible_tasks_tests {
             let json = body_json(resp).await;
             assert_eq!(json["error"], "db_unavailable", "{uri}");
         }
+    }
+
+    /// A task on a quarantined repo must be withheld from every read surface,
+    /// even from the repo's owner / task's delegator (matching ref-update
+    /// quarantine rules and `get_claimable_task`).
+    #[sqlx::test]
+    async fn quarantined_repo_task_withheld_from_owner_on_rest_and_graphql(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("q1", DELEGATOR, "quarantined-repo", true))
+            .await
+            .unwrap();
+        let touched = state.db.set_repo_quarantine("q1", true).await.unwrap();
+        assert_eq!(touched, 1, "quarantine flag must be set");
+
+        let t = task("t-quar", Some("q1"), DELEGATOR);
+        state.db.create_task(&t).await.unwrap();
+
+        // REST list: task must not appear in tasks array
+        let resp = list_router(state.clone())
+            .oneshot(signed_request_as(
+                DELEGATOR,
+                Method::GET,
+                "/api/v1/tasks",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let task_ids: Vec<&str> = body["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|task| task["id"].as_str())
+            .collect();
+        assert!(
+            !task_ids.contains(&"t-quar"),
+            "quarantined-repo task must be withheld from REST list: got {body}"
+        );
+
+        // REST get: must return 404 Not Found
+        let resp = list_router(state.clone())
+            .oneshot(signed_request_as(
+                DELEGATOR,
+                Method::GET,
+                "/api/v1/tasks/t-quar",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "quarantined-repo task must return 404 on REST get"
+        );
+
+        // GraphQL list: items must not contain the quarantined task
+        let list_query = "{ tasks { items { id } } }";
+        let resp = state
+            .graphql_schema
+            .execute(
+                async_graphql::Request::new(list_query)
+                    .data(crate::auth::AuthenticatedDid(DELEGATOR.to_string())),
+            )
+            .await;
+        assert!(
+            resp.errors.is_empty(),
+            "graphql list errors: {:?}",
+            resp.errors
+        );
+        let async_graphql::Value::Object(obj) = &resp.data else {
+            panic!("data not an object: {:?}", resp.data);
+        };
+        let tasks_obj = match obj.get("tasks") {
+            Some(async_graphql::Value::Object(o)) => o,
+            other => panic!("expected tasks object, got {other:?}"),
+        };
+        let items = match tasks_obj.get("items") {
+            Some(async_graphql::Value::List(l)) => l,
+            other => panic!("expected items list, got {other:?}"),
+        };
+        assert!(
+            items.is_empty(),
+            "quarantined-repo task must be withheld from GraphQL tasks query: got {items:?}"
+        );
+
+        // GraphQL get: task must be null
+        let get_query = r#"{ task(id: "t-quar") { id } }"#;
+        let resp = state
+            .graphql_schema
+            .execute(
+                async_graphql::Request::new(get_query)
+                    .data(crate::auth::AuthenticatedDid(DELEGATOR.to_string())),
+            )
+            .await;
+        assert!(
+            resp.errors.is_empty(),
+            "graphql get errors: {:?}",
+            resp.errors
+        );
+        let async_graphql::Value::Object(obj) = &resp.data else {
+            panic!("data not an object: {:?}", resp.data);
+        };
+        assert_eq!(
+            obj.get("task"),
+            Some(&async_graphql::Value::Null),
+            "quarantined-repo task must read as null in GraphQL query"
+        );
     }
 }
