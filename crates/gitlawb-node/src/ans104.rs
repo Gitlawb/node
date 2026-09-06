@@ -9,8 +9,9 @@
 //! the deep-hash signing input are derived from the binary form. A
 //! signed data item is what an Arweave gateway serves from
 //! `GET /<tx_id>`: parsing the response, verifying the signature
-//! against the persisted `node_did`, and only then trusting the
-//! embedded cert is what `verify_anchor` in `arweave_v2.rs` does.
+//! against the expected owner key, and only then trusting the
+//! embedded cert is what a future verify path does (deferred with
+//! the provider-backed endpoint to the vertical slice).
 //!
 //! The Arweave 2.0 deep-hash is the SHA-384 recursive list/blob
 //! construction. The on-wire id is
@@ -262,9 +263,9 @@ impl DataItem {
     /// The protocol-defined on-wire id: `base64url(SHA256(signature))`.
     /// The signature is over the 48-byte deep-hash digest, but the
     /// id is hashed from the signature itself, separately. This is
-    /// the value a gateway URL identifies the item by, and the
-    /// artifact-identity check in `arweave_v2::verify_anchor` compares
-    /// it to the requested `item_id` from the URL.
+    /// the value a gateway URL identifies the item by, and a future
+    /// verify path compares it to the requested `item_id` from the
+    /// URL (artifact-identity check).
     ///
     /// Returns `Err` if the signature is empty (the item was not
     /// signed) or not valid base64url.
@@ -398,7 +399,7 @@ impl DataItem {
 
     /// Parse the ANS-104 binary wire frame into a `DataItem`. See
     /// the module-level documentation for the exact byte layout.
-    #[allow(dead_code)] // consumed by `arweave_v2` and the golden-vector test in the next slice
+    #[allow(dead_code)] // consumed by the golden-vector test in the next slice
     pub fn from_binary(bytes: &[u8]) -> Result<Self> {
         let mut cur = 0usize;
         // Helper that returns the next `n` bytes, or bails if the
@@ -416,9 +417,18 @@ impl DataItem {
             *cur += n;
             Ok(s)
         };
-        // 2-byte signature type (LE).
+        // 2-byte signature type (LE). Kept as `u16` and validated
+        // BEFORE narrowing: truncating to `u8` first would alias
+        // wire value 258 (`02 01`) onto supported Ed25519 type 2,
+        // letting a malformed header verify under the wrong widths
+        // and re-encode as canonical `02 00`.
         let sig_type_bytes = take(&mut cur, 2, "signature_type")?;
-        let signature_type = u16::from_le_bytes([sig_type_bytes[0], sig_type_bytes[1]]) as u8;
+        let sig_type_wire = u16::from_le_bytes([sig_type_bytes[0], sig_type_bytes[1]]);
+        let signature_type = u8::try_from(sig_type_wire).map_err(|_| {
+            anyhow!(
+                "ANS-104 binary has unsupported signature_type {sig_type_wire} (not a u8 value)"
+            )
+        })?;
         let sig_len = signature_size(signature_type);
         let own_len = owner_size(signature_type);
         if sig_len == 0 || own_len == 0 {
@@ -496,7 +506,7 @@ impl DataItem {
     /// `sign -> to_binary -> from_binary -> verify` preserves a valid
     /// signature without re-signing after parse. An unsigned item
     /// (empty `signature`) encodes a zeroed slot as a placeholder.
-    #[allow(dead_code)] // consumed by `arweave_v2` and the golden-vector test in the next slice
+    #[allow(dead_code)] // consumed by the golden-vector test in the next slice
     pub fn to_binary(&self) -> Result<Vec<u8>> {
         let sig_len = signature_size(self.signature_type);
         let own_len = owner_size(self.signature_type);
@@ -1018,8 +1028,7 @@ mod tests {
     }
 
     /// A wire-shape round-trip: build, JSON-serialize, JSON-parse,
-    /// verify. This is the path the verify_anchor endpoint takes when
-    /// the gateway responds.
+    /// verify.
     #[test]
     fn wire_shape_round_trip() {
         let kp = Keypair::generate();
@@ -1105,8 +1114,8 @@ mod tests {
     /// The protocol-defined on-wire id is
     /// `base64url(SHA256(signature))`. This pins the id-derivation
     /// contract so a future refactor of the deep-hash path does not
-    /// silently change the artifact identity check in
-    /// `arweave_v2::verify_anchor`.
+    /// silently change the artifact identity check a verify path
+    /// performs.
     #[test]
     fn data_item_id_is_base64url_of_sha256_of_signature() {
         let kp = Keypair::generate();
@@ -1345,6 +1354,24 @@ mod tests {
             let parsed = DataItem::from_binary(&bin2).expect("re-parse");
             verify_data_item(&parsed, &pk).expect("signed re-parse verifies");
         }
+    }
+
+    /// A non-canonical two-byte signature type must not alias a
+    /// supported one. Flipping only the high type byte of the signed
+    /// Ed25519 golden frame (wire `02 00` = 2 → `02 01` = 258) must
+    /// fail parsing: truncating to `u8` first would accept it as
+    /// Ed25519, verify the untouched signature, and re-encode the
+    /// header as canonical `02 00`.
+    #[test]
+    fn from_binary_rejects_non_canonical_signature_type_high_byte() {
+        let binary_hex = "0200da41825fd44ca3b2705af18fce86ed6d04d0204331965d9af5d5cb1a740fcc6587ee81501b1d7928c54c0f174fde8893560d785db4d988a3161113b10a2028038a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c00000200000000000000300000000000000004104170702d4e616d650e6769746c6177620c536368656d612a6769746c6177622f7265662d7570646174652f76310068656c6c6f206769746c617762206564323535313920676f6c64656e";
+        let mut binary = hex::decode(binary_hex).expect("golden binary hex decodes");
+        binary[1] = 0x01;
+        let err = DataItem::from_binary(&binary).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported signature_type 258"),
+            "expected sigtype rejection, got: {err}"
+        );
     }
 }
 
