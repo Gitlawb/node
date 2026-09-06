@@ -2291,6 +2291,207 @@ mod tests {
         );
     }
 
+    /// E2E for the leftover-worktree cleanup (CodeRabbit #379), driven through the
+    /// real merge endpoint rather than merge_branch directly, because the defect's
+    /// consequence is an endpoint that wedges: every later merge on the repo fails.
+    ///
+    /// The fixture leaves the repo in the worst reachable leftover state -- the
+    /// `_merge_worktree` registration present, its directory gone, AND the worktree
+    /// LOCKED. `git worktree add` refuses that with "missing but locked worktree",
+    /// a single `--force` refuses to remove it, and `git worktree prune` skips it.
+    ///
+    /// Both response classes are asserted, not just the 200: the PR row must end
+    /// "merged" with a merge_sha that IS the new refs/heads/{target}, and the
+    /// endpoint must not report success without advancing the branch. REVERT PROOF
+    /// (RED): drop either --force from remove_worktree in store.rs and this test
+    /// fails with the endpoint returning non-200 and the PR row still open.
+    #[sqlx::test]
+    async fn merge_pr_recovers_from_a_locked_stale_worktree(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+        let rev = |args: &[&str], cwd: &std::path::Path| {
+            String::from_utf8_lossy(&run(args, cwd).stdout)
+                .trim()
+                .to_string()
+        };
+
+        let src = std::env::temp_dir().join(format!("gl-locked-wt-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _sg = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("base.txt"), b"base").unwrap();
+        run(&["add", "base.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+        run(&["checkout", "-q", "-b", "feature"], &src);
+        std::fs::write(src.join("feature.txt"), b"feature-only").unwrap();
+        run(&["add", "feature.txt"], &src);
+        run(&["commit", "-q", "-m", "on feature"], &src);
+        run(&["checkout", "-q", "main"], &src);
+        let feature_tip = rev(&["rev-parse", "refs/heads/feature"], &src);
+
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("locked-wt.git");
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let _bg = DirGuard(bare.clone());
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &std::env::temp_dir(),
+        );
+        let main_before = rev(&["rev-parse", "refs/heads/main"], &bare);
+
+        // Wedge the repo exactly the way a failed cleanup does: register the
+        // worktree, lock it, then delete its directory. remove_worktree's
+        // unconditional remove_dir_all is what produces the directory half of
+        // this in production; the lock is what makes a single --force useless.
+        run(&["worktree", "add", "_merge_worktree", "main"], &bare);
+        run(&["worktree", "lock", "_merge_worktree"], &bare);
+        std::fs::remove_dir_all(bare.join("_merge_worktree")).unwrap();
+        assert!(
+            bare.join("worktrees/_merge_worktree").exists(),
+            "fixture must leave a locked registration behind"
+        );
+        // Prove the fixture really is the refusing state before asserting recovery,
+        // so a future git that stopped refusing cannot make this test vacuous.
+        let blocked = Command::new("git")
+            .args(["worktree", "add", "_merge_worktree", "main"])
+            .current_dir(&bare)
+            .output()
+            .expect("git");
+        assert!(
+            !blocked.status.success()
+                && String::from_utf8_lossy(&blocked.stderr).contains("missing but locked"),
+            "fixture must be the state git refuses, got: {}",
+            String::from_utf8_lossy(&blocked.stderr)
+        );
+
+        let mut repo = seed_repo(&owner_did, "locked-wt");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let pr = crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo.id.clone(),
+            number: 1,
+            title: "merge over a locked leftover worktree".into(),
+            body: None,
+            author_did: owner_did.clone(),
+            source_branch: "feature".into(),
+            target_branch: "main".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state.db.create_pr(&pr).await.expect("insert pr row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                axum::routing::post(crate::api::pulls::merge_pr),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner_did}/locked-wt/pulls/1/merge");
+        let resp = router
+            .oneshot(signed_request_as(
+                &owner_did,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a locked leftover worktree must not wedge the merge endpoint, got {}",
+            resp.status()
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let merge_sha = json["merge_sha"].as_str().expect("merge_sha in response");
+        assert_eq!(json["status"].as_str(), Some("merged"));
+
+        let stored = state
+            .db
+            .get_pr(&repo.id, 1)
+            .await
+            .expect("get_pr")
+            .expect("pr row");
+        assert_eq!(stored.status, "merged");
+        assert_eq!(stored.merged_by_did.as_deref(), Some(owner_did.as_str()));
+
+        // A reported merge is only real if the branch moved to exactly that sha
+        // and carries the source commit. This is the half that catches a wedge
+        // rendered as success rather than as an error.
+        let main_after = rev(&["rev-parse", "refs/heads/main"], &bare);
+        assert_ne!(
+            main_after, main_before,
+            "refs/heads/main must advance past the merge"
+        );
+        assert_eq!(
+            main_after, merge_sha,
+            "reported merge_sha must match refs/heads/main"
+        );
+        run(
+            &["merge-base", "--is-ancestor", &feature_tip, &main_after],
+            &bare,
+        );
+        run(
+            &["cat-file", "-e", &format!("{main_after}:feature.txt")],
+            &bare,
+        );
+
+        // The cleanup must also leave nothing behind for the NEXT merge.
+        assert!(
+            !bare.join("worktrees/_merge_worktree").exists(),
+            "the merge must not leave its own worktree registered"
+        );
+        assert!(
+            !bare.join("_merge_worktree").exists(),
+            "the merge must not leave its own worktree directory"
+        );
+    }
+
     /// SINK GUARD: a poisoned row with option-shaped source_branch must not reach
     /// git merge argv (distinct from the diff revspec injection shape).
     #[sqlx::test]

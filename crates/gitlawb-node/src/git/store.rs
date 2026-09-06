@@ -939,17 +939,32 @@ pub fn merge_branch(
     let worktree_path = repo_path.join("_merge_worktree");
 
     let remove_worktree = || {
+        // Two --force flags, not one. A single --force refuses a LOCKED worktree
+        // ("cannot remove a locked working tree") and `git worktree prune` skips
+        // locked registrations too, so with one flag a locked leftover survives
+        // the whole cleanup and wedges this endpoint for good. With both flags a
+        // separate prune adds nothing: over every leftover state that can reach
+        // here (registered/unregistered x directory present/gone/locked/corrupt)
+        // `remove -f -f` plus the removal below already clears the registration.
         let _ = Command::new("git")
-            .args(["worktree", "remove", "--force", "_merge_worktree"])
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                "--force",
+                "_merge_worktree",
+            ])
             .current_dir(repo_path)
             .output();
         let _ = std::fs::remove_dir_all(&worktree_path);
     };
 
-    // Clean up any leftover worktree
-    if worktree_path.exists() {
-        remove_worktree();
-    }
+    // Clean up any leftover worktree. This cannot be gated on the directory
+    // existing: a registration whose directory is gone is the one state
+    // `worktree add` refuses outright ("missing but already registered"), and
+    // it is reachable from the cleanup above, so gating on .exists() would let
+    // one failed removal wedge every later merge on this repo.
+    remove_worktree();
 
     // The merge must land on the LOCAL target branch, so the worktree has to end
     // up attached to exactly refs/heads/{target}. validate_git_ref proves
@@ -964,6 +979,13 @@ pub fn merge_branch(
     // --verify matches the full refname literally — no DWIM, no abbreviation —
     // so a same-named tag with no local branch fails here instead of being
     // silently resolved.
+    //
+    // allow-unbounded-git: read-only `show-ref --verify` on one literal refname,
+    // no network and no object walk. It also sits alongside the pre-existing bare
+    // `git diff`, `git merge` and `git rev-parse` spawns in this same function,
+    // all under the same acquire_write lock, so bounding only this one would not
+    // change the function's exposure. Bounding merge_branch as a whole is a
+    // separate change against already-reviewed code, tracked as follow-up.
     let target_exists = Command::new("git")
         .args(["show-ref", "--verify", "--quiet", &target_ref])
         .current_dir(repo_path)
@@ -978,6 +1000,11 @@ pub fn merge_branch(
     // refs/heads/{name} would detach, so a successful merge would not advance
     // refs/heads/{target}); step (1) guarantees the branch exists, so an
     // attached checkout is the only acceptable outcome — verified right below.
+    //
+    // allow-unbounded-git: local `worktree add`, no network. Same reasoning as the
+    // show-ref spawn above: the surrounding function's other git children are
+    // already bare under this lock, so this one is not the thing that would need
+    // bounding first.
     let wt = Command::new("git")
         .args(["worktree", "add", "_merge_worktree", target_branch])
         .current_dir(repo_path)
@@ -995,6 +1022,9 @@ pub fn merge_branch(
     // something other than the local target branch; a merge committed on it
     // would be thrown away by cleanup, so refuse before merging rather than
     // relying on any denylist of symbolic shapes.
+    //
+    // allow-unbounded-git: read-only `symbolic-ref` resolving one local HEAD, no
+    // network. Same reasoning as the two spawns above.
     let head_ref = Command::new("git")
         .args(["symbolic-ref", "--quiet", "HEAD"])
         .current_dir(&worktree_path)
@@ -1135,7 +1165,7 @@ mod tests {
         );
     }
 
-    use super::branch_diff_names;
+    use super::{branch_diff_names, merge_branch};
     use std::path::Path;
     use std::process::Command;
 
@@ -2281,5 +2311,260 @@ mod tests {
             matches!(res, Ok(None)),
             "a clean `missing` twice on a readable store is a genuine absence; got {res:?}"
         );
+    }
+
+    /// CodeRabbit #379: `merge_branch`'s leftover-worktree cleanup ran only when the
+    /// `_merge_worktree` DIRECTORY still existed. A directory that is gone while
+    /// `$GIT_DIR/worktrees/_merge_worktree` still holds its registration is precisely
+    /// the state `git worktree add` refuses ("is a missing but already registered
+    /// worktree", exit 128), and it is self-inflicted: `remove_worktree` deletes the
+    /// directory even when the `git worktree remove` before it failed. Once a repo is
+    /// in that state every later merge on it fails permanently. REVERT PROOF (RED):
+    /// put the cleanup call back behind `if worktree_path.exists()` and this test
+    /// fails at the merge below with "missing but already registered".
+    #[test]
+    fn merge_branch_recovers_from_a_stale_worktree_registration() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let g = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        g(&["init", "-q"], &work);
+        g(&["config", "user.email", "t@t"], &work);
+        g(&["config", "user.name", "t"], &work);
+        std::fs::write(work.join("base.txt"), b"base\n").unwrap();
+        g(&["add", "."], &work);
+        g(&["commit", "-qm", "base"], &work);
+        let main = {
+            let o = Command::new("git")
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        g(&["checkout", "-q", "-b", "feature"], &work);
+        std::fs::write(work.join("feat.txt"), b"feat\n").unwrap();
+        g(&["add", "."], &work);
+        g(&["commit", "-qm", "feat"], &work);
+        g(&["checkout", "-q", &main], &work);
+
+        let bare = td.path().join("bare.git");
+        g(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        // Reproduce the stuck state exactly: register the worktree, then delete its
+        // directory without unregistering it. This is what a failed `worktree remove`
+        // followed by the unconditional `remove_dir_all` leaves behind.
+        //
+        // `gc.worktreePruneExpire=never` is set on purpose. Recovery must not depend on
+        // git's prune expiry policy: a registration this fresh would sit inside any
+        // sane expiry window, so a cleanup that only pruned on expiry would leave the
+        // repo wedged. Both `worktree remove --force` and `worktree prune` unregister a
+        // worktree whose gitdir target is gone regardless of this setting, and pinning
+        // it here keeps that true if either call is ever changed.
+        g(&["config", "gc.worktreePruneExpire", "never"], &bare);
+        g(&["worktree", "add", "_merge_worktree", &main], &bare);
+        std::fs::remove_dir_all(bare.join("_merge_worktree")).unwrap();
+        assert!(
+            bare.join("worktrees/_merge_worktree").exists(),
+            "fixture must leave the registration behind"
+        );
+
+        let before = Command::new("git")
+            .args(["rev-parse", &format!("refs/heads/{main}")])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        let before = String::from_utf8_lossy(&before.stdout).trim().to_string();
+
+        let merged = merge_branch(&bare, &main, "feature", "did:key:zTest", "t")
+            .expect("a stale worktree registration must not wedge the merge endpoint");
+
+        let after = Command::new("git")
+            .args(["rev-parse", &format!("refs/heads/{main}")])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        let after = String::from_utf8_lossy(&after.stdout).trim().to_string();
+        assert_ne!(before, after, "the merge must advance refs/heads/{main}");
+        assert_eq!(after, merged, "the returned sha must be the new branch tip");
+    }
+
+    /// Companion to the stale-registration case: the leftover worktree is also LOCKED.
+    /// `git worktree remove --force` (ONE flag) refuses a locked worktree outright, and
+    /// `git worktree prune` skips locked registrations too, so with a single --force the
+    /// cleanup makes no progress and `worktree add` keeps failing. REVERT PROOF (RED):
+    /// drop either --force from remove_worktree and this test fails.
+    #[test]
+    fn merge_branch_recovers_from_a_locked_stale_worktree() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let g = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        g(&["init", "-q"], &work);
+        g(&["config", "user.email", "t@t"], &work);
+        g(&["config", "user.name", "t"], &work);
+        std::fs::write(work.join("base.txt"), b"base\n").unwrap();
+        g(&["add", "."], &work);
+        g(&["commit", "-qm", "base"], &work);
+        let main = {
+            let o = Command::new("git")
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        g(&["checkout", "-q", "-b", "feature"], &work);
+        std::fs::write(work.join("feat.txt"), b"feat\n").unwrap();
+        g(&["add", "."], &work);
+        g(&["commit", "-qm", "feat"], &work);
+        g(&["checkout", "-q", &main], &work);
+
+        let bare = td.path().join("bare.git");
+        g(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        g(&["worktree", "add", "_merge_worktree", &main], &bare);
+        g(&["worktree", "lock", "_merge_worktree"], &bare);
+        std::fs::remove_dir_all(bare.join("_merge_worktree")).unwrap();
+
+        let before = Command::new("git")
+            .args(["rev-parse", &format!("refs/heads/{main}")])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        let before = String::from_utf8_lossy(&before.stdout).trim().to_string();
+
+        let merged = merge_branch(&bare, &main, "feature", "did:key:zTest", "t")
+            .expect("a locked leftover worktree must not wedge the merge endpoint");
+
+        let after = Command::new("git")
+            .args(["rev-parse", &format!("refs/heads/{main}")])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        let after = String::from_utf8_lossy(&after.stdout).trim().to_string();
+        assert_ne!(before, after, "the merge must advance refs/heads/{main}");
+        assert_eq!(after, merged, "the returned sha must be the new branch tip");
+    }
+
+    /// The third leftover shape: a `_merge_worktree` DIRECTORY with no registration
+    /// behind it, which is what a crash between `worktree add` creating the directory
+    /// and git recording it leaves. `git worktree remove` refuses this one outright
+    /// ("is not a working tree"), so the `remove_dir_all` in remove_worktree is the
+    /// only thing that clears it and `worktree add` otherwise fails on the existing
+    /// path. REVERT PROOF (RED): drop the remove_dir_all from remove_worktree and this
+    /// test fails.
+    #[test]
+    fn merge_branch_recovers_from_an_unregistered_leftover_directory() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let g = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        g(&["init", "-q"], &work);
+        g(&["config", "user.email", "t@t"], &work);
+        g(&["config", "user.name", "t"], &work);
+        std::fs::write(work.join("base.txt"), b"base\n").unwrap();
+        g(&["add", "."], &work);
+        g(&["commit", "-qm", "base"], &work);
+        let main = {
+            let o = Command::new("git")
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        g(&["checkout", "-q", "-b", "feature"], &work);
+        std::fs::write(work.join("feat.txt"), b"feat\n").unwrap();
+        g(&["add", "."], &work);
+        g(&["commit", "-qm", "feat"], &work);
+        g(&["checkout", "-q", &main], &work);
+
+        let bare = td.path().join("bare.git");
+        g(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        // A directory in the way, with nothing registered behind it.
+        std::fs::create_dir_all(bare.join("_merge_worktree")).unwrap();
+        std::fs::write(bare.join("_merge_worktree/leftover.txt"), b"junk\n").unwrap();
+        assert!(
+            !bare.join("worktrees/_merge_worktree").exists(),
+            "fixture must leave no registration, only the directory"
+        );
+
+        let before = Command::new("git")
+            .args(["rev-parse", &format!("refs/heads/{main}")])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        let before = String::from_utf8_lossy(&before.stdout).trim().to_string();
+
+        let merged = merge_branch(&bare, &main, "feature", "did:key:zTest", "t")
+            .expect("an unregistered leftover directory must not wedge the merge endpoint");
+
+        let after = Command::new("git")
+            .args(["rev-parse", &format!("refs/heads/{main}")])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        let after = String::from_utf8_lossy(&after.stdout).trim().to_string();
+        assert_ne!(before, after, "the merge must advance refs/heads/{main}");
+        assert_eq!(after, merged, "the returned sha must be the new branch tip");
     }
 }
