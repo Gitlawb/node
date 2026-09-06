@@ -1979,6 +1979,60 @@ mod identity_key_storage_tests {
         );
     }
 
+    /// A symlink refusal must name the symlink. An unrelated EACCES, ENOENT,
+    /// or write-authority failure satisfies "an error happened" while proving
+    /// nothing about whether the interior component was followed, so every
+    /// symlink row asserts the reason rather than the bare failure.
+    #[cfg(unix)]
+    fn assert_names_symlink_refusal(text: &str, what: &str) {
+        let lower = text.to_lowercase();
+        assert!(
+            lower.contains("symlink") || lower.contains("symbolic link"),
+            "{what} must be refused for the symlink on the path, and the refusal must say so, \
+             got: {text}"
+        );
+    }
+
+    /// Every regular file under `root`, following no symlink out of it. Used
+    /// to prove a refused boot published nothing where a followed interior
+    /// link would have put it, including a target outside the base.
+    #[cfg(unix)]
+    fn identity_collect_files(root: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(md) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if md.is_dir() {
+                identity_collect_files(&path, found);
+            } else if md.is_file() {
+                found.push(path);
+            }
+        }
+    }
+
+    /// No key anywhere beneath `root`. Stronger than naming one expected path,
+    /// because a followed link can land the key at a name the test did not
+    /// predict.
+    #[cfg(unix)]
+    fn assert_no_identity_key_under(root: &std::path::Path, what: &str) {
+        let mut found = Vec::new();
+        identity_collect_files(root, &mut found);
+        let keys: Vec<String> = found
+            .iter()
+            .filter(|p| p.file_name().is_some_and(|n| n == "identity.pem"))
+            .map(|p| p.display().to_string())
+            .collect();
+        assert!(
+            keys.is_empty(),
+            "{what}: a refused boot published an identity under {}: {keys:?}",
+            root.display()
+        );
+    }
+
     /// The assertions every success row shares: exact 0700 on each directory
     /// this invocation created, 0600 on the key, no scratch residue beside it,
     /// and a base this process never touched.
@@ -3201,6 +3255,495 @@ mod identity_key_storage_tests {
             !real.join("keys").exists(),
             "symlink target must be untouched"
         );
+    }
+
+    /// Build `base/evil/one` plus `base/link -> evil`, the layout every
+    /// interior-symlink row shares. `link` is relative so the layout is
+    /// self-contained; the absolute row builds its own.
+    #[cfg(unix)]
+    fn plant_interior_symlink_layout(base: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let evil = base.join("evil");
+        std::fs::create_dir(&evil).expect("create the symlink target directory");
+        std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod the symlink target directory");
+        let one = evil.join("one");
+        std::fs::create_dir(&one).expect("create the already-existing next level");
+        std::fs::set_permissions(&one, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod the already-existing next level");
+        std::os::unix::fs::symlink("evil", base.join("link")).expect("plant the interior symlink");
+        evil
+    }
+
+    /// `O_NOFOLLOW` binds the FINAL component only, so an interior symlink
+    /// whose next level already exists is resolved in one open and followed.
+    /// With `link -> evil` and `evil/one` present, the walk-up opens
+    /// `link/one` by pathname, anchors on `evil/one`, and creates the node
+    /// identity inside the attacker's tree.
+    #[cfg(unix)]
+    #[test]
+    fn identity_interior_symlink_with_existing_next_level_is_refused_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let evil = plant_interior_symlink_layout(base.path());
+
+        let key = base
+            .path()
+            .join("link")
+            .join("one")
+            .join("two")
+            .join("identity.pem");
+        match load_or_create_keypair_at(&key) {
+            Ok(kp) => panic!(
+                "an interior symlink on the key path was followed, not refused: the identity \
+                 {} was created through {} into the symlink's target\nkey storage:\n{}",
+                kp.did(),
+                key.display(),
+                identity_key_tree(base.path(), &key)
+            ),
+            Err(e) => assert_names_symlink_refusal(
+                &format!("{e:#}"),
+                "an interior symlink whose next level already exists",
+            ),
+        }
+        assert_identity_absent(&evil.join("one").join("two"));
+        assert_no_identity_key_under(
+            base.path(),
+            "an interior symlink with an existing next level",
+        );
+    }
+
+    /// The same interior symlink pointed by absolute path at a directory
+    /// outside the base. Following it publishes the node's identity somewhere
+    /// the configured path does not name at all, so the assertion is that no
+    /// key appears outside the base.
+    #[cfg(unix)]
+    #[test]
+    fn identity_interior_symlink_escaping_the_base_must_not_publish_the_key_outside_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(outside.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let outside_one = outside.path().join("one");
+        std::fs::create_dir(&outside_one).expect("create the escaped next level");
+        std::fs::set_permissions(&outside_one, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(outside.path(), base.path().join("link"))
+            .expect("plant the absolute escaping symlink");
+
+        let key = base
+            .path()
+            .join("link")
+            .join("one")
+            .join("two")
+            .join("identity.pem");
+        match load_or_create_keypair_at(&key) {
+            Ok(kp) => panic!(
+                "an absolute interior symlink was followed out of the base: the identity {} \
+                 was created outside {} through {}",
+                kp.did(),
+                base.path().display(),
+                key.display()
+            ),
+            Err(e) => assert_names_symlink_refusal(
+                &format!("{e:#}"),
+                "an interior symlink whose target is outside the base",
+            ),
+        }
+        assert_no_identity_key_under(outside.path(), "an escaping interior symlink");
+        assert_identity_absent(&outside_one.join("two"));
+    }
+
+    /// A chain, because refusing one link is not the same property as
+    /// refusing the path. `l1 -> l2 -> evil`, so the resolution that must be
+    /// refused takes two hops before it reaches the existing next level.
+    #[cfg(unix)]
+    #[test]
+    fn identity_chained_interior_symlinks_are_refused_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let evil = base.path().join("evil");
+        std::fs::create_dir(&evil).unwrap();
+        std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let one = evil.join("one");
+        std::fs::create_dir(&one).unwrap();
+        std::fs::set_permissions(&one, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink("evil", base.path().join("l2")).expect("plant the second hop");
+        std::os::unix::fs::symlink("l2", base.path().join("l1")).expect("plant the first hop");
+
+        let key = base
+            .path()
+            .join("l1")
+            .join("one")
+            .join("two")
+            .join("identity.pem");
+        match load_or_create_keypair_at(&key) {
+            Ok(kp) => panic!(
+                "a two-link chain on the key path was followed, not refused: the identity {} \
+                 was created through {}",
+                kp.did(),
+                key.display()
+            ),
+            Err(e) => {
+                assert_names_symlink_refusal(&format!("{e:#}"), "a chain of two interior symlinks")
+            }
+        }
+        assert_identity_absent(&one.join("two"));
+        assert_no_identity_key_under(base.path(), "a chain of two interior symlinks");
+    }
+
+    /// The existing-named-parent fast path never enters the walk: it opens the
+    /// whole configured parent pathname in one call and publishes into
+    /// whatever that resolves to. `link/one` exists through the symlink, so
+    /// this row reaches the fast path and not the walk-up.
+    #[cfg(unix)]
+    #[test]
+    fn identity_existing_named_parent_reached_through_a_symlink_is_refused_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let evil = plant_interior_symlink_layout(base.path());
+
+        let key = base.path().join("link").join("one").join("identity.pem");
+        match load_or_create_keypair_at(&key) {
+            Ok(kp) => panic!(
+                "the existing-named-parent fast path followed an interior symlink: the identity \
+                 {} was published into {} through {}",
+                kp.did(),
+                evil.join("one").display(),
+                key.display()
+            ),
+            Err(e) => assert_names_symlink_refusal(
+                &format!("{e:#}"),
+                "an interior symlink on the existing-named-parent fast path",
+            ),
+        }
+        assert_identity_absent(&evil.join("one").join("identity.pem"));
+        assert_no_identity_key_under(base.path(), "the existing-named-parent fast path");
+    }
+
+    /// Fixture: the relative-path row. `cwd` is process-global, so the row
+    /// that proves a relative configured path is judged the same way runs in
+    /// its own process. Double-gated like the other fixtures here: `#[ignore]`
+    /// keeps it out of a normal run and the env check keeps it inert under a
+    /// bare `--ignored` sweep, which would otherwise chdir the shared test
+    /// process.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=identity-symlink-relative"]
+    fn fixture_identity_relative_path_with_interior_symlink() {
+        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref()
+            != Some("identity-symlink-relative")
+        {
+            return;
+        }
+        let base = std::path::PathBuf::from(
+            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+        );
+        let evil = plant_interior_symlink_layout(&base);
+        std::env::set_current_dir(&base).expect("chdir into the row's base");
+
+        let call_path = std::path::Path::new("link/one/two/identity.pem");
+        match load_or_create_keypair_at(call_path) {
+            Ok(kp) => panic!(
+                "an interior symlink on a RELATIVE key path was followed, not refused: the \
+                 identity {} was created through {}",
+                kp.did(),
+                call_path.display()
+            ),
+            Err(e) => assert_names_symlink_refusal(
+                &format!("{e:#}"),
+                "an interior symlink on a relative configured path",
+            ),
+        }
+        assert_identity_absent(&evil.join("one").join("two"));
+        assert_no_identity_key_under(&base, "a relative path with an interior symlink");
+        println!("identity-symlink-relative: refused");
+    }
+
+    /// Driver for the relative row. An absolute path is not the only shape an
+    /// operator configures, and the walk resolves a relative pathname against
+    /// the process cwd, so the same interior-symlink refusal has to hold there.
+    #[cfg(unix)]
+    #[test]
+    fn identity_relative_key_path_with_interior_symlink_is_refused_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const REFUSED_SENTINEL: &str = "identity-symlink-relative: refused";
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+        cmd.args([
+            "identity_key_storage_tests::fixture_identity_relative_path_with_interior_symlink",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("GITLAWB_TEST_FIXTURE", "identity-symlink-relative")
+        .env("GITLAWB_TEST_BASE", base.path());
+        let output = cmd
+            .output()
+            .expect("spawn the relative-path symlink fixture");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "a relative key path with an interior symlink must be refused, not followed\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        // A filter matching nothing exits 0, and the fixture's env gate returns
+        // early as a passing test, so neither alone is proof the row ran.
+        assert!(
+            stdout.contains("1 passed"),
+            "the filter must select one passing test\n{stdout}"
+        );
+        assert!(
+            stdout.contains(REFUSED_SENTINEL),
+            "the fixture must print its refusal sentinel\n--- stdout ---\n{stdout}"
+        );
+    }
+
+    /// THE LOAD PATH, which is the identity-substitution primitive rather than
+    /// a permissions bug. The node's real key sits at `a/keys/identity.pem`
+    /// and the configured path is `link/keys/identity.pem`. An attacker who
+    /// can only repoint `link` from `a` to `b` makes the load resolve to a PEM
+    /// they supplied, and the node boots as THEIR DID while the real key is
+    /// still on disk, untouched, with nothing logged as wrong.
+    ///
+    /// The assertion is on the DID, not on a mode or an error string: a mode
+    /// assertion cannot see a substitution, because the substituted key is
+    /// a perfectly well-formed 0600 PEM.
+    #[cfg(unix)]
+    #[test]
+    fn identity_load_through_repointed_interior_symlink_must_not_adopt_the_substituted_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let real_key = base.path().join("a").join("keys").join("identity.pem");
+        let real_did = load_or_create_keypair_at(&real_key)
+            .expect("plant the node's real identity")
+            .did()
+            .to_string();
+        let attacker_key = base.path().join("b").join("keys").join("identity.pem");
+        let attacker_did = load_or_create_keypair_at(&attacker_key)
+            .expect("plant the attacker's identity")
+            .did()
+            .to_string();
+        assert_ne!(
+            real_did, attacker_did,
+            "the row needs two distinct identities to tell substitution from a load"
+        );
+        let real_bytes = std::fs::read(&real_key).expect("read the real key");
+
+        // The configured path never changes. Only the interior component does,
+        // which is exactly the authority an attacker with write access to one
+        // directory has.
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink("a", &link).expect("point the configured path at the real key");
+        std::fs::remove_file(&link).expect("the attacker repoints the interior component");
+        std::os::unix::fs::symlink("b", &link).expect("repoint the interior component");
+
+        let configured = link.join("keys").join("identity.pem");
+        match load_or_create_keypair_at(&configured) {
+            Ok(kp) => {
+                let booted = kp.did().to_string();
+                if booted == attacker_did {
+                    panic!(
+                        "identity substitution: repointing the interior symlink {} made the node \
+                         boot as the attacker's identity {attacker_did} (planted at {}) instead \
+                         of its own {real_did} at {}",
+                        link.display(),
+                        attacker_key.display(),
+                        real_key.display()
+                    );
+                }
+                panic!(
+                    "the load followed the interior symlink at {} and returned {booted} rather \
+                     than refusing the path",
+                    link.display()
+                );
+            }
+            Err(e) => assert_names_symlink_refusal(
+                &format!("{e:#}"),
+                "a repointed interior symlink on the load path",
+            ),
+        }
+
+        assert_eq!(
+            std::fs::read(&real_key).expect("read the real key"),
+            real_bytes,
+            "the real key must be untouched by the refused boot"
+        );
+        assert_eq!(
+            load_or_create_keypair_at(&real_key)
+                .expect("the real key must still load by its real path")
+                .did()
+                .to_string(),
+            real_did,
+            "the node's own identity must be unchanged"
+        );
+    }
+
+    /// The weaker variant of the same primitive. The attacker repoints the
+    /// interior component at an EMPTY directory, the load finds no key, and
+    /// the create path mints a fresh identity and logs it as a first boot. The
+    /// node comes up with a DID nobody knows and its real key is orphaned in
+    /// place with nothing reported.
+    #[cfg(unix)]
+    #[test]
+    fn identity_load_through_symlink_to_an_empty_directory_must_not_silently_mint_a_new_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let real_key = base.path().join("a").join("keys").join("identity.pem");
+        let real_did = load_or_create_keypair_at(&real_key)
+            .expect("plant the node's real identity")
+            .did()
+            .to_string();
+        let real_bytes = std::fs::read(&real_key).expect("read the real key");
+
+        let empty_keys = base.path().join("empty").join("keys");
+        std::fs::create_dir_all(&empty_keys).expect("create the empty target tree");
+        std::fs::set_permissions(&empty_keys, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            base.path().join("empty"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink("a", &link).expect("point the configured path at the real key");
+        std::fs::remove_file(&link).expect("the attacker repoints the interior component");
+        std::os::unix::fs::symlink("empty", &link).expect("repoint at an empty directory");
+
+        let configured = link.join("keys").join("identity.pem");
+        match load_or_create_keypair_at(&configured) {
+            Ok(kp) => {
+                let booted = kp.did().to_string();
+                panic!(
+                    "silent identity loss: repointing the interior symlink {} at an empty \
+                     directory made the node mint a fresh identity {booted} as if this were a \
+                     first boot, orphaning its real identity {real_did} at {}",
+                    link.display(),
+                    real_key.display()
+                );
+            }
+            Err(e) => assert_names_symlink_refusal(
+                &format!("{e:#}"),
+                "an interior symlink repointed at an empty directory",
+            ),
+        }
+
+        assert_identity_absent(&empty_keys.join("identity.pem"));
+        assert_eq!(
+            std::fs::read(&real_key).expect("read the real key"),
+            real_bytes,
+            "the real key must be untouched by the refused boot"
+        );
+        assert_eq!(
+            load_or_create_keypair_at(&real_key)
+                .expect("the real key must still load by its real path")
+                .did()
+                .to_string(),
+            real_did,
+            "the node's own identity must be unchanged"
+        );
+    }
+
+    /// Already correct, and here so it stays that way: a symlink at the key's
+    /// IMMEDIATE parent is the final component of the load's directory open,
+    /// which is the one position `O_NOFOLLOW` does bind.
+    #[cfg(unix)]
+    #[test]
+    fn identity_symlinked_immediate_parent_is_refused_at_load() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let planted_did = load_or_create_keypair_at(&real.join("identity.pem"))
+            .expect("plant a key behind the symlink")
+            .did()
+            .to_string();
+        std::os::unix::fs::symlink("real", base.path().join("link")).unwrap();
+
+        let configured = base.path().join("link").join("identity.pem");
+        match load_or_create_keypair_at(&configured) {
+            Ok(kp) => panic!(
+                "a symlink at the key's immediate parent was followed: loaded {} (planted \
+                 {planted_did}) through {}",
+                kp.did(),
+                configured.display()
+            ),
+            Err(e) => assert_names_symlink_refusal(
+                &format!("{e:#}"),
+                "a symlink at the key's immediate parent",
+            ),
+        }
+    }
+
+    /// Already correct, and here so it stays that way: a dangling symlink is
+    /// refused rather than replaced by a real directory of the same name,
+    /// both when it is the top component of the missing suffix and when it
+    /// sits under a real directory.
+    #[cfg(unix)]
+    #[test]
+    fn identity_dangling_symlink_on_the_key_path_is_refused_never_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for under_real_dir in [false, true] {
+            let base = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let holder = if under_real_dir {
+                let real = base.path().join("real");
+                std::fs::create_dir(&real).unwrap();
+                std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+                real
+            } else {
+                base.path().to_path_buf()
+            };
+            let link = holder.join("link");
+            std::os::unix::fs::symlink("nowhere", &link).expect("plant the dangling symlink");
+
+            let key = link.join("one").join("identity.pem");
+            let where_ = if under_real_dir {
+                "a dangling symlink under a real directory"
+            } else {
+                "a dangling symlink at the top of the path"
+            };
+            match load_or_create_keypair_at(&key) {
+                Ok(kp) => panic!(
+                    "{where_} was not refused: the identity {} was created through {}",
+                    kp.did(),
+                    key.display()
+                ),
+                Err(e) => assert_names_symlink_refusal(&format!("{e:#}"), where_),
+            }
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .expect("the dangling symlink must still be there")
+                    .file_type()
+                    .is_symlink(),
+                "{where_}: the refused boot replaced {} with something else",
+                link.display()
+            );
+            assert_no_identity_key_under(base.path(), where_);
+        }
     }
 
     /// 0111 grandparent cannot mkdir, so the key directory must already exist.

@@ -758,6 +758,123 @@ fn open_dir_with_flags(path: &Path, flags: libc::c_int) -> std::io::Result<std::
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
+/// Map a failed no-follow component open onto the refusal vocabulary the key
+/// storage tests assert on. `ENOTDIR` is what `O_NOFOLLOW | O_DIRECTORY`
+/// returns for a symlink in that position, dangling or not; `ELOOP` is the
+/// same refusal from a flag set without `O_DIRECTORY`. Anything else, notably
+/// `ENOENT`, is passed through unchanged so callers keep their missing-component
+/// handling.
+#[cfg(unix)]
+fn nofollow_component_error(e: std::io::Error, component: &Path) -> std::io::Error {
+    match e.raw_os_error() {
+        Some(code) if code == libc::ELOOP || code == libc::ENOTDIR => std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is a symlink or another object type rather than a real directory",
+                component.display()
+            ),
+        ),
+        _ => e,
+    }
+}
+
+/// Resolve `path` to a directory descriptor one component at a time, opening
+/// each component relative to the previously opened one so `O_NOFOLLOW` binds
+/// at EVERY position rather than only the last.
+///
+/// A path-based `open(2)` applies `O_NOFOLLOW` to the final component alone,
+/// which is all the kernel offers for a multi-component pathname, so every
+/// interior symlink is followed during resolution. That is enough to substitute
+/// the whole identity rather than merely misplace it: the load and the create
+/// path resolve the configured pathname identically, so repointing one interior
+/// link redirects both and the node boots as whichever key sits behind the new
+/// target while its own key stays untouched on disk.
+///
+/// Resolution only. No component is created here, and an existing one is
+/// adopted with NO ownership or mode judgment: `GITLAWB_KEY` is a file path
+/// rather than a dedicated-directory setting, so its ancestors are allowed to
+/// be a shared volume or owned by another uid, and the p2p `verify_component`
+/// predicate deliberately does not apply. The single refusal this adds is a
+/// symlink on the key path.
+///
+/// The anchor is the filesystem root for an absolute path and the process cwd
+/// (opened as `.`) for a relative one. A symlinked cwd is not a hole: `chdir`
+/// resolves to an inode, so `open(".")` is the real directory and its ancestors
+/// are out of reach of anyone who can repoint a name.
+///
+/// `leaf_flags` applies to the final component, which is the one the caller
+/// actually uses (`leaf_dir_open_flags` when it will fsync or fchmod through
+/// the handle, the walk set otherwise). Interior components are opened with the
+/// walk set, which needs search rather than directory-list permission.
+#[cfg(unix)]
+fn resolve_dir_nofollow(path: &Path, leaf_flags: libc::c_int) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut names: Vec<std::ffi::OsString> = Vec::new();
+    for component in path.components() {
+        match component {
+            // The anchor covers both, and a `.` inside the path is a no-op.
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::Normal(n) => names.push(n.to_os_string()),
+            // `..` is not a symlink, so stepping through it relative to the
+            // descriptor we hold is the same object the kernel would reach.
+            std::path::Component::ParentDir => names.push(std::ffi::OsString::from("..")),
+            std::path::Component::Prefix(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{} carries an unsupported path prefix", path.display()),
+                ));
+            }
+        }
+    }
+
+    let absolute = path.is_absolute();
+    let (anchor, mut acc) = if absolute {
+        (Path::new("/"), PathBuf::from("/"))
+    } else {
+        (Path::new("."), PathBuf::from("."))
+    };
+    // With no components of its own the anchor IS the requested directory, so
+    // it takes the caller's flags.
+    let anchor_flags = if names.is_empty() {
+        leaf_flags
+    } else {
+        walk_dir_open_flags()
+    };
+    let mut cur =
+        open_dir_with_flags(anchor, anchor_flags).map_err(|e| nofollow_component_error(e, &acc))?;
+
+    let last = names.len().saturating_sub(1);
+    for (idx, name) in names.iter().enumerate() {
+        acc.push(name);
+        let flags = if idx == last {
+            leaf_flags
+        } else {
+            walk_dir_open_flags()
+        };
+        let cname = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} contains an interior NUL byte", path.display()),
+            )
+        })?;
+        // SAFETY: openat relative to a directory descriptor this process owns;
+        // O_NOFOLLOW refuses a symlink in this position instead of resolving
+        // through it, and the returned descriptor is owned exactly once.
+        let fd = unsafe { libc::openat(cur.as_raw_fd(), cname.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(nofollow_component_error(
+                std::io::Error::last_os_error(),
+                &acc,
+            ));
+        }
+        // SAFETY: a descriptor we just received from openat and own exactly once.
+        cur = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    Ok(cur)
+}
+
 #[cfg(unix)]
 fn verify_and_create_ancestor_chain(dir: &Path, euid: u32) -> Result<std::os::fd::OwnedFd> {
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -1636,7 +1753,9 @@ fn ensure_key_dir(dir: &Path) -> Result<KeyDirHandle> {
 }
 
 /// Load an existing identity PEM without following a symlink at the key path
-/// or at its immediate parent. Missing parent or missing file is `Ok(None)`
+/// or anywhere above it: the parent is resolved component by component by
+/// [`resolve_dir_nofollow`], and the key itself is opened `openat` no-follow
+/// against that descriptor. Missing parent or missing file is `Ok(None)`
 /// so the caller can create. A symlink, or any other non-regular object, is
 /// an error. Write-authority on the parent is not judged here: an existing
 /// key must still load after upgrade even if its directory is one we would
@@ -1651,7 +1770,7 @@ pub(crate) fn load_identity_pem_if_present(key_path: &Path) -> Result<Option<Str
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("{} names no key file", key_path.display()))?;
     let parent = key_parent(key_path);
-    let dir = match open_dir_with_flags(parent, leaf_dir_open_flags()) {
+    let dir = match resolve_dir_nofollow(parent, leaf_dir_open_flags()) {
         Ok(dir) => dir,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
@@ -1770,17 +1889,18 @@ fn identity_parent_step(p: &Path) -> &Path {
 /// past, so the helper carries its own precondition rather than inheriting the
 /// `..` refusal from `load_or_create_keypair_at` in another file.
 ///
-/// The `O_NOFOLLOW` in those flags binds the FINAL component only, which is
-/// what the kernel gives a path-based open. So a symlink at the anchor itself
-/// is refused, and a symlink ABOVE it is followed during path resolution just
-/// as it was before this walk existed: the pre-fix code reached the same
-/// directory through `create_dir_all` plus a path-based open of the
-/// grandparent. Closing that would mean an `openat` chain from the filesystem
-/// root, which is what [`verify_and_create_ancestor_chain`] does for
-/// `GITLAWB_P2P_KEY`, and it would drag the full ancestor policy onto
-/// `GITLAWB_KEY` paths that deliberately do not get it. Ancestors above the
-/// anchor are therefore resolved by pathname and neither judged nor mutated,
-/// unchanged from the previous behavior.
+/// Each candidate is resolved by [`resolve_dir_nofollow`], one component at a
+/// time from the filesystem root or the cwd, so `O_NOFOLLOW` binds at every
+/// position rather than only the last one a path-based open would cover. A
+/// symlink anywhere on the key path is refused instead of followed, which is
+/// what stops an attacker who can repoint a single interior component from
+/// redirecting the walk into a tree of their choosing. Ancestors above the
+/// anchor are still neither judged nor mutated: the resolver applies no
+/// ownership or mode predicate, because `GITLAWB_KEY` names a file rather than
+/// a dedicated directory and its ancestors are allowed to be a shared volume or
+/// owned by another uid. That is the difference from
+/// [`verify_and_create_ancestor_chain`], which walks the same way but applies
+/// the full `GITLAWB_P2P_KEY` ancestor policy and creates what is missing.
 ///
 /// Pass 2 walks back down calling [`pin::create_dir_pinned_at`] per component
 /// against the descriptor of the one before it, so from the anchor down no
@@ -1805,7 +1925,7 @@ fn create_missing_identity_parents(
         vec![(dir_name.to_os_string(), dir.to_path_buf())];
     let mut cur = identity_parent_step(dir);
     let anchor = loop {
-        match open_dir_with_flags(cur, walk_dir_open_flags()) {
+        match resolve_dir_nofollow(cur, walk_dir_open_flags()) {
             Ok(fd) => break fd,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && cur.file_name().is_some() => {
                 let name = cur
@@ -1871,7 +1991,8 @@ fn create_missing_identity_parents(
 /// removed again if the boot fails past it, except a directory that has since
 /// been published into, which `AT_REMOVEDIR` refuses. Deliberately NOT the full
 /// `ensure_key_dir` ancestor walk: components above the deepest existing
-/// ancestor are neither judged nor mutated.
+/// ancestor are neither judged nor mutated, only resolved without following a
+/// symlink at any position.
 #[cfg(unix)]
 pub(crate) fn create_pinned_dir_and_publish(key_path: &Path, bytes: &[u8]) -> Result<()> {
     let file_name = key_path
@@ -1902,7 +2023,7 @@ pub(crate) fn create_pinned_dir_and_publish(key_path: &Path, bytes: &[u8]) -> Re
     // not a dedicated-directory setting, so this must not chmod `/etc` or a
     // shared 0755 volume. Write-authority still refuses a group/world-writable
     // parent. A missing parent is created at 0700 below.
-    match open_dir_with_flags(dir, leaf_dir_open_flags()) {
+    match resolve_dir_nofollow(dir, leaf_dir_open_flags()) {
         Ok(existing) => {
             let handle = KeyDirHandle::from_existing_dir(existing, dir, key_path)?;
             write_key_atomically(&handle, file_name, bytes).with_context(|| {
