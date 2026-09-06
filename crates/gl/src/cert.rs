@@ -115,10 +115,7 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
         .await?
         .error_for_status()
         .context("failed to list certificates")?;
-    let resp: Value = resp
-        .json()
-        .await
-        .context("failed to list certificates")?;
+    let resp: Value = resp.json().await.context("failed to list certificates")?;
 
     let certs = resp["certificates"].as_array().cloned().unwrap_or_default();
 
