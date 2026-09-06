@@ -51,6 +51,11 @@ static SYNC_PROCESSED: OnceLock<IntCounterVec> = OnceLock::new();
 static WEBHOOK_DELIVERIES: OnceLock<IntCounterVec> = OnceLock::new();
 static PACK_SIZE: OnceLock<Histogram> = OnceLock::new();
 static PEERS_CONNECTED: OnceLock<IntGauge> = OnceLock::new();
+/// 1 when the node started without its p2p identity because the key storage
+/// could not be used. The node keeps serving HTTP in that state and /health
+/// stays green, so without this the outage is visible only to whoever reads
+/// the startup log.
+static P2P_KEY_LOAD_FAILED: OnceLock<IntGauge> = OnceLock::new();
 
 /// One-time initializer. Builds the registry, registers every metric,
 /// and sets the constant `gitlawb_info` gauge. Idempotent — calling
@@ -202,6 +207,18 @@ fn init_inner(version: &str, node_did: &str) {
         .set(peers_connected)
         .expect("set PEERS_CONNECTED once");
 
+    let p2p_key_load_failed = IntGauge::with_opts(Opts::new(
+        "gitlawb_p2p_identity_key_load_failed",
+        "1 if the node is running without p2p because its identity key could not be loaded",
+    ))
+    .expect("gitlawb_p2p_identity_key_load_failed definition");
+    registry
+        .register(Box::new(p2p_key_load_failed.clone()))
+        .expect("register gitlawb_p2p_identity_key_load_failed");
+    P2P_KEY_LOAD_FAILED
+        .set(p2p_key_load_failed)
+        .expect("set P2P_KEY_LOAD_FAILED once");
+
     REGISTRY
         .set(registry)
         .expect("set REGISTRY once (init must be called exactly once)");
@@ -281,6 +298,13 @@ pub fn observe_pack_size(bytes: f64) {
 pub fn set_peers_connected(count: i64) {
     if let Some(g) = PEERS_CONNECTED.get() {
         g.set(count);
+    }
+}
+
+/// Record whether the node is running without its p2p identity.
+pub fn set_p2p_key_load_failed(failed: bool) {
+    if let Some(g) = P2P_KEY_LOAD_FAILED.get() {
+        g.set(i64::from(failed));
     }
 }
 

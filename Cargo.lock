@@ -3485,6 +3485,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-normalization",
  "uuid",
+ "zeroize",
  "zstd",
 ]
 
