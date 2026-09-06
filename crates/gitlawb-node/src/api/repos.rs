@@ -2509,11 +2509,10 @@ pub async fn git_receive_pack(
     // children and stamped the parent in separate writes, so a crash
     // between them left applied children attached to a `received`
     // parent the drain never schedules. The normalized `parsed_report`
-    // is the single accepted-ref authority the executor consumes:
-    // parsed reports are stored verbatim, implicit-ok stores a
-    // synthetic all-ok report (never null), and the indeterminate
-    // no-report/non-zero path stores no report and moves the parent
-    // to `rejected_at_git` for fail-closed reconcile.
+    // is the accepted-ref authority when present; the no-report path
+    // stores no report and moves the parent to `rejected_at_git` for
+    // fail-closed reconcile, and the executor's null-report fallback
+    // covers reconciled/legacy rows (not just backward compatibility).
     let pending_ref_names: Vec<&str> = ref_updates.iter().map(|u| u.ref_name.as_str()).collect();
 
     // #26 Split PR 1: the push event id is keyed on
@@ -7027,6 +7026,97 @@ mod tests {
             1,
             "a completed push must reach the Tigris upload site once"
         );
+    }
+
+    /// Durable intent is wired at the handler boundary: a successful
+    /// receive-pack leaves a request row, exactly one child carrying the
+    /// pusher DID, and a versioned proof record.
+    /// MUTATION (RED): wrapping the
+    /// `insert_receive_pack_request_with_children` call in `if false`
+    /// leaves zero rows and this test fails.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_success_persists_durable_intent_rows(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let owner = "z6intent";
+        let name = "in1";
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let git_bin = write_fake_git(
+            tmp.path(),
+            "#!/bin/sh\ncat >/dev/null\nprintf '0022\\001unpack ok\\nok refs/heads/main\\n0000'\nexit 0\n",
+        );
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.git_bin = git_bin;
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir.path().to_path_buf(),
+            None,
+            crate::git::repo_store::build_lock_pool(&pool, 4, std::time::Duration::from_secs(5)),
+        );
+        let mut cfg = (*state.config).clone();
+        cfg.enforce_owner_push = false;
+        state.config = std::sync::Arc::new(cfg);
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/tmp/z6intent-in1", None, false)
+            .await
+            .unwrap();
+
+        let pusher = "did:key:z6MkIntentProofDidAAAAAAAAAAAAAAAAAA";
+        let resp = git_receive_pack(
+            State(state.clone()),
+            Path((owner.to_string(), name.to_string())),
+            Extension(crate::auth::AuthenticatedDid(pusher.to_string())),
+            crate::rate_limit::PeerAddr(Some("203.0.113.84:5000".parse::<SocketAddr>().unwrap())),
+            axum::http::HeaderMap::new(),
+            ref_update_body("5555555555555555555555555555555555555555"),
+        )
+        .await
+        .expect("push must succeed");
+        assert_eq!(resp.status(), 200, "push must succeed");
+
+        let repo_id = state.db.get_repo(owner, name).await.unwrap().unwrap().id;
+        let (reqs,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::BIGINT FROM receive_pack_requests WHERE repo_id = $1 AND pusher_did = $2",
+        )
+        .bind(&repo_id)
+        .bind(pusher)
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            reqs, 1,
+            "exactly one durable request row per successful push"
+        );
+        let (kids,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::BIGINT FROM pending_ref_transitions WHERE repo_id = $1 AND pusher_did = $2",
+        )
+        .bind(&repo_id)
+        .bind(pusher)
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        // Live success applies inline and deletes accepted children after
+        // effects, so zero-or-one (deleted after Done) is accepted; the
+        // request + proof rows are the load-bearing evidence the insert
+        // creates. A disabled insert leaves all three at zero.
+        assert!(
+            kids <= 1,
+            "at most one child row survives live completion; got {kids}"
+        );
+        let (proofs,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::BIGINT FROM request_proofs WHERE repo_id = $1 AND pusher_did = $2",
+        )
+        .bind(&repo_id)
+        .bind(pusher)
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(proofs, 1, "exactly one versioned proof record per intent");
     }
 
     /// #173 F1 (RED-before/GREEN-after): an exhausted repo write-lock POOL is a capacity

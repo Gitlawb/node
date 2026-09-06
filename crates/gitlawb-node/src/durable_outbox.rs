@@ -1180,6 +1180,15 @@ pub async fn apply_request_effects(
         })
         .collect();
 
+    // No accepted applied child means no proven landing under the
+    // canonical authority (including unpack-false legacy rows whose
+    // report bits claim ok). Emit nothing: no push event, cert,
+    // anchor, or webhook. Completing via `Nothing` lets the caller
+    // retire the request without accounting effects.
+    if accepted_children.is_empty() {
+        return Ok(EffectsOutcome::Nothing);
+    }
+
     // 5. Look up the repo for cert/webhook payload construction. If
     //    the row is missing (deleted under us), bail with Retry so
     //    the drain re-runs later when the cache is warm again.
@@ -1777,6 +1786,352 @@ mod drain_tests {
             .unwrap();
         assert_eq!(n2, 0, "a second drain pass has nothing to do");
         assert_eq!(examined2, 0, "no requests to examine on a second pass");
+    }
+
+    /// Unpack-false guard: an `outcomes_committed` row with
+    /// `parsed_report.unpack_ok = false` and an `ok: true` child bit emits
+    /// nothing. Removing the unpack clear in `apply_request_effects`
+    /// creates a push event + cert + anchor and turns this red.
+    #[sqlx::test]
+    async fn unpack_false_with_ok_bit_emits_no_effects(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let request_id = "req-unpack-false";
+        let repo_id = "repo-unpack-false";
+        let mut row = make_row(repo_id, "refs/heads/main", &"0".repeat(40), &"b".repeat(40));
+        row.request_id = request_id.to_string();
+        row.id = crate::db::deterministic_id(&[
+            "pending_ref_transition",
+            request_id,
+            repo_id,
+            "refs/heads/main",
+            &"0".repeat(40),
+            &"b".repeat(40),
+        ]);
+        let parsed = serde_json::json!({
+            "unpack_ok": false,
+            "ref_results": [{ "ref_name": "refs/heads/main", "ok": true }],
+        });
+        stage_request_with_children(&state.db, request_id, repo_id, Some(0), &[row], parsed).await;
+
+        let outcome = apply_request_effects(&state, request_id).await.unwrap();
+        assert!(
+            matches!(outcome, EffectsOutcome::Nothing),
+            "unpack failure must yield Nothing, got {outcome:?}"
+        );
+        assert_eq!(
+            state.db.get_push_count("did:key:z6pusher").await.unwrap(),
+            0,
+            "no push event on unpack failure"
+        );
+        assert!(
+            state
+                .db
+                .list_ref_certificates(repo_id, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no cert on unpack failure"
+        );
+        assert_eq!(
+            state
+                .db
+                .count_anchor_jobs(repo_id, "refs/heads/main", &"0".repeat(40), &"b".repeat(40))
+                .await
+                .unwrap(),
+            0,
+            "no anchor on unpack failure"
+        );
+    }
+
+    /// Mixed push: one `ok` ref and one `ng` ref in the same report.
+    /// Only the accepted child receives cert + anchor + history; the
+    /// rejected child is untouched by the executor.
+    #[sqlx::test]
+    async fn mixed_ok_ng_emits_only_for_accepted_child(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let request_id = "req-mixed";
+        let repo_id = "repo-mixed";
+        let mk = |ref_name: &str, new: &str, req: &str, ord: i32, st: &str| {
+            let now = Utc::now().to_rfc3339();
+            PendingRefTransition {
+                id: crate::db::deterministic_id(&[
+                    "pending_ref_transition",
+                    req,
+                    repo_id,
+                    ref_name,
+                    &"0".repeat(40),
+                    new,
+                ]),
+                request_id: req.to_string(),
+                repo_id: repo_id.to_string(),
+                ref_name: ref_name.to_string(),
+                old_sha: "0".repeat(40),
+                new_sha: new.to_string(),
+                pusher_did: "did:key:z6pusher".to_string(),
+                node_did: "did:key:z6node".to_string(),
+                signature_header: "s".to_string(),
+                signature_input: "si".to_string(),
+                content_digest: "d".to_string(),
+                state: st.to_string(),
+                created_at: now.clone(),
+                applied_at: Some(now),
+                cancelled_at: None,
+                ordinal: ord,
+                git_target_kind: Some("update".to_string()),
+            }
+        };
+        let ok_child = mk(
+            "refs/heads/ok",
+            &"b".repeat(40),
+            request_id,
+            0,
+            pending_state::APPLIED,
+        );
+        let mut ng_child = mk(
+            "refs/heads/ng",
+            &"c".repeat(40),
+            request_id,
+            1,
+            pending_state::CANCELLED,
+        );
+        ng_child.applied_at = None;
+        ng_child.cancelled_at = Some(Utc::now().to_rfc3339());
+        let parsed = serde_json::json!({
+            "unpack_ok": true,
+            "ref_results": [
+                { "ref_name": "refs/heads/ok", "ok": true },
+                { "ref_name": "refs/heads/ng", "ok": false },
+            ],
+        });
+        stage_request_with_children(
+            &state.db,
+            request_id,
+            repo_id,
+            Some(0),
+            &[ok_child.clone(), ng_child],
+            parsed,
+        )
+        .await;
+
+        let outcome = apply_request_effects(&state, request_id).await.unwrap();
+        assert!(
+            matches!(outcome, EffectsOutcome::Done),
+            "mixed push with one accepted ref completes, got {outcome:?}"
+        );
+        let certs = state.db.list_ref_certificates(repo_id, 10).await.unwrap();
+        assert_eq!(certs.len(), 1, "exactly one cert for the accepted child");
+        assert_eq!(certs[0].ref_name, "refs/heads/ok");
+        // Landing history recorded for the accepted occurrence only.
+        assert!(
+            state
+                .db
+                .has_landed_tuple_by_other_request(
+                    repo_id,
+                    "refs/heads/ok",
+                    &"0".repeat(40),
+                    &"b".repeat(40),
+                    "other-req"
+                )
+                .await
+                .unwrap(),
+            "accepted occurrence must be recorded in landing history"
+        );
+        assert!(
+            !state
+                .db
+                .has_landed_tuple_by_other_request(
+                    repo_id,
+                    "refs/heads/ng",
+                    &"0".repeat(40),
+                    &"c".repeat(40),
+                    "other-req"
+                )
+                .await
+                .unwrap(),
+            "rejected ref must not record landing history"
+        );
+    }
+
+    /// Divergent cancelled child: report claims `ok` but the child row is
+    /// `cancelled`. The applied-intersect must exclude it; removing the
+    /// `state == APPLIED` filter issues a cert and turns this red.
+    #[sqlx::test]
+    async fn cancelled_child_with_ok_bit_gets_no_cert(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let request_id = "req-divergent";
+        let repo_id = "repo-divergent";
+        let now = Utc::now().to_rfc3339();
+        let child = PendingRefTransition {
+            id: crate::db::deterministic_id(&[
+                "pending_ref_transition",
+                request_id,
+                repo_id,
+                "refs/heads/main",
+                &"0".repeat(40),
+                &"b".repeat(40),
+            ]),
+            request_id: request_id.to_string(),
+            repo_id: repo_id.to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            old_sha: "0".repeat(40),
+            new_sha: "b".repeat(40),
+            pusher_did: "did:key:z6pusher".to_string(),
+            node_did: "did:key:z6node".to_string(),
+            signature_header: "s".to_string(),
+            signature_input: "si".to_string(),
+            content_digest: "d".to_string(),
+            state: pending_state::CANCELLED.to_string(),
+            created_at: now.clone(),
+            applied_at: None,
+            cancelled_at: Some(now),
+            ordinal: 0,
+            git_target_kind: Some("update".to_string()),
+        };
+        let parsed = serde_json::json!({
+            "unpack_ok": true,
+            "ref_results": [{ "ref_name": "refs/heads/main", "ok": true }],
+        });
+        stage_request_with_children(&state.db, request_id, repo_id, Some(0), &[child], parsed)
+            .await;
+
+        let outcome = apply_request_effects(&state, request_id).await.unwrap();
+        assert!(
+            matches!(outcome, EffectsOutcome::Nothing),
+            "divergent cancelled child must yield Nothing, got {outcome:?}"
+        );
+        assert!(
+            state
+                .db
+                .list_ref_certificates(repo_id, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no cert for a cancelled child even when the report claims ok"
+        );
+    }
+
+    /// Unresolved siblings block completion: an applied-but-unmentioned
+    /// child keeps the request retryable and its evidence is retained.
+    #[sqlx::test]
+    async fn unresolved_sibling_keeps_request_retryable(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let request_id = "req-partial";
+        let repo_id = "repo-partial";
+        let mk = |ref_name: &str, new: &str, ord: i32| {
+            let now = Utc::now().to_rfc3339();
+            PendingRefTransition {
+                id: crate::db::deterministic_id(&[
+                    "pending_ref_transition",
+                    request_id,
+                    repo_id,
+                    ref_name,
+                    &"0".repeat(40),
+                    new,
+                ]),
+                request_id: request_id.to_string(),
+                repo_id: repo_id.to_string(),
+                ref_name: ref_name.to_string(),
+                old_sha: "0".repeat(40),
+                new_sha: new.to_string(),
+                pusher_did: "did:key:z6pusher".to_string(),
+                node_did: "did:key:z6node".to_string(),
+                signature_header: "s".to_string(),
+                signature_input: "si".to_string(),
+                content_digest: "d".to_string(),
+                state: pending_state::APPLIED.to_string(),
+                created_at: now.clone(),
+                applied_at: Some(now),
+                cancelled_at: None,
+                ordinal: ord,
+                git_target_kind: Some("update".to_string()),
+            }
+        };
+        // Report mentions only the first ref; the second applied child is
+        // unreported (partial report-status).
+        let c1 = mk("refs/heads/one", &"b".repeat(40), 0);
+        let c2 = mk("refs/heads/two", &"c".repeat(40), 1);
+        let parsed = serde_json::json!({
+            "unpack_ok": true,
+            "ref_results": [{ "ref_name": "refs/heads/one", "ok": true }],
+        });
+        stage_request_with_children(
+            &state.db,
+            request_id,
+            repo_id,
+            Some(0),
+            &[c1, c2.clone()],
+            parsed,
+        )
+        .await;
+
+        let outcome = apply_request_effects(&state, request_id).await.unwrap();
+        assert!(
+            matches!(outcome, EffectsOutcome::Retry { .. }),
+            "unresolved sibling must keep the request retryable, got {outcome:?}"
+        );
+        // The unreported child evidence survives completion of its sibling.
+        let remaining = state
+            .db
+            .list_pending_ref_transitions_for_request(request_id)
+            .await
+            .unwrap();
+        assert!(
+            remaining.iter().any(|c| c.ref_name == "refs/heads/two"),
+            "partial-report sibling must not be deleted before reconcile"
+        );
+    }
+
+    /// Proof is acked on success and blocks purge until acked. Removing
+    /// the ack call leaves an unacked proof that retains the parent.
+    #[sqlx::test]
+    async fn proof_acked_on_success_and_gates_purge(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let request_id = "req-proof";
+        let repo_id = "repo-proof";
+        let mut row = make_row(repo_id, "refs/heads/main", &"0".repeat(40), &"b".repeat(40));
+        row.request_id = request_id.to_string();
+        row.id = crate::db::deterministic_id(&[
+            "pending_ref_transition",
+            request_id,
+            repo_id,
+            "refs/heads/main",
+            &"0".repeat(40),
+            &"b".repeat(40),
+        ]);
+        let parsed = parsed_report_ok(&[("refs/heads/main", true)]);
+        stage_request_with_children(&state.db, request_id, repo_id, Some(0), &[row], parsed).await;
+        // Stage the v33 proof row the intent insert would have created.
+        state
+            .db
+            .insert_request_proof_idempotent(&crate::db::RequestProof {
+                request_id: request_id.to_string(),
+                repo_id: repo_id.to_string(),
+                pusher_did: "did:key:z6pusher".to_string(),
+                body_digest: vec![0u8; 32],
+                signature_header: "s".to_string(),
+                signature_input: "si".to_string(),
+                content_digest: "d".to_string(),
+                created_at: Utc::now().to_rfc3339(),
+                acked_at: None,
+            })
+            .await
+            .unwrap();
+
+        let outcome = apply_request_effects(&state, request_id).await.unwrap();
+        assert!(
+            matches!(outcome, EffectsOutcome::Done),
+            "expected Done, got {outcome:?}"
+        );
+        let proof = state
+            .db
+            .get_request_proof(request_id)
+            .await
+            .unwrap()
+            .expect("proof exists");
+        assert!(
+            proof.acked_at.is_some(),
+            "successful effects must ack the proof"
+        );
     }
 
     /// The reviewer's second proof, end-to-end. A request that git

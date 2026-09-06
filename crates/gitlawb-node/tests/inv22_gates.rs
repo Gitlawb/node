@@ -604,6 +604,15 @@ fn inv26_step3_live_and_drain_share_apply_request_effects() {
          reverting to a per-ref inline fan-out splits live and recovery"
     );
 
+    // The durable intent insert closes the pre-outbox crash window this
+    // PR exists to fix. Wrapping it in `if false` must turn this gate
+    // red; drain-only tests cannot prove the handler creates the rows.
+    assert!(
+        production_repos.contains("insert_receive_pack_request_with_children("),
+        "live handler must persist durable intent via \
+         `insert_receive_pack_request_with_children`; disabling it must fail this gate"
+    );
+
     // The drain's per-request seam calls the same executor. Test
     // code lives below `mod drain_tests`, so split there too.
     let production_outbox = outbox

@@ -1781,6 +1781,18 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_marker_cleanup_due ON marker_cleanup_queue (dead_letter, next_attempt_at, created_at)",
         ],
     },
+    Migration {
+        // v35: webhook delivery sent-state so the ledger cannot claim a
+        // delivery that never fired. Claim inserts pending; the sender
+        // marks sent after the HTTP response; recovery re-fires stale
+        // pending rows.
+        version: 35,
+        name: "webhook_delivery_sent_state",
+        stmts: &[
+            "ALTER TABLE webhook_deliveries ADD COLUMN IF NOT EXISTS sent_at TEXT",
+            "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_pending ON webhook_deliveries (sent_at, created_at)",
+        ],
+    },
 ];
 
 /// Max distinct source repos recorded per pinned object (F1, #173 jatmn round 8).
@@ -4821,11 +4833,13 @@ impl Db {
         Ok(res.rows_affected() == 1)
     }
 
-    /// Occurrence delivery ledger for external effects. Inserts a stable
-    /// `(request, ref, hook)` delivery key; returns true when this caller
-    /// won the race, false when another executor already recorded it.
-    /// Best-effort webhooks remain lossy on crash, but concurrent
-    /// executors can no longer double-deliver one occurrence.
+    /// Occurrence delivery ledger for external effects. Claims a stable
+    /// `(request, ref, hook)` delivery key as pending; returns true when
+    /// this caller won the race, false when another executor already
+    /// recorded it. A stale pending claim (crashed between claim and
+    /// HTTP send) older than `stale_secs` is reclaimable so recovery
+    /// re-fires instead of suppressing forever. Sent deliveries are
+    /// never re-claimed.
     pub async fn claim_webhook_delivery(
         &self,
         delivery_id: &str,
@@ -4833,19 +4847,58 @@ impl Db {
         repo_id: &str,
         event: &str,
     ) -> Result<bool> {
+        self.claim_webhook_delivery_with_stale(delivery_id, request_id, repo_id, event, 300)
+            .await
+    }
+
+    pub async fn claim_webhook_delivery_with_stale(
+        &self,
+        delivery_id: &str,
+        request_id: &str,
+        repo_id: &str,
+        event: &str,
+        stale_secs: i64,
+    ) -> Result<bool> {
+        let now = Utc::now();
+        let now_iso = now.to_rfc3339();
+        let stale_before = (now - chrono::Duration::seconds(stale_secs.max(1))).to_rfc3339();
+        // Reclaim stale pending claims so a crash between claim and send
+        // does not permanently suppress the webhook.
+        let _ = sqlx::query(
+            r#"DELETE FROM webhook_deliveries
+               WHERE delivery_id = $1 AND sent_at IS NULL AND created_at < $2"#,
+        )
+        .bind(delivery_id)
+        .bind(&stale_before)
+        .execute(&self.pool)
+        .await?;
         let res = sqlx::query(
             r#"INSERT INTO webhook_deliveries
-               (delivery_id, request_id, repo_id, event, created_at)
-               VALUES ($1,$2,$3,$4,$5) ON CONFLICT (delivery_id) DO NOTHING"#,
+               (delivery_id, request_id, repo_id, event, created_at, sent_at)
+               VALUES ($1,$2,$3,$4,$5,NULL) ON CONFLICT (delivery_id) DO NOTHING"#,
         )
         .bind(delivery_id)
         .bind(request_id)
         .bind(repo_id)
         .bind(event)
-        .bind(Utc::now().to_rfc3339())
+        .bind(&now_iso)
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected() == 1)
+    }
+
+    /// Mark a claimed delivery sent after the HTTP response. Recovery
+    /// treats unmarked rows as pending and re-fires them past the stale
+    /// threshold instead of asserting a delivery that never happened.
+    pub async fn mark_webhook_sent(&self, delivery_id: &str) -> Result<u64> {
+        let res = sqlx::query(
+            r#"UPDATE webhook_deliveries SET sent_at = $2 WHERE delivery_id = $1 AND sent_at IS NULL"#,
+        )
+        .bind(delivery_id)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
     }
 
     /// Purge terminal batch in one transaction: children first (parent
@@ -7448,7 +7501,7 @@ mod migration_tests {
                 w[1]
             );
         }
-        for v in 27..=34 {
+        for v in 27..=35 {
             assert!(
                 versions.contains(&v),
                 "split-1 ledger must own v{v} contiguously from main v26"

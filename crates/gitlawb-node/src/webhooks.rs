@@ -116,6 +116,7 @@ async fn fire_event_async_occurrence(
         // sending (legacy best-effort) rather than dropping.
         if request_id.is_some() {
             match db
+                .clone()
                 .claim_webhook_delivery(&delivery_id, request_id.unwrap_or(""), repo_id, event)
                 .await
             {
@@ -125,7 +126,9 @@ async fn fire_event_async_occurrence(
             }
         }
 
+        let db_for_mark = db.clone();
         tokio::spawn(async move {
+            let delivery_for_mark = delivery_id.clone();
             let signature = hook.secret.as_deref().map(|s| sign_payload(s, &bytes));
 
             let mut req = client
@@ -147,6 +150,10 @@ async fn fire_event_async_occurrence(
                         "http_error"
                     };
                     crate::metrics::record_webhook_delivery(result_label);
+                    // Any HTTP response proves the delivery fired; mark
+                    // sent so the ledger never claims an unsent delivery.
+                    // Network errors stay pending for stale-reclaim.
+                    let _ = db_for_mark.mark_webhook_sent(&delivery_for_mark).await;
                     tracing::info!(
                         url = %hook.url,
                         event = %event_name,
