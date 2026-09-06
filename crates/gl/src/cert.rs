@@ -110,9 +110,12 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
 
     let client = signed_client(&node, dir.as_deref());
     let path = format!("/api/v1/repos/{owner}/{name}/certs");
-    let resp: Value = client
+    let resp = client
         .get_authed(&path)
         .await?
+        .error_for_status()
+        .context("failed to list certificates")?;
+    let resp: Value = resp
         .json()
         .await
         .context("failed to list certificates")?;
@@ -876,5 +879,42 @@ mod tests {
         // and the test would mean nothing.
         cert_mock.assert_async().await;
         root_mock.assert_async().await;
+    }
+
+    /// P2 (reviewer round 3): a gated `GET /api/v1/repos/{o}/{r}/certs`
+    /// must surface as an Err, not as "No ref certificates …" with
+    /// exit 0. The pre-fix shape called `.json()` straight through and
+    /// let a 404 body that happened to lack `certificates` fall into
+    /// the empty-list branch, silently claiming an empty repository.
+    /// Driving `cmd_list` end to end against a 404 mock is what makes
+    /// this guard load-bearing: removing `error_for_status()` and the
+    /// test fails.
+    #[tokio::test]
+    async fn cmd_list_surfaces_gated_404_as_err() {
+        let mut server = mockito::Server::new_async().await;
+        let list_mock = server
+            .mock("GET", "/api/v1/repos/o/r/certs")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            // Body that lacks the `certificates` key — this is the
+            // exact shape the pre-fix code swallowed into the
+            // empty-list branch. A passing test here therefore proves
+            // the new error path is taken, not just that 404 produces
+            // a non-200.
+            .with_body(r#"{"error":"not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = cmd_list("o/r".to_string(), server.url(), None)
+            .await
+            .expect_err("a gated 404 on the cert list must surface as an Err, not an empty list");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed to list certificates"),
+            "the failure must point at the list endpoint, not at an empty result: {msg}"
+        );
+
+        list_mock.assert_async().await;
     }
 }
