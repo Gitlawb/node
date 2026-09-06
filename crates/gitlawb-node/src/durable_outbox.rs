@@ -817,6 +817,28 @@ where
     let examined = reqs.len();
     for req in reqs {
         let request_id = req.id.clone();
+        // Request-level ownership: atomically claim the due row with a
+        // recoverable lease before loading children. Concurrent
+        // executors (live inline, startup drain, background worker,
+        // multi-node sharing one DB) collapse to one owner; losers skip.
+        // Crash recovery via expiry: a dead claimant's lease lapses.
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        match state
+            .db
+            .try_claim_due_request(&request_id, 300, &now_iso)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    "drain: claim failed; skipping for this pass"
+                );
+                continue;
+            }
+        }
         match derive_fn(state.clone(), request_id.clone()).await {
             Ok(EffectsOutcome::Done) => {
                 if let Err(e) = state.db.mark_request_complete(&request_id).await {
@@ -1139,9 +1161,23 @@ pub async fn apply_request_effects(
             .map(|c| c.ref_name.clone())
             .collect();
     }
+    // Unpack failure proves no ref landed even if legacy report bits
+    // claim otherwise. Force the accepted set empty so the executor
+    // cannot outrun cancelled rows when parent/child rows diverge.
+    if req
+        .parsed_report
+        .as_ref()
+        .and_then(|v| v.get("unpack_ok"))
+        .and_then(|v| v.as_bool())
+        == Some(false)
+    {
+        ok_ref_names.clear();
+    }
     let accepted_children: Vec<&PendingRefTransition> = children
         .iter()
-        .filter(|c| ok_ref_names.contains(&c.ref_name))
+        .filter(|c| {
+            ok_ref_names.contains(&c.ref_name) && c.state == crate::db::pending_state::APPLIED
+        })
         .collect();
 
     // 5. Look up the repo for cert/webhook payload construction. If
@@ -1258,8 +1294,11 @@ pub async fn apply_request_effects(
             first_error.get_or_insert_with(|| format!("anchor {}: {e}", child.ref_name));
             continue;
         }
-        // Landing history survives child deletion for future A/B checks.
-        let _ = state
+        // Landing history is the durable guard distinguishing two
+        // requests claiming the same tuple after children are removed.
+        // It is part of the success condition: on failure retain the
+        // child and retry; delete only after history is durable.
+        match state
             .db
             .insert_landing_history_idempotent(&crate::db::RefLanding {
                 request_id: req.id.clone(),
@@ -1270,7 +1309,19 @@ pub async fn apply_request_effects(
                 new_sha: child.new_sha.clone(),
                 landed_at: chrono::Utc::now().to_rfc3339(),
             })
-            .await;
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    ref_name = %child.ref_name,
+                    "apply_request_effects: landing history insert failed; child retained for retry"
+                );
+                first_error.get_or_insert_with(|| format!("history {}: {e}", child.ref_name));
+            }
+        }
     }
 
     if let Some(err) = first_error {
@@ -1280,9 +1331,20 @@ pub async fn apply_request_effects(
     // Proof must exist before effects are considered durable; ack it so
     // retention knows the downstream handoff owns a verifiable reference.
     // If the proof row is missing (pre-v33 legacy), proceed but do not
-    // block — the request-level columns still carry the envelope.
+    // block — the request-level columns still carry the envelope. A
+    // failed ACK leaves the request retryable rather than completing
+    // with an unacknowledged proof that purge would then retain forever.
     if state.db.get_request_proof(&req.id).await?.is_some() {
-        let _ = state.db.ack_request_proof(&req.id).await;
+        if let Err(e) = state.db.ack_request_proof(&req.id).await {
+            tracing::warn!(
+                err = %e,
+                request_id = %request_id,
+                "apply_request_effects: proof ack failed; request left for retry"
+            );
+            return Ok(EffectsOutcome::Retry {
+                last_error: format!("proof ack: {e}"),
+            });
+        }
     }
 
     // 9. All accepted artifacts landed — clean up only those children.
@@ -1344,12 +1406,14 @@ pub async fn apply_request_effects(
                     "clone_url": clone_url,
                 },
             });
-            crate::webhooks::fire_event(
+            crate::webhooks::fire_event_occurrence(
                 state.db.clone(),
                 state.http_client.clone(),
                 &repo.id,
                 "push",
                 payload,
+                Some(&req.id),
+                Some(&child.ref_name),
             );
         }
     }

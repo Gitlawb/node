@@ -204,7 +204,10 @@ pub struct RefLanding {
 
 /// Tombstone for Git-side marker deletion. Parent SQL row is gone only
 /// after children are gone; marker (external side effect) retains this
-/// tombstone until idempotent `git update-ref -d` succeeds.
+/// tombstone until idempotent `git update-ref -d` succeeds. `next_attempt_at`
+/// provides fairness (failing entries back off behind ready work);
+/// `dead_letter` parks permanent failures visibly after a bound instead
+/// of starving newer tombstones.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarkerCleanup {
     pub request_id: String,
@@ -212,6 +215,8 @@ pub struct MarkerCleanup {
     pub attempts: i32,
     pub created_at: String,
     pub last_error: Option<String>,
+    pub next_attempt_at: Option<String>,
+    pub dead_letter: bool,
 }
 
 /// The lifecycle states of a row in `pending_ref_transitions`. Persisted as a
@@ -695,15 +700,26 @@ impl Db {
     /// Must be called while holding the migration advisory lock.
     async fn run_pending_migrations(&self) -> Result<()> {
         for m in MIGRATIONS {
-            let already: bool = sqlx::query(
-                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1) AS applied",
-            )
-            .bind(m.version)
-            .fetch_one(&self.pool)
-            .await?
-            .get::<bool, _>("applied");
+            let existing: Option<String> =
+                sqlx::query("SELECT name FROM schema_migrations WHERE version = $1")
+                    .bind(m.version)
+                    .fetch_optional(&self.pool)
+                    .await?
+                    .map(|r| r.get::<String, _>("name"));
 
-            if already {
+            if let Some(stored) = existing {
+                // Same version, different name means two split PRs claimed
+                // one migration number (e.g. split-1 v27 vs a sibling v27).
+                // Fail fast instead of silently skipping the wrong schema.
+                if stored != m.name {
+                    anyhow::bail!(
+                        "migration version collision: database has v{} ({}) but binary wants v{} ({}); merge the split migration ledgers into one ordered sequence",
+                        m.version,
+                        stored,
+                        m.version,
+                        m.name
+                    );
+                }
                 continue;
             }
 
@@ -1745,6 +1761,24 @@ const MIGRATIONS: &[Migration] = &[
             "DROP INDEX IF EXISTS idx_anchor_jobs_repo_ref_transition",
             "CREATE INDEX IF NOT EXISTS idx_anchor_jobs_tuple ON anchor_jobs (repo_id, ref_name, old_sha, new_sha)",
             "CREATE INDEX IF NOT EXISTS idx_anchor_jobs_request ON anchor_jobs (request_id, request_ordinal)",
+        ],
+    },
+    Migration {
+        // v34: occurrence delivery ledger, marker cleanup scheduling.
+        version: 34,
+        name: "occurrence_delivery_and_cleanup_progress",
+        stmts: &[
+            r#"CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                delivery_id TEXT NOT NULL PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                repo_id TEXT NOT NULL,
+                event TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_request ON webhook_deliveries (request_id, event)",
+            "ALTER TABLE marker_cleanup_queue ADD COLUMN IF NOT EXISTS next_attempt_at TEXT",
+            "ALTER TABLE marker_cleanup_queue ADD COLUMN IF NOT EXISTS dead_letter BOOLEAN NOT NULL DEFAULT FALSE",
+            "CREATE INDEX IF NOT EXISTS idx_marker_cleanup_due ON marker_cleanup_queue (dead_letter, next_attempt_at, created_at)",
         ],
     },
 ];
@@ -3842,10 +3876,11 @@ impl Db {
             }
         }
         if terminal_no_effects {
-            // All refs rejected with exit zero: terminal with no
-            // effects, so retention can purge and the startup drain
-            // has nothing executable to revisit. Children are already
-            // cancelled above; no push/cert/anchor is emitted.
+            // All refs rejected/unpack-failed with no effects ever:
+            // terminal with explicit proof disposition (acked here, same
+            // txn) so retention can purge instead of retaining forever.
+            // Children are already cancelled above; no push/cert/anchor
+            // is emitted.
             let report = parsed_report.expect("terminal_no_effects requires parsed report");
             sqlx::query(
                 r#"UPDATE receive_pack_requests
@@ -3861,6 +3896,13 @@ impl Db {
             .bind(&now)
             .bind("all refs rejected; no effects".to_string())
             .bind(request_state::RECEIVED)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"UPDATE request_proofs SET acked_at = $2 WHERE request_id = $1 AND acked_at IS NULL"#,
+            )
+            .bind(request_id)
+            .bind(&now)
             .execute(&mut *tx)
             .await?;
         } else if let Some(report) = parsed_report {
@@ -4671,11 +4713,17 @@ impl Db {
     }
 
     pub async fn list_marker_cleanup_due(&self, limit: i64) -> Result<Vec<MarkerCleanup>> {
+        let now = Utc::now().to_rfc3339();
         let rows = sqlx::query(
-            r#"SELECT request_id, repo_id, attempts, created_at, last_error
-               FROM marker_cleanup_queue ORDER BY created_at ASC LIMIT $1"#,
+            r#"SELECT request_id, repo_id, attempts, created_at, last_error,
+                      next_attempt_at, dead_letter
+               FROM marker_cleanup_queue
+               WHERE dead_letter = FALSE
+                 AND (next_attempt_at IS NULL OR next_attempt_at < $2)
+               ORDER BY next_attempt_at NULLS FIRST, created_at ASC LIMIT $1"#,
         )
         .bind(limit.max(1))
+        .bind(&now)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -4686,20 +4734,48 @@ impl Db {
                 attempts: r.get("attempts"),
                 created_at: r.get("created_at"),
                 last_error: r.get("last_error"),
+                next_attempt_at: r.get("next_attempt_at"),
+                dead_letter: r.get("dead_letter"),
             })
             .collect())
     }
 
+    /// Record a failed marker attempt with backoff fairness; after the
+    /// bound, park visibly as dead-letter instead of starving newer work.
+    /// Never deletes the tombstone on failure: it is the final owner.
     pub async fn mark_marker_cleanup_attempt(
         &self,
         request_id: &str,
         last_error: Option<&str>,
     ) -> Result<u64> {
+        let row: Option<(i32,)> =
+            sqlx::query_as(r#"SELECT attempts FROM marker_cleanup_queue WHERE request_id=$1"#)
+                .bind(request_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let attempts = row.map(|(a,)| a).unwrap_or(0);
+        // Bound: 25 failures (~days of backoff) then dead-letter.
+        if attempts + 1 > 25 {
+            let res = sqlx::query(
+                r#"UPDATE marker_cleanup_queue
+                   SET attempts=attempts+1, last_error=$2, dead_letter=TRUE WHERE request_id=$1"#,
+            )
+            .bind(request_id)
+            .bind(last_error)
+            .execute(&self.pool)
+            .await?;
+            return Ok(res.rows_affected());
+        }
+        let shift = attempts.clamp(0, 6) as u32;
+        let backoff = 60_i64.saturating_mul(1_i64 << shift);
+        let next = (Utc::now() + chrono::Duration::seconds(backoff)).to_rfc3339();
         let res = sqlx::query(
-            r#"UPDATE marker_cleanup_queue SET attempts=attempts+1, last_error=$2 WHERE request_id=$1"#,
+            r#"UPDATE marker_cleanup_queue
+               SET attempts=attempts+1, last_error=$2, next_attempt_at=$3 WHERE request_id=$1"#,
         )
         .bind(request_id)
         .bind(last_error)
+        .bind(&next)
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected())
@@ -4711,6 +4787,65 @@ impl Db {
             .execute(&self.pool)
             .await?;
         Ok(res.rows_affected())
+    }
+
+    /// Atomically claim one due request for a single executor by pushing
+    /// its `next_attempt_at` into the future (recoverable lease). Returns
+    /// true when this caller owns the request; false when another executor
+    /// claimed it first or it is no longer due. Crash recovery via expiry:
+    /// a dead claimant's lease lapses and the request becomes due again.
+    pub async fn try_claim_due_request(
+        &self,
+        request_id: &str,
+        lease_secs: i64,
+        now_iso: &str,
+    ) -> Result<bool> {
+        let lease_until = (DateTime::parse_from_rfc3339(now_iso)
+            .map(|t| t.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now())
+            + chrono::Duration::seconds(lease_secs.max(1)))
+        .to_rfc3339();
+        let res = sqlx::query(
+            r#"UPDATE receive_pack_requests
+               SET next_attempt_at = $2
+               WHERE id = $1 AND state IN ($3, $4)
+                 AND (next_attempt_at IS NULL OR next_attempt_at < $5)"#,
+        )
+        .bind(request_id)
+        .bind(&lease_until)
+        .bind(request_state::OUTCOMES_COMMITTED)
+        .bind(request_state::EFFECTS_PENDING)
+        .bind(now_iso)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    /// Occurrence delivery ledger for external effects. Inserts a stable
+    /// `(request, ref, hook)` delivery key; returns true when this caller
+    /// won the race, false when another executor already recorded it.
+    /// Best-effort webhooks remain lossy on crash, but concurrent
+    /// executors can no longer double-deliver one occurrence.
+    pub async fn claim_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        request_id: &str,
+        repo_id: &str,
+        event: &str,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            r#"INSERT INTO webhook_deliveries
+               (delivery_id, request_id, repo_id, event, created_at)
+               VALUES ($1,$2,$3,$4,$5) ON CONFLICT (delivery_id) DO NOTHING"#,
+        )
+        .bind(delivery_id)
+        .bind(request_id)
+        .bind(repo_id)
+        .bind(event)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() == 1)
     }
 
     /// Purge terminal batch in one transaction: children first (parent
@@ -7291,6 +7426,32 @@ mod migration_tests {
                 "migration v{} ({}) has no SQL statements",
                 m.version,
                 m.name
+            );
+        }
+    }
+
+    #[test]
+    fn split_migration_ledger_is_linear_from_main_v26() {
+        // Split PRs must form one ordered ledger from main's v26:
+        // versions unique (strictly increasing covers it), names distinct
+        // (covered above), and the split-1 range v27..=v34 contiguous so a
+        // sibling claiming any of those numbers collides loudly via the
+        // (version, name) runner guard instead of silently skipping.
+        let versions: Vec<i64> = MIGRATIONS.iter().map(|m| m.version).collect();
+        for w in versions.windows(2) {
+            // Main history is contiguous; splits must not introduce gaps
+            // that hide a skipped sibling migration.
+            assert!(
+                w[1] == w[0] + 1 || w[0] < 27,
+                "migration gap between v{} and v{}; splits must extend one linear ledger",
+                w[0],
+                w[1]
+            );
+        }
+        for v in 27..=34 {
+            assert!(
+                versions.contains(&v),
+                "split-1 ledger must own v{v} contiguously from main v26"
             );
         }
     }

@@ -193,9 +193,15 @@ pub async fn write_marker_bounded(
 ) -> Result<()> {
     use tokio::process::Command as AsyncCommand;
     let ref_name = format!("refs/gitlawb/requests/{request_id}");
+    // `kill_on_drop(true)` makes the timeout real: dropping the output
+    // future kills the child instead of leaving it hung to later mutate
+    // the marker. `update-ref` forks no helpers (unlike receive-pack's
+    // pack-objects tree), so child kill suffices without process-group
+    // plumbing.
     let fut = async {
-        AsyncCommand::new(git_bin)
-            .args(["update-ref", &ref_name, marker_value, "--no-deref"])
+        let mut cmd = AsyncCommand::new(git_bin);
+        cmd.kill_on_drop(true);
+        cmd.args(["update-ref", &ref_name, marker_value, "--no-deref"])
             .current_dir(repo_path)
             .output()
             .await
@@ -223,7 +229,9 @@ pub async fn delete_marker_bounded(
 ) -> Result<bool> {
     use tokio::process::Command as AsyncCommand;
     let ref_name = format!("refs/gitlawb/requests/{request_id}");
-    let fut = AsyncCommand::new(git_bin)
+    let mut cmd = AsyncCommand::new(git_bin);
+    cmd.kill_on_drop(true);
+    let fut = cmd
         .args(["update-ref", "-d", &ref_name, "--no-deref"])
         .current_dir(repo_path)
         .output();
