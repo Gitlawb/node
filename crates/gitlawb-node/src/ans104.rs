@@ -93,8 +93,8 @@ pub const SIGNATURE_TYPE_ETHEREUM: u8 = 3;
 /// Length, in bytes, of the signature field for a given signature
 /// type. Per the spec, the signature size depends on the signature
 /// type: Arweave/RSA = 512, Ed25519 = 64, Ethereum = 65,
-/// Solana = 64. Unknown types fall back to the Ed25519 width with a
-/// debug-visible `0`.
+/// Solana = 64. Unknown types have no width: returns `0`, and every
+/// caller treats `0` as an unknown-type rejection.
 pub fn signature_size(sig_type: u8) -> usize {
     match sig_type {
         1 => 512, // Arweave / RSA
@@ -122,7 +122,7 @@ pub fn owner_size(sig_type: u8) -> usize {
 pub struct DataItem {
     /// Signature over the 48-byte deep-hash. base64url.
     pub signature: String,
-    /// Public key bytes, padded per the signature type, base64url.
+    /// Public key bytes, exactly `owner_size(signature_type)` wide, base64url.
     pub owner: String,
     /// Optional target address. Empty when absent.
     pub target: String,
@@ -249,9 +249,10 @@ impl DataItem {
     }
 
     /// Decode the 32-byte Ed25519 public key from the owner field.
-    /// The owner field carries 32 pubkey bytes + 32 zero bytes; the
-    /// zero pad is silently ignored here. The returned bytes are the
-    /// raw 32-byte public key, suitable for `VerifyingKey::from_bytes`.
+    /// The owner field carries exactly `owner_size(Ed25519)` = 32
+    /// pubkey bytes (the 64-byte owner is the Arweave/RSA sigtype-1
+    /// format, not Ed25519). The returned bytes are the raw 32-byte
+    /// public key, suitable for `VerifyingKey::from_bytes`.
     // Vertical-slice API: no production caller on this head (the
     // probe/endpoint slice is next); pinned by the unit tests.
     #[allow(dead_code)]
@@ -555,13 +556,6 @@ impl DataItem {
             }
             b
         };
-        if owner_bytes.len() < own_len {
-            bail!(
-                "ANS-104 to_binary: owner is {} bytes, expected at least {}",
-                owner_bytes.len(),
-                own_len
-            );
-        }
         let target_bytes = if self.target.is_empty() {
             Vec::new()
         } else {
@@ -711,7 +705,7 @@ fn decode_tags(payload: &[u8], expected_count: usize) -> Result<Vec<(Vec<u8>, Ve
                 bail!("ANS-104 Avro tag name length is negative ({})", name_len_i);
             }
             let name_len = name_len_i as usize;
-            if pos + name_len > payload.len() {
+            if name_len > payload.len().saturating_sub(pos) {
                 bail!("ANS-104 Avro tag name overruns payload");
             }
             let name = payload[pos..pos + name_len].to_vec();
@@ -725,7 +719,7 @@ fn decode_tags(payload: &[u8], expected_count: usize) -> Result<Vec<(Vec<u8>, Ve
                 );
             }
             let value_len = value_len_i as usize;
-            if pos + value_len > payload.len() {
+            if value_len > payload.len().saturating_sub(pos) {
                 bail!("ANS-104 Avro tag value overruns payload");
             }
             let value = payload[pos..pos + value_len].to_vec();
@@ -892,10 +886,10 @@ pub fn sign_data_item(
     item: &mut DataItem,
     keypair: &gitlawb_core::identity::Keypair,
 ) -> Result<()> {
-    // Ed25519 is sigtype 2 in the on-wire frame. If the item was
-    // constructed via the JSON projection (which carries the byte
-    // explicitly), use whatever sigtype is set; default to Ed25519
-    // if it was zeroed for an in-progress unsigned item.
+    // Ed25519 is sigtype 2 in the on-wire frame. Signing always
+    // produces Ed25519: `deep_hash` bails on an unknown sigtype
+    // (including a zeroed one) before the signature is computed,
+    // and the item's sigtype is then set to Ed25519 unconditionally.
     let sig_len = signature_size(SIGNATURE_TYPE_ED25519);
     let hash = item.deep_hash()?;
     let sig = keypair.sign(&hash);
@@ -918,7 +912,7 @@ pub fn verify_data_item(item: &DataItem, expected_pubkey: &[u8; PUBLIC_KEY_LENGT
     if item.signature_type != SIGNATURE_TYPE_ED25519 {
         bail!(
             "ANS-104 verify_data_item only supports Ed25519 (sigtype={}); \
-             ref sigtype = {}",
+             item sigtype = {}",
             SIGNATURE_TYPE_ED25519,
             item.signature_type
         );
