@@ -152,6 +152,26 @@ pub async fn pin_object(
 /// `upsert_branch_cid` and the p2p `publish_ref_update` gossip CID. The twin's return is
 /// log-only, so it omits a record-failed pin rather than logging a pin the resolver
 /// cannot serve. Moving this side to match would need that consumer moved first.
+/// Whether the committed `pinned_cids` row already names `repo_id` as
+/// first pinner, making a failed redundant `record_pin_source` insert
+/// irrelevant to resolvability (`pin_sources_for_oid` unions the
+/// primary row). Bounded read; any failure (including its own
+/// timeout) answers false — an unproven row never confirms.
+/// Used only after the primary `record_pinata_cid` for this call
+/// succeeded or verified: callers must not promote a row this call
+/// did not establish.
+async fn primary_covers_repo(
+    db: &crate::db::Db,
+    sha: &str,
+    repo_id: &str,
+    deadline: std::time::Instant,
+) -> bool {
+    matches!(
+        crate::ipfs_pin::db_bounded(deadline, db.provenance_for_oid(sha)).await,
+        Ok(Some(owner)) if owner.as_str() == repo_id
+    )
+}
+
 // Ten arguments, over clippy's threshold: the three the budget and the git seam add
 // (`git_bin`, `git_timeout`, `batch_budget`) plus #173's `repo_id` are what put the read
 // under test injection and under a deadline, and grouping them into a struct would only
@@ -535,6 +555,19 @@ pub async fn pin_new_objects(
                 // F1 (#173 round 8): also record the first pinner in pin_repo_sources.
                 // U3: an exhausted retry marks the set incomplete so the resolver keeps
                 // the scan fallback rather than 404ing a copy it could serve.
+                //
+                // Whether the pair stays confirmed depends on what the
+                // PRIMARY `record_pinata_cid` above established: that row
+                // already names this repo as first pinner
+                // (`pin_sources_for_oid` unions it), so the resolver
+                // reaches this copy with or without the redundant
+                // `pin_repo_sources` insert. A source-write failure then
+                // keeps the pair confirmed (but still marks the set
+                // incomplete, preserving the U3 compensation). If the
+                // primary row names ANOTHER repo — or is absent — the
+                // source write was load-bearing and the push stays
+                // suppressed. (The IPFS twin needs no equivalent: its
+                // pin and source land in ONE transaction.)
                 match crate::ipfs_pin::db_bounded(
                     crate::ipfs_pin::db_record_deadline(deadline),
                     crate::ipfs_pin::retry_db_record(|| db.record_pin_source(&sha, repo_id)),
@@ -546,9 +579,7 @@ pub async fn pin_new_objects(
                     // wraps `record_pin_source`, an explicit transaction, so a timed-out
                     // call definitely never committed and the source is definitely
                     // missing. Mark the set incomplete rather than leaving it incomplete
-                    // and unmarked. Round 10 P2: also suppress the (sha, cid) push
-                    // because the durable record set is now incomplete; the next pass
-                    // re-offers the gap.
+                    // and unmarked.
                     Err(e @ crate::ipfs_pin::BoundedDbError::Elapsed) => {
                         tracing::warn!(
                             sha = %sha,
@@ -565,7 +596,16 @@ pub async fn pin_new_objects(
                         {
                             tracing::warn!(sha = %sha, err = %e, "failed to mark pin sources incomplete");
                         }
-                        db_record_durable = false;
+                        if !primary_covers_repo(
+                            db,
+                            &sha,
+                            repo_id,
+                            crate::ipfs_pin::db_record_deadline(deadline),
+                        )
+                        .await
+                        {
+                            db_record_durable = false;
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
@@ -577,7 +617,16 @@ pub async fn pin_new_objects(
                         {
                             tracing::warn!(sha = %sha, err = %e, "failed to mark pin sources incomplete");
                         }
-                        db_record_durable = false;
+                        if !primary_covers_repo(
+                            db,
+                            &sha,
+                            repo_id,
+                            crate::ipfs_pin::db_record_deadline(deadline),
+                        )
+                        .await
+                        {
+                            db_record_durable = false;
+                        }
                     }
                 }
                 if db_record_durable {
@@ -1759,18 +1808,21 @@ mod tests {
         drop(lock);
 
         upload.assert_async().await;
-        // Round 10 P2: a successful upload with the post-upload
-        // source record timing out no longer returns the (sha, cid)
-        // pair. The reconcile contract is "filled iff durable": when
-        // any post-upload DB write fails, the push is suppressed
-        // and the gap is re-offered. Prior to the round 10 fix, the
-        // push fired regardless of the source-record outcome, and
-        // the next pass would re-offer the same gap.
+        // The primary `record_pinata_cid` committed above naming this
+        // repo as first pinner, so `pin_sources_for_oid` resolves the
+        // copy with or without the redundant `pin_repo_sources`
+        // insert: the pair stays confirmed even though the source
+        // record timed out. The incomplete marker below is still set
+        // (compensation preserved); only the suppression is gone.
+        // Prior to the round 10 fix, the push fired regardless of
+        // every post-upload outcome; the correction since is that
+        // confirmation follows the durable primary row, not the
+        // redundant source write.
         assert_eq!(
             pinned.confirmed.len(),
-            0,
-            "record_pin_source timed out (pin_repo_sources locked); the push must be \
-             suppressed so the reconcile does not count a non-durable pair as filled: {pinned:?}"
+            1,
+            "record_pin_source timed out (pin_repo_sources locked) but the primary row \
+             covers this repo, so the pair stays confirmed: {pinned:?}"
         );
         assert!(
             elapsed < Duration::from_secs(8),
@@ -1784,6 +1836,87 @@ mod tests {
              future never reaches `tx.commit()`, so the row definitely did not land, and \
              an incomplete-and-unmarked set is read as complete and 404s a copy this \
              repo would serve"
+        );
+    }
+
+    /// The other half of the source-write contract: when the committed
+    /// primary row names ANOTHER repo as first pinner, the failed
+    /// `record_pin_source` was load-bearing (not redundant) and the
+    /// push stays suppressed. Fixture: a local-only row owned by
+    /// repo-first (no Pinata CID yet), then a Pinata loop as
+    /// repo-second with `pin_repo_sources` locked. The upload lands,
+    /// the primary upsert keeps repo-first, the source insert stalls,
+    /// and coverage fails — so no pair, but the incomplete marker
+    /// still lands and the provider CID is still recorded.
+    #[sqlx::test]
+    async fn pinata_post_upload_stalled_source_without_coverage_suppresses_push(
+        pool: sqlx::PgPool,
+    ) {
+        let db = crate::db::Db::for_testing(pool.clone());
+        db.run_migrations().await.expect("migrations");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().join("pinata_second_source.git");
+        let oids = seed_loose_blobs(&repo_path, 1);
+        let sha = oids[0].clone();
+
+        // A local-only row owned by repo-first: the writer path below
+        // (repo-second, Pinata-only so far) must not claim it.
+        let raw =
+            gitlawb_core::cid::Cid::from_git_object_bytes(b"pinata loop object 0\n").to_string();
+        db.record_pinned_cid_with_source(&sha, &raw, "repo-first")
+            .await
+            .unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let upload = server
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"data":{"cid":"QmSecondSourceProviderCid"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (_logs, _log_guard) = capture_logs();
+        let mut lock = lock_table(&pool, "pin_repo_sources").await;
+
+        let client = reqwest::Client::new();
+        let pinned = tokio::time::timeout(
+            Duration::from_secs(20),
+            pin_new_objects(
+                &client,
+                &server.url(),
+                "test-jwt",
+                &repo_path,
+                "git",
+                Duration::from_secs(30),
+                oids,
+                &db,
+                "repo-second",
+                Duration::from_millis(1500),
+                None,
+            ),
+        )
+        .await
+        .expect("record + coverage ladders are each floored");
+
+        rollback(&mut lock).await;
+        drop(lock);
+
+        upload.assert_async().await;
+        assert!(
+            pinned.confirmed.is_empty(),
+            "repo-second is not covered by the repo-first primary row, so the \
+             failed source write stays suppressing: {pinned:?}"
+        );
+        assert!(
+            db.pin_sources_incomplete(&sha).await.unwrap(),
+            "the compensation marker still lands"
+        );
+        // The primary upsert itself landed (provider CID recorded under
+        // the first-pinner row); only the pair was suppressed.
+        assert!(
+            db.has_pinata_cid(&sha).await.unwrap(),
+            "the committed provider row survives the suppressed push"
         );
     }
 

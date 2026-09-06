@@ -383,6 +383,142 @@ const MAX_TREE_WALK_DEPTH: usize = 64;
 /// structural cost ceiling, not at the scheduler's mercy.
 const MAX_TREE_WALK_INVOCATIONS: usize = 50_000;
 
+/// Cap on retained (oid, path) pairs per walk enumeration. Bounds the
+/// collections a single commit window (or full walk) may retain: one
+/// legal commit with a very wide tree could otherwise allocate
+/// attacker-controlled set cardinality before any pin cap engages.
+/// Sized far past legitimate windows (1000 commits of dense trees)
+/// while failing closed — never partially admitted — on excess.
+const MAX_WALK_ENTRIES: usize = 250_000;
+
+/// Cap on a single git child's stdout bytes retained for parsing.
+/// Bounds the transient output buffer per child; combined with the
+/// entry cap it bounds retained walk memory. The wall-clock deadline
+/// stays as the additional bound.
+const MAX_WALK_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Typed budget-exhaustion signal: the walk hit a materialization
+/// ceiling, not a git or policy failure. Callers distinguish it from
+/// other errors: the sweep SKIPS the window (advancing past content
+/// it refuses to classify partially) while any other walk error
+/// retries the window. Partial results are never treated as complete.
+#[derive(Debug)]
+pub(crate) struct WalkBudgetExceeded;
+
+impl std::fmt::Display for WalkBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "walk materialization budget exceeded")
+    }
+}
+
+impl std::error::Error for WalkBudgetExceeded {}
+
+/// Per-enumeration materialization budget: retained entries, single
+/// child output bytes, and tree-walk subprocess invocations, with the
+/// walked-tree memo shared across every ref target the enumeration
+/// touches (previously the memo and counter reset per ref, multiplying
+/// work by ref count for shared trees).
+///
+/// Scope, stated: ONE budget per enumeration call (one window walk,
+/// one refilter walk, one serve walk). The sweep's per-pass total is
+/// therefore a small constant multiple of the window — bounded, never
+/// history-sized. The memo is shared within the enumeration (the
+/// defect class), not across phases: phases re-derive from the same
+/// window commits, and cross-phase memoizing would couple their
+/// failure modes for no bound improvement. Serve paths construct an
+/// unbounded budget, so their behavior is byte-identical to before;
+/// only the sweep's windowed walks enforce ceilings.
+pub(crate) struct WalkBudget {
+    max_entries: usize,
+    max_output_bytes: usize,
+    max_invocations: usize,
+    entries: usize,
+    invocations: usize,
+    walked: HashSet<String>,
+}
+
+impl WalkBudget {
+    /// Bounded budget for sweep windowed walks.
+    pub(crate) fn bounded() -> Self {
+        WalkBudget {
+            max_entries: MAX_WALK_ENTRIES,
+            max_output_bytes: MAX_WALK_OUTPUT_BYTES,
+            max_invocations: MAX_TREE_WALK_INVOCATIONS,
+            entries: 0,
+            invocations: 0,
+            walked: HashSet::new(),
+        }
+    }
+
+    /// Unbounded budget for legacy full walks (serve/push paths):
+    /// identical behavior to before budgets existed.
+    pub(crate) fn unbounded() -> Self {
+        WalkBudget {
+            max_entries: usize::MAX,
+            max_output_bytes: usize::MAX,
+            max_invocations: usize::MAX,
+            entries: 0,
+            invocations: 0,
+            walked: HashSet::new(),
+        }
+    }
+
+    /// Check one child's retained output size before parsing.
+    pub(crate) fn check_output(&self, len: usize) -> Result<()> {
+        if len > self.max_output_bytes {
+            anyhow::bail!(WalkBudgetExceeded);
+        }
+        Ok(())
+    }
+
+    /// Retain one blob pair, failing closed past the entry ceiling.
+    /// Only genuinely new pairs count: the same blob reachable from a
+    /// thousand commits must not trip the ceiling a thousand times.
+    pub(crate) fn insert_blob(
+        &mut self,
+        set: &mut HashSet<(String, String)>,
+        pair: (String, String),
+    ) -> Result<()> {
+        if set.insert(pair) {
+            self.entries += 1;
+            if self.entries > self.max_entries {
+                anyhow::bail!(WalkBudgetExceeded);
+            }
+        }
+        Ok(())
+    }
+
+    /// Retain one tree pair, failing closed past the entry ceiling.
+    /// Same dedup rule as [`WalkBudget::insert_blob`].
+    pub(crate) fn insert_tree(
+        &mut self,
+        set: &mut HashSet<(String, String)>,
+        pair: (String, String),
+    ) -> Result<()> {
+        if set.insert(pair) {
+            self.entries += 1;
+            if self.entries > self.max_entries {
+                anyhow::bail!(WalkBudgetExceeded);
+            }
+        }
+        Ok(())
+    }
+
+    /// Claim one tree-walk invocation for `oid`: `Ok(true)` means walk
+    /// it (newly memoized), `Ok(false)` means already walked (skip).
+    /// Exceeding the shared invocation ceiling fails closed.
+    pub(crate) fn walk_tree_slot(&mut self, oid: &str) -> Result<bool> {
+        if !self.walked.insert(oid.to_string()) {
+            return Ok(false);
+        }
+        if self.invocations >= self.max_invocations {
+            anyhow::bail!(WalkBudgetExceeded);
+        }
+        self.invocations += 1;
+        Ok(true)
+    }
+}
+
 /// Walk a tree OID recursively via bounded `git ls-tree -z` and
 /// insert every reachable blob and tree OID into `out` with an
 /// empty path. The empty path is the deny-side convention for
@@ -391,11 +527,11 @@ const MAX_TREE_WALK_INVOCATIONS: usize = 50_000;
 /// tip's child blobs, so the empty-path OID is the only correct
 /// shape for the phase-2 catch-all.
 ///
-/// Bounded by `deadline`, `MAX_TREE_WALK_DEPTH`, and
-/// `MAX_TREE_WALK_INVOCATIONS` so a malicious or malformed tree
-/// cannot exhaust the walk. The invocation cap closes the
-/// "wide shallow tree spawns one ls-tree per subtree" hole the
-/// previous wall-clock-only bound left (round 10 P2).
+/// Bounded by `deadline`, `MAX_TREE_WALK_DEPTH`, and the shared
+/// [`WalkBudget`] (memo, invocation ceiling, entry and output
+/// ceilings) so a malicious or malformed tree cannot exhaust the
+/// walk. The memo and counter live in the budget — shared across
+/// every ref target of the enumeration — never per-call locals.
 fn walk_tree_oids_bounded(
     repo_path: &Path,
     git_bin: &str,
@@ -403,17 +539,8 @@ fn walk_tree_oids_bounded(
     deadline: Instant,
     blobs: &mut HashSet<(String, String)>,
     trees: &mut HashSet<(String, String)>,
+    budget: &mut WalkBudget,
 ) -> Result<()> {
-    // Round 10 P2: memo of already-walked tree OIDs so a tree
-    // reachable from N ref tips is walked once, not N times.
-    // Without this, a ref with two tags pointing at the same
-    // tree paid for the ls-tree child process twice.
-    let mut walked: HashSet<String> = HashSet::new();
-    // Round 10 P2: a structural invocation cap. The wall-clock
-    // deadline cannot bound a wide shallow tree that spawns one
-    // `ls-tree` per subtree well inside the depth cap; this
-    // counter is the cost ceiling that actually closes the hole.
-    let mut invocations: usize = 0;
     walk_tree_oids_inner(
         repo_path,
         git_bin,
@@ -422,8 +549,7 @@ fn walk_tree_oids_bounded(
         deadline,
         blobs,
         trees,
-        &mut walked,
-        &mut invocations,
+        budget,
     )
 }
 
@@ -440,8 +566,7 @@ fn walk_tree_oids_inner(
     deadline: Instant,
     blobs: &mut HashSet<(String, String)>,
     trees: &mut HashSet<(String, String)>,
-    walked: &mut HashSet<String>,
-    invocations: &mut usize,
+    budget: &mut WalkBudget,
 ) -> Result<()> {
     if depth > MAX_TREE_WALK_DEPTH {
         anyhow::bail!(
@@ -449,23 +574,16 @@ fn walk_tree_oids_inner(
              refusing to recurse into a malicious or malformed tree chain"
         );
     }
-    // Memo: a tree reachable from multiple ref tips or from
-    // multiple parents (rare but legal in git) is walked once.
-    if !walked.insert(tree_oid.to_string()) {
+    // Shared memo: a tree reachable from multiple ref tips or from
+    // multiple parents (rare but legal in git) is walked once per
+    // budget scope, not once per ref.
+    if !budget.walk_tree_slot(tree_oid)? {
         return Ok(());
     }
-    if *invocations >= MAX_TREE_WALK_INVOCATIONS {
-        anyhow::bail!(
-            "tree walk exceeded {MAX_TREE_WALK_INVOCATIONS} ls-tree invocations \
-             (rooted at {tree_oid}); refusing to recurse into a wide or \
-             densely-referenced tree graph"
-        );
-    }
-    *invocations += 1;
     // The tree itself enters the withheld set keyed on OID. The
     // filtered pack serves trees by OID, so omitting the tree
     // would let a withheld subtree leak its parent.
-    trees.insert((tree_oid.to_string(), String::new()));
+    budget.insert_tree(trees, (tree_oid.to_string(), String::new()))?;
     let ls = run_bounded_git(
         git_bin,
         &["ls-tree", "-z", tree_oid],
@@ -473,6 +591,7 @@ fn walk_tree_oids_inner(
         b"",
         deadline,
     )?;
+    budget.check_output(ls.len())?;
     let stdout = match std::str::from_utf8(&ls) {
         Ok(s) => s,
         Err(_) => {
@@ -511,7 +630,7 @@ fn walk_tree_oids_inner(
         };
         match kind {
             "blob" => {
-                blobs.insert((child_oid.to_string(), String::new()));
+                budget.insert_blob(blobs, (child_oid.to_string(), String::new()))?;
             }
             "tree" => {
                 walk_tree_oids_inner(
@@ -522,8 +641,7 @@ fn walk_tree_oids_inner(
                     deadline,
                     blobs,
                     trees,
-                    walked,
-                    invocations,
+                    budget,
                 )?;
             }
             _ => {
@@ -619,7 +737,10 @@ fn blob_paths(repo_path: &Path, git_bin: &str, timeout: Duration) -> Result<Vec<
     // Phase 2: enumerate non-commit ref targets through the shared
     // extractor below (typed blob/tree sets; tag objects ignored here —
     // `blob_paths` feeds the deny side, which classifies by OID).
-    let nc = non_commit_ref_sets(repo_path, git_bin, deadline)?;
+    // Unbounded budget: serve-path walks keep their deadline-only
+    // bounds; ceilings apply to the sweep's windowed walks.
+    let mut budget = WalkBudget::unbounded();
+    let nc = non_commit_ref_sets(repo_path, git_bin, deadline, &mut budget)?;
     out.extend(nc.blobs);
     out.extend(nc.trees);
     Ok(out.into_iter().collect())
@@ -682,6 +803,7 @@ pub(crate) fn non_commit_ref_sets(
     repo_path: &Path,
     git_bin: &str,
     deadline: Instant,
+    budget: &mut WalkBudget,
 ) -> Result<NonCommitRefSets> {
     let mut blobs: HashSet<ObjectPath> = HashSet::new();
     let mut trees: HashSet<ObjectPath> = HashSet::new();
@@ -696,6 +818,7 @@ pub(crate) fn non_commit_ref_sets(
         b"",
         deadline,
     )?;
+    budget.check_output(refs_out.len())?;
     let refs_stdout = String::from_utf8_lossy(&refs_out);
     for line in refs_stdout.lines() {
         let line = line.trim();
@@ -716,15 +839,19 @@ pub(crate) fn non_commit_ref_sets(
         };
         // An annotated tag object at the tip is structural metadata
         // (pinned like a commit by sweep candidates); its referent is
-        // classified by the arms below.
+        // classified by the arms below. The chain behind the tip is
+        // walked too: on git 2.50 the peel atoms report only the final
+        // referent, so inner tags would otherwise be invisible here
+        // despite naming part of the reachable graph.
         if kind == "tag" {
             tag_oids.push(oid.to_string());
+            collect_tag_chain_oids(repo_path, git_bin, oid, deadline, &mut tag_oids);
         }
         // Commit tips are already covered by the rev-list walk above.
         // Direct blob tips (lightweight tag of a blob, raw blobref) are
         // inserted as-is.
         if kind == "blob" {
-            blobs.insert((oid.to_string(), String::new()));
+            budget.insert_blob(&mut blobs, (oid.to_string(), String::new()))?;
         }
         // P1 (reviewer round 9): direct TREE tips must walk their
         // children. A bare `mktree` published as a raw ref tip (or
@@ -733,7 +860,9 @@ pub(crate) fn non_commit_ref_sets(
         // to the deny-side `rev_list_keep`) but invisible to phase
         // 2 if phase 2 only inserts the tree OID. Walk it.
         if kind == "tree" {
-            walk_tree_oids_bounded(repo_path, git_bin, oid, deadline, &mut blobs, &mut trees)?;
+            walk_tree_oids_bounded(
+                repo_path, git_bin, oid, deadline, &mut blobs, &mut trees, budget,
+            )?;
         }
         if let Some((peeled_oid, peeled_kind)) = peeled {
             match peeled_kind {
@@ -741,13 +870,13 @@ pub(crate) fn non_commit_ref_sets(
                 // `rev-list --objects --all` serves, so it is what must
                 // enter the withheld set (round-8 P1).
                 "blob" => {
-                    blobs.insert((peeled_oid.to_string(), String::new()));
+                    budget.insert_blob(&mut blobs, (peeled_oid.to_string(), String::new()))?;
                 }
                 // P1 (reviewer round 9): annotated-tag-of-tree must
                 // walk the tree the same way a direct tree tip does.
                 "tree" => {
                     walk_tree_oids_bounded(
-                        repo_path, git_bin, peeled_oid, deadline, &mut blobs, &mut trees,
+                        repo_path, git_bin, peeled_oid, deadline, &mut blobs, &mut trees, budget,
                     )?;
                 }
                 // A tag peeling to a commit contributes nothing new:
@@ -789,11 +918,12 @@ pub(crate) fn non_commit_ref_sets(
                     let ty = String::from_utf8_lossy(&ty_out).trim().to_string();
                     match ty.as_str() {
                         "blob" => {
-                            blobs.insert((full_oid, String::new()));
+                            budget.insert_blob(&mut blobs, (full_oid, String::new()))?;
                         }
                         "tree" => {
                             walk_tree_oids_bounded(
                                 repo_path, git_bin, &full_oid, deadline, &mut blobs, &mut trees,
+                                budget,
                             )?;
                         }
                         _ => {}
@@ -810,6 +940,71 @@ pub(crate) fn non_commit_ref_sets(
         trees,
         tag_oids,
     })
+}
+
+/// Collect every intermediate annotated-tag OID on the chain rooted at
+/// `tip` (the tip itself is already recorded by the caller). Follows
+/// `object` while `type` is `tag`, one bounded `cat-file` per level,
+/// stopping at the first non-tag referent, on any parse/child error,
+/// on a cycle (already-seen OID), or at [`MAX_TAG_CHAIN_DEPTH`].
+/// Truncation keeps the collected prefix rather than bailing: inner
+/// tags feed only structural candidate pins, so stopping early delays
+/// those pins without under-withholding anything or failing the walk
+/// (contrast [`walk_tag_chain`], whose reachability set must be exact
+/// for the serve path and therefore fails closed).
+fn collect_tag_chain_oids(
+    repo_path: &Path,
+    git_bin: &str,
+    tip: &str,
+    deadline: Instant,
+    tag_oids: &mut Vec<String>,
+) {
+    let mut current = tip.to_string();
+    for _ in 0..MAX_TAG_CHAIN_DEPTH {
+        let body = match run_bounded_git(
+            git_bin,
+            &["cat-file", "tag", &current],
+            repo_path,
+            b"",
+            deadline,
+        ) {
+            Ok(out) => out,
+            Err(_) => return,
+        };
+        let body = match std::str::from_utf8(&body) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        // Tag headers list `object` then `type`, then a blank line.
+        // A non-tag target ends the chain; its own handling lives in
+        // the peel arms, not here.
+        let mut target_oid: Option<String> = None;
+        let mut target_kind: Option<String> = None;
+        for line in body.lines() {
+            if line.is_empty() {
+                break;
+            }
+            if let Some(oid) = line.strip_prefix("object ") {
+                target_oid = Some(oid.trim().to_string());
+            } else if let Some(kind) = line.strip_prefix("type ") {
+                target_kind = Some(kind.trim().to_string());
+            }
+        }
+        match (target_oid, target_kind) {
+            (Some(oid), Some(kind)) if kind == "tag" && !oid.is_empty() => {
+                if tag_oids.contains(&oid) {
+                    return;
+                }
+                tag_oids.push(oid.clone());
+                current = oid;
+            }
+            _ => return,
+        }
+    }
+    tracing::warn!(
+        tip = %tip,
+        "annotated-tag chain exceeded depth bound; collected prefix only"
+    );
 }
 
 /// All reachable blob and tree OIDs with their paths, derived from one bounded
@@ -921,6 +1116,7 @@ fn ls_tree_sets_for_commits(
     git_bin: &str,
     deadline: Instant,
     commits: &[String],
+    budget: &mut WalkBudget,
 ) -> Result<(HashSet<ObjectPath>, HashSet<ObjectPath>)> {
     let mut blob_set: HashSet<ObjectPath> = HashSet::new();
     let mut tree_set: HashSet<ObjectPath> = HashSet::new();
@@ -949,6 +1145,11 @@ fn ls_tree_sets_for_commits(
             b"",
             deadline,
         )?;
+        // Materialization ceiling: a single legal commit with a very
+        // wide tree can emit attacker-controlled output before any
+        // pin cap engages. Fail closed on oversize output instead of
+        // parsing and retaining it.
+        budget.check_output(listing_out.len())?;
         let Ok(listing_stdout) = std::str::from_utf8(&listing_out) else {
             anyhow::bail!(
                 "git ls-tree -r -t -z {commit} returned a non-UTF-8 path; \
@@ -966,12 +1167,12 @@ fn ls_tree_sets_for_commits(
             match kind {
                 Some("blob") => {
                     if let Some(oid) = oid {
-                        blob_set.insert((oid.to_string(), format!("/{path}")));
+                        budget.insert_blob(&mut blob_set, (oid.to_string(), format!("/{path}")))?;
                     }
                 }
                 Some("tree") => {
                     if let Some(oid) = oid {
-                        tree_set.insert((oid.to_string(), format!("/{path}")));
+                        budget.insert_tree(&mut tree_set, (oid.to_string(), format!("/{path}")))?;
                     }
                 }
                 _ => {}
@@ -1017,8 +1218,9 @@ fn all_object_paths(
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect();
+    let mut budget = WalkBudget::unbounded();
     let (mut blob_set, mut tree_set) =
-        ls_tree_sets_for_commits(repo_path, git_bin, deadline, &commits)?;
+        ls_tree_sets_for_commits(repo_path, git_bin, deadline, &commits, &mut budget)?;
     // OID-only indexes for the phase 2 membership check below. Without
     // these the catch-all branch does O(O×P) `blob_set.iter().any(...)`
     // scans, which on a 50k-object repo runs hundreds of millions of
@@ -1104,9 +1306,11 @@ pub(crate) fn enumerate_commit_window(
     git_bin: &str,
     deadline: Instant,
     commits: &[String],
+    budget: &mut WalkBudget,
 ) -> Result<WindowEnumeration> {
-    let (blob_set, tree_set) = ls_tree_sets_for_commits(repo_path, git_bin, deadline, commits)?;
-    let nc = non_commit_ref_sets(repo_path, git_bin, deadline)?;
+    let (blob_set, tree_set) =
+        ls_tree_sets_for_commits(repo_path, git_bin, deadline, commits, budget)?;
+    let nc = non_commit_ref_sets(repo_path, git_bin, deadline, budget)?;
     let mut blob_pairs: Vec<ObjectPath> = blob_set.into_iter().collect();
     let mut tree_pairs: Vec<ObjectPath> = tree_set.into_iter().collect();
     blob_pairs.extend(nc.blobs);
@@ -1732,6 +1936,15 @@ pub fn allowed_tree_set_for_caller_bounded(
 /// truncating silently (which would under-withhold a still-reachable tag object).
 const MAX_TAG_OBJECTS: usize = 8192;
 
+/// Chain-depth bound for [`collect_tag_chain_oids`] below. Real annotated-tag
+/// chains are one or two levels; 64 is orders past legitimate use and bounds
+/// a malicious tag cycle (which git permits as loose objects) to a fixed
+/// number of bounded children. Truncation keeps the collected prefix (see
+/// the function): unlike [`walk_tag_chain`]'s reachability set, a missing
+/// inner tag only delays a structural pin, so bailing the whole walk
+/// would trade a bounded gap for unbounded unavailability.
+const MAX_TAG_CHAIN_DEPTH: usize = 64;
+
 /// Walk the annotated-tag chains rooted at `seeds`, inserting every tag object they
 /// pass through into `set`. A tag whose target is itself a tag (tag-of-a-tag)
 /// discovers the inner tag, which is walked in a later round.
@@ -1973,7 +2186,7 @@ pub fn allowed_blob_tree_sets_bounded(
 ) -> Result<BlobTreeSets> {
     let (blob_pairs, tree_pairs) = all_object_paths(repo_path, git_bin, deadline)?;
     let commits = reachable_commit_oids(repo_path, git_bin, deadline)?;
-    classify_object_pairs(
+    let (sets, _) = classify_object_pairs(
         repo_path,
         git_bin,
         deadline,
@@ -1983,7 +2196,8 @@ pub fn allowed_blob_tree_sets_bounded(
         &blob_pairs,
         &tree_pairs,
         &commits,
-    )
+    )?;
+    Ok(sets)
 }
 
 /// Windowed twin of [`allowed_blob_tree_sets_bounded`]: enumerate exactly
@@ -2000,8 +2214,11 @@ pub(crate) fn allowed_blob_tree_sets_for_commits(
     owner_did: &str,
     commits: &[String],
 ) -> Result<BlobTreeSets> {
-    let window = enumerate_commit_window(repo_path, git_bin, deadline, commits)?;
-    classify_object_pairs(
+    // Fresh bounded budget per call: one window's enumeration shares
+    // memo and ceilings; separate calls do not accumulate.
+    let mut budget = WalkBudget::bounded();
+    let window = enumerate_commit_window(repo_path, git_bin, deadline, commits, &mut budget)?;
+    let (sets, _) = classify_object_pairs(
         repo_path,
         git_bin,
         deadline,
@@ -2011,7 +2228,8 @@ pub(crate) fn allowed_blob_tree_sets_for_commits(
         &window.blob_pairs,
         &window.tree_pairs,
         &window.commits,
-    )
+    )?;
+    Ok(sets)
 }
 
 /// Shared allow/deny classification over an explicit pair listing: the
@@ -2023,6 +2241,13 @@ pub(crate) fn allowed_blob_tree_sets_for_commits(
 /// the full reachable set for the whole-repo walk, the window for a
 /// windowed walk. Commits and tags are not classified here — the caller
 /// decides per type whether the allow-set applies.
+///
+/// Returns the four allow/universe sets plus the admitted root OIDs: a
+/// root tree carries no path (ls-tree lists entries *under* it), so no
+/// pair listing can name it and callers that build candidates from
+/// walked pairs would omit the tree a commit names directly. Only
+/// structurally safe roots are returned; a root that names withheld
+/// content is excluded here, never admitted.
 ///
 /// #218 review P1b: enumerate every given commit's root tree OID so
 /// the structural entry-level check can be applied to each: one
@@ -2044,9 +2269,10 @@ pub(crate) fn classify_object_pairs(
     blob_pairs: &[ObjectPath],
     tree_pairs: &[ObjectPath],
     root_commits: &[String],
-) -> Result<BlobTreeSets> {
+) -> Result<(BlobTreeSets, Vec<String>)> {
     let all_blob_oids: HashSet<String> = blob_pairs.iter().map(|(oid, _)| oid.clone()).collect();
-    let all_tree_oids: HashSet<String> = tree_pairs.iter().map(|(oid, _)| oid.clone()).collect();
+    let mut all_tree_oids: HashSet<String> =
+        tree_pairs.iter().map(|(oid, _)| oid.clone()).collect();
     let mut allowed_blobs = HashSet::new();
     for (oid, path) in blob_pairs {
         // #218 review round 9 (guidance #1): the empty-path
@@ -2104,16 +2330,27 @@ pub(crate) fn classify_object_pairs(
     // entry is safe at the root and (for tree entries) the child
     // tree is itself structurally safe. The check is recursive, so
     // a denied subtree propagates up to the root.
+    // Admitted roots join the tree universe as well as the allow set:
+    // the fail-closed filter below then verifies every root candidate
+    // against the allow list instead of passing it through as
+    // unclassified structural metadata. A denied root is in neither,
+    // so it can never reach a candidate list built from this result.
+    let mut admitted_roots: Vec<String> = Vec::new();
     for root_oid in root_tree_oids(repo_path, git_bin, root_commits, deadline)? {
         if visibility_check(rules, is_public, owner_did, None, "/") != Decision::Allow {
             continue;
         }
         if tree_structurally_safe(&ctx, &root_oid, "/", &mut allowed_trees, deadline)? {
-            allowed_trees.insert(root_oid);
+            allowed_trees.insert(root_oid.clone());
+            all_tree_oids.insert(root_oid.clone());
+            admitted_roots.push(root_oid);
         }
     }
 
-    Ok((allowed_blobs, allowed_trees, all_blob_oids, all_tree_oids))
+    Ok((
+        (allowed_blobs, allowed_trees, all_blob_oids, all_tree_oids),
+        admitted_roots,
+    ))
 }
 
 /// Objects safe to replicate, failing closed on blobs (#99) and denied trees
@@ -4349,7 +4586,8 @@ esac\n";
         let window = rev_list_commit_window(&bare, &git, deadline, 0, 2).unwrap();
         assert_eq!(window, oids[0..2]);
         std::fs::write(&count_file, "").unwrap();
-        let _ = enumerate_commit_window(&bare, &git, deadline, &window).unwrap();
+        let mut walk_budget = WalkBudget::bounded();
+        let _ = enumerate_commit_window(&bare, &git, deadline, &window, &mut walk_budget).unwrap();
         assert_eq!(
             count_invocations(&count_file, "ls-tree"),
             2,
@@ -4360,7 +4598,8 @@ esac\n";
         std::fs::write(&count_file, "").unwrap();
         let full = rev_list_commit_window(&bare, &git, deadline, 0, 100).unwrap();
         assert_eq!(full.len(), 6);
-        let _ = enumerate_commit_window(&bare, &git, deadline, &full).unwrap();
+        let mut walk_budget = WalkBudget::bounded();
+        let _ = enumerate_commit_window(&bare, &git, deadline, &full, &mut walk_budget).unwrap();
         assert_eq!(
             count_invocations(&count_file, "ls-tree"),
             6,
@@ -4399,7 +4638,8 @@ esac\n";
         }
         let window2 = rev_list_commit_window(&bare, &git, deadline, 0, 2).unwrap();
         std::fs::write(&count_file, "").unwrap();
-        let _ = enumerate_commit_window(&bare, &git, deadline, &window2).unwrap();
+        let mut walk_budget = WalkBudget::bounded();
+        let _ = enumerate_commit_window(&bare, &git, deadline, &window2, &mut walk_budget).unwrap();
         assert_eq!(
             count_invocations(&count_file, "ls-tree"),
             2,
@@ -4502,7 +4742,7 @@ esac\n";
         );
         let full_commits = rev_list_commit_window(&bare, "git", deadline, 0, 100).unwrap();
         assert_eq!(full_commits.len(), 5);
-        let full_sets = classify_object_pairs(
+        let (full_sets, _) = classify_object_pairs(
             &bare,
             "git",
             deadline,
@@ -4534,8 +4774,10 @@ esac\n";
             if window.is_empty() {
                 break;
             }
-            let e = enumerate_commit_window(&bare, "git", deadline, &window).unwrap();
-            let sets = classify_object_pairs(
+            let mut walk_budget = WalkBudget::bounded();
+            let e =
+                enumerate_commit_window(&bare, "git", deadline, &window, &mut walk_budget).unwrap();
+            let (sets, _) = classify_object_pairs(
                 &bare,
                 "git",
                 deadline,
@@ -4598,7 +4840,9 @@ esac\n";
             if window.is_empty() {
                 break;
             }
-            let e = enumerate_commit_window(&bare, "git", deadline, &window).unwrap();
+            let mut walk_budget = WalkBudget::bounded();
+            let e =
+                enumerate_commit_window(&bare, "git", deadline, &window, &mut walk_budget).unwrap();
             window_pairs.extend(e.blob_pairs);
             window_pairs.extend(e.tree_pairs);
         }
@@ -4606,6 +4850,122 @@ esac\n";
         assert!(
             recips.get(&secret_blob).is_some_and(|s| s.contains(OWNER)),
             "denied blob must reach the owner recovery set through windowed pairs"
+        );
+    }
+
+    /// Nested annotated-tag chains contribute every intermediate tag
+    /// object not just the tip: outer tag -> inner tag -> blob (and
+    /// outer -> inner -> tree), first with both refs present, then with
+    /// the inner ref deleted. The inner object must be collected in both
+    /// cases — by chain walking, not ref listing — alongside the peeled
+    /// referent. Otherwise deleting the inner ref (or losing local
+    /// storage after a sweep that never pinned it) leaves the outer tag
+    /// unpeelable despite a durable outer pin.
+    #[test]
+    fn non_commit_ref_sets_collects_nested_tag_chain() {
+        let td = TempDir::new().unwrap();
+        let bare_path = td.path().join("bare.git");
+        // init runs in the tempdir (the bare dir does not exist yet).
+        assert!(
+            Command::new("git")
+                .args(["init", "-q", "--bare", bare_path.to_str().unwrap()])
+                .current_dir(td.path())
+                .status()
+                .unwrap()
+                .success(),
+            "git init --bare failed"
+        );
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&bare_path)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        // Annotated tags need an identity even in a bare repo (CI has
+        // no global git identity).
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        // run() borrows bare_path via closure; helpers below need &Path.
+        let bare = bare_path.as_path();
+
+        // Shape 1: outer tag -> inner tag -> blob.
+        let blob = make_blob(bare, b"nested tag target\n");
+        run(&["tag", "-a", "-m", "inner", "innerref", &blob]);
+        let inner = {
+            let out = Command::new("git")
+                .args(["rev-parse", "innerref"])
+                .current_dir(bare)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["tag", "-a", "-m", "outer", "outerref", &inner]);
+        let outer = {
+            let out = Command::new("git")
+                .args(["rev-parse", "outerref"])
+                .current_dir(bare)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // Shape 2: outer tag -> inner tag -> tree.
+        let tree_out = Command::new("git")
+            .args(["mktree"])
+            .current_dir(bare)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(tree_out.status.success(), "git mktree empty tree");
+        let tree = String::from_utf8_lossy(&tree_out.stdout).trim().to_string();
+        run(&["tag", "-a", "-m", "inner2", "innerref2", &tree]);
+        let inner2 = {
+            let out = Command::new("git")
+                .args(["rev-parse", "innerref2"])
+                .current_dir(bare)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["tag", "-a", "-m", "outer2", "outerref2", &inner2]);
+
+        let deadline = Instant::now() + WALK_TIMEOUT;
+        let mut walk_budget = WalkBudget::bounded();
+        let sets = non_commit_ref_sets(bare, "git", deadline, &mut walk_budget).unwrap();
+        assert!(
+            sets.tag_oids.contains(&outer) && sets.tag_oids.contains(&inner),
+            "both tag objects collected with refs present, not just the tip"
+        );
+        assert!(
+            sets.blobs.iter().any(|(o, _)| o == &blob),
+            "peeled blob classified with refs present"
+        );
+        assert!(
+            sets.tag_oids.contains(&inner2),
+            "tree-chain inner tag collected"
+        );
+
+        // Delete the inner refs: the inner objects are now reachable
+        // ONLY through the outer chains. Collection must not depend on
+        // ref listing.
+        run(&["update-ref", "-d", "refs/tags/innerref"]);
+        run(&["update-ref", "-d", "refs/tags/innerref2"]);
+        let mut walk_budget2 = WalkBudget::bounded();
+        let sets2 = non_commit_ref_sets(bare, "git", deadline, &mut walk_budget2).unwrap();
+        for oid in [&outer, &inner, &inner2] {
+            assert!(
+                sets2.tag_oids.contains(oid),
+                "inner tag {oid} must survive inner-ref deletion via chain walking"
+            );
+        }
+        assert!(
+            sets2.blobs.iter().any(|(o, _)| o == &blob),
+            "peeled blob still classified after inner-ref deletion"
         );
     }
 

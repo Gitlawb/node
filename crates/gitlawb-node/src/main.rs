@@ -661,6 +661,7 @@ async fn main() -> Result<()> {
             node_did,
             pin_sem,
             shutdown_rx,
+            Some(state.repo_store.clone()),
         ) {
             info!("reconciliation sweep worker started");
         }
