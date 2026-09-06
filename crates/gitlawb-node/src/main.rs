@@ -2332,6 +2332,86 @@ mod identity_key_storage_tests {
                     .expect("a boot after the injected failure must load the published key");
                 println!("identity-key-umask: refused did={}", kp.did());
             }
+            // One process of a real concurrent first boot. Every child of a
+            // race runs this arm; the driver owns the tree assertions, because
+            // only it knows the race has finished.
+            "concurrent-first-boot" => {
+                let barrier = std::path::PathBuf::from(
+                    std::env::var("GITLAWB_TEST_BARRIER").expect("GITLAWB_TEST_BARRIER"),
+                );
+                let id = std::env::var("GITLAWB_TEST_RACE_ID").expect("GITLAWB_TEST_RACE_ID");
+                let role = std::env::var("GITLAWB_TEST_RACE_ROLE").expect("GITLAWB_TEST_RACE_ROLE");
+                let key = base.join("one").join("two").join("identity.pem");
+
+                // Two-phase rendezvous: each child announces itself with
+                // `ready.<id>` and then spins on `go`, which the driver creates
+                // only once every ready file is present. Chosen over a shared
+                // wake-up timestamp because a deadline bounds only the skew it
+                // cannot observe: a child that is slow to exec still arrives
+                // late and the race never overlaps. Here every child is already
+                // inside the spin loop before `go` can appear, so the spread
+                // across the racing call is one loop iteration rather than the
+                // tens of milliseconds a process takes to start. The deadline
+                // exists so a child whose sibling died never hangs the suite.
+                std::fs::write(barrier.join(format!("ready.{id}")), b"")
+                    .expect("announce readiness at the starting barrier");
+                let go = barrier.join("go");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                while !go.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the starting barrier never opened"
+                    );
+                    std::hint::spin_loop();
+                }
+
+                // The `fail-write` role is the only injected part of the race,
+                // and it is what puts a REAL second process into the window
+                // section 7 of the plan describes: this child creates a
+                // component, the other adopts it, this one fails before either
+                // has written, and its rollback reaches the still-empty
+                // directory the other is holding open.
+                if role == "fail-write" {
+                    p2p::FAIL_KEY_WRITE.with(|f| f.set(true));
+                }
+                let result = load_or_create_keypair_at(&key);
+                p2p::FAIL_KEY_WRITE.with(|f| f.set(false));
+
+                match result {
+                    Ok(kp) => {
+                        // A boot that reports success must have the identity it
+                        // returned on disk, at 0600, and readable as a keypair.
+                        // Checked here rather than in the driver so a success
+                        // that raced with a rollback is attributed to the
+                        // process that claimed it.
+                        let mode = identity_mode_of(&key);
+                        assert_eq!(
+                            mode,
+                            IDENTITY_WANT_KEY_MODE,
+                            "a successful concurrent boot published {} at {mode:04o}, requested \
+                             0600",
+                            key.display()
+                        );
+                        let pem = std::fs::read_to_string(&key)
+                            .unwrap_or_else(|e| panic!("read {}: {e}", key.display()));
+                        let on_disk = Keypair::from_pem(&pem)
+                            .expect("a successful concurrent boot must leave a loadable keypair");
+                        assert_eq!(
+                            on_disk.did().to_string(),
+                            kp.did().to_string(),
+                            "a successful boot must return the identity that is on disk"
+                        );
+                        println!("identity-key-race: ok did={}", kp.did());
+                    }
+                    Err(err) => {
+                        // One line so the driver can classify it; the anyhow
+                        // chain is multi-line under `{:#}` only when a context
+                        // carries a newline, but flattening is free insurance.
+                        let text = format!("{err:#}").replace('\n', " ");
+                        println!("identity-key-race: err {text}");
+                    }
+                }
+            }
             other => panic!("unknown layout {other}"),
         }
     }
@@ -2585,6 +2665,271 @@ mod identity_key_storage_tests {
             "the row and umask filters selected no child; a matrix that runs nothing is not a \
              passing matrix"
         );
+    }
+
+    /// Two or more real first boots racing the same multi-level missing key
+    /// path.
+    ///
+    /// The rollback added by this round can remove an intermediate a concurrent
+    /// boot has already adopted, so the plan's section 7 claims both processes
+    /// still fail closed. That claim was reasoned, not executed. This drives it
+    /// with real processes: `umask` and the injection hooks are process-global,
+    /// so threads inside one process would not be the production path.
+    ///
+    /// The race is nondeterministic and the assertions are not. Nothing here
+    /// asserts a particular interleaving; every check is a property that must
+    /// hold for all of them, so the test is deterministic in PASS/FAIL:
+    ///
+    /// * a boot that reports success has its own identity on disk at 0600 and
+    ///   parseable (asserted in the child, which is the process that claimed
+    ///   it);
+    /// * every surviving directory this run created is exactly 0700, never
+    ///   group or world writable;
+    /// * every successful boot agrees on the DID;
+    /// * if no boot succeeded, nothing partial is left (no key, no scratch) and
+    ///   a retry in this process then succeeds, which is the explicit form of
+    ///   "fail closed and recover on the next boot".
+    #[cfg(unix)]
+    #[test]
+    fn identity_concurrent_first_boots_fail_closed() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+
+        const OK_SENTINEL: &str = "identity-key-race: ok did=";
+        const ERR_SENTINEL: &str = "identity-key-race: err ";
+        // 0002 is the mask that produced finding 1, so a directory this run
+        // creates without pinning it lands 0775 and the exact-mode assertions
+        // below catch it.
+        const RACE_UMASK: &str = "0002";
+
+        // (arm, one role per child). The pure arm is three unaided first boots.
+        // The other two add losers that fail after the walk and before any key
+        // is written, so their rollback reaches a directory a sibling may
+        // already hold open: that is the window the plan describes and the only
+        // injected part of the race. Two children hit it rarely, because the
+        // winner reaches its scratch file before a single loser reaches its
+        // rmdir; four losers against one unaided boot hit it often, so the
+        // pressure arm is what actually executes the interleaving. The
+        // assertions do not depend on which arm hits it.
+        let arms: &[(&str, &[&str])] = &[
+            ("pure", &["pure", "pure", "pure"][..]),
+            ("loser-fails", &["fail-write", "pure"][..]),
+            (
+                "rollback-pressure",
+                &[
+                    "fail-write",
+                    "fail-write",
+                    "fail-write",
+                    "fail-write",
+                    "pure",
+                ][..],
+            ),
+        ];
+
+        // A single run of a nondeterministic test proves very little, so the
+        // default loops the whole race; raise it through the env for a longer
+        // shake without editing the test.
+        let iterations: usize = std::env::var("GITLAWB_TEST_RACE_ITERATIONS")
+            .ok()
+            .map(|v| {
+                v.parse()
+                    .expect("GITLAWB_TEST_RACE_ITERATIONS must be a count")
+            })
+            .unwrap_or(50);
+        assert!(iterations > 0, "a race run zero times proves nothing");
+
+        #[derive(Default)]
+        struct Tally {
+            all_ok: usize,
+            some_ok: usize,
+            none_ok: usize,
+            /// A boot refused because the directory it was holding had been
+            /// removed under it: the interleaving section 7 describes.
+            adopted_dir_unlinked: usize,
+        }
+        let mut tallies: Vec<(&str, Tally)> = arms
+            .iter()
+            .map(|(name, _)| (*name, Tally::default()))
+            .collect();
+
+        for iteration in 0..iterations {
+            for (arm_idx, (arm, roles)) in arms.iter().enumerate() {
+                let base = tempfile::tempdir().unwrap();
+                std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                let barrier = tempfile::tempdir().unwrap();
+                let one = base.path().join("one");
+                let two = one.join("two");
+                let key = two.join("identity.pem");
+                let label = format!("arm={arm} iteration={iteration}");
+
+                let mut children = Vec::new();
+                for (id, role) in roles.iter().enumerate() {
+                    let mut cmd =
+                        std::process::Command::new(std::env::current_exe().expect("current_exe"));
+                    cmd.args([
+                        "identity_key_storage_tests::fixture_identity_key_under_hostile_umask",
+                        "--exact",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("GITLAWB_TEST_FIXTURE", "identity-key-umask")
+                    .env("GITLAWB_TEST_BASE", base.path())
+                    .env("GITLAWB_TEST_UMASK", RACE_UMASK)
+                    .env("GITLAWB_TEST_LAYOUT", "concurrent-first-boot")
+                    .env("GITLAWB_TEST_PHASE", "create")
+                    .env("GITLAWB_TEST_BARRIER", barrier.path())
+                    .env("GITLAWB_TEST_RACE_ID", id.to_string())
+                    .env("GITLAWB_TEST_RACE_ROLE", *role)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                    children.push(cmd.spawn().expect("spawn a racing identity boot"));
+                }
+
+                // Open the barrier only once every child has announced itself.
+                // If one died before announcing, the deadline lets the run
+                // proceed to the exit-status assertion below rather than hang.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                loop {
+                    let ready = (0..roles.len())
+                        .filter(|id| barrier.path().join(format!("ready.{id}")).exists())
+                        .count();
+                    if ready == roles.len() || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                std::fs::write(barrier.path().join("go"), b"").expect("open the starting barrier");
+
+                let mut oks = Vec::new();
+                let mut errs = Vec::new();
+                for (id, child) in children.into_iter().enumerate() {
+                    let output = child.wait_with_output().expect("await a racing boot");
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let who = format!("{label} child={id} role={}", roles[id]);
+                    assert!(
+                        output.status.success(),
+                        "{who}: the racing fixture must pass whichever way the race went\n\
+                         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+                    );
+                    assert!(
+                        stdout.contains("1 passed"),
+                        "{who}: filter must select one passing test\n{stdout}"
+                    );
+                    let line = stdout
+                        .lines()
+                        .find(|l| l.starts_with("identity-key-race: "))
+                        .unwrap_or_else(|| {
+                            panic!("{who}: the child must report its outcome\n{stdout}")
+                        });
+                    if let Some(did) = line.strip_prefix(OK_SENTINEL) {
+                        oks.push(did.trim().to_string());
+                    } else if let Some(text) = line.strip_prefix(ERR_SENTINEL) {
+                        errs.push((roles[id], text.to_string()));
+                    } else {
+                        panic!("{who}: unrecognized outcome line {line:?}");
+                    }
+                }
+
+                // Invariant: every surviving directory this run created is
+                // exactly 0700. A missing one is legal (a loser rolled it
+                // back); a group or world writable one never is.
+                for d in [&one, &two] {
+                    if d.exists() {
+                        let mode = identity_mode_of(d);
+                        assert_eq!(
+                            mode,
+                            IDENTITY_WANT_DIR_MODE,
+                            "{label}: surviving directory {} achieved mode {mode:04o}, requested \
+                             {:04o}",
+                            d.display(),
+                            IDENTITY_WANT_DIR_MODE
+                        );
+                        let residue: Vec<String> = std::fs::read_dir(d)
+                            .expect("read a surviving directory")
+                            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                            .filter(|n| n.starts_with(".p2p.key.") && n.ends_with(".tmp"))
+                            .collect();
+                        assert!(
+                            residue.is_empty(),
+                            "{label}: a finished race must leave no scratch behind in {}: \
+                             {residue:?}",
+                            d.display()
+                        );
+                    }
+                }
+
+                if key.exists() {
+                    // Invariant: the published key is 0600 and loadable, and
+                    // every boot that reported success agrees on it.
+                    let mode = identity_mode_of(&key);
+                    assert_eq!(
+                        mode, IDENTITY_WANT_KEY_MODE,
+                        "{label}: the surviving key achieved mode {mode:04o}, requested 0600"
+                    );
+                    let mut pem = String::new();
+                    std::fs::File::open(&key)
+                        .expect("open the surviving key")
+                        .read_to_string(&mut pem)
+                        .expect("read the surviving key");
+                    let on_disk = Keypair::from_pem(&pem)
+                        .expect("the surviving key must parse as a keypair")
+                        .did()
+                        .to_string();
+                    for did in &oks {
+                        assert_eq!(
+                            *did, on_disk,
+                            "{label}: a successful boot reported an identity the disk does not \
+                             hold"
+                        );
+                    }
+                } else {
+                    // Invariant: no key means no boot may claim success, and
+                    // the tree must be clean enough that the next boot works.
+                    assert!(
+                        oks.is_empty(),
+                        "{label}: a boot reported success with no key on disk: {oks:?}"
+                    );
+                    let kp = load_or_create_keypair_at(&key).unwrap_or_else(|e| {
+                        panic!(
+                            "{label}: every boot failed, so a retry must succeed, got: {e:#}\n\
+                             errors: {errs:?}\nkey storage:\n{}",
+                            identity_key_tree(base.path(), &key)
+                        )
+                    });
+                    assert_identity_success(base.path(), &key, &[one.clone(), two.clone()]);
+                    assert!(
+                        !kp.did().to_string().is_empty(),
+                        "{label}: the recovering boot must produce an identity"
+                    );
+                }
+
+                let tally = &mut tallies[arm_idx].1;
+                if oks.len() == roles.len() {
+                    tally.all_ok += 1;
+                } else if oks.is_empty() {
+                    tally.none_ok += 1;
+                } else {
+                    tally.some_ok += 1;
+                }
+                // The rollback-under-an-adopted-directory window: a boot that
+                // was refused because the directory it held was unlinked.
+                if errs.iter().any(|(_, t)| {
+                    t.contains("No such file or directory") || t.contains("(os error 2)")
+                }) {
+                    tally.adopted_dir_unlinked += 1;
+                }
+            }
+        }
+
+        for (arm, tally) in &tallies {
+            println!(
+                "identity-race-summary: arm={arm} iterations={iterations} all_ok={} some_ok={} \
+                 none_ok={} adopted_dir_unlinked={}",
+                tally.all_ok, tally.some_ok, tally.none_ok, tally.adopted_dir_unlinked
+            );
+        }
     }
 
     /// Bare `GITLAWB_KEY=identity.pem` (and `./identity.pem`) must still create
