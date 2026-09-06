@@ -4919,12 +4919,19 @@ impl Db {
                WHERE r.state IN ($1,$2)
                  AND r.completed_at IS NOT NULL AND r.completed_at < $3
                  AND (p.request_id IS NULL OR p.acked_at IS NOT NULL)
+                 AND NOT EXISTS (
+                       SELECT 1 FROM pending_ref_transitions c
+                       WHERE c.request_id = r.id
+                         AND c.state IN ($5,$6)
+                   )
                LIMIT $4"#,
         )
         .bind(request_state::COMPLETE)
         .bind(request_state::REJECTED_AT_GIT)
         .bind(older_than_iso)
         .bind(limit.max(1))
+        .bind(pending_state::PREPARED)
+        .bind(pending_state::UNCERTAIN)
         .fetch_all(&mut *tx)
         .await?;
         if parents.is_empty() {
@@ -10063,6 +10070,69 @@ mod ref_certificate_tests {
             "ff00",
             "the update arm touches only the continuation columns, so an in-progress \
              table walk is never rewound by a window rotation"
+        );
+    }
+
+    /// #26 Split PR 1 — upgrade-path test: a node at v26 must be able to
+    /// apply the v27..v34 split ledger when sibling splits land. The
+    /// collision guard in `run_pending_migrations` catches a name mismatch,
+    /// but only if both migrations are registered. This test exercises the
+    /// v27 application through the real `run_migrations()` path so it stays
+    /// in sync with the `MIGRATIONS` entry rather than hand-copying SQL.
+    ///
+    /// MUTATION (RED): delete the v27 entry from `MIGRATIONS` and the
+    /// fresh-chain round-trip fails on the missing `pending_ref_transitions` table.
+    #[sqlx::test]
+    async fn v27_pending_ref_transitions_outbox_applies_on_upgrade(pool: PgPool) {
+        async fn outbox_tables_exist(pool: &PgPool) -> bool {
+            let has_transitions = sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM information_schema.tables
+                  WHERE table_name = 'pending_ref_transitions'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap()
+                == 1;
+            let has_anchor_jobs = sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM information_schema.tables
+                  WHERE table_name = 'anchor_jobs'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap()
+                == 1;
+            has_transitions && has_anchor_jobs
+        }
+
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+        assert!(
+            outbox_tables_exist(&pool).await,
+            "the fresh migration chain must create pending_ref_transitions and anchor_jobs"
+        );
+
+        // Simulate a node at pre-v27: drop the tables and their migration record.
+        sqlx::query("DROP TABLE IF EXISTS anchor_jobs")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE IF EXISTS pending_ref_transitions")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 27")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !outbox_tables_exist(&pool).await,
+            "precondition: v27 tables and migration record removed"
+        );
+
+        db.run_migrations().await.unwrap();
+        assert!(
+            outbox_tables_exist(&pool).await,
+            "v27 must create pending_ref_transitions and anchor_jobs on an upgrading node"
         );
     }
 

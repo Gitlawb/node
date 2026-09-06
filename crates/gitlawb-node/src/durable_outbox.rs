@@ -759,7 +759,7 @@ pub async fn drain_receive_pack_requests(
 /// loudly (Err) when the expected transition affects zero rows so a
 /// stuck row cannot silently spin. Exponential backoff: 60s *
 /// 2^min(attempt,6), quarantine once `attempt+1 > effects_max_attempts`.
-async fn schedule_request_retry_or_quarantine(
+pub async fn schedule_request_retry_or_quarantine(
     state: &AppState,
     request_id: &str,
     last_error: &str,

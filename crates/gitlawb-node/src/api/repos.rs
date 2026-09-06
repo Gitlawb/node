@@ -2674,28 +2674,52 @@ pub async fn git_receive_pack(
         )
     };
 
-    if let Err(e) = state
-        .db
-        .commit_request_outcomes_atomically(
-            &request_id,
-            &ok_names,
-            &ng_names,
-            &uncertain_names,
-            unpack_failed,
-            exit_ok,
-            parsed_json_opt.as_ref(),
-            accepted_ordinal,
-            rejected_reason.as_deref(),
-            terminal_no_effects,
-        )
-        .await
-    {
-        tracing::warn!(
-            err = %e,
-            request_id = %request_id,
-            repo = %name,
-            "failed to commit request outcomes atomically; reconcile will repair"
-        );
+    // Bounded synchronous retry for post-git outcome commit. After git has landed
+    // refs we cannot 503 (refs are already durable), but leaving the parent in
+    // `received` with no repair path freezes the due-worker from claiming it.
+    // Retry up to 3x with short backoff before falling through to warn +
+    // effects-only return; effects will retry on next drain pass once the
+    // claim lease expires.
+    let mut delay_ms = 20;
+    for attempt in 0..3 {
+        match state
+            .db
+            .commit_request_outcomes_atomically(
+                &request_id,
+                &ok_names,
+                &ng_names,
+                &uncertain_names,
+                unpack_failed,
+                exit_ok,
+                parsed_json_opt.as_ref(),
+                accepted_ordinal,
+                rejected_reason.as_deref(),
+                terminal_no_effects,
+            )
+            .await
+        {
+            Ok(()) => break,
+            Err(e) if attempt < 2 => {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    repo = %name,
+                    attempt = attempt + 1,
+                    "commit_request_outcomes_atomically failed; retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                delay_ms = delay_ms.saturating_mul(5).min(500);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    repo = %name,
+                    "commit_request_outcomes_atomically failed after 3 attempts; \
+                     reconcile will repair once claim lease expires"
+                );
+            }
+        }
     }
 
     // On non-zero exit, return an error to the caller. The outbox
@@ -2897,40 +2921,49 @@ pub async fn git_receive_pack(
             }
         }
         Ok(crate::durable_outbox::EffectsOutcome::Retry { last_error }) => {
-            // Same centralized policy as the drain: exponential backoff,
-            // valid from both executable states, loud on zero-row.
-            let backoff_secs = match state.db.get_receive_pack_request(&request_id).await {
-                Ok(Some(r)) => 60_i64.saturating_mul(1_i64 << (r.attempt_count.clamp(0, 6) as u32)),
-                _ => 60,
-            };
-            let next_attempt_at =
-                (Utc::now() + chrono::Duration::seconds(backoff_secs)).to_rfc3339();
-            match state
-                .db
-                .mark_request_effects_pending(&request_id, &next_attempt_at, &last_error)
-                .await
+            // Centralized policy: exponential backoff, attempt_count increment,
+            // and quarantine all live in one place — routing through the same helper
+            // as the drain so both executors advance retry state identically.
+            if let Err(e) = crate::durable_outbox::schedule_request_retry_or_quarantine(
+                &state,
+                &request_id,
+                &last_error,
+            )
+            .await
             {
-                Ok(0) => tracing::warn!(
-                    request_id = %request_id,
-                    repo = %name,
-                    "live path: mark_request_effects_pending affected 0 rows; drain will retry"
-                ),
-                Err(e) => tracing::warn!(
+                tracing::warn!(
                     err = %e,
                     request_id = %request_id,
                     repo = %name,
-                    "live path: mark_request_effects_pending failed; drain will retry"
-                ),
-                _ => {}
+                    "live path: schedule retry failed; drain will pick up"
+                );
             }
         }
         Err(e) => {
+            // Execution errors must advance retry accounting so the request
+            // is not frozen behind the 300s claim lease with attempt_count
+            // stuck. Route through the same helper as the drain.
             tracing::error!(
                 err = %e,
                 request_id = %request_id,
                 repo = %name,
-                "live path: apply_request_effects returned Err; request left for drain"
+                "live path: apply_request_effects returned Err; scheduling retry"
             );
+            let msg = format!("executor error: {e}");
+            if let Err(sched_err) = crate::durable_outbox::schedule_request_retry_or_quarantine(
+                &state,
+                &request_id,
+                &msg,
+            )
+            .await
+            {
+                tracing::warn!(
+                    err = %sched_err,
+                    request_id = %request_id,
+                    repo = %name,
+                    "live path: schedule retry (Err arm) failed"
+                );
+            }
         }
     }
 
