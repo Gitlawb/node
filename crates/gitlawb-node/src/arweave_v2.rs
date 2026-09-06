@@ -15,6 +15,10 @@
 //! only `DefinitivelyAbsent` permits spending another upload.
 
 /// Outcome of a gateway probe for a persisted `item_id`.
+// Policy surface for the recovery slice: no construction on this
+// head (the probe arrives with the provider contract); the unit
+// test pins the rule meanwhile.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeOutcome {
     /// The persisted item was served back with a verifiable envelope

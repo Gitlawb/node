@@ -216,6 +216,9 @@ impl DataItem {
     }
 
     /// Decode the data payload to raw bytes.
+    // Vertical-slice API: no production caller on this head (the
+    // probe/endpoint slice is next); pinned by the unit tests.
+    #[allow(dead_code)]
     pub fn data_bytes(&self) -> Result<Vec<u8>> {
         URL_SAFE_NO_PAD
             .decode(self.data.as_bytes())
@@ -226,6 +229,9 @@ impl DataItem {
     /// `owner_size(signature_type)` bytes are the actual key; any
     /// trailing bytes (the ANS-104 RSA/Arweave padding) are silently
     /// ignored here.
+    // Vertical-slice API: no production caller on this head (the
+    // probe/endpoint slice is next); pinned by the unit tests.
+    #[allow(dead_code)]
     pub fn owner_pubkey(&self) -> Result<Vec<u8>> {
         let owner_bytes = URL_SAFE_NO_PAD
             .decode(self.owner.as_bytes())
@@ -246,6 +252,9 @@ impl DataItem {
     /// The owner field carries 32 pubkey bytes + 32 zero bytes; the
     /// zero pad is silently ignored here. The returned bytes are the
     /// raw 32-byte public key, suitable for `VerifyingKey::from_bytes`.
+    // Vertical-slice API: no production caller on this head (the
+    // probe/endpoint slice is next); pinned by the unit tests.
+    #[allow(dead_code)]
     pub fn owner_pubkey_ed25519(&self) -> Result<[u8; PUBLIC_KEY_LENGTH]> {
         if self.signature_type != SIGNATURE_TYPE_ED25519 {
             bail!(
@@ -269,6 +278,9 @@ impl DataItem {
     ///
     /// Returns `Err` if the signature is empty (the item was not
     /// signed) or not valid base64url.
+    // Vertical-slice API: no production caller on this head (the
+    // probe/endpoint slice is next); pinned by the unit tests.
+    #[allow(dead_code)]
     pub fn id(&self) -> Result<String> {
         if self.signature.is_empty() {
             bail!("cannot derive id from an unsigned data item");
@@ -899,6 +911,9 @@ pub fn sign_data_item(
 /// `Err` otherwise. The error chain names the specific failure mode
 /// (bad base64, wrong key, malformed signature) so a probe of the
 /// verification endpoint can surface a useful reason to the caller.
+// Vertical-slice API: no production caller on this head (the
+// probe/endpoint slice is next); pinned by the unit tests.
+#[allow(dead_code)]
 pub fn verify_data_item(item: &DataItem, expected_pubkey: &[u8; PUBLIC_KEY_LENGTH]) -> Result<()> {
     if item.signature_type != SIGNATURE_TYPE_ED25519 {
         bail!(
