@@ -957,7 +957,8 @@ mod tests {
     //! module (low-level primitives) AND the golden vector in
     //! `dataitem_matches_arbundles_golden_vector` — a real signed
     //! DataItem captured from arbundles 0.10.x via
-    //! `scripts/ans104_golden.mjs`. The team memory
+    //! `scripts/ans104_golden_ed25519.mjs` (Ed25519 interop pin; the legacy
+    //! Ethereum script `scripts/ans104_golden.mjs` is illustrative only). The team memory
     //! `self-roundtrip-tests-do-not-prove-interop.md` is the policy.
     use super::*;
     use gitlawb_core::identity::Keypair;
