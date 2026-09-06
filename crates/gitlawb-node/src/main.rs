@@ -1902,12 +1902,169 @@ mod gossip_ssrf_tests {
 mod identity_key_storage_tests {
     use super::*;
 
-    /// Fixture: create the node identity key under a hostile umask.
+    /// Requested modes for the objects this invocation creates. Named once so
+    /// a failure prints achieved against requested rather than a bare boolean.
+    #[cfg(unix)]
+    const IDENTITY_WANT_DIR_MODE: u32 = 0o700;
+    #[cfg(unix)]
+    const IDENTITY_WANT_KEY_MODE: u32 = 0o600;
+    /// Mode a PRE-EXISTING ancestor is built at. Not group-writable, so the
+    /// write-authority check accepts it, and nothing this process does may
+    /// change it: only directories this invocation creates are its business.
+    #[cfg(unix)]
+    const IDENTITY_PREEXISTING_MODE: u32 = 0o755;
+    /// Mode the group-writable rows build. A parent carrying it must be
+    /// refused before anything is created inside it.
+    #[cfg(unix)]
+    const IDENTITY_LOOSE_MODE: u32 = 0o775;
+
+    #[cfg(unix)]
+    fn identity_mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path)
+            .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    /// Every directory on the key path with its achieved mode against what the
+    /// contract requested, so a RED is attributable to the mode rather than to
+    /// "something failed".
+    #[cfg(unix)]
+    fn identity_key_tree(base: &std::path::Path, key: &std::path::Path) -> String {
+        let mut dirs = Vec::new();
+        let mut cur = key.parent();
+        while let Some(d) = cur {
+            dirs.push(d.to_path_buf());
+            if d == base {
+                break;
+            }
+            cur = d.parent();
+        }
+        dirs.reverse();
+        let mut out = String::new();
+        for d in dirs {
+            match std::fs::symlink_metadata(&d) {
+                Ok(_) => out.push_str(&format!(
+                    "  dir  {} achieved mode {:04o}, requested {:04o}\n",
+                    d.display(),
+                    identity_mode_of(&d),
+                    IDENTITY_WANT_DIR_MODE
+                )),
+                Err(e) => out.push_str(&format!("  dir  {} absent ({e})\n", d.display())),
+            }
+        }
+        match std::fs::symlink_metadata(key) {
+            Ok(_) => out.push_str(&format!(
+                "  key  {} achieved mode {:04o}, requested {:04o}\n",
+                key.display(),
+                identity_mode_of(key),
+                IDENTITY_WANT_KEY_MODE
+            )),
+            Err(e) => out.push_str(&format!("  key  {} absent ({e})\n", key.display())),
+        }
+        out
+    }
+
+    /// An object a refused boot must not have left behind. The message is the
+    /// fixture's own: the anyhow text never carries the phrase, so a `contains`
+    /// on the error would be a check that can never pass.
+    #[cfg(unix)]
+    fn assert_identity_absent(path: &std::path::Path) {
+        assert!(
+            std::fs::symlink_metadata(path).is_err(),
+            "{} left behind by a refused boot",
+            path.display()
+        );
+    }
+
+    /// The assertions every success row shares: exact 0700 on each directory
+    /// this invocation created, 0600 on the key, no scratch residue beside it,
+    /// and a base this process never touched.
+    #[cfg(unix)]
+    fn assert_identity_success(
+        base: &std::path::Path,
+        key: &std::path::Path,
+        created: &[std::path::PathBuf],
+    ) {
+        for d in created {
+            let mode = identity_mode_of(d);
+            assert_eq!(
+                mode,
+                IDENTITY_WANT_DIR_MODE,
+                "created directory {} achieved mode {:04o}, requested {:04o}\n{}",
+                d.display(),
+                mode,
+                IDENTITY_WANT_DIR_MODE,
+                identity_key_tree(base, key)
+            );
+        }
+        let key_mode = identity_mode_of(key);
+        assert_eq!(
+            key_mode,
+            IDENTITY_WANT_KEY_MODE,
+            "identity key achieved mode {key_mode:04o}, requested 0600\n{}",
+            identity_key_tree(base, key)
+        );
+        let leaf = key.parent().expect("the key names a parent");
+        let entries: Vec<String> = std::fs::read_dir(leaf)
+            .expect("read the key directory")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![key.file_name().unwrap().to_string_lossy().into_owned()],
+            "the key directory must hold only the published key, no scratch residue: {entries:?}"
+        );
+        let base_mode = identity_mode_of(base);
+        assert_eq!(
+            base_mode, 0o700,
+            "the base directory must be left at 0700, achieved {base_mode:04o}"
+        );
+    }
+
+    /// Boot a success row and check its contract. `call_path` is what the code
+    /// is handed (relative for the relative row); `key` is the same key under
+    /// `base`, so the mode checks never depend on the child's cwd.
+    #[cfg(unix)]
+    fn run_identity_success_row(
+        base: &std::path::Path,
+        call_path: &std::path::Path,
+        key: &std::path::Path,
+        created: &[std::path::PathBuf],
+        phase: &str,
+    ) -> String {
+        if phase == "reload" {
+            assert!(
+                key.exists(),
+                "the reload phase requires the create phase to have published a key at {}",
+                key.display()
+            );
+        }
+        let kp = load_or_create_keypair_at(call_path).unwrap_or_else(|e| {
+            panic!(
+                "{} the node identity, got: {e:#}\nkey storage at failure:\n{}",
+                if phase == "reload" {
+                    "reload in a fresh process must load"
+                } else {
+                    "first boot must create"
+                },
+                identity_key_tree(base, key)
+            )
+        });
+        assert_identity_success(base, key, created);
+        kp.did().to_string()
+    }
+
+    /// Fixture: one (layout, umask, phase) row of the identity lifecycle
+    /// matrix.
     ///
     /// `~/.gitlawb` holds BOTH keys, and `load_or_create_keypair` runs before
     /// the listener binds, so a mask that strips owner bits here takes the
-    /// whole node down before any p2p code is reached. Double-gated like the
-    /// p2p fixtures: `#[ignore]` keeps it out of a normal run and the env check
+    /// whole node down before any p2p code is reached. `umask` is
+    /// process-global, so every row is a child. Double-gated like the p2p
+    /// fixtures: `#[ignore]` keeps it out of a normal run and the env check
     /// keeps it inert under a bare `--ignored` sweep, which would otherwise set
     /// a process-global umask inside the shared test process.
     #[cfg(unix)]
@@ -1924,49 +2081,259 @@ mod identity_key_storage_tests {
         );
         let umask_val =
             u32::from_str_radix(&std::env::var("GITLAWB_TEST_UMASK").unwrap(), 8).unwrap();
+        let layout = std::env::var("GITLAWB_TEST_LAYOUT").expect("GITLAWB_TEST_LAYOUT");
+        let phase = std::env::var("GITLAWB_TEST_PHASE").expect("GITLAWB_TEST_PHASE");
 
         // SAFETY: `umask` only reads and replaces the process-wide value, and
         // this process exists solely for this probe. No restore: the value dies
-        // with the child.
+        // with the child. Set FIRST, before any layout is built, so the
+        // explicit chmods below are what give a pre-existing directory its
+        // mode regardless of the mask.
         unsafe { libc::umask(umask_val as libc::mode_t) };
 
-        let key = base.join(".gitlawb").join("identity.pem");
-        let kp = load_or_create_keypair_at(&key).unwrap_or_else(|e| {
-            let dir_mode = std::fs::symlink_metadata(key.parent().unwrap())
-                .map(|m| format!("{:04o}", m.permissions().mode() & 0o7777))
-                .unwrap_or_else(|_| "absent".into());
-            panic!(
-                "first boot must create the node identity, got: {e:#}\n  \
-                 dir {} achieved mode {}, requested 0700",
-                key.parent().unwrap().display(),
-                dir_mode
-            )
-        });
-
-        let dir_mode = std::fs::symlink_metadata(key.parent().unwrap())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o7777;
-        assert_eq!(
-            dir_mode, 0o700,
-            "identity key directory achieved mode {dir_mode:04o}, requested 0700"
-        );
-        let key_mode = std::fs::symlink_metadata(&key)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o7777;
-        assert_eq!(
-            key_mode, 0o600,
-            "identity key achieved mode {key_mode:04o}, requested 0600"
-        );
-
-        // The identity must survive a reload, same as the p2p key.
-        let reloaded = load_or_create_keypair_at(&key).expect("reload the identity");
-        assert_eq!(kp.did(), reloaded.did(), "the identity must be stable");
-
-        println!("identity-key-umask: asserted did={}", kp.did());
+        match layout.as_str() {
+            "one-missing" => {
+                let dir = base.join(".gitlawb");
+                let key = dir.join("identity.pem");
+                let did = run_identity_success_row(&base, &key, &key, &[dir], &phase);
+                println!("identity-key-umask: asserted did={did}");
+            }
+            "multi-missing" => {
+                let one = base.join("one");
+                let two = one.join("two");
+                let key = two.join("identity.pem");
+                let did = run_identity_success_row(&base, &key, &key, &[one, two], &phase);
+                println!("identity-key-umask: asserted did={did}");
+            }
+            "three-missing" => {
+                let one = base.join("one");
+                let two = one.join("two");
+                let three = two.join("three");
+                let key = three.join("identity.pem");
+                let did = run_identity_success_row(&base, &key, &key, &[one, two, three], &phase);
+                println!("identity-key-umask: asserted did={did}");
+            }
+            "under-preexisting" => {
+                let pre = base.join("pre");
+                if phase == "create" {
+                    std::fs::create_dir(&pre).expect("create the pre-existing ancestor");
+                    std::fs::set_permissions(
+                        &pre,
+                        std::fs::Permissions::from_mode(IDENTITY_PREEXISTING_MODE),
+                    )
+                    .expect("chmod the pre-existing ancestor");
+                }
+                let one = pre.join("one");
+                let two = one.join("two");
+                let key = two.join("identity.pem");
+                let did = run_identity_success_row(&base, &key, &key, &[one, two], &phase);
+                let pre_mode = identity_mode_of(&pre);
+                assert_eq!(
+                    pre_mode,
+                    IDENTITY_PREEXISTING_MODE,
+                    "a pre-existing ancestor is neither chmodded nor judged: {} achieved \
+                     {pre_mode:04o}, expected {:04o}",
+                    pre.display(),
+                    IDENTITY_PREEXISTING_MODE
+                );
+                println!("identity-key-umask: asserted did={did}");
+            }
+            "relative-multi-missing" => {
+                std::env::set_current_dir(&base).expect("chdir into the row's base");
+                let one = base.join("one");
+                let two = one.join("two");
+                let key = two.join("identity.pem");
+                let call_path = std::path::PathBuf::from("one/two/identity.pem");
+                let did = run_identity_success_row(&base, &call_path, &key, &[one, two], &phase);
+                println!("identity-key-umask: asserted did={did}");
+            }
+            "loose-ancestor" => {
+                let loose = base.join("loose");
+                std::fs::create_dir(&loose).expect("create the group-writable ancestor");
+                std::fs::set_permissions(
+                    &loose,
+                    std::fs::Permissions::from_mode(IDENTITY_LOOSE_MODE),
+                )
+                .expect("chmod the group-writable ancestor");
+                let one = loose.join("one");
+                let two = one.join("two");
+                let key = two.join("identity.pem");
+                let Err(err) = load_or_create_keypair_at(&key) else {
+                    panic!(
+                        "a group-writable deepest ancestor must be refused\nkey storage:\n{}",
+                        identity_key_tree(&base, &key)
+                    )
+                };
+                let text = format!("{err:#}");
+                // The reason is checked before the leftovers so a refusal for
+                // the wrong reason is reported as that, not as a stray file.
+                assert!(
+                    text.contains("writable beyond its owner"),
+                    "a group-writable deepest ancestor must be refused for the write-authority \
+                     reason, got: {text}"
+                );
+                assert_identity_absent(&one);
+                assert_identity_absent(&two);
+                assert_identity_absent(&key);
+                let loose_mode = identity_mode_of(&loose);
+                assert_eq!(
+                    loose_mode,
+                    IDENTITY_LOOSE_MODE,
+                    "a refusal must not chmod {}: achieved {loose_mode:04o}",
+                    loose.display()
+                );
+                println!("identity-key-umask: refused");
+            }
+            "write-failure" => {
+                let one = base.join("one");
+                let two = one.join("two");
+                let three = two.join("three");
+                let key = three.join("identity.pem");
+                // Armed on this thread only, and disarmed before the
+                // assertions so a later boot in this process is unaffected.
+                p2p::FAIL_KEY_WRITE.with(|f| f.set(true));
+                let result = load_or_create_keypair_at(&key);
+                p2p::FAIL_KEY_WRITE.with(|f| f.set(false));
+                let Err(err) = result else {
+                    panic!("an injected key-write failure must not report a created identity")
+                };
+                let text = format!("{err:#}");
+                assert!(
+                    text.contains("injected key-write failure"),
+                    "the failure must name the injected key write, got: {text}"
+                );
+                assert_identity_absent(&one);
+                assert_identity_absent(&two);
+                assert_identity_absent(&three);
+                assert_identity_absent(&key);
+                let residue: Vec<String> = std::fs::read_dir(&base)
+                    .expect("read the base directory")
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect();
+                assert!(
+                    residue.is_empty(),
+                    "a failed first boot must leave nothing under the base: {residue:?}"
+                );
+                println!("identity-key-umask: refused");
+            }
+            "race-loose-intermediate" => {
+                let one = base.join("one");
+                let two = one.join("two");
+                let key = two.join("identity.pem");
+                // A concurrent process wins the mkdir with a group-writable
+                // mode. The loser adopts nothing it did not create, so its
+                // rollback must leave the winner's directory alone.
+                p2p::pin::RACE_CREATE_MODE.with(|c| c.set(Some(IDENTITY_LOOSE_MODE)));
+                let result = load_or_create_keypair_at(&key);
+                let Err(err) = result else {
+                    panic!("a race-won group-writable intermediate must be refused")
+                };
+                let text = format!("{err:#}");
+                assert!(
+                    text.contains("writable beyond its owner"),
+                    "the refusal must name the write-authority problem, got: {text}"
+                );
+                assert!(
+                    one.exists(),
+                    "a directory this invocation did not create must not be removed: {} is gone",
+                    one.display()
+                );
+                let one_mode = identity_mode_of(&one);
+                assert_eq!(
+                    one_mode,
+                    IDENTITY_LOOSE_MODE,
+                    "a directory this invocation did not create must not be removed or chmodded: \
+                     {} achieved {one_mode:04o}",
+                    one.display()
+                );
+                assert_identity_absent(&two);
+                assert_identity_absent(&key);
+                println!("identity-key-umask: refused");
+            }
+            "symlinked-deepest-ancestor" => {
+                let real = base.join("real");
+                std::fs::create_dir(&real).expect("create the real ancestor");
+                std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod the real ancestor");
+                let link = base.join("link");
+                std::os::unix::fs::symlink("real", &link).expect("plant the symlinked ancestor");
+                let key = link.join("one").join("two").join("identity.pem");
+                let Err(err) = load_or_create_keypair_at(&key) else {
+                    panic!("a symlinked deepest existing ancestor must be refused, not followed")
+                };
+                let text = format!("{err:#}");
+                assert!(
+                    text.contains("a symlink here is refused rather than followed"),
+                    "a symlinked deepest existing ancestor must be refused, not followed, and the \
+                     refusal must say so, got: {text}"
+                );
+                for p in [
+                    link.join("one"),
+                    link.join("one").join("two"),
+                    key.clone(),
+                    real.join("one"),
+                    real.join("one").join("two"),
+                    real.join("one").join("two").join("identity.pem"),
+                ] {
+                    assert_identity_absent(&p);
+                }
+                println!("identity-key-umask: refused");
+            }
+            "populated-leaf-refuses-rollback" => {
+                let one = base.join("one");
+                let two = one.join("two");
+                let key = two.join("identity.pem");
+                // The key is published and only the scratch removal fails, so
+                // the leaf this invocation created is no longer empty when the
+                // rollback reaches it. `AT_REMOVEDIR` must refuse it.
+                p2p::FAIL_SCRATCH_UNLINK.with(|f| f.set(true));
+                let result = load_or_create_keypair_at(&key);
+                p2p::FAIL_SCRATCH_UNLINK.with(|f| f.set(false));
+                let Err(err) = result else {
+                    panic!("an injected scratch-unlink failure must not report success")
+                };
+                let text = format!("{err:#}");
+                assert!(
+                    text.contains("failed to remove the scratch name"),
+                    "the failure must name the scratch it could not remove, got: {text}"
+                );
+                assert!(
+                    text.contains("also failed to remove")
+                        && text.contains("which this process created"),
+                    "the rollback must report the populated leaf it was refused, got: {text}"
+                );
+                let key_mode = identity_mode_of(&key);
+                assert_eq!(
+                    key_mode, IDENTITY_WANT_KEY_MODE,
+                    "a published key must survive its own boot's rollback: achieved \
+                     {key_mode:04o}, requested 0600"
+                );
+                for d in [&one, &two] {
+                    let mode = identity_mode_of(d);
+                    assert_eq!(
+                        mode,
+                        IDENTITY_WANT_DIR_MODE,
+                        "created directory {} achieved mode {mode:04o}, requested {:04o}",
+                        d.display(),
+                        IDENTITY_WANT_DIR_MODE
+                    );
+                }
+                let scratch: Vec<String> = std::fs::read_dir(&two)
+                    .expect("read the key directory")
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with(".p2p.key.") && n.ends_with(".tmp"))
+                    .collect();
+                assert_eq!(
+                    scratch.len(),
+                    1,
+                    "the refused unlink must leave exactly one scratch beside the key: {scratch:?}"
+                );
+                let kp = load_or_create_keypair_at(&key)
+                    .expect("a boot after the injected failure must load the published key");
+                println!("identity-key-umask: refused did={}", kp.did());
+            }
+            other => panic!("unknown layout {other}"),
+        }
     }
 
     /// GITLAWB_KEY names a PEM file, not a dedicated key directory. An existing
@@ -2093,15 +2460,64 @@ mod identity_key_storage_tests {
         );
     }
 
+    /// Parent for the identity lifecycle matrix: drives every row as a child
+    /// process and requires create and reload to agree on the DID.
     #[cfg(unix)]
     #[test]
     fn identity_key_storage_is_umask_independent() {
         use std::os::unix::fs::PermissionsExt;
 
-        for umask in ["0000", "0022", "0777"] {
-            let base = tempfile::tempdir().unwrap();
-            std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        const SUCCESS_SENTINEL: &str = "identity-key-umask: asserted did=";
+        const REFUSED_SENTINEL: &str = "identity-key-umask: refused";
+        // Fixed order, and part of the contract: 0000 and 0002 are the masks
+        // that leave a group/world-writable ancestor behind, 0022 is the one
+        // that boots with the wrong mode, and 0777 strips owner bits. Rows
+        // abort at the first failing mask, so several load-bearing proofs are
+        // pinned to which mask that is.
+        const ALL_UMASKS: &[&str] = &["0000", "0002", "0022", "0777"];
 
+        // (layout, umasks, succeeds). A success row runs create then reload
+        // against one base and must return the same DID; a reject row runs
+        // create alone and must print the refusal sentinel.
+        let rows: &[(&str, &[&str], bool)] = &[
+            ("one-missing", ALL_UMASKS, true),
+            ("multi-missing", ALL_UMASKS, true),
+            ("three-missing", ALL_UMASKS, true),
+            ("under-preexisting", ALL_UMASKS, true),
+            ("relative-multi-missing", ALL_UMASKS, true),
+            ("loose-ancestor", ALL_UMASKS, false),
+            ("write-failure", ALL_UMASKS, false),
+            ("race-loose-intermediate", &["0002"], false),
+            ("symlinked-deepest-ancestor", &["0022"], false),
+            ("populated-leaf-refuses-rollback", &["0022"], false),
+        ];
+
+        // Both filters are optional and both panic on a value that names
+        // nothing: a typo that quietly ran no child would be an empty green,
+        // which is the failure this matrix exists to rule out.
+        let layout_only = std::env::var("GITLAWB_TEST_LAYOUT_ONLY").ok();
+        let umask_only = std::env::var("GITLAWB_TEST_UMASK_ONLY").ok();
+        if let Some(l) = layout_only.as_deref() {
+            assert!(
+                rows.iter().any(|r| r.0 == l),
+                "GITLAWB_TEST_LAYOUT_ONLY={l} names no row in the matrix"
+            );
+        }
+        if let Some(u) = umask_only.as_deref() {
+            assert!(
+                ALL_UMASKS.contains(&u),
+                "GITLAWB_TEST_UMASK_ONLY={u} names no umask in the matrix"
+            );
+        }
+
+        // Run one row in a child and return whatever follows its sentinel.
+        fn run_row(
+            base: &std::path::Path,
+            umask: &str,
+            layout: &str,
+            phase: &str,
+            sentinel: &str,
+        ) -> String {
             let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
             cmd.args([
                 "identity_key_storage_tests::fixture_identity_key_under_hostile_umask",
@@ -2110,28 +2526,65 @@ mod identity_key_storage_tests {
                 "--nocapture",
             ])
             .env("GITLAWB_TEST_FIXTURE", "identity-key-umask")
-            .env("GITLAWB_TEST_BASE", base.path())
-            .env("GITLAWB_TEST_UMASK", umask);
+            .env("GITLAWB_TEST_BASE", base)
+            .env("GITLAWB_TEST_UMASK", umask)
+            .env("GITLAWB_TEST_LAYOUT", layout)
+            .env("GITLAWB_TEST_PHASE", phase);
             let output = cmd.output().expect("spawn the identity-key fixture");
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
+            let row = format!("layout={layout} umask={umask} phase={phase}");
 
             assert!(
                 output.status.success(),
-                "umask={umask}: the identity-key fixture must pass\n\
+                "row {row}: the identity-key fixture must pass\n\
                  --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
             );
             // A filter matching nothing exits 0, and the fixture's env gate
             // returns early as a passing test, so neither alone is proof.
             assert!(
                 stdout.contains("1 passed"),
-                "umask={umask}: filter must select one passing test\n{stdout}"
+                "row {row}: filter must select one passing test\n{stdout}"
             );
-            assert!(
-                stdout.contains("identity-key-umask: asserted did="),
-                "umask={umask}: fixture must print its sentinel\n{stdout}"
-            );
+            let line = stdout
+                .lines()
+                .find(|l| l.starts_with(sentinel))
+                .unwrap_or_else(|| {
+                    panic!("row {row}: fixture must print its sentinel\n--- stdout ---\n{stdout}")
+                });
+            line[sentinel.len()..].trim().to_string()
         }
+
+        let mut ran = 0usize;
+        for (layout, umasks, succeeds) in rows {
+            if layout_only.as_deref().is_some_and(|l| l != *layout) {
+                continue;
+            }
+            for umask in *umasks {
+                if umask_only.as_deref().is_some_and(|u| u != *umask) {
+                    continue;
+                }
+                let base = tempfile::tempdir().unwrap();
+                std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                if *succeeds {
+                    let created = run_row(base.path(), umask, layout, "create", SUCCESS_SENTINEL);
+                    let reloaded = run_row(base.path(), umask, layout, "reload", SUCCESS_SENTINEL);
+                    assert_eq!(
+                        created, reloaded,
+                        "layout={layout} umask={umask}: a fresh process must reload the same DID"
+                    );
+                } else {
+                    run_row(base.path(), umask, layout, "create", REFUSED_SENTINEL);
+                }
+                ran += 1;
+            }
+        }
+        assert!(
+            ran > 0,
+            "the row and umask filters selected no child; a matrix that runs nothing is not a \
+             passing matrix"
+        );
     }
 
     /// Bare `GITLAWB_KEY=identity.pem` (and `./identity.pem`) must still create
@@ -2433,24 +2886,55 @@ mod identity_key_storage_tests {
         assert_eq!(created.did(), reloaded.did());
     }
 
+    /// `/identity.pem` is a pathname contract, not a filesystem probe: its
+    /// parent is the root, which the operator has already nominated, so
+    /// `create_pinned_dir_and_publish` must take the already-nominated branch.
+    /// Asserted lexically because a probe against the real `/` cannot be
+    /// isolated and, run as root, leaves a real key at `/identity.pem`.
     #[cfg(unix)]
     #[test]
-    fn identity_root_adjacent_path_is_not_the_empty_component_error() {
-        if std::path::Path::new("/identity.pem").exists() {
-            return;
+    fn identity_root_adjacent_path_is_an_already_nominated_parent() {
+        use std::path::{Component, Path};
+
+        let root_adjacent = Path::new("/identity.pem");
+
+        assert!(
+            !p2p::path_denotes_a_directory(root_adjacent, None),
+            "the lexical gate in load_or_create_keypair_at must admit /identity.pem"
+        );
+        assert!(
+            !root_adjacent
+                .components()
+                .any(|c| c == Component::ParentDir),
+            "/identity.pem walks back out through no `..`"
+        );
+        assert_eq!(
+            p2p::key_parent(root_adjacent),
+            Path::new("/"),
+            "the lexical parent of /identity.pem is the filesystem root"
+        );
+        assert!(
+            p2p::identity_parent_is_already_nominated(root_adjacent),
+            "root-adjacent identity path must take the already-nominated branch, not the named-parent branch that fails with 'names no final directory component'"
+        );
+
+        for nominated in ["identity.pem", "./identity.pem"] {
+            assert!(
+                p2p::identity_parent_is_already_nominated(Path::new(nominated)),
+                "{nominated} publishes into the working directory, which is already nominated"
+            );
         }
-        let err = match load_or_create_keypair_at(std::path::Path::new("/identity.pem")) {
-            Ok(_) => panic!("creating /identity.pem as a non-root user must not succeed"),
-            Err(e) => format!("{e:#}"),
-        };
-        assert!(
-            !err.contains("names no final directory component"),
-            "root-adjacent identity create must reach the filesystem, got: {err}"
-        );
-        assert!(
-            !std::path::Path::new("/identity.pem").exists(),
-            "the probe must not leave /identity.pem behind"
-        );
+
+        for named in [
+            "/data/identity.pem",
+            "keys/identity.pem",
+            "/identity/identity.pem",
+        ] {
+            assert!(
+                !p2p::identity_parent_is_already_nominated(Path::new(named)),
+                "{named} names a parent component this process may create"
+            );
+        }
     }
 
     /// A terminal `.` is a directory spelling. Path drops it, so this would

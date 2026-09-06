@@ -188,6 +188,19 @@ pub(crate) fn key_parent(key_path: &Path) -> &Path {
     }
 }
 
+/// Whether the identity key's lexical parent is a directory the operator has
+/// already nominated by shape alone: the working directory (`identity.pem`,
+/// `./identity.pem`) or the filesystem root (`/identity.pem`). Those are
+/// published into as-is and never created, pinned, or chmodded; any other
+/// parent is a named component this process may create.
+///
+/// Lexical on purpose so the contract is testable without touching the
+/// filesystem: a probe against `/` cannot be isolated and, run as root, leaves
+/// a real key at `/identity.pem`.
+pub(crate) fn identity_parent_is_already_nominated(key_path: &Path) -> bool {
+    key_parent(key_path).file_name().is_none()
+}
+
 /// Whether `key_path` fails to name a directory the node is willing to manage.
 ///
 /// This is the gate `Config::validate` applies, kept next to `key_parent`
@@ -1684,17 +1697,183 @@ pub(crate) fn load_identity_pem_if_present(key_path: &Path) -> Result<Option<Str
     Ok(Some(pem))
 }
 
+/// The directories one identity boot created, held open so a failed boot can
+/// remove exactly them and nothing else.
+#[cfg(unix)]
+#[derive(Default)]
+struct CreatedDirs {
+    /// Every directory opened on the walk, anchor first, then each created or
+    /// adopted intermediate, held so each removal is addressed relative to the
+    /// descriptor it was created in. The leaf is not here; its descriptor goes
+    /// to the caller.
+    chain: Vec<std::os::fd::OwnedFd>,
+    /// (index into `chain` of the parent, entry name, display path), in
+    /// creation order. Only entries `create_dir_pinned_at` reported `created`.
+    created: Vec<(usize, std::ffi::CString, PathBuf)>,
+}
+
+#[cfg(unix)]
+impl CreatedDirs {
+    /// Remove, deepest first, only what this invocation created, and fold a
+    /// removal failure into the primary error.
+    ///
+    /// A race winner is never in `created`, so an adopted directory is never
+    /// removed. `AT_REMOVEDIR` refuses a non-empty directory, so a leaf another
+    /// boot has published into survives this loser's rollback. The first
+    /// failure stops the walk: a directory that cannot be removed keeps every
+    /// ancestor above it non-empty, so continuing would only report the same
+    /// leftover again, and what is left behind is 0700 owner-only.
+    fn roll_back(self, primary: anyhow::Error) -> anyhow::Error {
+        use std::os::fd::AsRawFd;
+
+        for (parent_idx, name, display) in self.created.iter().rev() {
+            let parent_fd = self.chain[*parent_idx].as_raw_fd();
+            // SAFETY: `name` was created by this invocation under a descriptor
+            // this struct still owns, so no pathname is re-resolved and no
+            // other user can repoint it; `AT_REMOVEDIR` removes only an empty
+            // directory, never a file and never a populated one.
+            let rc = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), libc::AT_REMOVEDIR) };
+            if rc != 0 {
+                let clean = std::io::Error::last_os_error();
+                return anyhow::anyhow!(
+                    "{primary:#}; also failed to remove {} which this process created: {clean}",
+                    display.display()
+                );
+            }
+        }
+        primary
+    }
+}
+
+/// The lexical parent of `p` for the walk up, with the two spellings of "the
+/// working directory" collapsed onto `.` the way [`key_parent`] collapses them.
+///
+/// Applied on EVERY step, not only the first: `Path::new("one").parent()` is
+/// `Some("")`, `open("")` is `NotFound`, and `Path::new("").parent()` is
+/// `None`, so an unnormalized loop would read the empty parent as one more
+/// missing component and walk off the top of a relative key path.
+#[cfg(unix)]
+fn identity_parent_step(p: &Path) -> &Path {
+    match p.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+/// Create every missing component from the deepest existing ancestor down to
+/// `dir`, and hand back the leaf's descriptor.
+///
+/// Pass 1 walks up by name from `dir`'s parent, opening each candidate until
+/// one opens; that descriptor is the anchor and the discovery open IS the use,
+/// so the anchor pathname is not resolved a second time. Termination is by
+/// shape: a candidate with no file name (`""`, `.`, `/`, `..`) is never stepped
+/// past, so the helper carries its own precondition rather than inheriting the
+/// `..` refusal from `load_or_create_keypair_at` in another file.
+///
+/// The `O_NOFOLLOW` in those flags binds the FINAL component only, which is
+/// what the kernel gives a path-based open. So a symlink at the anchor itself
+/// is refused, and a symlink ABOVE it is followed during path resolution just
+/// as it was before this walk existed: the pre-fix code reached the same
+/// directory through `create_dir_all` plus a path-based open of the
+/// grandparent. Closing that would mean an `openat` chain from the filesystem
+/// root, which is what [`verify_and_create_ancestor_chain`] does for
+/// `GITLAWB_P2P_KEY`, and it would drag the full ancestor policy onto
+/// `GITLAWB_KEY` paths that deliberately do not get it. Ancestors above the
+/// anchor are therefore resolved by pathname and neither judged nor mutated,
+/// unchanged from the previous behavior.
+///
+/// Pass 2 walks back down calling [`pin::create_dir_pinned_at`] per component
+/// against the descriptor of the one before it, so from the anchor down no
+/// pathname is resolved again. The only judgment an existing directory
+/// receives is `verify_trusted_parent` on the descriptor a child is actually
+/// created in.
+///
+/// `created_dirs` is an out-parameter so a failure on any component leaves the
+/// caller holding exactly what was made so far.
+#[cfg(unix)]
+fn create_missing_identity_parents(
+    dir: &Path,
+    dir_name: &std::ffi::OsStr,
+    euid: u32,
+    created_dirs: &mut CreatedDirs,
+) -> Result<(pin::Pinned<std::os::fd::OwnedFd>, bool)> {
+    use std::os::fd::AsRawFd;
+
+    // The caller has already observed `dir` as NotFound, so it is the first
+    // missing component. Deepest first; pass 2 iterates in reverse.
+    let mut missing: Vec<(std::ffi::OsString, PathBuf)> =
+        vec![(dir_name.to_os_string(), dir.to_path_buf())];
+    let mut cur = identity_parent_step(dir);
+    let anchor = loop {
+        match open_dir_with_flags(cur, walk_dir_open_flags()) {
+            Ok(fd) => break fd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && cur.file_name().is_some() => {
+                let name = cur
+                    .file_name()
+                    .expect("the arm guard just observed a file name")
+                    .to_os_string();
+                missing.push((name, cur.to_path_buf()));
+                cur = identity_parent_step(cur);
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "failed to open {} (a symlink here is refused rather than followed)",
+                    cur.display()
+                )));
+            }
+        }
+    };
+    created_dirs.chain.push(std::os::fd::OwnedFd::from(anchor));
+
+    let mut leaf = None;
+    for (idx, (name, display)) in missing.iter().enumerate().rev() {
+        let is_leaf = idx == 0;
+        let flags = if is_leaf {
+            leaf_dir_open_flags()
+        } else {
+            walk_dir_open_flags()
+        };
+        let cname = KeyDirHandle::child_name(name).map_err(|e| {
+            anyhow::Error::new(e).context(format!("failed to name {}", display.display()))
+        })?;
+        let parent_idx = created_dirs.chain.len() - 1;
+        let parent_fd = created_dirs.chain[parent_idx].as_raw_fd();
+        let (pinned, created) = pin::create_dir_pinned_at(parent_fd, name, display, euid, flags)
+            .map_err(|e| {
+                anyhow::Error::new(e).context(format!(
+                    "failed to create key directory {}",
+                    display.display()
+                ))
+            })?;
+        if created {
+            created_dirs
+                .created
+                .push((parent_idx, cname, display.clone()));
+        }
+        if is_leaf {
+            leaf = Some((pinned, created));
+        } else {
+            created_dirs.chain.push(pinned.into_inner());
+        }
+    }
+    Ok(leaf.expect("the leaf is the first entry of a list that always holds it"))
+}
+
 /// Publish `bytes` as a 0600 key at `key_path` through the same scratch-then-link
 /// path the p2p key uses.
 ///
-/// If the immediate parent is missing it is created pinned to 0700. If it
-/// already exists it is used without chmod: `GITLAWB_KEY` is a file path, not
-/// a dedicated-directory setting. Write-authority on that parent is still
-/// required. Deliberately NOT the full `ensure_key_dir` ancestor walk.
+/// Every component below the deepest existing ancestor is created pinned to
+/// 0700 on one descriptor chain, so a two-deep missing prefix lands at the
+/// mode this process chose rather than at the ambient umask. A pre-existing
+/// ancestor is adopted as-is and never chmodded: `GITLAWB_KEY` is a file path,
+/// not a dedicated-directory setting. Write-authority is still required on the
+/// directory each component is created in. Anything this invocation created is
+/// removed again if the boot fails past it, except a directory that has since
+/// been published into, which `AT_REMOVEDIR` refuses. Deliberately NOT the full
+/// `ensure_key_dir` ancestor walk: components above the deepest existing
+/// ancestor are neither judged nor mutated.
 #[cfg(unix)]
 pub(crate) fn create_pinned_dir_and_publish(key_path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::os::fd::AsRawFd;
-
     let file_name = key_path
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("{} names no key file", key_path.display()))?;
@@ -1705,7 +1884,7 @@ pub(crate) fn create_pinned_dir_and_publish(key_path: &Path, bytes: &[u8]) -> Re
     // helper must not chmod cwd or `/` as if they were a nominated key
     // directory.
     let parent = key_parent(key_path);
-    if parent.file_name().is_none() {
+    if identity_parent_is_already_nominated(key_path) {
         let cwd = open_dir_with_flags(parent, leaf_dir_open_flags())
             .with_context(|| format!("failed to open {} for the identity key", parent.display()))?;
         let handle = KeyDirHandle::from_existing_dir(cwd, parent, key_path)?;
@@ -1740,32 +1919,34 @@ pub(crate) fn create_pinned_dir_and_publish(key_path: &Path, bytes: &[u8]) -> Re
         }
     }
 
-    // Ancestors above the key directory keep the existing behavior; only the
-    // directory that actually holds the secret is pinned, and only when this
-    // process creates it.
-    if let Some(grandparent) = dir.parent() {
-        if !grandparent.as_os_str().is_empty() {
-            std::fs::create_dir_all(grandparent).with_context(|| {
-                format!("failed to create parent directories for {}", dir.display())
-            })?;
-        }
-    }
-    let grandparent = dir.parent().filter(|g| !g.as_os_str().is_empty());
-    let gp_path = grandparent.unwrap_or_else(|| Path::new("."));
-    let gp = open_dir_with_flags(gp_path, walk_dir_open_flags()).map_err(|e| {
-        anyhow::Error::new(e).context(format!(
-            "failed to open {} (a symlink here is refused rather than followed)",
-            gp_path.display()
-        ))
-    })?;
-
+    // Every missing component below the deepest existing ancestor is created on
+    // one descriptor chain. The accumulator is an out-parameter so a failure
+    // mid-walk and a failure after it reach the same rollback arm.
     let euid = effective_uid();
-    let (pinned, created) =
-        pin::create_dir_pinned_at(gp.as_raw_fd(), dir_name, dir, euid, leaf_dir_open_flags())
-            .map_err(|e| {
-                anyhow::Error::new(e)
-                    .context(format!("failed to create key directory {}", dir.display()))
-            })?;
+    let mut created_dirs = CreatedDirs::default();
+    let result = create_missing_identity_parents(dir, dir_name, euid, &mut created_dirs).and_then(
+        |(pinned, created)| publish_into_leaf(pinned, created, dir, key_path, file_name, bytes),
+    );
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => Err(created_dirs.roll_back(e)),
+    }
+}
+
+/// Publish the key into the leaf the walk handed back.
+///
+/// `created` is the walk's verdict on the leaf: a directory this invocation
+/// made arrives pinned and verified, and a race winner is adopted without
+/// chmod, exactly as the single-level path did before the walk existed.
+#[cfg(unix)]
+fn publish_into_leaf(
+    pinned: pin::Pinned<std::os::fd::OwnedFd>,
+    created: bool,
+    dir: &Path,
+    key_path: &Path,
+    file_name: &std::ffi::OsStr,
+    bytes: &[u8],
+) -> Result<()> {
     let handle = if created {
         KeyDirHandle::from_pinned_fd(pinned, dir)
     } else {
@@ -1775,7 +1956,6 @@ pub(crate) fn create_pinned_dir_and_publish(key_path: &Path, bytes: &[u8]) -> Re
 
     write_key_atomically(&handle, file_name, bytes)
         .with_context(|| format!("failed to write identity key to {}", key_path.display()))?;
-    let _ = gp;
     Ok(())
 }
 
@@ -1901,10 +2081,12 @@ fn fill_and_publish(
 thread_local! {
     /// Test-only fault injection for the key write. Thread-local so an armed
     /// test cannot disturb the others running beside it.
-    static FAIL_KEY_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FAIL_KEY_WRITE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 
     /// Test-only fault injection for scratch unlink after publish.
-    static FAIL_SCRATCH_UNLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FAIL_SCRATCH_UNLINK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 
     /// How many times this test thread fsync'd a key directory.
     static SYNC_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
