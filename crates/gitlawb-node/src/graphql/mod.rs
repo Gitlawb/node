@@ -254,7 +254,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deeply_nested_queries_are_rejected_before_resolver_execution() {
+    async fn query_depth_limit_accepts_twelve_and_rejects_thirteen() {
         let calls = Arc::new(AtomicUsize::new(0));
         let schema = apply_query_limits(Schema::build(
             CountingQuery(Arc::clone(&calls)),
@@ -262,17 +262,27 @@ mod tests {
             EmptySubscription,
         ))
         .finish();
-        let selection = (0..GRAPHQL_MAX_DEPTH).fold("value".to_string(), |selection, _| {
-            format!("child {{ {selection} }}")
-        });
+        let query_at_depth = |depth: usize| {
+            let selection = (2..depth).fold("value".to_string(), |selection, _| {
+                format!("child {{ {selection} }}")
+            });
+            format!("{{ nested {{ {selection} }} }}")
+        };
 
-        let response = schema
-            .execute(format!("{{ nested {{ {selection} }} }}"))
-            .await;
+        let accepted = schema.execute(query_at_depth(GRAPHQL_MAX_DEPTH)).await;
 
-        assert_eq!(response.data, Value::Null);
-        assert_eq!(response.errors.len(), 1);
-        assert_eq!(response.errors[0].message, "Query is nested too deep.");
+        assert!(
+            accepted.errors.is_empty(),
+            "depth {GRAPHQL_MAX_DEPTH} should be accepted: {:?}",
+            accepted.errors
+        );
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 1);
+
+        let rejected = schema.execute(query_at_depth(GRAPHQL_MAX_DEPTH + 1)).await;
+
+        assert_eq!(rejected.data, Value::Null);
+        assert_eq!(rejected.errors.len(), 1);
+        assert_eq!(rejected.errors[0].message, "Query is nested too deep.");
         assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
