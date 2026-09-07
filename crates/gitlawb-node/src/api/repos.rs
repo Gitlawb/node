@@ -2913,6 +2913,12 @@ struct FederatedPeerRepos {
     node_url: String,
     node_did: String,
     repos: Vec<serde_json::Value>,
+    truncated: bool,
+}
+
+struct FederatedPeerPage {
+    repos: Vec<serde_json::Value>,
+    truncated: bool,
 }
 
 struct BoundedFederatedPeerRows(Vec<serde_json::Value>);
@@ -3002,7 +3008,7 @@ impl FederatedRepoBudget {
 async fn fetch_federated_peer_repos(
     client: &reqwest::Client,
     url: &str,
-) -> Option<Vec<serde_json::Value>> {
+) -> Option<FederatedPeerPage> {
     let mut response = client.get(url).send().await.ok()?;
     if !response.status().is_success()
         || response
@@ -3011,6 +3017,11 @@ async fn fetch_federated_peer_repos(
     {
         return None;
     }
+    let total = response
+        .headers()
+        .get("x-total-count")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
 
     let capacity = response
         .content_length()
@@ -3026,7 +3037,8 @@ async fn fetch_federated_peer_repos(
     }
 
     let BoundedFederatedPeerRows(repos) = serde_json::from_slice(&body).ok()?;
-    Some(repos)
+    let truncated = total.is_some_and(|total| total > repos.len() as u64);
+    Some(FederatedPeerPage { repos, truncated })
 }
 
 fn enrich_federated_repo(
@@ -3060,6 +3072,7 @@ where
             continue;
         };
         nodes_queried += 1;
+        aggregate.truncated |= response.truncated;
         for repo in response.repos {
             let Some(repo) = enrich_federated_repo(repo, &response.node_url, &response.node_did)
             else {
@@ -3148,10 +3161,11 @@ pub async fn list_federated_repos(
                 .await
                 .ok()
                 .flatten()
-                .map(|repos| FederatedPeerRepos {
+                .map(|page| FederatedPeerRepos {
                     node_url: peer_url,
                     node_did: peer_did,
-                    repos,
+                    repos: page.repos,
+                    truncated: page.truncated,
                 })
             }
         })
@@ -3584,6 +3598,74 @@ mod tests {
         byte_server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn federated_peer_total_count_prevents_false_complete_page() {
+        let mut server = mockito::Server::new_async().await;
+        let body = serde_json::to_string(
+            &(0..MAX_FEDERATED_PEER_REPOS)
+                .map(|id| serde_json::json!({ "id": id }))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let page_mock = server
+            .mock("GET", "/api/v1/repos")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("x-total-count", &(MAX_FEDERATED_PEER_REPOS + 1).to_string())
+            .with_body(body)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let page = fetch_federated_peer_repos(
+            &reqwest::Client::new(),
+            &format!("{}/api/v1/repos", server.url()),
+        )
+        .await
+        .expect("the capped peer page is otherwise valid");
+        page_mock.assert_async().await;
+        assert_eq!(page.repos.len(), MAX_FEDERATED_PEER_REPOS);
+        assert!(page.truncated, "the peer total proves another row exists");
+
+        let mut aggregate = FederatedRepoBudget::new(300, 300, MAX_FEDERATED_REPO_JSON_BYTES);
+        let nodes = collect_federated_fetches(
+            [std::future::ready(Some(FederatedPeerRepos {
+                node_url: server.url(),
+                node_did: "did:key:peer".to_string(),
+                repos: page.repos,
+                truncated: page.truncated,
+            }))],
+            &mut aggregate,
+        )
+        .await;
+        assert_eq!(nodes, 1);
+        assert_eq!(aggregate.repos.len(), MAX_FEDERATED_PEER_REPOS);
+        assert!(
+            aggregate.truncated,
+            "the aggregate must not report the paged peer as complete"
+        );
+
+        let mut malformed_server = mockito::Server::new_async().await;
+        let malformed_mock = malformed_server
+            .mock("GET", "/api/v1/repos")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("x-total-count", "not-a-count")
+            .with_body("[{}]")
+            .expect(1)
+            .create_async()
+            .await;
+        let malformed = fetch_federated_peer_repos(
+            &reqwest::Client::new(),
+            &format!("{}/api/v1/repos", malformed_server.url()),
+        )
+        .await
+        .expect("a malformed optional total must not discard a bounded page");
+        malformed_mock.assert_async().await;
+        assert!(!malformed.truncated);
+        assert_eq!(malformed.repos.len(), 1);
+    }
+
     #[test]
     fn federated_aggregate_stays_inside_row_and_serialized_byte_budgets() {
         let mut rows = FederatedRepoBudget::new(3, 2, 4_096);
@@ -3646,6 +3728,7 @@ mod tests {
                     node_url: format!("https://peer-{i}.example"),
                     node_did: format!("did:key:peer-{i}"),
                     repos: vec![serde_json::json!({ "id": i })],
+                    truncated: false,
                 })
             });
         }
