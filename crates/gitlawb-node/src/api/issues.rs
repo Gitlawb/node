@@ -938,6 +938,63 @@ mod lock_pool_shed_tests {
         );
     }
 
+    /// #285 U2, gap-driving. `close_issue` decides authorship out of a
+    /// `read_snapshot`, and on a node whose only copy is the live tree that
+    /// snapshot IS the live tree. When a write left that tree carrying refs the
+    /// store never confirmed, the pre-check reads authorship out of state no
+    /// other node can see, so it must be refused as retryable rather than
+    /// answered.
+    ///
+    /// No backend is configured here, which is the sharpest form: nothing can
+    /// ever confirm the marked tree, so serving it is not a race, it is a
+    /// standing wrong answer.
+    #[sqlx::test]
+    async fn close_issue_refuses_a_quarantined_snapshot_before_authorization(pool: PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let owner = "did:key:zISSUECLOSEQUARANTINEBBBBBBBBBBBBBBBBBBB";
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store =
+            crate::git::repo_store::RepoStore::for_testing(tmp.path().to_path_buf(), pool.clone());
+        state
+            .db
+            .create_repo(&seed_repo(owner, "quar-close"))
+            .await
+            .expect("seed repo");
+
+        // A live tree with an unresolved publish beside it.
+        let live = state
+            .repo_store
+            .acquire(owner, "quar-close")
+            .await
+            .expect("resolve the live path");
+        let _ = std::fs::remove_dir_all(&live);
+        crate::git::store::init_bare(&live).expect("init bare repo");
+        crate::git::repo_store::quarantine_local_tree(
+            &live,
+            "quar-close",
+            Some(&crate::git::publish::PublishAttemptId::new()),
+        );
+
+        let refused = close_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(
+                "did:key:zISSUECLOSEQUARSTRANGER".to_string(),
+            )),
+            Path((
+                owner.to_string(),
+                "quar-close".to_string(),
+                "deadbeef".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(None),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(AppError::RepoUnavailable)),
+            "close_issue must not read authorship out of a quarantined tree the store cannot confirm"
+        );
+    }
+
     #[sqlx::test]
     async fn close_issue_lock_pool_exhaustion_sheds_503_not_500(pool: PgPool) {
         let owner = "did:key:zISSUECLOSELOCKPOOLBBBBBBBBBBBBBBBBBBBBB";

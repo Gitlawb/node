@@ -8238,6 +8238,177 @@ mod tests {
         );
     }
 
+    // ── #285 U7: the sweep skips trees whose publish is unresolved ─────────
+    //
+    // Two different things are called "quarantine" on this node. The operator
+    // status flag on the repo row, which the test above pins, and the sidecar
+    // marker beside a live tree whose publish never resolved. The sweep has
+    // never heard of the second. It does not merely read: it rewrites provider
+    // CIDs and records the repo as a source, durable state fed to the resolver,
+    // out of refs that may never become durable.
+
+    /// #285 U7, gap-driving. A KNOWN source (the row carries `repo_id`) whose
+    /// live tree is marked unresolved must be skipped before any object bytes
+    /// are read, and accounted the way a cold candidate is: retryable, so the
+    /// row is re-walked once the publish resolves.
+    #[sqlx::test]
+    async fn sweep_skips_a_source_whose_publish_is_unresolved_and_leaves_the_row_retryable(
+        pool: PgPool,
+    ) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+
+        let fx = seed_cid_repos(&slug, &short, &["swsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("swsrc.git");
+        let repo = seed_repo(&owner_did, "swsrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let (_raw_cid, provider_cid) =
+            seed_legacy_pin(&pool, &bare, &fx.public_oid, Some(&repo.id)).await;
+
+        // The sidecar an unresolved publish leaves beside the live tree.
+        crate::git::repo_store::quarantine_local_tree(
+            &bare,
+            "swsrc",
+            Some(&crate::git::publish::PublishAttemptId::new()),
+        );
+
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+                &mut Default::default(),
+            ),
+        )
+        .await
+        .expect("the sweep terminates");
+
+        assert_eq!(
+            stats.repaired, 0,
+            "the sweep must not read objects out of a tree whose publish is unresolved"
+        );
+        assert_eq!(
+            crate::ipfs_pin::legacy_repair_reads(),
+            0,
+            "an unresolved tree is skipped before any object bytes are read"
+        );
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            provider_cid,
+            "the legacy key must not be rewritten from an unconfirmed tree"
+        );
+        assert_eq!(
+            stats.retryable_skips, 1,
+            "an unresolved source must be a retryable skip, like a cold one, so the row is re-walked once the publish resolves"
+        );
+
+        // THE CONTROL: the same row, the same bytes, the marker gone.
+        crate::git::repo_store::clear_quarantine(&bare, "swsrc");
+        state.db.set_pin_repair_cursor("").await.unwrap();
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+                &mut Default::default(),
+            ),
+        )
+        .await
+        .expect("the second run terminates");
+        assert_eq!(
+            second.repaired, 1,
+            "once the publish resolves the same row repairs"
+        );
+    }
+
+    /// #285 U7, gap-driving. The discovery half: the row names no repo, so the
+    /// sweep goes looking for a warm holder. A holder whose publish is
+    /// unresolved must be filtered at warm-check time, before any probe, and
+    /// must never be recorded as a source.
+    #[sqlx::test]
+    async fn sweep_discovery_skips_a_warm_candidate_whose_publish_is_unresolved(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["unressrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("unressrc.git");
+        let repo = seed_repo(&owner_did, "unressrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        // The DB status is deliberately left alone: this candidate is healthy as
+        // far as the operator flag is concerned, and only the sidecar withholds it.
+        let (_raw_cid, provider_cid) = seed_legacy_pin(&pool, &bare, &fx.public_oid, None).await;
+        crate::git::repo_store::quarantine_local_tree(
+            &bare,
+            "unressrc",
+            Some(&crate::git::publish::PublishAttemptId::new()),
+        );
+
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+                &mut Default::default(),
+            ),
+        )
+        .await
+        .expect("the sweep terminates");
+
+        assert_eq!(
+            stats.repaired, 0,
+            "discovery must not probe the objects of a candidate whose publish is unresolved"
+        );
+        assert_eq!(
+            crate::ipfs_pin::legacy_repair_reads(),
+            0,
+            "the marker filters the candidate at warm-check time, before any probe"
+        );
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            provider_cid,
+            "the row keeps its provider key"
+        );
+        assert_eq!(
+            state
+                .db
+                .pin_sources_for_oid(&fx.public_oid)
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "no source may be recorded from an unconfirmed tree"
+        );
+    }
+
     /// F1 scenario 4 (#173, MUST-NOT): a candidate that is not on local disk is COLD.
     /// Discovery must not pull it back from remote storage (the sweep is opportunistic
     /// background maintenance, not a bulk restore), and it must not mark the row

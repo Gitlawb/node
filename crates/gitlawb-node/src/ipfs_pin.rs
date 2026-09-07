@@ -676,7 +676,20 @@ async fn warm_candidates(
                 &repo.owner_did,
                 &repo.name,
             ) {
-                Ok(p) if p.is_dir() => out.push((repo, created_at_key, p.into_path_buf())),
+                // A tree whose publish is unresolved is filtered HERE, before the
+                // candidate is ever probed: discovery records the repo as a source
+                // for a CID, and refs that may never become durable must not become
+                // durable provenance. This is a different filter from the `quarantined`
+                // status flag dropped at candidate-load time; that one is an operator
+                // decision about a mirror, this one is "the store cannot confirm what
+                // is on disk right now". An unresolved candidate falls into the arm
+                // below and is accounted exactly as a cold one: absent, not evidence.
+                Ok(p)
+                    if p.is_dir()
+                        && !crate::git::repo_store::live_tree_publish_unresolved(p.as_path()) =>
+                {
+                    out.push((repo, created_at_key, p.into_path_buf()))
+                }
                 Ok(_) => {}
                 Err(e) => {
                     tracing::warn!(repo_id = %repo.id, err = %e, "sweep discovery: rejected unsafe repo path");
@@ -1012,6 +1025,16 @@ async fn sweep_pass(
                 }
             };
             if !repo_path.is_dir() {
+                row_retryable = true;
+                continue;
+            }
+            // The repo is on disk but its last publish is unresolved, so the refs it
+            // holds may never become durable. The sweep does not merely read here: it
+            // rewrites the legacy provider CID from whatever these objects say, which
+            // is state the resolver then serves. Skip, and count it retryable rather
+            // than settled: an unresolved publish resolves one way or the other, so
+            // the row is worth walking again, unlike a repo that is simply gone.
+            if crate::git::repo_store::live_tree_publish_unresolved(repo_path.as_path()) {
                 row_retryable = true;
                 continue;
             }

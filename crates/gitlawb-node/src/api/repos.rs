@@ -3562,26 +3562,51 @@ pub async fn fork_repo(
                 // the create-only fence refuse the second copy. The stored object
                 // carrying our own attempt id says the publish succeeded, and
                 // refusing it would fence the fork name behind our own work.
-                if state
+                match state
                     .repo_store
                     .fork_attempt_landed(&forker_did, &fork_name, &attempt)
                     .await
-                    .unwrap_or(false)
                 {
-                    tracing::info!(
-                        fork = %fork_name,
-                        status,
-                        "fork create-only PUT was refused but the stored archive is this \
-                         attempt's own — continuing"
-                    );
-                } else {
-                    tracing::warn!(
-                        forker = %forker_did,
-                        fork = %fork_name,
-                        status,
-                        "fork refused: an archive already exists under the fork's key"
-                    );
-                    return Err(AppError::RepoExists(fork_name.clone()));
+                    Ok(true) => {
+                        tracing::info!(
+                            fork = %fork_name,
+                            status,
+                            "fork create-only PUT was refused but the stored archive is this \
+                             attempt's own — continuing"
+                        );
+                    }
+                    Ok(false) => {
+                        tracing::warn!(
+                            forker = %forker_did,
+                            fork = %fork_name,
+                            status,
+                            "fork refused: an archive already exists under the fork's key"
+                        );
+                        return Err(AppError::RepoExists(fork_name.clone()));
+                    }
+                    // The store could not be asked whether the stored archive is ours,
+                    // so "not ours" is not an answer we have. Reporting a permanent name
+                    // conflict from a transient store failure sends the client away from
+                    // a name that may well be free; refuse retryably instead.
+                    //
+                    // The clone guard is deliberately NOT disarmed here. Unlike the
+                    // ambiguous arm below, a lost precondition proves this attempt's PUT
+                    // was refused, so the local clone protects nothing the store does not
+                    // already hold. Keeping it would wedge the fork name: the retry this
+                    // 503 invites re-clones into the same destination and fails because
+                    // it exists, and the leftover carries a dead attempt's stamp that no
+                    // cleanup will ever claim. Let Drop remove it.
+                    Err(e) => {
+                        tracing::warn!(
+                            forker = %forker_did,
+                            fork = %fork_name,
+                            status,
+                            err = %e,
+                            "fork refused retryably: the store could not be asked whether the \
+                             archive under the fork's key is this attempt's own"
+                        );
+                        return Err(AppError::RepoUnavailable);
+                    }
                 }
             }
             crate::git::tigris::UploadError::NotPublished(other) => {
@@ -11343,6 +11368,227 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+
+        server.abort();
+    }
+
+    // ── #285 U3: the abandoned write path settles the live tree ────────────
+    //
+    // The sibling above proves the replication TAIL is withheld when a push is
+    // cancelled before its PUT is dispatched. Nothing yet stops the next READ
+    // from serving the very refs that tail refused to announce: the write guard
+    // drops without classifying the tree, so `acquire` finds a live directory,
+    // no marker, and hands it out.
+
+    /// The sidecar marker path for a live tree, derived the way production
+    /// derives it (`.{name}.git.quarantine` beside the validated path) rather
+    /// than returned by the state builder.
+    #[cfg(unix)]
+    fn p3_quarantine_marker(
+        repos_dir: &std::path::Path,
+        owner_did: &str,
+        name: &str,
+    ) -> std::path::PathBuf {
+        let live = crate::git::repo_store::validated_repo_disk_path(repos_dir, owner_did, name)
+            .expect("test repo path");
+        let file = live
+            .file_name()
+            .expect("a live tree always has a file name")
+            .to_string_lossy()
+            .to_string();
+        live.parent()
+            .expect("a live tree always has a parent")
+            .join(format!(".{file}.quarantine"))
+    }
+
+    /// #285 U3, gap-driving. A push cancelled inside the release-side
+    /// compression definitely never attempted publication, so the refs it wrote
+    /// exist only on this node's disk. The next read must not serve them.
+    ///
+    /// The p3 store answers every HEAD 404, so there is nothing stored to serve
+    /// in their place: the correct outcome is that the abandoned tree is gone,
+    /// not that a stale copy is handed out.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_cancelled_during_compression_leaves_no_servable_refs(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
+        let (state, log, puts, server) =
+            p3_compression_gated_state(pool, tmp.path(), "z6p3quar", "c1", Arc::clone(&gate)).await;
+        let rec = state.db.get_repo("z6p3quar", "c1").await.unwrap().unwrap();
+        let repos_dir = tmp.path().join("repos");
+        let live =
+            crate::git::repo_store::validated_repo_disk_path(&repos_dir, &rec.owner_did, "c1")
+                .expect("test repo path")
+                .into_path_buf();
+        let marker = p3_quarantine_marker(&repos_dir, &rec.owner_did, "c1");
+
+        let mut fut = Box::pin(p2_push(&state, "z6p3quar", "c1"));
+        let mut ran = false;
+        for _ in 0..1000 {
+            let step = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            assert!(
+                step.is_err(),
+                "the handler must park inside the release-side compression, not return"
+            );
+            if p2_logged(&log, "receive-pack") {
+                ran = true;
+                break;
+            }
+        }
+        assert!(ran, "the push must reach receive-pack");
+        for _ in 0..10 {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+        }
+        assert_eq!(
+            puts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "compression has not finished, so no PUT can have been built yet"
+        );
+
+        // THE DISCONNECT, inside the compression window.
+        drop(fut);
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        // Release the orphaned compression BEFORE the assertions. The guard has
+        // already dropped, so nothing below depends on the gate, and a failing
+        // assertion would otherwise leave a blocking task parked forever and
+        // hang the runtime teardown instead of reporting.
+        gate.open();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert!(
+            marker.exists(),
+            "a push cancelled before its PUT was dispatched must leave a marker beside the live tree"
+        );
+        // The read resolves the marker: a definite non-publication, so the tree
+        // is dropped and the stored generation (there is none here) is what
+        // would serve.
+        let _ = state.repo_store.acquire(&rec.owner_did, "c1").await;
+        assert!(
+            !live.exists(),
+            "a push cancelled before its PUT was dispatched left its refs servable on the live path"
+        );
+
+        server.abort();
+    }
+
+    /// #285 U3, gap-driving. The disconnect one step earlier: receive-pack has
+    /// already APPLIED a ref and the client goes away before `release` is ever
+    /// entered, so the publish stage is still `Idle`. The guard rides the
+    /// admission guard into the detached reaper, so it drops once the git group
+    /// is torn down, and at that point the tree carries refs no PUT ever
+    /// described.
+    ///
+    /// The fake git applies the ref and then hangs, which is what puts the
+    /// disconnect in that window; argv is
+    /// `<bin> receive-pack --stateless-rpc <repo path>`, so `$3` is the tree.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_disconnected_after_refs_are_applied_leaves_no_servable_refs(
+        pool: sqlx::PgPool,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
+        let (mut state, _log, _puts, server) =
+            p3_compression_gated_state(pool, tmp.path(), "z6p3disc", "c1", Arc::clone(&gate)).await;
+        // Its own directory: `write_fake_git` always writes `fakegit`, and the
+        // state builder has already put the logging shim at that name.
+        let gitdir = tmp.path().join("hanging-git");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        state.git_bin = write_fake_git(
+            &gitdir,
+            r#"#!/bin/sh
+case "$1" in
+  receive-pack)
+    mkdir -p "$3/refs/heads"
+    printf '%s\n' 1111111111111111111111111111111111111111 > "$3/refs/heads/main"
+    sleep 30
+    ;;
+  *) : ;;
+esac
+exit 0
+"#,
+        );
+
+        let rec = state.db.get_repo("z6p3disc", "c1").await.unwrap().unwrap();
+        let repos_dir = tmp.path().join("repos");
+        let live =
+            crate::git::repo_store::validated_repo_disk_path(&repos_dir, &rec.owner_did, "c1")
+                .expect("test repo path")
+                .into_path_buf();
+        let marker = p3_quarantine_marker(&repos_dir, &rec.owner_did, "c1");
+        let ref_path = live.join("refs").join("heads").join("main");
+
+        let mut fut = Box::pin(p2_push(&state, "z6p3disc", "c1"));
+        let mut applied = false;
+        for _ in 0..2000 {
+            let step = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            assert!(
+                step.is_err(),
+                "the handler must park inside the hanging receive-pack, not return"
+            );
+            if ref_path.exists() {
+                applied = true;
+                break;
+            }
+        }
+        assert!(applied, "the push must apply its ref before the disconnect");
+
+        // THE DISCONNECT, after the refs landed and before release is entered.
+        drop(fut);
+        // Nothing below depends on the gate: this disconnect never reaches
+        // release, so no compression is parked on it. Opened here anyway so a
+        // failing assertion reports rather than hanging the teardown.
+        gate.open();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a push disconnected after receive-pack applied its refs must mark the tree, or acquire serves refs object storage does not hold"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let _ = state.repo_store.acquire(&rec.owner_did, "c1").await;
+        assert!(
+            !ref_path.exists(),
+            "refs applied by a disconnected push must not be served"
+        );
+
+        server.abort();
+    }
+
+    /// THE CONTROL for both of the above. Same builder, no disconnect: the
+    /// publish completes, the store acknowledges the PUT, and the tree stays
+    /// readable with nothing withholding it. Without this a green refusal above
+    /// would prove only that this harness never serves.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_that_completes_its_publish_leaves_the_tree_servable(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
+        gate.open();
+        let (state, _log, puts, server) =
+            p3_compression_gated_state(pool, tmp.path(), "z6p3serv", "c1", gate).await;
+        let rec = state.db.get_repo("z6p3serv", "c1").await.unwrap().unwrap();
+        let repos_dir = tmp.path().join("repos");
+        let marker = p3_quarantine_marker(&repos_dir, &rec.owner_did, "c1");
+
+        p2_push(&state, "z6p3serv", "c1")
+            .await
+            .expect("an uncontended push must succeed");
+        assert_eq!(
+            puts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the release must have published exactly once"
+        );
+
+        let served = state.repo_store.acquire(&rec.owner_did, "c1").await;
+        assert!(
+            served.is_ok() && !marker.exists(),
+            "a confirmed publish must leave the tree readable with no marker"
+        );
 
         server.abort();
     }

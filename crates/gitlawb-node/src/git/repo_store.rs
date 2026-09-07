@@ -26,6 +26,30 @@ use super::tigris::{
     UploadPrecondition,
 };
 
+/// A live tree this store has decided it may hand out: its quarantine sidecar
+/// has been read and answered.
+///
+/// The point of the newtype is that inside this module a hand-out of the live
+/// path that skipped the gate does not type-check, so the next
+/// `read_snapshot`-shaped reader cannot forget it the way `read_snapshot` did.
+///
+/// Module-private, constructor included, and deliberately NOT `pub(crate)`: a
+/// `pub(crate)` signature mentioning a private type trips clippy's
+/// `private-interfaces` under `-D warnings`, and both callers live in this file.
+struct ConfirmedLiveTree(ValidatedRepoDiskPath);
+
+impl ConfirmedLiveTree {
+    /// Is the tree still there? A marker naming no attempt resolves by deleting
+    /// the tree, so a confirmed path can legitimately be absent.
+    fn exists(&self) -> bool {
+        self.0.exists()
+    }
+
+    fn into_path_buf(self) -> PathBuf {
+        self.0.into_path_buf()
+    }
+}
+
 /// Centralized repo storage: local disk cache + optional Tigris backend.
 #[derive(Clone)]
 pub struct RepoStore {
@@ -146,68 +170,78 @@ impl RepoStore {
             // possibly-refused write to every reader for as long as the directory
             // survives. Reconcile the quarantine FIRST, before the migration
             // bookkeeping and before the path is handed out.
-            if let Some(marker) = read_quarantine(&local_path) {
-                self.reconcile_quarantine(&owner_slug, repo_name, &local_path, &marker)
-                    .await?;
-            }
-            // Lazy migration: if Tigris is enabled and we haven't confirmed this
-            // repo is in Tigris yet, check and upload in the background.
-            if let Some(ref tigris) = self.tigris {
-                let key = format!("{owner_slug}/{repo_name}");
-                let already_migrated = self.migrated.lock().await.contains(&key);
-                if !already_migrated {
-                    let tigris = tigris.clone();
-                    let slug = owner_slug.clone();
-                    let name = repo_name.to_string();
-                    let path = local_path.clone();
-                    let migrated = Arc::clone(&self.migrated);
-                    tokio::spawn(async move {
-                        // Check if already in Tigris before uploading
-                        match tigris.exists(&slug, &name).await {
-                            Ok(true) => {
-                                debug!(repo = %name, "repo already in tigris — skipping migration");
-                            }
-                            Ok(false) => {
-                                info!(repo = %name, "migrating local repo to tigris");
-                                // Create-only. This backfill was decided on a
-                                // negative existence check that is already
-                                // stale, so a refusal means someone else
-                                // published this key in between and dropping
-                                // our bytes is the correct outcome. An
-                                // unconditional PUT here would overwrite their
-                                // archive, which is the exact bug this fence
-                                // exists to close.
-                                match tigris
-                                    .upload(&slug, &name, &path, UploadPrecondition::IfAbsent)
-                                    .await
-                                {
-                                    Ok(_) => {
-                                        info!(repo = %name, "lazy migration to tigris complete");
-                                    }
-                                    // Logged apart from the warn arm below so a
-                                    // refusal, which is the fence working, does
-                                    // not read as a storage failure. The key is
-                                    // populated either way, so this still
-                                    // counts as migrated.
-                                    Err(UploadError::PreconditionLost { status }) => {
-                                        info!(repo = %name, status, "lazy migration dropped: another writer already published this repo");
-                                    }
-                                    Err(e) => {
-                                        warn!(repo = %name, err = %e, "lazy migration to tigris failed");
-                                        return;
+            //
+            // FIRST is load-bearing, not tidiness. The lazy migration below
+            // backfills this very tree to object storage on an IfAbsent PUT. A
+            // gate that only sat at the returns would refuse the read and, on the
+            // same call, publish the unconfirmed refs it refused to serve, which
+            // is a worse outcome than the ungated read.
+            let confirmed = self
+                .confirm_live_tree(&owner_slug, repo_name, local_path.clone())
+                .await?;
+            // A marker naming no attempt is resolved by deleting the tree, so the
+            // path can be gone by the time it is confirmed. Fall through to the
+            // download branch and serve the stored generation instead.
+            if confirmed.exists() {
+                // Lazy migration: if Tigris is enabled and we haven't confirmed this
+                // repo is in Tigris yet, check and upload in the background.
+                if let Some(ref tigris) = self.tigris {
+                    let key = format!("{owner_slug}/{repo_name}");
+                    let already_migrated = self.migrated.lock().await.contains(&key);
+                    if !already_migrated {
+                        let tigris = tigris.clone();
+                        let slug = owner_slug.clone();
+                        let name = repo_name.to_string();
+                        let path = local_path.clone();
+                        let migrated = Arc::clone(&self.migrated);
+                        tokio::spawn(async move {
+                            // Check if already in Tigris before uploading
+                            match tigris.exists(&slug, &name).await {
+                                Ok(true) => {
+                                    debug!(repo = %name, "repo already in tigris — skipping migration");
+                                }
+                                Ok(false) => {
+                                    info!(repo = %name, "migrating local repo to tigris");
+                                    // Create-only. This backfill was decided on a
+                                    // negative existence check that is already
+                                    // stale, so a refusal means someone else
+                                    // published this key in between and dropping
+                                    // our bytes is the correct outcome. An
+                                    // unconditional PUT here would overwrite their
+                                    // archive, which is the exact bug this fence
+                                    // exists to close.
+                                    match tigris
+                                        .upload(&slug, &name, &path, UploadPrecondition::IfAbsent)
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            info!(repo = %name, "lazy migration to tigris complete");
+                                        }
+                                        // Logged apart from the warn arm below so a
+                                        // refusal, which is the fence working, does
+                                        // not read as a storage failure. The key is
+                                        // populated either way, so this still
+                                        // counts as migrated.
+                                        Err(UploadError::PreconditionLost { status }) => {
+                                            info!(repo = %name, status, "lazy migration dropped: another writer already published this repo");
+                                        }
+                                        Err(e) => {
+                                            warn!(repo = %name, err = %e, "lazy migration to tigris failed");
+                                            return;
+                                        }
                                     }
                                 }
+                                Err(e) => {
+                                    warn!(repo = %name, err = %e, "tigris existence check failed");
+                                    return;
+                                }
                             }
-                            Err(e) => {
-                                warn!(repo = %name, err = %e, "tigris existence check failed");
-                                return;
-                            }
-                        }
-                        migrated.lock().await.insert(format!("{slug}/{name}"));
-                    });
+                            migrated.lock().await.insert(format!("{slug}/{name}"));
+                        });
+                    }
                 }
+                return Ok(confirmed.into_path_buf());
             }
-            return Ok(local_path.into_path_buf());
         }
 
         // Try downloading from Tigris
@@ -223,13 +257,81 @@ impl RepoStore {
                     .lock()
                     .await
                     .insert(format!("{owner_slug}/{repo_name}"));
-                return Ok(local_path.into_path_buf());
+                // Through the gate like every other hand-out of the live path.
+                // Cheap here: the swap that installed the archive cleared any
+                // marker, so this is one failed stat.
+                return Ok(self
+                    .confirm_live_tree(&owner_slug, repo_name, local_path)
+                    .await?
+                    .into_path_buf());
             }
         }
 
         // Not found anywhere — return path anyway; caller will get a meaningful
-        // error from git when the path doesn't exist.
-        Ok(local_path.into_path_buf())
+        // error from git when the path doesn't exist. Still through the gate: an
+        // attempt-bearing marker with no tree beside it means a PUT that may have
+        // landed is unresolved, and answering that with a path is what the gate
+        // exists to prevent.
+        Ok(self
+            .confirm_live_tree(&owner_slug, repo_name, local_path)
+            .await?
+            .into_path_buf())
+    }
+
+    /// The one confirming hand-out of a live tree inside this store.
+    ///
+    /// Three answers, because the sidecar carries three different facts:
+    ///
+    /// - no marker: the tree is a confirmed generation, hand it out;
+    /// - a marker naming an ATTEMPT: unresolved, reconcile it against the store
+    ///   and refuse unless the store holds that attempt;
+    /// - a marker naming NO attempt: a DEFINITE non-publication left by a write
+    ///   that was abandoned before anything reached the wire. Resolvable, and it
+    ///   must be resolved: it is handled exactly the way `release` handles the
+    ///   same state, by invalidating the local write cache, after which the next
+    ///   read serves the stored generation. A definite non-publication that
+    ///   refused forever would wedge a repo at 503 with nothing able to lift it;
+    /// - an UNREADABLE sidecar: fail shut. That is the corrupt-marker case the
+    ///   shape exists for, and it must not be the routine outcome of a
+    ///   disconnect, which is why it is a distinct value from "no attempt".
+    async fn confirm_live_tree(
+        &self,
+        owner_slug: &str,
+        repo_name: &str,
+        local_path: ValidatedRepoDiskPath,
+    ) -> Result<ConfirmedLiveTree> {
+        match read_quarantine(&local_path) {
+            None => Ok(ConfirmedLiveTree(local_path)),
+            Some(Quarantine::Marker(marker)) => match marker.attempt.as_deref() {
+                Some(attempt) => {
+                    let attempt = PublishAttemptId::from_owned(attempt);
+                    self.reconcile_quarantine(owner_slug, repo_name, &local_path, &attempt)
+                        .await?;
+                    Ok(ConfirmedLiveTree(local_path))
+                }
+                None => {
+                    invalidate_local_write_cache(
+                        &local_path,
+                        repo_name,
+                        "definite non-publication left by an abandoned write",
+                    );
+                    // An absent tree is trivially confirmed: nothing at that path
+                    // can carry unconfirmed refs.
+                    Ok(ConfirmedLiveTree(local_path))
+                }
+            },
+            Some(Quarantine::Unreadable) => {
+                warn!(
+                    repo = %repo_name,
+                    "refusing a quarantined read: the marker beside this tree could not be \
+                     parsed, so nothing can say which attempt it is waiting on"
+                );
+                Err(anyhow::Error::new(RepoUnavailable).context(format!(
+                    "local tree for {owner_slug}/{repo_name} is quarantined by a marker that \
+                     could not be read"
+                )))
+            }
+        }
     }
 
     /// Decide whether a quarantined live tree may be served.
@@ -250,7 +352,7 @@ impl RepoStore {
         owner_slug: &str,
         repo_name: &str,
         local_path: &ValidatedRepoDiskPath,
-        marker: &QuarantineMarker,
+        attempt: &PublishAttemptId,
     ) -> Result<()> {
         let refuse = || {
             Err(anyhow::Error::new(RepoUnavailable).context(format!(
@@ -258,20 +360,16 @@ impl RepoStore {
                  is unresolved and could not be reconciled against object storage"
             )))
         };
-        let (Some(tigris), Some(attempt)) = (
-            self.tigris.as_ref(),
-            marker.attempt.as_deref().map(PublishAttemptId::from_owned),
-        ) else {
-            // No backend to ask, or no attempt to ask about. Either way nothing
-            // can confirm this tree, and a read that cannot be confirmed must
-            // not be served as an ordinary success.
+        let Some(tigris) = self.tigris.as_ref() else {
+            // No backend to ask, so nothing can confirm this tree, and a read
+            // that cannot be confirmed must not be served as an ordinary success.
             warn!(
                 repo = %repo_name,
-                "refusing a quarantined read: no attempt identity to reconcile against"
+                "refusing a quarantined read: no object-storage backend to reconcile against"
             );
             return refuse();
         };
-        match tigris.attempt_landed(owner_slug, repo_name, &attempt).await {
+        match tigris.attempt_landed(owner_slug, repo_name, attempt).await {
             Ok(true) => {
                 info!(
                     repo = %repo_name,
@@ -361,11 +459,13 @@ impl RepoStore {
             }
         }
 
-        // Tigris disabled or repo not in Tigris — fall back to local.
-        Ok(RepoSnapshot {
-            path: local_path.into_path_buf(),
-            owned: false,
-        })
+        // Tigris disabled or repo not in Tigris — fall back to local, through
+        // the SAME gate `acquire` uses. This reader had none, so the tree one
+        // reader refused as unconfirmed the other handed out as a snapshot.
+        Ok(RepoSnapshot::live(
+            self.confirm_live_tree(&owner_slug, repo_name, local_path)
+                .await?,
+        ))
     }
 
     /// Take a write lock (Postgres advisory lock), ensure repo is local, return guard.
@@ -568,6 +668,8 @@ impl RepoStore {
                 Some(_) => PublishStage::Idle,
                 None => PublishStage::NoBackend,
             })),
+            tree_settled: false,
+            path_handed_out: AtomicBool::new(false),
             #[cfg(test)]
             test_pre_unlock_gate: self.pre_unlock_gate.clone(),
             #[cfg(test)]
@@ -631,11 +733,17 @@ impl RepoStore {
 
             match refreshed {
                 Some(Ok(fence)) => {
-                    // The tree at the live path is now the generation this HEAD
-                    // observed (downloaded, or confirmed absent), so any
-                    // quarantine an earlier unresolved write left on this path is
-                    // answered by the refresh itself.
-                    clear_quarantine(&local_path, repo_name);
+                    // The refresh does NOT answer a quarantine. Only a swap that
+                    // replaced the live tree with a stored generation does, and
+                    // that swap now clears the marker itself. A HEAD that answered
+                    // "nothing stored" downloads nothing and swaps nothing, so the
+                    // tree it leaves behind is still the unresolved one.
+                    //
+                    // Consequence, stated rather than hidden: a writer on that arm
+                    // proceeds on a tree that may still be quarantined and, if it
+                    // publishes, publishes those refs. That is today's behavior;
+                    // what changes is that the marker survives until the publish is
+                    // acknowledged instead of being dropped before the write.
                     guard.publish_fence = fence;
                 }
                 Some(Err(RefreshFailure::Download { err, .. })) => {
@@ -705,6 +813,11 @@ impl RepoStore {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
 
         store::init_bare(&local_path).context("initializing bare repo")?;
+
+        // A fresh repo is a confirmed tree by the same rule as the swap: nothing
+        // has ever been published from it, so a marker a deleted predecessor left
+        // at this path describes nothing and must not fence the new repo.
+        clear_quarantine(&local_path, repo_name);
 
         // Upload to Tigris in background
         if let Some(ref tigris) = self.tigris {
@@ -932,16 +1045,41 @@ fn fork_clone_is_ours(disk_path: &Path, attempt: &PublishAttemptId) -> bool {
         .is_some_and(|owner| owner.trim() == attempt.as_str())
 }
 
-/// Remove a fork's clone only while it is still this attempt's.
-pub(crate) fn remove_fork_clone_if_ours(
+/// The name a claimed stamp is renamed to while the clone it names is being
+/// removed: `.{name}.git.fork-attempt.removing.{attempt}`.
+fn fork_removal_stamp_path(disk_path: &Path, attempt: &PublishAttemptId) -> Option<PathBuf> {
+    let live = fork_attempt_path(disk_path)?;
+    let name = live.file_name()?.to_string_lossy().to_string();
+    Some(live.with_file_name(format!("{name}.removing.{attempt}")))
+}
+
+/// A cleanup that has established the clone at `disk_path` is still this
+/// attempt's, kept apart from the removal itself so a test can interleave a
+/// successor's clone and stamp between the steps.
+struct ForkRemovalClaim {
+    disk_path: PathBuf,
+    /// The stamp this claim renamed aside. Only this path is ever removed, so a
+    /// successor's stamp written at the live path afterwards survives.
+    claimed_stamp: PathBuf,
+    reason: String,
+}
+
+/// Claim the clone at `disk_path` for `attempt`, by RENAMING its stamp.
+///
+/// Read first, then claim, and never the other way round. The refusal path is a
+/// pure read that touches nothing, so the rightful owner's own concurrent
+/// cleanup always finds its own stamp where it left it; a protocol that renamed
+/// first and renamed back on a foreign stamp would open exactly the window it
+/// was meant to close.
+///
+/// `None` means the stamp is missing, names another attempt, or was claimed by a
+/// concurrent remover for the same attempt. In every one of those cases nothing
+/// on disk has been changed by this call.
+fn begin_fork_removal(
     disk_path: &Path,
     attempt: &PublishAttemptId,
     reason: &str,
-) {
-    if !disk_path.exists() {
-        let _ = fork_attempt_path(disk_path).map(std::fs::remove_file);
-        return;
-    }
+) -> Option<ForkRemovalClaim> {
     if !fork_clone_is_ours(disk_path, attempt) {
         info!(
             path = %disk_path.display(),
@@ -949,18 +1087,93 @@ pub(crate) fn remove_fork_clone_if_ours(
             reason,
             "left the fork clone alone: it no longer belongs to this attempt"
         );
+        return None;
+    }
+    let live = fork_attempt_path(disk_path)?;
+    let claimed_stamp = fork_removal_stamp_path(disk_path, attempt)?;
+    // The rename is the claim, and it is taken BEFORE the tree is touched. The
+    // ownership read above is already stale by the time it returns: a successor
+    // can clone and stamp between it and any later unlink of the live path, and
+    // an unconditional unlink would then destroy the successor's ownership.
+    match std::fs::rename(&live, &claimed_stamp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // A concurrent remover for this same attempt claimed it first. It
+            // owns the removal; doing it twice is what would race.
+            info!(
+                path = %disk_path.display(),
+                attempt = %attempt,
+                reason,
+                "left the fork clone alone: another cleanup for this attempt already claimed it"
+            );
+            return None;
+        }
+        Err(e) => {
+            warn!(
+                path = %disk_path.display(),
+                attempt = %attempt,
+                err = %e,
+                reason,
+                "could not claim the fork clone's stamp — leaving the clone alone rather than \
+                 removing a tree this attempt cannot prove it still owns"
+            );
+            return None;
+        }
+    }
+    Some(ForkRemovalClaim {
+        disk_path: disk_path.to_path_buf(),
+        claimed_stamp,
+        reason: reason.to_string(),
+    })
+}
+
+impl ForkRemovalClaim {
+    /// Remove the clone. `false` means the tree is still there, so the caller
+    /// must not go on to drop the stamp that describes it.
+    fn remove_tree(&self) -> bool {
+        match std::fs::remove_dir_all(&self.disk_path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => {
+                warn!(
+                    path = %self.disk_path.display(),
+                    err = %e,
+                    reason = %self.reason,
+                    "failed to remove fork clone"
+                );
+                false
+            }
+        }
+    }
+
+    /// Drop the RENAMED stamp now that the clone it named is gone.
+    ///
+    /// The live stamp path is never touched after the claim, so a successor that
+    /// cloned into the freed name and stamped it keeps its ownership.
+    fn finish(self) {
+        let _ = std::fs::remove_file(&self.claimed_stamp);
+    }
+}
+
+/// Remove a fork's clone only while it is still this attempt's.
+pub(crate) fn remove_fork_clone_if_ours(
+    disk_path: &Path,
+    attempt: &PublishAttemptId,
+    reason: &str,
+) {
+    // No directory-absent early return. The old one unlinked the live stamp
+    // unconditionally on an `exists()` that is stale the moment it answers, which
+    // is the most reachable form of the race this protocol closes: a successor
+    // that clones and stamps in that window lost its stamp. An absent directory
+    // routes through the claim like every other case, and `remove_tree` tolerates
+    // the `NotFound` it gets.
+    let Some(claim) = begin_fork_removal(disk_path, attempt, reason) else {
+        return;
+    };
+    if !claim.remove_tree() {
         return;
     }
-    if let Err(e) = std::fs::remove_dir_all(disk_path) {
-        warn!(
-            path = %disk_path.display(),
-            err = %e,
-            reason,
-            "failed to remove fork clone"
-        );
-        return;
-    }
-    let _ = fork_attempt_path(disk_path).map(std::fs::remove_file);
+    claim.finish();
 }
 
 async fn retry_fork_archive_delete(
@@ -1126,6 +1339,22 @@ pub(crate) fn swap_extracted_into_validated_repo(
         std::fs::remove_dir_all(live).context("removing stale repo dir")?;
     }
     std::fs::rename(tmp_dir, live).context("swapping extracted repo into place")?;
+    // THE CLEAR BELONGS HERE, to the event that installs a confirmed generation,
+    // not to the callers that happen to observe one. This is the only function
+    // that replaces a live tree with a stored archive, so every present and
+    // future download site inherits the clear with no rule to remember, and a
+    // marker left beside a tree that no longer exists cannot fence the archive
+    // that replaces it.
+    //
+    // The log field is derived from the directory name (so it reads `name.git`
+    // at this one site) rather than threaded down: carrying `repo_name` through
+    // `decompress_repo` and `download_to` costs two signatures and a clone into
+    // the spawn_blocking closure, for a log field.
+    let logged_name = live
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    clear_quarantine(live, &logged_name);
     Ok(())
 }
 
@@ -1143,13 +1372,44 @@ const RECONCILE_BOUND: Duration = Duration::from_secs(5);
 /// and shipped to every node that downloads it, and the marker has to survive
 /// exactly as long as the directory it describes — a swap that replaces the
 /// directory wholesale must not carry the old marker along inside it.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct QuarantineMarker {
     /// The attempt whose PUT was left unresolved. `None` when the bound expired
     /// with no dispatched attempt to name (a state that should compensate rather
     /// than quarantine, kept representable so a marker is never unparseable).
     attempt: Option<String>,
     at: chrono::DateTime<chrono::Utc>,
+}
+
+/// What the sidecar says about a live tree, when it says anything.
+///
+/// `Unreadable` is a value of its own rather than a marker with no attempt,
+/// because the two license opposite actions: a corrupt sidecar must fail shut,
+/// and a marker that genuinely names no attempt is a definite non-publication
+/// that has to be resolvable or a disconnected first push wedges the repo.
+enum Quarantine {
+    Marker(QuarantineMarker),
+    Unreadable,
+}
+
+/// Quarantines whose sidecar could not be written, held here so the withholding
+/// contract does not rest on a single `fs::write`. A full disk or a read-only
+/// mount fails that write, and without this the tree it was meant to withhold is
+/// served as an ordinary read.
+///
+/// The two media are complementary and both are consulted: disk survives a
+/// restart, the map survives a filesystem that will not take the file.
+///
+/// Never evicted, the same shape and bound as `tigris::publish_lock`: one entry
+/// per repo path that ever failed to write a marker, removed on every clear and
+/// on every later successful write.
+static UNWRITTEN_QUARANTINES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, QuarantineMarker>>,
+> = std::sync::OnceLock::new();
+
+fn unwritten_quarantines(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, QuarantineMarker>> {
+    UNWRITTEN_QUARANTINES.get_or_init(Default::default)
 }
 
 /// Sidecar path for a live repo directory: `.{name}.git.quarantine` beside it.
@@ -1162,7 +1422,11 @@ fn quarantine_path(local_path: &Path) -> Option<PathBuf> {
 /// Mark the live tree as carrying an unresolved generation. Reads must reconcile
 /// it before serving; nothing may delete it, because the PUT may have landed and
 /// this can be the only local copy.
-fn quarantine_local_tree(local_path: &Path, repo_name: &str, attempt: Option<&PublishAttemptId>) {
+pub(crate) fn quarantine_local_tree(
+    local_path: &Path,
+    repo_name: &str,
+    attempt: Option<&PublishAttemptId>,
+) {
     let Some(path) = quarantine_path(local_path) else {
         return;
     };
@@ -1170,25 +1434,38 @@ fn quarantine_local_tree(local_path: &Path, repo_name: &str, attempt: Option<&Pu
         attempt: attempt.map(|a| a.as_str().to_string()),
         at: chrono::Utc::now(),
     };
-    let body = match serde_json::to_vec(&marker) {
-        Ok(body) => body,
-        Err(e) => {
-            warn!(repo = %repo_name, err = %e, "could not serialize the quarantine marker");
-            return;
+    let written = serde_json::to_vec(&marker)
+        .map_err(|e| e.to_string())
+        .and_then(|body| std::fs::write(&path, body).map_err(|e| e.to_string()));
+    match written {
+        Ok(()) => {
+            // The disk marker is now the authority for this path, so the shadow
+            // an earlier failed write left has to go. Leaving it would keep
+            // refusing after a confirmation cleared the file.
+            unwritten_quarantines()
+                .lock()
+                .expect("quarantine map poisoned")
+                .remove(&path);
+            warn!(
+                repo = %repo_name,
+                attempt = ?marker.attempt,
+                "quarantined the local tree: its publish outcome is unresolved, so reads must \
+                 reconcile it against the store before serving it"
+            );
         }
-    };
-    match std::fs::write(&path, body) {
-        Ok(()) => warn!(
-            repo = %repo_name,
-            attempt = ?marker.attempt,
-            "quarantined the local tree: its publish outcome is unresolved, so reads must \
-             reconcile it against the store before serving it"
-        ),
-        Err(e) => warn!(
-            repo = %repo_name,
-            err = %e,
-            "failed to write the quarantine marker — reads may serve an unconfirmed tree"
-        ),
+        Err(e) => {
+            unwritten_quarantines()
+                .lock()
+                .expect("quarantine map poisoned")
+                .insert(path.clone(), marker.clone());
+            warn!(
+                repo = %repo_name,
+                err = %e,
+                attempt = ?marker.attempt,
+                "could not write the quarantine marker — holding the quarantine in memory \
+                 for this process instead, so reads still refuse this tree"
+            );
+        }
     }
 }
 
@@ -1196,10 +1473,16 @@ fn quarantine_local_tree(local_path: &Path, repo_name: &str, attempt: Option<&Pu
 /// generation again: a publish the store acknowledged, an under-lock refresh
 /// that overwrote the tree from the stored archive, a reconciliation that found
 /// the attempt did land, or an invalidation that removed the tree entirely.
-fn clear_quarantine(local_path: &Path, repo_name: &str) {
+pub(crate) fn clear_quarantine(local_path: &Path, repo_name: &str) {
     let Some(path) = quarantine_path(local_path) else {
         return;
     };
+    // The map first: a clear that dropped the file and left the shadow would
+    // keep refusing a tree the store has already confirmed.
+    unwritten_quarantines()
+        .lock()
+        .expect("quarantine map poisoned")
+        .remove(&path);
     match std::fs::remove_file(&path) {
         Ok(()) => debug!(repo = %repo_name, "cleared the local tree's quarantine"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1211,16 +1494,38 @@ fn clear_quarantine(local_path: &Path, repo_name: &str) {
     }
 }
 
-/// The quarantine on a live tree, when there is one.
-fn read_quarantine(local_path: &Path) -> Option<QuarantineMarker> {
+/// The quarantine on a live tree, when there is one. Disk first, then the
+/// in-memory shadow for the markers that could not be written.
+fn read_quarantine(local_path: &Path) -> Option<Quarantine> {
     let path = quarantine_path(local_path)?;
-    let body = std::fs::read(&path).ok()?;
-    // An unparseable marker still means quarantined. Failing open on a corrupt
-    // sidecar would serve exactly the tree the sidecar exists to withhold.
-    Some(serde_json::from_slice(&body).unwrap_or(QuarantineMarker {
-        attempt: None,
-        at: chrono::Utc::now(),
-    }))
+    match std::fs::read(&path) {
+        // An unparseable marker still means quarantined, and it means something
+        // NARROWER than "no attempt": nothing can say what it is waiting on, so
+        // it fails shut rather than resolving as a definite non-publication.
+        Ok(body) => Some(match serde_json::from_slice::<QuarantineMarker>(&body) {
+            Ok(marker) => Quarantine::Marker(marker),
+            Err(_) => Quarantine::Unreadable,
+        }),
+        Err(_) => unwritten_quarantines()
+            .lock()
+            .expect("quarantine map poisoned")
+            .get(&path)
+            .cloned()
+            .map(Quarantine::Marker),
+    }
+}
+
+/// Is the live tree at `local_path` carrying a publish nobody has resolved?
+///
+/// For readers that resolve the disk path themselves and never ask the store, so
+/// they cannot go through [`RepoStore::confirm_live_tree`]. Both media and both
+/// marker shapes count: an unresolved publish is unresolved whether the sidecar
+/// names an attempt, names none, or cannot be parsed at all.
+///
+/// Distinct from the operator-level `quarantined` flag on a repo row, which is a
+/// different concept with the same word attached to it.
+pub(crate) fn live_tree_publish_unresolved(local_path: &Path) -> bool {
+    read_quarantine(local_path).is_some()
 }
 
 /// Remove a refused write from the unlocked read cache so `acquire` cannot serve
@@ -1539,6 +1844,16 @@ impl RepoSnapshot {
     pub(crate) fn from_owned_path(path: PathBuf) -> Self {
         Self { path, owned: true }
     }
+
+    /// A snapshot borrowing the live tree. Constructible only from a
+    /// [`ConfirmedLiveTree`], so the fallback cannot skip the quarantine gate.
+    /// Private, not `pub(crate)`, for the reason the newtype states.
+    fn live(tree: ConfirmedLiveTree) -> Self {
+        Self {
+            path: tree.into_path_buf(),
+            owned: false,
+        }
+    }
 }
 
 impl Drop for RepoSnapshot {
@@ -1578,6 +1893,23 @@ pub struct RepoWriteGuard {
     /// this is the only thing that can tell "the PUT was never constructed" from
     /// "the PUT is on the wire and may commit" after the future is gone.
     publish_stage: Arc<PublishStageCell>,
+    /// Has the live tree already been settled by `release`?
+    ///
+    /// `release` classifies the tree on every outcome it reaches, so `Drop` must
+    /// only settle the ABANDONED path. Without this a definite refusal, which
+    /// deletes the tree and clears its marker, would be followed by a `Drop` that
+    /// writes a marker back beside a directory that no longer exists.
+    tree_settled: bool,
+    /// Was the writable tree ever handed out through `path()`?
+    ///
+    /// This is what answers "may a write have landed" at stage `Idle`, where no
+    /// publish was ever started: the receive-pack disconnect applies its refs and
+    /// then loses the guard to the reaper before `release` is entered. Every
+    /// production writer obtains the tree through `path()`, so obtaining it IS
+    /// the declaration and no call site has a rule to remember.
+    ///
+    /// An atomic rather than a `Cell` because `path()` takes `&self`.
+    path_handed_out: AtomicBool,
     /// Test-only seam: when set, `release` parks on this gate at the exact point
     /// it is about to await `pg_advisory_unlock` (connection still owned, not yet
     /// released). Dropping the `release` future while it is parked reproduces a
@@ -1607,7 +1939,13 @@ impl RepoWriteGuard {
     }
 
     /// Path to the bare repo on local disk.
+    ///
+    /// Handing the tree out is also the DECLARATION that a write may land on it.
+    /// Every production writer goes through here, so an abandoned guard can tell
+    /// "the refs were applied and nothing published them" from "nothing ever
+    /// touched this tree" without a per-caller flag anyone could forget to set.
     pub fn path(&self) -> &Path {
+        self.path_handed_out.store(true, Ordering::Release);
         self.local_path.as_path()
     }
 
@@ -1936,6 +2274,11 @@ impl RepoWriteGuard {
             }
         }
 
+        // Whatever `release` reached, it has now classified the tree: published,
+        // refused and invalidated, quarantined, or (on `success == false`) left
+        // deliberately alone. `Drop` settles only the path that never got here.
+        self.tree_settled = true;
+
         // Release the advisory lock on the SAME session that took it. Unlocking
         // through the pool would land on an arbitrary backend, where the call is a
         // silent no-op.
@@ -2005,6 +2348,55 @@ impl Drop for RepoWriteGuard {
     fn drop(&mut self) {
         if let Some(authority) = self.refresh_swap_authority.take() {
             revoke_swap_authority(&authority);
+        }
+
+        // SETTLE THE TREE. A guard that never reached `release` is a write whose
+        // publication nobody classified, and the live tree it leaves behind is
+        // served by every later read on filesystem existence alone. The slot's
+        // own Drop already classified the abandoned attempt; this is the same
+        // question asked of the tree.
+        //
+        // Exhaustive on purpose, no wildcard arm: a new stage must be classified
+        // here rather than inheriting whatever the catch-all happened to do.
+        if !self.tree_settled {
+            let stage = self.publish_stage.get();
+            match &stage {
+                // The store acknowledged this write, so the live tree IS the
+                // stored generation. Mirrors `release`'s `Released` arm.
+                PublishStage::Published { .. } => {
+                    clear_quarantine(&self.local_path, &self.repo_name)
+                }
+                // Nothing to publish to: the local write is the durable copy.
+                PublishStage::NoBackend => {}
+                PublishStage::Idle => {
+                    // A publish was possible and never started. If the tree was
+                    // handed out, refs may already be on it (the receive-pack
+                    // disconnect: git applied them, the reaper killed the group,
+                    // and the guard dropped before `release` was entered), and
+                    // nothing dispatched, so this is a definite non-publication.
+                    // If it was never handed out, nothing touched the tree.
+                    if self.path_handed_out.load(Ordering::Acquire) {
+                        quarantine_local_tree(&self.local_path, &self.repo_name, None);
+                    }
+                }
+                // A definite non-publication after a successful write. The marker
+                // names no attempt, and the next read resolves it by invalidating
+                // the cache and serving the stored generation. Deliberately NOT a
+                // `remove_dir_all` here: that would run a blocking delete inside
+                // `Drop` on a runtime worker, when the read path already runs one.
+                PublishStage::PreparingArchive | PublishStage::Refused => {
+                    quarantine_local_tree(&self.local_path, &self.repo_name, None)
+                }
+                // The PUT may have committed. The marker carries the attempt, so
+                // a landed PUT can still lift it through reconciliation.
+                PublishStage::PutDispatched { .. } | PublishStage::Ambiguous { .. } => {
+                    quarantine_local_tree(
+                        &self.local_path,
+                        &self.repo_name,
+                        stage.unresolved_attempt(),
+                    )
+                }
+            }
         }
 
         let Some(mut conn) = self.conn.take() else {
@@ -3335,6 +3727,8 @@ mod tests {
             publish_fence: UploadPrecondition::Unconditional,
             refresh_swap_authority: None,
             publish_stage: Arc::new(PublishStageCell::new()),
+            tree_settled: false,
+            path_handed_out: AtomicBool::new(false),
             #[cfg(test)]
             test_pre_unlock_gate: None,
             #[cfg(test)]
@@ -3703,6 +4097,8 @@ mod tests {
             publish_fence: UploadPrecondition::Unconditional,
             refresh_swap_authority: None,
             publish_stage: Arc::new(PublishStageCell::new()),
+            tree_settled: false,
+            path_handed_out: AtomicBool::new(false),
             #[cfg(test)]
             test_pre_unlock_gate: None,
             #[cfg(test)]
@@ -4594,6 +4990,11 @@ mod tests {
         /// Conditional DELETEs the mock accepted, so a compensation test can
         /// assert that a guarded delete did NOT run.
         deletes: u32,
+        /// Set by `fail_next_head_for`, decremented per HEAD and answering 500
+        /// while positive. Keyed by request path rather than globally, so a
+        /// test can fail the reconciliation HEAD for ONE repo without also
+        /// failing the lazy-migration HEAD another key answers.
+        fail_heads_for: HashMap<String, u32>,
     }
 
     /// An in-process S3-compatible server with REAL conditional semantics.
@@ -4794,6 +5195,20 @@ mod tests {
                                 }
                                 axum::http::Method::HEAD | axum::http::Method::GET => {
                                     let mut st = state.lock().unwrap();
+                                    // Fault injection for the reconciliation
+                                    // HEAD, which is the one request that turns
+                                    // "is the stored archive ours" from a
+                                    // decision into a non-answer. GET is left
+                                    // alone so a download still works.
+                                    if method == axum::http::Method::HEAD {
+                                        if let Some(n) =
+                                            st.fail_heads_for.get_mut(&key).filter(|n| **n > 0)
+                                        {
+                                            *n -= 1;
+                                            return axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                                                .into_response();
+                                        }
+                                    }
                                     let answered = st.objects.get(&key).cloned();
                                     // Fault injection for the two-consecutive-
                                     // losses arm, and the only deterministic way
@@ -4926,6 +5341,19 @@ mod tests {
         /// The attempt id stamped on whatever the last successful PUT stored.
         fn stored_attempt(&self) -> Option<String> {
             self.last().and_then(|o| o.attempt)
+        }
+
+        /// Fail the next HEAD for ONE repo key with a 500, so a caller's
+        /// reconciliation cannot be answered either way.
+        fn fail_next_head_for(&self, owner_slug: &str, repo_name: &str) {
+            let key = format!("test-bucket/repos/v1/{owner_slug}/{repo_name}.tar.zst");
+            *self
+                .state
+                .lock()
+                .unwrap()
+                .fail_heads_for
+                .entry(key)
+                .or_insert(0) += 1;
         }
 
         /// How many DELETEs the mock actually carried out.
@@ -7351,6 +7779,974 @@ mod tests {
             .object_for(&owner_slug_of(forker), "plain")
             .expect("the fork archive is published");
         assert_eq!(stored.attempt.as_deref(), Some(id.as_str()));
+
+        mock.shutdown();
+    }
+
+    // ── Cycle 1 RED: the residual cache-contract and attempt-identity gaps ──
+
+    /// U1 / gap C. The under-lock refresh clears the quarantine whenever the
+    /// HEAD answered, including when it answered "nothing stored" and therefore
+    /// swapped no tree at all. Only an event that REPLACES the live tree with a
+    /// confirmed generation may lift the marker.
+    #[sqlx::test]
+    async fn a_create_only_refresh_does_not_lift_a_quarantine_it_did_not_answer(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let bound = std::time::Duration::from_millis(750);
+        let store = fenced_store_with_bound(&mock, &opts, repos.path(), bound).await;
+        let owner = "did:key:z6MkRefreshNoSwapAAAAAAAAAAAAAAAAAAAAAA";
+        let repo = "refresh-no-swap-repo";
+
+        let guard = store.acquire_write(owner, repo).await.expect("acquire");
+        marked_repo(&guard.local_path, "unresolved");
+        mock.park_next_put();
+        assert!(matches!(
+            guard.release(true).await,
+            ReleaseOutcome::UploadUnknowable
+        ));
+        assert!(
+            store.acquire(owner, repo).await.is_err(),
+            "refused while unresolved"
+        );
+
+        // A successor whose refresh downloads NOTHING: the parked PUT never
+        // committed, so the HEAD answers absent and no swap replaces the tree.
+        let successor = store.acquire_write(owner, repo).await.expect("successor");
+        let _ = successor.release(false).await;
+
+        let err = store.acquire(owner, repo).await.expect_err(
+            "a refresh that downloaded nothing must not lift a quarantine: the live tree \
+             still carries the unresolved write",
+        );
+        assert!(
+            err.downcast_ref::<RepoUnavailable>().is_some(),
+            "the refusal must be the retryable one, got {err:#}"
+        );
+
+        // The control: the abandoned PUT reaches the commit point and the
+        // marker is answered by the store, not by a writer that swapped nothing.
+        assert_eq!(mock.replay_captured(), 200);
+        store.acquire(owner, repo).await.expect(
+            "once the store holds the attempt the quarantine lifts through reconciliation, \
+             not through the write",
+        );
+
+        mock.open_gate();
+        mock.shutdown();
+    }
+
+    /// U1 / gap D. A marker can outlive the tree it describes (a crash between
+    /// an invalidation's `remove_dir_all` and its clear, or a swap that removed
+    /// the live tree and then failed to rename). The cache-miss download
+    /// installs a CONFIRMED archive at that path, so it must clear the marker.
+    #[sqlx::test]
+    async fn a_quarantine_marker_with_no_tree_does_not_fence_the_downloaded_archive(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let bound = std::time::Duration::from_millis(750);
+        let store = fenced_store_with_bound(&mock, &opts, repos.path(), bound).await;
+        let owner = "did:key:z6MkMarkerNoTreeAAAAAAAAAAAAAAAAAAAAAAA";
+        let repo = "marker-no-tree-repo";
+        let slug = owner_slug_of(owner);
+
+        let seed = TempDir::new().unwrap();
+        marked_repo(seed.path(), "seed");
+        mock_tigris(&mock)
+            .upload(&slug, repo, seed.path(), UploadPrecondition::Unconditional)
+            .await
+            .expect("seeding the archive");
+
+        let guard = store.acquire_write(owner, repo).await.expect("acquire");
+        std::fs::write(guard.local_path.join("MARKER"), "unresolved").unwrap();
+        let local_path = guard.local_path.clone();
+        mock.park_next_put();
+        assert!(matches!(
+            guard.release(true).await,
+            ReleaseOutcome::UploadUnknowable
+        ));
+
+        std::fs::remove_dir_all(&local_path).unwrap();
+
+        store.acquire(owner, repo).await.expect(
+            "a cache-miss download of the confirmed archive must not be refused by a marker \
+             left by a tree that no longer exists",
+        );
+        assert!(
+            !quarantine_path(&local_path).unwrap().exists(),
+            "the swap that installed the confirmed archive must have cleared the stale marker"
+        );
+        store.acquire(owner, repo).await.expect(
+            "a tree downloaded from the confirmed archive must not 503 on a later read either",
+        );
+
+        mock.open_gate();
+        mock.shutdown();
+    }
+
+    /// U1 / review open question 2. `init` installs a tree nothing has ever
+    /// published from, so a marker left by a deleted predecessor at the same
+    /// path describes nothing and must not fence the new repo.
+    #[sqlx::test]
+    async fn init_clears_a_predecessors_quarantine(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let store = fenced_store(&mock, &opts, repos.path()).await;
+        let owner = "did:key:z6MkInitClearsAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let repo = "init-clears-repo";
+
+        let path = validated_repo_disk_path(repos.path(), owner, repo).expect("path validates");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        quarantine_local_tree(&path, repo, Some(&PublishAttemptId::new()));
+
+        store.init(owner, repo).await.expect("init");
+
+        store.acquire(owner, repo).await.expect(
+            "a freshly initialised repo must not inherit a deleted predecessor's quarantine",
+        );
+
+        mock.shutdown();
+    }
+
+    /// U2 / gap B. `acquire` reconciles the quarantine; `read_snapshot`'s
+    /// live-path fallback does not, so the same unconfirmed tree one reader
+    /// refuses the other hands out.
+    #[sqlx::test]
+    async fn read_snapshot_refuses_a_quarantined_tree_when_nothing_is_stored(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let bound = std::time::Duration::from_millis(750);
+        let store = fenced_store_with_bound(&mock, &opts, repos.path(), bound).await;
+        let owner = "did:key:z6MkSnapshotRefuseAAAAAAAAAAAAAAAAAAAAA";
+        let repo = "snapshot-refuse-repo";
+
+        let guard = store.acquire_write(owner, repo).await.expect("acquire");
+        marked_repo(&guard.local_path, "unresolved");
+        let local_path = guard.local_path.clone();
+        mock.park_next_put();
+        assert!(matches!(
+            guard.release(true).await,
+            ReleaseOutcome::UploadUnknowable
+        ));
+
+        // `let ... else` rather than `expect_err`: `RepoSnapshot` is not `Debug`,
+        // and deriving it just to phrase an assertion is not this cycle's work.
+        let Err(err) = store.read_snapshot(owner, repo).await else {
+            panic!(
+                "read_snapshot must not hand out a quarantined live tree as a snapshot when \
+                 the store cannot confirm it"
+            );
+        };
+        assert!(
+            err.downcast_ref::<RepoUnavailable>().is_some(),
+            "the refusal must be the retryable one, got {err:#}"
+        );
+
+        // The control. Once the attempt is in the store the read is served, and
+        // it is served from the store rather than from the live path.
+        assert_eq!(mock.replay_captured(), 200);
+        let snapshot = store.read_snapshot(owner, repo).await.expect(
+            "a confirmed attempt must let read_snapshot serve, from the store, not the live path",
+        );
+        assert_ne!(
+            snapshot.path(),
+            local_path.as_path(),
+            "a confirmed attempt must let read_snapshot serve, from the store, not the live path"
+        );
+
+        mock.open_gate();
+        mock.shutdown();
+    }
+
+    /// U2 / gap B, the degenerate half. With no backend configured nothing can
+    /// ever confirm the tree, so the fallback is the ONLY path and it is the
+    /// one that serves.
+    #[sqlx::test]
+    async fn read_snapshot_refuses_a_quarantined_tree_with_no_backend(pool: PgPool) {
+        let _sink = log_sink();
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let store = RepoStore::new(
+            repos.path().to_path_buf(),
+            None,
+            no_reap_pool(&opts, 2).await,
+            std::time::Duration::from_secs(30),
+        );
+        let owner = "did:key:z6MkSnapshotNoBackendAAAAAAAAAAAAAAAAAA";
+        let repo = "snapshot-no-backend-repo";
+
+        let path = validated_repo_disk_path(repos.path(), owner, repo).expect("path validates");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        seed_bare_repo(&path);
+        quarantine_local_tree(&path, repo, Some(&PublishAttemptId::new()));
+
+        let Err(err) = store.read_snapshot(owner, repo).await else {
+            panic!(
+                "with no backend nothing can confirm a quarantined tree, so read_snapshot \
+                 must refuse rather than serve it"
+            );
+        };
+        assert!(
+            err.downcast_ref::<RepoUnavailable>().is_some(),
+            "the refusal must be the retryable one, got {err:#}"
+        );
+    }
+
+    /// A state whose store publishes to `mock`, plus a PUBLIC repo row whose
+    /// bare tree lives on local disk and is NOT in object storage, so a parked
+    /// write can leave it quarantined with nothing stored to confirm it.
+    async fn quarantined_advert_state(
+        mock: &S3Mock,
+        pool: &PgPool,
+        repos_dir: &Path,
+        owner: &str,
+        name: &str,
+        bound: std::time::Duration,
+    ) -> crate::state::AppState {
+        let opts = (*pool.connect_options()).clone();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store = fenced_store_with_bound(mock, &opts, repos_dir, bound).await;
+        let mut config = (*state.config).clone();
+        config.repos_dir = repos_dir.to_path_buf();
+        state.config = Arc::new(config);
+
+        let now = chrono::Utc::now();
+        state
+            .db
+            .create_repo(&crate::db::RepoRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: name.to_string(),
+                owner_did: owner.to_string(),
+                description: None,
+                is_public: true,
+                default_branch: "main".to_string(),
+                created_at: now,
+                updated_at: now,
+                disk_path: format!("/unused/{name}"),
+                forked_from: None,
+                machine_id: None,
+            })
+            .await
+            .expect("seed the repo row");
+        state
+    }
+
+    async fn advertise_receive_pack(
+        state: &crate::state::AppState,
+        owner: &str,
+        name: &str,
+    ) -> std::result::Result<axum::response::Response, crate::error::AppError> {
+        crate::api::repos::git_info_refs(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                crate::db::normalize_owner_key(owner).to_string(),
+                name.to_string(),
+            )),
+            axum::extract::Query(crate::api::repos::InfoRefsQuery {
+                service: Some("git-receive-pack".to_string()),
+            }),
+            crate::rate_limit::PeerAddr(Some("203.0.113.201:5000".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            None,
+        )
+        .await
+    }
+
+    /// U2 / gap B at the handler. The receive-pack advertisement reads through
+    /// `read_snapshot`, so an unconfirmed tree is advertised to a pushing client
+    /// as the base its push will be built on.
+    #[sqlx::test]
+    async fn info_refs_for_receive_pack_refuses_a_quarantined_tree_with_503(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let repos = TempDir::new().unwrap();
+        let owner = "did:key:z6MkAdvertQuarantineAAAAAAAAAAAAAAAAAAA";
+        let repo = "advert-quarantine-repo";
+        let bound = std::time::Duration::from_millis(750);
+        let state = quarantined_advert_state(&mock, &pool, repos.path(), owner, repo, bound).await;
+
+        let guard = state
+            .repo_store
+            .acquire_write(owner, repo)
+            .await
+            .expect("acquire");
+        // A REAL bare repo, not the minimal marked shape: this tree is what git
+        // advertises from, both on the live path and out of the archive.
+        store::init_bare(&guard.local_path).expect("a real bare repo");
+        mock.park_next_put();
+        assert!(matches!(
+            guard.release(true).await,
+            ReleaseOutcome::UploadUnknowable
+        ));
+
+        let err = advertise_receive_pack(&state, owner, repo)
+            .await
+            .expect_err(
+                "info/refs for receive-pack must refuse a quarantined tree the store cannot \
+             confirm, not advertise its refs",
+            );
+        assert!(
+            matches!(err, crate::error::AppError::RepoUnavailable),
+            "the refusal must be the retryable one, got {err:?}"
+        );
+
+        assert_eq!(mock.replay_captured(), 200);
+        advertise_receive_pack(&state, owner, repo)
+            .await
+            .expect("once confirmed, the advertisement serves");
+
+        mock.open_gate();
+        mock.shutdown();
+    }
+
+    /// U3 / gap A. `release`'s unknowable arm quarantines; the guard's own
+    /// `Drop` does not, so a handler cancelled with its PUT on the wire leaves
+    /// exactly the same state unmarked and servable.
+    #[sqlx::test]
+    async fn a_write_guard_dropped_with_its_put_in_flight_quarantines_the_tree(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let store = fenced_store(&mock, &opts, repos.path()).await;
+        let owner = "did:key:z6MkDropInFlightAAAAAAAAAAAAAAAAAAAAAAA";
+        let repo = "drop-in-flight-repo";
+
+        let guard = store.acquire_write(owner, repo).await.expect("acquire");
+        marked_repo(&guard.local_path, "in-flight");
+        let local_path = guard.local_path.clone();
+        mock.park_next_put();
+
+        let mut fut = Box::pin(guard.release(true));
+        let mut dispatched = false;
+        for _ in 0..1000 {
+            let step = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            assert!(
+                step.is_err(),
+                "the release must park on the in-flight PUT, not return"
+            );
+            if mock.captured_put().is_some() {
+                dispatched = true;
+                break;
+            }
+        }
+        assert!(dispatched, "the PUT must reach the store before the drop");
+
+        // THE DISCONNECT, with the request on the wire.
+        drop(fut);
+
+        let err = store.acquire(owner, repo).await.expect_err(
+            "a write guard dropped with its PUT in flight must leave the tree quarantined, \
+             not servable",
+        );
+        assert!(
+            err.downcast_ref::<RepoUnavailable>().is_some(),
+            "the refusal must be the retryable one, got {err:#}"
+        );
+        assert!(
+            local_path.exists(),
+            "the abandoned path must not delete a tree whose PUT may have landed"
+        );
+
+        // The control. The marker has to name the attempt, or a PUT that does
+        // land can never lift it.
+        assert_eq!(mock.replay_captured(), 200);
+        store.acquire(owner, repo).await.expect(
+            "the quarantine a Drop writes must carry the attempt so a landed PUT can lift it",
+        );
+
+        mock.open_gate();
+        mock.shutdown();
+    }
+
+    /// U3 / gap A, the definite half. A cancellation inside the compression
+    /// window dispatched nothing at all, so the abandoned refs must not be what
+    /// the next read serves.
+    #[sqlx::test]
+    async fn a_write_guard_dropped_during_compression_leaves_reads_served_from_the_store(
+        pool: PgPool,
+    ) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let owner = "did:key:z6MkDropCompressAAAAAAAAAAAAAAAAAAAAAAA";
+        let repo = "drop-compress-repo";
+        let slug = owner_slug_of(owner);
+
+        // Seeded through an ungated client, so the seeding upload's own
+        // compression does not park.
+        let seed = TempDir::new().unwrap();
+        marked_repo(seed.path(), "seed");
+        mock_tigris(&mock)
+            .upload(&slug, repo, seed.path(), UploadPrecondition::Unconditional)
+            .await
+            .expect("seeding the archive");
+
+        let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
+        let store = compression_gated_store(
+            &mock,
+            &opts,
+            repos.path(),
+            std::time::Duration::from_secs(30),
+            Arc::clone(&gate),
+        )
+        .await;
+
+        // Snapshot AFTER seeding: the fixture published the seed archive through this
+        // same mock, so the recorded PUTs are never empty. The property under test is
+        // that THIS guard's abandoned release dispatched nothing, not that the mock
+        // never saw a PUT at all.
+        let puts_before = mock.put_attempts().len();
+
+        let guard = store.acquire_write(owner, repo).await.expect("acquire");
+        std::fs::write(guard.local_path.join("MARKER"), "abandoned").unwrap();
+        let local_path = guard.local_path.clone();
+        let stage = guard.publish_stage();
+
+        let mut fut = Box::pin(guard.release(true));
+        let mut parked = false;
+        for _ in 0..1000 {
+            let step = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            assert!(
+                step.is_err(),
+                "the release must park inside the compression, not return"
+            );
+            if stage.get() == PublishStage::PreparingArchive {
+                parked = true;
+                break;
+            }
+        }
+        assert!(parked, "the release must reach the compression stage");
+
+        drop(fut);
+        gate.open();
+
+        let served = store.acquire(owner, repo).await.expect(
+            "a write abandoned before any PUT was dispatched is a definite non-publication: \
+             the next read must serve the stored generation, not the abandoned refs",
+        );
+        assert_eq!(
+            std::fs::read_to_string(served.join("MARKER")).unwrap_or_default(),
+            "seed",
+            "a write abandoned before any PUT was dispatched is a definite non-publication: \
+             the next read must serve the stored generation, not the abandoned refs"
+        );
+        assert!(
+            !quarantine_path(&local_path).unwrap().exists(),
+            "a no-attempt marker must resolve on the next read, never stand as a permanent 503"
+        );
+        assert_eq!(
+            mock.put_attempts().len(),
+            puts_before,
+            "nothing was dispatched, so nothing may have been published"
+        );
+
+        mock.shutdown();
+    }
+
+    /// U3 / gap A, the same cancellation on a repo with nothing stored. There
+    /// is no confirmed generation to fall back to, so the only safe answer is
+    /// that the abandoned refs are not left on disk.
+    #[sqlx::test]
+    async fn a_write_guard_dropped_during_compression_with_nothing_stored_leaves_no_servable_refs(
+        pool: PgPool,
+    ) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let owner = "did:key:z6MkDropCompressBareAAAAAAAAAAAAAAAAAAA";
+        let repo = "drop-compress-bare-repo";
+
+        let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
+        let store = compression_gated_store(
+            &mock,
+            &opts,
+            repos.path(),
+            std::time::Duration::from_secs(30),
+            Arc::clone(&gate),
+        )
+        .await;
+
+        let guard = store.acquire_write(owner, repo).await.expect("acquire");
+        marked_repo(&guard.local_path, "abandoned");
+        let local_path = guard.local_path.clone();
+        let stage = guard.publish_stage();
+
+        let mut fut = Box::pin(guard.release(true));
+        let mut parked = false;
+        for _ in 0..1000 {
+            let step = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            assert!(
+                step.is_err(),
+                "the release must park inside the compression, not return"
+            );
+            if stage.get() == PublishStage::PreparingArchive {
+                parked = true;
+                break;
+            }
+        }
+        assert!(parked, "the release must reach the compression stage");
+
+        drop(fut);
+        gate.open();
+
+        let _ = store.acquire(owner, repo).await;
+        assert!(
+            !local_path.exists(),
+            "a definite non-publication on a repo with nothing stored must not leave its \
+             refs on disk"
+        );
+
+        mock.shutdown();
+    }
+
+    /// U3 / gap A at stage `Idle`: the receive-pack disconnect. The refs are
+    /// already applied to the live tree and the guard is dropped by the reaper
+    /// before `release` is ever entered, so no stage past `Idle` is reached and
+    /// nothing records that the tree was written.
+    #[sqlx::test]
+    async fn a_write_guard_dropped_at_idle_after_handing_out_its_path_quarantines_the_tree(
+        pool: PgPool,
+    ) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let store = fenced_store(&mock, &opts, repos.path()).await;
+        let owner = "did:key:z6MkDropIdleHandedAAAAAAAAAAAAAAAAAAAAA";
+        let repo = "drop-idle-handed-repo";
+        let slug = owner_slug_of(owner);
+
+        let seed = TempDir::new().unwrap();
+        marked_repo(seed.path(), "seed");
+        mock_tigris(&mock)
+            .upload(&slug, repo, seed.path(), UploadPrecondition::Unconditional)
+            .await
+            .expect("seeding the archive");
+
+        let guard = store.acquire_write(owner, repo).await.expect("acquire");
+        let p = guard.path().to_path_buf();
+        std::fs::write(p.join("MARKER"), "applied").unwrap();
+        let local_path = guard.local_path.clone();
+        drop(guard);
+
+        let marker_path = quarantine_path(&local_path).expect("the marker path");
+        assert!(
+            marker_path.exists(),
+            "a guard dropped after its tree was handed out for writing must mark the tree, \
+             whatever stage the publish reached"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&std::fs::read(&marker_path).unwrap())
+            .expect("the marker is JSON");
+        assert_eq!(
+            body["attempt"],
+            serde_json::Value::Null,
+            "a guard dropped after its tree was handed out for writing must mark the tree, \
+             whatever stage the publish reached"
+        );
+
+        let served = store
+            .acquire(owner, repo)
+            .await
+            .expect("refs applied by a write that never reached release must not be served");
+        assert_eq!(
+            std::fs::read_to_string(served.join("MARKER")).unwrap_or_default(),
+            "seed",
+            "refs applied by a write that never reached release must not be served"
+        );
+
+        mock.shutdown();
+    }
+
+    /// THE CONTROL for the arm above. Every production writer obtains the tree
+    /// through `path()`, so a guard that never handed it out cannot have been
+    /// written through and has nothing to settle.
+    #[sqlx::test]
+    async fn a_write_guard_dropped_at_idle_without_handing_out_its_path_leaves_no_marker(
+        pool: PgPool,
+    ) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let store = fenced_store(&mock, &opts, repos.path()).await;
+        let owner = "did:key:z6MkDropIdleUntouchedAAAAAAAAAAAAAAAAAA";
+        let repo = "drop-idle-untouched-repo";
+
+        let guard = store.acquire_write(owner, repo).await.expect("acquire");
+        let local_path = guard.local_path.clone();
+        drop(guard);
+
+        assert!(
+            !quarantine_path(&local_path).unwrap().exists(),
+            "a guard that never handed out its tree has nothing to settle"
+        );
+
+        mock.shutdown();
+    }
+
+    /// THE CONTROL that pins the settlement to the ABANDONED path only. A
+    /// release that ended in a definite refusal already deleted the tree and
+    /// cleared the marker; the guard's Drop must not then write one back.
+    #[sqlx::test]
+    async fn a_definite_refusal_leaves_no_marker_beside_the_deleted_tree(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let store = fenced_store(&mock, &opts, repos.path()).await;
+        let owner = "did:key:z6MkDefiniteRefusalAAAAAAAAAAAAAAAAAAAA";
+        let repo = "definite-refusal-repo";
+        let slug = owner_slug_of(owner);
+
+        let seed = TempDir::new().unwrap();
+        marked_repo(seed.path(), "seed");
+        mock_tigris(&mock)
+            .upload(&slug, repo, seed.path(), UploadPrecondition::Unconditional)
+            .await
+            .expect("seeding the archive");
+
+        // Both of the release's HEADs lose their generation, so the fence and
+        // its one supersede-retry are both refused.
+        mock.roll_generation_after_next_heads(2);
+
+        let guard = store.acquire_write(owner, repo).await.expect("acquire");
+        std::fs::write(guard.local_path.join("MARKER"), "writer").unwrap();
+        let local_path = guard.local_path.clone();
+        let outcome = guard.release(true).await;
+
+        assert!(
+            matches!(outcome, ReleaseOutcome::Fenced),
+            "the write must be definitively refused, got {outcome:?}"
+        );
+        assert!(
+            !local_path.exists(),
+            "a definite refusal invalidates the local write cache"
+        );
+        assert!(
+            !quarantine_path(&local_path).unwrap().exists(),
+            "a release that already settled the tree must not be re-settled by Drop: no \
+             marker may exist beside a tree the definite refusal deleted"
+        );
+
+        mock.shutdown();
+    }
+
+    /// U4 / gap E. The whole withholding contract rests on one `fs::write`. A
+    /// full disk or a read-only mount fails it, and the tree is then served as
+    /// an ordinary read.
+    #[sqlx::test]
+    async fn an_unwritable_quarantine_marker_still_refuses_reads(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let bound = std::time::Duration::from_millis(750);
+        let store = fenced_store_with_bound(&mock, &opts, repos.path(), bound).await;
+        let owner = "did:key:z6MkUnwritableMarkerAAAAAAAAAAAAAAAAAAA";
+        let repo = "unwritable-marker-repo";
+
+        let guard = store.acquire_write(owner, repo).await.expect("acquire");
+        marked_repo(&guard.local_path, "unresolved");
+        let local_path = guard.local_path.clone();
+        // A directory at the marker path makes `fs::write` fail with EISDIR
+        // regardless of privilege; a chmod is silently ineffective as root.
+        std::fs::create_dir(quarantine_path(&local_path).unwrap()).unwrap();
+        mock.park_next_put();
+        assert!(matches!(
+            guard.release(true).await,
+            ReleaseOutcome::UploadUnknowable
+        ));
+
+        let err = store.acquire(owner, repo).await.expect_err(
+            "an unwritable quarantine marker must still refuse reads: the contract cannot \
+             rest on one fs::write",
+        );
+        assert!(
+            err.downcast_ref::<RepoUnavailable>().is_some(),
+            "the refusal must be the retryable one, got {err:#}"
+        );
+
+        // The control: the in-memory half must lift the same way the on-disk
+        // half does, or it is a permanent outage instead of a withholding.
+        assert_eq!(mock.replay_captured(), 200);
+        store.acquire(owner, repo).await.expect(
+            "the in-memory quarantine must lift through the same reconciliation as the \
+             on-disk one",
+        );
+
+        mock.open_gate();
+        mock.shutdown();
+    }
+
+    /// THE CONTROL for the two media. A marker that reaches disk has to replace
+    /// the in-memory shadow an earlier failed write left, or clearing the file
+    /// leaves the shadow refusing forever.
+    #[sqlx::test]
+    async fn a_marker_that_reaches_disk_replaces_its_in_memory_shadow(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let bound = std::time::Duration::from_millis(750);
+        let store = fenced_store_with_bound(&mock, &opts, repos.path(), bound).await;
+        let owner = "did:key:z6MkMarkerShadowAAAAAAAAAAAAAAAAAAAAAAA";
+        let repo = "marker-shadow-repo";
+
+        // First unresolved write: the marker path is a directory, so the write
+        // fails and only the in-memory half can hold the quarantine.
+        let guard = store.acquire_write(owner, repo).await.expect("acquire");
+        marked_repo(&guard.local_path, "first");
+        let local_path = guard.local_path.clone();
+        let marker_path = quarantine_path(&local_path).unwrap();
+        std::fs::create_dir(&marker_path).unwrap();
+        mock.park_next_put();
+        assert!(matches!(
+            guard.release(true).await,
+            ReleaseOutcome::UploadUnknowable
+        ));
+
+        // The path becomes writable, and a second unresolved write reaches disk.
+        std::fs::remove_dir(&marker_path).unwrap();
+        let second = store.acquire_write(owner, repo).await.expect("acquire");
+        std::fs::write(second.local_path.join("MARKER"), "second").unwrap();
+        mock.park_next_put();
+        assert!(matches!(
+            second.release(true).await,
+            ReleaseOutcome::UploadUnknowable
+        ));
+        assert!(
+            marker_path.exists(),
+            "the second quarantine must reach disk once the path is writable"
+        );
+
+        // Lift the second attempt and clear the file the way a confirmation
+        // does. Nothing may still be refusing after that.
+        assert_eq!(mock.replay_captured(), 200);
+        clear_quarantine(&local_path, repo);
+        assert!(
+            read_quarantine(&local_path).is_none(),
+            "a marker that reached disk must have replaced the in-memory shadow, or the \
+             shadow keeps refusing after the disk marker was cleared"
+        );
+
+        mock.open_gate();
+        mock.shutdown();
+    }
+
+    // ── U5: fork clone removal claims the stamp (#285 gap F) ───────────────
+
+    /// U5 / gap F. The removal reads ownership and then unlinks the LIVE stamp
+    /// path, so a successor that clones and stamps between the two loses its
+    /// stamp and its clone becomes unowned.
+    #[test]
+    fn fork_cleanup_after_the_directory_is_freed_leaves_a_successors_stamp_alone() {
+        let repos = TempDir::new().unwrap();
+        let disk = repos.path().join("owner").join("forked.git");
+        std::fs::create_dir_all(&disk).unwrap();
+        let failed = PublishAttemptId::new();
+        let successor = PublishAttemptId::new();
+        claim_fork_disk_path(&disk, &failed);
+
+        let claim = begin_fork_removal(&disk, &failed, "test").expect("A owns the clone");
+        assert!(claim.remove_tree(), "the tree removal must succeed");
+
+        // The successor clones into the freed name and stamps it before the
+        // failed attempt finishes its cleanup.
+        std::fs::create_dir_all(&disk).unwrap();
+        claim_fork_disk_path(&disk, &successor);
+
+        claim.finish();
+
+        let stamp = fork_attempt_path(&disk).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&stamp).unwrap_or_default().trim(),
+            successor.as_str(),
+            "a failed attempt's cleanup must not remove the stamp a successor wrote after \
+             the directory was freed"
+        );
+        assert!(
+            disk.exists(),
+            "the successor's clone must survive the failed attempt's cleanup"
+        );
+    }
+
+    /// U5 / gap F, the protocol itself. Ownership has to be claimed by RENAME
+    /// before the tree is touched; a read leaves a window a successor can land
+    /// in.
+    #[test]
+    fn fork_cleanup_claims_the_stamp_by_rename_before_touching_the_tree() {
+        let repos = TempDir::new().unwrap();
+        let disk = repos.path().join("owner").join("claimed.git");
+        std::fs::create_dir_all(&disk).unwrap();
+        let attempt = PublishAttemptId::new();
+        claim_fork_disk_path(&disk, &attempt);
+
+        let _claim = begin_fork_removal(&disk, &attempt, "test").expect("this attempt owns it");
+
+        let live = fork_attempt_path(&disk).unwrap();
+        let renamed = fork_removal_stamp_path(&disk, &attempt).unwrap();
+        assert!(
+            !live.exists() && renamed.exists(),
+            "ownership must be claimed by rename before the tree is touched, or a successor \
+             can re-stamp between the read and the unlink"
+        );
+    }
+
+    /// U5 / gap F, the F1 arm. The directory-absent early return unlinks the
+    /// live stamp unconditionally, on an `exists()` that is already stale.
+    #[test]
+    fn fork_cleanup_with_the_directory_absent_leaves_a_successors_stamp_alone() {
+        let repos = TempDir::new().unwrap();
+        let disk = repos.path().join("owner").join("absent.git");
+        std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+        let failed = PublishAttemptId::new();
+        let successor = PublishAttemptId::new();
+        claim_fork_disk_path(&disk, &successor);
+
+        remove_fork_clone_if_ours(&disk, &failed, "test");
+
+        let stamp = fork_attempt_path(&disk).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&stamp).unwrap_or_default().trim(),
+            successor.as_str(),
+            "a cleanup that finds no directory must not unlink a stamp that is not its own"
+        );
+    }
+
+    /// THE CONTROL. A refusal must be a pure read: renaming a foreign stamp and
+    /// renaming it back is not equivalent, because the rightful owner's own
+    /// cleanup can look during the window and find nothing.
+    #[cfg(unix)]
+    #[test]
+    fn fork_cleanup_refuses_a_foreign_stamp_without_touching_it() {
+        use std::os::unix::fs::MetadataExt;
+
+        let repos = TempDir::new().unwrap();
+        let disk = repos.path().join("owner").join("foreign.git");
+        std::fs::create_dir_all(&disk).unwrap();
+        let successor = PublishAttemptId::new();
+        let failed = PublishAttemptId::new();
+        claim_fork_disk_path(&disk, &successor);
+
+        let stamp = fork_attempt_path(&disk).unwrap();
+        let ctime_before = std::fs::metadata(&stamp).unwrap().ctime();
+        let ctime_ns_before = std::fs::metadata(&stamp).unwrap().ctime_nsec();
+
+        assert!(
+            begin_fork_removal(&disk, &failed, "test").is_none(),
+            "a stamp naming another attempt must refuse the claim"
+        );
+
+        let meta = std::fs::metadata(&stamp).unwrap();
+        assert!(
+            std::fs::read_to_string(&stamp).unwrap_or_default().trim() == successor.as_str()
+                && meta.ctime() == ctime_before
+                && meta.ctime_nsec() == ctime_ns_before,
+            "a refused cleanup must not move the successor's stamp even briefly, or the \
+             owner's own cleanup can miss it"
+        );
+    }
+
+    // ── U6: a failed reconciliation HEAD on the fork path (#285 gap G) ─────
+
+    /// Seed a FOREIGN archive under the fork's key, so the fork's create-only
+    /// PUT is refused and the handler has to reconcile.
+    async fn seed_foreign_fork_archive(mock: &S3Mock, forker: &str, fork_name: &str) {
+        let foreign = TempDir::new().unwrap();
+        marked_repo(foreign.path(), "someone-else");
+        mock_tigris(mock)
+            .upload_tracked(
+                &owner_slug_of(forker),
+                fork_name,
+                foreign.path(),
+                UploadPrecondition::Unconditional,
+                PublishAttemptId::from_owned("someone-else"),
+                None,
+            )
+            .await
+            .expect("seed the foreign archive under the fork key");
+    }
+
+    /// U6 / gap G. A reconciliation HEAD that FAILS is collapsed into "the
+    /// archive is not ours" and answered with a permanent name conflict, so a
+    /// storage blip burns the fork name.
+    #[sqlx::test]
+    async fn a_fork_whose_reconciliation_head_fails_after_a_lost_precondition_is_refused_retryably(
+        pool: PgPool,
+    ) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let repos = TempDir::new().unwrap();
+        let source_owner = "did:key:z6MkForkSourceHeadFailAAAAAAAAAAAAAAAA";
+        let forker = "did:key:z6MkForkerHeadFailAAAAAAAAAAAAAAAAAAAAA";
+        let state = fork_state(&mock, &pool, repos.path(), source_owner, "src").await;
+
+        seed_foreign_fork_archive(&mock, forker, "headfail").await;
+        // Keyed by object key, so the source repo's lazy-migration HEAD is not
+        // the one that fails.
+        mock.fail_next_head_for(&owner_slug_of(forker), "headfail");
+
+        let err = do_fork(&state, source_owner, "src", forker, "headfail")
+            .await
+            .expect_err("an unanswered reconciliation must not report a definite conflict");
+        assert!(
+            matches!(err, crate::error::AppError::RepoUnavailable),
+            "a fork whose reconciliation HEAD failed must be refused retryably, not \
+             reported as a permanent name conflict, got {err:?}"
+        );
+        assert!(
+            !repos
+                .path()
+                .join(owner_slug_of(forker))
+                .join("headfail.git")
+                .exists(),
+            "a refused precondition proves this attempt's PUT never landed, so its clone \
+             protects nothing and must not wedge the fork name against the retry the 503 \
+             invites"
+        );
+        assert_eq!(
+            mock.deletes(),
+            0,
+            "nothing may be compensated on an unanswered reconciliation"
+        );
+
+        mock.shutdown();
+    }
+
+    /// THE CONTROL. A reconciliation that ANSWERS, and answers "not ours", is a
+    /// real name conflict and stays a permanent refusal.
+    #[sqlx::test]
+    async fn a_fork_whose_precondition_is_lost_to_a_foreign_archive_is_refused_as_exists(
+        pool: PgPool,
+    ) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let repos = TempDir::new().unwrap();
+        let source_owner = "did:key:z6MkForkSourceForeignAAAAAAAAAAAAAAAAA";
+        let forker = "did:key:z6MkForkerForeignAAAAAAAAAAAAAAAAAAAAAA";
+        let state = fork_state(&mock, &pool, repos.path(), source_owner, "src").await;
+
+        seed_foreign_fork_archive(&mock, forker, "foreign").await;
+
+        let err = do_fork(&state, source_owner, "src", forker, "foreign")
+            .await
+            .expect_err("an archive that is not ours under the fork name refuses the fork");
+        assert!(
+            matches!(err, crate::error::AppError::RepoExists(_)),
+            "a stored archive that is not ours under the fork name is a real conflict, \
+             got {err:?}"
+        );
 
         mock.shutdown();
     }
