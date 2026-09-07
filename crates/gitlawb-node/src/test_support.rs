@@ -655,6 +655,71 @@ mod tests {
         );
     }
 
+    /// A signed non-reader and an anonymous caller get the same opaque 404 for
+    /// a withheld blob path. The gate runs before repository acquisition, so
+    /// the test needs no on-disk repository and any leaked record detail is a
+    /// direct authorization regression.
+    #[sqlx::test]
+    async fn get_blob_denies_withheld_path_without_leaking_details(pool: PgPool) {
+        use crate::db::VisibilityMode;
+
+        let owner = "did:key:zBLOBOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let stranger = "did:key:zBLOBSTRANGERBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+        let mut repo = seed_repo(owner, "blob-repo");
+        repo.description = Some("protected-description-marker".into());
+        repo.default_branch = "protected-branch-marker".into();
+        state.db.create_repo(&repo).await.expect("seed repo");
+        state
+            .db
+            .set_visibility_rule(&repo.id, "/secret/**", VisibilityMode::B, &[], owner)
+            .await
+            .expect("set rule");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/blob/{*path}",
+                    axum::routing::get(crate::api::repos::get_blob),
+                )
+                .with_state(state.clone())
+        };
+        let uri = format!("/api/v1/repos/{owner}/blob-repo/blob/secret/protected-file-marker.txt");
+
+        for (caller, request) in [
+            (
+                "authenticated non-reader",
+                signed_request_as(stranger, Method::GET, &uri, Body::empty()),
+            ),
+            ("anonymous caller", anon_get(&uri)),
+        ] {
+            let response = router().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{caller} must be denied as if the repository did not exist"
+            );
+            let body = json_body(response).await;
+            assert_eq!(body["error"], "repo_not_found", "wrong denial for {caller}");
+            assert_eq!(
+                body["message"],
+                format!("repository '{owner}/blob-repo' not found"),
+                "{caller} must receive the opaque repository denial"
+            );
+            let body = body.to_string();
+            for protected_detail in [
+                "protected-file-marker",
+                "protected-description-marker",
+                "protected-branch-marker",
+            ] {
+                assert!(
+                    !body.contains(protected_detail),
+                    "{caller} denial leaked protected detail: {protected_detail}"
+                );
+            }
+        }
+    }
+
     fn seed_task(id: &str, delegator: &str) -> AgentTask {
         let now = Utc::now().to_rfc3339();
         AgentTask {
