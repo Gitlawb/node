@@ -2359,12 +2359,11 @@ pub async fn git_receive_pack(
         ));
     }
 
-    // Marker namespace is already verified hidden by
-    // `verify_recovery_prereqs` above (which refuses the push on
-    // failure), so no advertisement window exists before the first
-    // marker. Write the per-request marker through the bounded runner
-    // using the configured git binary. Failure is non-fatal for Git
-    // progress but reconcile will quarantine on a missing marker.
+    // Marker hiding was verified above by `verify_recovery_prereqs`,
+    // which is warn-and-proceed (not a push refusal): on failure the
+    // marker is still written and reconcile quarantines on a missing
+    // or mismatched marker. Write the per-request marker through the
+    // bounded runner using the configured git binary.
     match crate::git::store::marker_value_for(&disk_path, &req_row.request_bytes_hash) {
         Ok(marker_value) => {
             if let Err(e) = crate::git::store::write_marker_bounded(
