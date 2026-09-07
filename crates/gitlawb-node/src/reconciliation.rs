@@ -441,6 +441,40 @@ fn set_fail_gap_filters(ipfs: bool, pinata: bool) {
     FAIL_PINATA_GAP_FILTER.with(|c| c.set(pinata));
 }
 
+// Failure injection for the windowed PUBLIC scan: when a repo id is in
+// this set, the scan closure fails before touching git while the
+// recovery walk still runs, proving a failed public scan falls through
+// to phase 2 instead of skipping the whole repo iteration.
+// Process-global (not thread-local) like no other seam here because the
+// scan closure runs on a `spawn_blocking` worker thread, which never
+// sees the test thread's thread-locals. Scoped by repo id — `seed_repo`
+// mints a fresh UUID per fixture — so concurrent tests with their own
+// repos never observe each other's injection.
+#[cfg(test)]
+static SCAN_FAILURE_REPOS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Force the public scan to fail for `repo_id`. Test-only.
+#[cfg(test)]
+fn inject_scan_failure(repo_id: &str) {
+    SCAN_FAILURE_REPOS
+        .lock()
+        .unwrap()
+        .insert(repo_id.to_string());
+}
+
+/// Release the injected scan failure for `repo_id`. Test-only.
+#[cfg(test)]
+fn clear_scan_failure(repo_id: &str) {
+    SCAN_FAILURE_REPOS.lock().unwrap().remove(repo_id);
+}
+
+#[cfg(test)]
+fn scan_failure_injected(repo_id: &str) -> bool {
+    SCAN_FAILURE_REPOS.lock().unwrap().contains(repo_id)
+}
+
 /// [`refilter_public_objects`] at the pin boundary — the last authorization
 /// stage before an irreversible public pin, and the one stage whose failure the
 /// continuation write has to distinguish from "nothing to do". Identical to the
@@ -627,6 +661,16 @@ fn cap_missing(v: Vec<String>, repo_slug: &str, backend: &str) -> Vec<String> {
     }
 }
 
+/// Windowed recovery-walk result: recipient sets, window-exhausted
+/// flag, walked-commit count, budget-exceeded flag. Aliased because the
+/// inline tuple trips `clippy::type_complexity` at the spawn boundary.
+type RecoveryWalkOutcome = (
+    std::collections::HashMap<String, std::collections::BTreeSet<String>>,
+    bool,
+    usize,
+    bool,
+);
+
 /// Run one sweep pass. Returns `(repos_scanned, gaps_found, gaps_filled)`.
 ///
 /// `repos_scanned` counts every repo actually visited this pass (mirror rows
@@ -694,6 +738,37 @@ async fn run_pass(
     let mut repos_scanned = 0usize;
     let mut batch_completed = true;
 
+    // Repo-loop outcome matrix: every early exit below answers four
+    // questions — advance the scan cursor? advance the recovery cursor?
+    // run phase 1 (public)? run phase 2 (encrypted recovery)? The lanes
+    // are independent: public scan, public pin, and encrypted recovery
+    // each own their cursor, and a `continue` must name which lanes it
+    // blocks. New exits must add their row here, with a deny test.
+    //
+    // | exit                                  | scan cursor | recovery cursor | phase 1 | phase 2 |
+    // |---------------------------------------|-------------|-----------------|---------|---------|
+    // | shutdown / acquire timeout / mirror / | untouched   | untouched       | no      | no      |
+    // | quarantine / missing repo             |             |                 |         |         |
+    // | scan walk ok                          | advance per | independent     | if work | yes     |
+    // |                                       | effect state| (own window)    |         |         |
+    // | scan walk hits WalkBudgetExceeded     | ADVANCE past| independent     | no work | yes     |
+    // |                                       | window      | (own window)    | (empty) |         |
+    // | scan walk fails / panics / times out  | untouched   | independent     | no work | yes     |
+    // |                                       | (retry)     | (own window)    | (empty) |         |
+    // | repo unlistable                       | untouched   | independent     | no work | yes     |
+    // |                                       |             | (own window)    | (empty) |         |
+    // | refilter / recheck-public fail        | untouched   | untouched       | no      | no      |
+    // | (fail-closed by design)               | (whole-iter | (whole-iter     |         |         |
+    // |                                       | ation skip)| ation skip)     |         |         |
+    // | fence capture fail                    | untouched   | untouched       | done    | no      |
+    // | recovery walk ok                      | as decided  | advance / clear | as run  | seals   |
+    // | recovery walk hits WalkBudgetExceeded | as decided  | ADVANCE past    | as run  | no work |
+    // |                                       |             | window          |         | (empty) |
+    // | recovery walk fails / panics /        | as decided  | untouched       | as run  | no      |
+    // | times out                             |             | (retry)         |         |         |
+    // | seal fails                            | as decided  | ADVANCED anyway | as run  | attempted|
+    // |                                       |             | (retry next     |         | (retry  |
+    // |                                       |             | cycle)          |         | next cyc)|
     for repo in &batch {
         if *shutdown_rx.borrow() {
             tracing::info!("reconciliation sweep: shutdown signal received mid-pass, exiting");
@@ -845,10 +920,21 @@ async fn run_pass(
         let object_list: Vec<String> = if !listable {
             Vec::new()
         } else {
+            // Moved into the scan closure for the test-only scan-failure
+            // seam (unused in production builds).
+            #[cfg(test)]
+            let repo_id_for_scan = repo.id.clone();
             let object_list = tokio::time::timeout(
                 scan_deadline.saturating_duration_since(Instant::now()),
                 tokio::task::spawn_blocking(
-                    move || -> anyhow::Result<(Vec<String>, Vec<String>, bool)> {
+                    move || -> anyhow::Result<(Vec<String>, Vec<String>, bool, bool)> {
+                        // Test seam: fail the PUBLIC scan only (the
+                        // recovery walk has no such seam), proving a
+                        // failed scan falls through to phase 2.
+                        #[cfg(test)]
+                        if scan_failure_injected(&repo_id_for_scan) {
+                            anyhow::bail!("injected public-scan failure (test seam)");
+                        }
                         let window = crate::git::visibility_pack::rev_list_commit_window(
                             &disk_clone,
                             "git",
@@ -860,13 +946,32 @@ async fn run_pass(
                         // Fresh bounded budget for this window's
                         // enumeration: memo and ceilings are per-walk.
                         let mut budget = crate::git::visibility_pack::WalkBudget::bounded();
-                        let enumeration = crate::git::visibility_pack::enumerate_commit_window(
-                            &disk_clone,
-                            "git",
-                            scan_deadline,
-                            &window,
-                            &mut budget,
-                        )?;
+                        // Typed dispatch at the sweep boundary (P1):
+                        // budget exhaustion is not a git or policy
+                        // failure. The sweep SKIPS the window (advances
+                        // past content it refuses to classify
+                        // partially) while any other walk error retries
+                        // the same window. Future typed walk errors
+                        // follow this same match-arm pattern here.
+                        let enumeration =
+                            match crate::git::visibility_pack::enumerate_commit_window(
+                                &disk_clone,
+                                "git",
+                                scan_deadline,
+                                &window,
+                                &mut budget,
+                            ) {
+                                Ok(enumeration) => enumeration,
+                                Err(e) if e
+                                    .downcast_ref::<
+                                        crate::git::visibility_pack::WalkBudgetExceeded,
+                                    >()
+                                    .is_some() =>
+                                {
+                                    return Ok((Vec::new(), window, exhausted, true));
+                                }
+                                Err(e) => return Err(e),
+                            };
                         let ((allowed, allowed_trees, all_blobs, all_trees), admitted_roots) =
                             crate::git::visibility_pack::classify_object_pairs(
                                 &disk_clone,
@@ -909,30 +1014,53 @@ async fn run_pass(
                                 &allowed_trees,
                                 &all_trees,
                             );
-                        Ok((object_list, window, exhausted))
+                        Ok((object_list, window, exhausted, false))
                     },
                 ),
             )
             .await;
 
             match object_list {
-                Ok(Ok(Ok((list, window, exhausted)))) => {
+                Ok(Ok(Ok((list, window, exhausted, budget_exceeded)))) => {
                     window_exhausted = exhausted;
-                    scan_advance = exhausted;
                     window_commits = window;
+                    // A budget-hit window advances even when full: a
+                    // successful walk with an empty list would HOLD a
+                    // full window for retry, but there is nothing to
+                    // retry — the content is deliberately left
+                    // unclassified. At the history end this deletes
+                    // the cursor like any exhausted walk.
+                    scan_advance = exhausted || budget_exceeded;
+                    if budget_exceeded {
+                        tracing::warn!(
+                            repo = %repo_slug,
+                            window = window_commits.len(),
+                            "windowed scan hit the walk budget, skipping window (no partial classification)"
+                        );
+                    }
                     list
                 }
+                // Scan failure (P2): no public work this pass, but the
+                // repo iteration does NOT `continue` — phase 2 below
+                // runs with the recovery lane's own cursor, same as for
+                // unlistable repos with an empty public list. An
+                // unclassifiable public list must not suppress encrypted
+                // recovery. The scan cursor is left untouched so the
+                // same window retries next pass. (Refilter/recheck
+                // failures deeper in phase 1 stay fail-closed whole-
+                // iteration `continue`s by design — this arm is scan
+                // only.)
                 Ok(Ok(Err(e))) => {
-                    tracing::warn!(repo = %repo_slug, err = %e, "windowed scan failed, skipping");
-                    continue;
+                    tracing::warn!(repo = %repo_slug, err = %e, "windowed scan failed, skipping public phase (recovery still runs)");
+                    Vec::new()
                 }
                 Ok(Err(e)) => {
-                    tracing::warn!(repo = %repo_slug, err = %e, "windowed scan task panicked, skipping");
-                    continue;
+                    tracing::warn!(repo = %repo_slug, err = %e, "windowed scan task panicked, skipping public phase (recovery still runs)");
+                    Vec::new()
                 }
                 Err(_) => {
-                    tracing::warn!(repo = %repo_slug, "windowed scan deadline exceeded, skipping");
-                    continue;
+                    tracing::warn!(repo = %repo_slug, "windowed scan deadline exceeded, skipping public phase (recovery still runs)");
+                    Vec::new()
                 }
             }
         };
@@ -1533,16 +1661,11 @@ async fn run_pass(
             let rskip = load_recovery_cursor(db, &repo.id).await;
             let recipients = tokio::time::timeout(
                 REPO_SCAN_DEADLINE,
-                tokio::task::spawn_blocking(move || -> anyhow::Result<(
-                    std::collections::HashMap<String, std::collections::BTreeSet<String>>,
-                    bool,
-                    usize,
-                )> {
+                tokio::task::spawn_blocking(move || -> anyhow::Result<RecoveryWalkOutcome> {
                     // Own deadline for the whole windowed walk (same
                     // shape as the scan's: one absolute bound, not a
                     // fresh budget per child).
-                    let deadline =
-                        std::time::Instant::now() + REPO_SCAN_DEADLINE;
+                    let deadline = std::time::Instant::now() + REPO_SCAN_DEADLINE;
                     let window = crate::git::visibility_pack::rev_list_commit_window(
                         &p,
                         "git",
@@ -1551,12 +1674,31 @@ async fn run_pass(
                         SCAN_COMMIT_WINDOW,
                     )?;
                     let exhausted = window.len() < SCAN_COMMIT_WINDOW;
-                    let mut budget =
-                        crate::git::visibility_pack::WalkBudget::bounded();
+                    let mut budget = crate::git::visibility_pack::WalkBudget::bounded();
+                    // Typed dispatch, mirroring the scan boundary: a
+                    // budget-hit window is SKIPPED (cursor advances
+                    // past the full window below) while any other walk
+                    // error retries it.
                     let enumeration =
-                        crate::git::visibility_pack::enumerate_commit_window(
+                        match crate::git::visibility_pack::enumerate_commit_window(
                             &p, "git", deadline, &window, &mut budget,
-                        )?;
+                        ) {
+                            Ok(enumeration) => enumeration,
+                            Err(e) if e
+                                .downcast_ref::<
+                                    crate::git::visibility_pack::WalkBudgetExceeded,
+                                >()
+                                .is_some() =>
+                            {
+                                return Ok((
+                                    std::collections::HashMap::new(),
+                                    exhausted,
+                                    window.len(),
+                                    true,
+                                ));
+                            }
+                            Err(e) => return Err(e),
+                        };
                     let mut pairs = enumeration.blob_pairs;
                     pairs.extend(enumeration.tree_pairs);
                     let walked = window.len();
@@ -1569,13 +1711,22 @@ async fn run_pass(
                         ),
                         exhausted,
                         walked,
+                        false,
                     ))
                 }),
             )
             .await;
 
             let (rec, recovery_exhausted, recovery_walked) = match recipients {
-                Ok(Ok(Ok(v))) => v,
+                Ok(Ok(Ok((rec, exhausted, walked, budget_exceeded)))) => {
+                    if budget_exceeded {
+                        tracing::warn!(
+                            repo = %repo_slug, window = walked,
+                            "recovery walk hit the walk budget, skipping window (no partial recipient set)"
+                        );
+                    }
+                    (rec, exhausted, walked)
+                }
                 Ok(Ok(Err(e))) => {
                     tracing::warn!(
                         repo = %repo_slug, err = %e,
@@ -1600,8 +1751,10 @@ async fn run_pass(
             };
 
             // Recovery-lane progress: the window was evaluated (walk
-            // ok), so advance the recovery cursor — or clear it at the
-            // history end. Seal outcomes do NOT gate this: a failed
+            // ok — including a budget-hit walk, which yields an empty
+            // recipient set for a window deliberately left
+            // unclassified), so advance the recovery cursor — or clear
+            // it at the history end. Seal outcomes do NOT gate this: a failed
             // seal leaves no row, so the next cycle re-derives and
             // retries it; holding discovery for seal results would
             // stall the lane behind one bad object. Walk/panic/timeout
@@ -3727,7 +3880,343 @@ mod tests {
         m.assert_async().await;
     }
 
-    /// R2-P1 regression: with `max_concurrent_pin_tasks = 1` (a semaphore of
+    /// Build a repo whose 1000th commit (0-indexed 999) holds a tree
+    /// wider than `MAX_WALK_ENTRIES`: 260,001 empty files trip the
+    /// entry ceiling deterministically with real production caps (one
+    /// `ls-tree` child emits ~16MB, under the 64MB per-child cap, but
+    /// pair insertion bails at the 250,001st pair — pairs are
+    /// (oid, path), so the shared empty-blob OID still counts per
+    /// path). Position 999 of 1005 is the NEWEST commit of window 1
+    /// (windows take the oldest 1000, newest-first), so both lanes trip
+    /// on their FIRST `ls-tree` instead of spawning ~1000 children per
+    /// walk — the same budget signal at a fraction of the suite load.
+    /// Built with plumbing (`mktree` writes one tree object in
+    /// seconds; routing 260k files through fast-import costs ~9
+    /// CPU-minutes). No seam: this exercises the typed
+    /// `WalkBudgetExceeded` dispatch at the sweep boundary.
+    fn seed_budget_busting_repo(work: &std::path::Path) {
+        fn git(work: &std::path::Path, args: &[&str], stdin: Option<&[u8]>) -> String {
+            use std::io::Write;
+            let mut child = std::process::Command::new("git")
+                .args(args)
+                .current_dir(work)
+                .stdin(if stdin.is_some() {
+                    std::process::Stdio::piped()
+                } else {
+                    std::process::Stdio::null()
+                })
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            if let Some(input) = stdin {
+                child.stdin.as_mut().unwrap().write_all(input).unwrap();
+            }
+            let out = child.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        git(work, &["init", "-q", "-b", "main"], None);
+        // 999 tiny commits first, each rewriting f.txt, on a scratch
+        // branch (fast-import forbids creating a branch from itself,
+        // and main does not exist yet — the scratch tip becomes main).
+        let mut stream = String::new();
+        const BEFORE: usize = 999;
+        for c in 0..BEFORE {
+            let body = format!("tiny {c:04}\n");
+            stream.push_str("commit refs/heads/tmpwork\n");
+            stream.push_str(&format!("mark :{}\n", c + 1));
+            stream.push_str("committer T <t@t> 1700000000 +0000\ndata 0\n");
+            if c > 0 {
+                stream.push_str(&format!("from :{c}\n"));
+            }
+            stream.push_str("M 100644 inline f.txt\n");
+            stream.push_str(&format!("data {}\n", body.len()));
+            stream.push_str(&body);
+        }
+        git(work, &["fast-import", "--quiet"], Some(stream.as_bytes()));
+        let tip = git(work, &["rev-parse", "refs/heads/tmpwork"], None);
+        git(work, &["update-ref", "refs/heads/main", &tip], None);
+        git(work, &["update-ref", "-d", "refs/heads/tmpwork"], None);
+        // The wide commit (index 999): same f.txt plus 260,001 empty
+        // files, built with plumbing. Flat root names keep `mktree`
+        // input byte-sorted (`f.txt` < `w…`).
+        let fblob = git(work, &["rev-parse", "refs/heads/main:f.txt"], None);
+        let empty = git(
+            work,
+            &["hash-object", "-w", "-t", "blob", "/dev/null"],
+            None,
+        );
+        let mut tree_in = format!("100644 blob {fblob}\tf.txt\n");
+        for i in 0..260_001usize {
+            tree_in.push_str(&format!("100644 blob {empty}\tw{i:06}\n"));
+        }
+        let root = git(work, &["mktree"], Some(tree_in.as_bytes()));
+        let wide = git(
+            work,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit-tree",
+                &root,
+                "-p",
+                &tip,
+                "-m",
+                "wide",
+            ],
+            None,
+        );
+        git(work, &["update-ref", "refs/heads/main", &wide], None);
+        // 5 tiny commits on top so the wide commit is the newest of
+        // window 1, not the tip (window 1 must be full, not exhausted).
+        let mut tail = String::new();
+        const AFTER: usize = 5;
+        for c in 0..AFTER {
+            let body = format!("tail {c}\n");
+            tail.push_str("commit refs/heads/tmpwork\n");
+            tail.push_str(&format!("mark :{}\n", c + 1));
+            tail.push_str("committer T <t@t> 1700000000 +0000\ndata 0\n");
+            if c == 0 {
+                tail.push_str("from refs/heads/main\n");
+            } else {
+                tail.push_str(&format!("from :{c}\n"));
+            }
+            tail.push_str("M 100644 inline f.txt\n");
+            tail.push_str(&format!("data {}\n", body.len()));
+            tail.push_str(&body);
+        }
+        git(work, &["fast-import", "--quiet"], Some(tail.as_bytes()));
+        let tip2 = git(work, &["rev-parse", "refs/heads/tmpwork"], None);
+        git(work, &["update-ref", "refs/heads/main", &tip2], None);
+        git(work, &["update-ref", "-d", "refs/heads/tmpwork"], None);
+        assert_eq!(
+            git(work, &["rev-list", "--count", "refs/heads/main"], None),
+            (BEFORE + 1 + AFTER).to_string(),
+            "tiny history around the wide commit"
+        );
+    }
+
+    /// Deny test for BOTH lanes (P1): a window that exceeds the walk
+    /// budget advances the SCAN and RECOVERY cursors past the window
+    /// instead of retrying it forever. Removing either
+    /// `WalkBudgetExceeded` arm (plain `continue` on every walk error)
+    /// leaves that lane's cursor unset and fails this test. Nothing
+    /// pins or seals: the window is deliberately left unclassified,
+    /// never partially admitted.
+    ///
+    /// One test covers both lanes (rather than one per lane) to halve
+    /// the suite load: the fixture needs a non-exhausted window (1000+
+    /// commits) tripped with real production caps, and each lane's walk
+    /// spawns ~1000 git children. Each arm's removal is still denied
+    /// independently by its own cursor assertion below.
+    #[sqlx::test]
+    async fn sweep_budget_exceeded_advances_both_lane_cursors(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let work = tmp.path().join("wide");
+        std::fs::create_dir_all(&work).unwrap();
+        seed_budget_busting_repo(&work);
+
+        let owner = "did:key:zWideBudgetOwner";
+        let rec = seed_repo(owner, "wide-budget", &work.display().to_string());
+        db.create_repo(&rec).await.unwrap();
+
+        // Zero expected uploads: a budget-hit window pins and seals nothing.
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            &server.url(),
+        ]);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        let (_tx, mut rx) = watch::channel(false);
+        let mut cursor = None;
+        let (scanned, _gaps, _filled) = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            super::run_pass(
+                &db,
+                &config,
+                &http,
+                &node_seed,
+                &node_did,
+                &pin_sem,
+                super::REPO_SCAN_DEADLINE,
+                &mut cursor,
+                &mut rx,
+                None,
+            ),
+        )
+        .await
+        .expect("pass must return")
+        .expect("run_pass succeeds");
+        assert_eq!(scanned, 1, "one repo scanned");
+        // Scan lane: removing the scan budget arm leaves this unset.
+        assert_eq!(
+            db.get_node_state(&super::scan_cursor_key(&rec.id))
+                .await
+                .unwrap(),
+            Some(super::SCAN_COMMIT_WINDOW.to_string()),
+            "budget-hit window advances the scan cursor past the full window"
+        );
+        // Recovery lane: removing the recovery budget arm leaves this unset.
+        assert_eq!(
+            db.get_node_state(&super::recovery_cursor_key(&rec.id))
+                .await
+                .unwrap(),
+            Some(super::SCAN_COMMIT_WINDOW.to_string()),
+            "budget-hit window advances the recovery cursor past the full window"
+        );
+        let pinned: i64 = sqlx::query_scalar("SELECT count(*) FROM pinned_cids")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(pinned, 0, "an unclassified window pins nothing");
+        let sealed: i64 = sqlx::query_scalar("SELECT count(*) FROM encrypted_blobs")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(sealed, 0, "an unclassified window seals nothing");
+        m.assert_async().await;
+    }
+
+    /// Deny test (P2): a failed PUBLIC scan still runs encrypted
+    /// recovery. The scan seam fails before touching git while the
+    /// recovery walk runs normally; the sweep must fall through to
+    /// phase 2 with an empty public list. Fails on the old
+    /// whole-iteration `continue` (no phase 2 means no recovery row).
+    #[sqlx::test]
+    async fn sweep_scan_failure_still_runs_encrypted_recovery(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        // The owner must be a real resolvable did:key for the recipient set.
+        let owner_did = gitlawb_core::identity::Keypair::generate()
+            .did()
+            .to_string();
+
+        // No commits: the only object hangs off a non-commit ref, so a
+        // working scan would surface it only via the ref phases while
+        // the injected failure surfaces nothing at all.
+        let td = tempfile::TempDir::new().unwrap();
+        let path = td.path();
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        let blob = {
+            use std::io::Write;
+            let mut child = std::process::Command::new("git")
+                .args(["hash-object", "-w", "--stdin"])
+                .current_dir(path)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"scan-fail recovery bytes\n")
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run_git(&["update-ref", "refs/direct/blob", &blob]);
+        let rec = seed_repo(
+            &owner_did,
+            "scan-fail-recovery",
+            &path.display().to_string(),
+        );
+        db.create_repo(&rec).await.unwrap();
+
+        // One seal upload: the recovery copy of the direct blob.
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/v0/add?cid-version=1&raw-leaves=true&pin=true")
+            .expect(1)
+            .with_status(200)
+            .with_body(r#"{"Hash":"QmScanFailMockCid"}"#)
+            .create_async()
+            .await;
+
+        let config = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            &server.url(),
+        ]);
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did();
+        let node_seed = *kp.to_seed();
+        let http = reqwest::Client::new();
+        let pin_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        super::inject_scan_failure(&rec.id);
+        let (_tx, mut rx) = watch::channel(false);
+        let mut cursor = None;
+        let (scanned, _gaps, _filled) = super::run_pass(
+            &db,
+            &config,
+            &http,
+            &node_seed,
+            &node_did,
+            &pin_sem,
+            super::REPO_SCAN_DEADLINE,
+            &mut cursor,
+            &mut rx,
+            None,
+        )
+        .await
+        .unwrap();
+        super::clear_scan_failure(&rec.id);
+        assert_eq!(scanned, 1, "one repo scanned");
+        assert!(
+            !db.has_ipfs_cid(&blob).await.unwrap(),
+            "direct blob must never be pinned in cleartext"
+        );
+        assert!(
+            db.encrypted_blob_cid(&rec.id, &blob)
+                .await
+                .unwrap()
+                .is_some(),
+            "encrypted recovery must run even though the public scan failed"
+        );
+        assert_eq!(
+            db.get_node_state(&super::scan_cursor_key(&rec.id))
+                .await
+                .unwrap(),
+            None,
+            "a failed scan leaves the cursor untouched so the window retries"
+        );
+        m.assert_async().await;
+    }
     /// one permit) a repo that has BOTH public gaps AND encrypted seal work must
     /// still complete. Each phase acquires its permit scoped to its own
     /// provider effects and drops it before the next phase acquires — never

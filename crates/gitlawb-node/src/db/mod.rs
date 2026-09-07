@@ -4877,17 +4877,23 @@ impl Db {
     }
 
     /// Remove a visibility rule and bump the repo's policy epoch atomically.
+    /// A delete that matches zero rows is not a write: the epoch bump is
+    /// skipped so a typo'd or double-deleted glob cannot abort in-flight
+    /// fenced batches for unchanged policy (mirrors `set_repo_quarantine`).
     pub async fn remove_visibility_rule(&self, repo_id: &str, path_glob: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM visibility_rules WHERE repo_id = $1 AND path_glob = $2")
-            .bind(repo_id)
-            .bind(path_glob)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("UPDATE repos SET policy_epoch = policy_epoch + 1 WHERE id = $1")
-            .bind(repo_id)
-            .execute(&mut *tx)
-            .await?;
+        let deleted =
+            sqlx::query("DELETE FROM visibility_rules WHERE repo_id = $1 AND path_glob = $2")
+                .bind(repo_id)
+                .bind(path_glob)
+                .execute(&mut *tx)
+                .await?;
+        if deleted.rows_affected() > 0 {
+            sqlx::query("UPDATE repos SET policy_epoch = policy_epoch + 1 WHERE id = $1")
+                .bind(repo_id)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -7763,6 +7769,61 @@ mod icaptcha_quarantine_tests {
         );
         assert!(!db.is_repo_quarantined("z6owner/good").await.unwrap());
         assert!(db.list_quarantined_repo_ids().await.unwrap().is_empty());
+    }
+
+    /// `remove_visibility_rule` bumps `policy_epoch` only when it actually
+    /// deletes a row: a delete matching nothing is not a write, and
+    /// bumping on it would abort in-flight fenced batches for unchanged
+    /// policy (mirrors the `set_repo_quarantine` rows-affected guard).
+    #[sqlx::test]
+    async fn remove_visibility_rule_bumps_epoch_only_on_delete(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_mirror_repo("z6owner", "epochrepo", "/srv/epoch", None, false)
+            .await
+            .unwrap();
+        let repo_id = "z6owner/epochrepo";
+        let epoch0 = db.repo_policy_epoch(repo_id).await.unwrap();
+
+        // Deleting a glob that was never written changes nothing.
+        db.remove_visibility_rule(repo_id, "/nope/**")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.repo_policy_epoch(repo_id).await.unwrap(),
+            epoch0,
+            "delete-with-zero-rows must not bump the epoch"
+        );
+
+        db.set_visibility_rule(
+            repo_id,
+            "/secret/**",
+            super::VisibilityMode::B,
+            &[],
+            "did:key:zEpochOwner",
+        )
+        .await
+        .unwrap();
+        let epoch1 = db.repo_policy_epoch(repo_id).await.unwrap();
+        assert_eq!(epoch1, epoch0 + 1, "insert bumps the epoch");
+
+        db.remove_visibility_rule(repo_id, "/secret/**")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.repo_policy_epoch(repo_id).await.unwrap(),
+            epoch1 + 1,
+            "deleting an existing rule bumps the epoch"
+        );
+
+        // Second delete of the same glob matches nothing now.
+        db.remove_visibility_rule(repo_id, "/secret/**")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.repo_policy_epoch(repo_id).await.unwrap(),
+            epoch1 + 1,
+            "double-delete must not bump the epoch"
+        );
     }
 
     /// A mirror admitted quarantined stays quarantined across a re-sync — the
