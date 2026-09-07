@@ -1,0 +1,9 @@
+{
+  "name": "ans104-golden",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "arbundles": "^0.10.0"
+  }
+}

@@ -1,0 +1,37 @@
+ANS-104 golden vectors, captured from arbundles 0.10.x.
+
+Ed25519 vector (the interop pin used by
+`ans104::tests::dataitem_matches_arbundles_golden_vector`):
+  captured by  = scripts/ans104_golden_ed25519.mjs (deterministic seed
+                 0x01 * 32 via SolanaSigner, sigtype 2, `await item.sign`)
+  data         = "hello gitlawb ed25519 golden"
+  tags         = [{name:"App-Name",value:"gitlawb"},
+                  {name:"Schema",value:"gitlawb/ref-update/v1"}]
+  target       = absent
+  anchor       = absent
+
+Outputs:
+  signature_type = 2 (Ed25519)
+  signature_len  = 64 bytes
+  owner_len      = 32 bytes
+  binary_len     = 192 bytes
+  id             = SGrcBs-ITTyzvd7eIB5kk2GdBWoxB_iTi9iJ6KOe_RE (base64url of sha256(signature))
+  deephash_hex   = f15c82431767f14ac9e66ab8e995a8cd08e094be3773245163b53c12feb50aefc55d9f8c1098fabcfbf11a462706d347
+                   (arbundles `getSignatureData` 8-element fold)
+
+binary_hex:
+0200da41825fd44ca3b2705af18fce86ed6d04d0204331965d9af5d5cb1a740fcc6587ee81501b1d7928c54c0f174fde8893560d785db4d988a3161113b10a2028038a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c00000200000000000000300000000000000004104170702d4e616d650e6769746c6177620c536368656d612a6769746c6177622f7265662d7570646174652f76310068656c6c6f206769746c617762206564323535313920676f6c64656e
+
+The Rust side will:
+1. Parse binary via DataItem::from_binary (signature_type, signature,
+   owner, target, anchor, tags, data).
+2. Compute deep_hash via DataItem::deep_hash (the 8-element arbundles
+   fold) and compare to deephash_hex above.
+3. Verify the Ed25519 signature via DataItem::verify_data_item WITHOUT
+   re-signing.
+4. Assert sha256(signature_bytes) base64url-encodes to the captured id.
+5. Assert to_binary round-trips byte-exact (signature slot preserved).
+
+Legacy Ethereum script (scripts/ans104_golden.mjs) now signs before
+capture as well; its output is illustrative only — the node verifies
+Ed25519 (sigtype 2) on the verify path.

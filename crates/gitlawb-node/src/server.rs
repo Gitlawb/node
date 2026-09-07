@@ -231,6 +231,10 @@ pub fn build_router(state: AppState) -> Router {
         .merge(Router::new().route("/api/v1/ipfs/pins", get(ipfs::list_pins)));
 
     // ── Arweave permanent anchors ──────────────────────────────────────────
+    // List endpoint only (public; issue #134 tracks surfacing
+    // visibility rules on list). The verify endpoint and its probe
+    // are deferred to the vertical slice with the uploader and a
+    // real provider contract (reviewer 2, #26 split 2/4 round 5).
     let arweave_routes = Router::new().route("/api/v1/arweave/anchors", get(arweave::list_anchors));
 
     // ── Bounty routes (write — require HTTP Signature) ─────────────────
