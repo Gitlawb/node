@@ -483,6 +483,37 @@ mod tests {
         assert!(matches!(err, Error::Signature(_)));
     }
 
+    /// The identity-point forgery must be rejected: the shared attestation
+    /// verifier is a cert-bound provenance gate, so accepting the weak-key
+    /// signature would let anyone mint a forged attestation that verifies.
+    /// Strict verification rejects small-order public keys and R (the identity
+    /// point here), which ordinary verification does not.
+    #[test]
+    fn verify_rejects_identity_point_forgery() {
+        let cert_hash = sample_cert_hash();
+        let mut att = dummy_attestation(&fresh(), cert_hash);
+
+        // Public key A = identity point (0,1); signature R = identity, S = 0.
+        // The equation `[S]B = R + [k]A` then holds for any k and any message.
+        let identity = [
+            1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0,
+        ];
+        let mut buf = Vec::with_capacity(34);
+        buf.extend_from_slice(&ED25519_MULTICODEC);
+        buf.extend_from_slice(&identity);
+        att.signer = format!(
+            "did:key:{}",
+            multibase::encode(multibase::Base::Base58Btc, &buf)
+        );
+        let mut sig = [0u8; 64];
+        sig[..32].copy_from_slice(&identity);
+        att.sig = B64U.encode(sig);
+
+        let err = att.verify_signature(cert_hash).unwrap_err();
+        assert!(matches!(err, Error::Signature(_)));
+    }
+
     /// A payload that happens to contain a `cert_hash` field of its own does
     /// not interfere with the outer binding: the attestation envelope's
     /// `cert_hash` is the only field consulted by `verify_signature`, and the

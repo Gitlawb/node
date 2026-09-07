@@ -90,6 +90,7 @@ Required env for on-chain PoS mode:
 Optional:
 - `GITLAWB_OPERATOR_STRICT_MODE=true` — refuse to start if not registered or not currently active
 - `GITLAWB_HEARTBEAT_INTERVAL_HOURS=20` — how often to post heartbeats (must be < 24)
+- `GITLAWB_RECONCILIATION_SWEEP=true` — enable the hourly durability sweep that re-pins/backstops missing objects (default `true`; disabled when no IPFS/Pinata backend is configured). Public pin repair runs against any configured backend. Encrypted recovery repair requires local IPFS (`GITLAWB_IPFS_API`); Pinata-only nodes reconcile public pins only. Set `=false` to disable.
 
 ## 5. Verify
 

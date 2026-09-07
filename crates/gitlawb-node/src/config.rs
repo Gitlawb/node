@@ -129,6 +129,17 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_AUTO_SYNC", default_value_t = false)]
     pub auto_sync: bool,
 
+    /// Enable the periodic reconciliation sweep that re-derives pin/seal sets
+    /// and fills durability gaps.  Defaults to true; set to false to disable
+    /// the sweep even when a pin backend (IPFS/Pinata) is configured.
+    #[arg(
+        long,
+        env = "GITLAWB_RECONCILIATION_SWEEP",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub reconciliation_sweep: bool,
+
     /// Irys URL for Arweave permanent anchoring.
     /// Leave empty to disable. Use https://devnet.irys.xyz for free devnet.
     #[arg(long, env = "GITLAWB_IRYS_URL", default_value = "")]

@@ -185,10 +185,13 @@ fn rev_list_delta(
 /// List every object in the repository via
 /// `git cat-file --batch-all-objects --batch-check='%(objectname)'`.
 ///
-/// This is the whole-repo enumeration the push path falls back to and the
-/// reconciliation sweep relies on. It returns *all* objects (including
-/// unreachable/dangling ones), which is what the sweep needs to catch
-/// stragglers — do not swap it for a reachability walk.
+/// This is the whole-repo enumeration the push path falls back to. It
+/// returns *all* objects (including unreachable/dangling ones), which is
+/// what the push path needs to catch stragglers — do not swap it for a
+/// reachability walk. The reconciliation sweep no longer uses it: sweep
+/// candidates come from the windowed walk (window commits plus walked
+/// pairs), which are reachable by construction, so dangling objects are
+/// absent rather than filtered.
 pub fn list_all_objects(repo_path: &Path, git_bin: &str, deadline: Instant) -> Result<Vec<String>> {
     let out = crate::git::visibility_pack::run_bounded_git(
         git_bin,
@@ -213,6 +216,7 @@ pub fn list_all_objects(repo_path: &Path, git_bin: &str, deadline: Instant) -> R
 /// `--batch-check='%(objectname) %(objecttype)'`. The pin path's fail-closed
 /// filter needs to tell blobs (content, withholdable) from commits/trees
 /// (structural, never withheld) without typing the candidate list itself.
+#[allow(dead_code)] // used by tests and all_blob_oids
 pub fn list_all_objects_with_type(
     repo_path: &Path,
     git_bin: &str,
@@ -245,6 +249,7 @@ pub fn list_all_objects_with_type(
 /// fail-closed pin filter drops any candidate blob absent from the reachable,
 /// visibility-allowed set; a dangling private blob is in this set but not the
 /// allowed set, so it never replicates (#99).
+#[allow(dead_code)] // used by visibility_pack tests
 pub fn all_blob_oids(
     repo_path: &Path,
     git_bin: &str,
@@ -278,10 +283,12 @@ pub struct PinCandidateSet {
 /// Every degraded path is **logged**, not silent: a full-scan fallback, a
 /// failed full scan, and a panicked blocking task each emit a warning. On a
 /// failed full scan or a task panic the candidate set is empty (pin nothing
-/// this push); that is a durability gap the reconciliation sweep backstops, and
-/// it can never leak because the withheld/fail-closed filter still runs on
-/// whatever set is returned. `full_scan` rides on the returned set so the caller
-/// knows when the dangling-inclusive filter is required.
+/// this push); that is a durability gap the reconciliation sweep backstops
+/// when it is enabled and a pin backend is configured (a node running with the
+/// sweep disabled or with no IPFS/Pinata backend has no backstop), and it can
+/// never leak because the withheld/fail-closed filter still runs on whatever
+/// set is returned. `full_scan` rides on the returned set so the caller knows
+/// when the dangling-inclusive filter is required.
 ///
 /// `scan_sem` is the post-receive scan admission pool (`git_encrypt_semaphore`,
 /// #174 F4): both git-spawning stages — the per-tip `cat-file` probe + delta

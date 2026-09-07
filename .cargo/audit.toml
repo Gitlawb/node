@@ -35,4 +35,27 @@ ignore = [
     # ever built with the `mysql` feature, or any other consumer of rsa enters
     # the build, at which point it becomes a real reachable advisory.
     "RUSTSEC-2023-0071", # rsa Marvin attack (no fix; not linked in our build)
+
+    # lru 0.12.5 (use-after-free in pop()). Reachable via aws-sdk-s3
+    # (reverted from the upgrade that pulled in lru 0.12.5). The
+    # lockfile currently has 0.12.5 (via aws-sdk-s3) AND 0.16.3 (via
+    # alloy). The RUSTSEC-2026-0253 advisory covers both ranges, and
+    # this ignore is still load-bearing for 0.12.5 — a future alloy
+    # release that bumps 0.16.x to a fixed version would let this
+    # ignore retire for the 0.16 range. REMOVE only when BOTH
+    # lockfile versions are fixed (or removed).
+    # Retirement owner: node maintainers, enforced by the weekly
+    # audit-schedule drift guard ("Fail if lru moved while its ignore
+    # remains"), which fails if either locked version moves or lru
+    # leaves the tree. No separate tracking issue exists; file one
+    # against the lru upgrade if this waiver needs discussion outside
+    # the schedule job.
+    "RUSTSEC-2026-0253",
+    #
+    # Round-3 P2 (reviewer 2): the previous version of this file
+    # ignored RUSTSEC-2026-0258 for h2 0.4.13, but the lockfile
+    # already has h2 0.4.18 (verified 2026-08-31: cargo tree -p h2
+    # shows 0.4.18) — the fix is in. The ignore was stale and would
+    # have silently re-accepted the advisory if h2 dropped back to
+    # 0.4.13. Removed.
 ]

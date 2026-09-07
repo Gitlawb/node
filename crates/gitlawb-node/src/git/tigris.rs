@@ -162,7 +162,9 @@ impl TigrisClient {
 }
 
 /// Compress a bare repo directory into a tar.zst byte vector.
-fn compress_repo(repo_path: &Path) -> Result<Vec<u8>> {
+/// `pub(crate)` for sweep tests that seed a fake object store with a
+/// byte-identical archive (rather than duplicating the format).
+pub(crate) fn compress_repo(repo_path: &Path) -> Result<Vec<u8>> {
     let buf = Vec::new();
     let encoder = zstd::stream::Encoder::new(buf, 3)?; // level 3 = fast + decent ratio
     let mut tar = tar::Builder::new(encoder);
