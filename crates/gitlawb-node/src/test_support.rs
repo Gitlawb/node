@@ -103,6 +103,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
         create_ip_rate_limiter: RateLimiter::new(1000, Duration::from_secs(3600)),
         push_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+        close_issue_rate_limiter: RateLimiter::new(120, Duration::from_secs(3600)),
         ipfs_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         ipfs_work_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
@@ -554,6 +555,35 @@ mod tests {
                 .expect("get_repo")
                 .is_none(),
             "no fork row may be created for a refused fork"
+        );
+    }
+
+    /// Fork disk paths must go through `validated_repo_disk_path` so a user-supplied
+    /// name cannot reach `remove_dir_all` on an escaped path (CodeQL path-injection).
+    #[sqlx::test]
+    async fn fork_rejects_name_that_fails_validated_disk_path(pool: PgPool) {
+        let owner = "did:key:zFORKOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        let repo = seed_repo(owner, "fork-src");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/fork",
+                axum::routing::post(crate::api::repos::fork_repo),
+            )
+            .with_state(state.clone());
+        let too_long = "a".repeat(101);
+        let uri = format!("/api/v1/repos/{owner}/fork-src/fork");
+        let body = Body::from(format!(r#"{{"name":"{too_long}"}}"#));
+        let resp = router
+            .oneshot(signed_request_as(owner, Method::POST, &uri, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "fork names that fail validated_repo_disk_path must be rejected before clone"
         );
     }
 
@@ -8205,6 +8235,177 @@ mod tests {
                 .len(),
             0,
             "no source is recorded from a quarantined repo"
+        );
+    }
+
+    // ── #285 U7: the sweep skips trees whose publish is unresolved ─────────
+    //
+    // Two different things are called "quarantine" on this node. The operator
+    // status flag on the repo row, which the test above pins, and the sidecar
+    // marker beside a live tree whose publish never resolved. The sweep has
+    // never heard of the second. It does not merely read: it rewrites provider
+    // CIDs and records the repo as a source, durable state fed to the resolver,
+    // out of refs that may never become durable.
+
+    /// #285 U7, gap-driving. A KNOWN source (the row carries `repo_id`) whose
+    /// live tree is marked unresolved must be skipped before any object bytes
+    /// are read, and accounted the way a cold candidate is: retryable, so the
+    /// row is re-walked once the publish resolves.
+    #[sqlx::test]
+    async fn sweep_skips_a_source_whose_publish_is_unresolved_and_leaves_the_row_retryable(
+        pool: PgPool,
+    ) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+
+        let fx = seed_cid_repos(&slug, &short, &["swsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("swsrc.git");
+        let repo = seed_repo(&owner_did, "swsrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let (_raw_cid, provider_cid) =
+            seed_legacy_pin(&pool, &bare, &fx.public_oid, Some(&repo.id)).await;
+
+        // The sidecar an unresolved publish leaves beside the live tree.
+        crate::git::repo_store::quarantine_local_tree(
+            &bare,
+            "swsrc",
+            Some(&crate::git::publish::PublishAttemptId::new()),
+        );
+
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+                &mut Default::default(),
+            ),
+        )
+        .await
+        .expect("the sweep terminates");
+
+        assert_eq!(
+            stats.repaired, 0,
+            "the sweep must not read objects out of a tree whose publish is unresolved"
+        );
+        assert_eq!(
+            crate::ipfs_pin::legacy_repair_reads(),
+            0,
+            "an unresolved tree is skipped before any object bytes are read"
+        );
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            provider_cid,
+            "the legacy key must not be rewritten from an unconfirmed tree"
+        );
+        assert_eq!(
+            stats.retryable_skips, 1,
+            "an unresolved source must be a retryable skip, like a cold one, so the row is re-walked once the publish resolves"
+        );
+
+        // THE CONTROL: the same row, the same bytes, the marker gone.
+        crate::git::repo_store::clear_quarantine(&bare, "swsrc");
+        state.db.set_pin_repair_cursor("").await.unwrap();
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+                &mut Default::default(),
+            ),
+        )
+        .await
+        .expect("the second run terminates");
+        assert_eq!(
+            second.repaired, 1,
+            "once the publish resolves the same row repairs"
+        );
+    }
+
+    /// #285 U7, gap-driving. The discovery half: the row names no repo, so the
+    /// sweep goes looking for a warm holder. A holder whose publish is
+    /// unresolved must be filtered at warm-check time, before any probe, and
+    /// must never be recorded as a source.
+    #[sqlx::test]
+    async fn sweep_discovery_skips_a_warm_candidate_whose_publish_is_unresolved(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["unressrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("unressrc.git");
+        let repo = seed_repo(&owner_did, "unressrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        // The DB status is deliberately left alone: this candidate is healthy as
+        // far as the operator flag is concerned, and only the sidecar withholds it.
+        let (_raw_cid, provider_cid) = seed_legacy_pin(&pool, &bare, &fx.public_oid, None).await;
+        crate::git::repo_store::quarantine_local_tree(
+            &bare,
+            "unressrc",
+            Some(&crate::git::publish::PublishAttemptId::new()),
+        );
+
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+                &mut Default::default(),
+            ),
+        )
+        .await
+        .expect("the sweep terminates");
+
+        assert_eq!(
+            stats.repaired, 0,
+            "discovery must not probe the objects of a candidate whose publish is unresolved"
+        );
+        assert_eq!(
+            crate::ipfs_pin::legacy_repair_reads(),
+            0,
+            "the marker filters the candidate at warm-check time, before any probe"
+        );
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            provider_cid,
+            "the row keeps its provider key"
+        );
+        assert_eq!(
+            state
+                .db
+                .pin_sources_for_oid(&fx.public_oid)
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "no source may be recorded from an unconfirmed tree"
         );
     }
 
@@ -15936,65 +16137,6 @@ mod tests {
             use super::*;
             use crate::api::repos::drain_faults;
 
-            /// Process-wide tracing capture so a test can assert the give-up is logged at
-            /// ERROR. A global default subscriber can only be installed once per process,
-            /// so it is shared by every test here and assertions filter on the repo id,
-            /// which is a fresh uuid per test.
-            mod logcap {
-                use std::sync::{Arc, Mutex, OnceLock};
-                use tracing::{Event, Level, Subscriber};
-                use tracing_subscriber::layer::{Context, Layer};
-                use tracing_subscriber::prelude::*;
-
-                type Lines = Arc<Mutex<Vec<(Level, String)>>>;
-
-                fn lines() -> &'static Lines {
-                    static LINES: OnceLock<Lines> = OnceLock::new();
-                    LINES.get_or_init(|| Arc::new(Mutex::new(Vec::new())))
-                }
-
-                struct Capture;
-                impl<S: Subscriber> Layer<S> for Capture {
-                    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-                        struct V(String);
-                        impl tracing::field::Visit for V {
-                            fn record_debug(
-                                &mut self,
-                                field: &tracing::field::Field,
-                                value: &dyn std::fmt::Debug,
-                            ) {
-                                self.0.push_str(&format!(" {}={:?}", field.name(), value));
-                            }
-                        }
-                        let mut v = V(String::new());
-                        event.record(&mut v);
-                        lines()
-                            .lock()
-                            .unwrap()
-                            .push((*event.metadata().level(), v.0));
-                    }
-                }
-
-                pub(super) fn install() {
-                    static ONCE: OnceLock<()> = OnceLock::new();
-                    ONCE.get_or_init(|| {
-                        let _ = tracing::subscriber::set_global_default(
-                            tracing_subscriber::registry().with(Capture),
-                        );
-                    });
-                }
-
-                pub(super) fn errors_containing(needle: &str) -> Vec<String> {
-                    lines()
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .filter(|(lvl, msg)| *lvl == Level::ERROR && msg.contains(needle))
-                        .map(|(_, msg)| msg.clone())
-                        .collect()
-                }
-            }
-
             /// SCENARIO 1. The repo re-read fails once, then succeeds: the drain lap
             /// must still RUN, under the refreshed state, and pin the coalesced push's
             /// object. RED before the fix (the single `Err` returned `None`, the lap
@@ -16060,11 +16202,11 @@ mod tests {
             }
 
             /// SCENARIO 2. Every re-read attempt fails: the loop must give up on a BOUND
-            /// (asserted as a literal, so raising or removing the bound goes RED) and log
-            /// the give-up at ERROR so the residual loss is observable rather than silent.
+            /// (asserted as a literal, so raising or removing the bound goes RED) and hit
+            /// the give-up path that logs at ERROR in production (asserted here via the
+            /// drain_faults seam, which fires on the same branch as that log).
             #[sqlx::test]
             async fn u2_sustained_repo_reread_failure_is_bounded_and_logged(pool: PgPool) {
-                logcap::install();
                 let state = test_state(pool).await;
                 let owner = new_did();
                 let repo = seed_repo(&owner, "u2-bounded");
@@ -16115,11 +16257,10 @@ mod tests {
                     !state.db.is_pinned(&obj2).await.unwrap(),
                     "with the read never succeeding there is nothing fresh to act on"
                 );
-                let errs = logcap::errors_containing(&repo.id);
                 assert!(
-                    !errs.is_empty(),
-                    "the exhausted drain re-read is logged at ERROR with the repo id, so \
-                     the residual work loss is observable; captured: {errs:?}"
+                    drain_faults::reread_exhausted(&repo.id),
+                    "the exhausted drain re-read must hit the give-up path that logs at \
+                     ERROR in production"
                 );
                 assert!(
                     state.encrypt_inflight.is_empty(),

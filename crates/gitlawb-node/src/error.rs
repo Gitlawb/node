@@ -69,6 +69,15 @@ pub enum AppError {
     #[error("server overloaded: {0}")]
     Overloaded(String),
 
+    #[error("repository is busy")]
+    RepoBusy,
+
+    #[error("repository is temporarily unavailable")]
+    RepoUnavailable,
+
+    #[error("repository write was fenced by a concurrent publish")]
+    RepoWriteFenced,
+
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 
@@ -110,7 +119,31 @@ impl From<anyhow::Error> for AppError {
     fn from(err: anyhow::Error) -> Self {
         match err.downcast::<sqlx::Error>() {
             Ok(sql) => AppError::Db(sql),
-            Err(err) => AppError::Internal(err),
+            // Lock contention is transient and ordinary, so it must not land as a
+            // 500. The internal message names the owner slug and repo, so the
+            // variant carries nothing: the detail stays in the log at the raise
+            // site and the client gets a fixed retryable body.
+            Err(err) => match err.downcast::<crate::git::repo_store::LockPoolBusy>() {
+                Ok(_) => AppError::Overloaded("git write locks at capacity, retry shortly".into()),
+                Err(err) => match err.downcast::<crate::git::repo_store::RepoBusy>() {
+                    Ok(_) => AppError::RepoBusy,
+                    // Same reasoning one rung down: a refused under-lock refresh is a
+                    // transient storage condition, and its internal message names the
+                    // owner slug and repo, so the variant carries nothing.
+                    Err(err) => match err.downcast::<crate::git::repo_store::RepoUnavailable>() {
+                        Ok(_) => AppError::RepoUnavailable,
+                        // And one more rung: a publish the store refused twice is
+                        // transient in the same way, and the retry is the client's
+                        // to make. The variant carries nothing for the same reason
+                        // as the two above.
+                        Err(err) => match err.downcast::<crate::git::repo_store::RepoWriteFenced>()
+                        {
+                            Ok(_) => AppError::RepoWriteFenced,
+                            Err(err) => AppError::Internal(err),
+                        },
+                    },
+                },
+            },
         }
     }
 }
@@ -184,6 +217,29 @@ impl IntoResponse for AppError {
             // 504, distinct from the 500 git_error and from the read-gate's 404 /
             // the auth 401, so the client can tell a deadline from a failure.
             AppError::Timeout(msg) => (StatusCode::GATEWAY_TIMEOUT, "git_timeout", msg.clone()),
+            // 503 with a FIXED body: the caller should retry, and must not be told
+            // which repo is contended or for how long.
+            AppError::RepoBusy => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repo_busy",
+                "repository is busy — retry".into(),
+            ),
+            // 503 with a FIXED body for the same reason: the caller should retry, and
+            // must not be told which repo could not be refreshed or why.
+            AppError::RepoUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repo_unavailable",
+                "repository is temporarily unavailable, retry".into(),
+            ),
+            // 503 with a FIXED body again, and its own code: the caller should
+            // retry, but the condition is not contention, so a client that
+            // distinguishes them should be able to. The body must not say which
+            // repo lost its publish or to whom.
+            AppError::RepoWriteFenced => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repo_write_fenced",
+                "repository changed underneath this write, retry".into(),
+            ),
             AppError::Db(e) if db_unavailable(e) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 DB_UNAVAILABLE_CODE,
@@ -244,7 +300,11 @@ impl IntoResponse for AppError {
         // here rather than in bespoke early returns, keeping each variant handled once.
         if matches!(
             self,
-            AppError::Overloaded(_) | AppError::SearchIncomplete { .. }
+            AppError::Overloaded(_)
+                | AppError::SearchIncomplete { .. }
+                | AppError::RepoBusy
+                | AppError::RepoUnavailable
+                | AppError::RepoWriteFenced
         ) {
             resp.headers_mut().insert(
                 axum::http::header::RETRY_AFTER,
@@ -361,5 +421,32 @@ mod tests {
         let err: AppError = anyhow::Error::from(sqlx::Error::PoolClosed).into();
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn lock_pool_busy_via_anyhow_from_is_503_overloaded() {
+        let err: AppError = anyhow::Error::new(crate::git::repo_store::LockPoolBusy).into();
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get("retry-after").unwrap().to_str().unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn repo_busy_unavailable_and_fenced_advertise_retry_after() {
+        for err in [
+            AppError::RepoBusy,
+            AppError::RepoUnavailable,
+            AppError::RepoWriteFenced,
+        ] {
+            let resp = err.into_response();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                resp.headers().get("retry-after").unwrap().to_str().unwrap(),
+                "1"
+            );
+        }
     }
 }
