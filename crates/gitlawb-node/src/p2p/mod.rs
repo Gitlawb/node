@@ -216,48 +216,84 @@ impl IdentifyAddressBook {
             }
         }
 
-        for address in addresses {
-            let Some(address) = address.clone().with_p2p(peer_id).ok() else {
-                continue;
-            };
+        let reported = addresses
+            .iter()
+            .filter_map(|address| address.clone().with_p2p(peer_id).ok())
+            .collect::<HashSet<_>>();
 
-            if let Some(existing) = self.peers.get_mut(&peer_id).and_then(|state| {
-                state
-                    .addresses
-                    .iter_mut()
-                    .find(|existing| existing.address == address)
-            }) {
-                existing.expires_at = now + IDENTIFY_ADDRESS_TTL;
-                continue;
+        // Refresh every address in the report before admitting anything new.
+        // This prevents an oversized report from evicting an address merely
+        // because it appeared later in the input.
+        if let Some(state) = self.peers.get_mut(&peer_id) {
+            for existing in &mut state.addresses {
+                if reported.contains(&existing.address) {
+                    existing.expires_at = now + IDENTIFY_ADDRESS_TTL;
+                }
             }
+        }
 
+        let mut new_addresses = self
+            .peers
+            .get(&peer_id)
+            .map(|state| {
+                reported
+                    .iter()
+                    .filter(|address| {
+                        !state
+                            .addresses
+                            .iter()
+                            .any(|existing| &existing.address == *address)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| reported.iter().cloned().collect());
+        // HashSet iteration is deliberately unordered. Sort new candidates so
+        // an oversized Identify report has deterministic admission behavior.
+        new_addresses.sort();
+
+        for address in new_addresses {
             if self
                 .peers
                 .get(&peer_id)
                 .is_some_and(|state| state.new_addresses >= IDENTIFY_NEW_ADDRESS_LIMIT)
             {
-                continue;
-            }
-
-            if self.address_count >= IDENTIFY_GLOBAL_ADDRESS_LIMIT {
-                let Some(evicted) = self.evict_oldest(peer_id) else {
-                    continue;
-                };
-                changes.removed.push(evicted);
+                break;
             }
 
             let evicted = self.peers.get_mut(&peer_id).and_then(|state| {
-                state.new_addresses += 1;
-                if state.addresses.len() >= IDENTIFY_ADDRESS_LIMIT {
-                    state.addresses.pop_front()
-                } else {
-                    None
+                if state.addresses.len() < IDENTIFY_ADDRESS_LIMIT {
+                    return None;
                 }
+                let index = state
+                    .addresses
+                    .iter()
+                    .position(|existing| !reported.contains(&existing.address))?;
+                state.addresses.remove(index)
             });
             if let Some(evicted) = evicted {
                 self.remove_insertion_token(peer_id, &evicted.address);
                 self.address_count -= 1;
                 changes.removed.push((peer_id, evicted.address));
+            } else if self
+                .peers
+                .get(&peer_id)
+                .is_some_and(|state| state.addresses.len() >= IDENTIFY_ADDRESS_LIMIT)
+            {
+                // Every retained address was refreshed in this report. Keep
+                // that stable subset and drop surplus new candidates.
+                break;
+            }
+
+            if self.address_count >= IDENTIFY_GLOBAL_ADDRESS_LIMIT {
+                let Some(evicted) = self.evict_oldest(peer_id) else {
+                    break;
+                };
+                changes.removed.push(evicted);
+            }
+
+            if let Some(state) = self.peers.get_mut(&peer_id) {
+                state.new_addresses += 1;
             }
 
             if let Some(state) = self.peers.get_mut(&peer_id) {
@@ -719,6 +755,35 @@ mod tests {
         );
         assert_eq!(second.added, vec![replacement]);
         assert_eq!(second.removed, vec![(peer_id, initial[0].clone())]);
+    }
+
+    #[test]
+    fn identify_oversized_reports_keep_the_same_refreshed_subset() {
+        let peer_id = PeerId::random();
+        let now = Instant::now();
+        let mut report = (0..IDENTIFY_ADDRESS_LIMIT + 2)
+            .map(|index| identify_address(peer_id, index as u8 + 1, 10_000 + index as u16))
+            .collect::<Vec<_>>();
+        let mut book = IdentifyAddressBook::default();
+
+        let first = book.update(peer_id, now, &report);
+        assert_eq!(first.added.len(), IDENTIFY_ADDRESS_LIMIT);
+        assert_eq!(first.removed.len(), 0);
+        let retained = first.added.clone();
+
+        report.reverse();
+        let second = book.update(peer_id, now + IDENTIFY_ADDRESS_WINDOW, &report);
+        assert!(second.added.is_empty());
+        assert!(second.removed.is_empty());
+        let current = book
+            .peers
+            .get(&peer_id)
+            .unwrap()
+            .addresses
+            .iter()
+            .map(|entry| entry.address.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(current, retained);
     }
 
     #[test]
