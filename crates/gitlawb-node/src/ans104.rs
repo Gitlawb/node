@@ -225,10 +225,10 @@ impl DataItem {
             .with_context(|| "decoding ANS-104 data payload from base64url")
     }
 
-    /// Decode the public-key bytes from the owner field. The first
-    /// `owner_size(signature_type)` bytes are the actual key; any
-    /// trailing bytes (the ANS-104 RSA/Arweave padding) are silently
-    /// ignored here.
+    /// Decode the public-key bytes from the owner field. The owner
+    /// must be exactly `owner_size(signature_type)` bytes; shorter
+    /// or longer owners are rejected rather than truncated, so junk
+    /// trailing bytes can never pass verification unnoticed.
     // Vertical-slice API: no production caller on this head (the
     // probe/endpoint slice is next); pinned by the unit tests.
     #[allow(dead_code)]
@@ -237,9 +237,9 @@ impl DataItem {
             .decode(self.owner.as_bytes())
             .with_context(|| "decoding ANS-104 owner from base64url")?;
         let need = owner_size(self.signature_type);
-        if owner_bytes.len() < need {
+        if owner_bytes.len() != need {
             bail!(
-                "ANS-104 owner is {} bytes, expected at least {} for sigtype {}",
+                "ANS-104 owner is {} bytes, expected exactly {} for sigtype {}",
                 owner_bytes.len(),
                 need,
                 self.signature_type
@@ -332,17 +332,16 @@ impl DataItem {
                 self.signature_type
             );
         }
-        if owner_full.len() < need {
+        if owner_full.len() != need {
             bail!(
-                "ANS-104 owner is {} bytes, expected at least {} for sigtype {}",
+                "ANS-104 owner is {} bytes, expected exactly {} for sigtype {}",
                 owner_full.len(),
                 need,
                 self.signature_type
             );
         }
-        // Canonical owner: exactly owner_size(sigtype) bytes. A
-        // legacy 64-byte owner (32 pubkey + 32 zero pad) truncates
-        // to the first 32; the wire frame carries the same prefix.
+        // Canonical owner: exactly owner_size(sigtype) bytes, enforced
+        // by the length check above — never truncated.
         let owner: Vec<u8> = owner_full[..need].to_vec();
         let data: Vec<u8> = URL_SAFE_NO_PAD
             .decode(self.data.as_bytes())
@@ -532,9 +531,9 @@ impl DataItem {
         let owner_bytes = URL_SAFE_NO_PAD
             .decode(self.owner.as_bytes())
             .with_context(|| "decoding owner for to_binary")?;
-        if owner_bytes.len() < own_len {
+        if owner_bytes.len() != own_len {
             bail!(
-                "ANS-104 to_binary: owner is {} bytes, expected at least {}",
+                "ANS-104 to_binary: owner is {} bytes, expected exactly {}",
                 owner_bytes.len(),
                 own_len
             );
@@ -887,14 +886,15 @@ pub fn sign_data_item(
     keypair: &gitlawb_core::identity::Keypair,
 ) -> Result<()> {
     // Ed25519 is sigtype 2 in the on-wire frame. Signing always
-    // produces Ed25519: `deep_hash` bails on an unknown sigtype
-    // (including a zeroed one) before the signature is computed,
-    // and the item's sigtype is then set to Ed25519 unconditionally.
+    // produces Ed25519, so the sigtype is set BEFORE hashing: the
+    // deep-hash folds the sigtype ASCII element, and hashing first
+    // would sign over a caller-supplied (e.g. sigtype-1) fold that
+    // `verify_data_item` could never reproduce.
+    item.signature_type = SIGNATURE_TYPE_ED25519;
     let sig_len = signature_size(SIGNATURE_TYPE_ED25519);
     let hash = item.deep_hash()?;
     let sig = keypair.sign(&hash);
     item.signature = URL_SAFE_NO_PAD.encode(sig.to_bytes());
-    item.signature_type = SIGNATURE_TYPE_ED25519;
     debug_assert_eq!(sig.to_bytes().len(), sig_len);
     Ok(())
 }
@@ -1382,6 +1382,43 @@ mod tests {
             err.to_string().contains("unsupported signature_type 258"),
             "expected sigtype rejection, got: {err}"
         );
+    }
+
+    /// A non-canonical owner (trailing junk past the 32 pubkey bytes)
+    /// must fail verification, not truncate silently. The junk could
+    /// otherwise ride along through `verify_data_item` (which only
+    /// ever saw the first 32 bytes) and be dropped on re-encode.
+    #[test]
+    fn non_canonical_owner_with_trailing_junk_fails_verify() {
+        let kp = Keypair::generate();
+        let pk = kp.verifying_key().to_bytes();
+        let mut item = DataItem::new_unsigned(&pk, "", "", sample_tags(), b"x".to_vec());
+        sign_data_item(&mut item, &kp).unwrap();
+        verify_data_item(&item, &pk).expect("canonical item verifies");
+
+        let mut owner_junk = pk.to_vec();
+        owner_junk.extend_from_slice(&[0xABu8; 10]);
+        item.owner = URL_SAFE_NO_PAD.encode(&owner_junk);
+        let err = verify_data_item(&item, &pk).unwrap_err();
+        assert!(
+            err.to_string().contains("expected exactly 32"),
+            "expected owner-length rejection, got: {err}"
+        );
+    }
+
+    /// `sign_data_item` hashes the Ed25519 fold even when the item
+    /// carries a caller-supplied wrong sigtype: the sigtype is set
+    /// before hashing, so the signature verifies afterwards instead
+    /// of being computed over an unreproducible fold.
+    #[test]
+    fn sign_data_item_normalizes_wrong_sigtype_before_hashing() {
+        let kp = Keypair::generate();
+        let pk = kp.verifying_key().to_bytes();
+        let mut item = DataItem::new_unsigned(&pk, "", "", sample_tags(), b"x".to_vec());
+        item.signature_type = 1; // caller-supplied wrong type (Arweave/RSA)
+        sign_data_item(&mut item, &kp).expect("sign");
+        assert_eq!(item.signature_type, SIGNATURE_TYPE_ED25519);
+        verify_data_item(&item, &pk).expect("signed item verifies");
     }
 }
 
