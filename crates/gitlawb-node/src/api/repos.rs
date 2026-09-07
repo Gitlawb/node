@@ -2278,7 +2278,7 @@ pub async fn git_receive_pack(
     // permit is a handler local here (moved into the AdmissionGuard only after this),
     // so the early return on timeout drops it and frees the slot; shed a bounded 503.
     let acquire_deadline = std::time::Duration::from_secs(state.config.git_acquire_timeout_secs);
-    let guard = tokio::time::timeout(
+    let mut guard = tokio::time::timeout(
         acquire_deadline,
         state
             .repo_store
@@ -2314,6 +2314,17 @@ pub async fn git_receive_pack(
     // this copy dies with the future and the reaper's copy is last, so the lock frees
     // after the reap with no upload, which is the release(success = false) semantics an
     // interrupted push must have.
+    // THE SPLIT (#285 U3). Settling the tree and freeing the advisory lock do not
+    // have to happen at the same moment, and only the unlock has to wait for the
+    // reaper. The guard below is shared, so on a disconnect its last copy is the
+    // one riding `KillGroupOnDrop`, and a settlement done from `RepoWriteGuard::drop`
+    // would therefore land only after the process group is torn down. `acquire`
+    // takes no advisory lock on its way to the live tree, so a read inside that
+    // window would be served refs no publish ever confirmed. Holding the
+    // settlement in THIS future puts the marker on disk at the disconnect instant,
+    // while the reaper still holds the lock. The success path disarms it below,
+    // after `release` has classified the tree itself.
+    let mut settlement = guard.take_settlement();
     let guard = std::sync::Arc::new(std::sync::Mutex::new(Some(guard)));
     // Clone (a) of the write lease rides this AdmissionGuard: on a client disconnect the
     // guard moves into KillGroupOnDrop's detached reaper, so the lease frees only after
@@ -2405,6 +2416,12 @@ pub async fn git_receive_pack(
     // certificates or answering 200 would all be reporting a write no other
     // node can read.
     let outcome = reclaimed.release(push_succeeded).await;
+    // `release` classified the tree on whatever outcome it reached, so this
+    // future's copy of the settlement must not classify it a second time: a
+    // definite refusal has already deleted the tree and cleared its marker.
+    if let Some(settlement) = settlement.as_mut() {
+        settlement.disarm();
+    }
     if push_succeeded {
         publish_durability.record(outcome).await;
     }
@@ -11554,6 +11571,117 @@ exit 0
         assert!(
             !ref_path.exists(),
             "refs applied by a disconnected push must not be served"
+        );
+
+        server.abort();
+    }
+
+    /// #285 U3, the REAP WINDOW. The sibling above waits for the marker before
+    /// it reads, so it proves the settled state and cannot see the interval
+    /// between the disconnect and the settlement. This one reads inside that
+    /// interval: `RepoWriteGuard::drop` runs on the guard clone that rode the
+    /// admission guard into `KillGroupOnDrop`'s detached reaper, so the marker
+    /// cannot exist until the receive-pack group is torn down, and `acquire`
+    /// takes no advisory lock on the way to the live tree.
+    ///
+    /// The read happens immediately after the handler future is dropped, while
+    /// the fake receive-pack is still sleeping, so the guard is still alive in
+    /// the reaper.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_read_inside_the_reap_window_serves_no_abandoned_refs(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
+        let (mut state, _log, _puts, server) = p3_compression_gated_state(
+            pool.clone(),
+            tmp.path(),
+            "z6p3rwin",
+            "c1",
+            Arc::clone(&gate),
+        )
+        .await;
+        let gitdir = tmp.path().join("hanging-git");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        state.git_bin = write_fake_git(
+            &gitdir,
+            r#"#!/bin/sh
+case "$1" in
+  receive-pack)
+    mkdir -p "$3/refs/heads"
+    printf '%s\n' 1111111111111111111111111111111111111111 > "$3/refs/heads/main"
+    sleep 30
+    ;;
+  *) : ;;
+esac
+exit 0
+"#,
+        );
+
+        let rec = state.db.get_repo("z6p3rwin", "c1").await.unwrap().unwrap();
+        let repos_dir = tmp.path().join("repos");
+        let marker = p3_quarantine_marker(&repos_dir, &rec.owner_did, "c1");
+        let live =
+            crate::git::repo_store::validated_repo_disk_path(&repos_dir, &rec.owner_did, "c1")
+                .expect("test repo path")
+                .into_path_buf();
+        let ref_path = live.join("refs").join("heads").join("main");
+
+        let mut fut = Box::pin(p2_push(&state, "z6p3rwin", "c1"));
+        let mut applied = false;
+        for _ in 0..2000 {
+            let step = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            assert!(
+                step.is_err(),
+                "the handler must park inside the hanging receive-pack, not return"
+            );
+            if ref_path.exists() {
+                applied = true;
+                break;
+            }
+        }
+        assert!(applied, "the push must apply its ref before the disconnect");
+
+        // THE DISCONNECT. Nothing parks on the gate here, opened only so a
+        // failing assertion reports instead of hanging teardown.
+        drop(fut);
+        gate.open();
+        tokio::task::yield_now().await;
+
+        // THE PROBE, inside the window. What makes the read INSIDE it is that the
+        // receive-pack group is still being reaped, and the write lock rides that
+        // reaper: the guard's last copy is held by `KillGroupOnDrop`, so the
+        // advisory lock is still taken at this instant. Sampled before the read,
+        // from an independent session, and filtered to this test's own database,
+        // which `#[sqlx::test]` gives it exclusively.
+        //
+        // Keying conclusiveness on the LOCK rather than on the marker's absence:
+        // the marker is what the settlement writes, so requiring it to be missing
+        // would demand the very state the fix removes, and no correct
+        // implementation could satisfy it.
+        let locks_held: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' \
+             AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count the advisory locks this test's database holds");
+        let marker_before = marker.exists();
+        let served = state.repo_store.acquire(&rec.owner_did, "c1").await;
+        let refs_after = ref_path.exists();
+        let served_ok = served.is_ok();
+
+        assert!(
+            locks_held.0 >= 1,
+            "INCONCLUSIVE: the write lock was already free when the probe ran, so the \
+             reaper had finished and this read never observed the reap window"
+        );
+        assert!(
+            !(served_ok && refs_after),
+            "a read inside the reap window served the abandoned refs: marker_before={}, \
+             acquire={:?}, ref still on the served tree={}",
+            marker_before,
+            served,
+            refs_after
         );
 
         server.abort();

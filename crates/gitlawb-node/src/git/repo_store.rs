@@ -669,7 +669,7 @@ impl RepoStore {
                 None => PublishStage::NoBackend,
             })),
             tree_settled: false,
-            path_handed_out: AtomicBool::new(false),
+            path_handed_out: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_pre_unlock_gate: self.pre_unlock_gate.clone(),
             #[cfg(test)]
@@ -1908,8 +1908,9 @@ pub struct RepoWriteGuard {
     /// production writer obtains the tree through `path()`, so obtaining it IS
     /// the declaration and no call site has a rule to remember.
     ///
-    /// An atomic rather than a `Cell` because `path()` takes `&self`.
-    path_handed_out: AtomicBool,
+    /// An atomic rather than a `Cell` because `path()` takes `&self`, and
+    /// shared with the settlement token so a hand-out is seen from either side.
+    path_handed_out: Arc<AtomicBool>,
     /// Test-only seam: when set, `release` parks on this gate at the exact point
     /// it is about to await `pg_advisory_unlock` (connection still owned, not yet
     /// released). Dropping the `release` future while it is parked reproduces a
@@ -2058,6 +2059,36 @@ impl RepoWriteGuard {
     /// classify a CANCELLED release. See [`PublishStageCell`].
     pub fn publish_stage(&self) -> Arc<PublishStageCell> {
         Arc::clone(&self.publish_stage)
+    }
+
+    /// Take the tree settlement out of this guard.
+    ///
+    /// The caller becomes responsible for classifying the live tree an
+    /// abandoned write leaves behind, and this guard stops doing it. That is
+    /// the point: a shared guard frees its advisory lock only when the last
+    /// copy drops, which on a disconnect is the detached reaper, whereas the
+    /// marker has to be on disk before the next read reaches the live tree.
+    ///
+    /// `None` once the tree is settled: `release` classifies it on every
+    /// outcome it reaches, and there is nothing left to hand out.
+    pub fn take_settlement(&mut self) -> Option<TreeSettlement> {
+        if self.tree_settled {
+            return None;
+        }
+        self.tree_settled = true;
+        Some(self.settlement())
+    }
+
+    /// An armed settlement over this guard's tree. Shares the publish stage and
+    /// the hand-out flag, so it reads the same state the guard would.
+    fn settlement(&self) -> TreeSettlement {
+        TreeSettlement {
+            local_path: self.local_path.clone(),
+            repo_name: self.repo_name.clone(),
+            publish_stage: Arc::clone(&self.publish_stage),
+            path_handed_out: Arc::clone(&self.path_handed_out),
+            armed: true,
+        }
     }
 
     /// Decide what a publish that ran out its bound actually left behind.
@@ -2344,6 +2375,92 @@ impl RepoWriteGuard {
     }
 }
 
+/// The half of a write guard's settlement that does not need the advisory lock.
+///
+/// A `RepoWriteGuard` can be shared, and the lock frees only when the LAST copy
+/// drops. On a receive-pack disconnect that copy rides the admission guard into
+/// the detached process reaper, so a settlement done from `Drop` lands only
+/// after the process group is torn down. `acquire` takes no advisory lock on
+/// the way to the live tree, so a read inside that window is served the
+/// abandoned refs.
+///
+/// Only the UNLOCK has to wait for the reaper. This token carries everything
+/// the settlement itself needs, so the request future can hold it and settle
+/// the tree at the disconnect instant while the reaper still holds the lock.
+pub(crate) struct TreeSettlement {
+    local_path: ValidatedRepoDiskPath,
+    repo_name: String,
+    /// Shared with the guard, so the stage read here is the stage the publish
+    /// actually reached, not a copy taken when the token was handed out.
+    publish_stage: Arc<PublishStageCell>,
+    path_handed_out: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl TreeSettlement {
+    /// `release` classified the tree itself, so this token has nothing to do.
+    ///
+    /// Disarming rather than forgetting the token: a settlement that ran after
+    /// a definite refusal would write a marker beside a tree the refusal has
+    /// already deleted.
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Classify the live tree an abandoned write left behind.
+    ///
+    /// Exhaustive on purpose, no wildcard arm: a new stage must be classified
+    /// here rather than inheriting whatever the catch-all happened to do.
+    fn settle(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let stage = self.publish_stage.get();
+        match &stage {
+            // The store acknowledged this write, so the live tree IS the
+            // stored generation. Mirrors `release`'s `Released` arm.
+            PublishStage::Published { .. } => clear_quarantine(&self.local_path, &self.repo_name),
+            // Nothing to publish to: the local write is the durable copy.
+            PublishStage::NoBackend => {}
+            PublishStage::Idle => {
+                // A publish was possible and never started. If the tree was
+                // handed out, refs may already be on it (the receive-pack
+                // disconnect: git applied them, the reaper killed the group,
+                // and the guard dropped before `release` was entered), and
+                // nothing dispatched, so this is a definite non-publication.
+                // If it was never handed out, nothing touched the tree.
+                if self.path_handed_out.load(Ordering::Acquire) {
+                    quarantine_local_tree(&self.local_path, &self.repo_name, None);
+                }
+            }
+            // A definite non-publication after a successful write. The marker
+            // names no attempt, and the next read resolves it by invalidating
+            // the cache and serving the stored generation. Deliberately NOT a
+            // `remove_dir_all` here: that would run a blocking delete inside
+            // `Drop` on a runtime worker, when the read path already runs one.
+            PublishStage::PreparingArchive | PublishStage::Refused => {
+                quarantine_local_tree(&self.local_path, &self.repo_name, None)
+            }
+            // The PUT may have committed. The marker carries the attempt, so
+            // a landed PUT can still lift it through reconciliation.
+            PublishStage::PutDispatched { .. } | PublishStage::Ambiguous { .. } => {
+                quarantine_local_tree(
+                    &self.local_path,
+                    &self.repo_name,
+                    stage.unresolved_attempt(),
+                )
+            }
+        }
+    }
+}
+
+impl Drop for TreeSettlement {
+    fn drop(&mut self) {
+        self.settle();
+    }
+}
+
 impl Drop for RepoWriteGuard {
     fn drop(&mut self) {
         if let Some(authority) = self.refresh_swap_authority.take() {
@@ -2358,45 +2475,15 @@ impl Drop for RepoWriteGuard {
         //
         // Exhaustive on purpose, no wildcard arm: a new stage must be classified
         // here rather than inheriting whatever the catch-all happened to do.
+        // SETTLE THE TREE, if the handler did not take the settlement out.
+        //
+        // `take_settlement` exists because the lock and the tree do not have to
+        // be freed at the same moment; when it was called this guard's copy has
+        // nothing left to classify. Otherwise this is the only classifier a
+        // guard that never reached `release` gets.
         if !self.tree_settled {
-            let stage = self.publish_stage.get();
-            match &stage {
-                // The store acknowledged this write, so the live tree IS the
-                // stored generation. Mirrors `release`'s `Released` arm.
-                PublishStage::Published { .. } => {
-                    clear_quarantine(&self.local_path, &self.repo_name)
-                }
-                // Nothing to publish to: the local write is the durable copy.
-                PublishStage::NoBackend => {}
-                PublishStage::Idle => {
-                    // A publish was possible and never started. If the tree was
-                    // handed out, refs may already be on it (the receive-pack
-                    // disconnect: git applied them, the reaper killed the group,
-                    // and the guard dropped before `release` was entered), and
-                    // nothing dispatched, so this is a definite non-publication.
-                    // If it was never handed out, nothing touched the tree.
-                    if self.path_handed_out.load(Ordering::Acquire) {
-                        quarantine_local_tree(&self.local_path, &self.repo_name, None);
-                    }
-                }
-                // A definite non-publication after a successful write. The marker
-                // names no attempt, and the next read resolves it by invalidating
-                // the cache and serving the stored generation. Deliberately NOT a
-                // `remove_dir_all` here: that would run a blocking delete inside
-                // `Drop` on a runtime worker, when the read path already runs one.
-                PublishStage::PreparingArchive | PublishStage::Refused => {
-                    quarantine_local_tree(&self.local_path, &self.repo_name, None)
-                }
-                // The PUT may have committed. The marker carries the attempt, so
-                // a landed PUT can still lift it through reconciliation.
-                PublishStage::PutDispatched { .. } | PublishStage::Ambiguous { .. } => {
-                    quarantine_local_tree(
-                        &self.local_path,
-                        &self.repo_name,
-                        stage.unresolved_attempt(),
-                    )
-                }
-            }
+            let mut settlement = self.settlement();
+            settlement.settle();
         }
 
         let Some(mut conn) = self.conn.take() else {
@@ -3728,7 +3815,7 @@ mod tests {
             refresh_swap_authority: None,
             publish_stage: Arc::new(PublishStageCell::new()),
             tree_settled: false,
-            path_handed_out: AtomicBool::new(false),
+            path_handed_out: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_pre_unlock_gate: None,
             #[cfg(test)]
@@ -4098,7 +4185,7 @@ mod tests {
             refresh_swap_authority: None,
             publish_stage: Arc::new(PublishStageCell::new()),
             tree_settled: false,
-            path_handed_out: AtomicBool::new(false),
+            path_handed_out: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_pre_unlock_gate: None,
             #[cfg(test)]
@@ -8528,6 +8615,18 @@ mod tests {
         assert!(
             marker_path.exists(),
             "the second quarantine must reach disk once the path is writable"
+        );
+        // THE PROPERTY, observed BEFORE any clear. `clear_quarantine` drops the
+        // map entry ahead of the file, so an assertion taken after one passes
+        // whatever the successful-write arm did with the shadow. This is the
+        // only point where the shadow is observable.
+        assert!(
+            !unwritten_quarantines()
+                .lock()
+                .expect("quarantine map poisoned")
+                .contains_key(&marker_path),
+            "a marker that reached disk left the in-memory shadow of the earlier failed \
+             write behind it, so the disk marker is no longer the authority for this path"
         );
 
         // Lift the second attempt and clear the file the way a confirmation
