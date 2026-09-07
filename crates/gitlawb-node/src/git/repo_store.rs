@@ -669,6 +669,7 @@ impl RepoStore {
                 None => PublishStage::NoBackend,
             })),
             tree_settled: false,
+            settlement_armed: Arc::new(AtomicBool::new(true)),
             path_handed_out: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_pre_unlock_gate: self.pre_unlock_gate.clone(),
@@ -1900,6 +1901,16 @@ pub struct RepoWriteGuard {
     /// deletes the tree and clears its marker, would be followed by a `Drop` that
     /// writes a marker back beside a directory that no longer exists.
     tree_settled: bool,
+    /// Is the tree still waiting to be classified by SOMEONE?
+    ///
+    /// Shared with every [`TreeSettlement`] this guard hands out, because
+    /// `tree_settled` above is private to the guard and a token that has already
+    /// left it cannot see it. `release` classifies the tree and only THEN awaits
+    /// the connection-affine unlock, so a cancel in that gap drops a token the
+    /// handler has not reached its `disarm` for yet. Clearing this at the moment
+    /// `release` classifies, rather than when it returns, is what makes the
+    /// second settle impossible instead of merely unlikely.
+    settlement_armed: Arc<AtomicBool>,
     /// Was the writable tree ever handed out through `path()`?
     ///
     /// This is what answers "may a write have landed" at stage `Idle`, where no
@@ -2087,7 +2098,7 @@ impl RepoWriteGuard {
             repo_name: self.repo_name.clone(),
             publish_stage: Arc::clone(&self.publish_stage),
             path_handed_out: Arc::clone(&self.path_handed_out),
-            armed: true,
+            armed: Arc::clone(&self.settlement_armed),
         }
     }
 
@@ -2308,7 +2319,14 @@ impl RepoWriteGuard {
         // Whatever `release` reached, it has now classified the tree: published,
         // refused and invalidated, quarantined, or (on `success == false`) left
         // deliberately alone. `Drop` settles only the path that never got here.
+        //
+        // Disarmed HERE, above the unlock await, not after `release` returns.
+        // The unlock is an await, so the handler's copy of the settlement can be
+        // dropped between this classification and the handler's own `disarm`; a
+        // token that still believed the tree unclassified would then write a
+        // marker beside the directory the refusal arm above just deleted.
         self.tree_settled = true;
+        self.settlement_armed.store(false, Ordering::Release);
 
         // Release the advisory lock on the SAME session that took it. Unlocking
         // through the pool would land on an arbitrary backend, where the call is a
@@ -2394,7 +2412,12 @@ pub(crate) struct TreeSettlement {
     /// actually reached, not a copy taken when the token was handed out.
     publish_stage: Arc<PublishStageCell>,
     path_handed_out: Arc<AtomicBool>,
-    armed: bool,
+    /// Shared with the guard and with every other token over the same tree, so
+    /// the first settler wins and every later one is a no-op. A plain `bool`
+    /// here left the window this closes: `release` deletes the tree on a
+    /// definite refusal and then awaits the unlock, and a cancel in between
+    /// dropped a token that still believed nothing had classified the tree.
+    armed: Arc<AtomicBool>,
 }
 
 impl TreeSettlement {
@@ -2404,7 +2427,7 @@ impl TreeSettlement {
     /// a definite refusal would write a marker beside a tree the refusal has
     /// already deleted.
     pub(crate) fn disarm(&mut self) {
-        self.armed = false;
+        self.armed.store(false, Ordering::Release);
     }
 
     /// Classify the live tree an abandoned write left behind.
@@ -2412,10 +2435,15 @@ impl TreeSettlement {
     /// Exhaustive on purpose, no wildcard arm: a new stage must be classified
     /// here rather than inheriting whatever the catch-all happened to do.
     fn settle(&mut self) {
-        if !self.armed {
+        // Take the arm, don't just read it: the guard, this token, and any other
+        // copy all race to be the one classifier, and only the winner may act.
+        if self
+            .armed
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return;
         }
-        self.armed = false;
         let stage = self.publish_stage.get();
         match &stage {
             // The store acknowledged this write, so the live tree IS the
@@ -3815,6 +3843,7 @@ mod tests {
             refresh_swap_authority: None,
             publish_stage: Arc::new(PublishStageCell::new()),
             tree_settled: false,
+            settlement_armed: Arc::new(AtomicBool::new(true)),
             path_handed_out: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_pre_unlock_gate: None,
@@ -4185,6 +4214,7 @@ mod tests {
             refresh_swap_authority: None,
             publish_stage: Arc::new(PublishStageCell::new()),
             tree_settled: false,
+            settlement_armed: Arc::new(AtomicBool::new(true)),
             path_handed_out: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_pre_unlock_gate: None,
@@ -8524,6 +8554,124 @@ mod tests {
             !quarantine_path(&local_path).unwrap().exists(),
             "a release that already settled the tree must not be re-settled by Drop: no \
              marker may exist beside a tree the definite refusal deleted"
+        );
+
+        mock.shutdown();
+    }
+
+    /// The POST-CLASSIFY CANCEL WINDOW. `release` classifies the tree and only
+    /// then awaits the connection-affine unlock. The receive-pack handler holds
+    /// the settlement token across that await and disarms it after `release`
+    /// returns, so a disconnect inside the unlock gap drops a still-armed token
+    /// on a tree the definite refusal has already deleted. The second settle
+    /// would write a marker beside nothing, and every later `acquire` on that
+    /// path would take the refuse/reconcile branch for a write that definitively
+    /// did not publish.
+    #[sqlx::test]
+    async fn a_cancel_in_the_unlock_gap_after_a_definite_refusal_leaves_no_marker(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let store = fenced_store(&mock, &opts, repos.path()).await;
+        let owner = "did:key:z6MkCancelAfterRefusalAAAAAAAAAAAAAAAAA";
+        let repo = "cancel-after-refusal-repo";
+        let slug = owner_slug_of(owner);
+
+        let seed = TempDir::new().unwrap();
+        marked_repo(seed.path(), "seed");
+        mock_tigris(&mock)
+            .upload(&slug, repo, seed.path(), UploadPrecondition::Unconditional)
+            .await
+            .expect("seeding the archive");
+
+        // Both of the release's HEADs lose their generation, so the fence and
+        // its one supersede-retry are both refused: a DEFINITE refusal.
+        mock.roll_generation_after_next_heads(2);
+
+        let mut guard = store.acquire_write(owner, repo).await.expect("acquire");
+        std::fs::write(guard.local_path.join("MARKER"), "writer").unwrap();
+        let local_path = guard.local_path.clone();
+        // Exactly what `git_receive_pack` does: the handler takes the token so
+        // the marker can land at the disconnect instant rather than after the
+        // detached reaper frees the lock.
+        let settlement = guard.take_settlement();
+        assert!(
+            settlement.is_some(),
+            "the handler must be able to take the settlement out of a fresh guard"
+        );
+        // Park `release` at its pre-unlock point: classification has happened,
+        // the unlock has not.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        guard.test_pre_unlock_gate = Some(gate);
+
+        let mut fut = Box::pin(guard.release(true));
+        let parked = tokio::time::timeout(std::time::Duration::from_secs(20), fut.as_mut()).await;
+        assert!(
+            parked.is_err(),
+            "release must park on the pre-unlock gate, not complete"
+        );
+        assert!(
+            !local_path.exists(),
+            "release must have reached its definite-refusal arm and deleted the tree before \
+             parking on the unlock"
+        );
+
+        // The disconnect. Handler locals drop in reverse declaration order, so
+        // the release future goes first and the settlement token after it.
+        drop(fut);
+        drop(settlement);
+
+        assert!(
+            !quarantine_path(&local_path).unwrap().exists(),
+            "a cancel in the unlock gap must not settle a tree release already classified: no \
+             marker may exist beside a tree the definite refusal deleted"
+        );
+
+        mock.shutdown();
+    }
+
+    /// The OTHER half of the hand-off, and the one property `tree_settled` still
+    /// carries on its own. Once the handler has taken the settlement out, the
+    /// guard has given up responsibility for the tree: on a receive-pack
+    /// disconnect the guard's last copy rides `KillGroupOnDrop`'s detached
+    /// reaper, so a guard that still settled from its own `Drop` would put the
+    /// marker on disk at reaper exit and reopen the window U3 closed. The shared
+    /// arm alone does not answer this: it is still armed at this point, so
+    /// whichever of the two dropped first would win the race.
+    #[sqlx::test]
+    async fn a_guard_that_handed_off_its_settlement_does_not_settle_when_it_drops(pool: PgPool) {
+        let _sink = log_sink();
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let store = fenced_store(&mock, &opts, repos.path()).await;
+        let owner = "did:key:z6MkHandedOffSettlementAAAAAAAAAAAAAAAA";
+        let repo = "handed-off-settlement-repo";
+
+        let mut guard = store.acquire_write(owner, repo).await.expect("acquire");
+        // The hand-out is what makes an Idle abandonment worth settling at all.
+        let handed_out = guard.path().to_path_buf();
+        marked_repo(&handed_out, "writer");
+        let local_path = guard.local_path.clone();
+        let marker = quarantine_path(&local_path).unwrap();
+        let mut settlement = guard
+            .take_settlement()
+            .expect("a fresh guard hands out its token");
+
+        drop(guard);
+        assert!(
+            !marker.exists(),
+            "a guard that handed its settlement to the handler must not be re-settled by Drop: \
+             on a disconnect that Drop is the detached reaper's, which is the whole window the \
+             hand-off exists to close"
+        );
+
+        // THE CONTROL: the token that took the responsibility still discharges it.
+        settlement.settle();
+        assert!(
+            marker.exists(),
+            "the token that took the settlement must classify the tree it took"
         );
 
         mock.shutdown();

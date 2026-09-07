@@ -11602,14 +11602,26 @@ exit 0
         .await;
         let gitdir = tmp.path().join("hanging-git");
         std::fs::create_dir_all(&gitdir).unwrap();
+        // Ignores SIGTERM and re-parks after each interrupted `sleep`, so the
+        // process group outlives the reaper's grace period and only SIGKILL ends
+        // it. A plain `sleep 30` does NOT hold this window open: the group kill
+        // TERMs the sleep, the shell falls through the case and exits, and the
+        // reaper can free the advisory lock before the probe below runs, which
+        // turns this test into its own INCONCLUSIVE branch instead of an
+        // observation of the window it names.
         state.git_bin = write_fake_git(
             &gitdir,
             r#"#!/bin/sh
+trap '' TERM
 case "$1" in
   receive-pack)
     mkdir -p "$3/refs/heads"
     printf '%s\n' 1111111111111111111111111111111111111111 > "$3/refs/heads/main"
-    sleep 30
+    i=0
+    while [ "$i" -lt 300 ]; do
+      sleep 1
+      i=$((i+1))
+    done
     ;;
   *) : ;;
 esac
@@ -11675,13 +11687,24 @@ exit 0
             "INCONCLUSIVE: the write lock was already free when the probe ran, so the \
              reaper had finished and this read never observed the reap window"
         );
+        // THE FIX'S OWN PROPERTY, asserted rather than only reported. The marker
+        // has to be on disk at the DISCONNECT instant, which is what moving the
+        // settlement out of the reaper-held guard buys; without this the test
+        // reddens only through the refs below, which a settlement arriving late
+        // can still satisfy by accident once the reaper catches up.
         assert!(
-            !(served_ok && refs_after),
-            "a read inside the reap window served the abandoned refs: marker_before={}, \
-             acquire={:?}, ref still on the served tree={}",
             marker_before,
-            served,
-            refs_after
+            "the settlement must land at the disconnect, not at reaper exit: no quarantine \
+             marker existed when the probe read inside the reap window (acquire={served:?})"
+        );
+        // Unconditional on the refs, not `!(served_ok && refs_after)`. That form
+        // also passed when `acquire` failed for a reason unrelated to the
+        // withholding while the abandoned refs were still sitting on the live
+        // tree, which is a pass for the wrong reason.
+        assert!(
+            !refs_after,
+            "a read inside the reap window left the abandoned refs on the live tree: \
+             marker_before={marker_before}, acquire={served:?}, served_ok={served_ok}"
         );
 
         server.abort();
