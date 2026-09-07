@@ -73,7 +73,7 @@ These are documented limitations of the current live release. They should be pri
 ### Private repository reads
 - Repository and path-scoped visibility checks are enforced for repository API and Git content reads. A denied whole-repository or root read returns the same 404 shape as a missing repository, so the denial does not reveal private-repository existence.
 - Sparse-clone support exposes withheld path globs to callers who may read the repository root. Do not put sensitive information in withheld path names.
-- `GET /api/v1/tasks`, `/api/v1/ipfs/pins`, and `/api/v1/arweave/anchors` are not repository-gated. Task records include a UCAN token; pin and anchor listings expose object and ref metadata.
+- Task list/get reads (`GET /api/v1/tasks`, `GET /api/v1/tasks/{id}`, and GraphQL `tasks` / `task`) are repository/task-gated through shared visibility collectors and omit `ucan_token`. `/api/v1/ipfs/pins` and `/api/v1/arweave/anchors` are not repository-gated; pin and anchor listings expose object and ref metadata.
 - Changing a repository's visibility controls future serving, but cannot retract ref metadata or configured external pins and anchors already announced while the repository was public. Do not push secrets to an announceable repository.
 - **Impact:** Visibility policies protect the repository and Git content routes they gate, not every metadata endpoint or previously published content.
 - **Remaining boundary:** This read control does not address the independent write-authorization and UCAN-delegation limitations described above.
