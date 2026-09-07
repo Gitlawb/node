@@ -35,6 +35,9 @@ pub enum AppError {
     #[error("invalid request: {0}")]
     BadRequest(String),
 
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
+
     /// A DID was well-formed enough to carry to a resolver but no verifying key
     /// could be derived from it. Its own code rather than plain `bad_request`
     /// because the auth middleware already answers `unresolvable_did` for the
@@ -162,6 +165,11 @@ impl IntoResponse for AppError {
             // IcaptchaProofRequired is handled above (it carries extra headers/fields).
             AppError::IcaptchaProofRequired { .. } => unreachable!("handled before this match"),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg.clone()),
+            AppError::PayloadTooLarge(msg) => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                msg.clone(),
+            ),
             AppError::UnresolvableDid(msg) => {
                 (StatusCode::BAD_REQUEST, "unresolvable_did", msg.clone())
             }
@@ -271,6 +279,16 @@ mod tests {
         assert_eq!(
             AppError::Git("x".into()).into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn payload_too_large_maps_to_413() {
+        assert_eq!(
+            AppError::PayloadTooLarge("x".into())
+                .into_response()
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
         );
     }
 

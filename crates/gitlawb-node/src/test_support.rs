@@ -118,6 +118,9 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         shutdown_tx: tokio::sync::watch::channel(false).0,
         // Generous — no test drives the handler-level shed (git_permit is unit-tested).
         git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        git_blob_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            crate::api::repos::MAX_CONCURRENT_BLOB_READS,
+        )),
         git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
         git_push_advert_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
         git_encrypt_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),

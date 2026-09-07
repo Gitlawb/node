@@ -2,7 +2,7 @@ use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::Json;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use std::sync::Arc;
 
 use crate::auth::{caller_authorized_to_push, AuthenticatedDid};
@@ -20,6 +20,40 @@ use crate::webhooks;
 
 /// The git all-zeros object id — the create/delete sentinel in a ref update.
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
+
+/// REST blob responses share the same served-object ceiling as `/ipfs/{cid}`.
+const MAX_SERVED_BLOB_BYTES: u64 = crate::api::ipfs::MAX_SERVED_OBJECT_BYTES;
+
+/// A dedicated pool bounds retained REST blob bodies independently of smart-HTTP
+/// traffic. At the per-response ceiling, the default caps live blob data at 128 MiB.
+pub(crate) const MAX_CONCURRENT_BLOB_READS: usize = 4;
+
+const BLOB_RESPONSE_CHUNK_BYTES: usize = 64 * 1024;
+
+struct BlobResponseStream {
+    content: Bytes,
+    _git_permit: tokio::sync::OwnedSemaphorePermit,
+    _blob_permit: tokio::sync::OwnedSemaphorePermit,
+    _caller_permit: Option<crate::rate_limit::PerCallerPermit>,
+}
+
+impl futures::Stream for BlobResponseStream {
+    type Item = std::result::Result<Bytes, std::convert::Infallible>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.content.is_empty() {
+            return std::task::Poll::Ready(None);
+        }
+        let len = this.content.len().min(BLOB_RESPONSE_CHUNK_BYTES);
+        let chunk = Bytes::copy_from_slice(&this.content[..len]);
+        this.content.advance(len);
+        std::task::Poll::Ready(Some(Ok(chunk)))
+    }
+}
 
 /// The set of blob OIDs withheld from **anonymous** replication for a repo, or
 /// `None` when the repo must not replicate at all (private / mode A /
@@ -413,21 +447,33 @@ pub async fn list_commits(
 pub async fn get_blob(
     State(state): State<AppState>,
     Path((owner, name, file_path)): Path<(String, String, String)>,
+    crate::rate_limit::PeerAddr(peer): crate::rate_limit::PeerAddr,
+    headers: axum::http::HeaderMap,
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Response> {
     use axum::http::header;
-    use axum::response::IntoResponse;
 
     // Unnormalized paths ("../..", "./", "//") can't resolve in `git show`
     // and crawlers combinatorially explode them from relative links — that's
     // a client error, not a 500.
     let file_path = file_path.trim_matches('/');
     if file_path.is_empty()
-        || file_path
-            .split('/')
-            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        || file_path.split('/').any(|seg| {
+            seg.is_empty() || seg == "." || seg == ".." || seg.chars().any(char::is_control)
+        })
     {
         return Err(AppError::BadRequest("invalid file path".into()));
+    }
+
+    if state.git_read_semaphore.available_permits() == 0
+        || state.git_blob_semaphore.available_permits() == 0
+    {
+        tracing::warn!(
+            "served-git concurrency cap reached; shedding blob request with 503 (pre-DB)"
+        );
+        return Err(AppError::Overloaded(
+            "git service at capacity, retry shortly".into(),
+        ));
     }
 
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
@@ -435,25 +481,60 @@ pub async fn get_blob(
     let (record, _rules) =
         crate::api::authorize_repo_read(&state, &owner, &name, caller, &gate_path).await?;
 
-    let disk_path = state
-        .repo_store
-        .acquire(&record.owner_did, &record.name)
-        .await
-        .map_err(|e| AppError::Git(e.to_string()))?;
-    let head_ref = store::resolve_head(&disk_path, &record.default_branch);
-    let content = store::read_file(&disk_path, &head_ref, file_path).map_err(|e| {
-        let msg = e.to_string();
-        // `git show ref:path` on a path absent from the tree is a 404,
-        // not a server error
-        if msg.contains("does not exist in")
-            || msg.contains("invalid object name")
-            || msg.contains("exists on disk, but not in")
-        {
-            AppError::NotFound(format!("file not found: {file_path}"))
-        } else {
-            AppError::Git(msg)
+    let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
+    let caller_permit = acquire_read_caller_permit(
+        &state.git_read_per_caller,
+        caller_key.as_deref(),
+        &name,
+        "REST blob",
+    )?;
+    let blob_permit = git_permit(&state.git_blob_semaphore)?;
+    let permit = git_permit(&state.git_read_semaphore)?;
+
+    let acquire_deadline = std::time::Duration::from_secs(state.config.git_acquire_timeout_secs);
+    let disk_path = tokio::time::timeout(
+        acquire_deadline,
+        state.repo_store.acquire(&record.owner_did, &record.name),
+    )
+    .await
+    .map_err(|_elapsed| {
+        tracing::warn!(repo = %name, "repo acquire timed out; shedding blob request with 503");
+        AppError::Overloaded("git service acquisition timed out, retry shortly".into())
+    })?
+    .map_err(|e| AppError::Git(e.to_string()))?;
+
+    let default_branch = record.default_branch.clone();
+    let read_path = file_path.to_string();
+    let git_bin = state.git_bin.clone();
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+    let (read, permit, blob_permit, caller_permit) = tokio::task::spawn_blocking(move || {
+        let read = store::read_file_bounded(
+            &git_bin,
+            &disk_path,
+            &default_branch,
+            &read_path,
+            MAX_SERVED_BLOB_BYTES,
+            deadline,
+        );
+        (read, permit, blob_permit, caller_permit)
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("blob read task failed: {e}")))?;
+    let read = read.map_err(|e| git_service_app_error(&e))?;
+
+    let content = match read {
+        store::BoundedFileRead::Found(content) => content,
+        store::BoundedFileRead::Missing => {
+            return Err(AppError::NotFound(format!("file not found: {file_path}")));
         }
-    })?;
+        store::BoundedFileRead::TooLarge { size, max } => {
+            tracing::warn!(repo = %name, path = %file_path, size, max, "REST blob exceeds served size limit");
+            return Err(AppError::PayloadTooLarge(format!(
+                "file exceeds the maximum served size of {max} bytes"
+            )));
+        }
+    };
 
     // Guess content type
     let mime = match file_path.rsplit('.').next() {
@@ -467,7 +548,24 @@ pub async fn get_blob(
         _ => "application/octet-stream",
     };
 
-    Ok(([(header::CONTENT_TYPE, mime)], content).into_response())
+    let content_len = content.len();
+    let stream = BlobResponseStream {
+        content: Bytes::from(content),
+        _git_permit: permit,
+        _blob_permit: blob_permit,
+        _caller_permit: caller_permit,
+    };
+    let mut response = Response::new(axum::body::Body::from_stream(stream));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(mime),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        axum::http::HeaderValue::from_str(&content_len.to_string())
+            .expect("a decimal content length is a valid header value"),
+    );
+    Ok(response)
 }
 
 /// GET /api/v1/repos/:owner/:repo/tree  (root listing)
@@ -3342,6 +3440,45 @@ mod tests {
     const OWNER_DID: &str = "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
     const OWNER_SHORT: &str = "z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
     const STRANGER_DID: &str = "did:key:z6Mkffonly5tranger0000000000000000000000000000000";
+
+    #[tokio::test]
+    async fn blob_response_holds_admission_until_the_body_is_dropped() {
+        use futures::StreamExt;
+
+        let git = Arc::new(tokio::sync::Semaphore::new(1));
+        let blob = Arc::new(tokio::sync::Semaphore::new(1));
+        let callers = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        let source = vec![b'x'; BLOB_RESPONSE_CHUNK_BYTES * 2];
+        let source_start = source.as_ptr() as usize;
+        let source_end = source_start + source.len();
+        let mut stream = BlobResponseStream {
+            content: Bytes::from(source),
+            _git_permit: git.clone().try_acquire_owned().unwrap(),
+            _blob_permit: blob.clone().try_acquire_owned().unwrap(),
+            _caller_permit: callers.try_acquire("source"),
+        };
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.len(), BLOB_RESPONSE_CHUNK_BYTES);
+        assert!(git.clone().try_acquire_owned().is_err());
+        assert!(blob.clone().try_acquire_owned().is_err());
+        assert!(callers.try_acquire("source").is_none());
+
+        let second = stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.is_none());
+        for chunk in [&first, &second] {
+            let chunk_start = chunk.as_ptr() as usize;
+            assert!(
+                chunk_start < source_start || chunk_start >= source_end,
+                "emitted chunks must not retain the full source allocation"
+            );
+        }
+
+        drop(stream);
+        assert!(git.try_acquire_owned().is_ok());
+        assert!(blob.try_acquire_owned().is_ok());
+        assert!(callers.try_acquire("source").is_some());
+    }
 
     #[test]
     fn upload_pack_request_finalizes_only_with_done_pktline() {

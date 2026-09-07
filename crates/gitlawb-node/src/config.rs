@@ -314,8 +314,8 @@ pub struct Config {
     /// cap is a different axis (500 connections each fan out to git +
     /// pack-objects + threads). Size below the process budget with headroom.
     ///
-    /// This is the READ pool (`git_read_semaphore`): upload-pack and the UPLOAD-PACK
-    /// `info/refs` advertisement only. The authenticated push POST draws from a
+    /// This is the READ pool (`git_read_semaphore`): upload-pack, the UPLOAD-PACK
+    /// `info/refs` advertisement, and REST blob reads. The authenticated push POST draws from a
     /// separate write pool (`max_concurrent_git_pushes`) that anonymous reads can
     /// never reach, and each read caller is additionally bounded by
     /// `max_concurrent_reads_per_caller`, so an anonymous flood cannot shed the actual
@@ -422,9 +422,10 @@ pub struct Config {
     )]
     pub max_concurrent_pin_tasks: usize,
 
-    /// Maximum concurrent read operations (`upload-pack` and the upload-pack
-    /// `info/refs` advertisement) a single caller may hold at once, so one caller
-    /// cannot monopolize the `max_concurrent_git_ops` read pool (#174). Callers are
+    /// Maximum concurrent read operations (`upload-pack`, the upload-pack
+    /// `info/refs` advertisement, and REST blob reads) a single caller may hold at
+    /// once, so one caller cannot monopolize the `max_concurrent_git_ops` read pool
+    /// (#174). Callers are
     /// keyed on the RESOLVED SOURCE IP, never the DID — a signature does not move a
     /// caller off this cap, so an authenticated client cannot mint DIDs to escape it.
     /// IMPORTANT: the source-IP key is only as granular as `GITLAWB_TRUSTED_PROXY`.
