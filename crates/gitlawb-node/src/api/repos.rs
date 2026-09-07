@@ -2676,12 +2676,15 @@ pub async fn git_receive_pack(
 
     // Bounded synchronous retry for post-git outcome commit. After git has landed
     // refs we cannot 503 (refs are already durable), but leaving the parent in
-    // `received` with no repair path freezes the due-worker from claiming it.
-    // Retry up to 3x with short backoff before falling through to warn +
-    // effects-only return; effects will retry on next drain pass once the
-    // claim lease expires.
+    // `received` hides it from the claim-gated due worker, which only matches
+    // `outcomes_committed` / `effects_pending`. Retry up to 3x with short
+    // backoff; on persistent failure the push still returns 200 (git did
+    // land), metrics/effects are skipped inline, and durable effects wait for
+    // the next process restart, when startup reconcile promotes disk-proved
+    // children and the aggregate. This attended-restart window is by design:
+    // refs are safe on disk, never silently dropped, just not yet accounted.
     let mut delay_ms = 20;
-    for attempt in 0..3 {
+    let outcome_commit_ok = loop {
         match state
             .db
             .commit_request_outcomes_atomically(
@@ -2698,13 +2701,13 @@ pub async fn git_receive_pack(
             )
             .await
         {
-            Ok(()) => break,
-            Err(e) if attempt < 2 => {
+            Ok(()) => break true,
+            Err(e) if delay_ms < 500 => {
                 tracing::warn!(
                     err = %e,
                     request_id = %request_id,
                     repo = %name,
-                    attempt = attempt + 1,
+                    delay_ms,
                     "commit_request_outcomes_atomically failed; retrying"
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
@@ -2715,12 +2718,13 @@ pub async fn git_receive_pack(
                     err = %e,
                     request_id = %request_id,
                     repo = %name,
-                    "commit_request_outcomes_atomically failed after 3 attempts; \
-                     reconcile will repair once claim lease expires"
+                    "commit_request_outcomes_atomically failed after retries; \
+                     parent stays received, effects deferred to startup reconcile"
                 );
+                break false;
             }
         }
-    }
+    };
 
     // On non-zero exit, return an error to the caller. The outbox
     // rows have already been handled above (per-ref fates applied).
@@ -2873,6 +2877,20 @@ pub async fn git_receive_pack(
     // startup. A `Nothing` outcome means the request had no
     // accepted ref (the four-branch flip above would have caught
     // that case via `any_ref_ok`, so this is defensive).
+    //
+    // When the outcome commit above failed, the outcome was never
+    // durably recorded: skip observability side effects and inline
+    // effects alike so metrics do not advance ahead of effects.
+    // The client still gets HTTP 200 (git landed); durable effects
+    // wait for startup reconcile.
+    if !outcome_commit_ok {
+        return axum::response::Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .header("Content-Type", "application/x-git-receive-pack-result")
+            .header("Cache-Control", "no-cache")
+            .body(axum::body::Body::from(receive_raw))
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to build response: {e}")));
+    }
     let _ = state.db.touch_repo(&record.id).await;
     crate::metrics::record_push(&record.id);
     crate::metrics::observe_pack_size(body_len as f64);

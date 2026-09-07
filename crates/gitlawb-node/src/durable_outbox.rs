@@ -2134,6 +2134,113 @@ mod drain_tests {
         );
     }
 
+    /// Landing-history failure retains the child and retries. Landing
+    /// history is part of the success condition (it guards future A/B
+    /// attribution after children are deleted), so a failed insert must
+    /// set `first_error` and return `Retry`, never delete the child.
+    /// Dropping the table simulates a transient DB failure on that
+    /// write only; cert/anchor/push paths stay intact. Removing the
+    /// `first_error` assignment for history keeps `Done`, deletes the
+    /// child, and turns this red.
+    #[sqlx::test]
+    async fn landing_history_insert_failure_returns_retry(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let request_id = "req-hist-fail";
+        let repo_id = "repo-hist-fail";
+        let mut row = make_row(repo_id, "refs/heads/main", &"0".repeat(40), &"b".repeat(40));
+        row.request_id = request_id.to_string();
+        row.id = crate::db::deterministic_id(&[
+            "pending_ref_transition",
+            request_id,
+            repo_id,
+            "refs/heads/main",
+            &"0".repeat(40),
+            &"b".repeat(40),
+        ]);
+        let parsed = parsed_report_ok(&[("refs/heads/main", true)]);
+        stage_request_with_children(
+            &state.db,
+            request_id,
+            repo_id,
+            Some(0),
+            &[row.clone()],
+            parsed,
+        )
+        .await;
+
+        sqlx::query("DROP TABLE ref_landing_history")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let outcome = apply_request_effects(&state, request_id).await.unwrap();
+        assert!(
+            matches!(outcome, EffectsOutcome::Retry { .. }),
+            "history failure must yield Retry, got {outcome:?}"
+        );
+        let remaining = state
+            .db
+            .list_pending_ref_transitions_for_request(request_id)
+            .await
+            .unwrap();
+        assert!(
+            remaining.iter().any(|c| c.id == row.id),
+            "failed history must retain the child for retry"
+        );
+    }
+
+    /// Proof-ack failure retries instead of completing. The ack gates
+    /// purge eligibility, so an unacknowledged proof must leave the
+    /// request executable. Dropping the proofs table forces the ack
+    /// read to error; swallowing that error (completing anyway) turns
+    /// this red via the error assertion.
+    #[sqlx::test]
+    async fn proof_ack_failure_returns_retry(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let request_id = "req-ack-fail";
+        let repo_id = "repo-ack-fail";
+        let mut row = make_row(repo_id, "refs/heads/main", &"0".repeat(40), &"b".repeat(40));
+        row.request_id = request_id.to_string();
+        row.id = crate::db::deterministic_id(&[
+            "pending_ref_transition",
+            request_id,
+            repo_id,
+            "refs/heads/main",
+            &"0".repeat(40),
+            &"b".repeat(40),
+        ]);
+        let parsed = parsed_report_ok(&[("refs/heads/main", true)]);
+        stage_request_with_children(
+            &state.db,
+            request_id,
+            repo_id,
+            Some(0),
+            &[row.clone()],
+            parsed,
+        )
+        .await;
+
+        sqlx::query("DROP TABLE request_proofs")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let result = apply_request_effects(&state, request_id).await;
+        assert!(
+            result.is_err(),
+            "proof-table failure must surface as Err for drain retry, got {result:?}"
+        );
+        let remaining = state
+            .db
+            .list_pending_ref_transitions_for_request(request_id)
+            .await
+            .unwrap();
+        assert!(
+            remaining.iter().any(|c| c.id == row.id),
+            "failed ack must retain the child for retry"
+        );
+    }
+
     /// The reviewer's second proof, end-to-end. A request that git
     /// rejected (no `accepted_ordinal`) never produces a push event,
     /// cert, or anchor. The drain still picks up the request
@@ -4211,6 +4318,73 @@ mod drain_tests {
                 .map(|a| !a.is_empty())
                 .unwrap_or(false),
             "reconciled parent carries a normalized accepted-ref report"
+        );
+    }
+
+    /// Post-git outcome-commit failure defers to startup reconcile, not the
+    /// due worker. A parent stuck in `received` (commit txn rolled back
+    /// after git landed) is invisible to the claim-gated due worker, which
+    /// only matches `outcomes_committed` / `effects_pending`. Startup
+    /// reconcile promotes the disk-proved child and the aggregate, and the
+    /// drain then completes effects. Removing the reconcile promotion
+    /// turns this red; routing `received` into the due query would be the
+    /// wrong fix (it would let uncommitted outcomes execute).
+    #[sqlx::test]
+    async fn received_parent_needs_restart_reconcile_not_due_worker(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        crate::git::store::init_bare(&bare).expect("init_bare");
+        let on_disk_sha = seed_ref_on_bare(&bare, "refs/heads/main");
+
+        let repo_id = seed_repo_row(&state, bare.to_str().unwrap()).await;
+        seed_parent_request(&state.db, "req-restart-repair", &repo_id, vec![0xb7; 32]).await;
+        stage_marker(&bare, "req-restart-repair", &[0xb7; 32]).await;
+
+        let mut row = make_row(&repo_id, "refs/heads/main", &"0".repeat(40), &on_disk_sha);
+        row.request_id = "req-restart-repair".to_string();
+        row.state = pending_state::PREPARED.to_string();
+        row.applied_at = None;
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row)
+            .await
+            .unwrap();
+
+        // The due worker is blind to `received`: nothing executable.
+        let due = state.db.list_receive_pack_requests_due(100).await.unwrap();
+        assert!(
+            due.iter().all(|r| r.id != "req-restart-repair"),
+            "a received parent must not be due for the claim-gated worker"
+        );
+
+        // Startup reconcile promotes child and aggregate.
+        let n = reconcile_prepared_from_disk(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "reconcile promotes the disk-proved child");
+        let parent = state
+            .db
+            .get_receive_pack_request("req-restart-repair")
+            .await
+            .unwrap()
+            .expect("parent row exists");
+        assert_eq!(
+            parent.state,
+            request_state::OUTCOMES_COMMITTED,
+            "reconcile advances the stuck aggregate"
+        );
+
+        // The drain now completes effects exactly once.
+        let (processed, _) = drain_receive_pack_requests(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(processed, 1, "drain completes the repaired request");
+        assert_eq!(
+            state.db.get_push_count("did:key:z6pusher").await.unwrap(),
+            1,
+            "exactly one push event after restart repair"
         );
     }
 
