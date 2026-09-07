@@ -3,7 +3,7 @@ pub mod query;
 pub mod subscription;
 pub mod types;
 
-use async_graphql::Schema;
+use async_graphql::{Schema, SchemaBuilder};
 use std::sync::Arc;
 
 use crate::db::Db;
@@ -13,6 +13,21 @@ use query::QueryRoot;
 use subscription::SubscriptionRoot;
 
 pub type GitlawbSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
+
+// Keep ordinary schema discovery and application queries usable while
+// bounding validation work and the number of resolver selections per request.
+const GRAPHQL_MAX_COMPLEXITY: usize = 400;
+// The current public schema is shallow; this leaves headroom for composed
+// clients without allowing recursively nested documents to grow unchecked.
+const GRAPHQL_MAX_DEPTH: usize = 12;
+
+fn apply_query_limits<Query, Mutation, Subscription>(
+    builder: SchemaBuilder<Query, Mutation, Subscription>,
+) -> SchemaBuilder<Query, Mutation, Subscription> {
+    builder
+        .limit_complexity(GRAPHQL_MAX_COMPLEXITY)
+        .limit_depth(GRAPHQL_MAX_DEPTH)
+}
 
 /// Client-facing message for GraphQL resolver failures that wrap a real
 /// `sqlx::Error`. The real error is logged server-side; never put sqlx/Postgres
@@ -81,7 +96,7 @@ pub fn build_schema(
     ref_update_tx: tokio::sync::broadcast::Sender<RefUpdateBroadcast>,
     task_event_tx: tokio::sync::broadcast::Sender<TaskEventBroadcast>,
 ) -> GitlawbSchema {
-    Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
+    apply_query_limits(Schema::build(QueryRoot, MutationRoot, SubscriptionRoot))
         .data(db)
         .data(ref_update_tx)
         .data(task_event_tx)
@@ -91,6 +106,8 @@ pub fn build_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_graphql::{EmptyMutation, EmptySubscription, Object, Value};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn graphql_db_err_opaques_sqlx_chain() {
@@ -158,6 +175,105 @@ mod tests {
         assert_eq!(err.message, GRAPHQL_DB_ERROR_MESSAGE);
         assert!(!err.message.contains(path));
         assert!(!err.message.contains("failed to open"));
+    }
+
+    #[tokio::test]
+    async fn expensive_root_aliases_are_rejected_before_database_access() {
+        // QueryRoot expects a Db in the schema data. Deliberately omit it: if
+        // validation ever lets this document reach a resolver, the test fails.
+        let schema =
+            apply_query_limits(Schema::build(QueryRoot, EmptyMutation, EmptySubscription)).finish();
+        let fields = (0..8)
+            .map(|n| format!("r{n}: repos {{ name }}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let response = schema.execute(format!("{{ {fields} }}")).await;
+
+        assert_eq!(response.data, Value::Null);
+        assert_eq!(response.errors.len(), 1);
+        assert_eq!(response.errors[0].message, "Query is too complex.");
+    }
+
+    #[tokio::test]
+    async fn ordinary_schema_introspection_remains_available() {
+        let schema =
+            apply_query_limits(Schema::build(QueryRoot, EmptyMutation, EmptySubscription)).finish();
+        let response = schema
+            .execute(
+                r#"
+                query IntrospectionQuery {
+                    __schema {
+                        queryType {
+                            name
+                            fields {
+                                name
+                                type {
+                                    kind
+                                    name
+                                    ofType { kind name }
+                                }
+                            }
+                        }
+                    }
+                }
+                "#,
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "graphql errors: {:?}",
+            response.errors
+        );
+        assert_ne!(response.data, Value::Null);
+    }
+
+    #[derive(Clone, Copy)]
+    struct Nested;
+
+    #[Object]
+    impl Nested {
+        async fn child(&self) -> Nested {
+            Nested
+        }
+
+        async fn value(&self) -> i32 {
+            1
+        }
+    }
+
+    struct CountingQuery(Arc<AtomicUsize>);
+
+    #[Object]
+    impl CountingQuery {
+        async fn nested(&self) -> Nested {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Nested
+        }
+    }
+
+    #[tokio::test]
+    async fn deeply_nested_queries_are_rejected_before_resolver_execution() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let schema = apply_query_limits(Schema::build(
+            CountingQuery(Arc::clone(&calls)),
+            EmptyMutation,
+            EmptySubscription,
+        ))
+        .finish();
+        let selection = (0..GRAPHQL_MAX_DEPTH).fold("value".to_string(), |selection, _| {
+            format!("child {{ {selection} }}")
+        });
+
+        let response = schema
+            .execute(format!("{{ nested {{ {selection} }} }}"))
+            .await;
+
+        assert_eq!(response.data, Value::Null);
+        assert_eq!(response.errors.len(), 1);
+        assert_eq!(response.errors[0].message, "Query is nested too deep.");
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
     /// Every `.map_err(` in the GraphQL query/mutation resolvers must route

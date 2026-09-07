@@ -9,6 +9,9 @@ pub struct QueryRoot;
 
 #[Object]
 impl QueryRoot {
+    // DB-backed roots carry a base cost so aliases consume the request budget
+    // even when each alias selects only one inexpensive response field.
+    #[graphql(complexity = "50 + child_complexity")]
     async fn repos(&self, ctx: &Context<'_>) -> Result<Vec<RepoType>> {
         let db = ctx.data_unchecked::<Arc<Db>>();
         let repos = db
@@ -45,6 +48,7 @@ impl QueryRoot {
             .collect())
     }
 
+    #[graphql(complexity = "50 + child_complexity")]
     async fn ref_updates(
         &self,
         ctx: &Context<'_>,
@@ -105,6 +109,7 @@ impl QueryRoot {
         Ok(resolved)
     }
 
+    #[graphql(complexity = "50 + child_complexity")]
     async fn tasks(
         &self,
         ctx: &Context<'_>,
@@ -128,6 +133,7 @@ impl QueryRoot {
         Ok(tasks.into_iter().map(AgentTaskType::from).collect())
     }
 
+    #[graphql(complexity = "50 + child_complexity")]
     async fn task(&self, ctx: &Context<'_>, id: String) -> Result<Option<AgentTaskType>> {
         let db = ctx.data_unchecked::<Arc<Db>>();
         let t = db
