@@ -2390,6 +2390,456 @@ mod tests {
              authorization"
         );
     }
+    /// Delegated push, end to end through both auth layers.
+    ///
+    /// A non-owner presenting an invocation whose chain roots at the repo owner
+    /// clears the owner-push gate; the same signer without one, and with one that
+    /// names a different repository, are both refused. This is the regression the
+    /// owner-push default introduced: a CI or delegated key holding a valid
+    /// `git/push` capability was refused exactly like a stranger.
+    ///
+    /// Status codes are the discriminators. 500 means the request passed
+    /// `require_signature` (not 401), passed `require_ucan_chain` (not 401), and
+    /// cleared the owner gate (not 403), then reached git on a repo with no disk
+    /// backing — the same shape `git_upload_pack_post_is_read_gated_on_private_repo`
+    /// relies on. A bare `!= 403` would let a 401 regression pass.
+    ///
+    /// Not `#[cfg(unix)]`: no fake-git shim is involved, only HTTP and the gate.
+    #[sqlx::test]
+    async fn delegated_push_clears_the_owner_gate(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+        use gitlawb_core::ucan::{caps, Capability, Ucan};
+        use std::sync::Arc;
+
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+
+        let mut state = test_state(pool).await;
+        // Explicit rather than relying on the shipped default, so this test states
+        // the configuration it is about.
+        let mut cfg = (*state.config).clone();
+        cfg.enforce_owner_push = true;
+        state.config = Arc::new(cfg);
+
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "deleg"))
+            .await
+            .expect("seed repo");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/{owner}/{repo}/git-receive-pack",
+                    axum::routing::post(crate::api::repos::git_receive_pack),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::auth::require_ucan_chain,
+                ))
+                .layer(axum::middleware::from_fn(crate::auth::require_signature))
+                .with_state(state.clone())
+        };
+
+        let path = format!("/{short}/deleg.git/git-receive-pack");
+        let body = b"0000".to_vec();
+
+        // owner -> agent delegation, then agent -> node invocation carrying it.
+        // Both links carry a finite expiry: a write capability that never lapses is
+        // refused, since there is no revocation path to withdraw a leaked one.
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+        let invocation_with_exp = |resource: String, exp: Option<chrono::DateTime<chrono::Utc>>| {
+            let delegation = Ucan::issue(
+                &owner,
+                agent.did(),
+                vec![Capability::new(resource, caps::GIT_PUSH)],
+                exp,
+            )
+            .expect("issue delegation");
+            Ucan::delegate(
+                &agent,
+                state.node_did.clone(),
+                delegation.payload.att.clone(),
+                exp,
+                &delegation,
+            )
+            .expect("wrap invocation")
+            .encode()
+            .expect("encode invocation")
+        };
+        let invocation_for = |resource: String| invocation_with_exp(resource, Some(hour));
+
+        let signed_push = |ucan: Option<String>| {
+            let signed = sign_request(&agent, "POST", &path, &body);
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri(&path)
+                .header("content-type", "application/x-git-receive-pack-request")
+                .header("content-digest", signed.content_digest)
+                .header("signature-input", signed.signature_input)
+                .header("signature", signed.signature);
+            if let Some(token) = ucan {
+                req = req.header("x-ucan", token);
+            }
+            req.body(Body::from(body.clone())).expect("request")
+        };
+
+        // 1. Valid delegation for THIS repo: clears the gate.
+        let resp = router()
+            .oneshot(signed_push(Some(invocation_for(format!(
+                "gitlawb://repos/{owner_did}/deleg"
+            )))))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "an owner-rooted git/push delegation must clear the owner gate and reach git"
+        );
+
+        // 2. Delegation naming a DIFFERENT repo: refused.
+        let other = router()
+            .oneshot(signed_push(Some(invocation_for(format!(
+                "gitlawb://repos/{owner_did}/someotherrepo"
+            )))))
+            .await
+            .unwrap();
+        assert_eq!(
+            other.status(),
+            StatusCode::FORBIDDEN,
+            "a delegation for another repository must not authorize this push"
+        );
+        let other_body = axum::body::to_bytes(other.into_body(), 4096).await.unwrap();
+
+        // 3. No delegation at all: refused, with a byte-identical body. A caller
+        //    must not be able to tell a non-applicable delegation from none, or the
+        //    denial becomes an oracle for which capabilities exist.
+        let none = router().oneshot(signed_push(None)).await.unwrap();
+        assert_eq!(
+            none.status(),
+            StatusCode::FORBIDDEN,
+            "a non-owner with no delegation must still be refused"
+        );
+        let none_body = axum::body::to_bytes(none.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            other_body, none_body,
+            "an inapplicable delegation and no delegation must be indistinguishable"
+        );
+
+        // 4. A delegation that never expires: refused, however otherwise valid.
+        //    Owner-rooted, right repo, right action — but with no revocation path an
+        //    unbounded grant cannot be withdrawn once the token leaks.
+        let perpetual = router()
+            .oneshot(signed_push(Some(invocation_with_exp(
+                format!("gitlawb://repos/{owner_did}/deleg"),
+                None,
+            ))))
+            .await
+            .unwrap();
+        assert_eq!(
+            perpetual.status(),
+            StatusCode::FORBIDDEN,
+            "a delegation with no expiry must not authorize a push"
+        );
+    }
+
+    /// The two-gate contract on a PRIVATE repository, end to end.
+    ///
+    /// A `git push` crosses two independent gates. Gate 1 is read visibility on
+    /// the `info/refs` advertisement (both services): the owner, anyone on a public
+    /// repository, or a caller a rule names in `reader_dids`. Gate 2 is push
+    /// authorization on the `git-receive-pack` POST, the owner gate a delegation
+    /// clears. A UCAN speaks only to gate 2 and grants no read, so a delegate on a
+    /// private repository needs BOTH a push delegation AND a reader rule. That
+    /// composition — not a POST defect — is what "delegated push does not work on
+    /// my private repo" turns out to be; the sibling test above runs on a public
+    /// repository and never meets gate 1.
+    ///
+    /// Status codes discriminate as in the sibling: 404 is gate 1 withholding the
+    /// advertisement, 403 is gate 2 refusing the push, 500 is a request that cleared
+    /// every gate and reached git on a repo with no disk backing.
+    ///
+    /// Each gate is mounted under the middleware production gives it (`server.rs`):
+    /// `optional_signature` alone on `info/refs`, `require_signature` plus
+    /// `require_ucan_chain` on the receive-pack POST.
+    #[sqlx::test]
+    async fn delegated_push_on_a_private_repo_needs_read_visibility_too(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+        use gitlawb_core::ucan::{caps, Capability, Ucan};
+        use std::sync::Arc;
+
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+
+        let mut state = test_state(pool).await;
+        let mut cfg = (*state.config).clone();
+        cfg.enforce_owner_push = true;
+        state.config = Arc::new(cfg);
+
+        let mut repo = seed_repo(&owner_did, "priv-deleg");
+        repo.is_public = false;
+        state
+            .db
+            .create_repo(&repo)
+            .await
+            .expect("seed private repo");
+
+        let advertisement = || {
+            Router::new()
+                .route(
+                    "/{owner}/{repo}/info/refs",
+                    axum::routing::get(crate::api::repos::git_info_refs),
+                )
+                .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+                .with_state(state.clone())
+        };
+        let receive_pack = || {
+            Router::new()
+                .route(
+                    "/{owner}/{repo}/git-receive-pack",
+                    axum::routing::post(crate::api::repos::git_receive_pack),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::auth::require_ucan_chain,
+                ))
+                .layer(axum::middleware::from_fn(crate::auth::require_signature))
+                .with_state(state.clone())
+        };
+
+        // A delegation that is valid in every respect the push gate checks.
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+        let delegation = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{owner_did}/priv-deleg"),
+                caps::GIT_PUSH,
+            )],
+            Some(hour),
+        )
+        .expect("issue delegation");
+        let invocation = Ucan::delegate(
+            &agent,
+            state.node_did.clone(),
+            delegation.payload.att.clone(),
+            Some(hour),
+            &delegation,
+        )
+        .expect("wrap invocation")
+        .encode()
+        .expect("encode invocation");
+
+        let advert_path = format!("/{short}/priv-deleg.git/info/refs?service=git-receive-pack");
+        let signed_advert = |ucan: Option<&str>| {
+            let signed = sign_request(&agent, "GET", &advert_path, b"");
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(&advert_path)
+                .header("content-digest", signed.content_digest)
+                .header("signature-input", signed.signature_input)
+                .header("signature", signed.signature);
+            if let Some(token) = ucan {
+                req = req.header("x-ucan", token);
+            }
+            req.body(Body::empty()).expect("request")
+        };
+        let push_path = format!("/{short}/priv-deleg.git/git-receive-pack");
+        let push_body = b"0000".to_vec();
+        let signed_push = |ucan: Option<&str>| {
+            let signed = sign_request(&agent, "POST", &push_path, &push_body);
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri(&push_path)
+                .header("content-type", "application/x-git-receive-pack-request")
+                .header("content-digest", signed.content_digest)
+                .header("signature-input", signed.signature_input)
+                .header("signature", signed.signature);
+            if let Some(token) = ucan {
+                req = req.header("x-ucan", token);
+            }
+            req.body(Body::from(push_body.clone())).expect("request")
+        };
+
+        // 1. Delegation, no reader rule. Gate 1 withholds the advertisement even
+        //    though the delegate presents the token there too: a UCAN grants no read.
+        let resp = advertisement()
+            .oneshot(signed_advert(Some(&invocation)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a push delegation must not open the advertisement of a private repo"
+        );
+        //    Gate 2, taken on its own, is satisfied by the same delegation: the two
+        //    gates are independent, which is exactly why both must be arranged.
+        let resp = receive_pack()
+            .oneshot(signed_push(Some(&invocation)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the push gate must clear on the delegation alone and reach git"
+        );
+
+        // 2. The owner makes the agent a reader of the whole repository — what
+        //    `gl visibility set / --repo <repo> --readers <agent>` does.
+        state
+            .db
+            .set_visibility_rule(
+                &repo.id,
+                "/",
+                crate::db::VisibilityMode::B,
+                &[agent.did().to_string()],
+                &owner_did,
+            )
+            .await
+            .expect("reader rule");
+        let resp = advertisement()
+            .oneshot(signed_advert(Some(&invocation)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a reader clears the advertisement gate and reaches git"
+        );
+        let resp = receive_pack()
+            .oneshot(signed_push(Some(&invocation)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "with both gates arranged the push reaches git"
+        );
+
+        // 3. Reader rule, no delegation: reading is not pushing.
+        let resp = advertisement().oneshot(signed_advert(None)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the reader rule alone still opens the advertisement"
+        );
+        let resp = receive_pack().oneshot(signed_push(None)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a reader with no delegation must still be refused on the push"
+        );
+    }
+
+    /// A valid delegation clears the owner gate but is still refused on a branch
+    /// the owner has explicitly protected.
+    ///
+    /// Two predicates deliberately disagree: the owner gate accepts a delegate, the
+    /// branch-protection loop is owner-only. A protected branch is the owner's
+    /// marker that even routine writes should stop, so a `git/push` delegation must
+    /// not silently override it — otherwise issuing any capability would weaken
+    /// every protection the owner had already set.
+    ///
+    /// The 403 body is the discriminator: it must name the branch, proving the
+    /// request reached branch protection rather than being turned away by the owner
+    /// gate for lacking a delegation.
+    #[sqlx::test]
+    async fn delegated_push_is_still_refused_on_a_protected_branch(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+        use gitlawb_core::ucan::{caps, Capability, Ucan};
+        use std::sync::Arc;
+
+        const ZERO: &str = "0000000000000000000000000000000000000000";
+        let new_sha = "1111111111111111111111111111111111111111";
+
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+
+        let mut state = test_state(pool).await;
+        let mut cfg = (*state.config).clone();
+        cfg.enforce_owner_push = true;
+        state.config = Arc::new(cfg);
+
+        let rec = seed_repo(&owner_did, "protrepo");
+        state.db.create_repo(&rec).await.expect("seed repo");
+        state
+            .db
+            .protect_branch(&rec.id, "main", &owner_did)
+            .await
+            .expect("protect main");
+
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+        let delegation = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{owner_did}/protrepo"),
+                caps::GIT_PUSH,
+            )],
+            Some(hour),
+        )
+        .expect("issue delegation");
+        let invocation = Ucan::delegate(
+            &agent,
+            state.node_did.clone(),
+            delegation.payload.att.clone(),
+            Some(hour),
+            &delegation,
+        )
+        .expect("wrap")
+        .encode()
+        .expect("encode");
+
+        let router = Router::new()
+            .route(
+                "/{owner}/{repo}/git-receive-pack",
+                axum::routing::post(crate::api::repos::git_receive_pack),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::auth::require_ucan_chain,
+            ))
+            .layer(axum::middleware::from_fn(crate::auth::require_signature))
+            .with_state(state.clone());
+
+        let path = format!("/{short}/protrepo.git/git-receive-pack");
+        let line = format!("{ZERO} {new_sha} refs/heads/main");
+        let body = format!("{:04x}{}0000", line.len() + 4, line).into_bytes();
+
+        let signed = sign_request(&agent, "POST", &path, &body);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(&path)
+            .header("content-type", "application/x-git-receive-pack-request")
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .header("x-ucan", invocation)
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a delegation must not override branch protection"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("protected"),
+            "the refusal must come from branch protection, not the owner gate; got {text}"
+        );
+    }
 
     /// A1 Phase-2 contract: the `git-upload-pack` POST (the actual fetch, after
     /// the advertisement) is itself read-visibility gated. An ANONYMOUS upload-pack

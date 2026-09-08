@@ -283,7 +283,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "ucan_show",
-            "description": "Show the saved bootstrap UCAN token for this agent.",
+            "description": "Show the saved bootstrap UCAN for this agent: issuer, audience, capabilities, expiry, and signature validity. The token itself is not returned.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -560,7 +560,7 @@ fn tool_definitions() -> Value {
         // ── UCAN delegation tools ───────────────────────────────────────────
         {
             "name": "ucan_delegate",
-            "description": "Delegate capabilities to another agent by issuing a signed UCAN token. Requires agent identity.",
+            "description": "Delegate capabilities to another agent by issuing a signed UCAN token. Requires agent identity. The recipient stores it with `gl ucan import <token>` or the `ucan_import` tool so their `git push` can present it.",
             "inputSchema": {
                 "type": "object",
                 "required": ["to", "resource", "action"],
@@ -568,18 +568,29 @@ fn tool_definitions() -> Value {
                     "to": { "type": "string", "description": "Audience DID — who receives this capability (e.g. did:key:z6Mk...)" },
                     "resource": { "type": "string", "description": "Resource URI (e.g. gitlawb://repos/owner/repo)" },
                     "action": { "type": "string", "description": "Action to grant (e.g. git/push, pr/open, repo/admin)" },
-                    "expiry_hours": { "type": "integer", "description": "Expiry in hours (optional, default: no expiry)" }
+                    "expiry_hours": { "type": "integer", "minimum": 1, "description": "Expiry in hours (default: 720, the same as `gl ucan delegate`). Every link of a push chain must expire, so there is no unbounded option." }
                 }
             }
         },
         {
             "name": "ucan_verify",
-            "description": "Verify a UCAN token's signature and expiry. Returns structured verification result.",
+            "description": "Verify a UCAN token: signature, expiry, and the proof chain back to its root issuer. `valid` is true only when all three hold.",
             "inputSchema": {
                 "type": "object",
                 "required": ["token"],
                 "properties": {
                     "token": { "type": "string", "description": "UCAN token (JSON string)" }
+                }
+            }
+        },
+        {
+            "name": "ucan_import",
+            "description": "Store a delegation received from a repository owner where `git push` (git-remote-gitlawb) will present it. Same checks as `gl ucan import`: addressed to this identity, owner-rooted, every link bounded and naming one repository. Requires agent identity.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["token"],
+                "properties": {
+                    "token": { "type": "string", "description": "UCAN token JSON, as returned by ucan_delegate" }
                 }
             }
         },
@@ -759,15 +770,45 @@ async fn call_tool(
         ]))?),
 
         "ucan_show" => {
-            let ucan_path = dirs::home_dir()
-                .context("no home dir")?
-                .join(".gitlawb/ucan.json");
-            if ucan_path.exists() {
-                let content = std::fs::read_to_string(ucan_path)?;
-                Ok(content)
-            } else {
-                Ok("No UCAN saved. Run `gl register` or use the agent_register tool.".to_string())
+            // The directory the server was started with, like every sibling tool.
+            // Reading the default here while the rest honour `--dir` splits one MCP
+            // session across two identity directories.
+            let ucan_path = crate::identity::gitlawb_dir(dir.map(std::path::Path::to_path_buf))?
+                .join("ucan.json");
+            if !ucan_path.exists() {
+                return Ok(
+                    "No UCAN saved. Run `gl register` or use the agent_register tool.".to_string(),
+                );
             }
+            let content = std::fs::read_to_string(&ucan_path)?;
+            // Decoded fields, matching what `gl ucan show` reports — the two are the
+            // same question asked through different surfaces and should not answer
+            // it in different shapes.
+            //
+            // Returning the file verbatim also handed the caller the bootstrap token
+            // itself. That is the credential the agent presents, and an MCP response
+            // travels further than a terminal: into a model's context, transcripts,
+            // and logs. The fields below are what a caller actually needs to know
+            // whether it is registered and until when.
+            let ucan = crate::ucan_cmd::decode_saved_ucan(&content).with_context(|| {
+                format!("could not read the saved UCAN at {}", ucan_path.display())
+            })?;
+            Ok(serde_json::to_string_pretty(&json!({
+                "issuer": ucan.payload.iss.to_string(),
+                "audience": ucan.payload.aud.to_string(),
+                "version": ucan.payload.ucan,
+                "capabilities": ucan.payload.att.iter()
+                    .map(|c| json!({ "with": c.with, "can": c.can }))
+                    .collect::<Vec<_>>(),
+                "expires": ucan.payload.exp.map(|e| {
+                    chrono::DateTime::from_timestamp(e, 0)
+                        .map(|d| d.to_rfc3339())
+                        .unwrap_or_else(|| e.to_string())
+                }),
+                "expired": ucan.is_expired(),
+                "signature_valid": ucan.verify_signature().is_ok(),
+                "path": ucan_path.display().to_string(),
+            }))?)
         }
 
         "did_resolve" => {
@@ -1125,14 +1166,35 @@ async fn call_tool(
             let resource = args["resource"].as_str().context("missing 'resource'")?;
             let action = args["action"].as_str().context("missing 'action'")?;
 
+            // The same refusal `gl ucan delegate` applies. A push-class wildcard cannot
+            // be honoured anywhere downstream — import refuses it, the helper refuses
+            // it, the node refuses it — so issuing one only manufactures a token that
+            // fails later with less context than this.
+            if gitlawb_core::ucan::push::is_push_wildcard(resource, action) {
+                anyhow::bail!(
+                    "a wildcard resource cannot carry a push capability: a delegation is \n                     scoped to the repositories it names when issued, and `*` cannot say \n                     which those were. Use resource gitlawb://repos/<owner>/<repo>."
+                );
+            }
+
             let audience: gitlawb_core::did::Did = to_str
                 .parse()
                 .map_err(|e: gitlawb_core::Error| anyhow::anyhow!("{e}"))?;
 
-            let exp = args
-                .get("expiry_hours")
-                .and_then(|v| v.as_i64())
-                .map(|h| chrono::Utc::now() + chrono::Duration::hours(h));
+            // The CLI defaults to `DEFAULT_DELEGATION_EXPIRY_HOURS` and has no way
+            // to issue an unbounded token. An omitted field here used to mean "no
+            // expiry", which for a push capability is dead on arrival: import
+            // refuses it and so does the node (`chain_lifetime_is_bounded`). Same
+            // default, same rule.
+            let hours = match args.get("expiry_hours") {
+                None | Some(Value::Null) => crate::ucan_cmd::DEFAULT_DELEGATION_EXPIRY_HOURS as i64,
+                Some(v) => v
+                    .as_i64()
+                    .context("invalid expiry_hours: expected an integer")?,
+            };
+            if hours < 1 {
+                anyhow::bail!("expiry_hours must be at least 1: a token that has already expired grants nothing");
+            }
+            let exp = Some(chrono::Utc::now() + chrono::Duration::hours(hours));
 
             let ucan = gitlawb_core::ucan::Ucan::issue(
                 &kp,
@@ -1155,23 +1217,26 @@ async fn call_tool(
             let token = args["token"].as_str().context("missing 'token'")?;
             let ucan =
                 gitlawb_core::ucan::Ucan::decode(token).context("failed to parse UCAN token")?;
-            let sig_valid = ucan.verify_signature().is_ok();
-            let expired = ucan.is_expired();
-            let caps: Vec<Value> = ucan
-                .payload
-                .att
-                .iter()
-                .map(|c| json!({ "with": c.with, "can": c.can }))
-                .collect();
+            // The same report `gl ucan verify` prints, so the two cannot disagree
+            // about what "valid" means. In particular the proof chain is walked:
+            // a leaf with a good signature on a broken chain used to report valid
+            // here and then fail at import and at the node.
+            let report = crate::ucan_cmd::VerifyReport::of(&ucan);
+            Ok(serde_json::to_string_pretty(&report.to_json())?)
+        }
 
+        "ucan_import" => {
+            let token = args["token"].as_str().context("missing 'token'")?;
+            // `gl ucan import` with a JSON answer: one set of checks, one store, so
+            // an MCP-only agent can complete the delegated-push workflow without
+            // a shell and without a second copy of the rules.
+            let imported = crate::ucan_cmd::import_delegation(token, dir).await?;
             Ok(serde_json::to_string_pretty(&json!({
-                "valid": sig_valid && !expired,
-                "signature_valid": sig_valid,
-                "expired": expired,
-                "issuer": ucan.payload.iss.to_string(),
-                "audience": ucan.payload.aud.to_string(),
-                "capabilities": caps,
-                "expires": ucan.payload.exp,
+                "owner": imported.owner,
+                "repo": imported.repo,
+                "root_issuer": imported.root,
+                "expires": imported.expires,
+                "path": imported.path.display().to_string(),
             }))?)
         }
 
@@ -1564,6 +1629,7 @@ mod tests {
             .collect();
         assert!(names.contains(&"ucan_delegate"));
         assert!(names.contains(&"ucan_verify"));
+        assert!(names.contains(&"ucan_import"));
     }
 
     #[test]
@@ -1730,6 +1796,38 @@ mod tests {
         assert_eq!(parsed["capability"]["can"], "git/push");
     }
 
+    /// The same refusal the CLI applies. `test_ucan_delegate_via_mcp` uses a named
+    /// resource, so it could never catch the MCP arm issuing a wildcard the CLI
+    /// refuses.
+    #[tokio::test]
+    async fn test_ucan_delegate_via_mcp_refuses_a_push_class_wildcard() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+        let audience = gitlawb_core::identity::Keypair::generate();
+
+        for action in ["git/push", "*", "repo/admin"] {
+            let err = call_tool(
+                "ucan_delegate",
+                json!({
+                    "to": audience.did().to_string(),
+                    "resource": "*",
+                    "action": action,
+                    "expiry_hours": 24,
+                }),
+                "http://localhost",
+                Some(dir.path()),
+            )
+            .await
+            .expect_err("MCP must refuse a push-class wildcard like the CLI does");
+            assert!(err.to_string().contains("wildcard"), "{action}: {err}");
+        }
+    }
+
     #[tokio::test]
     async fn test_ucan_verify_via_mcp() {
         let kp = gitlawb_core::identity::Keypair::generate();
@@ -1758,6 +1856,204 @@ mod tests {
         assert_eq!(parsed["valid"], true);
         assert_eq!(parsed["signature_valid"], true);
         assert_eq!(parsed["expired"], false);
+        assert_eq!(parsed["chain_valid"], true);
+        assert_eq!(parsed["root_issuer"], kp.did().to_string());
+    }
+
+    /// The round-ten P2: `ucan_verify` answered from the leaf alone. A leaf with a
+    /// good signature sitting on a proof that never named its issuer reported
+    /// `valid: true` here, and was then refused by import and by the node.
+    #[tokio::test]
+    async fn test_ucan_verify_via_mcp_walks_the_proof_chain() {
+        let alice = gitlawb_core::identity::Keypair::generate();
+        let bob = gitlawb_core::identity::Keypair::generate();
+        let eve = gitlawb_core::identity::Keypair::generate();
+        let node = gitlawb_core::identity::Keypair::generate();
+        let cap = || {
+            vec![gitlawb_core::ucan::Capability::new(
+                "gitlawb://repos/alice/r",
+                "git/push",
+            )]
+        };
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        // Alice grants Bob; Eve presents Alice's grant as if it were hers. Eve's
+        // own signature is fine — the break is in the chain.
+        let root = gitlawb_core::ucan::Ucan::issue(&alice, bob.did(), cap(), Some(hour)).unwrap();
+        let forged =
+            gitlawb_core::ucan::Ucan::delegate(&eve, node.did(), cap(), Some(hour), &root).unwrap();
+        assert!(
+            forged.verify_signature().is_ok(),
+            "fixture: the leaf signature is valid"
+        );
+
+        let result = call_tool(
+            "ucan_verify",
+            json!({"token": forged.encode().unwrap()}),
+            "http://localhost",
+            None,
+        )
+        .await
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["signature_valid"], true);
+        assert_eq!(parsed["expired"], false);
+        assert_eq!(parsed["chain_valid"], false);
+        assert_eq!(
+            parsed["valid"], false,
+            "a broken proof chain must not report valid: {parsed}"
+        );
+        assert!(
+            parsed["chain_error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("proof chain broken"),
+            "the reason must be reported: {parsed}"
+        );
+        assert!(parsed["root_issuer"].is_null());
+    }
+
+    /// The workflow an MCP-only agent could not finish: it could be issued a
+    /// delegation and verify it, but not store it where `git-remote-gitlawb`
+    /// looks. `ucan_import` is `gl ucan import` behind a tool — same checks, same
+    /// file — so a token the CLI would store lands in the same place, and one the
+    /// CLI would refuse is refused with the same reason.
+    #[tokio::test]
+    async fn test_ucan_import_via_mcp_stores_where_the_helper_looks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let me = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            me.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+        let owner = gitlawb_core::identity::Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+        let token = gitlawb_core::ucan::Ucan::issue(
+            &owner,
+            me.did(),
+            vec![gitlawb_core::ucan::Capability::new(
+                format!("gitlawb://repos/{owner_did}/ci-repo"),
+                "git/push",
+            )],
+            Some(hour),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+
+        let result = call_tool(
+            "ucan_import",
+            json!({"token": token}),
+            "http://localhost",
+            Some(dir.path()),
+        )
+        .await
+        .expect("a delegation addressed to this identity must import");
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["owner"], owner_did);
+        assert_eq!(parsed["repo"], "ci-repo");
+        assert_eq!(parsed["root_issuer"], owner_did);
+        assert_eq!(parsed["expires"], hour.timestamp());
+
+        let stored = crate::ucan_cmd::delegation_path(dir.path(), &owner_did, "ci-repo");
+        assert_eq!(parsed["path"], stored.display().to_string());
+        assert_eq!(
+            std::fs::read_to_string(&stored).unwrap(),
+            token,
+            "the token must be stored byte-for-byte where the helper reads it"
+        );
+
+        // Same refusals as the CLI: a token addressed to someone else is unusable
+        // here however well-formed it is.
+        let stranger = gitlawb_core::identity::Keypair::generate();
+        let misaddressed = gitlawb_core::ucan::Ucan::issue(
+            &owner,
+            stranger.did(),
+            vec![gitlawb_core::ucan::Capability::new(
+                format!("gitlawb://repos/{owner_did}/ci-repo"),
+                "git/push",
+            )],
+            Some(hour),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        let err = call_tool(
+            "ucan_import",
+            json!({"token": misaddressed}),
+            "http://localhost",
+            Some(dir.path()),
+        )
+        .await
+        .expect_err("a token addressed to another identity must be refused");
+        assert!(err.to_string().contains("addressed to"), "{err}");
+    }
+
+    /// The round-ten P2: an omitted `expiry_hours` issued an unbounded token, which
+    /// import and the node both refuse for push. The default is now the CLI's.
+    #[tokio::test]
+    async fn test_ucan_delegate_via_mcp_defaults_to_the_cli_expiry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+        let audience = gitlawb_core::identity::Keypair::generate();
+
+        let before = chrono::Utc::now();
+        let result = call_tool(
+            "ucan_delegate",
+            json!({
+                "to": audience.did().to_string(),
+                "resource": "gitlawb://repos/test/repo",
+                "action": "git/push",
+            }),
+            "http://localhost",
+            Some(dir.path()),
+        )
+        .await
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+
+        let expires = parsed["expires"]
+            .as_i64()
+            .expect("an omitted expiry_hours must still produce an expiring token");
+        let expected = (before
+            + chrono::Duration::hours(crate::ucan_cmd::DEFAULT_DELEGATION_EXPIRY_HOURS as i64))
+        .timestamp();
+        assert!(
+            (expires - expected).abs() <= 60,
+            "expiry must default to the CLI's {} hours, got {expires} vs {expected}",
+            crate::ucan_cmd::DEFAULT_DELEGATION_EXPIRY_HOURS
+        );
+        let token = gitlawb_core::ucan::Ucan::decode(parsed["token"].as_str().unwrap()).unwrap();
+        assert!(
+            token.chain_lifetime_is_bounded(),
+            "the token must satisfy the rule import and the node apply"
+        );
+
+        // A token that has already expired grants nothing, so the request is a
+        // mistake to report, not a token to mint.
+        for bad in [json!(0), json!(-5)] {
+            let err = call_tool(
+                "ucan_delegate",
+                json!({
+                    "to": audience.did().to_string(),
+                    "resource": "gitlawb://repos/test/repo",
+                    "action": "git/push",
+                    "expiry_hours": bad,
+                }),
+                "http://localhost",
+                Some(dir.path()),
+            )
+            .await
+            .expect_err("a non-positive expiry must be refused");
+            assert!(err.to_string().contains("expiry_hours"), "{bad}: {err}");
+        }
     }
 
     #[tokio::test]
@@ -2027,9 +2323,95 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_count_is_42() {
+    fn test_tool_count_matches_the_shipped_list() {
         let tools = tool_definitions();
         let count = tools.as_array().unwrap().len();
-        assert_eq!(count, 40, "expected 40 tools, got {count}");
+        // 41 with `ucan_import`. Bump this when a tool is added or removed; the
+        // point is that no tool is added without someone noticing.
+        assert_eq!(count, 41, "expected 41 tools, got {count}");
+    }
+}
+
+#[cfg(test)]
+mod ucan_show_tests {
+    use super::*;
+
+    /// The MCP tool and `gl ucan show` answer the same question and must answer it
+    /// in the same shape — decoded fields, not the file. Returning the file verbatim
+    /// also handed back the bootstrap token, which an MCP response carries much
+    /// further than a terminal does.
+    #[tokio::test]
+    async fn ucan_show_returns_decoded_fields_and_withholds_the_token() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let issuer = gitlawb_core::identity::Keypair::generate();
+        let audience = gitlawb_core::identity::Keypair::generate();
+        let token = gitlawb_core::ucan::Ucan::issue(
+            &issuer,
+            audience.did(),
+            vec![gitlawb_core::ucan::Capability::new(
+                "gitlawb://repos/z6MkAbc/myrepo",
+                gitlawb_core::ucan::caps::GIT_PUSH,
+            )],
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+
+        // The envelope shape every writer produces.
+        std::fs::write(
+            dir.path().join("ucan.json"),
+            serde_json::to_string_pretty(&json!({
+                "ucan": token,
+                "node": "https://node.gitlawb.com",
+                "did": issuer.did().to_string(),
+                "saved_at": "2026-08-18T00:00:00Z",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let out = call_tool("ucan_show", json!({}), "http://localhost", Some(dir.path()))
+            .await
+            .expect("ucan_show must read the envelope every writer produces");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("must be JSON");
+
+        assert_eq!(v["issuer"], issuer.did().to_string());
+        assert_eq!(v["audience"], audience.did().to_string());
+        assert_eq!(v["capabilities"][0]["can"], "git/push");
+        assert_eq!(v["expired"], false);
+        assert_eq!(v["signature_valid"], true);
+
+        // NOT `!out.contains(&token)`: the token is itself JSON, so embedding it in
+        // a pretty-printed response escapes every quote and that assertion passes
+        // whether or not the token leaked. The signature is a bare base64 string that
+        // survives escaping unchanged, so it is the substring that actually proves
+        // absence.
+        let sig = serde_json::from_str::<serde_json::Value>(&token).unwrap()["s"]
+            .as_str()
+            .expect("a UCAN carries its signature in `s`")
+            .to_string();
+        assert!(!sig.is_empty());
+        assert!(
+            !out.contains(&sig),
+            "the bootstrap token must not be returned to an MCP caller"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&out)
+                .unwrap()
+                .get("ucan")
+                .is_none(),
+            "no field may carry the token itself"
+        );
+    }
+
+    /// An unregistered agent gets a usable message, not a decode error.
+    #[tokio::test]
+    async fn ucan_show_reports_no_saved_ucan() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let out = call_tool("ucan_show", json!({}), "http://localhost", Some(dir.path()))
+            .await
+            .unwrap();
+        assert!(out.contains("No UCAN saved"), "got: {out}");
     }
 }

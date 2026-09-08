@@ -24,7 +24,7 @@ pub struct DoctorArgs {
     #[arg(long, default_value = PUBLIC_NODE, env = "GITLAWB_NODE")]
     pub node: String,
 
-    /// Identity directory (default: ~/.gitlawb)
+    /// Identity directory (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
     #[arg(long)]
     pub dir: Option<PathBuf>,
 }
@@ -73,17 +73,18 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
     println!("gl doctor — checking your gitlawb setup");
     println!();
 
-    let dir = args.dir.unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".gitlawb")
-    });
+    // The same resolver every other command uses. `doctor` reporting on
+    // `~/.gitlawb` while `gl register` writes to the parent of `GITLAWB_KEY` would
+    // make the one command whose job is to explain a broken setup the one that
+    // misreports it.
+    let args_dir = args.dir.clone();
+    let dir = crate::identity::gitlawb_dir(args.dir)?;
 
     let mut checks = Vec::new();
     let mut all_ok = true;
 
     // ── 1. Identity ───────────────────────────────────────────────────────
-    let pem_path = dir.join("identity.pem");
+    let pem_path = crate::identity::key_path_for(args_dir.as_deref())?;
     if pem_path.exists() {
         match std::fs::read_to_string(&pem_path)
             .ok()

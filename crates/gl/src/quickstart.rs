@@ -23,7 +23,7 @@ pub struct QuickstartArgs {
     #[arg(long, default_value = PUBLIC_NODE, env = "GITLAWB_NODE")]
     pub node: String,
 
-    /// Identity directory (default: ~/.gitlawb)
+    /// Identity directory (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
     #[arg(long)]
     pub dir: Option<PathBuf>,
 
@@ -39,19 +39,26 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
     println!("and create your first repository.");
     println!();
 
-    let dir = args.dir.clone().unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".gitlawb")
-    });
+    // The wizard generates the identity AND stores the bootstrap UCAN, so it has to
+    // land where every later command reads from — the parent of `GITLAWB_KEY`, not
+    // an unconditional `~/.gitlawb`.
+    let dir = crate::identity::gitlawb_dir(args.dir.clone())?;
 
     // ── Step 1: Identity ──────────────────────────────────────────────────
     println!("── Step 1: Identity ─────────────────────────────────────────────────");
     println!();
 
-    let pem_path = dir.join("identity.pem");
+    let pem_path = crate::identity::key_path_for(args.dir.as_deref())?;
     let keypair = if pem_path.exists() {
-        match load_keypair_from_dir(Some(&dir)) {
+        // `args.dir.as_deref()`, not `Some(&dir)`. Passing the DIRECTORY made the
+        // loader re-derive the basename as `identity.pem`, so with
+        // `GITLAWB_KEY=/data/keys/ci-agent.pem` the check above found `ci-agent.pem`
+        // while the load looked for a sibling that need not exist — and the Err arm
+        // below then regenerated ONTO `ci-agent.pem`, destroying a working key and
+        // changing the DID that repository ownership, registrations, and delegations
+        // are all tied to. Regeneration must follow a failure to read the file that
+        // was actually selected, never the absence of a conventional sibling.
+        match load_keypair_from_dir(args.dir.as_deref()) {
             Ok(kp) => {
                 let did = kp.did();
                 println!("  ✓  Identity already exists");
@@ -59,14 +66,15 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
                 println!();
                 kp
             }
-            Err(_) => {
-                println!("  Identity file exists but is unreadable. Regenerating...");
-                generate_identity(&dir)?
+            Err(e) => {
+                println!("  Identity at {} is unreadable: {e}", pem_path.display());
+                println!("  Regenerating — the previous key cannot be recovered.");
+                generate_identity(&dir, &pem_path)?
             }
         }
     } else {
         println!("  No identity found. Generating a new Ed25519 keypair...");
-        generate_identity(&dir)?
+        generate_identity(&dir, &pem_path)?
     };
 
     let did = keypair.did().to_string();
@@ -99,7 +107,14 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
             Ok(resp) if resp.status().is_success() => {
                 let payload: Value = resp.json().await.unwrap_or_default();
                 let ucan = payload["ucan"].as_str().unwrap_or("");
-                if !ucan.is_empty() {
+                // The messaging below derives from what was actually persisted, not
+                // from the 2xx: a success response carrying no `ucan` skips the write,
+                // and saying "UCAN saved" anyway sends the operator looking for a file
+                // that was never created — then resurfaces later as a push rejection
+                // with nothing pointing back here.
+                let saved = if ucan.is_empty() {
+                    false
+                } else {
                     std::fs::create_dir_all(&dir)?;
                     let record = json!({
                         "ucan": ucan,
@@ -108,11 +123,20 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
                         "saved_at": chrono::Utc::now().to_rfc3339(),
                     });
                     std::fs::write(&ucan_path, serde_json::to_string_pretty(&record)?)?;
-                }
+                    true
+                };
                 let trust = payload["trust_score"].as_f64().unwrap_or(0.0);
                 println!("  ✓  Registered successfully");
                 println!("     Trust score: {trust:.2}");
-                println!("     UCAN saved to {}", ucan_path.display());
+                if saved {
+                    println!("     UCAN saved to {}", ucan_path.display());
+                } else {
+                    println!("     The node returned no bootstrap UCAN, so registration-gated");
+                    println!(
+                        "     workflows are unavailable. Retry with: gl register --node {}",
+                        args.node
+                    );
+                }
                 println!();
             }
             Ok(resp) => {
@@ -226,22 +250,24 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-fn generate_identity(dir: &PathBuf) -> Result<gitlawb_core::identity::Keypair> {
+fn generate_identity(
+    dir: &PathBuf,
+    path: &std::path::Path,
+) -> Result<gitlawb_core::identity::Keypair> {
     std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
 
     let keypair = gitlawb_core::identity::Keypair::generate();
     let pem = keypair.to_pem()?;
-    let path = dir.join("identity.pem");
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::write(&path, pem.as_bytes())?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::write(path, pem.as_bytes())?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(&path, pem.as_bytes())?;
+        std::fs::write(path, pem.as_bytes())?;
     }
 
     let did = keypair.did();

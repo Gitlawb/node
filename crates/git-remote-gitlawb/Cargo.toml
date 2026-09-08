@@ -14,8 +14,17 @@ path = "src/main.rs"
 gitlawb-core = { path = "../gitlawb-core", features = ["redirect"] }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
+# Reading the node's DID from `GET /` so a delegated push can address its
+# invocation to the right executor.
+serde_json = { workspace = true }
+# The invocation carries the delegation's expiry, so an unbounded write capability
+# is never minted; converting the stored i64 timestamp needs chrono.
+chrono = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Home-directory lookup for the shared GITLAWB_KEY resolver in gitlawb-core,
+# which takes `home` as an argument so core's dependency allowlist stays lean.
+dirs = "5"
 
 [dev-dependencies]
 mockito = "1"
