@@ -1629,6 +1629,7 @@ mod tests {
             .collect();
         assert!(names.contains(&"ucan_delegate"));
         assert!(names.contains(&"ucan_verify"));
+        assert!(names.contains(&"ucan_import"));
     }
 
     #[test]
@@ -2322,10 +2323,12 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_count_is_42() {
+    fn test_tool_count_matches_the_shipped_list() {
         let tools = tool_definitions();
         let count = tools.as_array().unwrap().len();
-        assert_eq!(count, 40, "expected 40 tools, got {count}");
+        // 41 with `ucan_import`. Bump this when a tool is added or removed; the
+        // point is that no tool is added without someone noticing.
+        assert_eq!(count, 41, "expected 41 tools, got {count}");
     }
 }
 
