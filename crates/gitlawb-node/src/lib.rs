@@ -3431,7 +3431,7 @@ fn load_or_create_keypair_with(
                         .permissions()
                         .mode()
                         & 0o777;
-                    if mode & 0o022 != 0 {
+                    if mode & 0o077 != 0 {
                         ensure_key_parent_dir_private(parent)?;
                     }
                 }
@@ -7033,6 +7033,16 @@ mod identity_key_tests {
     // EACCES. Vacuously green before U4 (no sweep exists); load-bearing once
     // the sweep runs, since a sweep that surfaced removal errors would fail
     // this load.
+    //
+    // After the reload mask fix (0o022 -> 0o077), a 0555 parent now has
+    // group/world read bits set, so the reload path tightens it to 0700
+    // before the sweep runs. The sweep then succeeds and the marker is
+    // removed. The test now asserts the tightened behavior: the load
+    // succeeds, the directory is 0700, and the marker is gone. The
+    // best-effort sweep-failure tolerance is still covered by
+    // sweep_durability_gate_leaves_markers_on_sync_failure (sync failure)
+    // and the unremovable case is now unreachable through a read-only
+    // directory because the reload path fixes the permissions first.
     #[test]
     fn sweep_failure_tolerated() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -7044,18 +7054,26 @@ mod identity_key_tests {
 
         let result = load_or_create_keypair(&key_config(&key_path));
 
+        let parent_mode = std::fs::metadata(dir.path())
+            .expect("parent exists")
+            .permissions()
+            .mode()
+            & 0o777;
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
             .expect("restore key dir");
-        let kp = result.expect("unremovable markers must not fail the load");
+        let kp = result.expect("a read-only key dir must not fail the load");
         assert_eq!(
             format!("{}", kp.did()),
             format!("{}", existing.did()),
-            "the identity must load despite the failed sweep removals"
+            "the identity must load despite the read-only key dir"
         );
         assert_eq!(
-            names_containing(dir.path(), ".publishing."),
-            vec![".identity.pem.publishing.99999.0".to_string()],
-            "the unremovable marker survives, harmlessly"
+            parent_mode, 0o700,
+            "the reload path must tighten a 0555 parent to 0700 before the sweep, got {parent_mode:o}"
+        );
+        assert!(
+            names_containing(dir.path(), ".publishing.").is_empty(),
+            "the marker is removed once the directory is tightened to 0700"
         );
     }
 
@@ -8358,6 +8376,55 @@ mod identity_key_tests {
         assert!(
             names_containing(dir.path(), ".publishing.").is_empty(),
             "no publish markers may remain"
+        );
+    }
+
+    /// A parent directory at 0755 (group/world READ but no write) must be
+    /// tightened to 0700 on reload, matching publish-time policy. Before the
+    /// fix the reload fast-path checked only write bits (0o022), so a 0755
+    /// parent survived reload but was tightened on publish, leaving the
+    /// on-disk policy inconsistent across restarts. RED with the old mask:
+    /// the parent stays 0755 after load.
+    #[test]
+    fn reload_tightens_0755_parent_dir_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let parent = root.path().join("keys");
+        std::fs::create_dir_all(&parent).expect("keys dir");
+        let key_path = parent.join("identity.pem");
+        let kp = Keypair::generate();
+        let pem = kp.to_pem().expect("pem");
+        std::fs::write(&key_path, pem.as_bytes()).expect("write key");
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("0600 key");
+        // 0755: group/world can read but not write. The old reload mask
+        // (0o022) missed this; the publish mask (0o077) caught it.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755))
+            .expect("0755 parent");
+
+        let loaded = load_or_create_keypair_with(
+            &key_path,
+            &|| {},
+            &|| {},
+            PublishFaults::NONE,
+            RecoverySeam::NONE,
+        )
+        .expect("load existing key under a 0755 parent must tighten the parent dir");
+
+        let mode = std::fs::metadata(&parent)
+            .expect("parent exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "the identity key parent directory must be owner-only after reload, got {mode:o}"
+        );
+        assert_eq!(
+            format!("{}", loaded.did()),
+            format!("{}", kp.did()),
+            "the identity must be unchanged"
         );
     }
 }

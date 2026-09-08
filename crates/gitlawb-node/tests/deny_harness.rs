@@ -199,6 +199,71 @@ async fn signed_stranger_protected_branch_push_is_forbidden(pool: sqlx::PgPool) 
     node.shutdown().await;
 }
 
+// ── U6(b): INV-1 — a validly signed NON-owner push to an UNprotected branch is
+//    owner-gated (403) by enforce_owner_push, not by branch protection ─────────
+
+/// `enforce_owner_push` (on by default) rejects a signed non-owner before
+/// branch protection runs, on an unprotected branch where the protected-branch
+/// gate does not apply. Without this probe the registry sweep and completeness
+/// scan stay green while the owner-push wiring rots, because git_receive_pack's
+/// registry row only drives the unsigned-401 signature path. Drives the 403 so
+/// the gate cannot regress silently.
+#[sqlx::test]
+async fn signed_stranger_push_to_unprotected_branch_is_forbidden(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    let client = support::bounded_client();
+    let owner = Keypair::generate();
+    let owner_did = owner.did().to_string();
+    let stranger = Keypair::generate();
+
+    // Unprotected repo: no branch protection, so the 403 can only come from
+    // enforce_owner_push, not from the protected-branch gate.
+    let repo_id = node.seed_repo(&owner_did, "pushrepo", true).await;
+
+    let path = format!("/{owner_did}/pushrepo/git-receive-pack");
+    let body = receive_pack_update_body("main");
+
+    // Signed non-owner -> 403 from enforce_owner_push; leaks no repo internals.
+    let resp = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &path,
+        body.clone(),
+        &stranger,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "a signed non-owner push to an unprotected branch must be forbidden (403) by enforce_owner_push"
+    );
+    assert_denied(resp, 403, &[repo_id.as_str()]).await;
+
+    // Owner control: the owner is NOT blocked by enforce_owner_push (it may fail
+    // later on the dummy pack, but must not be the 403 the stranger got).
+    let resp = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &path,
+        body,
+        &owner,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_ne!(
+        resp.status().as_u16(),
+        403,
+        "the owner must not be blocked by their own enforce_owner_push gate (control)"
+    );
+
+    node.shutdown().await;
+}
+
 // ── U5(b): INV-8/INV-2 — anonymous /ipfs/{cid} of a withheld blob is denied ──
 
 /// A public repo with a `/secret/**` withhold rule (readers = one allowed DID).
