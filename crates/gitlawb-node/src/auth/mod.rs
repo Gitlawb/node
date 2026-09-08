@@ -1074,6 +1074,55 @@ mod ucan_push_tests {
         ));
     }
 
+    /// The round-ten P1, pinned where it bites. The middleware verifies the chain
+    /// on the `X-Ucan` header of any signed request before the scope walk runs,
+    /// so a depth bound that lived only in `chain_grants_push_to` protected
+    /// nothing: a hand-built header reached the unbounded recursion first. A
+    /// chain at `MAX_CHAIN_DEPTH` links validates; one link more is refused here,
+    /// with 401 and a message that names depth, before any authorization runs.
+    #[test]
+    fn validate_ucan_chain_stops_at_the_depth_bound() {
+        use gitlawb_core::ucan::MAX_CHAIN_DEPTH;
+
+        let owner = Keypair::generate();
+        let node = Keypair::generate();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+        let resource = format!("gitlawb://repos/{}/myrepo", owner.did());
+        let cap = || vec![Capability::new(&resource, caps::GIT_PUSH)];
+
+        // owner -> k1 -> ... -> signer: MAX_CHAIN_DEPTH - 1 links, all concrete,
+        // all signed, all expiring. Only the length is in question.
+        let mut signer = Keypair::generate();
+        let mut cur = Ucan::issue(&owner, signer.did(), cap(), Some(hour)).unwrap();
+        for _ in 2..MAX_CHAIN_DEPTH {
+            let next = Keypair::generate();
+            cur = Ucan::delegate(&signer, next.did(), cap(), Some(hour), &cur).unwrap();
+            signer = next;
+        }
+
+        // Wrapped into an invocation for the node: exactly MAX_CHAIN_DEPTH links.
+        let at_bound = Ucan::delegate(&signer, node.did(), cap(), Some(hour), &cur).unwrap();
+        let verified = validate_ucan_chain(&at_bound.encode().unwrap(), &node.did(), &signer.did())
+            .expect("a chain at the bound must still validate");
+        assert_eq!(verified.root, owner.did());
+
+        // One more link and it is past the bound.
+        let next = Keypair::generate();
+        let deeper = Ucan::delegate(&signer, next.did(), cap(), Some(hour), &cur).unwrap();
+        let past_bound = Ucan::delegate(&next, node.did(), cap(), Some(hour), &deeper).unwrap();
+        let (status, body) =
+            match validate_ucan_chain(&past_bound.encode().unwrap(), &node.did(), &next.did()) {
+                Ok(_) => panic!("a chain past the bound must be refused, not walked"),
+                Err(refusal) => refusal,
+            };
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let message = body.0["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("deeper than"),
+            "the refusal must name depth as the reason: {message}"
+        );
+    }
+
     #[test]
     fn refuses_a_malformed_resource_uri() {
         let rec = repo(&owner_full(), "myrepo");

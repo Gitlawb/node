@@ -16,6 +16,19 @@ use crate::did::Did;
 use crate::identity::Keypair;
 use crate::{Error, Result};
 
+/// Proof chains deeper than this fail closed, in every walk over `prf`:
+/// [`Ucan::verify_chain`], [`Ucan::chain_lifetime_is_bounded`] and
+/// [`Ucan::chain_grants_push_to`] all stop here. Nothing this codebase mints is
+/// longer than owner → agent → node. The bound exists for the hand-built token:
+/// the node verifies the chain on the `X-Ucan` header of any signed request, and
+/// nothing else says how deep a sender may nest `prf`. In practice not very
+/// deep — a proof is a JSON string inside the next link's JSON, so each level
+/// re-escapes the one beneath it and the encoding roughly doubles per link
+/// (eight links is about 11 KiB, thirteen about 270 KiB) — but a walk should
+/// refuse on its own terms rather than count on the encoding running the sender
+/// out of room first.
+pub const MAX_CHAIN_DEPTH: usize = 8;
+
 /// A UCAN capability: what resource the token grants access to.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Capability {
@@ -156,10 +169,7 @@ pub mod push {
         with == "*" && is_push_action(can)
     }
 
-    /// Proof chains deeper than this fail closed. Nothing this codebase mints is
-    /// longer than owner → agent → node, and the bound is what keeps a hand-built
-    /// token from recursing without limit in a helper that runs mid-push.
-    pub const MAX_CHAIN_DEPTH: usize = 8;
+    pub use super::MAX_CHAIN_DEPTH;
 
     impl Capability {
         /// Push-class, unconstrained, and naming exactly this repository.
@@ -315,14 +325,22 @@ impl Ucan {
     /// non-expiring token is well-formed and may be perfectly appropriate for a
     /// read-only or advisory capability; whether an unbounded grant is acceptable
     /// is the consumer's policy, not the format's.
+    ///
+    /// Fails closed past [`MAX_CHAIN_DEPTH`], like every other walk over `prf`.
     pub fn chain_lifetime_is_bounded(&self) -> bool {
+        self.chain_lifetime_is_bounded_at(0)
+    }
+
+    fn chain_lifetime_is_bounded_at(&self, depth: usize) -> bool {
+        if depth >= MAX_CHAIN_DEPTH {
+            return false;
+        }
         if self.payload.exp.is_none() {
             return false;
         }
-        self.payload
-            .prf
-            .iter()
-            .all(|token| Self::decode(token).is_ok_and(|proof| proof.chain_lifetime_is_bounded()))
+        self.payload.prf.iter().all(|token| {
+            Self::decode(token).is_ok_and(|proof| proof.chain_lifetime_is_bounded_at(depth + 1))
+        })
     }
 
     /// Check if this UCAN's not-before time is in the future (token not yet valid).
@@ -436,7 +454,24 @@ impl Ucan {
     /// token — a repo owner, a configured value, a registry lookup. Discarding
     /// the return value is only correct when the caller is checking that a token
     /// is well-formed and deliberately does not care who issued it.
+    ///
+    /// The walk stops at [`MAX_CHAIN_DEPTH`] and fails closed there. The node
+    /// runs this on the `X-Ucan` header of any signed request before it asks
+    /// what the chain grants, so this is the first place sender-chosen depth is
+    /// felt: each link costs a signature check and a decode of everything
+    /// beneath it. The scope walk was bounded and this one was not, which made
+    /// that bound decorative — a deep chain met the unbounded walk first.
     pub fn verify_chain(&self) -> Result<Did> {
+        self.verify_chain_at(0)
+    }
+
+    fn verify_chain_at(&self, depth: usize) -> Result<Did> {
+        if depth >= MAX_CHAIN_DEPTH {
+            return Err(Error::Ucan(format!(
+                "proof chain deeper than {MAX_CHAIN_DEPTH} links is not accepted"
+            )));
+        }
+
         // First verify our own signature
         self.verify_signature()?;
 
@@ -485,7 +520,7 @@ impl Ucan {
         }
 
         // Recurse; the root of the proof's chain is the root of ours.
-        proof.verify_chain()
+        proof.verify_chain_at(depth + 1)
     }
 }
 
@@ -1258,5 +1293,87 @@ mod push_scope_tests {
             !cur.chain_grants_push_to(&owner_s, "r"),
             "depth bound must fail closed"
         );
+    }
+}
+
+/// Every walk over `prf` stops at the same depth. The round-ten P1: the scope
+/// walk was bounded while `verify_chain` and `chain_lifetime_is_bounded` were
+/// not, and the node runs `verify_chain` on an attacker-supplied `X-Ucan` header
+/// before the bounded walk ever sees it, so the bound protected nothing.
+#[cfg(test)]
+mod chain_depth_tests {
+    use super::{caps, Capability, Ucan, MAX_CHAIN_DEPTH};
+    use crate::identity::Keypair;
+
+    fn hour() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() + chrono::Duration::hours(1)
+    }
+
+    /// A well-formed, fully signed, expiring chain of exactly `links` links, every
+    /// one naming the owner's repository, so the only thing any walk can object
+    /// to is how long it is. Returns the leaf and the owner it roots at.
+    fn concrete_chain(links: usize) -> (Ucan, Keypair) {
+        assert!(links >= 1);
+        let owner = Keypair::generate();
+        let owner_s = owner.did().to_string();
+        let res = format!("gitlawb://repos/{owner_s}/r");
+        let cap = || vec![Capability::new(&res, caps::GIT_PUSH)];
+
+        let mut signer = Keypair::generate();
+        let mut cur = Ucan::issue(&owner, signer.did(), cap(), Some(hour())).unwrap();
+        for _ in 1..links {
+            let next = Keypair::generate();
+            cur = Ucan::delegate(&signer, next.did(), cap(), Some(hour()), &cur).unwrap();
+            signer = next;
+        }
+        (cur, owner)
+    }
+
+    #[test]
+    fn a_chain_at_the_bound_passes_every_walk() {
+        let (leaf, owner) = concrete_chain(MAX_CHAIN_DEPTH);
+        let owner_s = owner.did().to_string();
+        assert_eq!(
+            leaf.verify_chain()
+                .expect("a chain at the bound must verify"),
+            owner.did()
+        );
+        assert!(leaf.chain_lifetime_is_bounded());
+        assert!(leaf.chain_grants_push_to(&owner_s, "r"));
+    }
+
+    #[test]
+    fn one_link_past_the_bound_fails_every_walk_closed() {
+        let (leaf, owner) = concrete_chain(MAX_CHAIN_DEPTH + 1);
+        let owner_s = owner.did().to_string();
+
+        let err = leaf
+            .verify_chain()
+            .expect_err("verify_chain must refuse a chain past the bound");
+        assert!(
+            err.to_string().contains("deeper than"),
+            "the refusal must say depth was the reason, not a fake signature failure: {err}"
+        );
+        assert!(
+            !leaf.chain_lifetime_is_bounded(),
+            "an unwalkable chain cannot be vouched for as bounded"
+        );
+        assert!(!leaf.chain_grants_push_to(&owner_s, "r"));
+    }
+
+    /// A chain well past the bound is refused from the top, before any per-link
+    /// work. Only a few links past it, deliberately: a proof is embedded as a JSON
+    /// string inside the next link's JSON, so every level re-escapes the one
+    /// inside it and the encoding roughly doubles per link — eight links is about
+    /// 10 KiB, sixteen is megabytes, and a chain of "a few hundred levels" cannot
+    /// physically be encoded, let alone sent as a header. The bound is still
+    /// what stops the reachable dozen-odd levels from each costing a decode of
+    /// everything beneath them.
+    #[test]
+    fn a_chain_well_past_the_bound_is_refused_not_walked() {
+        let (leaf, _) = concrete_chain(MAX_CHAIN_DEPTH + 4);
+        let err = leaf.verify_chain().expect_err("must refuse");
+        assert!(err.to_string().contains("deeper than"), "{err}");
+        assert!(!leaf.chain_lifetime_is_bounded());
     }
 }

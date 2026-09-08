@@ -56,7 +56,7 @@ pub enum UcanCmd {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
-    /// Verify a UCAN token (from stdin, file, or argument)
+    /// Verify a UCAN token: signature, expiry, and its proof chain back to the root
     Verify {
         /// UCAN JSON token (or path to file containing it)
         token: String,
@@ -149,16 +149,64 @@ pub async fn run(args: UcanArgs) -> Result<()> {
     }
 }
 
+/// Largest token file `gl ucan import` and `gl ucan verify` will read. A full
+/// eight-link chain encodes to well under 32 KiB even though every nesting level
+/// re-escapes the one inside it, so this only stops a mistaken argument from
+/// slurping something enormous into memory.
+const MAX_TOKEN_FILE_BYTES: u64 = 1 << 20;
+
+/// The token a command was given: the argument itself when it is JSON, otherwise
+/// the contents of the file it names.
+///
+/// A path that exists but cannot be read — a directory, a permission problem, a
+/// file past the size cap — is reported as that. It used to fall through to
+/// "treat the argument as a token", which then failed in `Ucan::decode` with a
+/// message about the path string not being JSON, sending the reader after the
+/// wrong problem.
+fn read_token_argument(arg: &str) -> Result<String> {
+    let trimmed = arg.trim();
+    if trimmed.starts_with('{') {
+        return Ok(trimmed.to_string());
+    }
+    let meta = match std::fs::metadata(arg) {
+        Ok(meta) => meta,
+        // Not a path at all: a token in some form `decode` may or may not accept,
+        // whose error will say so. `InvalidFilename` is what a long JSON string
+        // produces on Windows (and past PATH_MAX elsewhere), `InvalidInput` its
+        // older spelling.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::InvalidFilename
+                    | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            return Ok(trimmed.to_string());
+        }
+        Err(e) => return Err(e).with_context(|| format!("cannot read token file {arg}")),
+    };
+    if !meta.is_file() {
+        anyhow::bail!("{arg} is not a file");
+    }
+    if meta.len() > MAX_TOKEN_FILE_BYTES {
+        anyhow::bail!(
+            "{arg} is {} bytes, larger than any UCAN token (the cap is {MAX_TOKEN_FILE_BYTES})",
+            meta.len()
+        );
+    }
+    let contents =
+        std::fs::read_to_string(arg).with_context(|| format!("cannot read token file {arg}"))?;
+    Ok(contents.trim().to_string())
+}
+
 /// Store a delegation where `git-remote-gitlawb` will look for it on push.
 ///
 /// The token is decoded here rather than at push time so a malformed delegation
 /// fails where the error is actionable, instead of surfacing as an unexplained
 /// 403 in the middle of a `git push`.
 async fn cmd_import(token: String, dir: Option<PathBuf>) -> Result<()> {
-    let raw = match std::fs::read_to_string(&token) {
-        Ok(contents) => contents.trim().to_string(),
-        Err(_) => token.clone(),
-    };
+    let raw = read_token_argument(&token)?;
 
     let ucan = Ucan::decode(&raw).context(
         "not a valid UCAN token — pass the JSON emitted by `gl ucan delegate`, or a path to it",
@@ -482,13 +530,11 @@ fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Resul
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    // Windows `rename` refuses an existing destination, so the live file is removed
-    // first. That window is why this is second-best to the Unix path: it can leave
-    // the delegation absent, but never truncated or half-written, and re-importing
-    // restores it.
-    if path.exists() {
-        let _ = std::fs::remove_file(path);
-    }
+    // `rename` replaces an existing destination here too: std maps it to
+    // `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`. An earlier version removed
+    // the live file first on the belief that Windows refused the overwrite, which
+    // opened a window with no delegation at all — the one outcome the staging
+    // dance exists to prevent. One step, same contract as the Unix path.
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
@@ -600,34 +646,108 @@ async fn cmd_show(dir: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_verify(token: String) -> Result<()> {
-    // Try as file first, then as raw JSON
-    let content = if std::path::Path::new(&token).exists() {
-        std::fs::read_to_string(&token)?
-    } else {
-        token
-    };
+/// What `gl ucan verify` and the MCP `ucan_verify` tool report about a token.
+///
+/// One definition for both surfaces, so they cannot disagree about what "valid"
+/// means. Both used to answer from the leaf alone — signature and expiry — and
+/// called a token valid whose proof chain was broken (a proof signed by the
+/// wrong key, an audience that did not match the issuer, a child claiming more
+/// than its parent granted). Import and the node then refused it, with nothing
+/// on the client side having said why.
+pub struct VerifyReport {
+    /// The leaf's own signature, or why it failed.
+    pub signature: std::result::Result<(), String>,
+    pub expired: bool,
+    /// The root issuer the proof chain walks to, or why the walk failed.
+    /// [`Ucan::verify_chain`] covers signature and expiry of every link, the
+    /// leaf included, so `chain` alone decides validity; the other fields say
+    /// which part of it went wrong.
+    pub chain: std::result::Result<String, String>,
+    pub issuer: String,
+    pub audience: String,
+    pub capabilities: Vec<(String, String)>,
+    pub expires: Option<i64>,
+}
 
+impl VerifyReport {
+    pub fn of(ucan: &Ucan) -> Self {
+        Self {
+            signature: ucan.verify_signature().map_err(|e| e.to_string()),
+            expired: ucan.is_expired(),
+            chain: ucan
+                .verify_chain()
+                .map(|root| root.to_string())
+                .map_err(|e| e.to_string()),
+            issuer: ucan.payload.iss.to_string(),
+            audience: ucan.payload.aud.to_string(),
+            capabilities: ucan
+                .payload
+                .att
+                .iter()
+                .map(|c| (c.with.clone(), c.can.clone()))
+                .collect(),
+            expires: ucan.payload.exp,
+        }
+    }
+
+    /// Signature good, not expired, and the proof chain walks to a root.
+    pub fn is_valid(&self) -> bool {
+        self.signature.is_ok() && !self.expired && self.chain.is_ok()
+    }
+
+    /// The MCP shape. `valid` is [`Self::is_valid`]; the rest is there so a
+    /// caller can see which check failed without re-running them.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "valid": self.is_valid(),
+            "signature_valid": self.signature.is_ok(),
+            "expired": self.expired,
+            "chain_valid": self.chain.is_ok(),
+            "chain_error": self.chain.as_ref().err(),
+            "root_issuer": self.chain.as_ref().ok(),
+            "issuer": self.issuer,
+            "audience": self.audience,
+            "capabilities": self.capabilities
+                .iter()
+                .map(|(with, can)| serde_json::json!({ "with": with, "can": can }))
+                .collect::<Vec<_>>(),
+            "expires": self.expires,
+        })
+    }
+
+    /// The CLI shape, one line per check.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        match &self.signature {
+            Ok(()) => out.push_str("Signature: valid\n"),
+            Err(e) => out.push_str(&format!("Signature: INVALID — {e}\n")),
+        }
+        out.push_str(if self.expired {
+            "Expired:   yes\n"
+        } else {
+            "Expired:   no\n"
+        });
+        match &self.chain {
+            Ok(root) => out.push_str(&format!("Chain:     valid (root {root})\n")),
+            Err(e) => out.push_str(&format!("Chain:     INVALID — {e}\n")),
+        }
+        out.push_str(&format!("Issuer:    {}\n", self.issuer));
+        out.push_str(&format!("Audience:  {}\n", self.audience));
+        for (with, can) in &self.capabilities {
+            out.push_str(&format!("Cap:       {with} → {can}\n"));
+        }
+        out
+    }
+}
+
+async fn cmd_verify(token: String) -> Result<()> {
+    let content = read_token_argument(&token)?;
     let ucan = Ucan::decode(&content).context("failed to parse UCAN token")?;
 
-    match ucan.verify_signature() {
-        Ok(()) => println!("Signature: valid"),
-        Err(e) => println!("Signature: INVALID — {e}"),
-    }
+    let report = VerifyReport::of(&ucan);
+    print!("{}", report.render());
 
-    if ucan.is_expired() {
-        println!("Expired:   yes");
-    } else {
-        println!("Expired:   no");
-    }
-
-    println!("Issuer:    {}", ucan.payload.iss);
-    println!("Audience:  {}", ucan.payload.aud);
-    for cap in &ucan.payload.att {
-        println!("Cap:       {} → {}", cap.with, cap.can);
-    }
-
-    if ucan.verify_signature().is_err() || ucan.is_expired() {
+    if !report.is_valid() {
         std::process::exit(1);
     }
     Ok(())
@@ -780,6 +900,133 @@ mod tests {
         cmd_verify(path.to_string_lossy().to_string())
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod verify_report_tests {
+    use super::*;
+    use gitlawb_core::identity::Keypair;
+
+    fn hour() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() + chrono::Duration::hours(1)
+    }
+
+    /// The round-ten P2: `gl ucan verify` answered from the leaf alone. A leaf with
+    /// a good signature on a proof that never named its issuer was reported valid,
+    /// then refused by import and by the node.
+    #[test]
+    fn a_broken_proof_chain_is_not_valid() {
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let eve = Keypair::generate();
+        let node = Keypair::generate();
+        let cap = || vec![Capability::new("gitlawb://repos/alice/r", caps::GIT_PUSH)];
+
+        let root = Ucan::issue(&alice, bob.did(), cap(), Some(hour())).unwrap();
+        let forged = Ucan::delegate(&eve, node.did(), cap(), Some(hour()), &root).unwrap();
+
+        let report = VerifyReport::of(&forged);
+        assert!(
+            report.signature.is_ok(),
+            "fixture: the leaf signature is valid"
+        );
+        assert!(!report.expired);
+        let chain_err = report
+            .chain
+            .as_ref()
+            .expect_err("the chain must be reported broken");
+        assert!(chain_err.contains("proof chain broken"), "{chain_err}");
+        assert!(!report.is_valid());
+
+        let rendered = report.render();
+        assert!(rendered.contains("Signature: valid"), "{rendered}");
+        assert!(rendered.contains("Chain:     INVALID"), "{rendered}");
+
+        let json = report.to_json();
+        assert_eq!(json["valid"], false);
+        assert_eq!(json["signature_valid"], true);
+        assert_eq!(json["chain_valid"], false);
+        assert!(json["root_issuer"].is_null());
+    }
+
+    #[test]
+    fn a_sound_chain_reports_its_root() {
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let node = Keypair::generate();
+        let cap = || vec![Capability::new("gitlawb://repos/alice/r", caps::GIT_PUSH)];
+
+        let root = Ucan::issue(&alice, bob.did(), cap(), Some(hour())).unwrap();
+        let leaf = Ucan::delegate(&bob, node.did(), cap(), Some(hour()), &root).unwrap();
+
+        let report = VerifyReport::of(&leaf);
+        assert!(report.is_valid());
+        assert_eq!(
+            report.chain.as_deref(),
+            Ok(alice.did().to_string().as_str())
+        );
+        assert!(
+            report
+                .render()
+                .contains(&format!("Chain:     valid (root {})", alice.did())),
+            "{}",
+            report.render()
+        );
+        assert_eq!(report.to_json()["root_issuer"], alice.did().to_string());
+    }
+}
+
+#[cfg(test)]
+mod token_argument_tests {
+    use super::*;
+
+    #[test]
+    fn json_passes_through_without_touching_the_filesystem() {
+        let raw = r#"  {"payload":{}}  "#;
+        assert_eq!(read_token_argument(raw).unwrap(), r#"{"payload":{}}"#);
+    }
+
+    #[test]
+    fn a_file_is_read_and_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token.json");
+        std::fs::write(&path, "  {\"a\":1}\n").unwrap();
+        assert_eq!(
+            read_token_argument(path.to_str().unwrap()).unwrap(),
+            "{\"a\":1}"
+        );
+    }
+
+    /// A path that exists but cannot be read is an error about the file. It used
+    /// to fall through to "treat the argument as a token" and fail in `decode`
+    /// with a message about the path string not being JSON.
+    #[test]
+    fn an_unreadable_path_is_reported_as_the_file_problem_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_token_argument(dir.path().to_str().unwrap())
+            .expect_err("a directory is not a token file");
+        assert!(err.to_string().contains("is not a file"), "{err}");
+    }
+
+    #[test]
+    fn a_file_past_the_cap_is_refused_before_it_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.json");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_TOKEN_FILE_BYTES + 1).unwrap();
+        let err = read_token_argument(path.to_str().unwrap()).expect_err("must refuse");
+        assert!(err.to_string().contains("larger than"), "{err}");
+    }
+
+    /// A missing file is indistinguishable from a raw token that is not JSON, and
+    /// `decode` names both possibilities in its error, so this stays permissive.
+    #[test]
+    fn a_missing_path_falls_through_to_decode() {
+        assert_eq!(
+            read_token_argument("no-such-token.json").unwrap(),
+            "no-such-token.json"
+        );
     }
 }
 
@@ -1225,6 +1472,62 @@ mod refresh_atomicity_tests {
             leftovers.is_empty(),
             "a failed staging write must clean up after itself, found {leftovers:?}"
         );
+    }
+
+    /// The other half of the contract: a successful refresh replaces the stored
+    /// token in one step. On Windows this is `rename` over an existing file, which
+    /// std supports (`MOVEFILE_REPLACE_EXISTING`); the writer used to remove the
+    /// live file first, on the belief that it did not, and that remove was the
+    /// only moment the delegation could be absent.
+    #[tokio::test]
+    async fn a_successful_refresh_replaces_the_stored_delegation_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = seed_identity(dir.path());
+        let owner = gitlawb_core::identity::Keypair::generate();
+        let bare = owner
+            .did()
+            .to_string()
+            .strip_prefix("did:key:")
+            .unwrap()
+            .to_string();
+        let token_for = |hours: i64| {
+            Ucan::issue(
+                &owner,
+                me.did(),
+                vec![Capability::new(
+                    format!("gitlawb://repos/{bare}/myrepo"),
+                    caps::GIT_PUSH,
+                )],
+                Some(chrono::Utc::now() + chrono::Duration::hours(hours)),
+            )
+            .unwrap()
+            .encode()
+            .unwrap()
+        };
+        let first = token_for(1);
+        let second = token_for(2);
+        assert_ne!(first, second);
+
+        cmd_import(first.clone(), Some(dir.path().to_path_buf()))
+            .await
+            .expect("first import");
+        let stored = delegation_path(dir.path(), &bare, "myrepo");
+        assert_eq!(std::fs::read_to_string(&stored).unwrap(), first);
+
+        cmd_import(second.clone(), Some(dir.path().to_path_buf()))
+            .await
+            .expect("a refresh over an existing delegation must succeed");
+        assert_eq!(
+            std::fs::read_to_string(&stored).unwrap(),
+            second,
+            "the refresh must publish the new token over the old one"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("delegations"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "found {leftovers:?}");
     }
 
     /// Two refreshes must not share a staging path: one could rename bytes the other
