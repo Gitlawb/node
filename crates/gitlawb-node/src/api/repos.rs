@@ -3046,6 +3046,25 @@ pub async fn fork_repo(
         ));
     }
 
+    // Same barrier every other repo-creation route goes through. The character
+    // allowlist above is vacuously true on an empty name, and `repo_disk_path`
+    // is a raw join, so without this a `{"name":""}` fork lands a row with an
+    // empty name at `<repos_dir>/<owner_slug>/.git`. Closed #272 fixed this
+    // class on the sync route and never scoped fork.
+    //
+    // It runs with the other admissibility checks, above the proof spend and the
+    // source acquire, because the header comment promises that a fork rejected
+    // for a bad name never burns a valid proof. The two name rules are kept
+    // separate on purpose: neither is a subset of the other, since the allowlist
+    // above rejects a dot (`v1.2.3`) that `validate_repo_name` accepts, and
+    // accepts a non-ASCII alphanumeric that it rejects.
+    let disk_path = crate::git::repo_store::validated_repo_disk_path(
+        &state.config.repos_dir,
+        &forker_did,
+        &fork_name,
+    )
+    .map_err(|e| AppError::BadRequest(e.to_string()))?;
+
     // Check no name conflict under the forker's ownership
     let forker_short = crate::db::normalize_owner_key(&forker_did);
     if state.db.get_repo(forker_short, &fork_name).await?.is_some() {
@@ -3063,8 +3082,6 @@ pub async fn fork_repo(
         .acquire(&source.owner_did, &source.name)
         .await
         .map_err(|e| AppError::Git(e.to_string()))?;
-
-    let disk_path = store::repo_disk_path(&state.config.repos_dir, &forker_did, &fork_name);
 
     // Clone the source repo as a mirror
     let output = std::process::Command::new("git")
