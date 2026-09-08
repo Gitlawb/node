@@ -143,9 +143,11 @@ During the cooldown your node still earns rewards if it keeps heartbeating.
 
 ## Owner-only push
 
-The node requires the authenticated pusher to be the repo owner on **every**
-branch. A push whose authenticated DID is not the repo owner is rejected with
-HTTP 403 before any ref update is applied. The owner is matched in both the full
+On the `git-receive-pack` POST — the push itself — the node requires the
+authenticated pusher to be the repo owner, or to present a UCAN whose proof chain
+roots at the owner and carries `git/push` for this repository (see *Delegating
+push to a CI agent* below). Anyone else is rejected with HTTP 403 before any ref
+update is applied, on **every** branch. The owner is matched in both the full
 `did:key:z6Mk…` form and its bare `z6Mk…` suffix.
 
 This is on by default, and the default is the point. The node authenticates every
@@ -154,6 +156,20 @@ is self-certifying: any party can generate a key, derive its DID and sign.
 Authentication is not authorization, so without this gate every signed caller can
 push to every repository — private ones included — on any branch that is not
 explicitly protected.
+
+A `git push` crosses two independent gates, and this section is about the second:
+
+1. **Read visibility**, on the `info/refs` advertisement that precedes every fetch
+   *and* every push. The node admits the owner, anyone on a public repository, and
+   a caller that a visibility rule names among its readers; everyone else gets a
+   404, since a private repository is not confirmed to exist for a non-reader. A
+   UCAN plays no part here — a delegation grants no read access.
+2. **Push authorization**, on the `git-receive-pack` POST: the owner, or an
+   owner-rooted, bounded, repository-scoped push delegation.
+
+Both must pass. On a public repository the first is open to everyone, so a
+delegation alone is enough; on a private one the delegate must also be a reader —
+see *Private repositories* below.
 
 ### Turning it off
 
@@ -199,6 +215,27 @@ What the node requires, and why:
 | **Every link carries an expiry** | There is no revocation path yet. An unbounded delegation could never be withdrawn once leaked, so the node refuses one outright. `gl ucan delegate` defaults to 30 days. |
 | No `nb` constraints | Constraints are reserved but not yet interpreted, so a capability carrying them authorizes nothing rather than silently granting more than the owner intended. |
 | The token is addressed to the pusher | The node requires the proof's audience to equal the invocation's issuer, and `gl ucan import` refuses a token addressed to another identity rather than storing one that can only fail. |
+
+**Private repositories.** A delegation clears the push gate only. The `info/refs`
+advertisement that `git push` fetches first is read-gated, and a UCAN grants no
+read access, so on a private repository the delegate must also be a reader:
+
+```bash
+# Owner: let the agent read the whole repository
+gl visibility set / --repo <repo> --readers did:key:z6MkAgent…
+```
+
+Without it the agent's push fails at the advertisement with a 404 — the same
+answer a stranger gets, because a private repository is not confirmed to exist
+for a non-reader — even though the delegation itself is valid and would clear the
+push gate. On a public repository this step is unnecessary. The two gates are
+independent in the other direction as well: a reader with no delegation is still
+refused on the push.
+
+**One repository per token.** `gl ucan delegate` issues one capability per token,
+and `gl ucan import` stores one repository per token. A hand-built token that
+names several repositories is refused at import rather than applied to some of
+them; ask the owner for one delegation per repository.
 
 **A delegation does not override branch protection.** A protected branch is your
 explicit marker that even routine writes should stop, so a delegate is still
