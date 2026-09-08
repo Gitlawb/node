@@ -573,7 +573,17 @@ mod tests {
         // `repo_store::for_testing` pins its on-disk root to /tmp, so the config
         // the handler reads at the raw join must name the same root or the two
         // halves of this test look at different directories.
-        let owner = "did:key:zFORKEMPTYNAMEAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        // A per-run owner: the fixture path is a fixed /tmp/<slug>, so a shared
+        // constant lets two concurrent `cargo test` PROCESSES delete each
+        // other's repo mid-test.
+        let owner = format!(
+            "did:key:zFORKEMPTY{}",
+            gitlawb_core::identity::Keypair::generate()
+                .did()
+                .to_string()
+                .replace("did:key:", "")
+        );
+        let owner = owner.as_str();
         let owner_slug = owner.replace([':', '/'], "_");
         let repos_dir = std::path::PathBuf::from("/tmp");
         let owner_dir = repos_dir.join(&owner_slug);
@@ -771,6 +781,56 @@ mod tests {
                 .expect("get_repo")
                 .is_some(),
             "the accepted fork must have a repo row"
+        );
+    }
+
+    /// The name barrier must run BEFORE the proof spend and the source acquire.
+    /// `fork_repo`'s header comment promises that a fork rejected for a bad name
+    /// never burns a valid proof, and the first version of this fix validated
+    /// after both, so an empty name paid a Tigris download and spent the proof
+    /// before its 400.
+    ///
+    /// The seam that pins the order without iCaptcha plumbing: seed a repo ROW
+    /// whose bytes are not on disk. If validation still ran after the acquire,
+    /// the acquire fails first and the caller sees a 500 from git. A 400 proves
+    /// the refusal came first.
+    #[sqlx::test]
+    async fn fork_refuses_a_bad_name_before_acquiring_the_source(pool: PgPool) {
+        let owner = "did:key:zFORKORDERAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let repos_dir = std::path::PathBuf::from("/tmp");
+        let state = test_state_with(pool, |cfg| cfg.repos_dir = repos_dir.clone()).await;
+
+        // Row only. Nothing is written to disk, so `repo_store.acquire` cannot
+        // succeed and any 500 here means validation ran too late.
+        let repo = seed_repo(owner, "absent-source");
+        state.db.create_repo(&repo).await.expect("seed source row");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/fork",
+                axum::routing::post(crate::api::repos::fork_repo),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner}/absent-source/fork");
+        let resp = router
+            .oneshot(signed_request_as(
+                owner,
+                Method::POST,
+                &uri,
+                Body::from(r#"{"name":""}"#),
+            ))
+            .await
+            .unwrap();
+
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a bad fork name must be refused before the source acquire, not after; body={body}"
         );
     }
 
