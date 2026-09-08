@@ -4651,9 +4651,9 @@ impl Db {
         Ok(res.rows_affected() == 1)
     }
 
-    /// Has a *different* request already landed this exact tuple after
-    /// `since_iso`? Used to fail closed when A's intent postdates B's
-    /// proven landing (history survives B's child cleanup).
+    /// Has a *different* request already landed this exact tuple? Used to
+    /// fail closed when A's intent postdates B's proven landing (history
+    /// survives B's child cleanup, unlike competing live rows).
     pub async fn has_landed_tuple_by_other_request(
         &self,
         repo_id: &str,

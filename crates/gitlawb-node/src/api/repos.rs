@@ -1907,6 +1907,37 @@ fn fork_withheld_blocks(
 /// and as the signing path, so they can never drift apart.
 const SYNC_NOTIFY_PATH: &str = "/api/v1/sync/notify";
 
+/// Post-git disposition: one tested gate deciding replication/Tigris,
+/// metrics/inline effects, and HTTP 200 after `git receive-pack` returns.
+///
+/// Policy 2 carve-out (documented in the PR body): `spawn_tail` and
+/// `release_ok` follow in-memory report knowledge (`exit_ok &&
+/// any_ref_ok`) even when the outcome commit failed, because F2
+/// disconnect safety requires the tail before `release`, the tail is
+/// read-only on disk, and announces carry `cert_id: None`. Durable
+/// accounting (`run_effects`: push events, certs, webhooks) instead
+/// waits for the outcome commit, else startup reconcile (Option B
+/// attended-restart contract).
+#[derive(Debug, PartialEq, Eq)]
+struct PostGitDisposition {
+    spawn_tail: bool,
+    release_ok: bool,
+    run_effects: bool,
+}
+
+fn post_git_disposition(
+    exit_ok: bool,
+    any_ref_ok: bool,
+    outcome_commit_ok: bool,
+) -> PostGitDisposition {
+    let landed = exit_ok && any_ref_ok;
+    PostGitDisposition {
+        spawn_tail: landed,
+        release_ok: landed,
+        run_effects: landed && outcome_commit_ok,
+    }
+}
+
 /// Send one signed `/sync/notify` request for a single ref update.
 ///
 /// The receiver is single-ref, so a multi-ref push fans out one request per
@@ -2401,13 +2432,10 @@ pub async fn git_receive_pack(
     // 2. On success, write effects and then DELETE outbox rows so they
     //    don't replay on restart.
     //
-    // The reflog action binds the Git ref transaction to this request
-    // id so startup reconcile has request-specific landing proof
-    // (not just a tuple that a later request could recreate).
-    // Also ensure the marker namespace stays hidden for repos that
     // The reflog action is best-effort binding (receive-pack writes a
     // fixed `push` message and ignores GIT_REFLOG_ACTION); causality
-    // still relies on marker + tuple/timestamp + history guards.
+    // still relies on marker + tuple/timestamp + history guards. Marker
+    // namespace hiding was verified above by `verify_recovery_prereqs`.
     let reflog_action = format!("gitlawb-request:{request_id}");
     let (receive_raw, exit_ok) = match smart_http::receive_pack_raw_with_reflog(
         &state.git_bin,
@@ -2807,9 +2835,20 @@ pub async fn git_receive_pack(
     // never from the raw `ok_set`, so an `unpack_ok: false` report
     // listing `ok: true` bits cannot reach effects or the tail.
     let any_ref_ok = unpack_ok && !ok_names.is_empty();
-    let push_succeeded = exit_ok && any_ref_ok;
+    // Single post-git disposition gate: replication/Tigris, metrics, and
+    // inline effects all derive from one struct so Option B
+    // attended-restart cannot disagree with itself across blocks.
+    // Policy 2 carve-out (see PR body): replication/Tigris runs on
+    // in-memory report knowledge even when the outcome commit failed,
+    // because F2 disconnect safety requires the tail before `release`,
+    // the tail is read-only on disk, and announces carry `cert_id: None`.
+    // Durable accounting instead waits for startup reconcile.
+    //
+    // MUTATION (RED): gating `spawn_tail`/`release_ok` on
+    // `outcome_commit_ok` breaks `post_git_disposition_replication_carve_out`.
+    let disposition = post_git_disposition(exit_ok, any_ref_ok, outcome_commit_ok);
 
-    if push_succeeded {
+    if disposition.spawn_tail {
         // Spawn the replication tail only for refs that landed.
         // Filtering at spawn-time keeps the tail's input accurate
         // even for a mixed push.
@@ -2842,7 +2881,7 @@ pub async fn git_receive_pack(
         .expect("repo write-lock mutex poisoned")
         .take()
         .expect("the write lock is only taken here, and only once");
-    reclaimed.release(push_succeeded).await;
+    reclaimed.release(disposition.release_ok).await;
     // Clean path: clone (a) already dropped inside run_git_service when the receive-pack
     // group was reaped; clone (b) held here spanned the success-only Tigris upload that
     // ran inside release() above. Drop it now so a second same-repo push proceeds the
@@ -2850,13 +2889,13 @@ pub async fn git_receive_pack(
     // the disconnect path this line is never reached: clone (a) rides the reaper (F3).
     drop(lease);
 
-    // If no ref landed, return 200 with the receive-pack body but do
-    // NOT run any durable effects (no push event, no trust score,
-    // no metrics, no webhooks, no certs, no anchor jobs). The
-    // outbox rows have already been flipped to `cancelled` /
-    // `uncertain` for every ref above; the next startup reconcile
-    // will not promote them.
-    if !any_ref_ok {
+    // Unless refs landed AND the outcome was durably committed, return 200
+    // with the receive-pack body and run no durable effects (no push event,
+    // no trust score, no metrics, no webhooks, no certs, no anchor jobs).
+    // Unlanded refs were flipped to `cancelled` / `uncertain` above and
+    // reconcile will not promote them; uncommitted outcomes wait for
+    // startup reconcile.
+    if !disposition.run_effects {
         return axum::response::Response::builder()
             .status(axum::http::StatusCode::OK)
             .header("Content-Type", "application/x-git-receive-pack-result")
@@ -2874,22 +2913,8 @@ pub async fn git_receive_pack(
     // per-ref effects failed transiently; the request is left in
     // `effects_pending` for the drain to pick up on the next
     // startup. A `Nothing` outcome means the request had no
-    // accepted ref (the four-branch flip above would have caught
-    // that case via `any_ref_ok`, so this is defensive).
-    //
-    // When the outcome commit above failed, the outcome was never
-    // durably recorded: skip observability side effects and inline
-    // effects alike so metrics do not advance ahead of effects.
-    // The client still gets HTTP 200 (git landed); durable effects
-    // wait for startup reconcile.
-    if !outcome_commit_ok {
-        return axum::response::Response::builder()
-            .status(axum::http::StatusCode::OK)
-            .header("Content-Type", "application/x-git-receive-pack-result")
-            .header("Cache-Control", "no-cache")
-            .body(axum::body::Body::from(receive_raw))
-            .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to build response: {e}")));
-    }
+    // accepted ref (the disposition gate above would have caught
+    // that case via `run_effects`, so this is defensive).
     let _ = state.db.touch_repo(&record.id).await;
     crate::metrics::record_push(&record.id);
     crate::metrics::observe_pack_size(body_len as f64);
@@ -4214,6 +4239,50 @@ mod tests {
         let repo = repo_owned_by(OWNER_DID);
         assert!(owner_push_rejection(false, &repo, Some(STRANGER_DID)).is_none());
         assert!(owner_push_rejection(false, &repo, None).is_none());
+    }
+
+    /// Policy 2 carve-out: replication/Tigris follows landed report
+    /// knowledge even when the outcome commit failed, while durable
+    /// accounting waits. MUTATION (RED): gating `spawn_tail` or
+    /// `release_ok` on `outcome_commit_ok` breaks the carve-out row.
+    #[test]
+    fn post_git_disposition_replication_carve_out() {
+        // Happy path: everything runs.
+        assert_eq!(
+            post_git_disposition(true, true, true),
+            PostGitDisposition {
+                spawn_tail: true,
+                release_ok: true,
+                run_effects: true
+            },
+        );
+        // Commit failure defers accounting but NOT replication/Tigris.
+        assert_eq!(
+            post_git_disposition(true, true, false),
+            PostGitDisposition {
+                spawn_tail: true,
+                release_ok: true,
+                run_effects: false
+            },
+        );
+        // No landed refs: nothing runs anywhere.
+        assert_eq!(
+            post_git_disposition(true, false, true),
+            PostGitDisposition {
+                spawn_tail: false,
+                release_ok: false,
+                run_effects: false
+            },
+        );
+        // Failed git: nothing runs anywhere.
+        assert_eq!(
+            post_git_disposition(false, false, false),
+            PostGitDisposition {
+                spawn_tail: false,
+                release_ok: false,
+                run_effects: false
+            },
+        );
     }
 
     #[test]

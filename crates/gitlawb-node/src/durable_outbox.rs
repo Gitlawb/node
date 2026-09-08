@@ -82,9 +82,11 @@ const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 /// the intent was durable, which is precisely what a coincidental tip
 /// cannot produce.
 ///
-/// Deletions are exempt from the reflog half: git removes a ref's
-/// reflog when it removes the ref, so absence of the ref plus the age
-/// window is all the evidence that can exist for one.
+/// Deletions are fail-closed with a terminating attended lifecycle:
+/// git removes a ref's reflog with the ref, so no reflog entry can prove
+/// a deletion was caused by this request. Reconcile quarantines deletion
+/// rows (cancelling siblings) instead of promoting them; an operator
+/// resolves via `resolve_attended_request`.
 ///
 /// No reflog means NO PROOF, and no proof means no promotion — the row
 /// stays put and is logged for human-attended recovery.
@@ -1083,6 +1085,252 @@ pub enum EffectsOutcome {
 /// moved to `complete`", the same drain pass completes the state
 /// transition. The artifacts are already in place; the
 /// `mark_request_complete` call is a single SQL UPDATE.
+/// Phase 1 of [`apply_request_effects`]: the full per-ref effect bundle
+/// (push event, cert, anchor, landing history, webhook, proof ack) for every
+/// accepted child, run BEFORE child deletion and the sibling gate.
+///
+/// Returns `Ok(Done)` as a proceed-to-gate sentinel, not the final outcome:
+/// request completion is decided by the phase-2 gate in the caller, which
+/// returns `Retry` while any non-cancelled sibling remains and `Done` /
+/// `Nothing` only when every sibling is cancelled or gone. `Ok(Retry{..})`
+/// retries the bundle; `Err` propagates hard errors (e.g. proof-table
+/// failure) for the drain's `Err` retry arm.
+async fn run_effect_bundle(
+    state: &AppState,
+    req: &crate::db::ReceivePackRequest,
+    request_id: &str,
+    children: &[PendingRefTransition],
+    accepted_children: &[&PendingRefTransition],
+    ok_ref_names: &std::collections::HashSet<String>,
+    accepted_ordinal: i32,
+) -> anyhow::Result<EffectsOutcome> {
+    // 5. Look up the repo for cert/webhook payload construction. If
+    //    the row is missing (deleted under us), bail with Retry so
+    //    the drain re-runs later when the cache is warm again.
+    let repo = match state.db.get_repo_by_id(&req.repo_id).await? {
+        Some(r) => r,
+        None => {
+            return Ok(EffectsOutcome::Retry {
+                last_error: format!("repo {} not found", req.repo_id),
+            });
+        }
+    };
+
+    // 6. Push event — written once, for the request. The live and
+    //    recovery paths produce the same id because both key on
+    //    `(request_id, accepted_ordinal)`.
+    let push_event_id = crate::db::push_event_id_for(&req.id, accepted_ordinal);
+    let accepted_ref = children.iter().find(|c| c.ordinal == accepted_ordinal);
+    let commit_hash = accepted_ref
+        .map(|c| c.new_sha.clone())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp().to_string());
+    if let Err(e) = state
+        .db
+        .record_push_with_id(
+            &push_event_id,
+            &req.pusher_did,
+            &req.repo_id,
+            &commit_hash,
+            0,
+        )
+        .await
+    {
+        tracing::warn!(
+            err = %e,
+            request_id = %request_id,
+            "apply_request_effects: push event insert failed; request left for drain retry"
+        );
+        return Ok(EffectsOutcome::Retry {
+            last_error: format!("push event: {e}"),
+        });
+    }
+
+    // 7. Trust score bump — best-effort, like the inline handler. A
+    //    failure here does NOT retry the request; the bump is
+    //    informational and the next push will catch up.
+    if let Ok(push_count) = state.db.get_push_count(&req.pusher_did).await {
+        // 0.05 base (from registration) + 0.05 per push, capped at 1.0
+        let new_score = (push_count as f64 * 0.05 + 0.05).min(1.0);
+        let _ = state
+            .db
+            .update_trust_score(&req.pusher_did, new_score)
+            .await;
+    }
+
+    // 8. Per-ref certs and anchor jobs. Each accepted child gets one
+    //    of each. Failures are accumulated; the first one is
+    //    returned as the Retry reason. Anchor identity is by occurrence
+    //    (request_id + ordinal) so recurrence yields distinct handoffs;
+    //    landing history is recorded for A/B disambiguation and survives
+    //    child cleanup.
+    let mut first_error: Option<String> = None;
+    for child in accepted_children {
+        let cert_id = crate::db::ref_cert_id_for(&req.id, child.ordinal);
+        if let Err(e) = cert::issue_ref_certificate_with_issued_at(
+            state,
+            &req.repo_id,
+            &child.ref_name,
+            &child.old_sha,
+            &child.new_sha,
+            &req.pusher_did,
+            &cert_id,
+            Some(child.created_at.clone()),
+        )
+        .await
+        {
+            tracing::warn!(
+                err = %e,
+                request_id = %request_id,
+                ref_name = %child.ref_name,
+                "apply_request_effects: cert insert failed; child left for drain retry"
+            );
+            first_error.get_or_insert_with(|| format!("cert {}: {e}", child.ref_name));
+            continue;
+        }
+
+        let anchor_id = crate::db::anchor_job_id_for_occurrence(
+            &req.id,
+            child.ordinal,
+            &req.repo_id,
+            &child.ref_name,
+            &child.old_sha,
+            &child.new_sha,
+        );
+        let job = crate::db::AnchorJob {
+            id: anchor_id,
+            repo_id: req.repo_id.clone(),
+            ref_name: child.ref_name.clone(),
+            old_sha: child.old_sha.clone(),
+            new_sha: child.new_sha.clone(),
+            pusher_did: req.pusher_did.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            claimed_at: None,
+            request_id: Some(req.id.clone()),
+            request_ordinal: Some(child.ordinal),
+        };
+        if let Err(e) = state.db.insert_anchor_job_idempotent(&job).await {
+            tracing::warn!(
+                err = %e,
+                request_id = %request_id,
+                ref_name = %child.ref_name,
+                "apply_request_effects: anchor insert failed; child left for drain retry"
+            );
+            first_error.get_or_insert_with(|| format!("anchor {}: {e}", child.ref_name));
+            continue;
+        }
+        // Landing history is the durable guard distinguishing two
+        // requests claiming the same tuple after children are removed.
+        // It is part of the success condition: on failure retain the
+        // child and retry; delete only after history is durable.
+        match state
+            .db
+            .insert_landing_history_idempotent(&crate::db::RefLanding {
+                request_id: req.id.clone(),
+                ordinal: child.ordinal,
+                repo_id: req.repo_id.clone(),
+                ref_name: child.ref_name.clone(),
+                old_sha: child.old_sha.clone(),
+                new_sha: child.new_sha.clone(),
+                landed_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    ref_name = %child.ref_name,
+                    "apply_request_effects: landing history insert failed; child retained for retry"
+                );
+                first_error.get_or_insert_with(|| format!("history {}: {e}", child.ref_name));
+            }
+        }
+    }
+
+    if let Some(err) = first_error {
+        return Ok(EffectsOutcome::Retry { last_error: err });
+    }
+    // 9. Webhooks — best-effort, per landed ref. Same shape as the
+    //     inline handler's webhook block.
+    if !ok_ref_names.is_empty() {
+        let base_url = state
+            .config
+            .public_url
+            .as_deref()
+            .unwrap_or("http://127.0.0.1:7545")
+            .trim_end_matches('/');
+        let owner_short = crate::db::normalize_owner_key(&repo.owner_did);
+        let clone_url = format!("{}/{}/{}.git", base_url, owner_short, repo.name);
+        for child in accepted_children {
+            let payload = serde_json::json!({
+                "ref": child.ref_name,
+                "before": child.old_sha,
+                "after": child.new_sha,
+                "created": child.old_sha == "0000000000000000000000000000000000000000",
+                "forced": false,
+                "pusher": {
+                    "did": req.pusher_did,
+                },
+                "repository": {
+                    "id": repo.id,
+                    "name": repo.name,
+                    "owner_did": repo.owner_did,
+                    "clone_url": clone_url,
+                },
+            });
+            crate::webhooks::fire_event_occurrence(
+                state.db.clone(),
+                state.http_client.clone(),
+                &repo.id,
+                "push",
+                payload,
+                Some(&req.id),
+                Some(&child.ref_name),
+            );
+        }
+    }
+    // Proof must exist before effects are considered durable; ack it so
+    // retention knows the downstream handoff owns a verifiable reference.
+    // If the proof row is missing (pre-v33 legacy), proceed but do not
+    // block — the request-level columns still carry the envelope. A
+    // failed ACK leaves the request retryable rather than completing
+    // with an unacknowledged proof that purge would then retain forever.
+    if state.db.get_request_proof(&req.id).await?.is_some() {
+        if let Err(e) = state.db.ack_request_proof(&req.id).await {
+            tracing::warn!(
+                err = %e,
+                request_id = %request_id,
+                "apply_request_effects: proof ack failed; request left for retry"
+            );
+            return Ok(EffectsOutcome::Retry {
+                last_error: format!("proof ack: {e}"),
+            });
+        }
+    }
+
+    // 9. All accepted artifacts landed — clean up only those children.
+    //    Uncertain/prepared siblings are reconciliation evidence and must
+    //    survive; if any remain, keep the request executable for a later
+    //    pass rather than completing with evidence deleted.
+    let accepted_ids: Vec<String> = accepted_children.iter().map(|c| c.id.clone()).collect();
+    if let Err(e) = state
+        .db
+        .delete_pending_ref_transitions_by_ids(&accepted_ids)
+        .await
+    {
+        tracing::warn!(
+            err = %e,
+            request_id = %request_id,
+            "apply_request_effects: child cleanup failed; idempotent retry will pick them up on next pass"
+        );
+        // Don't fail the request — the artifacts are in place and a
+        // future pass is harmless.
+    }
+
+    Ok(EffectsOutcome::Done)
+}
+
 pub async fn apply_request_effects(
     state: &AppState,
     request_id: &str,
@@ -1180,200 +1428,44 @@ pub async fn apply_request_effects(
         })
         .collect();
 
-    // No accepted applied child means no proven landing under the
-    // canonical authority (including unpack-false legacy rows whose
-    // report bits claim ok). Emit nothing: no push event, cert,
-    // anchor, or webhook. Completing via `Nothing` lets the caller
-    // retire the request without accounting effects.
-    if accepted_children.is_empty() {
-        return Ok(EffectsOutcome::Nothing);
-    }
-
-    // 5. Look up the repo for cert/webhook payload construction. If
-    //    the row is missing (deleted under us), bail with Retry so
-    //    the drain re-runs later when the cache is warm again.
-    let repo = match state.db.get_repo_by_id(&req.repo_id).await? {
-        Some(r) => r,
-        None => {
-            return Ok(EffectsOutcome::Retry {
-                last_error: format!("repo {} not found", req.repo_id),
-            });
-        }
-    };
-
-    // 6. Push event — written once, for the request. The live and
-    //    recovery paths produce the same id because both key on
-    //    `(request_id, accepted_ordinal)`.
-    let push_event_id = crate::db::push_event_id_for(&req.id, accepted_ordinal);
-    let accepted_ref = children.iter().find(|c| c.ordinal == accepted_ordinal);
-    let commit_hash = accepted_ref
-        .map(|c| c.new_sha.clone())
-        .unwrap_or_else(|| chrono::Utc::now().timestamp().to_string());
-    if let Err(e) = state
-        .db
-        .record_push_with_id(
-            &push_event_id,
-            &req.pusher_did,
-            &req.repo_id,
-            &commit_hash,
-            0,
-        )
-        .await
-    {
-        tracing::warn!(
-            err = %e,
-            request_id = %request_id,
-            "apply_request_effects: push event insert failed; request left for drain retry"
-        );
-        return Ok(EffectsOutcome::Retry {
-            last_error: format!("push event: {e}"),
-        });
-    }
-
-    // 7. Trust score bump — best-effort, like the inline handler. A
-    //    failure here does NOT retry the request; the bump is
-    //    informational and the next push will catch up.
-    if let Ok(push_count) = state.db.get_push_count(&req.pusher_did).await {
-        // 0.05 base (from registration) + 0.05 per push, capped at 1.0
-        let new_score = (push_count as f64 * 0.05 + 0.05).min(1.0);
-        let _ = state
-            .db
-            .update_trust_score(&req.pusher_did, new_score)
-            .await;
-    }
-
-    // 8. Per-ref certs and anchor jobs. Each accepted child gets one
-    //    of each. Failures are accumulated; the first one is
-    //    returned as the Retry reason. Anchor identity is by occurrence
-    //    (request_id + ordinal) so recurrence yields distinct handoffs;
-    //    landing history is recorded for A/B disambiguation and survives
-    //    child cleanup.
-    let mut first_error: Option<String> = None;
-    for child in &accepted_children {
-        let cert_id = crate::db::ref_cert_id_for(&req.id, child.ordinal);
-        if let Err(e) = cert::issue_ref_certificate_with_issued_at(
+    // Phase 1 below runs the full per-ref effect bundle (push event,
+    // cert, anchor, history, webhook, proof ack) for every accepted
+    // child BEFORE child deletion. Phase 2 (completion gate at the
+    // function tail) terminalizes only when no non-cancelled sibling
+    // remains. An empty accepted set with only cancelled siblings
+    // yields `Nothing` (no bundle owed); an empty accepted set with a
+    // live sibling yields `Retry` so a later `Nothing` pass can never
+    // complete the parent while effects are still owed.
+    //
+    // MUTATION (RED): moving the webhook block below the sibling
+    // check without the completion gate, or deleting accepted children
+    // before their webhooks fire, drops webhook delivery on partial
+    // completion and turns `partial_sibling_does_not_complete_without_webhooks` red.
+    let bundle_owed = !accepted_children.is_empty();
+    // `Done` from the bundle is a proceed-to-gate sentinel, not the final
+    // outcome: request completion is decided by the phase-2 gate below.
+    if bundle_owed {
+        match run_effect_bundle(
             state,
-            &req.repo_id,
-            &child.ref_name,
-            &child.old_sha,
-            &child.new_sha,
-            &req.pusher_did,
-            &cert_id,
-            Some(child.created_at.clone()),
+            &req,
+            request_id,
+            &children,
+            &accepted_children,
+            &ok_ref_names,
+            accepted_ordinal,
         )
         .await
         {
-            tracing::warn!(
-                err = %e,
-                request_id = %request_id,
-                ref_name = %child.ref_name,
-                "apply_request_effects: cert insert failed; child left for drain retry"
-            );
-            first_error.get_or_insert_with(|| format!("cert {}: {e}", child.ref_name));
-            continue;
-        }
-
-        let anchor_id = crate::db::anchor_job_id_for_occurrence(
-            &req.id,
-            child.ordinal,
-            &req.repo_id,
-            &child.ref_name,
-            &child.old_sha,
-            &child.new_sha,
-        );
-        let job = crate::db::AnchorJob {
-            id: anchor_id,
-            repo_id: req.repo_id.clone(),
-            ref_name: child.ref_name.clone(),
-            old_sha: child.old_sha.clone(),
-            new_sha: child.new_sha.clone(),
-            pusher_did: req.pusher_did.clone(),
-            created_at: chrono::Utc::now().to_rfc3339(),
-            claimed_at: None,
-            request_id: Some(req.id.clone()),
-            request_ordinal: Some(child.ordinal),
-        };
-        if let Err(e) = state.db.insert_anchor_job_idempotent(&job).await {
-            tracing::warn!(
-                err = %e,
-                request_id = %request_id,
-                ref_name = %child.ref_name,
-                "apply_request_effects: anchor insert failed; child left for drain retry"
-            );
-            first_error.get_or_insert_with(|| format!("anchor {}: {e}", child.ref_name));
-            continue;
-        }
-        // Landing history is the durable guard distinguishing two
-        // requests claiming the same tuple after children are removed.
-        // It is part of the success condition: on failure retain the
-        // child and retry; delete only after history is durable.
-        match state
-            .db
-            .insert_landing_history_idempotent(&crate::db::RefLanding {
-                request_id: req.id.clone(),
-                ordinal: child.ordinal,
-                repo_id: req.repo_id.clone(),
-                ref_name: child.ref_name.clone(),
-                old_sha: child.old_sha.clone(),
-                new_sha: child.new_sha.clone(),
-                landed_at: chrono::Utc::now().to_rfc3339(),
-            })
-            .await
-        {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(
-                    err = %e,
-                    request_id = %request_id,
-                    ref_name = %child.ref_name,
-                    "apply_request_effects: landing history insert failed; child retained for retry"
-                );
-                first_error.get_or_insert_with(|| format!("history {}: {e}", child.ref_name));
-            }
+            Ok(EffectsOutcome::Done) => {}
+            Ok(other) => return Ok(other),
+            Err(e) => return Err(e),
         }
     }
 
-    if let Some(err) = first_error {
-        return Ok(EffectsOutcome::Retry { last_error: err });
-    }
-
-    // Proof must exist before effects are considered durable; ack it so
-    // retention knows the downstream handoff owns a verifiable reference.
-    // If the proof row is missing (pre-v33 legacy), proceed but do not
-    // block — the request-level columns still carry the envelope. A
-    // failed ACK leaves the request retryable rather than completing
-    // with an unacknowledged proof that purge would then retain forever.
-    if state.db.get_request_proof(&req.id).await?.is_some() {
-        if let Err(e) = state.db.ack_request_proof(&req.id).await {
-            tracing::warn!(
-                err = %e,
-                request_id = %request_id,
-                "apply_request_effects: proof ack failed; request left for retry"
-            );
-            return Ok(EffectsOutcome::Retry {
-                last_error: format!("proof ack: {e}"),
-            });
-        }
-    }
-
-    // 9. All accepted artifacts landed — clean up only those children.
-    //    Uncertain/prepared siblings are reconciliation evidence and must
-    //    survive; if any remain, keep the request executable for a later
-    //    pass rather than completing with evidence deleted.
-    let accepted_ids: Vec<String> = accepted_children.iter().map(|c| c.id.clone()).collect();
-    if let Err(e) = state
-        .db
-        .delete_pending_ref_transitions_by_ids(&accepted_ids)
-        .await
-    {
-        tracing::warn!(
-            err = %e,
-            request_id = %request_id,
-            "apply_request_effects: child cleanup failed; idempotent retry will pick them up on next pass"
-        );
-        // Don't fail the request — the artifacts are in place and a
-        // future pass is harmless.
-    }
+    // Phase 2 — request completion gate. Retry while any non-cancelled
+    // sibling remains (evidence owed or a reconciled promotion pending);
+    // terminalize only when every sibling is cancelled or gone. The
+    // bundle flag decides `Done` (bundle ran) vs `Nothing` (nothing owed).
     let remaining = state
         .db
         .list_pending_ref_transitions_for_request(request_id)
@@ -1386,48 +1478,11 @@ pub async fn apply_request_effects(
             last_error: "unresolved siblings remain for reconcile".to_string(),
         });
     }
-
-    // 10. Webhooks — best-effort, per landed ref. Same shape as the
-    //     inline handler's webhook block.
-    if !ok_ref_names.is_empty() {
-        let base_url = state
-            .config
-            .public_url
-            .as_deref()
-            .unwrap_or("http://127.0.0.1:7545")
-            .trim_end_matches('/');
-        let owner_short = crate::db::normalize_owner_key(&repo.owner_did);
-        let clone_url = format!("{}/{}/{}.git", base_url, owner_short, repo.name);
-        for child in &accepted_children {
-            let payload = serde_json::json!({
-                "ref": child.ref_name,
-                "before": child.old_sha,
-                "after": child.new_sha,
-                "created": child.old_sha == "0000000000000000000000000000000000000000",
-                "forced": false,
-                "pusher": {
-                    "did": req.pusher_did,
-                },
-                "repository": {
-                    "id": repo.id,
-                    "name": repo.name,
-                    "owner_did": repo.owner_did,
-                    "clone_url": clone_url,
-                },
-            });
-            crate::webhooks::fire_event_occurrence(
-                state.db.clone(),
-                state.http_client.clone(),
-                &repo.id,
-                "push",
-                payload,
-                Some(&req.id),
-                Some(&child.ref_name),
-            );
-        }
+    if bundle_owed {
+        Ok(EffectsOutcome::Done)
+    } else {
+        Ok(EffectsOutcome::Nothing)
     }
-
-    Ok(EffectsOutcome::Done)
 }
 
 #[cfg(test)]
@@ -1791,7 +1846,10 @@ mod drain_tests {
     /// Unpack-false guard: an `outcomes_committed` row with
     /// `parsed_report.unpack_ok = false` and an `ok: true` child bit emits
     /// nothing. Removing the unpack clear in `apply_request_effects`
-    /// creates a push event + cert + anchor and turns this red.
+    /// creates a push event + cert + anchor and turns this red. The
+    /// divergent applied child is NOT silently completed either: the
+    /// completion gate returns `Retry` (retried toward quarantine for
+    /// attended review) because a non-cancelled sibling remains.
     #[sqlx::test]
     async fn unpack_false_with_ok_bit_emits_no_effects(pool: sqlx::PgPool) {
         let state = crate::test_support::test_state(pool).await;
@@ -1815,8 +1873,8 @@ mod drain_tests {
 
         let outcome = apply_request_effects(&state, request_id).await.unwrap();
         assert!(
-            matches!(outcome, EffectsOutcome::Nothing),
-            "unpack failure must yield Nothing, got {outcome:?}"
+            matches!(outcome, EffectsOutcome::Retry { .. }),
+            "unpack failure with a divergent applied child must stay retryable (toward quarantine), never silently complete, got {outcome:?}"
         );
         assert_eq!(
             state.db.get_push_count("did:key:z6pusher").await.unwrap(),
@@ -2079,6 +2137,132 @@ mod drain_tests {
             remaining.iter().any(|c| c.ref_name == "refs/heads/two"),
             "partial-report sibling must not be deleted before reconcile"
         );
+    }
+
+    /// Partial completion never drops webhooks permanently. Pass 1 fires the
+    /// webhook occurrence for the landed ref inside the effect bundle (before
+    /// child deletion) and returns `Retry` for the uncertain sibling; pass 2
+    /// must stay `Retry` — never `Nothing` → `complete` — and must not fire
+    /// a second webhook for the same occurrence.
+    ///
+    /// MUTATION (RED): moving the webhook block below the sibling check
+    /// without the completion gate drops delivery (pass 2 sees no applied
+    /// children, terminalizes via `Nothing`, webhooks never fire); deleting
+    /// accepted children before their webhooks fire loses the occurrence the
+    /// same way.
+    #[sqlx::test]
+    async fn partial_sibling_does_not_complete_without_webhooks(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let request_id = "req-partial-hook";
+        let repo_id = "repo-partial-hook";
+        let mk = |ref_name: &str, new: &str, ord: i32, st: &str| {
+            let now = Utc::now().to_rfc3339();
+            PendingRefTransition {
+                id: crate::db::deterministic_id(&[
+                    "pending_ref_transition",
+                    request_id,
+                    repo_id,
+                    ref_name,
+                    &"0".repeat(40),
+                    new,
+                ]),
+                request_id: request_id.to_string(),
+                repo_id: repo_id.to_string(),
+                ref_name: ref_name.to_string(),
+                old_sha: "0".repeat(40),
+                new_sha: new.to_string(),
+                pusher_did: "did:key:z6pusher".to_string(),
+                node_did: "did:key:z6node".to_string(),
+                signature_header: "s".to_string(),
+                signature_input: "si".to_string(),
+                content_digest: "d".to_string(),
+                state: st.to_string(),
+                created_at: now.clone(),
+                applied_at: (st == pending_state::APPLIED).then(|| now.clone()),
+                cancelled_at: None,
+                ordinal: ord,
+                git_target_kind: Some("update".to_string()),
+            }
+        };
+        let c1 = mk("refs/heads/one", &"b".repeat(40), 0, pending_state::APPLIED);
+        let c2 = mk(
+            "refs/heads/two",
+            &"c".repeat(40),
+            1,
+            pending_state::UNCERTAIN,
+        );
+        let parsed = serde_json::json!({
+            "unpack_ok": true,
+            "ref_results": [{ "ref_name": "refs/heads/one", "ok": true }],
+        });
+        stage_request_with_children(&state.db, request_id, repo_id, Some(0), &[c1, c2], parsed)
+            .await;
+        // Register a push webhook. The URL is unroutable on purpose: the
+        // occurrence ledger claim (not the HTTP response) is the durable
+        // signal this test asserts; best-effort delivery stays pending.
+        state
+            .db
+            .create_webhook(&crate::db::Webhook {
+                id: "hook-1".to_string(),
+                repo_id: repo_id.to_string(),
+                url: "http://127.0.0.1:9/unroutable".to_string(),
+                secret: None,
+                events: vec!["push".to_string()],
+                created_by_did: "did:key:z6pusher".to_string(),
+                created_at: Utc::now().to_rfc3339(),
+                active: true,
+            })
+            .await
+            .unwrap();
+
+        // Pass 1: bundle runs for the landed ref, sibling keeps it Retry.
+        let outcome = apply_request_effects(&state, request_id).await.unwrap();
+        assert!(
+            matches!(outcome, EffectsOutcome::Retry { .. }),
+            "partial completion must stay retryable, got {outcome:?}"
+        );
+        // The webhook occurrence fired exactly once, before child deletion.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (n,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*)::BIGINT FROM webhook_deliveries WHERE request_id = $1",
+            )
+            .bind(request_id)
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap();
+            if n == 1 || std::time::Instant::now() >= deadline {
+                assert_eq!(n, 1, "exactly one webhook occurrence for the landed ref");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Pass 2: the landed child is gone but the uncertain sibling
+        // remains — must stay Retry, never Nothing → complete.
+        let outcome2 = apply_request_effects(&state, request_id).await.unwrap();
+        assert!(
+            matches!(outcome2, EffectsOutcome::Retry { .. }),
+            "second pass with a live sibling must not terminalize, got {outcome2:?}"
+        );
+        let parent = state
+            .db
+            .get_receive_pack_request(request_id)
+            .await
+            .unwrap()
+            .expect("parent row exists");
+        assert_ne!(
+            parent.state,
+            request_state::COMPLETE,
+            "parent must not complete while a sibling is unresolved"
+        );
+        let (n,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*)::BIGINT FROM webhook_deliveries WHERE request_id = $1")
+                .bind(request_id)
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(n, 1, "no second webhook for the same occurrence");
     }
 
     /// Proof is acked on success and blocks purge until acked. Removing
