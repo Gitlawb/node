@@ -1155,6 +1155,16 @@ async fn call_tool(
             let resource = args["resource"].as_str().context("missing 'resource'")?;
             let action = args["action"].as_str().context("missing 'action'")?;
 
+            // The same refusal `gl ucan delegate` applies. A push-class wildcard cannot
+            // be honoured anywhere downstream — import refuses it, the helper refuses
+            // it, the node refuses it — so issuing one only manufactures a token that
+            // fails later with less context than this.
+            if gitlawb_core::ucan::push::is_push_wildcard(resource, action) {
+                anyhow::bail!(
+                    "a wildcard resource cannot carry a push capability: a delegation is \n                     scoped to the repositories it names when issued, and `*` cannot say \n                     which those were. Use resource gitlawb://repos/<owner>/<repo>."
+                );
+            }
+
             let audience: gitlawb_core::did::Did = to_str
                 .parse()
                 .map_err(|e: gitlawb_core::Error| anyhow::anyhow!("{e}"))?;
@@ -1758,6 +1768,38 @@ mod tests {
         assert_eq!(parsed["audience"], audience.did().to_string());
         assert!(parsed["token"].as_str().unwrap().len() > 10);
         assert_eq!(parsed["capability"]["can"], "git/push");
+    }
+
+    /// The same refusal the CLI applies. `test_ucan_delegate_via_mcp` uses a named
+    /// resource, so it could never catch the MCP arm issuing a wildcard the CLI
+    /// refuses.
+    #[tokio::test]
+    async fn test_ucan_delegate_via_mcp_refuses_a_push_class_wildcard() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+        let audience = gitlawb_core::identity::Keypair::generate();
+
+        for action in ["git/push", "*", "repo/admin"] {
+            let err = call_tool(
+                "ucan_delegate",
+                json!({
+                    "to": audience.did().to_string(),
+                    "resource": "*",
+                    "action": action,
+                    "expiry_hours": 24,
+                }),
+                "http://localhost",
+                Some(dir.path()),
+            )
+            .await
+            .expect_err("MCP must refuse a push-class wildcard like the CLI does");
+            assert!(err.to_string().contains("wildcard"), "{action}: {err}");
+        }
     }
 
     #[tokio::test]

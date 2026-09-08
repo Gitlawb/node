@@ -92,6 +92,141 @@ pub mod caps {
     pub const REPO_ADMIN: &str = "repo/admin";
 }
 
+/// Rules shared by every boundary that decides whether a UCAN can push.
+///
+/// Four places answer "can this token push to this repository?": `gl ucan
+/// delegate` and the MCP `ucan_delegate` tool when a token is issued, `gl ucan
+/// import` when one is stored, `git-remote-gitlawb` when it mints an invocation,
+/// and the node when it authorizes the push. For three review rounds each of them
+/// carried its own copy of the answer, and every round found a token that one
+/// boundary accepted and the next refused: a constrained grant that imported and
+/// then authorized nothing; a wildcard proof the helper narrowed and the node
+/// rejected; a resource whose owner the leaf named but the chain root did not.
+///
+/// The rules live here, once, in the crate all four already depend on. A boundary
+/// may add checks of its own — the node anchors the chain root to a repository
+/// record it holds independently, import binds the audience to the local key —
+/// but the definition of a *usable push capability* is not one of them.
+pub mod push {
+    use super::{caps, Capability, Ucan};
+
+    /// The `did:key` representation rule: `did:key:z6Mk…` and bare `z6Mk…` are
+    /// the same identity. Mirror rows store the bare form; canonical rows and
+    /// every token store the full form.
+    ///
+    /// Collapses representation only within `did:key`. `did:web` and
+    /// `did:gitlawb` share the base58 space, so a trailing-segment compare would
+    /// treat `did:key:X` and `did:gitlawb:X` as equal; after stripping the prefix,
+    /// a value that still contains `:` is a non-key DID and matches nothing bare.
+    pub fn did_key_eq(a: &str, b: &str) -> bool {
+        if a == b {
+            return true;
+        }
+        fn key_id(d: &str) -> &str {
+            d.strip_prefix("did:key:").unwrap_or(d)
+        }
+        let (ka, kb) = (key_id(a), key_id(b));
+        !ka.contains(':') && !kb.contains(':') && ka == kb
+    }
+
+    /// The actions that authorize a push: `git/push` itself, the action wildcard,
+    /// and `repo/admin`, which covers it.
+    pub fn is_push_action(can: &str) -> bool {
+        can == caps::GIT_PUSH || can == "*" || can == caps::REPO_ADMIN
+    }
+
+    /// `gitlawb://repos/<owner>/<repo>` → `(owner, repo)`, or `None` for any other
+    /// shape. Exactly two non-empty segments: an owner DID never contains `/`, so
+    /// a third segment, a trailing slash, or an empty half is malformed rather than
+    /// something to interpret.
+    pub fn parse_repo_resource(with: &str) -> Option<(&str, &str)> {
+        let rest = with.strip_prefix("gitlawb://repos/")?;
+        let (owner, repo) = rest.split_once('/')?;
+        if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+            return None;
+        }
+        Some((owner, repo))
+    }
+
+    /// A push-class capability whose resource is the wildcard. Refused at
+    /// issuance, at import, by the helper, and by the node: a delegation's scope is
+    /// fixed when it is issued, and `*` cannot say which repositories it covered
+    /// at that moment.
+    pub fn is_push_wildcard(with: &str, can: &str) -> bool {
+        with == "*" && is_push_action(can)
+    }
+
+    /// Proof chains deeper than this fail closed. Nothing this codebase mints is
+    /// longer than owner → agent → node, and the bound is what keeps a hand-built
+    /// token from recursing without limit in a helper that runs mid-push.
+    pub const MAX_CHAIN_DEPTH: usize = 8;
+
+    impl Capability {
+        /// Push-class, unconstrained, and naming exactly this repository.
+        ///
+        /// Unconstrained because `nb` has no semantics yet: an owner who wrote
+        /// constraints meant to restrict, and honouring the capability while
+        /// ignoring them would grant more than was intended. The owner segment is
+        /// compared with [`did_key_eq`], so a token issued against the full DID
+        /// matches a mirror row keyed on the bare form.
+        pub fn grants_push_to(&self, owner: &str, repo: &str) -> bool {
+            self.constraints.is_none()
+                && is_push_action(&self.can)
+                && parse_repo_resource(&self.with)
+                    .is_some_and(|(o, r)| did_key_eq(o, owner) && r == repo)
+        }
+    }
+
+    impl Ucan {
+        /// Whether this chain — the leaf **and every proof behind it** — carries a
+        /// capability that [`Capability::grants_push_to`] this repository.
+        ///
+        /// Every link, not just the leaf. [`Capability::is_attenuated_by`] accepts
+        /// a concrete child under a `*` parent, so a leaf that names the repository
+        /// can sit on a proof that names every repository the root owns — including
+        /// ones created after the delegation was issued. Checking the leaf alone
+        /// let exactly that through.
+        ///
+        /// This establishes scope, not trust. It does not verify signatures,
+        /// expiry, or audience; call [`Ucan::verify_chain`] first, and anchor the
+        /// root it returns to something held independently of the token.
+        ///
+        /// Fails closed on anything it cannot vouch for: a proof that does not
+        /// decode, more than one proof per link, or a chain deeper than
+        /// [`MAX_CHAIN_DEPTH`].
+        pub fn chain_grants_push_to(&self, owner: &str, repo: &str) -> bool {
+            self.chain_grants_push_to_at(owner, repo, 0)
+        }
+
+        fn chain_grants_push_to_at(&self, owner: &str, repo: &str, depth: usize) -> bool {
+            if depth >= MAX_CHAIN_DEPTH {
+                return false;
+            }
+            if !self
+                .payload
+                .att
+                .iter()
+                .any(|c| c.grants_push_to(owner, repo))
+            {
+                return false;
+            }
+            // `verify_chain` refuses more than one proof per link for the same
+            // reason: two proofs mean two roots, and nothing says which authorized
+            // what.
+            if self.payload.prf.len() > 1 {
+                return false;
+            }
+            match self.payload.prf.first() {
+                None => true,
+                Some(token) => match Ucan::decode(token) {
+                    Ok(proof) => proof.chain_grants_push_to_at(owner, repo, depth + 1),
+                    Err(_) => false,
+                },
+            }
+        }
+    }
+}
+
 /// The UCAN payload (what gets signed).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UcanPayload {
@@ -949,6 +1084,179 @@ mod tests {
         assert!(
             err.to_string().contains("multi-proof"),
             "the error must name the reason, got: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod push_scope_tests {
+    use super::push::*;
+    use super::{caps, Capability, Ucan};
+    use crate::identity::Keypair;
+
+    fn hour() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() + chrono::Duration::hours(1)
+    }
+
+    #[test]
+    fn did_key_eq_collapses_representation_only_within_did_key() {
+        assert!(did_key_eq("did:key:z6MkAbc", "z6MkAbc"));
+        assert!(did_key_eq("z6MkAbc", "did:key:z6MkAbc"));
+        assert!(did_key_eq("did:key:z6MkAbc", "did:key:z6MkAbc"));
+        assert!(!did_key_eq("did:key:z6MkAbc", "did:key:z6MkXyz"));
+        // A bare id must never match across methods: `did:gitlawb` shares the
+        // base58 space with `did:key`.
+        assert!(!did_key_eq("did:gitlawb:z6MkAbc", "z6MkAbc"));
+        assert!(!did_key_eq("did:key:z6MkAbc", "did:gitlawb:z6MkAbc"));
+        assert!(!did_key_eq("did:web:example.com", "example.com"));
+    }
+
+    #[test]
+    fn parse_repo_resource_requires_exactly_two_segments() {
+        assert_eq!(
+            parse_repo_resource("gitlawb://repos/did:key:z6Mk/r"),
+            Some(("did:key:z6Mk", "r"))
+        );
+        for bad in [
+            "*",
+            "",
+            "gitlawb://repos/",
+            "gitlawb://repos/owner",
+            "gitlawb://repos/owner/",
+            "gitlawb://repos//r",
+            "gitlawb://repos/owner/r/extra",
+            "https://repos/owner/r",
+        ] {
+            assert_eq!(parse_repo_resource(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn is_push_wildcard_is_the_resource_wildcard_with_a_push_action() {
+        for can in [caps::GIT_PUSH, "*", caps::REPO_ADMIN] {
+            assert!(is_push_wildcard("*", can), "{can}");
+        }
+        assert!(!is_push_wildcard("*", caps::GIT_FETCH));
+        assert!(!is_push_wildcard("*", caps::PR_OPEN));
+        assert!(!is_push_wildcard("gitlawb://repos/o/r", caps::GIT_PUSH));
+    }
+
+    #[test]
+    fn a_capability_grants_push_only_when_concrete_unconstrained_and_push_class() {
+        let owner = "did:key:z6MkOwner";
+        let ok = Capability::new("gitlawb://repos/did:key:z6MkOwner/r", caps::GIT_PUSH);
+        assert!(ok.grants_push_to(owner, "r"));
+        // Bare and full owner forms are the same identity.
+        assert!(ok.grants_push_to("z6MkOwner", "r"));
+
+        assert!(!Capability::new("*", caps::GIT_PUSH).grants_push_to(owner, "r"));
+        assert!(
+            !Capability::new("gitlawb://repos/did:key:z6MkOwner/r", caps::GIT_FETCH)
+                .grants_push_to(owner, "r")
+        );
+        assert!(
+            !Capability::new("gitlawb://repos/did:key:z6MkOwner/other", caps::GIT_PUSH)
+                .grants_push_to(owner, "r")
+        );
+        assert!(
+            !Capability::new("gitlawb://repos/did:key:z6MkOther/r", caps::GIT_PUSH)
+                .grants_push_to(owner, "r")
+        );
+        assert!(
+            !Capability::new("gitlawb://repos/did:key:z6MkOwner/r", caps::GIT_PUSH)
+                .with_constraints(serde_json::json!({"max_bytes": 1}))
+                .grants_push_to(owner, "r")
+        );
+        for can in ["*", caps::REPO_ADMIN] {
+            assert!(
+                Capability::new("gitlawb://repos/did:key:z6MkOwner/r", can)
+                    .grants_push_to(owner, "r"),
+                "{can} covers git/push"
+            );
+        }
+    }
+
+    /// The chain walk, at every depth: a wildcard anywhere denies; concrete
+    /// everywhere grants. The grandparent case is the one a single-level check
+    /// misses, because the immediate proof already names the repo.
+    #[test]
+    fn chain_grants_push_only_when_every_link_names_the_repo() {
+        let owner = Keypair::generate();
+        let a = Keypair::generate();
+        let b = Keypair::generate();
+        let node = Keypair::generate();
+        let owner_s = owner.did().to_string();
+        let res = format!("gitlawb://repos/{owner_s}/r");
+        let concrete = || vec![Capability::new(&res, caps::GIT_PUSH)];
+        let wild = || vec![Capability::new("*", caps::GIT_PUSH)];
+
+        // Single self-issued link.
+        assert!(Ucan::issue(&owner, a.did(), concrete(), Some(hour()))
+            .unwrap()
+            .chain_grants_push_to(&owner_s, "r"));
+        assert!(!Ucan::issue(&owner, a.did(), wild(), Some(hour()))
+            .unwrap()
+            .chain_grants_push_to(&owner_s, "r"));
+
+        // Two links: concrete leaf on a wildcard proof must deny.
+        let wild_proof = Ucan::issue(&owner, a.did(), wild(), Some(hour())).unwrap();
+        let leaf = Ucan::delegate(&a, node.did(), concrete(), Some(hour()), &wild_proof).unwrap();
+        assert!(
+            leaf.verify_chain().is_ok(),
+            "attenuation accepts it — that is why we walk"
+        );
+        assert!(!leaf.chain_grants_push_to(&owner_s, "r"));
+
+        // Three links: wildcard grandparent, concrete parent, concrete leaf.
+        let gp = Ucan::issue(&owner, a.did(), wild(), Some(hour())).unwrap();
+        let parent = Ucan::delegate(&a, b.did(), concrete(), Some(hour()), &gp).unwrap();
+        let leaf = Ucan::delegate(&b, node.did(), concrete(), Some(hour()), &parent).unwrap();
+        assert!(leaf.verify_chain().is_ok());
+        assert!(
+            !leaf.chain_grants_push_to(&owner_s, "r"),
+            "a wildcard two links up must deny"
+        );
+
+        // Three links, all concrete.
+        let gp = Ucan::issue(&owner, a.did(), concrete(), Some(hour())).unwrap();
+        let parent = Ucan::delegate(&a, b.did(), concrete(), Some(hour()), &gp).unwrap();
+        let leaf = Ucan::delegate(&b, node.did(), concrete(), Some(hour()), &parent).unwrap();
+        assert!(leaf.chain_grants_push_to(&owner_s, "r"));
+        // And the bare owner form is the same repo.
+        assert!(leaf.chain_grants_push_to(owner_s.strip_prefix("did:key:").unwrap(), "r"));
+        // But not another repo.
+        assert!(!leaf.chain_grants_push_to(&owner_s, "other"));
+    }
+
+    /// Fail closed on anything the walk cannot vouch for.
+    #[test]
+    fn chain_walk_fails_closed_on_undecodable_or_multi_proofs_or_excess_depth() {
+        let owner = Keypair::generate();
+        let a = Keypair::generate();
+        let owner_s = owner.did().to_string();
+        let res = format!("gitlawb://repos/{owner_s}/r");
+        let cap = || vec![Capability::new(&res, caps::GIT_PUSH)];
+
+        let mut broken = Ucan::issue(&owner, a.did(), cap(), Some(hour())).unwrap();
+        broken.payload.prf = vec!["not a ucan".into()];
+        assert!(!broken.chain_grants_push_to(&owner_s, "r"));
+
+        let good = Ucan::issue(&owner, a.did(), cap(), Some(hour())).unwrap();
+        let mut two = Ucan::issue(&owner, a.did(), cap(), Some(hour())).unwrap();
+        two.payload.prf = vec![good.encode().unwrap(), good.encode().unwrap()];
+        assert!(!two.chain_grants_push_to(&owner_s, "r"));
+
+        // Deeper than MAX_CHAIN_DEPTH, all concrete: refused on depth alone.
+        let mut cur = Ucan::issue(&owner, a.did(), cap(), Some(hour())).unwrap();
+        let mut signer = a;
+        for _ in 0..MAX_CHAIN_DEPTH {
+            let next = Keypair::generate();
+            cur = Ucan::delegate(&signer, next.did(), cap(), Some(hour()), &cur).unwrap();
+            signer = next;
+        }
+        assert!(
+            !cur.chain_grants_push_to(&owner_s, "r"),
+            "depth bound must fail closed"
         );
     }
 }

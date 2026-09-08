@@ -68,16 +68,9 @@ pub(crate) async fn authorize_repo_read(
 /// `did:web` / `did:gitlawb` share the base58 space with `did:key`, so a
 /// trailing-segment compare would treat `did:key:X` and `did:gitlawb:X` as equal.
 pub(crate) fn did_matches(a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
-    }
-    fn key_id(d: &str) -> &str {
-        d.strip_prefix("did:key:").unwrap_or(d)
-    }
-    let (ka, kb) = (key_id(a), key_id(b));
-    // After stripping `did:key:`, a value still containing ':' is a non-key full
-    // DID — do not let it match a bare `did:key` id.
-    !ka.contains(':') && !kb.contains(':') && ka == kb
+    // One implementation, shared with `gl` and `git-remote-gitlawb` through core:
+    // every boundary that compares a DID applies the same collapse rule.
+    gitlawb_core::ucan::push::did_key_eq(a, b)
 }
 
 /// 403 unless `caller` is the repo owner. Uses [`did_matches`] so the owner check

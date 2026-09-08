@@ -172,7 +172,7 @@ async fn cmd_import(token: String, dir: Option<PathBuf>) -> Result<()> {
     let me = crate::identity::load_keypair_from_dir(dir.as_deref())
         .context("cannot tell who this delegation is for without a local identity")?;
     let my_did = me.did().to_string();
-    if !did_eq(&ucan.payload.aud.to_string(), &my_did) {
+    if !gitlawb_core::ucan::push::did_key_eq(&ucan.payload.aud.to_string(), &my_did) {
         anyhow::bail!(
             "this delegation is addressed to {}, but the local identity is {my_did}. \
              Ask the owner to re-issue it with `--to {my_did}`.",
@@ -195,38 +195,53 @@ async fn cmd_import(token: String, dir: Option<PathBuf>) -> Result<()> {
     }
     tracing::debug!("delegation verified, rooted at {root}");
 
-    // Import admits only what the push path can actually use, by the SAME rule the
-    // helper and the node apply — `is_push_class` plus `constraints.is_none()`.
-    // Three independent definitions of "usable for push" is how a token gets
-    // accepted at one stage and guaranteed to fail at the next: a constrained-only
-    // grant used to import cleanly, then be skipped by `build_invocation` and
-    // treated as granting nothing by `ucan_grants_push`.
+    // Every capability is admitted by the SAME rule the helper and the node apply —
+    // `gitlawb_core::ucan::push`. Three independent definitions of "usable for push"
+    // is how a token got accepted at one stage and refused at the next: a
+    // constrained grant that imported and then authorized nothing; a wildcard proof
+    // the helper narrowed and the node rejected; a resource whose owner the leaf
+    // named but the chain root did not.
     //
-    // The owner segment is checked against the VERIFIED ROOT, not trusted from the
-    // token. `verify_chain` proves a chain is internally valid; it says nothing
-    // about which repository that chain applies to. Without this, any key holder
-    // could issue a valid bounded token to this agent naming
-    // `gitlawb://repos/<victim>/repo` and displace the working delegation for a
-    // repository they have no authority over — the node would refuse the push
-    // later, but the good credential would already be gone.
+    // Two things are checked here that `verify_chain` does not establish:
+    //
+    //  - The owner named by each capability is the VERIFIED ROOT. `verify_chain`
+    //    proves a chain is internally valid; it says nothing about which repository
+    //    that chain applies to. Without this, any key holder could issue a valid
+    //    bounded token naming `gitlawb://repos/<victim>/repo` and displace the
+    //    working delegation for a repository they have no authority over.
+    //
+    //  - EVERY LINK names the repository, not just the leaf. `is_attenuated_by`
+    //    accepts a concrete child under a `*` parent, so a leaf that names the
+    //    repository can sit on a proof that names every repository the root owns.
+    //    The node walks the whole chain and refuses that; storing it here would
+    //    turn a successful import into a guaranteed 403 at push time — the silent
+    //    success this command exists to prevent.
+    //
+    // Everything is validated before anything is written, so a later bad capability
+    // cannot leave a multi-repository import half applied.
     let mut push_caps: Vec<(String, String)> = Vec::new();
     let mut rejected_owner: Vec<String> = Vec::new();
+    let mut rejected_chain: Vec<String> = Vec::new();
     for cap in &ucan.payload.att {
-        if !is_push_class(&cap.can) || cap.constraints.is_some() {
+        if !gitlawb_core::ucan::push::is_push_action(&cap.can) || cap.constraints.is_some() {
             continue;
         }
+        // `repo_from_resource` is the shared structural parse plus a filename
+        // allow-list: this value becomes a path the store WRITES to.
         let Some((owner, repo)) = repo_from_resource(&cap.with) else {
             continue;
         };
-        if !did_eq(&owner, &root.to_string()) {
+        if !gitlawb_core::ucan::push::did_key_eq(&owner, &root.to_string()) {
             rejected_owner.push(cap.with.clone());
+            continue;
+        }
+        if !ucan.chain_grants_push_to(&owner, &repo) {
+            rejected_chain.push(cap.with.clone());
             continue;
         }
         push_caps.push((owner, repo));
     }
 
-    // Validate every entry before writing any of them, so a later bad capability
-    // cannot leave a multi-repository import half applied.
     if !rejected_owner.is_empty() {
         anyhow::bail!(
             "this delegation names repositories owned by someone other than the \
@@ -234,6 +249,18 @@ async fn cmd_import(token: String, dir: Option<PathBuf>) -> Result<()> {
              The root is the identity the whole chain rests on, so a capability for \
              another owner cannot have come from them and will be refused on push.",
             rejected_owner.join(", ")
+        );
+    }
+
+    if !rejected_chain.is_empty() {
+        anyhow::bail!(
+            "this delegation's leaf names {}, but a proof behind it does not — it is a \
+             wildcard, is constrained, or names another repository. A delegation's \
+             scope is fixed when it is issued, and the node refuses a chain whose \
+             proofs are wider than its leaf, so storing this would only defer the \
+             refusal to `git push`. Ask the owner to issue the delegation directly \
+             against this repository.",
+            rejected_chain.join(", ")
         );
     }
 
@@ -289,13 +316,6 @@ async fn cmd_import(token: String, dir: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Actions the push path accepts. Kept in step with the filter in
-/// `git-remote-gitlawb`'s `build_invocation`, which is what actually mints an
-/// invocation from a stored delegation.
-fn is_push_class(can: &str) -> bool {
-    can == caps::GIT_PUSH || can == "*" || can == caps::REPO_ADMIN
-}
-
 /// Create the delegation store owner-only, with no window at a wider mode.
 ///
 /// `create_dir_all` followed by `set_permissions` leaves the directory at the
@@ -314,11 +334,60 @@ fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
-/// Write `contents`, owner-only from the moment the file exists.
+/// Test-only fault injection for the staging write.
 ///
-/// Not `create_new`: re-importing a refreshed delegation has to overwrite the
-/// stored one. `mode` applies only when the file is created, so the trailing
-/// `set_permissions` covers a 0644 file written by an older `gl`.
+/// The refresh contract — a failed replacement leaves the old token complete — can
+/// only be proven by making a replacement fail, and filesystem permissions are not
+/// a reliable way to do that: `create_private_dir` repairs the store to 0700 before
+/// every write, which undid the read-only directory a previous test relied on, and a
+/// privileged runner ignores modes altogether. So the write path asks this hook at
+/// the most damaging moment — bytes written, nothing published — and production
+/// code compiles it to a no-op.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_STAGING_WRITE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Fails every staging write on this thread until dropped.
+    pub(crate) struct FailStagingWrites;
+
+    impl FailStagingWrites {
+        pub(crate) fn arm() -> Self {
+            FAIL_STAGING_WRITE.with(|f| f.set(true));
+            Self
+        }
+    }
+
+    impl Drop for FailStagingWrites {
+        fn drop(&mut self) {
+            FAIL_STAGING_WRITE.with(|f| f.set(false));
+        }
+    }
+
+    pub(crate) fn staging_write_fault() -> std::io::Result<()> {
+        if FAIL_STAGING_WRITE.with(|f| f.get()) {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "injected: staging write failed after the bytes were written",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+use fault::staging_write_fault;
+
+#[cfg(not(test))]
+#[inline]
+fn staging_write_fault() -> std::io::Result<()> {
+    Ok(())
+}
+
 /// A staging path unique to this call, in the same directory as `path`.
 ///
 /// A single deterministic `.<name>.tmp` is shared by every importer for a
@@ -337,6 +406,9 @@ fn staging_path(path: &std::path::Path) -> std::path::PathBuf {
     ))
 }
 
+/// Write `contents`, owner-only from the moment the file exists, and never
+/// half-published: staged to a per-call sibling at 0600, synced, then renamed over
+/// the live path. See `staging_path` for why the sibling is per-call.
 #[cfg(unix)]
 fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
@@ -358,6 +430,7 @@ fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Resul
             .mode(0o600)
             .open(&tmp)?;
         file.write_all(contents)?;
+        staging_write_fault()?;
         // Durable before it becomes live: a rename that beats the data to disk can
         // surface an empty file after a crash.
         file.sync_all()?;
@@ -401,6 +474,7 @@ fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Resul
             .create_new(true)
             .open(&tmp)?;
         file.write_all(contents)?;
+        staging_write_fault()?;
         file.sync_all()
     };
 
@@ -441,7 +515,7 @@ async fn cmd_delegate(
     // issued and a bare `*` cannot express which repositories it covered at that
     // moment. Refusing at issuance beats minting a token that imports cleanly and
     // then fails every push.
-    if cap == "*" && (can == caps::GIT_PUSH || can == "*" || can == caps::REPO_ADMIN) {
+    if gitlawb_core::ucan::push::is_push_wildcard(&cap, &can) {
         anyhow::bail!(
             "a wildcard resource cannot carry a push capability: a delegation is scoped \n             to the repositories it names when issued, and `*` cannot say which those \n             were. Re-run with --cap gitlawb://repos/<owner>/<repo>."
         );
@@ -906,13 +980,15 @@ mod delegation_store_tests {
 
         let dir = tempfile::tempdir().unwrap();
         let agent = seed_identity(dir.path());
-        let token = token_for_agent(&agent, caps::GIT_PUSH, "gitlawb://repos/z6MkAbc/myrepo");
+        // Owner-consistent: import binds the resource owner to the chain root, so a
+        // synthetic `z6MkAbc` owner is refused before the mode assertions are reached.
+        let (token, owner) = owned_token(&agent, caps::GIT_PUSH, "myrepo");
         cmd_import(token.clone(), Some(dir.path().to_path_buf()))
             .await
             .unwrap();
 
         let store = dir.path().join("delegations");
-        let stored = delegation_path(dir.path(), "z6MkAbc", "myrepo");
+        let stored = delegation_path(dir.path(), &owner, "myrepo");
         assert_eq!(
             std::fs::metadata(&store).unwrap().permissions().mode() & 0o777,
             0o700
@@ -1009,17 +1085,6 @@ mod saved_ucan_tests {
     }
 }
 
-/// Compare two DIDs ignoring the `did:key:` prefix.
-///
-/// The same identity appears in both forms across this codebase — the node stores
-/// canonical rows full and mirror rows bare, and `delegation_path` keys on the bare
-/// form for filename safety — so a literal string compare would reject a match that
-/// every other layer accepts.
-fn did_eq(a: &str, b: &str) -> bool {
-    let bare = |d: &str| d.strip_prefix("did:key:").unwrap_or(d).to_string();
-    bare(a) == bare(b)
-}
-
 #[cfg(test)]
 mod import_binding_tests {
     use super::delegation_store_tests::{owned_token, seed_identity, token_for_agent};
@@ -1113,23 +1178,24 @@ mod import_binding_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod refresh_atomicity_tests {
     use super::delegation_store_tests::{owned_token, seed_identity};
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
-    /// The writer's own contract: a failed replacement preserves the old token.
+    /// The writer's own contract: a failed replacement preserves the old token,
+    /// complete, and leaves nothing half-published behind.
     ///
-    /// The previously named "refused reimport" test never reached
-    /// `write_private_file` — it stopped at the audience check — so nothing covered
-    /// the case this exists for. Making the store unwritable forces the failure at
-    /// the write itself.
+    /// Failure is injected, not arranged. The previous version chmod'd the store to
+    /// 0500 and expected the staging create to fail; `create_private_dir` repairs
+    /// the store to 0700 before every write, so the second import succeeded and the
+    /// test failed on `is_err()` — and a privileged CI user would have made the same
+    /// arrangement pass anyway. The seam fires after the bytes are written and
+    /// before anything is published, the most damaging point, on every platform.
     #[tokio::test]
     async fn a_failed_write_leaves_the_stored_delegation_intact() {
         let dir = tempfile::tempdir().unwrap();
         let me = seed_identity(dir.path());
-        // The resource owner must equal the chain root, which `owned_token` ensures.
         let (good, owner_key) = owned_token(&me, caps::GIT_PUSH, "myrepo");
         cmd_import(good.clone(), Some(dir.path().to_path_buf()))
             .await
@@ -1139,21 +1205,25 @@ mod refresh_atomicity_tests {
         let before = std::fs::read(&stored).unwrap();
         assert!(!before.is_empty());
 
-        // Make the store read-only so the staging create fails.
-        let store = dir.path().join("delegations");
-        let orig = std::fs::metadata(&store).unwrap().permissions();
-        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = {
+            let _fail = fault::FailStagingWrites::arm();
+            cmd_import(good, Some(dir.path().to_path_buf())).await
+        };
 
-        let result = cmd_import(good, Some(dir.path().to_path_buf())).await;
-
-        // Restore before asserting, so a failure here cannot leave a locked tempdir.
-        std::fs::set_permissions(&store, orig).unwrap();
-
-        assert!(result.is_err(), "the write must fail on a read-only store");
+        assert!(result.is_err(), "the injected staging failure must surface");
         assert_eq!(
             std::fs::read(&stored).unwrap(),
             before,
             "a failed refresh must leave the old token complete, not empty or partial"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("delegations"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a failed staging write must clean up after itself, found {leftovers:?}"
         );
     }
 
@@ -1170,5 +1240,121 @@ mod refresh_atomicity_tests {
             p.parent(),
             "staging must be a sibling, for rename"
         );
+    }
+}
+
+#[cfg(test)]
+mod chain_scope_tests {
+    use super::delegation_store_tests::{owned_token, seed_identity};
+    use super::*;
+
+    /// The round-9 P2: a leaf that names the repository sitting on a proof that is
+    /// `*`. Attenuation accepts it, the root matches, and the leaf-only check that
+    /// import used to apply stored it — after which the node's full-chain walk
+    /// refused every push. Import applies the same walk now and refuses before it
+    /// touches the store.
+    #[tokio::test]
+    async fn import_refuses_a_leaf_whose_proof_is_a_wildcard() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = seed_identity(dir.path());
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        // A good delegation already in place, so the test can also prove the
+        // refused one did not displace it.
+        let (good, owner_key) = owned_token(&me, caps::GIT_PUSH, "myrepo");
+        cmd_import(good, Some(dir.path().to_path_buf()))
+            .await
+            .expect("seed import");
+        let stored = delegation_path(dir.path(), &owner_key, "myrepo");
+        let before = std::fs::read(&stored).unwrap();
+
+        // owner --*--> intermediary --concrete--> me
+        let owner = gitlawb_core::identity::Keypair::generate();
+        let intermediary = gitlawb_core::identity::Keypair::generate();
+        let owner_bare = owner
+            .did()
+            .to_string()
+            .strip_prefix("did:key:")
+            .unwrap()
+            .to_string();
+        let wildcard_proof = Ucan::issue(
+            &owner,
+            intermediary.did(),
+            vec![Capability::new("*", caps::GIT_PUSH)],
+            Some(hour),
+        )
+        .unwrap();
+        let concrete_leaf = Ucan::delegate(
+            &intermediary,
+            me.did(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{owner_bare}/other"),
+                caps::GIT_PUSH,
+            )],
+            Some(hour),
+            &wildcard_proof,
+        )
+        .unwrap();
+        assert!(
+            concrete_leaf.verify_chain().is_ok(),
+            "the chain is cryptographically valid — that is the point"
+        );
+
+        let err = cmd_import(
+            concrete_leaf.encode().unwrap(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .expect_err("a wildcard proof must be refused at import, not at push");
+        assert!(
+            err.to_string().contains("proof behind it"),
+            "the error must say the proof, not the leaf, is the problem: {err}"
+        );
+        assert!(
+            !delegation_path(dir.path(), &owner_bare, "other").exists(),
+            "nothing may be written for a chain the node would refuse"
+        );
+        assert_eq!(
+            std::fs::read(&stored).unwrap(),
+            before,
+            "the existing delegation must be untouched"
+        );
+    }
+
+    /// Issuance is the first boundary. Minting a push-class wildcard only creates a
+    /// token that every later stage refuses with less context than this.
+    #[tokio::test]
+    async fn delegate_refuses_a_push_class_wildcard() {
+        let dir = tempfile::tempdir().unwrap();
+        let _me = seed_identity(dir.path());
+        let audience = gitlawb_core::identity::Keypair::generate();
+
+        for can in [caps::GIT_PUSH, "*", caps::REPO_ADMIN] {
+            let err = cmd_delegate(
+                audience.did().to_string(),
+                "*".into(),
+                can.into(),
+                Some(24),
+                None,
+                Some(dir.path().to_path_buf()),
+                false,
+            )
+            .await
+            .expect_err("a wildcard resource with a push-class action must be refused");
+            assert!(err.to_string().contains("wildcard"), "{can}: {err}");
+        }
+
+        // A non-push wildcard is still fine: nothing downstream refuses it.
+        cmd_delegate(
+            audience.did().to_string(),
+            "*".into(),
+            caps::GIT_FETCH.into(),
+            Some(24),
+            None,
+            Some(dir.path().to_path_buf()),
+            false,
+        )
+        .await
+        .expect("a fetch wildcard is not push-class");
     }
 }

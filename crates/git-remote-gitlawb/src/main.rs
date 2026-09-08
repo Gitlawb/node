@@ -460,50 +460,26 @@ fn build_invocation(
 ) -> Result<gitlawb_core::ucan::Ucan> {
     use gitlawb_core::ucan::{caps, Capability};
 
-    // Narrow to the repo this push actually targets rather than copying `att`
-    // wholesale. A delegation written as `with: "*"` otherwise grows without
-    // limit — it would cover every repo the owner creates AFTER signing, a scope
-    // nobody chose. `is_attenuated_by` accepts a concrete resource under a `*`
-    // parent, so narrowing is always a legal attenuation.
-    //
-    // Constraints are copied from the covering capability, not dropped: dropping
-    // them is a widening and `verify_chain` refuses it.
     let resource = format!("gitlawb://repos/{owner}/{repo}");
 
-    // The owner segment must be compared on the bare key. `parse_gitlawb_url` yields
-    // the bare form from the push URL, while an owner following the operator guide
-    // issues `--cap gitlawb://repos/<owner-did>/<repo>` — the full DID. Comparing the
-    // whole resource string finds nothing, and because every failure here is
-    // best-effort the push goes out with no header and the delegate is told to obtain
-    // the delegation they already hold.
-    fn bare(d: &str) -> &str {
-        d.strip_prefix("did:key:").unwrap_or(d)
+    // The whole chain has to grant push to this repository, by the same rule the
+    // node applies (`chain_grants_push_to`): a stored token whose proof is still a
+    // wildcard would mint an invocation the node is certain to refuse, and the push
+    // would fail remotely with a vaguer message than this one. Checked before the
+    // leaf is selected so the message names the actual reason.
+    if !delegation.chain_grants_push_to(owner, repo) {
+        anyhow::bail!(
+            "stored delegation does not grant git/push for {resource} on every link of 
+             its chain — a proof behind it may be a wildcard or name another repository. 
+             Ask the owner to re-issue it against this repository and re-run 
+             `gl ucan import`."
+        );
     }
-    let names_this_repo = |with: &str| {
-        with.strip_prefix("gitlawb://repos/")
-            .and_then(|rest| rest.rsplit_once('/'))
-            .is_some_and(|(o, r)| bare(o) == bare(owner) && r == repo)
-    };
-
     let source = delegation
         .payload
         .att
         .iter()
-        .find(|c| {
-            // `constraints.is_none()` mirrors the node: `ucan_grants_push` treats any
-            // capability carrying `nb` as granting nothing, so selecting one here
-            // would mint an invocation guaranteed to be refused — and a delegation
-            // holding BOTH a constrained and an unconstrained grant would fail or
-            // succeed purely on their order in `att`.
-            // No `c.with == "*"` arm any more. Narrowing a wildcard to the pushed
-            // repo is what let one delegation reach every repo the owner has or
-            // later creates; the node now refuses a chain whose proof does not name
-            // this repository, so minting from a wildcard could only produce a push
-            // that fails remotely with a less obvious message.
-            c.constraints.is_none()
-                && names_this_repo(&c.with)
-                && (c.can == caps::GIT_PUSH || c.can == "*" || c.can == caps::REPO_ADMIN)
-        })
+        .find(|c| c.grants_push_to(owner, repo))
         .ok_or_else(|| {
             anyhow::anyhow!("stored delegation carries no git/push capability for {resource}")
         })?;
@@ -3020,6 +2996,52 @@ mod delegated_push_tests {
         assert!(
             build_invocation(&agent, &node.did(), &delegation, "z6MkOwner", "r").is_err(),
             "a bare wildcard cannot be narrowed into a usable invocation any more"
+        );
+    }
+
+    /// A stored two-link delegation whose leaf names this repo but whose proof is
+    /// `*`. The leaf alone would select fine; the node's chain walk refuses it, so
+    /// the helper refuses it first with a message that says why.
+    #[test]
+    fn build_invocation_refuses_a_concrete_leaf_on_a_wildcard_proof() {
+        use gitlawb_core::ucan::{caps, Capability, Ucan};
+
+        let owner = Keypair::generate();
+        let intermediary = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+        let owner_bare = owner
+            .did()
+            .to_string()
+            .strip_prefix("did:key:")
+            .unwrap()
+            .to_string();
+
+        let proof = Ucan::issue(
+            &owner,
+            intermediary.did(),
+            vec![Capability::new("*", caps::GIT_PUSH)],
+            Some(hour),
+        )
+        .expect("issue");
+        let stored = Ucan::delegate(
+            &intermediary,
+            agent.did(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{owner_bare}/r"),
+                caps::GIT_PUSH,
+            )],
+            Some(hour),
+            &proof,
+        )
+        .expect("re-delegate");
+
+        let err = build_invocation(&agent, &node.did(), &stored, &owner_bare, "r")
+            .expect_err("a wildcard proof must fail closed in the helper");
+        assert!(
+            err.to_string().contains("every link"),
+            "the message must point at the chain, not the leaf: {err}"
         );
     }
 
