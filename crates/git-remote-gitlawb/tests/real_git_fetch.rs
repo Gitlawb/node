@@ -1242,3 +1242,33 @@ fn run_bounded_bounds_join_when_leader_exits_leaving_a_pipe_holder() {
          held pipes do not stall the joins)"
     );
 }
+
+/// The plaintext-transport gate, proven at its CALL SITE rather than in
+/// isolation. `main.rs`'s unit tests cover `is_insecure_remote` and
+/// `check_transport_security` as functions; neither notices if the call in
+/// `main()` is deleted, which is the regression that would silently restore the
+/// cleartext hop. Only driving the built binary binds the wiring.
+///
+/// `192.0.2.1` is TEST-NET-1 (RFC 5737): non-loopback, reserved for
+/// documentation, and never routable, so the gate is what stops this and no
+/// connection is attempted even if it regressed.
+#[test]
+fn real_git_fetch_refuses_a_remote_plaintext_node() {
+    // A shallow fixture is enough: the gate fires before any negotiation.
+    let repos = build_divergent_repos(1);
+    let (ok, out) = fetch_with_helper(&repos.clone, "http://192.0.2.1:7545");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !ok || !out.status.success(),
+        "the fetch must not succeed: {stderr}"
+    );
+    assert!(
+        stderr.contains("plaintext http"),
+        "the helper must refuse the cleartext hop and say so; stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("GITLAWB_ALLOW_INSECURE_HTTP"),
+        "the refusal must name the escape hatch; stderr was: {stderr}"
+    );
+}

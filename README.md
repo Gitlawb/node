@@ -188,7 +188,12 @@ export GITLAWB_NODE=http://localhost:7545
 git clone gitlawb://did:key:z6Mk.../my-repo
 ```
 
-For public-network use, make sure `GITLAWB_NODE` points to the node you want. The helper defaults to localhost for local development.
+For public-network use, make sure `GITLAWB_NODE` points to the node you want, over
+`https://`. The helper defaults to localhost for local development, and plaintext
+`http://` is allowed only to this machine: requests are signed but not encrypted, so
+a cleartext hop to a remote node exposes the pack contents and the `Signature`
+header. A remote `http://` node is refused, and `GITLAWB_ALLOW_INSECURE_HTTP=1`
+overrides that for a trusted private network.
 
 ### Full lifecycle against an iCaptcha-enforcing node
 
@@ -393,7 +398,7 @@ Important node settings:
 | `GITLAWB_P2P_BOOTSTRAP` | Comma-separated libp2p multiaddrs. |
 | `GITLAWB_BOOTSTRAP_DISABLE_SEEDS` | Disable embedded seed peers for isolated dev/test networks. |
 | `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` | Require signed peer announce/sync writes. Defaults to `false` during the staged rollout below. |
-| `GITLAWB_ENFORCE_OWNER_PUSH` | Require the authenticated pusher to be the repo owner on `git-receive-pack`. **Defaults to `true`.** A `did:key` signature is authentication, not authorization — anyone can mint a key and sign — so with this off every signed caller may push to every repository, private ones included. Delegated and CI keys count as non-owners: a UCAN `git/push` capability is verified but not yet honored for authorization, so they cannot push while this is on. Set `false` only for a rolling upgrade; see [`docs/RUN-A-NODE.md`](docs/RUN-A-NODE.md). |
+| `GITLAWB_ENFORCE_OWNER_PUSH` | Require the authenticated pusher to be the repo owner on `git-receive-pack`. **Defaults to `true`.** A `did:key` signature is authentication, not authorization (anyone can mint a key and sign), so with this off every signed caller may push to every repository, private ones included. Delegated and CI keys count as non-owners: a UCAN `git/push` capability is verified but not yet honored for authorization, so they cannot push while this is on. Set `false` only for a rolling upgrade; see [`docs/RUN-A-NODE.md`](docs/RUN-A-NODE.md). |
 | `GITLAWB_AUTO_SYNC` | Enable automatic sync from known peers. |
 | `GITLAWB_MAX_PACK_BYTES` | Max git pack body size for smart-HTTP routes. |
 | `GITLAWB_GIT_SERVICE_TIMEOUT_SECS` | Max seconds a served git upload-pack, receive-pack, or `info/refs` advertisement may run before it is aborted (504). Default 600. Also bounds the withheld-blob classification walk (on both the upload-pack serve and receive-pack replication paths) and the push-side pin-candidate discovery (`rev-list` / `cat-file`), each reaped via process-group teardown at the deadline. On the path-scoped upload-pack path the classification walk and the pack serve share ONE deadline, so this value bounds their combined duration rather than granting each stage a full budget: a walk that consumes it leaves the serve nothing and the clone gets a 504. Serving large path-scoped repos may therefore need a higher value than they did when each stage was budgeted separately. Accepted range is 1 to 3153600000 (100 years), since the node derives deadlines from this value and a larger one cannot be represented. |

@@ -66,6 +66,10 @@ fn main() -> Result<()> {
     // v0.1: default to localhost. Override with GITLAWB_NODE env var.
     let node_base =
         std::env::var("GITLAWB_NODE").unwrap_or_else(|_| "http://127.0.0.1:7545".to_string());
+    check_transport_security(
+        &node_base,
+        std::env::var_os("GITLAWB_ALLOW_INSECURE_HTTP").is_some(),
+    )?;
     let repo_base = format!("{}/{}/{}", node_base, short_owner, repo_name);
     tracing::debug!("repo_base: {repo_base}");
 
@@ -76,6 +80,69 @@ fn main() -> Result<()> {
     let keypair = load_keypair();
 
     run_helper(&repo_base, keypair.as_ref())
+}
+
+/// Whether `url` would send git data off this machine in cleartext.
+///
+/// True only for `http://` to a non-loopback host. RFC 9421 signs the request
+/// but does not encrypt it, so on a plaintext hop the pack contents and the
+/// `Signature` header are both readable, and a captured signature is replayable
+/// for its freshness window against any host.
+///
+/// Loopback is decided from the parsed address rather than a string match, so
+/// `127.0.0.2`, `[::1]` and an IPv4-mapped `[::ffff:127.0.0.1]` are all
+/// recognised as this machine. A value that does not parse, or that is not
+/// http(s), is not this guard's business and returns false: it fails later with
+/// its own error, and naming it a TLS problem would misdirect the reader.
+fn is_insecure_remote(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url.trim()) else {
+        return false;
+    };
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host == "localhost" {
+        return false;
+    }
+    // host_str() keeps the brackets on an IPv6 literal.
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        if ip.is_loopback() {
+            return false;
+        }
+        // An IPv4-mapped IPv6 literal hides a v4 loopback from is_loopback().
+        if let std::net::IpAddr::V6(v6) = ip {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                if v4.is_loopback() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Refuse a cleartext hop off this machine unless the operator has opted in.
+///
+/// Fail closed: the alternative is signing a request and then handing it, and
+/// the pack it carries, to anyone on the path. `GITLAWB_ALLOW_INSECURE_HTTP`
+/// exists for a private LAN where the operator has decided that is acceptable.
+fn check_transport_security(node_base: &str, allow_insecure: bool) -> Result<()> {
+    if allow_insecure || !is_insecure_remote(node_base) {
+        return Ok(());
+    }
+    bail!(
+        "refusing to send git data to {node_base} over plaintext http.\n\
+         Requests are signed but not encrypted, so the pack contents and the \
+         Signature header are readable by anyone on the path, and a captured \
+         signature can be replayed.\n\
+         Use https://, or set GITLAWB_ALLOW_INSECURE_HTTP=1 to accept the risk \
+         (for a trusted private network only)."
+    )
 }
 
 // ── CLI argument handling ──────────────────────────────────────────────────────
@@ -125,6 +192,7 @@ fn help_text() -> String {
          ENVIRONMENT:\n\
          \x20   GITLAWB_NODE   Node base URL (default: http://127.0.0.1:7545)\n\
          \x20   GITLAWB_KEY    Identity PEM path for signed fetch/push (default: ~/.gitlawb/identity.pem)\n\
+         \x20   GITLAWB_ALLOW_INSECURE_HTTP  Permit plaintext http:// to a non-loopback node (unset by default)\n\
          \x20   GITLAWB_LOG    Log filter (default: warn)\n\
          \n\
          FLAGS:\n\
@@ -828,6 +896,148 @@ fn resolve_key_path() -> std::path::PathBuf {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod insecure_transport_tests {
+    use super::*;
+
+    /// Loopback in every form the transport can legitimately be pointed at.
+    /// Plaintext to this machine is the documented local-alpha default and must
+    /// keep working, so a false positive here breaks every stock install.
+    #[test]
+    fn loopback_http_is_allowed() {
+        for url in [
+            "http://127.0.0.1:7545",
+            "http://localhost:7545",
+            "http://[::1]:7545",
+            "http://127.0.0.2:7545",
+            "http://[::ffff:127.0.0.1]:7545",
+            "http://LocalHost:7545",
+        ] {
+            assert!(
+                !is_insecure_remote(url),
+                "{url} is this machine; plaintext to it must stay allowed"
+            );
+        }
+    }
+
+    /// The case the guard exists for: cleartext git data leaving the machine.
+    #[test]
+    fn remote_http_is_refused() {
+        for url in [
+            "http://node.example.com:7545",
+            "http://10.0.0.36:7777",
+            "http://192.168.1.10",
+            "http://[2001:db8::1]:7545",
+            "http://8.8.8.8",
+        ] {
+            assert!(
+                is_insecure_remote(url),
+                "{url} sends git data off-machine in cleartext and must be refused"
+            );
+        }
+    }
+
+    /// TLS is always fine, loopback or not, so the guard keys on the scheme and
+    /// not merely on the host being remote.
+    #[test]
+    fn https_is_always_allowed() {
+        for url in [
+            "https://node.gitlawb.com",
+            "https://10.0.0.36:7777",
+            "https://127.0.0.1:7545",
+        ] {
+            assert!(!is_insecure_remote(url), "{url} is TLS and must be allowed");
+        }
+    }
+
+    /// Spellings that defeat a naive loopback check. `Url` normalizes the scheme
+    /// and the host at parse time (lowercasing, and the WHATWG numeric forms), so
+    /// these must all still read as this machine.
+    #[test]
+    fn loopback_spellings_are_normalized_not_string_matched() {
+        for url in [
+            "HTTP://127.0.0.1:7545",
+            "Http://LOCALHOST:7545",
+            "http://localhost.:7545",
+            "http://user:pw@127.0.0.1:7545",
+            "http://2130706433:7545",
+            "http://0x7f000001:7545",
+            "http://[::ffff:7f00:1]:7545",
+        ] {
+            assert!(
+                !is_insecure_remote(url),
+                "{url} resolves to this machine; plaintext to it must stay allowed"
+            );
+        }
+    }
+
+    /// The mirror of the above: an uppercase scheme must not become an escape
+    /// from the guard, and a remote host in any spelling is still remote.
+    #[test]
+    fn uppercase_scheme_does_not_escape_the_guard() {
+        for url in [
+            "HTTP://node.example.com:7545",
+            "Http://8.8.8.8",
+            "http://NODE.EXAMPLE.COM",
+            "http://user:pw@node.example.com",
+        ] {
+            assert!(
+                is_insecure_remote(url),
+                "{url} is a remote cleartext hop and must be refused"
+            );
+        }
+    }
+
+    /// The gate itself, both directions, including the opt-in escape hatch.
+    #[test]
+    fn gate_refuses_remote_plaintext_unless_opted_in() {
+        let err = check_transport_security("http://node.example.com:7545", false)
+            .expect_err("remote plaintext must be refused by default");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("plaintext http"),
+            "the refusal must say why: {msg}"
+        );
+        assert!(
+            msg.contains("GITLAWB_ALLOW_INSECURE_HTTP"),
+            "the refusal must name the escape hatch: {msg}"
+        );
+
+        check_transport_security("http://node.example.com:7545", true)
+            .expect("the opt-in must permit the same URL");
+        check_transport_security("http://127.0.0.1:7545", false)
+            .expect("the local default must keep working with no opt-in");
+        check_transport_security("https://node.gitlawb.com", false)
+            .expect("TLS must need no opt-in");
+    }
+
+    /// The documented knob must appear in --help. A gate the operator cannot
+    /// discover reads as a broken transport rather than a deliberate refusal.
+    #[test]
+    fn help_documents_the_opt_in() {
+        assert!(help_text().contains("GITLAWB_ALLOW_INSECURE_HTTP"));
+    }
+
+    /// An unparseable or non-http value is not classified as insecure here: it
+    /// fails later with its own error, and reporting it as a TLS problem would
+    /// send the reader after the wrong thing.
+    #[test]
+    fn unparseable_or_other_scheme_is_not_this_guards_problem() {
+        for url in [
+            "",
+            "   ",
+            "not a url",
+            "ftp://node.example.com",
+            "file:///tmp/x",
+        ] {
+            assert!(
+                !is_insecure_remote(url),
+                "{url:?} is not a cleartext-http-to-remote case"
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
