@@ -200,13 +200,49 @@ fn read_token_argument(arg: &str) -> Result<String> {
     Ok(contents.trim().to_string())
 }
 
+/// Most characters of one token-derived value that reach the terminal.
+const SHOWN_MAX_CHARS: usize = 512;
+
+/// Token-derived text, made safe for a terminal.
+///
+/// Every string a token carries — `with`, `can`, `iss`, `aud`, and the error text
+/// `verify_chain` builds out of them — is chosen by whoever built the token: `Did`
+/// deserializes any string, and a capability field is free text. Printed raw, an
+/// ANSI or OSC sequence in one of them drives the operator's terminal (INV-6).
+/// The strip is the workspace's one definition; the cap keeps a megabyte of
+/// nonsense from scrolling the reason off the screen.
+fn shown(s: &str) -> String {
+    let clean = gitlawb_core::sanitize::strip_terminal_controls(s);
+    if clean.chars().count() > SHOWN_MAX_CHARS {
+        let mut cut: String = clean.chars().take(SHOWN_MAX_CHARS).collect();
+        cut.push('…');
+        cut
+    } else {
+        clean
+    }
+}
+
+/// What a successful import stored, for the caller to report.
+pub(crate) struct Imported {
+    pub owner: String,
+    pub repo: String,
+    pub path: PathBuf,
+    /// The root issuer the chain verified to — the owner the node will anchor on.
+    pub root: String,
+    pub expires: Option<i64>,
+}
+
 /// Store a delegation where `git-remote-gitlawb` will look for it on push.
 ///
 /// The token is decoded here rather than at push time so a malformed delegation
 /// fails where the error is actionable, instead of surfacing as an unexplained
-/// 403 in the middle of a `git push`.
-async fn cmd_import(token: String, dir: Option<PathBuf>) -> Result<()> {
-    let raw = read_token_argument(&token)?;
+/// 403 in the middle of a `git push`. `gl ucan import` and the MCP `ucan_import`
+/// tool are both this function: one set of checks, one store.
+pub(crate) async fn import_delegation(
+    token: &str,
+    dir: Option<&std::path::Path>,
+) -> Result<Imported> {
+    let raw = read_token_argument(token)?;
 
     let ucan = Ucan::decode(&raw).context(
         "not a valid UCAN token — pass the JSON emitted by `gl ucan delegate`, or a path to it",
@@ -217,14 +253,14 @@ async fn cmd_import(token: String, dir: Option<PathBuf>) -> Result<()> {
     // however well-formed it is: the helper would sign as us, the proof would name
     // them, and the node would refuse the linkage — a 403 with nothing locally to
     // explain it. Import is the last cheap place to say so.
-    let me = crate::identity::load_keypair_from_dir(dir.as_deref())
+    let me = crate::identity::load_keypair_from_dir(dir)
         .context("cannot tell who this delegation is for without a local identity")?;
     let my_did = me.did().to_string();
     if !gitlawb_core::ucan::push::did_key_eq(&ucan.payload.aud.to_string(), &my_did) {
         anyhow::bail!(
             "this delegation is addressed to {}, but the local identity is {my_did}. \
              Ask the owner to re-issue it with `--to {my_did}`.",
-            ucan.payload.aud
+            shown(&ucan.payload.aud.to_string())
         );
     }
 
@@ -293,10 +329,15 @@ async fn cmd_import(token: String, dir: Option<PathBuf>) -> Result<()> {
     if !rejected_owner.is_empty() {
         anyhow::bail!(
             "this delegation names repositories owned by someone other than the \
-             chain's root issuer ({root}): {}\n\
+             chain's root issuer ({}): {}\n\
              The root is the identity the whole chain rests on, so a capability for \
              another owner cannot have come from them and will be refused on push.",
-            rejected_owner.join(", ")
+            shown(&root.to_string()),
+            rejected_owner
+                .iter()
+                .map(|s| shown(s))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
 
@@ -308,7 +349,11 @@ async fn cmd_import(token: String, dir: Option<PathBuf>) -> Result<()> {
              proofs are wider than its leaf, so storing this would only defer the \
              refusal to `git push`. Ask the owner to issue the delegation directly \
              against this repository.",
-            rejected_chain.join(", ")
+            rejected_chain
+                .iter()
+                .map(|s| shown(s))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
 
@@ -329,8 +374,8 @@ async fn cmd_import(token: String, dir: Option<PathBuf>) -> Result<()> {
                 .iter()
                 .map(|c| format!(
                     "{} -> {}{}",
-                    c.with,
-                    c.can,
+                    shown(&c.with),
+                    shown(&c.can),
                     if c.constraints.is_some() {
                         " (constrained)"
                     } else {
@@ -364,25 +409,45 @@ async fn cmd_import(token: String, dir: Option<PathBuf>) -> Result<()> {
         );
     }
 
+    let (owner, repo) = push_caps
+        .into_iter()
+        .next()
+        .expect("push_caps is non-empty: the empty case bailed above");
+
     // The identity directory is a private-data contract, not a public one: it
     // already holds `identity.pem`, whose disclosure is strictly worse than a
     // delegation's. `create_private_dir` and `write_private_file` below carry the
     // per-platform reasoning.
-    let base = crate::identity::gitlawb_dir(dir)?;
+    let base = crate::identity::gitlawb_dir(dir.map(std::path::Path::to_path_buf))?;
     let store = base.join("delegations");
     create_private_dir(&store).with_context(|| format!("could not create {}", store.display()))?;
 
-    for (owner, repo) in &push_caps {
-        let path = delegation_path(&base, owner, repo);
-        // 0600, like the sibling identity key. The token is not itself sufficient to
-        // push — the node requires `iss` to equal the request signer, so a reader
-        // still needs the delegate's private key — but it does disclose the
-        // delegation graph and which identities hold capabilities on which repos.
-        write_private_file(&path, raw.as_bytes())
-            .with_context(|| format!("could not write {}", path.display()))?;
-        println!("Stored delegation for {owner}/{repo} at {}", path.display());
-    }
+    let path = delegation_path(&base, &owner, &repo);
+    // 0600, like the sibling identity key. The token is not itself sufficient to
+    // push — the node requires `iss` to equal the request signer, so a reader
+    // still needs the delegate's private key — but it does disclose the
+    // delegation graph and which identities hold capabilities on which repos.
+    write_private_file(&path, raw.as_bytes())
+        .with_context(|| format!("could not write {}", path.display()))?;
 
+    Ok(Imported {
+        owner,
+        repo,
+        path,
+        root: root.to_string(),
+        expires: ucan.payload.exp,
+    })
+}
+
+async fn cmd_import(token: String, dir: Option<PathBuf>) -> Result<()> {
+    let imported = import_delegation(&token, dir.as_deref()).await?;
+    // `owner` and `repo` passed `is_safe_component`, so they are plain to print.
+    println!(
+        "Stored delegation for {}/{} at {}",
+        imported.owner,
+        imported.repo,
+        imported.path.display()
+    );
     Ok(())
 }
 
@@ -419,6 +484,7 @@ pub(crate) mod fault {
 
     thread_local! {
         static FAIL_STAGING_WRITE: Cell<bool> = const { Cell::new(false) };
+        static FAIL_PUBLISH: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Fails every staging write on this thread until dropped.
@@ -447,14 +513,49 @@ pub(crate) mod fault {
             Ok(())
         }
     }
+
+    /// Fails the publish step — the rename over the live path — on this thread
+    /// until dropped. The staged bytes are complete and durable by then, so this
+    /// is the moment at which a writer that cleared the live path before renaming
+    /// would leave no delegation at all.
+    pub(crate) struct FailPublish;
+
+    impl FailPublish {
+        pub(crate) fn arm() -> Self {
+            FAIL_PUBLISH.with(|f| f.set(true));
+            Self
+        }
+    }
+
+    impl Drop for FailPublish {
+        fn drop(&mut self) {
+            FAIL_PUBLISH.with(|f| f.set(false));
+        }
+    }
+
+    pub(crate) fn publish_fault() -> std::io::Result<()> {
+        if FAIL_PUBLISH.with(|f| f.get()) {
+            Err(std::io::Error::other(
+                "injected: publish failed after the staged token was complete",
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
-use fault::staging_write_fault;
+use fault::{publish_fault, staging_write_fault};
 
 #[cfg(not(test))]
 #[inline]
 fn staging_write_fault() -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[inline]
+fn publish_fault() -> std::io::Result<()> {
     Ok(())
 }
 
@@ -511,7 +612,7 @@ fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Resul
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    if let Err(e) = publish_fault().and_then(|()| std::fs::rename(&tmp, path)) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
@@ -556,8 +657,10 @@ fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Resul
     // `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`. An earlier version removed
     // the live file first on the belief that Windows refused the overwrite, which
     // opened a window with no delegation at all — the one outcome the staging
-    // dance exists to prevent. One step, same contract as the Unix path.
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    // dance exists to prevent. One step, same contract as the Unix path;
+    // `a_failed_publish_leaves_the_stored_delegation_intact` is what reddens if
+    // that remove ever comes back.
+    if let Err(e) = publish_fault().and_then(|()| std::fs::rename(&tmp, path)) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
@@ -642,14 +745,16 @@ async fn cmd_show(dir: Option<PathBuf>) -> Result<()> {
     let ucan = decode_saved_ucan(&content)
         .with_context(|| format!("could not read the saved UCAN at {}", ucan_path.display()))?;
 
-    println!("Issuer:   {}", ucan.payload.iss);
-    println!("Audience: {}", ucan.payload.aud);
-    println!("Version:  {}", ucan.payload.ucan);
+    // The saved token came from the node at registration: token-derived, so shown
+    // through the same sanitizer as `verify` and `import`.
+    println!("Issuer:   {}", shown(&ucan.payload.iss.to_string()));
+    println!("Audience: {}", shown(&ucan.payload.aud.to_string()));
+    println!("Version:  {}", shown(&ucan.payload.ucan));
     if ucan.payload.att.is_empty() {
         println!("Caps:     (none)");
     } else {
         for cap in &ucan.payload.att {
-            println!("Cap:      {} → {}", cap.with, cap.can);
+            println!("Cap:      {} → {}", shown(&cap.with), shown(&cap.can));
         }
     }
     if let Some(exp) = ucan.payload.exp {
@@ -737,12 +842,14 @@ impl VerifyReport {
         })
     }
 
-    /// The CLI shape, one line per check.
+    /// The CLI shape, one line per check. Every value here came out of the token
+    /// (the error strings too — `verify_chain` quotes `with`, `can`, `iss` and
+    /// `aud` in them), so each passes through [`shown`] on its way out.
     pub fn render(&self) -> String {
         let mut out = String::new();
         match &self.signature {
             Ok(()) => out.push_str("Signature: valid\n"),
-            Err(e) => out.push_str(&format!("Signature: INVALID — {e}\n")),
+            Err(e) => out.push_str(&format!("Signature: INVALID — {}\n", shown(e))),
         }
         out.push_str(if self.expired {
             "Expired:   yes\n"
@@ -750,13 +857,13 @@ impl VerifyReport {
             "Expired:   no\n"
         });
         match &self.chain {
-            Ok(root) => out.push_str(&format!("Chain:     valid (root {root})\n")),
-            Err(e) => out.push_str(&format!("Chain:     INVALID — {e}\n")),
+            Ok(root) => out.push_str(&format!("Chain:     valid (root {})\n", shown(root))),
+            Err(e) => out.push_str(&format!("Chain:     INVALID — {}\n", shown(e))),
         }
-        out.push_str(&format!("Issuer:    {}\n", self.issuer));
-        out.push_str(&format!("Audience:  {}\n", self.audience));
+        out.push_str(&format!("Issuer:    {}\n", shown(&self.issuer)));
+        out.push_str(&format!("Audience:  {}\n", shown(&self.audience)));
         for (with, can) in &self.capabilities {
-            out.push_str(&format!("Cap:       {with} → {can}\n"));
+            out.push_str(&format!("Cap:       {} → {}\n", shown(with), shown(can)));
         }
         out
     }
@@ -970,6 +1077,49 @@ mod verify_report_tests {
         assert_eq!(json["signature_valid"], true);
         assert_eq!(json["chain_valid"], false);
         assert!(json["root_issuer"].is_null());
+    }
+
+    /// Everything the report prints came out of the token, and `Did` deserializes
+    /// any string, so a crafted token can put an escape sequence in `iss`, `aud`,
+    /// `with` or `can` — and, through `verify_chain`'s error text, in the chain
+    /// line too. None of it may reach the terminal.
+    #[test]
+    fn rendered_output_carries_no_terminal_controls_from_the_token() {
+        let alice = Keypair::generate();
+        let node = Keypair::generate();
+        let hostile = "gitlawb://repos/x/\u{1b}]0;pwned\u{7}\u{202E}r";
+        let mut ucan = Ucan::issue(
+            &alice,
+            node.did(),
+            vec![Capability::new(hostile, "git/push\u{1b}[31m")],
+            Some(hour()),
+        )
+        .unwrap();
+        // A hostile issuer too, by the route a crafted token takes: `Did`'s
+        // `FromStr` validates, its `Deserialize` does not. The signature no longer
+        // matches, which is fine — the point is what the lines look like, not
+        // whether they say "valid".
+        ucan.payload.iss = serde_json::from_str::<Did>("\"did:key:z6Mk\\u001b[2J\"").unwrap();
+
+        let rendered = VerifyReport::of(&ucan).render();
+        assert!(
+            !rendered.chars().any(|c| c.is_control() && c != '\n'),
+            "control characters leaked into the report: {rendered:?}"
+        );
+        assert!(!rendered.contains('\u{202E}'), "{rendered:?}");
+        assert!(
+            rendered.contains("pwned"),
+            "the text itself stays: {rendered}"
+        );
+    }
+
+    #[test]
+    fn shown_caps_runaway_values_and_marks_the_cut() {
+        let long = "a".repeat(SHOWN_MAX_CHARS + 50);
+        let out = shown(&long);
+        assert_eq!(out.chars().count(), SHOWN_MAX_CHARS + 1);
+        assert!(out.ends_with('…'));
+        assert_eq!(shown("plain"), "plain");
     }
 
     #[test]
@@ -1494,6 +1644,47 @@ mod refresh_atomicity_tests {
             leftovers.is_empty(),
             "a failed staging write must clean up after itself, found {leftovers:?}"
         );
+    }
+
+    /// The publish step itself failing — staged bytes complete and durable, the
+    /// rename over the live path refused — must leave the old token in place.
+    /// This is the moment the non-Unix writer used to have already removed the
+    /// live file, so a failed rename there left NO delegation; the success-path
+    /// test below cannot tell that writer from this one, because a rename that
+    /// succeeds ends in the same state either way. Reinstating the remove reddens
+    /// this on the platform that had it.
+    #[tokio::test]
+    async fn a_failed_publish_leaves_the_stored_delegation_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = seed_identity(dir.path());
+        let (good, owner_key) = owned_token(&me, caps::GIT_PUSH, "myrepo");
+        cmd_import(good.clone(), Some(dir.path().to_path_buf()))
+            .await
+            .expect("the first import must succeed");
+        let stored = delegation_path(dir.path(), &owner_key, "myrepo");
+        let before = std::fs::read(&stored).unwrap();
+
+        let result = {
+            let _fail = fault::FailPublish::arm();
+            cmd_import(good, Some(dir.path().to_path_buf())).await
+        };
+
+        assert!(result.is_err(), "the injected publish failure must surface");
+        assert!(
+            stored.exists(),
+            "a failed publish must not leave the delegation absent"
+        );
+        assert_eq!(
+            std::fs::read(&stored).unwrap(),
+            before,
+            "a failed publish must leave the old token complete"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("delegations"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "found {leftovers:?}");
     }
 
     /// The other half of the contract: a successful refresh replaces the stored

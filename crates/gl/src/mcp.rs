@@ -560,7 +560,7 @@ fn tool_definitions() -> Value {
         // ── UCAN delegation tools ───────────────────────────────────────────
         {
             "name": "ucan_delegate",
-            "description": "Delegate capabilities to another agent by issuing a signed UCAN token. Requires agent identity. The recipient stores it with `gl ucan import <token>` so their `git push` can present it; there is no MCP import tool.",
+            "description": "Delegate capabilities to another agent by issuing a signed UCAN token. Requires agent identity. The recipient stores it with `gl ucan import <token>` or the `ucan_import` tool so their `git push` can present it.",
             "inputSchema": {
                 "type": "object",
                 "required": ["to", "resource", "action"],
@@ -580,6 +580,17 @@ fn tool_definitions() -> Value {
                 "required": ["token"],
                 "properties": {
                     "token": { "type": "string", "description": "UCAN token (JSON string)" }
+                }
+            }
+        },
+        {
+            "name": "ucan_import",
+            "description": "Store a delegation received from a repository owner where `git push` (git-remote-gitlawb) will present it. Same checks as `gl ucan import`: addressed to this identity, owner-rooted, every link bounded and naming one repository. Requires agent identity.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["token"],
+                "properties": {
+                    "token": { "type": "string", "description": "UCAN token JSON, as returned by ucan_delegate" }
                 }
             }
         },
@@ -1212,6 +1223,21 @@ async fn call_tool(
             // here and then fail at import and at the node.
             let report = crate::ucan_cmd::VerifyReport::of(&ucan);
             Ok(serde_json::to_string_pretty(&report.to_json())?)
+        }
+
+        "ucan_import" => {
+            let token = args["token"].as_str().context("missing 'token'")?;
+            // `gl ucan import` with a JSON answer: one set of checks, one store, so
+            // an MCP-only agent can complete the delegated-push workflow without
+            // a shell and without a second copy of the rules.
+            let imported = crate::ucan_cmd::import_delegation(token, dir).await?;
+            Ok(serde_json::to_string_pretty(&json!({
+                "owner": imported.owner,
+                "repo": imported.repo,
+                "root_issuer": imported.root,
+                "expires": imported.expires,
+                "path": imported.path.display().to_string(),
+            }))?)
         }
 
         // ── Issue tools ───────────────────────────────────────────────────
@@ -1884,6 +1910,84 @@ mod tests {
             "the reason must be reported: {parsed}"
         );
         assert!(parsed["root_issuer"].is_null());
+    }
+
+    /// The workflow an MCP-only agent could not finish: it could be issued a
+    /// delegation and verify it, but not store it where `git-remote-gitlawb`
+    /// looks. `ucan_import` is `gl ucan import` behind a tool — same checks, same
+    /// file — so a token the CLI would store lands in the same place, and one the
+    /// CLI would refuse is refused with the same reason.
+    #[tokio::test]
+    async fn test_ucan_import_via_mcp_stores_where_the_helper_looks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let me = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            me.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+        let owner = gitlawb_core::identity::Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+        let token = gitlawb_core::ucan::Ucan::issue(
+            &owner,
+            me.did(),
+            vec![gitlawb_core::ucan::Capability::new(
+                format!("gitlawb://repos/{owner_did}/ci-repo"),
+                "git/push",
+            )],
+            Some(hour),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+
+        let result = call_tool(
+            "ucan_import",
+            json!({"token": token}),
+            "http://localhost",
+            Some(dir.path()),
+        )
+        .await
+        .expect("a delegation addressed to this identity must import");
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["owner"], owner_did);
+        assert_eq!(parsed["repo"], "ci-repo");
+        assert_eq!(parsed["root_issuer"], owner_did);
+        assert_eq!(parsed["expires"], hour.timestamp());
+
+        let stored = crate::ucan_cmd::delegation_path(dir.path(), &owner_did, "ci-repo");
+        assert_eq!(parsed["path"], stored.display().to_string());
+        assert_eq!(
+            std::fs::read_to_string(&stored).unwrap(),
+            token,
+            "the token must be stored byte-for-byte where the helper reads it"
+        );
+
+        // Same refusals as the CLI: a token addressed to someone else is unusable
+        // here however well-formed it is.
+        let stranger = gitlawb_core::identity::Keypair::generate();
+        let misaddressed = gitlawb_core::ucan::Ucan::issue(
+            &owner,
+            stranger.did(),
+            vec![gitlawb_core::ucan::Capability::new(
+                format!("gitlawb://repos/{owner_did}/ci-repo"),
+                "git/push",
+            )],
+            Some(hour),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        let err = call_tool(
+            "ucan_import",
+            json!({"token": misaddressed}),
+            "http://localhost",
+            Some(dir.path()),
+        )
+        .await
+        .expect_err("a token addressed to another identity must be refused");
+        assert!(err.to_string().contains("addressed to"), "{err}");
     }
 
     /// The round-ten P2: an omitted `expiry_hours` issued an unbounded token, which

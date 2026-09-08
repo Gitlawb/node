@@ -323,8 +323,8 @@ pub(crate) async fn read_body_capped(mut resp: reqwest::Response, cap: usize) ->
 /// defangs ANSI/OSC escapes) AND the Unicode bidi/format controls (which
 /// `char::is_control` does not cover — they can reorder the displayed line).
 pub(crate) fn sanitize_node_msg(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control() && !gitlawb_core::sanitize::is_bidi_format(*c))
+    gitlawb_core::sanitize::strip_terminal_controls(s)
+        .chars()
         .take(200)
         .collect()
 }
