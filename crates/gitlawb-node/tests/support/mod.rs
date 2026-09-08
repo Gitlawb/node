@@ -22,3 +22,12 @@ pub fn bounded_client() -> reqwest::Client {
         .build()
         .unwrap()
 }
+
+/// Build an anonymous (unsigned) GET request for `path` under `base_url`.
+/// Extracted from inline call sites so URL construction goes through a
+/// function boundary, matching the `signed_request` pattern in `support::signing`.
+#[allow(dead_code)]
+pub fn anon_get(client: &reqwest::Client, base_url: &str, path: &str) -> reqwest::RequestBuilder {
+    let url = format!("{base_url}{path}");
+    client.get(url)
+}

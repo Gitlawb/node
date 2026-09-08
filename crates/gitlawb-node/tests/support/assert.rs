@@ -76,6 +76,18 @@ pub fn check_denied_with_headers(
     Ok(())
 }
 
+/// Replace each withheld token in `s` with `[REDACTED]` so a test-failure
+/// witness does not itself leak the secret it caught.
+fn redact_withheld(s: &str, withheld: &[&str]) -> String {
+    let mut result = s.to_string();
+    for token in withheld {
+        if !token.is_empty() {
+            result = result.replace(token, "[REDACTED]");
+        }
+    }
+    result
+}
+
 /// Drive a real response through the deny check and panic on failure. Reads the
 /// full body once.
 pub async fn assert_denied(resp: reqwest::Response, expected: u16, withheld: &[&str]) {
@@ -102,13 +114,14 @@ pub async fn assert_denied(resp: reqwest::Response, expected: u16, withheld: &[&
         .expect("read denial body: an unreadable denial cannot be certified leak-free");
     if let Err(reason) = check_denied_with_headers(status, &body, &header_text, expected, withheld)
     {
-        panic!("{reason}"); // codeql[rust/cleartext-logging]: intentional leak witness on test failure only
+        let redacted = redact_withheld(&reason, withheld);
+        panic!("{redacted}");
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{check_denied, check_denied_with_headers};
+    use super::{check_denied, check_denied_with_headers, redact_withheld};
 
     #[test]
     fn clean_403_with_no_leak_passes() {
@@ -191,5 +204,29 @@ mod tests {
             &[withheld],
         );
         assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[test]
+    fn redact_withheld_replaces_secrets() {
+        let withheld = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let msg = format!("withheld token {withheld:?} leaked in body: near {withheld}");
+        let redacted = redact_withheld(&msg, &[withheld]);
+        assert!(
+            !redacted.contains(withheld),
+            "token must be redacted: {redacted}"
+        );
+        assert!(
+            redacted.contains("[REDACTED]"),
+            "redaction marker must appear: {redacted}"
+        );
+    }
+
+    #[test]
+    fn redact_withheld_leaves_clean_strings() {
+        let result = redact_withheld(
+            "no secrets here",
+            &["deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"],
+        );
+        assert_eq!(result, "no secrets here");
     }
 }
