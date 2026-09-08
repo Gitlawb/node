@@ -342,6 +342,28 @@ async fn cmd_import(token: String, dir: Option<PathBuf>) -> Result<()> {
         );
     }
 
+    // One repository per token. `gl ucan delegate` and the MCP tool issue one
+    // capability per token, so anything naming several repositories was built by
+    // hand. The store publishes one file per repository and `write_private_file`
+    // is atomic per file, not across files: a failure on the second write would
+    // leave the first published while the command reports failure. Refusing is
+    // honest where a half-applied import is not. Several capabilities on the SAME
+    // repository (`git/push` plus `repo/admin`, say) are one file and are fine.
+    push_caps.sort();
+    push_caps.dedup();
+    if push_caps.len() > 1 {
+        anyhow::bail!(
+            "this delegation names {} repositories ({}), and `gl ucan import` stores one \
+             repository per token. Ask the owner for one delegation per repository.",
+            push_caps.len(),
+            push_caps
+                .iter()
+                .map(|(owner, repo)| format!("{owner}/{repo}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     // The identity directory is a private-data contract, not a public one: it
     // already holds `identity.pem`, whose disclosure is strictly worse than a
     // delegation's. `create_private_dir` and `write_private_file` below carry the
@@ -1550,6 +1572,85 @@ mod refresh_atomicity_tests {
 mod chain_scope_tests {
     use super::delegation_store_tests::{owned_token, seed_identity};
     use super::*;
+
+    /// A hand-built token naming two repositories is refused before anything is
+    /// written. `write_private_file` is atomic per file, not across files, so
+    /// applying such a token could publish one repository's delegation and then
+    /// fail on the other while reporting failure for both.
+    #[tokio::test]
+    async fn import_refuses_a_token_naming_two_repositories() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = seed_identity(dir.path());
+        let owner = gitlawb_core::identity::Keypair::generate();
+        let bare = owner
+            .did()
+            .to_string()
+            .strip_prefix("did:key:")
+            .unwrap()
+            .to_string();
+        let token = Ucan::issue(
+            &owner,
+            me.did(),
+            vec![
+                Capability::new(format!("gitlawb://repos/{bare}/first"), caps::GIT_PUSH),
+                Capability::new(format!("gitlawb://repos/{bare}/second"), caps::GIT_PUSH),
+            ],
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+
+        let err = cmd_import(token, Some(dir.path().to_path_buf()))
+            .await
+            .expect_err("two repositories in one token must be refused");
+        assert!(
+            err.to_string().contains("one repository per token"),
+            "the refusal must say what the supported shape is: {err}"
+        );
+        for repo in ["first", "second"] {
+            assert!(
+                !delegation_path(dir.path(), &bare, repo).exists(),
+                "nothing may be written for a refused import ({repo})"
+            );
+        }
+    }
+
+    /// The refusal is about distinct repositories, not distinct capabilities: two
+    /// push-class actions on one repository are one stored file.
+    #[tokio::test]
+    async fn import_accepts_two_capabilities_on_one_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = seed_identity(dir.path());
+        let owner = gitlawb_core::identity::Keypair::generate();
+        let bare = owner
+            .did()
+            .to_string()
+            .strip_prefix("did:key:")
+            .unwrap()
+            .to_string();
+        let resource = format!("gitlawb://repos/{bare}/only");
+        let token = Ucan::issue(
+            &owner,
+            me.did(),
+            vec![
+                Capability::new(&resource, caps::GIT_PUSH),
+                Capability::new(&resource, caps::REPO_ADMIN),
+            ],
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+
+        cmd_import(token.clone(), Some(dir.path().to_path_buf()))
+            .await
+            .expect("two capabilities on one repository are one delegation");
+        assert_eq!(
+            std::fs::read_to_string(delegation_path(dir.path(), &bare, "only")).unwrap(),
+            token
+        );
+    }
 
     /// The round-9 P2: a leaf that names the repository sitting on a proof that is
     /// `*`. Attenuation accepts it, the root matches, and the leaf-only check that
