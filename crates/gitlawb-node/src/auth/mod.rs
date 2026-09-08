@@ -49,23 +49,6 @@ pub fn caller_authorized_to_push(
         || verified.is_some_and(|v| ucan_grants_push(record, v))
 }
 
-/// Whether `with` names this repository.
-///
-/// A thin wrapper over the shared rule in [`gitlawb_core::ucan::push`]: parse the
-/// `gitlawb://repos/<owner>/<repo>` shape structurally and compare the owner with
-/// [`did_key_eq`](gitlawb_core::ucan::push::did_key_eq), so a delegation issued
-/// against the full `did:key:z6Mk…` matches a mirror row keyed on the bare form.
-///
-/// A resource wildcard does not match anything, and that is only the leaf half of
-/// the rule. The other half is that every *proof* must name the repository too —
-/// see [`ucan_grants_push`] — because `is_attenuated_by` accepts a concrete child
-/// under a `*` parent, and nothing on the client side is a protocol boundary.
-fn repo_capability_matches(with: &str, record: &crate::db::RepoRecord) -> bool {
-    gitlawb_core::ucan::push::parse_repo_resource(with).is_some_and(|(owner, name)| {
-        gitlawb_core::ucan::push::did_key_eq(owner, &record.owner_did) && name == record.name
-    })
-}
-
 /// Whether a verified UCAN authorizes a push to `record`.
 ///
 /// Three conditions, all required:
