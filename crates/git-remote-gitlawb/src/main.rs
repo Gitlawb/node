@@ -82,6 +82,13 @@ fn main() -> Result<()> {
     run_helper(&repo_base, keypair.as_ref())
 }
 
+/// Whether `url` is plaintext http, regardless of where it points.
+fn is_http(url: &str) -> bool {
+    reqwest::Url::parse(url.trim())
+        .map(|u| u.scheme() == "http")
+        .unwrap_or(false)
+}
+
 /// Whether `url` would send git data off this machine in cleartext.
 ///
 /// True only for `http://` to a non-loopback host. RFC 9421 signs the request
@@ -267,7 +274,8 @@ fn handle_connect<R: Read>(
         other => bail!("unsupported git service: {other}"),
     }
 
-    let client = build_http_client()?;
+    // A loopback node must never be proxied; see build_http_client.
+    let client = build_http_client(!is_insecure_remote(repo_base) && is_http(repo_base))?;
 
     // ── Phase 1: ref advertisement (GET /info/refs?service=<service>) ─────────
     //
@@ -403,8 +411,22 @@ const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 /// node named, and on a 307/308 the pack body went with them. Scope the follow to the
 /// origin that issued the redirect AND to an identical request-target, which is the
 /// same predicate `gl` uses.
-fn build_http_client() -> Result<reqwest::blocking::Client> {
-    Ok(reqwest::blocking::Client::builder()
+/// `bypass_proxy` must be true whenever the node is on this machine. reqwest's
+/// default client honours `HTTP_PROXY` / `ALL_PROXY` for a loopback URL too, so a
+/// proxy variable pointing off-machine turns an allowed local request into a
+/// cleartext hop carrying the `Signature` header, straight past
+/// `check_transport_security`. Verified: with `HTTP_PROXY` set, reqwest logged
+/// `proxy(...) intercepts 'http://127.0.0.1:7545/'` and dialled the proxy. A
+/// local node is never legitimately reached through a proxy, so this refuses one
+/// rather than trying to reimplement `NO_PROXY` parsing.
+fn build_http_client(bypass_proxy: bool) -> Result<reqwest::blocking::Client> {
+    let builder = reqwest::blocking::Client::builder();
+    let builder = if bypass_proxy {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    Ok(builder
         .timeout(HTTP_TIMEOUT)
         .redirect(reqwest::redirect::Policy::custom(same_origin_redirect))
         .build()?)
@@ -1139,7 +1161,7 @@ mod tests {
     #[test]
     fn signed_requests_do_not_follow_a_redirect_off_the_node_origin() {
         let kp = Keypair::generate();
-        let client = build_http_client().unwrap();
+        let client = build_http_client(false).unwrap();
 
         let mut elsewhere = mockito::Server::new();
         let never = elsewhere
@@ -1241,7 +1263,7 @@ mod tests {
     #[test]
     fn a_same_origin_path_changing_redirect_is_refused() {
         let kp = Keypair::generate();
-        let client = build_http_client().unwrap();
+        let client = build_http_client(false).unwrap();
 
         let mut node = mockito::Server::new();
         let bounce = node
@@ -1292,7 +1314,7 @@ mod tests {
     #[test]
     fn an_identical_target_redirect_is_still_followed_up_to_the_chain_bound() {
         let kp = Keypair::generate();
-        let client = build_http_client().unwrap();
+        let client = build_http_client(false).unwrap();
 
         let mut node = mockito::Server::new();
         let loop_route = node
@@ -1453,7 +1475,7 @@ mod tests {
     fn a_rewritten_target_never_receives_the_signature() {
         let kp = Keypair::generate();
         let expected_did = kp.did().to_string();
-        let client = build_http_client().unwrap();
+        let client = build_http_client(false).unwrap();
         let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<Verdict>));
 
         let mut node = mockito::Server::new();
@@ -1515,7 +1537,7 @@ mod tests {
     fn a_direct_signed_advertisement_verifies_under_the_node_verifier() {
         let kp = Keypair::generate();
         let expected_did = kp.did().to_string();
-        let client = build_http_client().unwrap();
+        let client = build_http_client(false).unwrap();
         let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<Verdict>));
 
         let mut node = mockito::Server::new();
