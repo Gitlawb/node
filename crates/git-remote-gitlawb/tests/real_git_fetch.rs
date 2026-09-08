@@ -298,7 +298,11 @@ fn fetch_with_helper_env(
         // machine/CI with git-l10n installed and LANG set to a translated locale.
         .env("LC_ALL", "C")
         .env("GITLAWB_NODE", node_url)
-        .env("GITLAWB_KEY", "/nonexistent-key-for-anon-fetch");
+        .env("GITLAWB_KEY", "/nonexistent-key-for-anon-fetch")
+        // The helper inherits this process's environment, so an operator or CI
+        // that exports the insecure-HTTP override would decide the transport
+        // policy for every test below. Clear it and let each test opt in.
+        .env_remove("GITLAWB_ALLOW_INSECURE_HTTP");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
