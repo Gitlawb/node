@@ -12,10 +12,12 @@
 // (Gitlawb/node#277): legal Rust separators between the attribute path and
 // its ]/( delimiter must be accepted (line comments, nested block comments,
 // splits onto immediately following added lines), while unrelated patch
-// records — delimiter-looking lines before the path, later in the hunk, or in
-// another hunk — must never complete a path they do not adjoin. False
-// negatives here SUPPRESS the needs-tests label silently, so every uncertain
-// path in the detector is required to answer "no inline test".
+// records - delimiter-looking lines before the path, later in the hunk, or in
+// another hunk - must never complete a path they do not adjoin. False
+// positives here SUPPRESS the needs-tests label silently (they set
+// touchedTests, which clears the label), while false negatives apply it
+// (the loud, corrigible direction). So every uncertain path in the detector
+// is required to answer "no inline test".
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -127,6 +129,84 @@ const cases = [
     "continuation bound exceeded stays loud",
     "@@ -1,0 +1,40 @@\n+#[test /*\n" + "+ filler\n".repeat(30) + "+ */ ]",
     false,
+  ],
+  [
+    "raw-string fixture with adjoining closer",
+    '@@ -1,0 +1,4 @@\n+const FIXTURE: &str = r#"\n+#[test_case\n+(1)]\n+"#;',
+    false,
+  ],
+  [
+    "block comment with adjoining closer",
+    '@@ -1,0 +1,4 @@\n+/* this is a comment\n+#[test_case\n+(1)]\n+end of comment */',
+    false,
+  ],
+  [
+    "raw string with no hash delimiters",
+    '@@ -1,0 +1,4 @@\n+let s = r"\n+#[test_case\n+(1)]\n+";',
+    false,
+  ],
+  [
+    "raw string closes then real test attribute on next line",
+    '@@ -1,0 +1,2 @@\n+let s = r#""#;\n+#[test_case(1)]',
+    true,
+  ],
+  [
+    "block comment closes then real test attribute on next line",
+    '@@ -1,0 +1,2 @@\n+/* c */\n+#[test]',
+    true,
+  ],
+  [
+    "multiline regular string with test attribute inside",
+    '@@ -1,0 +1,3 @@\n+const S: &str = "\n+#[test]\n+";',
+    false,
+  ],
+  [
+    "regular string closes then real test on next line",
+    '@@ -1,0 +1,2 @@\n+let s = "text";\n+#[test]',
+    true,
+  ],
+  [
+    "context line with stray closing quote then real test",
+    '@@ -1,1 +1,2 @@\n  );"\n+#[test]',
+    true,
+  ],
+  [
+    "context line with stray opening quote then real test",
+    '@@ -1,1 +1,2 @@\n  let s = "\n+#[test]',
+    true,
+  ],
+  [
+    "r# inside string on context line then real test",
+    '@@ -1,1 +1,2 @@\n  let s = "r#";\n+#[test]',
+    true,
+  ],
+  [
+    "/* inside string on context line then real test",
+    '@@ -1,1 +1,2 @@\n  let s = "/*";\n+#[test]',
+    true,
+  ],
+  // Known limitation: a non-code region opened by a context line is invisible
+  // to the pre-pass (context lines are not scanned). An added #[test] inside
+  // an existing raw string or block comment is scanned as code and may match.
+  // This is a false positive (silent direction), accepted because the old
+  // detector had the same behavior, the pattern is rare, and needs-tests is
+  // advisory. Scanning context lines to close this gap would re-introduce a
+  // false negative on the far more common case of a context line with a stray
+  // " from a string that opened before the visible window.
+  [
+    "known limitation: #[test] inside context-opened raw string (FP)",
+    '@@ -1,1 +1,2 @@\n  const FIX: &str = r#"\n+#[test]\n  "#;',
+    true,
+  ],
+  [
+    "known limitation: #[test_case] inside context-opened raw string (FP)",
+    '@@ -1,1 +1,3 @@\n  const FIX: &str = r#"\n+#[test_case\n+(1)]\n  "#;',
+    true,
+  ],
+  [
+    "known limitation: #[test] inside context-opened block comment (FP)",
+    '@@ -1,1 +1,2 @@\n  /*\n+#[test]\n  */',
+    true,
   ],
 ];
 

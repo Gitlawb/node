@@ -152,10 +152,100 @@ jobs:
               }
               return false; // out of adjoined lines (or bound hit): stay loud
             }
+            // Before the candidate scan, a pre-pass walks added patch lines
+            // tracking Rust lexical state: raw strings (r#*", br#*", cr#*"),
+            // block comments (/* */ with nesting), regular strings ("...",
+            // which can span newlines), and line comments (//). An added line
+            // that starts inside any of these is skipped as a candidate,
+            // because a #[test_case] appearing there is lexical non-code, not
+            // a real test attribute. State is only tracked across consecutive
+            // added lines and reset at any break (context line, removal,
+            // hunk header): context lines carry a partial view of the file,
+            // so a " or r#" or /* there might be inside a string that opened
+            // before the hunk's visible window, and treating it as an opener
+            // would mark every later added line as non-code (a false negative
+            // on a real #[test]). The tradeoff is that a non-code region
+            // opened by a context line is invisible: an added #[test] inside
+            // an existing raw string or block comment is scanned as code and
+            // may match (a false positive, silent direction). This is accepted
+            // because (1) the old detector had the same behavior, (2) the
+            // pattern is rare, and (3) needs-tests is advisory, not a merge
+            // gate. Scanning context lines to close this gap would re-introduce
+            // the false negative, which affects the far more common case of a
+            // context line carrying a stray " from a string that opened before
+            // the visible window. Single forward pass, O(n) in patch length.
             function patchAddsInlineTest(patch) {
               const lines = patch.split("\n");
+              const nonCodeStart = new Set();
+              let rawHashes = -1; // -1 = not in raw string; >=0 = # count
+              let blockDepth = 0;
+              let inString = false;
+              for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                if (!line) continue;
+                const prefix = line[0];
+                // Only scan added lines. Context and removal lines carry
+                // a partial view of the file: a " or r#" or /* on a context
+                // line might be inside a string that opened before the
+                // hunk's visible window, and treating it as an opener would
+                // mark every later added line as non-code (a false negative
+                // on a real #[test]). So lexical state is only tracked across
+                // consecutive added lines and reset at any break. A non-code
+                // region opened by a context line is invisible; the candidate
+                // is still scanned, which fails toward the loud label.
+                if (prefix !== "+") {
+                  rawHashes = -1; blockDepth = 0; inString = false;
+                  continue;
+                }
+                const text = line.slice(1);
+                if (rawHashes >= 0 || blockDepth > 0 || inString)
+                  nonCodeStart.add(i);
+                let j = 0;
+                while (j < text.length) {
+                  if (rawHashes >= 0) {
+                    if (text[j] === '"') {
+                      let h = 1;
+                      while (h <= rawHashes && text[j + h] === "#") h++;
+                      if (h > rawHashes) { rawHashes = -1; j += h; continue; }
+                    }
+                    j += 1; continue;
+                  }
+                  if (blockDepth > 0) {
+                    if (text.startsWith("/*", j)) { blockDepth += 1; j += 2; }
+                    else if (text.startsWith("*/", j)) { blockDepth -= 1; j += 2; }
+                    else { j += 1; }
+                    continue;
+                  }
+                  if (inString) {
+                    if (text[j] === "\\") { j += 2; continue; }
+                    if (text[j] === '"') { inString = false; j += 1; continue; }
+                    j += 1; continue;
+                  }
+                  if (text[j] === '"') { inString = true; j += 1; continue; }
+                  if (text.startsWith("//", j)) break;
+                  if (text.startsWith("/*", j)) { blockDepth = 1; j += 2; continue; }
+                  const prev = j > 0 ? text[j - 1] : "";
+                  const isIdent = /[A-Za-z0-9_]/.test(prev);
+                  if (!isIdent && text[j] === "r") {
+                    let k = j + 1, h = 0;
+                    while (text[k + h] === "#") h++;
+                    if (text[k + h] === '"') {
+                      rawHashes = h; j = k + h + 1; continue;
+                    }
+                  }
+                  if (!isIdent && (text[j] === "b" || text[j] === "c") && text[j + 1] === "r") {
+                    let k = j + 2, h = 0;
+                    while (text[k + h] === "#") h++;
+                    if (text[k + h] === '"') {
+                      rawHashes = h; j = k + h + 1; continue;
+                    }
+                  }
+                  j += 1;
+                }
+              }
               for (let i = 0; i < lines.length; i++) {
                 if (lines[i][0] !== "+") continue;
+                if (nonCodeStart.has(i)) continue;
                 const m = TEST_ATTR_LINE.exec(lines[i].slice(1));
                 if (m === null) continue;
                 const segs = [m[1]];
