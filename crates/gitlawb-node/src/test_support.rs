@@ -557,6 +557,232 @@ mod tests {
         );
     }
 
+    /// A fork name that is empty passes `fork_repo`'s character allowlist
+    /// (`.chars().all(..)` is vacuously true on ""), and the handler then builds
+    /// its clone destination with the RAW `store::repo_disk_path`. Every other
+    /// repo-creation route goes through `validated_repo_disk_path`, whose
+    /// `validate_repo_name` rejects an empty name, so fork is the one entrypoint
+    /// that skips that barrier and lands a repo at `<repos_dir>/<owner>/.git`
+    /// instead of `<repos_dir>/<owner>/<name>.git`.
+    ///
+    /// Closed #272 fixed this class on the sync route and named
+    /// `repo_disk_path` as the sanitizing convention; it is in fact the
+    /// unvalidated join, and the fork route was never scoped.
+    #[sqlx::test]
+    async fn fork_rejects_an_empty_name(pool: PgPool) {
+        // `repo_store::for_testing` pins its on-disk root to /tmp, so the config
+        // the handler reads at the raw join must name the same root or the two
+        // halves of this test look at different directories.
+        let owner = "did:key:zFORKEMPTYNAMEAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let owner_slug = owner.replace([':', '/'], "_");
+        let repos_dir = std::path::PathBuf::from("/tmp");
+        let owner_dir = repos_dir.join(&owner_slug);
+        let _cleanup = OwnerDirGuard(owner_dir.clone());
+        let _ = std::fs::remove_dir_all(&owner_dir);
+
+        let state = test_state_with(pool, |cfg| cfg.repos_dir = repos_dir.clone()).await;
+        let repo = seed_repo(owner, "source-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        // Put the source where `repo_store.acquire` reads, so the handler gets
+        // past acquire and the empty name is what this test measures.
+        let source_path = crate::git::store::repo_disk_path(&repos_dir, owner, "source-repo");
+        std::fs::create_dir_all(&owner_dir).expect("owner dir");
+        crate::git::store::init_bare(&source_path).expect("init source repo");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/fork",
+                axum::routing::post(crate::api::repos::fork_repo),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner}/source-repo/fork");
+        let resp = router
+            .oneshot(signed_request_as(
+                owner,
+                Method::POST,
+                &uri,
+                Body::from(r#"{"name":""}"#),
+            ))
+            .await
+            .unwrap();
+
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read fork response body");
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an empty fork name must be refused, not turned into a '.git' path; body={body}"
+        );
+
+        // The barrier's real job: nothing may be created at <owner>/.git.
+        assert!(
+            !owner_dir.join(".git").exists(),
+            "an empty fork name must not materialize <repos_dir>/<owner>/.git"
+        );
+        let owner_short = owner.split(':').next_back().unwrap();
+        assert!(
+            state
+                .db
+                .get_repo(owner_short, "")
+                .await
+                .expect("get_repo")
+                .is_none(),
+            "no repo row may be created for a refused fork"
+        );
+    }
+
+    /// End-to-end companion to `fork_rejects_an_empty_name`, through the
+    /// PRODUCTION router with REAL Ed25519 signatures rather than an injected
+    /// `AuthenticatedDid`. `signed_request_as` only sets the extension, so the
+    /// unit test above proves the handler but says nothing about the request
+    /// actually clearing `require_signature` / `require_ucan_chain` and the
+    /// creation-route rate limiter that `build_router` puts in front of fork.
+    ///
+    /// It also pins the FULL set the barrier refuses, not just the empty name.
+    /// The handler's own allowlist is `char::is_alphanumeric`, which is
+    /// Unicode-aware and has no length or leading-character rule, so it admits
+    /// "", "cafe\u{301}"-style names, a leading '-', and a 101-char name.
+    /// `validate_repo_name` is ASCII-only and bounded, so routing fork through
+    /// the shared barrier narrows all five at once. The positive control is what
+    /// keeps that from being a blanket refusal: an ordinary name must still fork.
+    #[sqlx::test]
+    async fn fork_name_rules_match_the_shared_barrier_e2e(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+
+        // repo_store::for_testing pins its root to /tmp; the handler reads
+        // config.repos_dir at the join, so both must name the same root.
+        let repos_dir = std::path::PathBuf::from("/tmp");
+        let owner_slug = owner_did.replace([':', '/'], "_");
+        let owner_dir = repos_dir.join(&owner_slug);
+        let _cleanup = OwnerDirGuard(owner_dir.clone());
+
+        let state = test_state_with(pool, |cfg| cfg.repos_dir = repos_dir.clone()).await;
+        let source = seed_repo(&owner_did, "source-repo");
+        state
+            .db
+            .create_repo(&source)
+            .await
+            .expect("seed source repo");
+
+        let source_path = crate::git::store::repo_disk_path(&repos_dir, &owner_did, "source-repo");
+        std::fs::create_dir_all(&owner_dir).expect("owner dir");
+        crate::git::store::init_bare(&source_path).expect("init source repo");
+
+        let path = format!("/api/v1/repos/{short}/source-repo/fork");
+        let long_name = "x".repeat(101);
+
+        // Every name the handler's own allowlist admits but the shared barrier
+        // refuses. Each must now be a 400 through the real stack.
+        let refused: [(&str, &str); 4] = [
+            ("", "empty"),
+            ("caf\u{e9}", "non-ascii alphanumeric"),
+            ("-lead", "leading hyphen"),
+            (long_name.as_str(), "over the 100-char bound"),
+        ];
+        for (name, why) in refused {
+            let body = serde_json::to_vec(&serde_json::json!({ "name": name })).unwrap();
+            let signed = sign_request(&kp, "POST", &path, &body);
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(&path)
+                .header("content-type", "application/json")
+                .header("content-digest", signed.content_digest)
+                .header("signature-input", signed.signature_input)
+                .header("signature", signed.signature)
+                .body(Body::from(body))
+                .unwrap();
+            let resp = crate::server::build_router(state.clone())
+                .oneshot(req)
+                .await
+                .unwrap();
+            let status = resp.status();
+            let rb = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let rb = String::from_utf8_lossy(&rb);
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "a fork name that is {why} must be refused through the real router; body={rb}"
+            );
+        }
+
+        // The specific artifact the empty name used to leave behind.
+        assert!(
+            !owner_dir.join(".git").exists(),
+            "no fork may materialize <repos_dir>/<owner_slug>/.git"
+        );
+        assert!(
+            state
+                .db
+                .get_repo(&short, "")
+                .await
+                .expect("get_repo")
+                .is_none(),
+            "no repo row may be created for a refused fork"
+        );
+
+        // Positive control: an ordinary name still forks, all the way to disk
+        // and a row. Without this the four assertions above would also pass if
+        // the barrier rejected everything.
+        let body = serde_json::to_vec(&serde_json::json!({ "name": "forked-ok" })).unwrap();
+        let signed = sign_request(&kp, "POST", &path, &body);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(&path)
+            .header("content-type", "application/json")
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::from(body))
+            .unwrap();
+        let resp = crate::server::build_router(state.clone())
+            .oneshot(req)
+            .await
+            .unwrap();
+        let status = resp.status();
+        let rb = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rb = String::from_utf8_lossy(&rb);
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "an ordinary fork name must still succeed through the real router; body={rb}"
+        );
+        assert!(
+            owner_dir.join("forked-ok.git").is_dir(),
+            "the accepted fork must exist on disk at <repos_dir>/<owner_slug>/forked-ok.git"
+        );
+        assert!(
+            state
+                .db
+                .get_repo(&short, "forked-ok")
+                .await
+                .expect("get_repo")
+                .is_some(),
+            "the accepted fork must have a repo row"
+        );
+    }
+
+    /// Fixed-path temp cleanup that survives a panic (the suite's convention;
+    /// `TempDir` cannot own a path this test must compute up front).
+    struct OwnerDirGuard(std::path::PathBuf);
+    impl Drop for OwnerDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// N13: the task handlers bind the acting DID to the signer. A caller signed
     /// as B claiming delegator_did A is rejected before any DB write (DB-free).
     #[sqlx::test]

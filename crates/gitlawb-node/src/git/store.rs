@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 /// Initialize a new bare git repository with SHA-1 object format (default).
@@ -870,7 +870,19 @@ pub fn merge_branch(
 }
 
 /// Resolve a repo disk path: {repos_dir}/{owner_slug}/{repo_name}.git
-pub fn repo_disk_path(repos_dir: &Path, owner_did: &str, repo_name: &str) -> PathBuf {
+///
+/// UNVALIDATED, and test-only for that reason. It performs the bare join with no
+/// allowlist, no containment check and no component walk, so it accepts an empty
+/// or traversal-bearing name. Production code must use
+/// `git::repo_store::validated_repo_disk_path`; the last production caller was
+/// `fork_repo`, which used this and turned a `{"name":""}` request into a repo
+/// row at `<repos_dir>/<owner_slug>/.git`. The `cfg(test)` is the guard: a new
+/// production caller fails to compile rather than silently skipping the barrier.
+///
+/// Tests keep it because a fixture that must escape `repos_dir` cannot be built
+/// with the validated form.
+#[cfg(test)]
+pub fn repo_disk_path(repos_dir: &Path, owner_did: &str, repo_name: &str) -> std::path::PathBuf {
     // Sanitize the DID for use as a directory name
     let owner_slug = owner_did.replace([':', '/'], "_");
     repos_dir.join(owner_slug).join(format!("{repo_name}.git"))

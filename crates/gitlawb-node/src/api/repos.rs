@@ -3064,7 +3064,17 @@ pub async fn fork_repo(
         .await
         .map_err(|e| AppError::Git(e.to_string()))?;
 
-    let disk_path = store::repo_disk_path(&state.config.repos_dir, &forker_did, &fork_name);
+    // Same barrier every other repo-creation route goes through. The character
+    // allowlist above is vacuously true on an empty name, and `repo_disk_path`
+    // is a raw join, so without this a `{"name":""}` fork lands a row with an
+    // empty name at `<repos_dir>/<owner_slug>/.git`. Closed #272 fixed this
+    // class on the sync route and never scoped fork.
+    let disk_path = crate::git::repo_store::validated_repo_disk_path(
+        &state.config.repos_dir,
+        &forker_did,
+        &fork_name,
+    )
+    .map_err(|e| AppError::BadRequest(e.to_string()))?;
 
     // Clone the source repo as a mirror
     let output = std::process::Command::new("git")
