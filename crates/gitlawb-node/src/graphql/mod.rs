@@ -195,6 +195,7 @@ mod tests {
             "claimTask(id: \"missing\", assigneeDid: \"did:key:test\") { id }",
             "refUpdates(limit: 200) { repo }",
             "tasks(limit: 200) { id }",
+            "reposPage(limit: 200) { nodes { name } }",
         ] {
             let count = if field.starts_with("claim") { 8 } else { 2 };
             let fields = (0..count)

@@ -11,6 +11,14 @@ pub struct RepoType {
     pub created_at: String,
 }
 
+#[derive(SimpleObject)]
+pub struct RepoPageType {
+    pub nodes: Vec<RepoType>,
+    pub has_next_page: bool,
+    /// Position after the last returned visible repository; null for an empty page.
+    pub end_cursor: Option<String>,
+}
+
 #[derive(SimpleObject, Clone)]
 pub struct AgentTaskType {
     pub id: String,

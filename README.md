@@ -53,6 +53,7 @@ Good today:
 
 - Local or Docker node startup.
 - Postgres-backed repo metadata.
+- Bounded GraphQL queries with [repository pagination](docs/graphql-pagination.md).
 - Bare git repository storage.
 - Git smart-HTTP clone/fetch/push.
 - RFC 9421-signed writes.
