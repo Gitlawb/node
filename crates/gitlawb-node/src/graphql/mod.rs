@@ -181,11 +181,199 @@ mod tests {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/unused")
             .unwrap();
+        production_test_schema_with_db(Arc::new(Db::for_testing(pool)))
+    }
+
+    fn production_test_schema_with_db(db: Arc<Db>) -> GitlawbSchema {
         build_schema(
-            Arc::new(Db::for_testing(pool)),
+            db,
             tokio::sync::broadcast::channel(1).0,
             tokio::sync::broadcast::channel(1).0,
         )
+    }
+
+    #[tokio::test]
+    async fn ref_update_subscription_alias_budget() {
+        assert_subscription_alias_budget("refUpdates { repo }").await;
+    }
+
+    #[tokio::test]
+    async fn task_event_subscription_alias_budget() {
+        assert_subscription_alias_budget("taskEvents { taskId }").await;
+    }
+
+    async fn assert_subscription_alias_budget(field: &str) {
+        use futures::StreamExt;
+        use std::time::Duration;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        let (ref_tx, _) = tokio::sync::broadcast::channel(16);
+        let (task_tx, _) = tokio::sync::broadcast::channel(16);
+        let schema = build_schema(
+            Arc::new(Db::for_testing(pool)),
+            ref_tx.clone(),
+            task_tx.clone(),
+        );
+        for count in [7, 8] {
+            let fields = (0..count)
+                .map(|n| format!("r{n}: {field}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let query = format!("subscription {{ {fields} }}");
+            let mut responses = Box::pin(schema.execute_stream(query));
+            if count == 8 {
+                let response = tokio::time::timeout(Duration::from_secs(1), responses.next())
+                    .await
+                    .expect("over-budget subscriptions must reject before waiting for events")
+                    .expect("the validation error must be returned");
+                assert_eq!(response.errors.len(), 1);
+                assert_eq!(response.errors[0].message, "Query is too complex.");
+                assert_eq!(ref_tx.receiver_count() + task_tx.receiver_count(), 0);
+                continue;
+            }
+            // Poll the accepted operation far enough to register its receivers.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), responses.next())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(ref_tx.receiver_count() + task_tx.receiver_count(), 7);
+            let _ = ref_tx.send(RefUpdateBroadcast {
+                repo: "owner/repo".into(),
+                ref_name: "refs/heads/main".into(),
+                old_sha: "0".repeat(40),
+                new_sha: "1".repeat(40),
+                pusher_did: "did:key:test".into(),
+                node_did: "did:key:node".into(),
+                timestamp: "2026-01-01T00:00:00Z".into(),
+                owner_did: "did:key:test".into(),
+            });
+            let _ = task_tx.send(TaskEventBroadcast {
+                task_id: "task".into(),
+                old_status: "pending".into(),
+                new_status: "claimed".into(),
+                by_did: "did:key:test".into(),
+                at: "2026-01-01T00:00:00Z".into(),
+            });
+            let response = tokio::time::timeout(Duration::from_secs(1), responses.next())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+            assert_ne!(response.data, Value::Null);
+            drop(responses);
+            assert_eq!(ref_tx.receiver_count() + task_tx.receiver_count(), 0);
+        }
+    }
+
+    #[sqlx::test]
+    async fn production_mutation_budget_accepts_seven_and_rejects_eight(pool: sqlx::PgPool) {
+        let db = Arc::new(Db::for_testing(pool));
+        db.run_migrations().await.unwrap();
+        let caller = "did:key:reviewer";
+        let now = chrono::Utc::now().to_rfc3339();
+        for index in 0..8 {
+            db.create_task(&crate::db::AgentTask {
+                id: format!("task-{index}"),
+                repo_id: None,
+                kind: "test".into(),
+                status: "pending".into(),
+                delegator_did: caller.into(),
+                assignee_did: None,
+                capability: "test".into(),
+                ucan_token: None,
+                payload: None,
+                result: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                deadline: None,
+            })
+            .await
+            .unwrap();
+        }
+        let schema = production_test_schema_with_db(db.clone());
+        for count in [8, 7] {
+            let fields = (0..count)
+                .map(|n| {
+                    format!("r{n}: claimTask(id: \"task-{n}\", assigneeDid: \"{caller}\") {{ id }}")
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let response = schema
+                .execute(
+                    async_graphql::Request::new(format!("mutation {{ {fields} }}"))
+                        .data(crate::auth::AuthenticatedDid(caller.into())),
+                )
+                .await;
+            if count == 8 {
+                assert_eq!(response.errors.len(), 1);
+                assert_eq!(response.errors[0].message, "Query is too complex.");
+                assert_eq!(
+                    db.list_tasks(Some("pending"), None, 8).await.unwrap().len(),
+                    8
+                );
+                continue;
+            }
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+            assert_eq!(
+                response
+                    .data
+                    .into_json()
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .len(),
+                7
+            );
+            assert_eq!(
+                db.list_tasks(Some("claimed"), Some(caller), 8)
+                    .await
+                    .unwrap()
+                    .len(),
+                7
+            );
+            assert_eq!(
+                db.get_task("task-7").await.unwrap().unwrap().status,
+                "pending"
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn production_list_cost_scales_with_the_same_alias_count(pool: sqlx::PgPool) {
+        let db = Arc::new(Db::for_testing(pool));
+        db.run_migrations().await.unwrap();
+        let schema = production_test_schema_with_db(db);
+        for (field, selection) in [
+            ("refUpdates", "repo"),
+            ("tasks", "id"),
+            ("reposPage", "nodes { name }"),
+        ] {
+            for limit in [1, 200] {
+                let fields = (0..2)
+                    .map(|n| format!("r{n}: {field}(limit: {limit}) {{ {selection} }}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let response = schema.execute(format!("{{ {fields} }}")).await;
+                if limit == 200 {
+                    assert_eq!(response.errors.len(), 1);
+                    assert_eq!(response.errors[0].message, "Query is too complex.");
+                    continue;
+                }
+                assert!(response.errors.is_empty(), "{field}: {:?}", response.errors);
+                assert_eq!(
+                    response
+                        .data
+                        .into_json()
+                        .unwrap()
+                        .as_object()
+                        .unwrap()
+                        .len(),
+                    2
+                );
+            }
+        }
     }
 
     #[tokio::test]
