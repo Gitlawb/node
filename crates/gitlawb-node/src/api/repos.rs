@@ -476,11 +476,8 @@ pub async fn get_blob(
         ));
     }
 
-    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
-    let gate_path = format!("/{file_path}");
-    let (record, _rules) =
-        crate::api::authorize_repo_read(&state, &owner, &name, caller, &gate_path).await?;
-
+    // Charge the source before visibility queries, retaining its permit through
+    // authorization, Git work, and response delivery.
     let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
     let caller_permit = acquire_read_caller_permit(
         &state.git_read_per_caller,
@@ -488,6 +485,11 @@ pub async fn get_blob(
         &name,
         "REST blob",
     )?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let gate_path = format!("/{file_path}");
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, &gate_path).await?;
+
     let blob_permit = git_permit(&state.git_blob_semaphore)?;
     let permit = git_permit(&state.git_read_semaphore)?;
 
@@ -501,7 +503,7 @@ pub async fn get_blob(
         tracing::warn!(repo = %name, "repo acquire timed out; shedding blob request with 503");
         AppError::Overloaded("git service acquisition timed out, retry shortly".into())
     })?
-    .map_err(|e| AppError::Git(e.to_string()))?;
+    .map_err(AppError::Internal)?;
 
     let default_branch = record.default_branch.clone();
     let read_path = file_path.to_string();
@@ -3633,24 +3635,66 @@ mod tests {
     #[cfg(unix)]
     #[sqlx::test]
     async fn blob_cat_file_failure_is_opaque(pool: sqlx::PgPool) {
-        use axum::response::IntoResponse;
         use http_body_util::BodyExt;
         let tmp = tempfile::TempDir::new().unwrap();
-        let fake = write_fake_git(
-            tmp.path(),
-            "#!/bin/sh\necho 'private-git-stderr /internal/repo.git' >&2\nexit 1\n",
+        for (index, failure) in [
+            "echo 'private-git-stderr /internal/repo.git' >&2; exit 1",
+            "echo 'error: private-git-stderr /internal/repo.git' >&2; exit 0",
+            "if [ \"$2\" = --batch-check ]; then echo '1111111111111111111111111111111111111111 blob 1'; exit 0; fi\necho 'private-git-stderr /internal/repo.git' >&2; exit 1",
+        ].iter().enumerate() {
+            let fake = write_fake_git(tmp.path(), &format!(
+                "#!/bin/sh\nif [ \"$1\" = rev-parse ]; then exit 0; fi\n{failure}\n"
+            ));
+            let owner = format!("z6bloberror{index}");
+            let state = f4_state_with_repo(pool.clone(), tmp.path(), &fake, &owner, "repo", false).await;
+            let response = blob_route_request(state, &owner, "203.0.113.31:5000").await;
+            assert_eq!(response.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["message"], crate::error::INTERNAL_ERROR_MESSAGE);
+            let body = body.to_string();
+            assert!(!body.contains("private-git-stderr"));
+            assert!(!body.contains("/internal/repo.git"));
+        }
+    }
+
+    async fn blob_route_request(state: AppState, owner: &str, peer: &str) -> Response {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let router = axum::Router::new()
+            .route(
+                "/repos/{owner}/{repo}/blob/{*path}",
+                axum::routing::get(get_blob),
+            )
+            .with_state(state);
+        let mut request = Request::builder()
+            .uri(format!("/repos/{owner}/repo/blob/file.txt"))
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(peer.parse::<std::net::SocketAddr>().unwrap()));
+        router.oneshot(request).await.unwrap()
+    }
+
+    #[sqlx::test]
+    async fn blob_acquire_failure_is_opaque(pool: sqlx::PgPool) {
+        use http_body_util::BodyExt;
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state
+            .db
+            .upsert_mirror_repo("z6blobacquire", "repo", "/unused", None, false)
+            .await
+            .unwrap();
+        // An invalid configured storage root makes the real acquire() fail before Git.
+        let tmp = tempfile::TempDir::new().unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(
+            tmp.path().join("private-storage").join("..").join("repos"),
+            pool,
         );
-        let state = f4_state_with_repo(pool, tmp.path(), &fake, "z6bloberror", "repo", false).await;
-        let response = get_blob(
-            State(state),
-            Path(("z6bloberror".into(), "repo".into(), "file.txt".into())),
-            crate::rate_limit::PeerAddr(None),
-            axum::http::HeaderMap::new(),
-            None,
-        )
-        .await
-        .unwrap_err()
-        .into_response();
+        let response = blob_route_request(state, "z6blobacquire", "203.0.113.31:5000").await;
         assert_eq!(
             response.status(),
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
@@ -3658,9 +3702,113 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["message"], crate::error::INTERNAL_ERROR_MESSAGE);
-        let body = body.to_string();
-        assert!(!body.contains("private-git-stderr"));
-        assert!(!body.contains("/internal/repo.git"));
+        assert!(!body.to_string().contains("parent-directory"));
+    }
+
+    #[tokio::test]
+    async fn blob_capacity_sheds_before_database_access() {
+        use axum::http::StatusCode;
+        use http_body_util::BodyExt;
+        for capacity in ["caller", "blob", "global"] {
+            let mut state = crate::test_support::test_state_lazy();
+            // A misplaced DB lookup returns db_unavailable immediately, without a timeout.
+            state.db.pool().close().await;
+            state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+            state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+            let caller_slot = (capacity == "caller").then(|| {
+                state
+                    .git_read_per_caller
+                    .try_acquire("203.0.113.31")
+                    .unwrap()
+            });
+            if capacity == "blob" {
+                state.git_blob_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+            }
+            if capacity == "global" {
+                state.git_read_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+            }
+            let response =
+                blob_route_request(state.clone(), "z6blobcap", "203.0.113.31:5000").await;
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{capacity}"
+            );
+            assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"], "overloaded", "{capacity}");
+            if capacity == "caller" {
+                let other =
+                    blob_route_request(state.clone(), "z6blobcap", "203.0.113.32:5000").await;
+                assert_eq!(other.status(), StatusCode::SERVICE_UNAVAILABLE);
+                let bytes = other.into_body().collect().await.unwrap().to_bytes();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["error"], crate::error::DB_UNAVAILABLE_CODE);
+                drop(caller_slot);
+                let released = blob_route_request(state, "z6blobcap", "203.0.113.31:5000").await;
+                assert_eq!(released.status(), StatusCode::SERVICE_UNAVAILABLE);
+                let bytes = released.into_body().collect().await.unwrap().to_bytes();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["error"], crate::error::DB_UNAVAILABLE_CODE);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn blob_route_maps_oversize_and_timeout(pool: sqlx::PgPool) {
+        use axum::http::StatusCode;
+        use http_body_util::BodyExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        for (owner, command, expected) in [
+            (
+                "z6blobsize",
+                format!(
+                    "echo '1111111111111111111111111111111111111111 blob {}'",
+                    MAX_SERVED_BLOB_BYTES + 1
+                ),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (
+                "z6blobtime",
+                "exec sleep 30".into(),
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+        ] {
+            let fake = write_fake_git(
+                tmp.path(),
+                &format!("#!/bin/sh\nif [ \"$1\" = rev-parse ]; then exit 0; fi\n{command}\n"),
+            );
+            let mut state =
+                f4_state_with_repo(pool.clone(), tmp.path(), &fake, owner, "repo", false).await;
+            let mut config = (*state.config).clone();
+            config.git_service_timeout_secs = 1;
+            state.config = std::sync::Arc::new(config);
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                blob_route_request(state.clone(), owner, "203.0.113.31:5000"),
+            )
+            .await
+            .expect("blob deadline must terminate the Git child");
+            assert_eq!(response.status(), expected);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body["error"],
+                if expected == StatusCode::PAYLOAD_TOO_LARGE {
+                    "payload_too_large"
+                } else {
+                    "git_timeout"
+                }
+            );
+            assert!(state.git_read_semaphore.available_permits() > 0);
+            assert!(state.git_blob_semaphore.available_permits() > 0);
+            assert!(state
+                .git_read_per_caller
+                .try_acquire("203.0.113.31")
+                .is_some());
+        }
     }
 
     #[test]
