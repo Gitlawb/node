@@ -330,6 +330,8 @@ pub struct AppState {
     /// costs the node real work per request whether or not anything is visible.
     /// Keyed on the resolved client IP via `push_limiter_trust`. Layered on
     /// `task_read_routes` via `rate_limit_by_ip`.
+    /// The same per-IP hourly budget applies to GraphQL `tasks` / `task`
+    /// queries and WebSocket task queries via `TaskReadBrake`.
     pub task_read_rate_limiter: RateLimiter,
     /// The `git` executable the served-git withheld-blob walk spawns. Production is
     /// `"git"` (resolved via PATH); injectable so a fake `git` can drive the walk's
