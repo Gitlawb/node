@@ -1822,6 +1822,22 @@ impl Db {
         Ok(row.map(|r| r.get::<String, _>("proof_token")))
     }
 
+    /// Return quarantined IDs from a bounded candidate page in one query.
+    pub async fn quarantined_repo_ids_in(
+        &self,
+        repo_ids: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
+        if repo_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM repos WHERE id = ANY($1) AND quarantined = TRUE")
+                .bind(repo_ids)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(ids.into_iter().collect())
+    }
+
     /// Whether a repo row is quarantined (admitted as a mirror but withheld from
     /// serve/clone and listings pending operator review).
     pub async fn is_repo_quarantined(&self, repo_id: &str) -> Result<bool> {
