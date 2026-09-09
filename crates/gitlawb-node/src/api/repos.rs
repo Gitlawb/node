@@ -2921,7 +2921,7 @@ struct FederatedPeerPage {
     truncated: bool,
 }
 
-struct BoundedFederatedPeerRows(Vec<serde_json::Value>);
+struct BoundedFederatedPeerRows(Vec<serde_json::Value>, bool);
 
 impl<'de> serde::Deserialize<'de> for BoundedFederatedPeerRows {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
@@ -2942,12 +2942,10 @@ impl<'de> serde::Deserialize<'de> for BoundedFederatedPeerRows {
                 A: serde::de::SeqAccess<'de>,
             {
                 let mut repos = Vec::with_capacity(MAX_FEDERATED_PEER_REPOS);
-                while let Some(repo) = rows.next_element::<serde_json::Value>()? {
-                    if repos.len() == MAX_FEDERATED_PEER_REPOS {
-                        return Err(<A::Error as serde::de::Error>::custom(
-                            "peer repository row limit exceeded",
-                        ));
-                    }
+                while repos.len() < MAX_FEDERATED_PEER_REPOS {
+                    let Some(repo) = rows.next_element::<serde_json::Value>()? else {
+                        return Ok(BoundedFederatedPeerRows(repos, false));
+                    };
                     if !repo.is_object() {
                         return Err(<A::Error as serde::de::Error>::custom(
                             "peer repository row is not an object",
@@ -2955,7 +2953,11 @@ impl<'de> serde::Deserialize<'de> for BoundedFederatedPeerRows {
                     }
                     repos.push(repo);
                 }
-                Ok(BoundedFederatedPeerRows(repos))
+                let mut truncated = false;
+                while rows.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    truncated = true;
+                }
+                Ok(BoundedFederatedPeerRows(repos, truncated))
             }
         }
 
@@ -3036,8 +3038,8 @@ async fn fetch_federated_peer_repos(
         body.extend_from_slice(&chunk);
     }
 
-    let BoundedFederatedPeerRows(repos) = serde_json::from_slice(&body).ok()?;
-    let truncated = total.is_some_and(|total| total > repos.len() as u64);
+    let BoundedFederatedPeerRows(repos, overflow) = serde_json::from_slice(&body).ok()?;
+    let truncated = overflow || total.is_some_and(|total| total > repos.len() as u64);
     Some(FederatedPeerPage { repos, truncated })
 }
 
@@ -3067,8 +3069,20 @@ where
     let mut responses = stream::iter(fetches).buffer_unordered(FEDERATED_PEER_CONCURRENCY);
     let mut nodes_queried = 0;
 
-    while let Some(response) = responses.next().await {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let response = match tokio::time::timeout_at(deadline, responses.next()).await {
+            Ok(Some(response)) => response,
+            Ok(None) => break,
+            Err(_) => {
+                aggregate.truncated = true;
+                tracing::warn!("federated aggregation deadline exceeded");
+                break;
+            }
+        };
         let Some(response) = response else {
+            aggregate.truncated = true;
+            tracing::warn!("federated peer fetch failed or exceeded its response limits");
             continue;
         };
         nodes_queried += 1;
@@ -3092,7 +3106,8 @@ where
 ///
 /// Query all known peers for their public repos and return a merged view of
 /// the network. Each repo includes a `node_url` and `node_did` indicating
-/// which node hosts it. Results from unreachable peers are silently omitted.
+/// which node hosts it. Peer work stops after ten seconds or 200 peers; omitted
+/// results set `truncated`. The route admits 12 requests per minute per client IP.
 pub async fn list_federated_repos(
     State(state): State<AppState>,
     auth: Option<Extension<AuthenticatedDid>>,
@@ -3141,7 +3156,10 @@ pub async fn list_federated_repos(
     // Keep peer work bounded even when the table contains many reachable rows.
     // Dropping the buffered stream at the aggregate ceiling cancels its in-flight
     // request futures and leaves the remaining iterator entries unpolled.
-    let peers = state.db.list_peers().await.unwrap_or_default();
+    // One extra row detects omitted peers without materializing the full table.
+    let mut peers = state.db.list_federation_peers(201).await?;
+    aggregate.truncated |= peers.len() > 200;
+    peers.truncate(200);
     let fetches: Vec<_> = peers
         .into_iter()
         .filter(|p| p.last_ping_ok && !p.http_url.is_empty())
@@ -3538,6 +3556,58 @@ mod tests {
     const OWNER_SHORT: &str = "z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
     const STRANGER_DID: &str = "did:key:z6Mkffonly5tranger0000000000000000000000000000000";
 
+    #[sqlx::test]
+    async fn federated_peer_query_is_bounded(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        sqlx::query("INSERT INTO peers (did, http_url, last_ping_ok, announced_at) SELECT 'peer-' || n, 'https://example.com', TRUE, '2026-01-01T00:00:00Z' FROM generate_series(1, 205) n")
+            .execute(&pool).await.unwrap();
+        let peers = state.db.list_federation_peers(1000).await.unwrap();
+        assert_eq!(peers.len(), 201);
+        assert_eq!(state.db.list_federation_peers(2).await.unwrap().len(), 2);
+        assert!(state.db.list_federation_peers(0).await.unwrap().is_empty());
+    }
+
+    #[sqlx::test]
+    async fn federated_route_brakes_repeated_anonymous_requests(pool: sqlx::PgPool) {
+        use tower::ServiceExt;
+        let mut state = crate::test_support::test_state(pool).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        let router = crate::server::build_router(state);
+        for n in 0..13 {
+            let mut request = axum::http::Request::builder()
+                .uri("/api/v1/repos/federated")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                "203.0.113.42:5000".parse::<std::net::SocketAddr>().unwrap(),
+            ));
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                if n < 12 {
+                    StatusCode::OK
+                } else {
+                    StatusCode::TOO_MANY_REQUESTS
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn federated_aggregate_deadline_returns_partial_results() {
+        let mut budget = FederatedRepoBudget::new(0, 1000, MAX_FEDERATED_REPO_JSON_BYTES);
+        let fetches =
+            (0..8).map(|_| async { std::future::pending::<Option<FederatedPeerRepos>>().await });
+        let nodes = tokio::time::timeout(
+            std::time::Duration::from_secs(12),
+            collect_federated_fetches(fetches, &mut budget),
+        )
+        .await
+        .expect("the aggregate must stop before the caller deadline");
+        assert_eq!(nodes, 0);
+        assert!(budget.truncated);
+    }
+
     #[tokio::test]
     async fn federated_peer_response_enforces_byte_and_row_ceilings() {
         let mut row_server = mockito::Server::new_async().await;
@@ -3554,12 +3624,12 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        assert!(
+        let page =
             fetch_federated_peer_repos(&client, &format!("{}/api/v1/repos", row_server.url()))
                 .await
-                .is_none(),
-            "a peer page above the row ceiling must be omitted"
-        );
+                .unwrap();
+        assert_eq!(page.repos.len(), MAX_FEDERATED_PEER_REPOS);
+        assert!(page.truncated);
         row_mock.assert_async().await;
 
         let byte_body = serde_json::to_string(&vec![serde_json::json!({

@@ -2709,6 +2709,26 @@ impl Db {
         Ok(())
     }
 
+    pub async fn list_federation_peers(&self, limit: i64) -> Result<Vec<PeerRecord>> {
+        let rows = sqlx::query(
+            "SELECT did, http_url, last_seen, last_ping_ok, announced_at
+             FROM peers WHERE last_ping_ok = TRUE AND http_url <> '' ORDER BY last_seen DESC NULLS LAST, did LIMIT $1",
+        )
+        .bind(limit.clamp(0, 201))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| PeerRecord {
+                did: r.get("did"),
+                http_url: r.get("http_url"),
+                last_seen: r.get("last_seen"),
+                last_ping_ok: r.get::<bool, _>("last_ping_ok"),
+                announced_at: r.get("announced_at"),
+            })
+            .collect())
+    }
+
     pub async fn list_peers(&self) -> Result<Vec<PeerRecord>> {
         let rows = sqlx::query(
             "SELECT did, http_url, last_seen, last_ping_ok, announced_at
