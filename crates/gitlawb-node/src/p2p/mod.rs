@@ -33,6 +33,8 @@ pub const REF_UPDATES_TOPIC: &str = "gitlawb/ref-updates/v1";
 // Identify is an untrusted address source. Keep enough entries for normal
 // multi-homed peers while bounding both one peer and the whole routing table.
 const IDENTIFY_ADDRESS_LIMIT: usize = 8;
+// Bound canonicalization and sorting too, including rejected/duplicate entries.
+const IDENTIFY_REPORT_ADDRESS_LIMIT: usize = 64;
 const IDENTIFY_NEW_ADDRESS_LIMIT: usize = 8;
 const IDENTIFY_GLOBAL_ADDRESS_LIMIT: usize = 1024;
 const IDENTIFY_ADDRESS_WINDOW: Duration = Duration::from_secs(60);
@@ -201,6 +203,14 @@ impl IdentifyAddressBook {
         if self.peers.contains_key(&peer_id) {
             changes.removed.extend(self.expire_peer(peer_id, now));
         }
+        let reported = addresses
+            .iter()
+            .take(IDENTIFY_REPORT_ADDRESS_LIMIT)
+            .filter_map(|address| address.clone().with_p2p(peer_id).ok())
+            .collect::<HashSet<_>>();
+        if reported.is_empty() && !self.peers.contains_key(&peer_id) {
+            return changes;
+        }
         self.peers
             .entry(peer_id)
             .or_insert_with(|| IdentifyPeerAddresses {
@@ -216,20 +226,21 @@ impl IdentifyAddressBook {
             }
         }
 
-        let reported = addresses
-            .iter()
-            .filter_map(|address| address.clone().with_p2p(peer_id).ok())
-            .collect::<HashSet<_>>();
-
-        // Refresh every address in the report before admitting anything new.
-        // This prevents an oversized report from evicting an address merely
-        // because it appeared later in the input.
+        // Refresh every retained address in the bounded report before admission.
+        let mut refreshed = Vec::new();
         if let Some(state) = self.peers.get_mut(&peer_id) {
             for existing in &mut state.addresses {
                 if reported.contains(&existing.address) {
                     existing.expires_at = now + IDENTIFY_ADDRESS_TTL;
+                    refreshed.push(existing.address.clone());
                 }
             }
+        }
+        // Global eviction follows refresh recency, so an active address does
+        // not lose its slot just because it was originally admitted first.
+        for address in refreshed {
+            self.remove_insertion_token(peer_id, &address);
+            self.insertion_order.push_back((peer_id, address));
         }
 
         let mut new_addresses = self
@@ -733,6 +744,93 @@ mod tests {
         format!("/ip4/192.0.2.{octet}/udp/{port}/quic-v1")
             .parse::<Multiaddr>()
             .unwrap()
+    }
+
+    #[test]
+    fn identify_empty_reports_do_not_retain_peer_entries() {
+        let now = Instant::now();
+        let mut book = IdentifyAddressBook::default();
+        let foreign = identify_address(PeerId::random(), 1, 10_000);
+        for _ in 0..IDENTIFY_GLOBAL_ADDRESS_LIMIT + 1 {
+            let peer = PeerId::random();
+            assert_eq!(
+                book.update(peer, now, &[]),
+                IdentifyAddressChanges::default()
+            );
+            assert_eq!(
+                book.update(peer, now, std::slice::from_ref(&foreign)),
+                IdentifyAddressChanges::default()
+            );
+        }
+        assert!(book.peers.is_empty());
+        assert!(book.insertion_order.is_empty());
+        assert_eq!(book.address_count, 0);
+    }
+
+    #[test]
+    fn identify_report_processing_stops_at_the_input_limit() {
+        let peer = PeerId::random();
+        let now = Instant::now();
+        let foreign = identify_address(PeerId::random(), 1, 10_000);
+        let accepted = identify_address(peer, 2, 10_001);
+        let ignored = identify_address(peer, 3, 10_002);
+        let mut report = vec![foreign; IDENTIFY_REPORT_ADDRESS_LIMIT - 1];
+        report.push(accepted.clone());
+        report.push(ignored);
+        let mut book = IdentifyAddressBook::default();
+        let changes = book.update(peer, now, &report);
+        assert_eq!(changes.added, vec![accepted]);
+        assert!(changes.removed.is_empty());
+        assert_eq!(book.address_count, 1);
+    }
+
+    #[test]
+    fn identify_addresses_grow_without_eviction_below_the_peer_cap() {
+        let peer = PeerId::random();
+        let now = Instant::now();
+        let first = identify_address(peer, 1, 10_000);
+        let second = identify_address(peer, 2, 10_001);
+        let mut book = IdentifyAddressBook::default();
+        book.update(peer, now, std::slice::from_ref(&first));
+        let changes = book.update(
+            peer,
+            now + IDENTIFY_ADDRESS_WINDOW,
+            std::slice::from_ref(&second),
+        );
+        assert_eq!(changes.added, vec![second]);
+        assert!(changes.removed.is_empty());
+        assert_eq!(book.peers[&peer].addresses.len(), 2);
+        assert_eq!(book.address_count, 2);
+    }
+
+    #[test]
+    fn identify_global_eviction_preserves_refreshed_addresses() {
+        let now = Instant::now();
+        let mut book = IdentifyAddressBook::default();
+        let peers = (0..IDENTIFY_GLOBAL_ADDRESS_LIMIT)
+            .map(|index| {
+                let peer = PeerId::random();
+                let address = identify_address(peer, 1, 10_000 + index as u16);
+                book.update(peer, now, std::slice::from_ref(&address));
+                (peer, address)
+            })
+            .collect::<Vec<_>>();
+        let (peer, refreshed) = &peers[0];
+        let new_address = identify_address(*peer, 2, 30_000);
+        let changes = book.update(
+            *peer,
+            now + IDENTIFY_ADDRESS_WINDOW,
+            &[new_address.clone(), refreshed.clone()],
+        );
+        assert_eq!(changes.added, vec![new_address]);
+        assert_eq!(changes.removed, vec![peers[1].clone()]);
+        assert!(book.peers[peer]
+            .addresses
+            .iter()
+            .any(|a| &a.address == refreshed));
+        assert_eq!(book.address_count, IDENTIFY_GLOBAL_ADDRESS_LIMIT);
+        assert_eq!(book.insertion_order.len(), book.address_count);
+        assert_eq!(book.peers.len(), IDENTIFY_GLOBAL_ADDRESS_LIMIT - 1);
     }
 
     #[test]
