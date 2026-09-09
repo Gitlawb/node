@@ -114,8 +114,13 @@ pub async fn assert_denied(resp: reqwest::Response, expected: u16, withheld: &[&
         .expect("read denial body: an unreadable denial cannot be certified leak-free");
     if let Err(reason) = check_denied_with_headers(status, &body, &header_text, expected, withheld)
     {
-        let redacted = redact_withheld(&reason, withheld);
-        panic!("{redacted}");
+        // Panic with a fixed string: CodeQL's taint analysis traces withheld
+        // tokens from check_denied through redact_withheld into the panic sink,
+        // even though redact_withheld strips them at runtime. A fixed message
+        // keeps no tainted data on the sink path. The test name identifies
+        // which probe failed; check_denied's unit tests cover the error detail.
+        let _ = redact_withheld(&reason, withheld);
+        panic!("deny assertion failed: status/body/header leak check");
     }
 }
 

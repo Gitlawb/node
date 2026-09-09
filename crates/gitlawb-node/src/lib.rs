@@ -3639,9 +3639,16 @@ mod lock_pool_sizing_tests {
 
 #[cfg(test)]
 mod gossip_ssrf_tests {
-    use super::{gossip_ping_round, peer_ping_db_update, ping_peer_readiness};
+    use super::{
+        gossip_ping_round, peer_ping_db_update, ping_peer_readiness,
+        ping_peer_readiness_with_timeout,
+    };
+    use axum::{http::StatusCode, routing::get, Router};
     use sqlx::PgPool;
     use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     // Build the client exactly as production does (super::build_http_client) so
     // these tests bind the redirect guarantee to the real shared client the
@@ -3811,6 +3818,129 @@ mod gossip_ssrf_tests {
     async fn ping_peer_health_reports_unhealthy_on_connection_error() {
         let ok = ping_peer_readiness(&production_http_client(), "http://127.0.0.1:1").await;
         assert!(!ok, "a connection error must count as an unhealthy peer");
+    }
+
+    // Restored from the lib+bin split (merge-base main.rs). These four tests
+    // were dropped when the module moved to lib.rs; production gossip behavior
+    // is unchanged, but CI guardrails shrank. No production code change needed.
+
+    #[tokio::test]
+    async fn ping_peer_readiness_reports_success_on_200() {
+        let mut server = mockito::Server::new_async().await;
+        let _ready = server
+            .mock("GET", "/ready")
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
+
+        assert!(ok, "a 200 /ready must count as a ready peer");
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_ignores_liveness_only_health() {
+        let mut server = mockito::Server::new_async().await;
+        let health = server
+            .mock("GET", "/health")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let ready = server
+            .mock("GET", "/ready")
+            .with_status(503)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
+
+        assert!(!ok, "a peer with an unavailable database must not be ready");
+        health.assert_async().await;
+        ready.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_falls_back_for_legacy_peer() {
+        let mut server = mockito::Server::new_async().await;
+        let ready = server
+            .mock("GET", "/ready")
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        let health = server
+            .mock("GET", "/health")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
+
+        assert!(
+            ok,
+            "a legacy peer with a healthy /health must remain reachable"
+        );
+        ready.assert_async().await;
+        health.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_legacy_fallback_shares_deadline() {
+        let health_requests = Arc::new(AtomicUsize::new(0));
+        let health_requests_for_route = Arc::clone(&health_requests);
+        let app = Router::new()
+            .route(
+                "/ready",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    StatusCode::NOT_FOUND
+                }),
+            )
+            .route(
+                "/health",
+                get(move || {
+                    let health_requests = Arc::clone(&health_requests_for_route);
+                    async move {
+                        health_requests.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        StatusCode::OK
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind delayed legacy peer");
+        let peer_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("delayed legacy peer has no local address")
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("delayed legacy peer failed");
+        });
+
+        let ok = ping_peer_readiness_with_timeout(
+            &production_http_client(),
+            &peer_url,
+            // Each response arrives within 350 ms, but the two serial requests
+            // cannot both finish within one 350 ms probe budget.
+            Duration::from_millis(350),
+        )
+        .await;
+
+        assert!(!ok, "the fallback must not start a fresh timeout budget");
+        assert_eq!(
+            health_requests.load(Ordering::Relaxed),
+            1,
+            "the delayed 404 should reach the legacy fallback"
+        );
+        server.abort();
     }
 }
 
