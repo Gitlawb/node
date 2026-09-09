@@ -7,10 +7,10 @@
 //! The node's PeerId is derived from its Ed25519 identity keypair,
 //! so the gitlawb DID and libp2p PeerId share the same key.
 
-use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -29,6 +29,17 @@ use crate::db::{Db, ReceivedRefUpdate};
 
 /// Topic for ref-update notifications published after every push.
 pub const REF_UPDATES_TOPIC: &str = "gitlawb/ref-updates/v1";
+
+// Identify is an untrusted address source. Keep enough entries for normal
+// multi-homed peers while bounding both one peer and the whole routing table.
+const IDENTIFY_ADDRESS_LIMIT: usize = 8;
+// Bound canonicalization and sorting too, including rejected/duplicate entries.
+const IDENTIFY_REPORT_ADDRESS_LIMIT: usize = 64;
+const IDENTIFY_NEW_ADDRESS_LIMIT: usize = 8;
+const IDENTIFY_GLOBAL_ADDRESS_LIMIT: usize = 1024;
+const IDENTIFY_ADDRESS_WINDOW: Duration = Duration::from_secs(60);
+const IDENTIFY_ADDRESS_TTL: Duration = Duration::from_secs(30 * 60);
+const IDENTIFY_ADDRESS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A ref-update event published to Gossipsub when a push lands.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -155,6 +166,242 @@ fn did_to_kad_key(did: &str) -> kad::RecordKey {
     kad::RecordKey::new(&format!("/gitlawb/did/{did}").as_bytes())
 }
 
+#[derive(Debug)]
+struct IdentifyAddress {
+    address: Multiaddr,
+    expires_at: Instant,
+}
+
+#[derive(Debug)]
+struct IdentifyPeerAddresses {
+    addresses: VecDeque<IdentifyAddress>,
+    window_started: Instant,
+    new_addresses: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct IdentifyAddressChanges {
+    added: Vec<Multiaddr>,
+    removed: Vec<(PeerId, Multiaddr)>,
+}
+
+#[derive(Debug, Default)]
+struct IdentifyAddressBook {
+    peers: HashMap<PeerId, IdentifyPeerAddresses>,
+    insertion_order: VecDeque<(PeerId, Multiaddr)>,
+    address_count: usize,
+}
+
+impl IdentifyAddressBook {
+    fn update(
+        &mut self,
+        peer_id: PeerId,
+        now: Instant,
+        addresses: &[Multiaddr],
+    ) -> IdentifyAddressChanges {
+        let mut changes = IdentifyAddressChanges::default();
+        if self.peers.contains_key(&peer_id) {
+            changes.removed.extend(self.expire_peer(peer_id, now));
+        }
+        let reported = addresses
+            .iter()
+            .take(IDENTIFY_REPORT_ADDRESS_LIMIT)
+            .filter_map(|address| address.clone().with_p2p(peer_id).ok())
+            .collect::<HashSet<_>>();
+        if reported.is_empty() && !self.peers.contains_key(&peer_id) {
+            return changes;
+        }
+        self.peers
+            .entry(peer_id)
+            .or_insert_with(|| IdentifyPeerAddresses {
+                addresses: VecDeque::new(),
+                window_started: now,
+                new_addresses: 0,
+            });
+
+        if let Some(state) = self.peers.get_mut(&peer_id) {
+            if now.saturating_duration_since(state.window_started) >= IDENTIFY_ADDRESS_WINDOW {
+                state.window_started = now;
+                state.new_addresses = 0;
+            }
+        }
+
+        // Refresh every retained address in the bounded report before admission.
+        let mut refreshed = Vec::new();
+        if let Some(state) = self.peers.get_mut(&peer_id) {
+            for existing in &mut state.addresses {
+                if reported.contains(&existing.address) {
+                    existing.expires_at = now + IDENTIFY_ADDRESS_TTL;
+                    refreshed.push(existing.address.clone());
+                }
+            }
+        }
+        // Global eviction follows refresh recency, so an active address does
+        // not lose its slot just because it was originally admitted first.
+        for address in refreshed {
+            self.remove_insertion_token(peer_id, &address);
+            self.insertion_order.push_back((peer_id, address));
+        }
+
+        let mut new_addresses = self
+            .peers
+            .get(&peer_id)
+            .map(|state| {
+                reported
+                    .iter()
+                    .filter(|address| {
+                        !state
+                            .addresses
+                            .iter()
+                            .any(|existing| &existing.address == *address)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| reported.iter().cloned().collect());
+        // HashSet iteration is deliberately unordered. Sort new candidates so
+        // an oversized Identify report has deterministic admission behavior.
+        new_addresses.sort();
+
+        for address in new_addresses {
+            if self
+                .peers
+                .get(&peer_id)
+                .is_some_and(|state| state.new_addresses >= IDENTIFY_NEW_ADDRESS_LIMIT)
+            {
+                break;
+            }
+
+            let evicted = self.peers.get_mut(&peer_id).and_then(|state| {
+                if state.addresses.len() < IDENTIFY_ADDRESS_LIMIT {
+                    return None;
+                }
+                let index = state
+                    .addresses
+                    .iter()
+                    .position(|existing| !reported.contains(&existing.address))?;
+                state.addresses.remove(index)
+            });
+            if let Some(evicted) = evicted {
+                self.remove_insertion_token(peer_id, &evicted.address);
+                self.address_count -= 1;
+                changes.removed.push((peer_id, evicted.address));
+            } else if self
+                .peers
+                .get(&peer_id)
+                .is_some_and(|state| state.addresses.len() >= IDENTIFY_ADDRESS_LIMIT)
+            {
+                // Every retained address was refreshed in this report. Keep
+                // that stable subset and drop surplus new candidates.
+                break;
+            }
+
+            if self.address_count >= IDENTIFY_GLOBAL_ADDRESS_LIMIT {
+                let Some(evicted) = self.evict_oldest(peer_id) else {
+                    break;
+                };
+                changes.removed.push(evicted);
+            }
+
+            if let Some(state) = self.peers.get_mut(&peer_id) {
+                state.new_addresses += 1;
+            }
+
+            if let Some(state) = self.peers.get_mut(&peer_id) {
+                state.addresses.push_back(IdentifyAddress {
+                    address: address.clone(),
+                    expires_at: now + IDENTIFY_ADDRESS_TTL,
+                });
+                self.insertion_order.push_back((peer_id, address.clone()));
+                self.address_count += 1;
+                changes.added.push(address);
+            }
+        }
+
+        changes
+    }
+
+    fn expire(&mut self, now: Instant) -> Vec<(PeerId, Multiaddr)> {
+        let mut removed = Vec::new();
+        let peers = self.peers.keys().copied().collect::<Vec<_>>();
+        for peer_id in peers {
+            removed.extend(self.expire_peer(peer_id, now));
+        }
+        removed
+    }
+
+    fn expire_peer(&mut self, peer_id: PeerId, now: Instant) -> Vec<(PeerId, Multiaddr)> {
+        let expired = self
+            .peers
+            .get_mut(&peer_id)
+            .map(|state| Self::expire_state(state, now))
+            .unwrap_or_default();
+        for address in &expired {
+            self.remove_insertion_token(peer_id, address);
+            self.address_count -= 1;
+        }
+        if self
+            .peers
+            .get(&peer_id)
+            .is_some_and(|state| state.addresses.is_empty())
+        {
+            self.peers.remove(&peer_id);
+        }
+        expired
+            .into_iter()
+            .map(|address| (peer_id, address))
+            .collect()
+    }
+
+    fn expire_state(state: &mut IdentifyPeerAddresses, now: Instant) -> Vec<Multiaddr> {
+        let mut expired = Vec::new();
+        let mut retained = VecDeque::with_capacity(state.addresses.len());
+        while let Some(address) = state.addresses.pop_front() {
+            if address.expires_at <= now {
+                expired.push(address.address);
+            } else {
+                retained.push_back(address);
+            }
+        }
+        state.addresses = retained;
+        expired
+    }
+
+    fn evict_oldest(&mut self, preserve_peer: PeerId) -> Option<(PeerId, Multiaddr)> {
+        while let Some((peer_id, address)) = self.insertion_order.pop_front() {
+            let Some(state) = self.peers.get_mut(&peer_id) else {
+                continue;
+            };
+            let Some(index) = state
+                .addresses
+                .iter()
+                .position(|tracked| tracked.address == address)
+            else {
+                continue;
+            };
+            let evicted = state.addresses.remove(index)?.address;
+            self.address_count -= 1;
+            if state.addresses.is_empty() && peer_id != preserve_peer {
+                self.peers.remove(&peer_id);
+            }
+            return Some((peer_id, evicted));
+        }
+        None
+    }
+
+    fn remove_insertion_token(&mut self, peer_id: PeerId, address: &Multiaddr) {
+        if let Some(index) = self
+            .insertion_order
+            .iter()
+            .position(|(token_peer, token_address)| {
+                token_peer == &peer_id && token_address == address
+            })
+        {
+            self.insertion_order.remove(index);
+        }
+    }
+}
+
 /// Combined libp2p behaviour.
 #[derive(NetworkBehaviour)]
 #[behaviour(prelude = "libp2p_swarm::derive_prelude")]
@@ -275,12 +522,30 @@ pub async fn start(
     // Track in-flight GetRecord queries → reply channels
     let mut pending_get_did: HashMap<kad::QueryId, oneshot::Sender<Option<DidRecord>>> =
         HashMap::new();
+    // Keep Identify-derived entries across disconnects so a bootstrap address
+    // learned through Identify remains usable for redial. The TTL cleanup below
+    // removes entries that are no longer refreshed without touching explicit
+    // AddKnownPeer addresses.
+    let mut identify_addresses = IdentifyAddressBook::default();
+    let mut explicit_addresses: HashMap<PeerId, HashSet<Multiaddr>> = HashMap::new();
+    let mut identify_cleanup = tokio::time::interval(IDENTIFY_ADDRESS_CLEANUP_INTERVAL);
+    identify_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Start the event loop as a background task
     tokio::spawn(async move {
         let mut shutdown_rx = shutdown_rx;
         loop {
             tokio::select! {
+                _ = identify_cleanup.tick() => {
+                    for (peer_id, address) in identify_addresses.expire(Instant::now()) {
+                        if !explicit_addresses
+                            .get(&peer_id)
+                            .is_some_and(|addresses| addresses.contains(&address))
+                        {
+                            swarm.behaviour_mut().kademlia.remove_address(&peer_id, &address);
+                        }
+                    }
+                }
                 // Graceful shutdown: exit the swarm loop when the
                 // process-wide signal flips. This drops the Swarm
                 // which closes all libp2p connections cleanly.
@@ -366,7 +631,23 @@ pub async fn start(
                             identify::Event::Received { peer_id, info, .. }
                         )) => {
                             debug!(peer = %peer_id, "identify received");
-                            for addr in info.listen_addrs {
+                            let changes = identify_addresses.update(
+                                peer_id,
+                                Instant::now(),
+                                &info.listen_addrs,
+                            );
+                            for (removed_peer, addr) in changes.removed {
+                                if !explicit_addresses
+                                    .get(&removed_peer)
+                                    .is_some_and(|addresses| addresses.contains(&addr))
+                                {
+                                    swarm
+                                        .behaviour_mut()
+                                        .kademlia
+                                        .remove_address(&removed_peer, &addr);
+                                }
+                            }
+                            for addr in changes.added {
                                 swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                             }
                         }
@@ -392,6 +673,14 @@ pub async fn start(
                             }
                         }
                         P2pCommand::AddKnownPeer { peer_id, addr } => {
+                            let Ok(addr) = addr.clone().with_p2p(peer_id) else {
+                                warn!(%peer_id, %addr, "dropping known-peer address with a foreign peer suffix");
+                                continue;
+                            };
+                            explicit_addresses
+                                .entry(peer_id)
+                                .or_default()
+                                .insert(addr.clone());
                             swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                         }
                         P2pCommand::Dial(addr) => {
@@ -442,6 +731,262 @@ pub async fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn identify_address(peer_id: PeerId, octet: u8, port: u16) -> Multiaddr {
+        format!("/ip4/192.0.2.{octet}/udp/{port}/quic-v1")
+            .parse::<Multiaddr>()
+            .unwrap()
+            .with_p2p(peer_id)
+            .unwrap()
+    }
+
+    fn identify_address_without_peer(octet: u8, port: u16) -> Multiaddr {
+        format!("/ip4/192.0.2.{octet}/udp/{port}/quic-v1")
+            .parse::<Multiaddr>()
+            .unwrap()
+    }
+
+    #[test]
+    fn identify_empty_reports_do_not_retain_peer_entries() {
+        let now = Instant::now();
+        let mut book = IdentifyAddressBook::default();
+        let foreign = identify_address(PeerId::random(), 1, 10_000);
+        for _ in 0..IDENTIFY_GLOBAL_ADDRESS_LIMIT + 1 {
+            let peer = PeerId::random();
+            assert_eq!(
+                book.update(peer, now, &[]),
+                IdentifyAddressChanges::default()
+            );
+            assert_eq!(
+                book.update(peer, now, std::slice::from_ref(&foreign)),
+                IdentifyAddressChanges::default()
+            );
+        }
+        assert!(book.peers.is_empty());
+        assert!(book.insertion_order.is_empty());
+        assert_eq!(book.address_count, 0);
+    }
+
+    #[test]
+    fn identify_report_processing_stops_at_the_input_limit() {
+        let peer = PeerId::random();
+        let now = Instant::now();
+        let foreign = identify_address(PeerId::random(), 1, 10_000);
+        let accepted = identify_address(peer, 2, 10_001);
+        let ignored = identify_address(peer, 3, 10_002);
+        let mut report = vec![foreign; IDENTIFY_REPORT_ADDRESS_LIMIT - 1];
+        report.push(accepted.clone());
+        report.push(ignored);
+        let mut book = IdentifyAddressBook::default();
+        let changes = book.update(peer, now, &report);
+        assert_eq!(changes.added, vec![accepted]);
+        assert!(changes.removed.is_empty());
+        assert_eq!(book.address_count, 1);
+    }
+
+    #[test]
+    fn identify_addresses_grow_without_eviction_below_the_peer_cap() {
+        let peer = PeerId::random();
+        let now = Instant::now();
+        let first = identify_address(peer, 1, 10_000);
+        let second = identify_address(peer, 2, 10_001);
+        let mut book = IdentifyAddressBook::default();
+        book.update(peer, now, std::slice::from_ref(&first));
+        let changes = book.update(
+            peer,
+            now + IDENTIFY_ADDRESS_WINDOW,
+            std::slice::from_ref(&second),
+        );
+        assert_eq!(changes.added, vec![second]);
+        assert!(changes.removed.is_empty());
+        assert_eq!(book.peers[&peer].addresses.len(), 2);
+        assert_eq!(book.address_count, 2);
+    }
+
+    #[test]
+    fn identify_global_eviction_preserves_refreshed_addresses() {
+        let now = Instant::now();
+        let mut book = IdentifyAddressBook::default();
+        let peers = (0..IDENTIFY_GLOBAL_ADDRESS_LIMIT)
+            .map(|index| {
+                let peer = PeerId::random();
+                let address = identify_address(peer, 1, 10_000 + index as u16);
+                book.update(peer, now, std::slice::from_ref(&address));
+                (peer, address)
+            })
+            .collect::<Vec<_>>();
+        let (peer, refreshed) = &peers[0];
+        let new_address = identify_address(*peer, 2, 30_000);
+        let changes = book.update(
+            *peer,
+            now + IDENTIFY_ADDRESS_WINDOW,
+            &[new_address.clone(), refreshed.clone()],
+        );
+        assert_eq!(changes.added, vec![new_address]);
+        assert_eq!(changes.removed, vec![peers[1].clone()]);
+        assert!(book.peers[peer]
+            .addresses
+            .iter()
+            .any(|a| &a.address == refreshed));
+        assert_eq!(book.address_count, IDENTIFY_GLOBAL_ADDRESS_LIMIT);
+        assert_eq!(book.insertion_order.len(), book.address_count);
+        assert_eq!(book.peers.len(), IDENTIFY_GLOBAL_ADDRESS_LIMIT - 1);
+    }
+
+    #[test]
+    fn identify_addresses_are_capped_with_fifo_eviction() {
+        let peer_id = PeerId::random();
+        let now = Instant::now();
+        let initial = (0..IDENTIFY_ADDRESS_LIMIT)
+            .map(|index| identify_address(peer_id, index as u8 + 1, 10_000 + index as u16))
+            .collect::<Vec<_>>();
+        let replacement = identify_address(peer_id, 200, 20_000);
+        let mut book = IdentifyAddressBook::default();
+
+        let first = book.update(peer_id, now, &initial);
+        assert_eq!(first.added, initial);
+        assert!(first.removed.is_empty());
+
+        let second = book.update(
+            peer_id,
+            now + IDENTIFY_ADDRESS_WINDOW,
+            std::slice::from_ref(&replacement),
+        );
+        assert_eq!(second.added, vec![replacement]);
+        assert_eq!(second.removed, vec![(peer_id, initial[0].clone())]);
+    }
+
+    #[test]
+    fn identify_oversized_reports_keep_the_same_refreshed_subset() {
+        let peer_id = PeerId::random();
+        let now = Instant::now();
+        let mut report = (0..IDENTIFY_ADDRESS_LIMIT + 2)
+            .map(|index| identify_address(peer_id, index as u8 + 1, 10_000 + index as u16))
+            .collect::<Vec<_>>();
+        let mut book = IdentifyAddressBook::default();
+
+        let first = book.update(peer_id, now, &report);
+        assert_eq!(first.added.len(), IDENTIFY_ADDRESS_LIMIT);
+        assert_eq!(first.removed.len(), 0);
+        let retained = first.added.clone();
+
+        report.reverse();
+        let second = book.update(peer_id, now + IDENTIFY_ADDRESS_WINDOW, &report);
+        assert!(second.added.is_empty());
+        assert!(second.removed.is_empty());
+        let current = book
+            .peers
+            .get(&peer_id)
+            .unwrap()
+            .addresses
+            .iter()
+            .map(|entry| entry.address.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(current, retained);
+    }
+
+    #[test]
+    fn identify_addresses_rate_limit_new_entries_across_updates() {
+        let peer_id = PeerId::random();
+        let now = Instant::now();
+        let initial = (0..IDENTIFY_NEW_ADDRESS_LIMIT)
+            .map(|index| identify_address(peer_id, index as u8 + 1, 10_000 + index as u16))
+            .collect::<Vec<_>>();
+        let replacement = identify_address(peer_id, 200, 20_000);
+        let mut book = IdentifyAddressBook::default();
+
+        assert_eq!(book.update(peer_id, now, &initial).added, initial);
+        assert!(book
+            .update(peer_id, now, std::slice::from_ref(&replacement))
+            .added
+            .is_empty());
+        assert_eq!(
+            book.update(
+                peer_id,
+                now + IDENTIFY_ADDRESS_WINDOW,
+                std::slice::from_ref(&replacement),
+            )
+            .added,
+            vec![replacement]
+        );
+    }
+
+    #[test]
+    fn identify_addresses_have_a_global_budget_across_peers() {
+        let now = Instant::now();
+        let mut book = IdentifyAddressBook::default();
+        let mut first = None;
+
+        for index in 0..IDENTIFY_GLOBAL_ADDRESS_LIMIT {
+            let peer_id = PeerId::random();
+            let address = identify_address(peer_id, (index % 254) as u8 + 1, 10_000 + index as u16);
+            if first.is_none() {
+                first = Some((peer_id, address.clone()));
+            }
+            assert!(book.update(peer_id, now, &[address]).removed.is_empty());
+        }
+
+        let (peer_id, first_address) = first.unwrap();
+        let address = identify_address(peer_id, 250, 30_000);
+        let changes = book.update(
+            peer_id,
+            now + IDENTIFY_ADDRESS_WINDOW,
+            std::slice::from_ref(&address),
+        );
+        assert_eq!(changes.added, vec![address]);
+        assert_eq!(changes.removed, vec![(peer_id, first_address)]);
+    }
+
+    #[test]
+    fn identify_addresses_refresh_and_expire() {
+        let peer_id = PeerId::random();
+        let now = Instant::now();
+        let address = identify_address(peer_id, 1, 10_000);
+        let mut book = IdentifyAddressBook::default();
+
+        assert_eq!(
+            book.update(peer_id, now, std::slice::from_ref(&address))
+                .added,
+            vec![address.clone()]
+        );
+        let refreshed = now + IDENTIFY_ADDRESS_TTL - Duration::from_secs(1);
+        let refresh = book.update(peer_id, refreshed, std::slice::from_ref(&address));
+        assert!(refresh.added.is_empty());
+        assert!(refresh.removed.is_empty());
+        assert!(book
+            .expire(now + IDENTIFY_ADDRESS_TTL + Duration::from_secs(1))
+            .is_empty());
+        assert_eq!(
+            book.expire(refreshed + IDENTIFY_ADDRESS_TTL + Duration::from_secs(1)),
+            vec![(peer_id, address)]
+        );
+    }
+
+    #[test]
+    fn identify_addresses_reject_foreign_peer_suffixes() {
+        let peer_id = PeerId::random();
+        let other_peer_id = PeerId::random();
+        let address = identify_address(other_peer_id, 1, 10_000);
+        let mut book = IdentifyAddressBook::default();
+
+        assert!(book
+            .update(peer_id, Instant::now(), &[address])
+            .added
+            .is_empty());
+    }
+
+    #[test]
+    fn identify_addresses_canonicalize_the_peer_suffix_once() {
+        let peer_id = PeerId::random();
+        let raw = identify_address_without_peer(1, 10_000);
+        let canonical = identify_address(peer_id, 1, 10_000);
+        let mut book = IdentifyAddressBook::default();
+
+        assert_eq!(
+            book.update(peer_id, Instant::now(), &[raw]).added,
+            vec![canonical]
+        );
+    }
 
     #[test]
     fn ref_update_event_round_trip_with_owner_did() {
