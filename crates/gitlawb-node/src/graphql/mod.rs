@@ -177,12 +177,72 @@ mod tests {
         assert!(!err.message.contains("failed to open"));
     }
 
+    fn production_test_schema() -> GitlawbSchema {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        build_schema(
+            Arc::new(Db::for_testing(pool)),
+            tokio::sync::broadcast::channel(1).0,
+            tokio::sync::broadcast::channel(1).0,
+        )
+    }
+
+    #[tokio::test]
+    async fn production_limits_reject_mutation_aliases_and_large_lists() {
+        let schema = production_test_schema();
+        for field in [
+            "claimTask(id: \"missing\", assigneeDid: \"did:key:test\") { id }",
+            "refUpdates(limit: 200) { repo }",
+            "tasks(limit: 200) { id }",
+        ] {
+            let count = if field.starts_with("claim") { 8 } else { 2 };
+            let fields = (0..count)
+                .map(|n| format!("r{n}: {field}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let prefix = if field.starts_with("claim") {
+                "mutation"
+            } else {
+                "query"
+            };
+            let response = schema.execute(format!("{prefix} {{ {fields} }}")).await;
+            assert_eq!(response.errors.len(), 1, "{:?}", response.errors);
+            assert_eq!(response.errors[0].message, "Query is too complex.");
+        }
+    }
+
+    #[tokio::test]
+    async fn seven_root_aliases_are_accepted() {
+        struct Root(Arc<AtomicUsize>);
+        #[Object]
+        impl Root {
+            #[graphql(complexity = "50 + child_complexity")]
+            async fn repos(&self) -> Vec<Nested> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                vec![Nested]
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let schema = apply_query_limits(Schema::build(
+            Root(calls.clone()),
+            EmptyMutation,
+            EmptySubscription,
+        ))
+        .finish();
+        let fields = (0..7)
+            .map(|n| format!("r{n}: repos {{ value }}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let response = schema.execute(format!("{{ {fields} }}")).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert_eq!(calls.load(Ordering::Relaxed), 7);
+    }
+
     #[tokio::test]
     async fn expensive_root_aliases_are_rejected_before_database_access() {
-        // QueryRoot expects a Db in the schema data. Deliberately omit it: if
-        // validation ever lets this document reach a resolver, the test fails.
-        let schema =
-            apply_query_limits(Schema::build(QueryRoot, EmptyMutation, EmptySubscription)).finish();
+        // Use the production builder with a lazy pool: rejection must precede DB access.
+        let schema = production_test_schema();
         let fields = (0..8)
             .map(|n| format!("r{n}: repos {{ name }}"))
             .collect::<Vec<_>>()

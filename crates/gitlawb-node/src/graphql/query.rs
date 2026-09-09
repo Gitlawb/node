@@ -48,7 +48,7 @@ impl QueryRoot {
             .collect())
     }
 
-    #[graphql(complexity = "50 + child_complexity")]
+    #[graphql(complexity = "50 + (limit.clamp(0, 200) as usize) * child_complexity")]
     async fn ref_updates(
         &self,
         ctx: &Context<'_>,
@@ -109,7 +109,7 @@ impl QueryRoot {
         Ok(resolved)
     }
 
-    #[graphql(complexity = "50 + child_complexity")]
+    #[graphql(complexity = "50 + (limit.clamp(0, 200) as usize) * child_complexity")]
     async fn tasks(
         &self,
         ctx: &Context<'_>,
