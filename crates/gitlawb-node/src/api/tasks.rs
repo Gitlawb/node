@@ -284,12 +284,7 @@ pub(crate) async fn collect_visible_tasks(
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        let mut quarantined_repos = HashSet::new();
-        for repo_id in &referenced {
-            if db.is_repo_quarantined(repo_id).await? {
-                quarantined_repos.insert(repo_id.clone());
-            }
-        }
+        let quarantined_repos = db.quarantined_repo_ids_in(&referenced).await?;
         let repos_by_id: HashMap<String, RepoRecord> = db
             .list_repos_deduped_by_ids(&referenced)
             .await?
@@ -2606,6 +2601,24 @@ mod visible_tasks_tests {
             .unwrap();
         let touched = state.db.set_repo_quarantine("q1", true).await.unwrap();
         assert_eq!(touched, 1, "quarantine flag must be set");
+
+        state
+            .db
+            .create_repo(&repo("q2", DELEGATOR, "visible-repo", true))
+            .await
+            .unwrap();
+        let quarantined = state
+            .db
+            .quarantined_repo_ids_in(&["q1".into(), "q2".into(), "missing".into(), "q1".into()])
+            .await
+            .unwrap();
+        assert_eq!(quarantined, HashSet::from(["q1".to_string()]));
+        assert!(state
+            .db
+            .quarantined_repo_ids_in(&[])
+            .await
+            .unwrap()
+            .is_empty());
 
         let t = task("t-quar", Some("q1"), DELEGATOR);
         state.db.create_task(&t).await.unwrap();

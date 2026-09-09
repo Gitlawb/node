@@ -713,7 +713,8 @@ pub struct Config {
     /// so the brake bounds the cost of anonymous probes. Keyed on the resolved
     /// client IP via `GITLAWB_TRUSTED_PROXY`. `0` disables. Default: 1200 (a list page
     /// followed by per-task reads is a normal client pattern, so this sits above
-    /// the `/ipfs` budget).
+    /// the `/ipfs` budget). GraphQL `tasks` / `task` queries, including WebSocket
+    /// operations, share this per-IP budget with REST task reads.
     #[arg(long, env = "GITLAWB_TASK_READ_RATE_LIMIT", default_value_t = 1200)]
     pub task_read_rate_limit: usize,
 }
