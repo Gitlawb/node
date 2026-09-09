@@ -105,16 +105,30 @@ impl Attestation {
         let bytes = canonical_signing_bytes(&self.type_, &self.payload, &self.cert_hash)?;
 
         let vk = verifying_key_from_did_key(&self.signer)?;
+        self.verify_sig_with_key(&vk, &bytes)?;
+
+        Ok(vk)
+    }
+
+    /// The signature check itself, against a key the caller supplies.
+    ///
+    /// Split out so the STRICTNESS of the check stays provable on its own.
+    /// `verifying_key_from_did_key` now refuses a small-order key, so a weak
+    /// signer can no longer reach this line through `verify_signature`. Without
+    /// this seam there would be nothing left that fails when `verify_strict` is
+    /// downgraded to the non-strict `verify`, and that regression would land
+    /// silently. Check order in `verify_signature` is unchanged.
+    fn verify_sig_with_key(&self, vk: &VerifyingKey, bytes: &[u8]) -> Result<()> {
         let sig_bytes: [u8; 64] = B64U
             .decode(&self.sig)
             .map_err(|e| Error::Signature(format!("base64url: {e}")))?
             .try_into()
             .map_err(|_| Error::Signature("signature must be 64 bytes".to_string()))?;
         let sig = Signature::from_bytes(&sig_bytes);
-        vk.verify_strict(&bytes, &sig)
+        vk.verify_strict(bytes, &sig)
             .map_err(|e| Error::Signature(format!("ed25519: {e}")))?;
 
-        Ok(vk)
+        Ok(())
     }
 
     /// Reparse `payload` as `P`. Errors if the type discriminator does not
@@ -181,7 +195,7 @@ fn canonical_signing_bytes(
     Ok(out)
 }
 
-fn did_key_from_verifying_key(key: &VerifyingKey) -> String {
+pub(crate) fn did_key_from_verifying_key(key: &VerifyingKey) -> String {
     let mut buf = Vec::with_capacity(ED25519_MULTICODEC.len() + 32);
     buf.extend_from_slice(&ED25519_MULTICODEC);
     buf.extend_from_slice(&key.to_bytes());
@@ -202,6 +216,19 @@ fn verifying_key_from_did_key(did: &str) -> Result<VerifyingKey> {
             "did:key must use base58btc (z-prefix): {did}"
         )));
     }
+    // Refuse an oversized id before decoding. base58 decoding is quadratic in
+    // its input and `signer` comes off an attacker-supplied attestation, so a
+    // short request could otherwise buy a large decode. An ed25519 did:key
+    // method-id is a fixed 48 characters, so this bound is slack rather than a
+    // behavior change, and it only helps ahead of the decode. Mirrors the same
+    // cap in gitlawb-core's Did::to_verifying_key, which this crate cannot call
+    // (gitlawb-core is a dev-dependency here).
+    const MAX_METHOD_ID_LEN: usize = 64;
+    if method_id.len() > MAX_METHOD_ID_LEN {
+        return Err(Error::Did(
+            "did:key method-specific id too long".to_string(),
+        ));
+    }
     let (base, bytes) =
         multibase::decode(method_id).map_err(|e| Error::Did(format!("multibase: {e}")))?;
     if base != multibase::Base::Base58Btc {
@@ -217,8 +244,20 @@ fn verifying_key_from_did_key(did: &str) -> Result<VerifyingKey> {
     let key_bytes: [u8; 32] = bytes[ED25519_MULTICODEC.len()..]
         .try_into()
         .expect("length checked above");
-    VerifyingKey::from_bytes(&key_bytes)
-        .map_err(|e| Error::Did(format!("invalid ed25519 key: {e}")))
+    let key = VerifyingKey::from_bytes(&key_bytes)
+        .map_err(|e| Error::Did(format!("invalid ed25519 key: {e}")))?;
+
+    // `from_bytes` only decompresses, so it accepts a small-order point. This
+    // crate parses did:key itself rather than going through gitlawb-core's
+    // `Did`, and it cannot go through it (gitlawb-core is a dev-dependency
+    // here), so the rejection is mirrored rather than inherited. Signature
+    // verification is already strict, so this is defense in depth against a
+    // future consumer of this parser that does not verify strictly.
+    if key.is_weak() {
+        return Err(Error::Did("small-order ed25519 key".to_string()));
+    }
+
+    Ok(key)
 }
 
 #[cfg(test)]
@@ -559,6 +598,111 @@ mod tests {
     /// weak (small-order) public key satisfies the verification equation
     /// but must be rejected. The identity point is such a key: with R the
     /// identity and S = 0, [S]B - [k]A is the identity for any message.
+    /// gitlawb-attest parses did:key itself and never routes through
+    /// gitlawb-core's `Did`, which it cannot: gitlawb-core is a dev-dependency
+    /// here. So the choke-point rejection has to be mirrored in this parser or
+    /// this crate keeps handing out keys the rest of the system rejects.
+    #[test]
+    fn verifying_key_from_did_key_rejects_a_small_order_key() {
+        let mut weak = [0u8; 32];
+        weak[0] = 1; // compressed identity point
+        let mut buf = Vec::with_capacity(ED25519_MULTICODEC.len() + 32);
+        buf.extend_from_slice(&ED25519_MULTICODEC);
+        buf.extend_from_slice(&weak);
+        let did = format!(
+            "did:key:{}",
+            multibase::encode(multibase::Base::Base58Btc, &buf)
+        );
+
+        let err =
+            verifying_key_from_did_key(&did).expect_err("a small-order did:key must not resolve");
+        match err {
+            Error::Did(msg) => assert!(
+                msg.contains("small-order"),
+                "rejection must name the small-order key, got: {msg}"
+            ),
+            other => panic!("expected Error::Did, got {other:?}"),
+        }
+    }
+
+    /// base58 decoding is quadratic in its input and `signer` is attacker
+    /// controlled, so an oversized method-id must be refused BEFORE the decode
+    /// or a hostile attestation buys a large decode for a short request. The
+    /// assertion is on the length error specifically: a multibase error here
+    /// would mean the cap ran too late to matter.
+    #[test]
+    fn verifying_key_from_did_key_refuses_an_oversized_method_id_before_decoding() {
+        let oversized = format!("did:key:z{}", "1".repeat(65_536));
+        let err = verifying_key_from_did_key(&oversized)
+            .expect_err("an oversized method-id must be refused");
+        match err {
+            Error::Did(msg) => assert!(
+                msg.contains("too long"),
+                "must fail on the length cap, not after decoding: {msg}"
+            ),
+            other => panic!("expected Error::Did, got {other:?}"),
+        }
+    }
+
+    /// Strictness regression guard. The parser now refuses a small-order key,
+    /// so `verify_signature` can no longer carry a weak signer down to the
+    /// signature check; this drives that check directly to prove it is still
+    /// STRICT. Downgrading `verify_strict` to `verify` makes this go red,
+    /// which nothing else in the suite would catch.
+    #[test]
+    fn verify_sig_with_key_is_strict_about_a_weak_key() {
+        let mut weak_key_bytes = [0u8; 32];
+        weak_key_bytes[0] = 1; // compressed identity point
+        let weak_vk = VerifyingKey::from_bytes(&weak_key_bytes).unwrap();
+        assert!(weak_vk.is_weak());
+
+        let cert_hash = sample_cert_hash();
+        let mut att = dummy_attestation(&SigningKey::generate(&mut OsRng), cert_hash);
+        // R = identity, S = 0: satisfies the non-strict verification equation
+        // for any message under a small-order key.
+        let mut forged = [0u8; 64];
+        forged[0] = 1;
+        att.sig = B64U.encode(forged);
+
+        let bytes = canonical_signing_bytes(&att.type_, &att.payload, &att.cert_hash).expect("jcs");
+        let err = att
+            .verify_sig_with_key(&weak_vk, &bytes)
+            .expect_err("strict verification must reject a small-order key");
+        assert!(
+            matches!(err, Error::Signature(_)),
+            "expected a signature error, got {err:?}"
+        );
+    }
+
+    /// Accept control for the seam: a genuine signature still verifies through
+    /// the same helper, so the guard above is not simply rejecting everything.
+    #[test]
+    fn verify_sig_with_key_accepts_a_genuine_signature() {
+        let cert_hash = sample_cert_hash();
+        let sk = SigningKey::generate(&mut OsRng);
+        let att = dummy_attestation(&sk, cert_hash);
+        let bytes = canonical_signing_bytes(&att.type_, &att.payload, &att.cert_hash).expect("jcs");
+        att.verify_sig_with_key(&sk.verifying_key(), &bytes)
+            .expect("a real signature must verify");
+    }
+
+    /// Control for the guard above: a real did:key must still resolve.
+    #[test]
+    fn verifying_key_from_did_key_still_accepts_a_real_key() {
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        let vk = sk.verifying_key();
+        let mut buf = Vec::with_capacity(ED25519_MULTICODEC.len() + 32);
+        buf.extend_from_slice(&ED25519_MULTICODEC);
+        buf.extend_from_slice(&vk.to_bytes());
+        let did = format!(
+            "did:key:{}",
+            multibase::encode(multibase::Base::Base58Btc, &buf)
+        );
+
+        let got = verifying_key_from_did_key(&did).expect("a real did:key must resolve");
+        assert_eq!(got.to_bytes(), vk.to_bytes());
+    }
+
     #[test]
     fn verify_rejects_weak_key_signature() {
         let mut weak_key_bytes = [0u8; 32];
@@ -572,7 +716,13 @@ mod tests {
         let forged_sig = B64U.encode(forged);
 
         // Build an attestation with the weak key as signer and the forged
-        // signature. The weak-key check happens at verify time.
+        // signature. Rejection now happens at DID RESOLUTION rather than at
+        // verify time: `verifying_key_from_did_key` refuses a small-order key
+        // before `verify_strict` is reached, so the observed error is
+        // `Error::Did`, not `Error::Signature`. `verify_strict` remains the
+        // second layer for malleability cases that do not involve a weak
+        // public key (a small-order R under an honest key), which this fixture
+        // cannot construct and therefore no longer covers.
         let mut att = dummy_attestation(&SigningKey::generate(&mut OsRng), cert_hash);
         let mut buf = Vec::with_capacity(ED25519_MULTICODEC.len() + 32);
         buf.extend_from_slice(&ED25519_MULTICODEC);
@@ -584,9 +734,12 @@ mod tests {
         att.sig = forged_sig;
 
         let err = att.verify_signature(cert_hash).unwrap_err();
-        assert!(
-            matches!(err, Error::Signature(_)),
-            "signature under a weak (small-order) public key must be rejected"
-        );
+        match err {
+            Error::Did(msg) => assert!(
+                msg.contains("small-order"),
+                "weak signer must be refused as a small-order key, got: {msg}"
+            ),
+            other => panic!("expected Error::Did for a small-order signer, got {other:?}"),
+        }
     }
 }
