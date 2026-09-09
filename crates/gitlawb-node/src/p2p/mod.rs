@@ -662,7 +662,8 @@ pub async fn start(
                             }
                         }
                         P2pCommand::AddKnownPeer { peer_id, addr } => {
-                            let Ok(addr) = addr.with_p2p(peer_id) else {
+                            let Ok(addr) = addr.clone().with_p2p(peer_id) else {
+                                warn!(%peer_id, %addr, "dropping known-peer address with a foreign peer suffix");
                                 continue;
                             };
                             explicit_addresses
