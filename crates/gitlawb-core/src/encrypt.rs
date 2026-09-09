@@ -469,7 +469,8 @@ mod tests {
         let nonce = ChaChaBox::generate_nonce(&mut OsRng);
         let wrap = zero_box.encrypt(&nonce, &content_key[..]).unwrap();
 
-        let body_nonce = [0x24u8; 24];
+        let mut body_nonce: [u8; 24] = Default::default();
+        OsRng.fill_bytes(&mut body_nonce);
         let body_cipher = XChaCha20Poly1305::new_from_slice(&content_key).unwrap();
         let body = body_cipher
             .encrypt(
@@ -541,7 +542,8 @@ mod tests {
         let nonce = ChaChaBox::generate_nonce(&mut OsRng);
         let wrap = crypto_box::aead::Aead::encrypt(&zero_box, &nonce, &content_key[..]).unwrap();
 
-        let body_nonce = [0x24u8; 24];
+        let mut body_nonce: [u8; 24] = Default::default();
+        OsRng.fill_bytes(&mut body_nonce);
         let body_cipher = XChaCha20Poly1305::new_from_slice(&content_key).unwrap();
         let body = chacha20poly1305::aead::Aead::encrypt(
             &body_cipher,
