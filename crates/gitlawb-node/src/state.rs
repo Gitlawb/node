@@ -186,6 +186,9 @@ pub struct AppState {
     /// sink as trigger and accepts unsigned requests from known peers, so it is
     /// braked too; each peer's distinct IP gets its own bucket.
     pub peer_write_rate_limiter: RateLimiter,
+    /// Per-client-IP federation budget: 12 requests per minute, with at most
+    /// 10,000 tracked source keys. Shared by router instances and swept below.
+    pub federated_rate_limiter: RateLimiter,
     /// Process-wide graceful-shutdown signal. Sending `true` causes every
     /// task that holds a `watch::Receiver` to exit at its next await point.
     /// Used by:
@@ -346,6 +349,7 @@ impl AppState {
         self.ipfs_work_rate_limiter.cleanup().await;
         self.sync_trigger_rate_limiter.cleanup().await;
         self.peer_write_rate_limiter.cleanup().await;
+        self.federated_rate_limiter.cleanup().await;
     }
 
     /// Trigger graceful shutdown. Idempotent — calling more than once

@@ -115,6 +115,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         push_limiter_trust: crate::rate_limit::TrustedProxy::None,
         sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
         peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+        federated_rate_limiter: RateLimiter::new_bounded(12, Duration::from_secs(60), 10_000),
         shutdown_tx: tokio::sync::watch::channel(false).0,
         // Generous — no test drives the handler-level shed (git_permit is unit-tested).
         git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),

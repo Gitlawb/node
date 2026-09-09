@@ -25,6 +25,8 @@ const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 
 const FEDERATED_PEER_CONCURRENCY: usize = 4;
 const FEDERATED_PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const FEDERATED_AGGREGATE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const MAX_FEDERATED_PEERS: usize = 200;
 const MAX_FEDERATED_PEER_BYTES: usize = 512 * 1024;
 const MAX_FEDERATED_PEER_REPOS: usize = 200;
 const MAX_FEDERATED_REPOS: usize = 1_000;
@@ -3069,7 +3071,7 @@ where
     let mut responses = stream::iter(fetches).buffer_unordered(FEDERATED_PEER_CONCURRENCY);
     let mut nodes_queried = 0;
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + FEDERATED_AGGREGATE_DEADLINE;
     loop {
         let response = match tokio::time::timeout_at(deadline, responses.next()).await {
             Ok(Some(response)) => response,
@@ -3106,7 +3108,8 @@ where
 ///
 /// Query all known peers for their public repos and return a merged view of
 /// the network. Each repo includes a `node_url` and `node_did` indicating
-/// which node hosts it. Peer work stops after ten seconds or 200 peers; omitted
+/// which node hosts it. Peer work is bounded by `FEDERATED_AGGREGATE_DEADLINE`
+/// and `MAX_FEDERATED_PEERS`; omitted
 /// results set `truncated`. The route admits 12 requests per minute per client IP.
 pub async fn list_federated_repos(
     State(state): State<AppState>,
@@ -3157,9 +3160,12 @@ pub async fn list_federated_repos(
     // Dropping the buffered stream at the aggregate ceiling cancels its in-flight
     // request futures and leaves the remaining iterator entries unpolled.
     // One extra row detects omitted peers without materializing the full table.
-    let mut peers = state.db.list_federation_peers(201).await?;
-    aggregate.truncated |= peers.len() > 200;
-    peers.truncate(200);
+    let mut peers = state
+        .db
+        .list_federation_peers(MAX_FEDERATED_PEERS as i64 + 1)
+        .await?;
+    aggregate.truncated |= peers.len() > MAX_FEDERATED_PEERS;
+    peers.truncate(MAX_FEDERATED_PEERS);
     let fetches: Vec<_> = peers
         .into_iter()
         .filter(|p| p.last_ping_ok && !p.http_url.is_empty())
@@ -3559,10 +3565,11 @@ mod tests {
     #[sqlx::test]
     async fn federated_peer_query_is_bounded(pool: sqlx::PgPool) {
         let state = crate::test_support::test_state(pool.clone()).await;
-        sqlx::query("INSERT INTO peers (did, http_url, last_ping_ok, announced_at) SELECT 'peer-' || n, 'https://example.com', TRUE, '2026-01-01T00:00:00Z' FROM generate_series(1, 205) n")
+        sqlx::query("INSERT INTO peers (did, http_url, last_ping_ok, announced_at) SELECT 'peer-' || n, 'https://example.com', TRUE, '2026-01-01T00:00:00Z' FROM generate_series(1, $1) n")
+            .bind(MAX_FEDERATED_PEERS as i64 + 5)
             .execute(&pool).await.unwrap();
-        let peers = state.db.list_federation_peers(1000).await.unwrap();
-        assert_eq!(peers.len(), 201);
+        let peers = state.db.list_federation_peers(i64::MAX).await.unwrap();
+        assert_eq!(peers.len(), MAX_FEDERATED_PEERS + 1);
         assert_eq!(state.db.list_federation_peers(2).await.unwrap().len(), 2);
         assert!(state.db.list_federation_peers(0).await.unwrap().is_empty());
     }
@@ -3572,8 +3579,10 @@ mod tests {
         use tower::ServiceExt;
         let mut state = crate::test_support::test_state(pool).await;
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.federated_rate_limiter =
+            crate::rate_limit::RateLimiter::new_bounded(1, std::time::Duration::from_secs(60), 10);
         let router = crate::server::build_router(state);
-        for n in 0..13 {
+        for n in 0..2 {
             let mut request = axum::http::Request::builder()
                 .uri("/api/v1/repos/federated")
                 .body(axum::body::Body::empty())
@@ -3584,7 +3593,7 @@ mod tests {
             let response = router.clone().oneshot(request).await.unwrap();
             assert_eq!(
                 response.status(),
-                if n < 12 {
+                if n == 0 {
                     StatusCode::OK
                 } else {
                     StatusCode::TOO_MANY_REQUESTS
@@ -3594,12 +3603,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn federated_route_uses_the_state_owned_bucket_before_database_access() {
+        use tower::ServiceExt;
+        let mut state = crate::test_support::test_state_lazy();
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.federated_rate_limiter =
+            crate::rate_limit::RateLimiter::new_bounded(1, std::time::Duration::from_secs(60), 10);
+        assert!(state.federated_rate_limiter.check("203.0.113.42").await);
+        // Both routers must use the same exhausted bucket from AppState.
+        for router in [
+            crate::server::build_router(state.clone()),
+            crate::server::build_router(state),
+        ] {
+            let mut request = axum::http::Request::builder()
+                .uri("/api/v1/repos/federated")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                "203.0.113.42:5000".parse::<std::net::SocketAddr>().unwrap(),
+            ));
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(1), router.oneshot(request))
+                    .await
+                    .expect("the exhausted bucket must reject before accessing the lazy database")
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+
+    #[tokio::test]
     async fn federated_aggregate_deadline_returns_partial_results() {
         let mut budget = FederatedRepoBudget::new(0, 1000, MAX_FEDERATED_REPO_JSON_BYTES);
         let fetches =
             (0..8).map(|_| async { std::future::pending::<Option<FederatedPeerRepos>>().await });
         let nodes = tokio::time::timeout(
-            std::time::Duration::from_secs(12),
+            FEDERATED_AGGREGATE_DEADLINE + std::time::Duration::from_secs(2),
             collect_federated_fetches(fetches, &mut budget),
         )
         .await

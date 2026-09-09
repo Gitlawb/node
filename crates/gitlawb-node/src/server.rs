@@ -346,11 +346,7 @@ pub fn build_router(state: AppState) -> Router {
             get(repos::list_federated_repos)
                 .route_layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
                 .route_layer(axum::Extension(rate_limit::IpRateLimiter {
-                    limiter: rate_limit::RateLimiter::new_bounded(
-                        12,
-                        std::time::Duration::from_secs(60),
-                        10_000,
-                    ),
+                    limiter: state.federated_rate_limiter.clone(),
                     trust: state.push_limiter_trust,
                 })),
         )
