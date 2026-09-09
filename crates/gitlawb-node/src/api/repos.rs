@@ -521,7 +521,12 @@ pub async fn get_blob(
     })
     .await
     .map_err(|e| AppError::Internal(anyhow::anyhow!("blob read task failed: {e}")))?;
-    let read = read.map_err(|e| git_service_app_error(&e))?;
+    let read = read.map_err(|e| {
+        if e.downcast_ref::<smart_http::GitServiceTimeout>().is_some() {
+            return AppError::Timeout("git service timed out".into());
+        }
+        AppError::Internal(e)
+    })?;
 
     let content = match read {
         store::BoundedFileRead::Found(content) => content,
@@ -3623,6 +3628,39 @@ mod tests {
             1,
             "a fresh filtered clone (want+done) must count exactly one"
         );
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn blob_cat_file_failure_is_opaque(pool: sqlx::PgPool) {
+        use axum::response::IntoResponse;
+        use http_body_util::BodyExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = write_fake_git(
+            tmp.path(),
+            "#!/bin/sh\necho 'private-git-stderr /internal/repo.git' >&2\nexit 1\n",
+        );
+        let state = f4_state_with_repo(pool, tmp.path(), &fake, "z6bloberror", "repo", false).await;
+        let response = get_blob(
+            State(state),
+            Path(("z6bloberror".into(), "repo".into(), "file.txt".into())),
+            crate::rate_limit::PeerAddr(None),
+            axum::http::HeaderMap::new(),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["message"], crate::error::INTERNAL_ERROR_MESSAGE);
+        let body = body.to_string();
+        assert!(!body.contains("private-git-stderr"));
+        assert!(!body.contains("/internal/repo.git"));
     }
 
     #[test]
