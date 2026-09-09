@@ -396,6 +396,8 @@ async fn main() -> Result<()> {
         std::time::Duration::from_secs(3600),
         200_000,
     );
+    let federated_rate_limiter =
+        rate_limit::RateLimiter::new_bounded(12, std::time::Duration::from_secs(60), 10_000);
     if config.sync_trigger_rate_limit == 0 {
         tracing::warn!(
             "GITLAWB_SYNC_TRIGGER_RATE_LIMIT=0 — /sync/trigger IP rate limiting disabled"
@@ -442,6 +444,7 @@ async fn main() -> Result<()> {
         push_limiter_trust,
         sync_trigger_rate_limiter,
         peer_write_rate_limiter,
+        federated_rate_limiter,
         shutdown_tx: shutdown_tx.clone(),
         git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_git_ops)),
         git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(
@@ -1189,6 +1192,7 @@ mod rate_limiter_sweep_tests {
         state.push_rate_limiter = RateLimiter::new(10, window);
         state.sync_trigger_rate_limiter = RateLimiter::new(10, window);
         state.peer_write_rate_limiter = RateLimiter::new(10, window);
+        state.federated_rate_limiter = RateLimiter::new(10, window);
         state.ipfs_rate_limiter = RateLimiter::new(10, window);
         state.ipfs_work_rate_limiter = RateLimiter::new(10, window);
 
@@ -1199,6 +1203,7 @@ mod rate_limiter_sweep_tests {
                 s.push_rate_limiter.clone(),
                 s.sync_trigger_rate_limiter.clone(),
                 s.peer_write_rate_limiter.clone(),
+                s.federated_rate_limiter.clone(),
                 s.ipfs_rate_limiter.clone(),
                 s.ipfs_work_rate_limiter.clone(),
             ]

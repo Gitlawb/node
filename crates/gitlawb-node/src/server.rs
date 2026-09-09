@@ -341,7 +341,15 @@ pub fn build_router(state: AppState) -> Router {
     // ── Read routes — open for public repos ───────────────────────────────
     let read_routes = Router::new()
         .route("/api/v1/repos", get(repos::list_repos))
-        .route("/api/v1/repos/federated", get(repos::list_federated_repos))
+        .route(
+            "/api/v1/repos/federated",
+            get(repos::list_federated_repos)
+                .route_layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+                .route_layer(axum::Extension(rate_limit::IpRateLimiter {
+                    limiter: state.federated_rate_limiter.clone(),
+                    trust: state.push_limiter_trust,
+                })),
+        )
         .route("/api/v1/repos/{owner}/{repo}", get(repos::get_repo))
         .route(
             "/api/v1/repos/{owner}/{repo}/commits",
