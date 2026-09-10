@@ -535,6 +535,33 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
+    #[tokio::test]
+    async fn production_schema_enforces_depth_limit() {
+        let schema = production_test_schema();
+        // Depth 12 is accepted through the production build_schema path.
+        let of_types_12 = (0..7).fold("name".to_string(), |acc, _| format!("ofType {{ {acc} }}"));
+        let query_12 =
+            format!("{{ __schema {{ types {{ fields {{ type {{ {of_types_12} }} }} }} }} }}");
+        let accepted = schema.execute(&query_12).await;
+        assert!(accepted.errors.is_empty(), "{:?}", accepted.errors);
+
+        // Construct an introspection query of depth 13 using __schema.
+        // 1: __schema
+        // 2: types
+        // 3: fields
+        // 4: type
+        // 5..12: ofType (8 times)
+        // 13: name
+        // Total depth = 13 > GRAPHQL_MAX_DEPTH (12).
+        let of_types = (0..8).fold("name".to_string(), |acc, _| format!("ofType {{ {acc} }}"));
+        let query = format!("{{ __schema {{ types {{ fields {{ type {{ {of_types} }} }} }} }} }}");
+
+        let rejected = schema.execute(&query).await;
+        assert_eq!(rejected.data, async_graphql::Value::Null);
+        assert_eq!(rejected.errors.len(), 1);
+        assert_eq!(rejected.errors[0].message, "Query is nested too deep.");
+    }
+
     /// Every `.map_err(` in the GraphQL query/mutation resolvers must route
     /// through the opaque helpers, or discard the error (`|_|`). Same source-
     /// scrape pattern as `api::authz_guard` (#255 review).

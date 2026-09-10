@@ -284,12 +284,15 @@ mod tests {
             .unwrap();
         let response = anon(&schema(db), "{ repos { name } }").await;
         assert!(response.errors.is_empty(), "{:?}", response.errors);
-        assert_eq!(
-            response.data.into_json().unwrap()["repos"]
-                .as_array()
-                .unwrap()
-                .len(),
-            crate::db::MAX_VISIBLE_REPO_PAGE_SIZE
+        let repos = response.data.into_json().unwrap()["repos"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(repos.len(), crate::db::MAX_VISIBLE_REPO_PAGE_SIZE);
+        let names: Vec<_> = repos.iter().filter_map(|r| r["name"].as_str()).collect();
+        assert!(
+            !names.contains(&"hidden"),
+            "hidden repo must be excluded from legacy repos response"
         );
     }
 
@@ -382,6 +385,54 @@ mod tests {
         assert_eq!(cursor, (OWNER.to_owned(), "odd-star".to_owned()));
         assert!(!json.to_string().contains("private"));
         assert!(!json.to_string().contains("quarantined"));
+
+        // Route-level check with unauthorized authenticated caller:
+        // Excludes private, quarantined, and root-deny repos, matching anonymous behavior.
+        let all_query = "{ reposPage(limit: 50) { nodes { name } hasNextPage } }";
+        let unauth_response = authed(&schema, all_query, "did:key:zUnauthorized").await;
+        assert!(
+            unauth_response.errors.is_empty(),
+            "{:?}",
+            unauth_response.errors
+        );
+        let unauth_json = unauth_response.data.into_json().unwrap();
+        let unauth_names: Vec<&str> = unauth_json["reposPage"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n["name"].as_str())
+            .collect();
+        assert_eq!(unauth_names, vec!["odd-star", "open", "subtree"]);
+        let unauth_str = unauth_json.to_string();
+        assert!(!unauth_str.contains("private"));
+        assert!(!unauth_str.contains("quarantined"));
+        assert!(!unauth_str.contains("root-deny"));
+        assert!(!unauth_str.contains("root-reader"));
+        assert!(!unauth_str.contains("root-tie"));
+
+        // Reader caller gets root-reader and root-tie, but still excludes private, quarantined, root-deny.
+        let reader_response = authed(&schema, all_query, reader).await;
+        assert!(
+            reader_response.errors.is_empty(),
+            "{:?}",
+            reader_response.errors
+        );
+        let reader_json = reader_response.data.into_json().unwrap();
+        let reader_names: Vec<&str> = reader_json["reposPage"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n["name"].as_str())
+            .collect();
+        assert_eq!(
+            reader_names,
+            vec!["odd-star", "open", "root-reader", "subtree"]
+        );
+        let reader_str = reader_json.to_string();
+        assert!(!reader_str.contains("private"));
+        assert!(!reader_str.contains("quarantined"));
+        assert!(!reader_str.contains("root-deny"));
+        assert!(!reader_str.contains("root-tie"));
     }
 
     #[sqlx::test]
@@ -415,6 +466,14 @@ mod tests {
         assert!(anon.errors.is_empty());
         assert_eq!(
             anon.data.into_json().unwrap()["reposPage"],
+            serde_json::json!({
+                "nodes": [], "hasNextPage": false, "endCursor": null
+            })
+        );
+        let unauth = authed(&schema, &query, "did:key:zUnauthorized").await;
+        assert!(unauth.errors.is_empty());
+        assert_eq!(
+            unauth.data.into_json().unwrap()["reposPage"],
             serde_json::json!({
                 "nodes": [], "hasNextPage": false, "endCursor": null
             })
