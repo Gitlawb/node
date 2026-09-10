@@ -1180,6 +1180,17 @@ pub(crate) async fn ingest_ref_update(
         ));
     }
 
+    // The cheapest denial under enforcement, ahead of every gate that reads a
+    // field: an unsigned event is refused before its `node_did` is resolved or
+    // its slug validated, so a flood of them buys no pre-auth work at all and
+    // no rejection reason built from attacker-chosen fields, under only the
+    // loose pre-parse brake that `PeerId` rotation defeats. Below this point a
+    // missing signature can only be the rolling-upgrade `None` arm, which is
+    // why that arm no longer names the flag.
+    if event.sig.is_none() && require_signed {
+        return IngestOutcome::Rejected("unsigned ref-update event".to_string());
+    }
+
     // did-method gate first, and in BOTH enforcement modes: a non-did:key peer
     // is unauthenticatable by design, and running this before the flag branch
     // is what keeps the answer independent of flag state.
@@ -1227,11 +1238,10 @@ pub(crate) async fn ingest_ref_update(
             }
             verified = true;
         }
-        None if require_signed => {
-            return IngestOutcome::Rejected("unsigned ref-update event".to_string());
-        }
         // Rolling-upgrade window, same posture and same pointer at the flag as
-        // the HTTP twin's unsigned-notify warning.
+        // the HTTP twin's unsigned-notify warning. The require_signed refusal
+        // lives above the did-method gate now, so reaching this arm already
+        // means the flag was off.
         None => {
             unsigned = true;
             // Unsigned traffic is bounded here, on the forwarder, because it is
@@ -1789,12 +1799,20 @@ pub async fn start(
                                 IngestOutcome::UnsignedAdmitted => {}
                                 IngestOutcome::WriteFailed(reason) => warn!(
                                     from = %propagation_source,
-                                    reason = %reason,
+                                    reason = %sanitize_for_log(&reason),
                                     "admitted gossip ref-update but a write failed"
                                 ),
+                                // The reason can carry fields read off the wire
+                                // before any signature bound them (the claimed
+                                // node_did in a resolve failure, the slug in a
+                                // repo-field refusal), so it goes through the
+                                // same bounded control-free rendering as the
+                                // freshness detail. Sanitizing at this one sink
+                                // rather than at each producer keeps a future
+                                // Rejected reason from re-opening the hole.
                                 IngestOutcome::Rejected(reason) => warn!(
                                     from = %propagation_source,
-                                    reason = %reason,
+                                    reason = %sanitize_for_log(&reason),
                                     "dropped gossip ref-update"
                                 ),
                                 // Both arms are warn, not debug: a dropped
@@ -2699,6 +2717,29 @@ mod tests {
         rejection_reason(outcome, "unsigned event with enforcement on");
     }
 
+    /// Under enforcement the unsigned refusal is the cheapest one: it runs
+    /// before the did-method gate, so a hostile `node_did` on an unsigned
+    /// event is never resolved and never embedded in a reason a warn! would
+    /// log. The exact-reason assert is what pins the ordering: if resolution
+    /// ran first, the answer would be the unresolvable-DID sentence carrying
+    /// the wire bytes, not this fixed string.
+    #[sqlx::test]
+    async fn flag_on_unsigned_event_is_refused_before_did_resolution(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let mut event = populated_event();
+        event.node_did = "not-a-did\n\u{1b}[31mFORGED".into();
+        assert_eq!(event.sig, None, "the case is an unsigned event");
+
+        let outcome =
+            ingest_with_fresh_limiter(&db, true, true, &bytes_of(&event), &PeerId::random()).await;
+        assert_nothing_written(&pool, "unsigned event, hostile node_did, enforcement on").await;
+        assert_eq!(
+            rejection_reason(outcome, "unsigned event, hostile node_did"),
+            "unsigned ref-update event",
+            "the fixed refusal must answer before the claimed node_did is resolved"
+        );
+    }
+
     /// An event from a build newer than this one is refused AS a version
     /// problem, in its own words.
     ///
@@ -3181,8 +3222,17 @@ mod tests {
         let mut unsigned = event_for(&key_a);
         unsigned.sig = None;
 
+        // A signed event whose claimed node_did is control-bearing garbage:
+        // resolution refuses it, and the Rejected reason carries the wire
+        // bytes into the warn sink, which must render them bounded and
+        // control-free.
+        let mut forged = event_for(&key_a);
+        forged.node_did = format!("not-a-did\n\u{1b}[31m{}", "F".repeat(4096));
+        sign_ref_update(&key_a, &mut forged).expect("signing does not validate the DID");
+
         a.publish_raw_ref_update(malleated).await;
         a.publish_raw_ref_update(bytes_of(&unsigned)).await;
+        a.publish_raw_ref_update(bytes_of(&forged)).await;
 
         // A fresh signed event proves the mesh still delivers once both
         // refusals have had their chance; deliveries from one publisher over
@@ -3212,6 +3262,18 @@ mod tests {
         assert!(
             text.contains("unsigned ref-update event"),
             "the unsigned event must be refused under require_signed, got: {text}"
+        );
+        assert!(
+            text.contains("cannot resolve DID"),
+            "the forged DID must be refused at resolution, got: {text}"
+        );
+        assert!(
+            !text.contains('\u{1b}'),
+            "a control character in a logged reason forges terminal output, got: {text}"
+        );
+        assert!(
+            !text.contains(&"F".repeat(65)),
+            "a 4096-char wire field must be bounded to the sanitizer's ceiling, got: {text}"
         );
         assert_eq!(
             count(&pool, "received_ref_updates").await,
