@@ -166,6 +166,46 @@ const cases = [
     true,
   ],
   [
+    "char literal with double quote then real test",
+    "@@ -1,0 +1,4 @@\n+const QUOTE: char = '\"';\n+#[test]\n+fn real_test() {\n+    assert_eq!(QUOTE as u32, 34);\n+}",
+    true,
+  ],
+  [
+    "byte char literal with double quote then real test",
+    "@@ -1,0 +1,4 @@\n+const QUOTE: u8 = b'\"';\n+#[test]\n+fn real_test() {\n+    assert_eq!(QUOTE, 34);\n+}",
+    true,
+  ],
+  [
+    "char literal with escaped quote then real test",
+    "@@ -1,0 +1,4 @@\n+const Q: char = '\\'';\n+#[test]\n+fn real_test() {\n+    assert_eq!(Q as u32, 39);\n+}",
+    true,
+  ],
+  [
+    "char literal with escaped backslash then real test",
+    "@@ -1,0 +1,4 @@\n+const Q: char = '\\\\';\n+#[test]\n+fn real_test() {\n+    assert_eq!(Q as u32, 92);\n+}",
+    true,
+  ],
+  [
+    "char literal with unicode escape then real test",
+    "@@ -1,0 +1,4 @@\n+const Q: char = '\\u{2764}';\n+#[test]\n+fn real_test() {\n+    assert_eq!(Q as u32, 10084);\n+}",
+    true,
+  ],
+  [
+    "lifetime in type then real test",
+    "@@ -1,0 +1,3 @@\n+fn foo<'a>(x: &'a str) {}\n+#[test]\n+fn real_test() {}",
+    true,
+  ],
+  [
+    "label then real test",
+    "@@ -1,0 +1,3 @@\n+'label: loop {}\n+#[test]\n+fn real_test() {}",
+    true,
+  ],
+  [
+    "static lifetime then real test",
+    "@@ -1,0 +1,3 @@\n+const S: &'static str = \"hi\";\n+#[test]\n+fn real_test() {}",
+    true,
+  ],
+  [
     "context line with stray closing quote then real test",
     '@@ -1,1 +1,2 @@\n  );"\n+#[test]',
     true,

@@ -221,6 +221,29 @@ jobs:
                     if (text[j] === '"') { inString = false; j += 1; continue; }
                     j += 1; continue;
                   }
+                  // Recognize Rust char and byte-char literals ('X', '\X',
+                  // '\u{...}', b'X') so their contents never open string or
+                  // comment state. A char literal has a closing ' within a
+                  // bounded distance; a lifetime or label ('a, 'static,
+                  // 'label:) does not, so it falls through as a regular char.
+                  // This is not a skip-to-next-' rule: the lookhead is 2-4
+                  // chars (or to } for \u escapes), never unbounded.
+                  if (text[j] === "'") {
+                    let k = j + 1;
+                    if (text[k] === "\\") {
+                      k += 1;
+                      if (text[k] === "u" && text[k + 1] === "{") {
+                        while (text[k] && text[k] !== "}") k++;
+                        if (text[k] === "}") k++;
+                      } else {
+                        k += 1;
+                      }
+                    } else {
+                      k += 1;
+                    }
+                    if (text[k] === "'") { j = k + 1; continue; }
+                    // lifetime or label: just skip the apostrophe
+                  }
                   if (text[j] === '"') { inString = true; j += 1; continue; }
                   if (text.startsWith("//", j)) break;
                   if (text.startsWith("/*", j)) { blockDepth = 1; j += 2; continue; }
