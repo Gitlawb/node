@@ -1510,6 +1510,15 @@ pub struct SwarmStatus {
 pub enum P2pCommand {
     /// Publish a ref-update event to Gossipsub
     PublishRefUpdate(RefUpdateEvent),
+    /// Publish caller-supplied bytes to the ref-updates topic verbatim.
+    ///
+    /// Test-only seam. The production path signs and serializes the event
+    /// itself, so nothing on it can emit a malleated encoding or an unsigned
+    /// event, and the replay and require-signed gates exist only on the
+    /// receiving side. A live-mesh test needs this to drive those refusals
+    /// through the real transport rather than around it.
+    #[cfg(test)]
+    PublishRawRefUpdate(Vec<u8>),
     /// Add a known peer address to the Kademlia routing table
     #[allow(dead_code)]
     AddKnownPeer { peer_id: PeerId, addr: Multiaddr },
@@ -1537,6 +1546,13 @@ pub struct P2pHandle {
 impl P2pHandle {
     pub async fn publish_ref_update(&self, event: RefUpdateEvent) {
         let _ = self.tx.send(P2pCommand::PublishRefUpdate(event)).await;
+    }
+
+    /// Test-only: publish raw bytes to the ref-updates topic. See
+    /// [`P2pCommand::PublishRawRefUpdate`].
+    #[cfg(test)]
+    pub async fn publish_raw_ref_update(&self, bytes: Vec<u8>) {
+        let _ = self.tx.send(P2pCommand::PublishRawRefUpdate(bytes)).await;
     }
 
     #[allow(dead_code)]
@@ -1888,6 +1904,13 @@ pub async fn start(
                                 // Skip the publish rather than emit something a
                                 // verifying peer would drop anyway.
                                 Err(e) => warn!(err = %e, "failed to sign ref-update; not publishing"),
+                            }
+                        }
+                        #[cfg(test)]
+                        P2pCommand::PublishRawRefUpdate(bytes) => {
+                            let topic = gossipsub::IdentTopic::new(REF_UPDATES_TOPIC);
+                            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, bytes) {
+                                warn!(err = %e, "failed to publish raw ref-update");
                             }
                         }
                         P2pCommand::AddKnownPeer { peer_id, addr } => {
@@ -3024,6 +3047,177 @@ mod tests {
             "the publish arm's bytes must survive ingest with enforcement on, got {outcome:?}"
         );
         assert_eq!(count(&pool, "received_ref_updates").await, 1);
+    }
+
+    /// The two seams the emit-path tests above name as needing a live swarm:
+    /// the `PublishRefUpdate` select! arm dispatching to sign+publish, and
+    /// `require_signed` reaching the receive path. Driven with two real swarms
+    /// on QUIC loopback, a real Ed25519 signature, and real Postgres.
+    ///
+    /// A signed event from A is admitted by B and stored. A re-delivery of the
+    /// same signed content under a different wire encoding, which defeats the
+    /// gossipsub message-id dedup that would otherwise eat it, is refused by
+    /// the replay guard. An unsigned event on the same mesh is refused under
+    /// `require_signed`. Both refusals are observed in the warn stream rather
+    /// than inferred from absent rows.
+    ///
+    /// Still not covered, named rather than implied: the `run_ingest_sweep`
+    /// select! arm, which fires on `GOSSIP_INGEST_SWEEP_INTERVAL` and cannot be
+    /// waited out in a test, and the `main.rs` half of the flag wiring above
+    /// `p2p::start`.
+    #[sqlx::test]
+    async fn live_mesh_accepts_signed_then_refuses_replay_and_unsigned(pool: PgPool) {
+        let (logs, _capture) = capture_warnings();
+        let _db = ingest_db(&pool).await;
+
+        let key_a = Keypair::generate();
+        let key_b = Keypair::generate();
+        let did_a = key_a.did().to_string();
+        seed_peer(&pool, &did_a).await;
+
+        let (_shutdown_a_tx, shutdown_a_rx) = tokio::sync::watch::channel(false);
+        let (_shutdown_b_tx, shutdown_b_rx) = tokio::sync::watch::channel(false);
+
+        // The receiver first, so its subscription precedes the dial.
+        let b = start(
+            &key_b.did().to_string(),
+            0,
+            vec![],
+            Arc::new(Db::for_testing(pool.clone())),
+            false,
+            shutdown_b_rx,
+            Arc::new(key_b),
+            true,
+        )
+        .await
+        .expect("the receiver swarm must start");
+
+        // B's bound IPv4 address, rewritten from the wildcard listen form to a
+        // dialable loopback one.
+        let mut b_addr = None;
+        for _ in 0..100 {
+            if let Some(status) = b.status().await {
+                if let Some(addr) = status.listen_addrs.iter().find(|a| a.contains("/ip4/")) {
+                    b_addr = Some(addr.replace("/ip4/0.0.0.0/", "/ip4/127.0.0.1/"));
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let b_addr: Multiaddr = b_addr
+            .expect("the receiver must be listening")
+            .parse()
+            .expect("the listen addr must parse");
+
+        let a = start(
+            &did_a,
+            0,
+            vec![b_addr],
+            Arc::new(Db::for_testing(pool.clone())),
+            false,
+            shutdown_a_rx,
+            Arc::new(key_a.clone()),
+            true,
+        )
+        .await
+        .expect("the publisher swarm must start");
+
+        // Wait until A's gossipsub knows B: subscriptions exchange on connect,
+        // and a publish before that is dropped as InsufficientPeers with only
+        // a log line to show for it.
+        let mut a_sees_b = false;
+        for _ in 0..300 {
+            if a.status().await.map(|s| s.gossipsub_all_peers).unwrap_or(0) >= 1 {
+                a_sees_b = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            a_sees_b,
+            "A never learned B's subscription; the mesh never formed"
+        );
+
+        async fn admitted_from(pool: &PgPool, peer: &str) -> i64 {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM received_ref_updates WHERE from_peer = $1",
+            )
+            .bind(peer)
+            .fetch_one(pool)
+            .await
+            .expect("count rows")
+        }
+        let from_a = a.local_peer_id.to_string();
+
+        // The signed event across the live mesh. Republishing identical bytes
+        // is safe: they collapse to one gossipsub message id and dedup there.
+        let event = event_for(&key_a);
+        let mut admitted = false;
+        for _ in 0..150 {
+            a.publish_ref_update(event.clone()).await;
+            if admitted_from(&pool, &from_a).await >= 1 {
+                admitted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(
+            admitted,
+            "a signed event must cross the live mesh and be stored"
+        );
+
+        // The same signed content under a different wire encoding reaches B's
+        // replay guard instead of dying in message-id dedup, and must be
+        // refused there.
+        let signed = signed_publish_bytes(&key_a, &event).expect("the emit path signs");
+        let malleated = serde_json::to_string_pretty(
+            &serde_json::from_slice::<serde_json::Value>(&signed).expect("signed bytes parse"),
+        )
+        .expect("re-encode")
+        .into_bytes();
+        assert_ne!(malleated, signed, "the twin must differ on the wire");
+
+        // An unsigned event on the same live path, refused by require_signed.
+        let mut unsigned = event_for(&key_a);
+        unsigned.sig = None;
+
+        a.publish_raw_ref_update(malleated).await;
+        a.publish_raw_ref_update(bytes_of(&unsigned)).await;
+
+        // A fresh signed event proves the mesh still delivers once both
+        // refusals have had their chance; deliveries from one publisher over
+        // one connection are ordered, so its landing bounds the wait.
+        let mut control = event_for(&key_a);
+        control.ref_name = "refs/heads/e2e-control".into();
+        for _ in 0..150 {
+            a.publish_ref_update(control.clone()).await;
+            if admitted_from(&pool, &from_a).await >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        assert_eq!(
+            admitted_from(&pool, &from_a).await,
+            2,
+            "the replay and the unsigned event must write nothing; only the two \
+             distinct signed events may land"
+        );
+        let text = logs.text();
+        assert!(
+            text.contains("already admitted this exact signed event"),
+            "the replayed delivery must hit the replay guard's refusal, got: {text}"
+        );
+        assert!(
+            text.contains("unsigned ref-update event"),
+            "the unsigned event must be refused under require_signed, got: {text}"
+        );
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            2,
+            "no third row may arrive from any direction"
+        );
     }
 
     // ── Durable-write failure ─────────────────────────────────────────────
