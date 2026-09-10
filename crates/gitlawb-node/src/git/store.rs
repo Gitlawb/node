@@ -245,6 +245,7 @@ pub async fn delete_marker_bounded(
 
 /// Delete a per-request marker ref. Best-effort; called on terminal
 /// retirement so SQL and Git-side retention cannot diverge.
+#[allow(dead_code)]
 pub fn delete_marker(repo_path: &Path, request_id: &str) {
     let ref_name = format!("refs/gitlawb/requests/{request_id}");
     let _ = Command::new("git")

@@ -3727,6 +3727,7 @@ impl Db {
     /// the child is `applied` but the parent can never schedule
     /// effects. Returns rows affected (0 means the parent already
     /// moved on — the caller must not treat that as success).
+    #[allow(dead_code)]
     pub async fn promote_reconciled_request_outcomes(
         &self,
         request_id: &str,
@@ -3750,6 +3751,54 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected())
+    }
+
+    /// Idempotent version of promote_reconciled_request_outcomes that updates
+    /// the parsed_report even if the parent is already outcomes_committed.
+    /// This handles the case where children span multiple reconciliation pages:
+    /// the first page promotes with a partial set, later pages update with the
+    /// full superset to ensure all applied children get certificate/anchor handoff.
+    pub async fn promote_reconciled_request_outcomes_idempotent(
+        &self,
+        request_id: &str,
+        git_exit_ok: bool,
+        parsed_report: &serde_json::Value,
+        accepted_ordinal: Option<i32>,
+    ) -> Result<u64> {
+        // First try the normal promotion
+        let res = sqlx::query(
+            r#"UPDATE receive_pack_requests
+               SET state = $2, git_exit_ok = $3, parsed_report = $4,
+                   accepted_ordinal = $5
+               WHERE id = $1 AND state IN ($6, $7)"#,
+        )
+        .bind(request_id)
+        .bind(request_state::OUTCOMES_COMMITTED)
+        .bind(git_exit_ok)
+        .bind(parsed_report)
+        .bind(accepted_ordinal)
+        .bind(request_state::RECEIVED)
+        .bind(request_state::REJECTED_AT_GIT)
+        .execute(&self.pool)
+        .await?;
+
+        // If no rows affected, parent is already outcomes_committed - update the report
+        if res.rows_affected() == 0 {
+            let update_res = sqlx::query(
+                r#"UPDATE receive_pack_requests
+                   SET parsed_report = $3, accepted_ordinal = $4
+                   WHERE id = $1 AND state = $2"#,
+            )
+            .bind(request_id)
+            .bind(request_state::OUTCOMES_COMMITTED)
+            .bind(parsed_report)
+            .bind(accepted_ordinal)
+            .execute(&self.pool)
+            .await?;
+            Ok(update_res.rows_affected())
+        } else {
+            Ok(res.rows_affected())
+        }
     }
 
     /// Requests stuck with applied children but a non-executable
@@ -4602,23 +4651,6 @@ impl Db {
         }))
     }
 
-    /// Verify a proof against exact method/path/digest components.
-    /// Returns false when any covered component or signature differs.
-    /// Load-bearing: recovered authorization must fail when altered.
-    #[allow(dead_code)]
-    pub fn verify_request_proof(
-        proof: &RequestProof,
-        expected_digest: &[u8],
-        signature_header: &str,
-        signature_input: &str,
-        content_digest: &str,
-    ) -> bool {
-        proof.body_digest == expected_digest
-            && proof.signature_header == signature_header
-            && proof.signature_input == signature_input
-            && proof.content_digest == content_digest
-    }
-
     pub async fn ack_request_proof(&self, request_id: &str) -> Result<u64> {
         let res = sqlx::query(
             r#"UPDATE request_proofs SET acked_at = $2 WHERE request_id = $1 AND acked_at IS NULL"#,
@@ -4710,7 +4742,6 @@ impl Db {
     }
 
     /// Enqueue a marker tombstone. Idempotent.
-    #[allow(dead_code)]
     pub async fn enqueue_marker_cleanup(&self, request_id: &str, repo_id: &str) -> Result<()> {
         sqlx::query(
             r#"INSERT INTO marker_cleanup_queue (request_id, repo_id, attempts, created_at, last_error)
@@ -11775,42 +11806,6 @@ mod pending_ref_transition_tests {
             "retry reuses occurrence identity"
         );
         let _ = (a2,);
-    }
-
-    #[sqlx::test]
-    async fn proof_verify_fails_when_any_field_altered(_pool: PgPool) {
-        let proof = super::RequestProof {
-            request_id: "req-p".to_string(),
-            repo_id: "repo-p".to_string(),
-            pusher_did: "did:key:pusher".to_string(),
-            body_digest: vec![1, 2, 3],
-            signature_header: "sig".to_string(),
-            signature_input: "input".to_string(),
-            content_digest: "digest".to_string(),
-            created_at: chrono::Utc::now().to_rfc3339(),
-            acked_at: None,
-        };
-        assert!(super::Db::verify_request_proof(
-            &proof,
-            &[1, 2, 3],
-            "sig",
-            "input",
-            "digest"
-        ));
-        assert!(!super::Db::verify_request_proof(
-            &proof,
-            &[9, 9, 9],
-            "sig",
-            "input",
-            "digest"
-        ));
-        assert!(!super::Db::verify_request_proof(
-            &proof,
-            &[1, 2, 3],
-            "tampered",
-            "input",
-            "digest"
-        ));
     }
 
     /// `mark_cancelled` is also idempotent. The state predicate is

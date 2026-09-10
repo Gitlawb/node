@@ -2215,6 +2215,111 @@ pub async fn git_receive_pack(
     )?;
     let _permit = git_permit(&state.git_write_semaphore)?;
 
+    // #26 Split PR 1: durable intent for this push, written BEFORE
+    // the receive_pack call. Every ref update the pusher intends to
+    // land gets a `prepared` row carrying the verified pusher DID,
+    // the raw RFC 9421 signature header, signature-input, and
+    // content-digest that authorized the push, plus the request id.
+    //
+    // The state is flipped to `applied` (Ok) or `cancelled` (Err)
+    // AFTER receive_pack returns. The drain reads only `applied`
+    // rows, so a row that never gets the post-Ok flip stays in
+    // `prepared` (handler crash / dropped future) or `cancelled`
+    // (receive_pack Err) and is never promoted to a push event, a
+    // certificate, or an anchor.
+    //
+    // Moved BEFORE admission guard creation to prevent unbounded DB
+    // writes from exhausting the admission pool. The write is bounded
+    // by a timeout that releases permits on expiry.
+    let signature_header = headers
+        .get("signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let signature_input = headers
+        .get("signature-input")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let content_digest = headers
+        .get("content-digest")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    // #26 Split PR 1 — request-level intent row. Written BEFORE
+    // `smart_http::receive_pack` runs, in state `received`, carrying
+    // the raw HTTP body the handler will hand to git and the SHA-256
+    // of it. The recovery drain (step 3) and the on-disk reconcile
+    // (already on this branch) both key off this row; a node crash
+    // between this write and the outcomes commit leaves the row in
+    // `received` and its children in `prepared`, which is the
+    // recoverable state.
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    let request_bytes_hash = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&body);
+        h.finalize().to_vec()
+    };
+    // Durable intent is minimal: only the digest is consumed by
+    // recovery (marker correlation). The raw pack is never replayed
+    // by this split, so it is not copied into the shared database —
+    // every request lookup would otherwise re-materialize up to the
+    // route's 2 GiB body as BYTEA/WAL/backup amplification.
+    let req_row = crate::db::ReceivePackRequest {
+        id: request_id.clone(),
+        repo_id: record.id.clone(),
+        pusher_did: auth.0.to_string(),
+        node_did: state.node_did.to_string(),
+        request_bytes: Vec::new(),
+        request_bytes_hash,
+        state: crate::db::request_state::RECEIVED.to_string(),
+        git_exit_ok: None,
+        parsed_report: None,
+        accepted_ordinal: None,
+        attempt_count: 0,
+        last_error: None,
+        next_attempt_at: None,
+        created_at: now.clone(),
+        completed_at: None,
+        signature_header: Some(signature_header.clone()),
+        signature_input: Some(signature_input.clone()),
+        content_digest: Some(content_digest.clone()),
+    };
+    // Atomic parent+children: either the full intent exists or none
+    // of it does, so a refused pre-Git request cannot strand a
+    // payload-only parent. Bounded by timeout to prevent admission
+    // pool exhaustion on slow DB operations.
+    let db_timeout = std::time::Duration::from_secs(30);
+    let db_result = tokio::time::timeout(
+        db_timeout,
+        state.db.insert_receive_pack_request_with_children(
+            &req_row,
+            &record.id,
+            &state.node_did.to_string(),
+            auth.0.as_str(),
+            &ref_updates,
+            &signature_header,
+            &signature_input,
+            &content_digest,
+        ),
+    )
+    .await;
+
+    if let Err(e) = db_result {
+        // Log the error and refuse push - timeout vs other errors doesn't matter
+        // for admission capacity preservation, both release the permit
+        tracing::error!(
+            err = %e,
+            repo = %name,
+            "failed to persist durable post-receive intent; refusing push"
+        );
+        return Err(AppError::Overloaded(
+            "durable intent write failed, retry shortly".into(),
+        ));
+    }
+
     tracing::debug!(repo = %name, "acquiring write lock");
     // Bound the write acquire under `git_acquire_timeout_secs`. acquire_write's
     // advisory-lock loop already caps at ~60s, but its per-iteration
@@ -2285,110 +2390,6 @@ pub async fn git_receive_pack(
     let admission = smart_http::AdmissionGuard::new(_permit, _caller_permit)
         .with_hold(std::sync::Arc::clone(&guard))
         .with_lease(lease.clone());
-
-    // #26 Split PR 1: durable intent for this push, written BEFORE
-    // the receive_pack call. Every ref update the pusher intends to
-    // land gets a `prepared` row carrying the verified pusher DID,
-    // the raw RFC 9421 signature header, signature-input, and
-    // content-digest that authorized the push, plus the request id.
-    //
-    // The state is flipped to `applied` (Ok) or `cancelled` (Err)
-    // AFTER receive_pack returns. The drain reads only `applied`
-    // rows, so a row that never gets the post-Ok flip stays in
-    // `prepared` (handler crash / dropped future) or `cancelled`
-    // (receive_pack Err) and is never promoted to a push event, a
-    // certificate, or an anchor.
-    //
-    // Inserted AT THE LAST POSSIBLE MOMENT, immediately before the
-    // receive_pack call, so a rejection above (owner enforcement,
-    // branch protection, etc.) does not produce a `prepared` row
-    // that nothing will ever flip.
-    let signature_header = headers
-        .get("signature")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let signature_input = headers
-        .get("signature-input")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let content_digest = headers
-        .get("content-digest")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    // #26 Split PR 1 — request-level intent row. Written BEFORE
-    // `smart_http::receive_pack` runs, in state `received`, carrying
-    // the raw HTTP body the handler will hand to git and the SHA-256
-    // of it. The recovery drain (step 3) and the on-disk reconcile
-    // (already on this branch) both key off this row; a node crash
-    // between this write and the outcomes commit leaves the row in
-    // `received` and its children in `prepared`, which is the
-    // recoverable state.
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let now = Utc::now().to_rfc3339();
-    let request_bytes_hash = {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(&body);
-        h.finalize().to_vec()
-    };
-    // Durable intent is minimal: only the digest is consumed by
-    // recovery (marker correlation). The raw pack is never replayed
-    // by this split, so it is not copied into the shared database —
-    // every request lookup would otherwise re-materialize up to the
-    // route's 2 GiB body as BYTEA/WAL/backup amplification.
-    let req_row = crate::db::ReceivePackRequest {
-        id: request_id.clone(),
-        repo_id: record.id.clone(),
-        pusher_did: auth.0.to_string(),
-        node_did: state.node_did.to_string(),
-        request_bytes: Vec::new(),
-        request_bytes_hash,
-        state: crate::db::request_state::RECEIVED.to_string(),
-        git_exit_ok: None,
-        parsed_report: None,
-        accepted_ordinal: None,
-        attempt_count: 0,
-        last_error: None,
-        next_attempt_at: None,
-        created_at: now.clone(),
-        completed_at: None,
-        signature_header: Some(signature_header.clone()),
-        signature_input: Some(signature_input.clone()),
-        content_digest: Some(content_digest.clone()),
-    };
-    // Atomic parent+children: either the full intent exists or none
-    // of it does, so a refused pre-Git request cannot strand a
-    // payload-only parent.
-    if let Err(e) = state
-        .db
-        .insert_receive_pack_request_with_children(
-            &req_row,
-            &record.id,
-            &state.node_did.to_string(),
-            auth.0.as_str(),
-            &ref_updates,
-            &signature_header,
-            &signature_input,
-            &content_digest,
-        )
-        .await
-    {
-        // A durable-intent write failure here means we cannot
-        // guarantee recovery for the upcoming git apply. Refuse the
-        // push with 503 rather than risk a ref landing with no
-        // recovery record.
-        tracing::error!(
-            err = %e,
-            repo = %name,
-            "failed to persist durable post-receive intent; refusing push"
-        );
-        return Err(AppError::Overloaded(
-            "durable intent write failed, retry shortly".into(),
-        ));
-    }
 
     // Marker hiding was verified above by `verify_recovery_prereqs`,
     // which is warn-and-proceed (not a push refusal): on failure the

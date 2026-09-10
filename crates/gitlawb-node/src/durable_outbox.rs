@@ -14,10 +14,9 @@
 //! Idempotency is delegated to the DB layer. The push event and anchor
 //! job use `ON CONFLICT (id) DO NOTHING` keyed on the deterministic
 //! `(request_id, ref_name)` / `(repo_id, ref_name, old_sha, new_sha)`
-//! id. The ref certificate uses
-//! `insert_ref_certificate_idempotent`, which checks the unique
-//! `(repo_id, ref_name)` index and returns `None` if a live-path cert
-//! already exists. Re-running the drain against the same row is
+//! id. The ref certificate uses an idempotent insert that checks the
+//! unique `(repo_id, ref_name)` index and returns `None` if a live-path
+//! cert already exists. Re-running the drain against the same row is
 //! therefore a no-op for the artifact writes; the row deletion at the
 //! end is also idempotent because a missing `id` simply affects zero
 //! rows.
@@ -133,6 +132,23 @@ async fn reconcile_prepared_page(
             limit,
         )
         .await?;
+
+    // P1 (reviewer-2 finding 3): Run stuck-parent repair even when prepared queue is empty.
+    // A crash between child flip and parent promotion leaves the parent non-executable
+    // with no prepared rows, so the normal page walk never reaches it. This repair must
+    // run independently of the prepared queue.
+    if let Ok(stuck) = state.db.list_stuck_request_aggregates(1000).await {
+        for request_id in stuck {
+            if let Err(e) = promote_request_aggregate_if_proved(&state, &request_id).await {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    "reconcile: stuck aggregate promotion failed"
+                );
+            }
+        }
+    }
+
     if rows.is_empty() {
         return Ok((0, None));
     }
@@ -505,8 +521,11 @@ async fn reconcile_prepared_page(
     // until the parent moves to `outcomes_committed` with the same
     // normalized outcome the live path writes. Promote every
     // distinct parent seen on this page that now has applied
-    // children; a separate sweep below covers parents whose children
-    // were already applied before this page ran.
+    // children.
+    //
+    // Note: stuck-parent repair (parents with applied children but no
+    // prepared rows) is handled at the start of this function to ensure
+    // it runs even when the prepared queue is empty.
     for request_id in &distinct_request_ids {
         if let Err(e) = promote_request_aggregate_if_proved(&state, request_id).await {
             tracing::warn!(
@@ -516,25 +535,6 @@ async fn reconcile_prepared_page(
             );
         }
     }
-    // Repair the crash gap where the child flip succeeded but the
-    // parent outcomes commit did not (or Git landed a ref after the
-    // handler moved the parent to `rejected_at_git`): those parents
-    // have applied children but no prepared rows left, so the page
-    // above never sees them.
-    if let Ok(stuck) = state.db.list_stuck_request_aggregates(1000).await {
-        for request_id in stuck {
-            if distinct_request_ids.contains(&request_id) {
-                continue;
-            }
-            if let Err(e) = promote_request_aggregate_if_proved(&state, &request_id).await {
-                tracing::warn!(
-                    err = %e,
-                    request_id = %request_id,
-                    "reconcile: stuck aggregate promotion failed"
-                );
-            }
-        }
-    }
     Ok((flipped as usize, next_cursor))
 }
 
@@ -542,8 +542,12 @@ async fn reconcile_prepared_page(
 /// children establish the accepted set. Builds the same normalized
 /// `parsed_report` the live path stores (synthetic `reconciled`
 /// marker) and moves `received`/`rejected_at_git` →
-/// `outcomes_committed`. No-op when the parent is already executable
-/// or has no applied children.
+/// `outcomes_committed`.
+///
+/// Idempotent: if the parent is already `outcomes_committed` (because
+/// children spanned multiple pages), updates the parsed_report with the
+/// superset of all applied children to ensure no applied child is left
+/// without certificate/anchor handoff.
 async fn promote_request_aggregate_if_proved(
     state: &AppState,
     request_id: &str,
@@ -552,9 +556,12 @@ async fn promote_request_aggregate_if_proved(
         Some(r) => r,
         None => return Ok(false),
     };
+    // Allow updating if already outcomes_committed to handle page-crossing children
     if !matches!(
         req.state.as_str(),
-        crate::db::request_state::RECEIVED | crate::db::request_state::REJECTED_AT_GIT
+        crate::db::request_state::RECEIVED
+            | crate::db::request_state::REJECTED_AT_GIT
+            | crate::db::request_state::OUTCOMES_COMMITTED
     ) {
         return Ok(false);
     }
@@ -579,9 +586,11 @@ async fn promote_request_aggregate_if_proved(
         })).collect::<Vec<_>>(),
         "synthetic": "reconciled",
     });
+
+    // Use idempotent update that works even if parent is already outcomes_committed
     let n = state
         .db
-        .promote_reconciled_request_outcomes(request_id, true, &parsed, accepted_ordinal)
+        .promote_reconciled_request_outcomes_idempotent(request_id, true, &parsed, accepted_ordinal)
         .await?;
     Ok(n > 0)
 }
@@ -970,12 +979,18 @@ pub async fn purge_request_queue(
         .purge_terminal_batch(&older_than_iso, per_pass_limit)
         .await?;
     let requests_deleted = purged.len() as u64;
-    // Best-effort synchronous marker sweep for the direct-call path
-    // (tests, one-off runs). The background tombstone worker owns
-    // retries; failures retain the tombstone.
+    // Queue marker deletions through the bounded tombstone worker.
+    // The synchronous delete_marker call is removed from production
+    // to prevent unblocking Git operations from blocking the daily
+    // lifecycle task. Failures retain the tombstone for the next tick.
     for (request_id, repo_id) in &purged {
-        if let Ok(Some(repo)) = db.get_repo_by_id(repo_id).await {
-            crate::git::store::delete_marker(std::path::Path::new(&repo.disk_path), request_id);
+        if let Err(e) = db.enqueue_marker_cleanup(request_id, repo_id).await {
+            tracing::warn!(
+                err = %e,
+                request_id = %request_id,
+                repo_id = %repo_id,
+                "queue lifecycle: failed to queue marker cleanup; will retry on next tick"
+            );
         }
     }
 
@@ -1253,6 +1268,7 @@ async fn run_effect_bundle(
     }
     // 9. Webhooks — best-effort, per landed ref. Same shape as the
     //     inline handler's webhook block.
+    //     Claim delivery before spawning HTTP POST to prevent permanent loss on crash.
     if !ok_ref_names.is_empty() {
         let base_url = state
             .config
@@ -1263,31 +1279,45 @@ async fn run_effect_bundle(
         let owner_short = crate::db::normalize_owner_key(&repo.owner_did);
         let clone_url = format!("{}/{}/{}.git", base_url, owner_short, repo.name);
         for child in accepted_children {
-            let payload = serde_json::json!({
-                "ref": child.ref_name,
-                "before": child.old_sha,
-                "after": child.new_sha,
-                "created": child.old_sha == "0000000000000000000000000000000000000000",
-                "forced": false,
-                "pusher": {
-                    "did": req.pusher_did,
-                },
-                "repository": {
-                    "id": repo.id,
-                    "name": repo.name,
-                    "owner_did": repo.owner_did,
-                    "clone_url": clone_url,
-                },
-            });
-            crate::webhooks::fire_event_occurrence(
+            // Claim webhook delivery synchronously before spawning HTTP POST
+            let claimed_hook_ids = crate::webhooks::claim_webhook_delivery_before_spawn(
                 state.db.clone(),
-                state.http_client.clone(),
                 &repo.id,
                 "push",
-                payload,
                 Some(&req.id),
                 Some(&child.ref_name),
-            );
+            )
+            .await;
+
+            if !claimed_hook_ids.is_empty() {
+                let payload = serde_json::json!({
+                    "ref": child.ref_name,
+                    "before": child.old_sha,
+                    "after": child.new_sha,
+                    "created": child.old_sha == "0000000000000000000000000000000000000000",
+                    "forced": false,
+                    "pusher": {
+                        "did": req.pusher_did,
+                    },
+                    "repository": {
+                        "id": repo.id,
+                        "name": repo.name,
+                        "owner_did": repo.owner_did,
+                        "clone_url": clone_url,
+                    },
+                });
+                // Spawn HTTP POST only; claim already handled synchronously above
+                crate::webhooks::fire_event_occurrence_with_claimed_hooks(
+                    state.db.clone(),
+                    state.http_client.clone(),
+                    &repo.id,
+                    "push",
+                    payload,
+                    Some(&req.id),
+                    Some(&child.ref_name),
+                    claimed_hook_ids,
+                );
+            }
         }
     }
     // Proof must exist before effects are considered durable; ack it so

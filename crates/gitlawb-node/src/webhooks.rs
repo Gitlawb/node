@@ -45,6 +45,10 @@ pub fn fire_event(
 /// `(request_id, ref_name, hook)` is spawned; concurrent executors
 /// collapse via the `webhook_deliveries` ledger. Best-effort on crash
 /// (ledger is claimed before spawn), which the PR scope allows.
+///
+/// For durable outbox usage, call `claim_webhook_delivery_before_spawn` first
+/// to claim deliveries synchronously, then call this with `skip_claim=true` and
+/// the claimed hook IDs to only spawn HTTP POST for claimed hooks.
 pub fn fire_event_occurrence(
     db: Arc<Db>,
     http_client: Arc<reqwest::Client>,
@@ -67,11 +71,85 @@ pub fn fire_event_occurrence(
             payload,
             request_id.as_deref(),
             ref_name.as_deref(),
+            false,
+            None,
         )
         .await;
     });
 }
 
+/// Variant for durable outbox: only spawn HTTP POST for previously claimed hooks.
+#[allow(clippy::too_many_arguments)]
+pub fn fire_event_occurrence_with_claimed_hooks(
+    db: Arc<Db>,
+    http_client: Arc<reqwest::Client>,
+    repo_id: &str,
+    event: &str,
+    payload: serde_json::Value,
+    request_id: Option<&str>,
+    ref_name: Option<&str>,
+    claimed_hook_ids: Vec<String>,
+) {
+    let repo_id = repo_id.to_string();
+    let event = event.to_string();
+    let request_id = request_id.map(|s| s.to_string());
+    let ref_name = ref_name.map(|s| s.to_string());
+    tokio::spawn(async move {
+        fire_event_async_occurrence(
+            db,
+            http_client,
+            &repo_id,
+            &event,
+            payload,
+            request_id.as_deref(),
+            ref_name.as_deref(),
+            true,
+            Some(claimed_hook_ids),
+        )
+        .await;
+    });
+}
+
+/// Claim webhook delivery before spawning HTTP POST.
+/// Returns the list of hook IDs that were successfully claimed.
+/// This synchronous claim phase must be awaited before child deletion to prevent
+/// permanent webhook loss on crash between deletion and claim.
+pub async fn claim_webhook_delivery_before_spawn(
+    db: Arc<Db>,
+    repo_id: &str,
+    event: &str,
+    request_id: Option<&str>,
+    ref_name: Option<&str>,
+) -> Vec<String> {
+    let mut claimed_hooks = Vec::new();
+
+    // Only claim when we have occurrence context (request_id + ref_name)
+    if let (Some(req), Some(r)) = (request_id, ref_name) {
+        let hooks = match db.list_webhooks_for_event(repo_id, event).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(err = %e, "failed to list webhooks for event {event}");
+                return claimed_hooks;
+            }
+        };
+
+        for hook in hooks {
+            let delivery_id = crate::db::deterministic_id(&["webhook", req, r, &hook.id]);
+            match db
+                .claim_webhook_delivery(&delivery_id, req, repo_id, event)
+                .await
+            {
+                Ok(true) => claimed_hooks.push(hook.id),
+                Ok(false) => continue, // Already claimed
+                Err(_) => continue,
+            }
+        }
+    }
+
+    claimed_hooks
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn fire_event_async_occurrence(
     db: Arc<Db>,
     http_client: Arc<reqwest::Client>,
@@ -80,6 +158,8 @@ async fn fire_event_async_occurrence(
     payload: serde_json::Value,
     request_id: Option<&str>,
     ref_name: Option<&str>,
+    skip_claim: bool,
+    claimed_hook_ids: Option<Vec<String>>,
 ) {
     let hooks = match db.list_webhooks_for_event(repo_id, event).await {
         Ok(h) => h,
@@ -114,7 +194,8 @@ async fn fire_event_async_occurrence(
         // Claim before spawn so concurrent executors collapse to one
         // delivery per occurrence. Failures to record fall back to
         // sending (legacy best-effort) rather than dropping.
-        if request_id.is_some() {
+        // Skip claim if already done by caller (durable_outbox path).
+        if !skip_claim && request_id.is_some() {
             match db
                 .clone()
                 .claim_webhook_delivery(&delivery_id, request_id.unwrap_or(""), repo_id, event)
@@ -123,6 +204,13 @@ async fn fire_event_async_occurrence(
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(_) => {}
+            }
+        } else if skip_claim {
+            // Skip hooks that weren't claimed by the caller
+            if let Some(ref claimed) = claimed_hook_ids {
+                if !claimed.contains(&hook.id) {
+                    continue;
+                }
             }
         }
 

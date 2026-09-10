@@ -331,6 +331,10 @@ pub(crate) fn run_bounded_git(
 /// Full peeling is why this is not `for-each-ref %(*objecttype)`, which
 /// dereferences only one tag level and so misclassifies a tag-of-a-tag-of-a-
 /// commit as a non-commit.
+///
+/// Internal metadata refs (refs/gitlawb/requests/*) are exempt from this check
+/// since they point to blobs for request marker purposes, not repository content.
+/// The visibility logic only cares about content refs, not internal metadata.
 fn assert_all_refs_are_commits(repo_path: &Path, git_bin: &str, deadline: Instant) -> Result<()> {
     let refs_out = run_bounded_git(
         git_bin,
@@ -349,12 +353,23 @@ fn assert_all_refs_are_commits(repo_path: &Path, git_bin: &str, deadline: Instan
         return Ok(());
     }
 
-    // Peel every ref in one `git cat-file --batch-check` pass: one `<refname>^{}`
+    // Filter out internal metadata refs before checking object types
+    let content_refs: Vec<&str> = refnames
+        .iter()
+        .filter(|r| !r.starts_with("refs/gitlawb/"))
+        .copied()
+        .collect();
+
+    if content_refs.is_empty() {
+        return Ok(());
+    }
+
+    // Peel every content ref in one `git cat-file --batch-check` pass: one `<refname>^{}`
     // query per line, one output line per input line, in order. cat-file echoes the
     // full query on a `<query> missing` line, so output scales with refname length;
     // run_bounded_git drains stdout concurrently with the stdin write, so the pipe
     // cannot deadlock, and the whole peel is bounded by the shared walk deadline.
-    let queries = refnames
+    let queries = content_refs
         .iter()
         .map(|r| format!("{r}^{{}}"))
         .collect::<Vec<_>>()
@@ -370,15 +385,15 @@ fn assert_all_refs_are_commits(repo_path: &Path, git_bin: &str, deadline: Instan
     let peel_stdout = String::from_utf8_lossy(&peel_out);
     let types: Vec<&str> = peel_stdout.lines().map(str::trim).collect();
     // A short read means at least one ref went unclassified — fail closed.
-    if types.len() != refnames.len() {
+    if types.len() != content_refs.len() {
         anyhow::bail!(
             "git cat-file returned {} lines for {} refs; \
              refusing to produce a partial (under-withheld) set",
             types.len(),
-            refnames.len()
+            content_refs.len()
         );
     }
-    for (refname, kind) in refnames.iter().zip(types.iter()) {
+    for (refname, kind) in content_refs.iter().zip(types.iter()) {
         // git emits `<query> missing` (not the objecttype) when the peel target
         // is absent; the status word is the last token.
         if kind.split_ascii_whitespace().last() == Some("missing") {

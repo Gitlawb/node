@@ -26,12 +26,10 @@ use crate::state::AppState;
 /// new `issued_at` is strictly greater).
 ///
 /// #26 Split PR 1 P1-B: the live handler routes through this
-/// function (the upsert), NOT through
-/// [`issue_ref_certificate_idempotent`] (DO NOTHING). After the
-/// reviewer-1 round-2 fix, the recovery drain also routes through
-/// this function (P1: refresh a stale cert), so both paths use the
-/// same deterministic `cert_id` and the same upsert. A re-pass is
-/// always safe:
+/// function (the upsert). After the reviewer-1 round-2 fix, the
+/// recovery drain also routes through this function (P1: refresh a
+/// stale cert), so both paths use the same deterministic `cert_id`
+/// and the same upsert. A re-pass is always safe:
 ///
 /// - Live handler → live upsert: re-push updates the row, preserves
 ///   the original `id`. The contract pinned by
@@ -110,45 +108,6 @@ pub async fn issue_ref_certificate_with_issued_at(
     )
     .await?;
     state.db.insert_ref_certificate(&cert).await
-}
-
-/// #26 Split PR 1 — idempotent variant.
-///
-/// `cert_id` is the deterministic id derived from
-/// `(request_id, ref_name)` so a recovery re-pass against the same
-/// transition produces the same primary key. The insert uses
-/// `ON CONFLICT (repo_id, ref_name) DO NOTHING` (the existing
-/// `insert_ref_certificate_idempotent` helper), so the function
-/// returns `None` if a live-path cert already exists for the
-/// `(repo_id, ref_name)` pair, and `Some(cert)` if it wrote a new
-/// one.
-///
-/// Retained for any future caller that wants DO-NOTHING semantics
-/// (e.g. an explicit "never overwrite" handler); the live and
-/// recovery paths both use [`issue_ref_certificate`] (the upsert)
-/// after the P1 fix in #26 Split 1 round 2.
-#[allow(dead_code)]
-pub async fn issue_ref_certificate_idempotent(
-    state: &AppState,
-    repo_id: &str,
-    ref_name: &str,
-    old_sha: &str,
-    new_sha: &str,
-    pusher_did: &str,
-    cert_id: &str,
-) -> Result<Option<RefCertificate>> {
-    let cert = build_ref_certificate(
-        state,
-        repo_id,
-        ref_name,
-        old_sha,
-        new_sha,
-        pusher_did,
-        Some(cert_id.to_string()),
-        None,
-    )
-    .await?;
-    state.db.insert_ref_certificate_idempotent(&cert).await
 }
 
 /// Shared cert construction: build the JSON payload, sign it with the
