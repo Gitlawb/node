@@ -1293,6 +1293,11 @@ pub(crate) async fn ingest_ref_update(
     // to drain the victim author's budget until their own next push came back
     // `AuthorRateLimited`, which is the harm this guard exists to remove.
     let mut reservation = None;
+    // The key the seen-set judged on, kept for the row id below. A verified
+    // event gets a deterministic id derived from it; an unsigned one gets a
+    // random id, because dedup on unauthenticated content is the censorship
+    // primitive the skipped seen-set comment above describes.
+    let mut seen_key = None;
     if verified {
         // ONE reading, shared by the freshness comparison and the seen-set
         // below. `ingest_now`'s whole reason to exist is that the two layers
@@ -1339,6 +1344,7 @@ pub(crate) async fn ingest_ref_update(
             Begin::Saturated => {}
             Begin::Reserved(held) => reservation = Some(held),
         }
+        seen_key = Some(key);
     }
 
     // Authentication is not authorization: a freshly minted did:key signs its
@@ -1434,7 +1440,21 @@ pub(crate) async fn ingest_ref_update(
     );
 
     let update = ReceivedRefUpdate {
-        id: Uuid::new_v4().to_string(),
+        // A verified event's row id is derived from its replay key, so a
+        // republish after a partial write failure re-attempts only the write
+        // that never landed: the insert dedupes on the id conflict rather
+        // than storing a second row for the same signed content. That is the
+        // pair the reservation release trades on — release keeps a failed
+        // event republishable, and this key is what stops the repaired retry
+        // from repeating the half that already landed.
+        id: seen_key.map_or_else(
+            || Uuid::new_v4().to_string(),
+            |key| {
+                let mut bytes = [0u8; 16];
+                bytes.copy_from_slice(&key[..16]);
+                Uuid::from_bytes(bytes).to_string()
+            },
+        ),
         node_did: event.node_did.clone(),
         pusher_did: event.pusher_did.clone(),
         repo: event.repo.clone(),
@@ -3363,6 +3383,48 @@ mod tests {
             count(&pool, "received_ref_updates").await,
             1,
             "the ref-update row is a separate write and must not be lost to the enqueue failure"
+        );
+    }
+
+    /// A republish after a partial write failure must retry the write that
+    /// never landed WITHOUT repeating the one that did. The reservation
+    /// releases on failure so the retry reaches the writes at all, and the row
+    /// id derived from the replay key is what makes the retry's insert a
+    /// no-op rather than a duplicate. The second `WriteFailed` is the
+    /// load-bearing half of the assertion: it proves the republish was not
+    /// refused as a replay before it could repair anything.
+    #[sqlx::test]
+    async fn a_republish_after_partial_failure_retries_without_a_duplicate_row(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        seed_peer(&pool, &event.node_did).await;
+
+        sqlx::query("DROP TABLE sync_queue")
+            .execute(&pool)
+            .await
+            .expect("drop the queue sink so its write genuinely fails");
+
+        let guard = ReplayGuard::new();
+        let limiters = IngestLimiters::new();
+        let source = PeerId::random();
+        let bytes = bytes_of(&event);
+
+        for attempt in 1..=2 {
+            let outcome =
+                ingest_ref_update(&db, &limiters, &guard, true, true, &bytes, &source).await;
+            assert!(
+                matches!(outcome, IngestOutcome::WriteFailed(_)),
+                "attempt {attempt}: the queue is down, so each ingest must reach the writes \
+                 and report WriteFailed, got {outcome:?}"
+            );
+        }
+        assert_eq!(
+            count(&pool, "received_ref_updates").await,
+            1,
+            "the republish reached the writes but must not store a second row \
+             for the same signed content"
         );
     }
 
@@ -6162,8 +6224,9 @@ mod tests {
         );
         assert_eq!(
             count(&pool, "received_ref_updates").await,
-            2,
-            "the row write is a separate write and succeeded on both passes"
+            1,
+            "the re-publish repairs the queue entry without repeating the row write: \
+             the row id is derived from the replay key, so the second insert dedupes"
         );
     }
 
@@ -6227,9 +6290,15 @@ mod tests {
         );
         assert_eq!(
             count(&pool, "received_ref_updates").await,
+            1,
+            "the readmission still reaches the writes, which is what makes it an exposure, but \
+             the row id derives from the replay key so the duplicate insert dedupes"
+        );
+        assert_eq!(
+            count(&pool, "sync_queue").await,
             2,
-            "the readmission is a real write, which is exactly what makes it an exposure worth \
-             bounding"
+            "the queue write has no natural key, so the readmission re-enqueues: the residual \
+             effect of a restart is a duplicate fetch, not a duplicate record"
         );
 
         // One second past the event's own freshness horizon, and a guard as
@@ -6257,7 +6326,7 @@ mod tests {
         );
         assert_eq!(
             count(&pool, "received_ref_updates").await,
-            2,
+            1,
             "the refused delivery must write nothing"
         );
     }
