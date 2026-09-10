@@ -113,15 +113,48 @@ impl HttpSignature {
         })
     }
 
-    /// Reject if the `created` timestamp is more than 5 minutes from now.
+    /// Reject a `created` timestamp outside the acceptance window, which is
+    /// ASYMMETRIC: up to 5 minutes into the past, but only 60 seconds into the
+    /// future.
+    ///
+    /// The two directions are two comparisons rather than one distance, because
+    /// they are not the same event. A signature that arrives late is ordinary:
+    /// clocks run slow, requests queue, and networks are not instant, so the
+    /// past side keeps the full 300-second allowance. A signature stamped ahead
+    /// of this node's clock is not ordinary, and folding both sides into an
+    /// `abs()` let a signer extend its own validity: signed at T with
+    /// `created = T + 300`, it stayed acceptable until roughly T + 600, so the
+    /// effective window was double the one this function advertises. The
+    /// forward tolerance exists only to absorb honest drift between two hosts,
+    /// which is what 60 seconds buys; it is the same allowance the gossip
+    /// path's freshness check uses for the same reason.
     pub fn check_created(&self) -> Result<()> {
+        const MAX_AGE_SECS: i64 = 300;
+        const MAX_FUTURE_SECS: i64 = 60;
+
         let now = Utc::now().timestamp();
-        let skew = (now - self.created).abs();
-        if skew > 300 {
+
+        // Saturating, not plain subtraction. `created` is parsed as an
+        // unrestricted i64 straight from the Signature-Input header, so a
+        // sender picks it: at i64::MIN the past-side subtraction overflows,
+        // which panics a debug build and wraps a release one into an absurd
+        // value that can read as acceptable. Saturating gives the answer the
+        // check wants at both extremes, since a timestamp that far away is
+        // refused by whichever side it saturates toward.
+        let age = now.saturating_sub(self.created);
+        if age > MAX_AGE_SECS {
             return Err(Error::HttpSignature(format!(
-                "clock skew too large: {skew}s (max 300s)"
+                "clock skew too large: created {age}s in the past (max {MAX_AGE_SECS}s)"
             )));
         }
+
+        let ahead = self.created.saturating_sub(now);
+        if ahead > MAX_FUTURE_SECS {
+            return Err(Error::HttpSignature(format!(
+                "clock skew too large: created {ahead}s in the future (max {MAX_FUTURE_SECS}s)"
+            )));
+        }
+
         Ok(())
     }
 
@@ -333,6 +366,75 @@ mod tests {
         );
         let sig = HttpSignature::parse(&sig_input, "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:").unwrap();
         assert!(sig.check_created().is_err());
+    }
+
+    /// Build a parseable signature whose `created` is `offset` seconds from now
+    /// (negative for the past), so a test can pin one side of the window.
+    fn sig_created_at_offset(offset: i64) -> HttpSignature {
+        let kp = Keypair::generate();
+        let did = kp.did();
+        let created = Utc::now().timestamp() + offset;
+        let sig_input = format!(
+            r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created={created}"#
+        );
+        HttpSignature::parse(&sig_input, "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:").unwrap()
+    }
+
+    /// Build a signature at an ABSOLUTE `created`, so a test can drive the
+    /// extremes an offset from now cannot reach.
+    fn sig_created_absolute(created: i64) -> HttpSignature {
+        let kp = Keypair::generate();
+        let did = kp.did();
+        let sig_input = format!(
+            r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created={created}"#
+        );
+        HttpSignature::parse(&sig_input, "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:").unwrap()
+    }
+
+    /// `created` is parsed as an unrestricted i64 from a header the sender
+    /// writes, so the window check has to survive both ends of the type. Before
+    /// the saturating form this panicked with "attempt to subtract with
+    /// overflow" on the past side, which is a debug-build crash any client
+    /// could trigger by sending one header value.
+    #[test]
+    fn extreme_created_values_are_refused_rather_than_overflowing() {
+        for created in [i64::MIN, i64::MIN + 1, i64::MAX - 1, i64::MAX] {
+            let err = sig_created_absolute(created)
+                .check_created()
+                .expect_err("an extreme created must be refused, not accepted");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("past") || msg.contains("future"),
+                "created={created} must be refused by a named direction, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn created_301s_in_past_rejected() {
+        let err = sig_created_at_offset(-301).check_created().unwrap_err();
+        assert!(err.to_string().contains("past"), "{err}");
+    }
+
+    #[test]
+    fn created_299s_in_past_accepted() {
+        assert!(sig_created_at_offset(-299).check_created().is_ok());
+    }
+
+    #[test]
+    fn created_61s_in_future_rejected() {
+        let err = sig_created_at_offset(61).check_created().unwrap_err();
+        assert!(err.to_string().contains("future"), "{err}");
+    }
+
+    #[test]
+    fn created_30s_in_future_accepted() {
+        assert!(sig_created_at_offset(30).check_created().is_ok());
+    }
+
+    #[test]
+    fn created_exactly_now_accepted() {
+        assert!(sig_created_at_offset(0).check_created().is_ok());
     }
 
     #[test]
