@@ -270,6 +270,11 @@ const probes = [
     "@@ -1,0 +1,1 @@\n+#[test /*" + " *".repeat(30000),
     false,
   ],
+  [
+    "long malformed \\u{ escape run (quadratic guard)",
+    "@@ -1,0 +1,1 @@\n+" + "'\\u{".repeat(30000),
+    false,
+  ],
 ];
 for (const [name, patch, expected] of probes) {
   const t0 = process.hrtime.bigint();
