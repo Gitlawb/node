@@ -3153,6 +3153,12 @@ struct RefUpdate {
     ref_name: String,
 }
 
+/// A git object id is 40 hex chars; length alone is not enough, since a peer
+/// can send 40 arbitrary bytes (#398).
+fn is_hex_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Parse git receive-pack pkt-line ref updates from the request body.
 /// Format per line: `<40-hex-old> <40-hex-new> <refname>[NUL capabilities]\n`
 fn parse_ref_updates(body: &[u8]) -> Vec<RefUpdate> {
@@ -3194,7 +3200,7 @@ fn parse_ref_updates(body: &[u8]) -> Vec<RefUpdate> {
             .trim_end_matches('\n');
 
         let parts: Vec<&str> = line.splitn(3, ' ').collect();
-        if parts.len() == 3 && parts[0].len() == 40 && parts[1].len() == 40 {
+        if parts.len() == 3 && is_hex_sha(parts[0]) && is_hex_sha(parts[1]) {
             updates.push(RefUpdate {
                 old_sha: parts[0].to_string(),
                 new_sha: parts[1].to_string(),
@@ -3486,6 +3492,45 @@ mod tests {
             1,
             "a fresh filtered clone (want+done) must count exactly one"
         );
+    }
+
+    // #398: a peer-supplied pkt-line whose 40-byte "SHA" fields carry non-hex
+    // content must be dropped, not forwarded into RefUpdate events, branch_cid
+    // rows, and sync-notify JSON as a canonical-looking identifier.
+    #[test]
+    fn parse_ref_updates_requires_hex_shas() {
+        let sha_a = "a".repeat(40);
+        let sha_b = "b".repeat(40);
+        let pkt = |old: &str, new: &str, refname: &str| {
+            let line = format!("{old} {new} {refname}");
+            format!("{:04x}{}0000", line.len() + 4, line).into_bytes()
+        };
+
+        // Valid 40-hex old + new -> accepted.
+        let updates = parse_ref_updates(&pkt(&sha_a, &sha_b, "refs/heads/main"));
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].old_sha, sha_a);
+        assert_eq!(updates[0].new_sha, sha_b);
+        assert_eq!(updates[0].ref_name, "refs/heads/main");
+
+        // 40-byte non-hex fields -> dropped.
+        let junk = "Z".repeat(40);
+        assert!(parse_ref_updates(&pkt(&junk, &sha_b, "refs/heads/main")).is_empty());
+        assert!(parse_ref_updates(&pkt(&sha_a, &junk, "refs/heads/main")).is_empty());
+
+        // Wrong lengths -> dropped.
+        assert!(parse_ref_updates(&pkt(&"a".repeat(39), &sha_b, "refs/heads/main")).is_empty());
+        assert!(parse_ref_updates(&pkt(&sha_a, &"b".repeat(41), "refs/heads/main")).is_empty());
+
+        // A bad line among good ones drops only the bad line.
+        let sha_c = "c".repeat(40);
+        let bad = pkt(&junk, &sha_b, "refs/heads/bad");
+        let good = pkt(&sha_a, &sha_c, "refs/heads/good");
+        let mut mixed = bad[..bad.len() - 4].to_vec(); // strip trailing flush
+        mixed.extend_from_slice(&good);
+        let updates = parse_ref_updates(&mixed);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].ref_name, "refs/heads/good");
     }
 
     #[test]
