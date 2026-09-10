@@ -80,14 +80,7 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
     let _guard = TmpGuard(tmp_root);
 
     println!("Cloning source (this may take a while for large repos)...");
-    let clone_status = Command::new("git")
-        .args(["clone", "--mirror", &source, mirror_path.to_str().unwrap()])
-        .status()
-        .context("failed to run git clone — is git installed?")?;
-
-    if !clone_status.success() {
-        bail!("git clone --mirror failed\nCheck that the source URL is accessible: {source}");
-    }
+    clone_mirror(&source, &mirror_path)?;
 
     // ── 4. Create the repo on gitlawb ─────────────────────────────────────
     println!("Creating repo on gitlawb node...");
@@ -136,6 +129,25 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
     println!("  Clone:  git clone {gitlawb_url}");
     println!("  View:   https://gitlawb.com/{owner_short}/{name}");
 
+    Ok(())
+}
+
+/// `git clone --mirror <source> <dest>`. The destination is passed as an
+/// OS-native path so a non-UTF-8 temp dir (e.g. a TMPDIR with non-UTF-8 bytes)
+/// does not panic on a `to_str()` conversion.
+fn clone_mirror(source: &str, dest: &std::path::Path) -> Result<()> {
+    // allow-unbounded-git: gl is the client CLI; this clone runs in the user's
+    // terminal with no server-side permit or disconnect to survive. The
+    // bounded-runner rule governs node request handlers. Same spawn as before,
+    // only relocated into this helper.
+    let status = Command::new("git")
+        .args(["clone", "--mirror", source])
+        .arg(dest)
+        .status()
+        .context("failed to run git clone — is git installed?")?;
+    if !status.success() {
+        bail!("git clone --mirror failed\nCheck that the source URL is accessible: {source}");
+    }
     Ok(())
 }
 
@@ -219,6 +231,28 @@ mod tests {
     fn test_extract_dot_git_only_returns_none() {
         // edge case: URL ending in just ".git" with no name
         assert_eq!(extract_repo_name("https://example.com/.git"), None);
+    }
+
+    // #417: a non-UTF-8 destination path must reach git as an OS-native arg, not
+    // panic on a `to_str()` conversion.
+    #[cfg(unix)]
+    #[test]
+    fn test_clone_mirror_non_utf8_dest() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("src.git");
+        let st = Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(st.success());
+
+        let dest = tmp.path().join(OsStr::from_bytes(b"mirror-\xffdest"));
+        clone_mirror(src.to_str().unwrap(), &dest).unwrap();
+        assert!(dest.join("HEAD").exists());
     }
 
     #[tokio::test]
