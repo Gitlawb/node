@@ -1068,12 +1068,16 @@ async fn call_tool(
                 None | Some(Value::Null) => 50,
                 Some(val) => val.as_i64().context("invalid limit: expected an integer")?,
             };
+            let cursor = match args.get("cursor") {
+                None | Some(Value::Null) => None,
+                Some(val) => Some(val.as_str().context("invalid cursor: expected a string")?),
+            };
             let result = crate::task::fetch_tasks(
                 &client,
                 args.get("status").and_then(|v| v.as_str()),
                 args.get("assignee_did").and_then(|v| v.as_str()),
                 limit,
-                args.get("cursor").and_then(|v| v.as_str()),
+                cursor,
             )
             .await?;
             let mut out = result.to_json();
@@ -2352,6 +2356,45 @@ mod tests {
                 .contains("invalid limit: expected an integer"),
             "got: {err_float}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_task_list_invalid_cursor_rejected() {
+        let server = mockito::Server::new_async().await;
+        for invalid in [json!(123), json!({}), json!([]), json!(true)] {
+            let err = call_tool("task_list", json!({"cursor": invalid}), &server.url(), None)
+                .await
+                .expect_err("non-string cursor must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("invalid cursor: expected a string"),
+                "for {invalid}: got {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_task_list_null_or_absent_cursor_accepted() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[],"has_more":false,"incomplete":false,"next_cursor":null}"#)
+            .expect(2)
+            .create_async()
+            .await;
+
+        call_tool("task_list", json!({}), &server.url(), None)
+            .await
+            .unwrap();
+
+        call_tool("task_list", json!({"cursor": null}), &server.url(), None)
+            .await
+            .unwrap();
     }
 
     #[test]
