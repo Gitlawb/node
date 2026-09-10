@@ -8126,6 +8126,7 @@ mod tests {
             let outcome = ingest_ref_update(
                 &db,
                 &limiters,
+                &ReplayGuard::new(),
                 true,
                 true,
                 &bytes_of(&signed_nth(i)),
@@ -8142,6 +8143,7 @@ mod tests {
         let outcome = ingest_ref_update(
             &db,
             &limiters,
+            &ReplayGuard::new(),
             true,
             true,
             &bytes_of(&signed_nth(GOSSIP_AUTHOR_MAX_EVENTS)),
@@ -8177,8 +8179,16 @@ mod tests {
         sign_ref_update(&stranger, &mut e).unwrap();
 
         let before = limiters.author.tracked_keys().await;
-        let outcome =
-            ingest_ref_update(&db, &limiters, true, true, &bytes_of(&e), &PeerId::random()).await;
+        let outcome = ingest_ref_update(
+            &db,
+            &limiters,
+            &ReplayGuard::new(),
+            true,
+            true,
+            &bytes_of(&e),
+            &PeerId::random(),
+        )
+        .await;
         assert!(
             matches!(outcome, IngestOutcome::Rejected(_)),
             "an unregistered DID is refused by the peer lookup, got {outcome:?}"
