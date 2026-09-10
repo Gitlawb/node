@@ -465,19 +465,8 @@ pub async fn get_blob(
         return Err(AppError::BadRequest("invalid file path".into()));
     }
 
-    if state.git_read_semaphore.available_permits() == 0
-        || state.git_blob_semaphore.available_permits() == 0
-    {
-        tracing::warn!(
-            "served-git concurrency cap reached; shedding blob request with 503 (pre-DB)"
-        );
-        return Err(AppError::Overloaded(
-            "git service at capacity, retry shortly".into(),
-        ));
-    }
-
-    // Charge the source before visibility queries, retaining its permit through
-    // authorization, Git work, and response delivery.
+    // Charge the source and acquire blob/global read permits before any database work.
+    // The OwnedSemaphorePermits release on drop if authorization or subsequent work fails.
     let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
     let caller_permit = acquire_read_caller_permit(
         &state.git_read_per_caller,
@@ -485,13 +474,13 @@ pub async fn get_blob(
         &name,
         "REST blob",
     )?;
+    let blob_permit = git_permit(&state.git_blob_semaphore)?;
+    let permit = git_permit(&state.git_read_semaphore)?;
+
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
     let gate_path = format!("/{file_path}");
     let (record, _rules) =
         crate::api::authorize_repo_read(&state, &owner, &name, caller, &gate_path).await?;
-
-    let blob_permit = git_permit(&state.git_blob_semaphore)?;
-    let permit = git_permit(&state.git_read_semaphore)?;
 
     let acquire_deadline = std::time::Duration::from_secs(state.config.git_acquire_timeout_secs);
     let disk_path = tokio::time::timeout(
@@ -3658,7 +3647,12 @@ mod tests {
         }
     }
 
-    async fn blob_route_request(state: AppState, owner: &str, peer: &str) -> Response {
+    async fn blob_route_request_path(
+        state: AppState,
+        owner: &str,
+        path: &str,
+        peer: &str,
+    ) -> Response {
         use axum::body::Body;
         use axum::extract::ConnectInfo;
         use axum::http::Request;
@@ -3670,13 +3664,17 @@ mod tests {
             )
             .with_state(state);
         let mut request = Request::builder()
-            .uri(format!("/repos/{owner}/repo/blob/file.txt"))
+            .uri(format!("/repos/{owner}/repo/blob/{path}"))
             .body(Body::empty())
             .unwrap();
         request
             .extensions_mut()
             .insert(ConnectInfo(peer.parse::<std::net::SocketAddr>().unwrap()));
         router.oneshot(request).await.unwrap()
+    }
+
+    async fn blob_route_request(state: AppState, owner: &str, peer: &str) -> Response {
+        blob_route_request_path(state, owner, "file.txt", peer).await
     }
 
     #[sqlx::test]
@@ -3809,6 +3807,76 @@ mod tests {
                 .try_acquire("203.0.113.31")
                 .is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn blob_route_rejects_invalid_paths() {
+        use axum::http::StatusCode;
+        use http_body_util::BodyExt;
+        let state = crate::test_support::test_state_lazy();
+        for invalid_path in [
+            "file%01.txt",
+            "file%1f.txt",
+            "foo/%2e%2e/bar.txt",
+            "foo/%2e/bar.txt",
+            "foo//bar.txt",
+        ] {
+            let response =
+                blob_route_request_path(state.clone(), "z6test", invalid_path, "203.0.113.31:5000")
+                    .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "path: {invalid_path:?}"
+            );
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"], "bad_request");
+        }
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn blob_route_returns_not_found_on_missing_blob(pool: sqlx::PgPool) {
+        use axum::http::StatusCode;
+        use http_body_util::BodyExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = write_fake_git(
+            tmp.path(),
+            "#!/bin/sh\nif [ \"$1\" = rev-parse ]; then exit 0; fi\nif [ \"$2\" = --batch-check ]; then echo 'missing'; exit 0; fi\nexit 1\n",
+        );
+        let state =
+            f4_state_with_repo(pool, tmp.path(), &fake, "z6blobmissing", "repo", false).await;
+        let response =
+            blob_route_request_path(state, "z6blobmissing", "missing.txt", "203.0.113.31:5000")
+                .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "not_found");
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn blob_route_returns_200_with_expected_headers_and_content(pool: sqlx::PgPool) {
+        use axum::http::{header, StatusCode};
+        use http_body_util::BodyExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = write_fake_git(
+            tmp.path(),
+            "#!/bin/sh\nif [ \"$1\" = rev-parse ]; then exit 0; fi\nif [ \"$2\" = --batch-check ]; then echo '1111111111111111111111111111111111111111 blob 13'; exit 0; fi\nprintf '{\"hello\":123}'; exit 0\n",
+        );
+        let state = f4_state_with_repo(pool, tmp.path(), &fake, "z6blobhappy", "repo", false).await;
+        let response =
+            blob_route_request_path(state, "z6blobhappy", "data.json", "203.0.113.31:5000").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/json; charset=utf-8"
+        );
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "13");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"{\"hello\":123}");
     }
 
     #[test]

@@ -1169,6 +1169,92 @@ mod tests {
     }
 
     #[test]
+    fn resolve_head_bounded_covers_all_fallback_arms() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(work)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(work.join("hello.txt"), b"hello").unwrap();
+        run(&["add", "hello.txt"]);
+        run(&["commit", "-qm", "initial"]);
+        run(&["branch", "-M", "custom-feature"]);
+        // Detach or point HEAD to an unborn branch so HEAD itself does not resolve.
+        run(&["symbolic-ref", "HEAD", "refs/heads/unborn-branch"]);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        // 1. Preferred branch arm: "custom-feature" resolves to refs/heads/custom-feature.
+        let resolved =
+            super::resolve_head_bounded("git", work, "custom-feature", deadline).unwrap();
+        assert_eq!(resolved, "refs/heads/custom-feature");
+        let read =
+            super::read_file_bounded("git", work, "custom-feature", "hello.txt", 1024, deadline)
+                .unwrap();
+        assert_eq!(read, super::BoundedFileRead::Found(b"hello".to_vec()));
+
+        // 2. Candidate branch arm (main, master, develop): create "master".
+        run(&["branch", "-M", "custom-feature", "master"]);
+        // Asking for a nonexistent preferred branch falls back to "master".
+        let resolved_master =
+            super::resolve_head_bounded("git", work, "nonexistent", deadline).unwrap();
+        assert_eq!(resolved_master, "refs/heads/master");
+        let read_master =
+            super::read_file_bounded("git", work, "nonexistent", "hello.txt", 1024, deadline)
+                .unwrap();
+        assert_eq!(
+            read_master,
+            super::BoundedFileRead::Found(b"hello".to_vec())
+        );
+
+        // 3. for-each-ref fallback arm: rename "master" to "isolated-branch" (neither main, master, nor develop).
+        run(&["branch", "-M", "master", "isolated-branch"]);
+        let resolved_isolated =
+            super::resolve_head_bounded("git", work, "nonexistent", deadline).unwrap();
+        assert_eq!(resolved_isolated, "refs/heads/isolated-branch");
+        let read_isolated =
+            super::read_file_bounded("git", work, "nonexistent", "hello.txt", 1024, deadline)
+                .unwrap();
+        assert_eq!(
+            read_isolated,
+            super::BoundedFileRead::Found(b"hello".to_vec())
+        );
+
+        // 4. Empty refs fallback: a completely empty repo with unborn HEAD.
+        let td_empty = tempfile::TempDir::new().unwrap();
+        let run_empty = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(td_empty.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_empty(&["init", "-q"]);
+        let resolved_empty =
+            super::resolve_head_bounded("git", td_empty.path(), "nonexistent", deadline).unwrap();
+        assert_eq!(resolved_empty, "HEAD");
+        let read_empty = super::read_file_bounded(
+            "git",
+            td_empty.path(),
+            "nonexistent",
+            "hello.txt",
+            1024,
+            deadline,
+        )
+        .unwrap();
+        assert_eq!(read_empty, super::BoundedFileRead::Missing);
+    }
+
+    #[test]
     fn branch_diff_names_lists_changed_paths() {
         let td = tempfile::TempDir::new().unwrap();
         let work: &Path = td.path();
