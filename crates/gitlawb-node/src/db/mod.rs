@@ -1509,8 +1509,7 @@ impl Db {
 
     /// Shared dedup CTE: collapses the mirror row and the canonical row of one
     /// logical repo into a single survivor. `$1` is an optional owner filter
-    /// (NULL = all rows). `$2` optionally scopes the work to the logical groups
-    /// containing the supplied repo ids. Grouping collapses on a did:key-aware
+    /// (NULL = all rows). Grouping collapses on a did:key-aware
     /// owner key: strip a `did:key:` prefix (8 chars, so
     /// `substr(owner_did, 9)`) only when the remainder is a bare id with no `:`,
     /// otherwise keep the full DID. That is the exact normalization in
@@ -1525,12 +1524,7 @@ impl Db {
     /// `crate::api::repos::dedupe_canonical_repos` must stay in sync.
     fn dedup_cte() -> String {
         format!(
-            "WITH requested_groups AS (
-                 SELECT DISTINCT {key} AS owner_key, name
-                 FROM repos
-                 WHERE $2::text[] IS NOT NULL AND id = ANY($2)
-             ),
-             deduped AS (
+            "WITH deduped AS (
                  SELECT DISTINCT ON ({key}, name)
                      id, name, owner_did, description, is_public, default_branch,
                      created_at,
@@ -1549,11 +1543,6 @@ impl Db {
                  -- Quarantined mirrors (admitted but unvalidated by the iCaptcha
                  -- propagation gate) are withheld from every listing surface.
                  WHERE quarantined = FALSE AND ($1::text IS NULL OR ({key}) = $1)
-                   AND ($2::text[] IS NULL OR EXISTS (
-                       SELECT 1 FROM requested_groups requested
-                       WHERE requested.owner_key = ({key})
-                         AND requested.name = repos.name
-                   ))
                  ORDER BY {key}, name,
                      -- mirror rows carry a slash-form id (\"{{owner_short}}/{{name}}\"),
                      -- written only by upsert_mirror_repo; canonical ids are UUIDs.
@@ -1566,9 +1555,51 @@ impl Db {
         )
     }
 
+    /// Dedicated SQL for scoped repo lookup: resolves the requested IDs to
+    /// logical groups, considers the relevant canonical/mirror members via the
+    /// owner-key/name index, picks the survivor, and filters to the requested IDs.
+    pub fn scoped_dedup_sql() -> String {
+        format!(
+            "WITH requested_groups AS (
+                 SELECT DISTINCT {key} AS owner_key, name
+                 FROM repos
+                 WHERE id = ANY($1)
+             ),
+             candidate_repos AS (
+                 SELECT repos.id, repos.name, repos.owner_did, repos.description,
+                     repos.is_public, repos.default_branch, repos.created_at,
+                     repos.updated_at, repos.disk_path, repos.forked_from,
+                     repos.machine_id
+                 FROM requested_groups rg
+                 JOIN repos ON ({key}) = rg.owner_key AND repos.name = rg.name
+                 WHERE repos.quarantined = FALSE
+             ),
+             deduped AS (
+                 SELECT DISTINCT ON ({key}, name)
+                     id, name, owner_did, description, is_public, default_branch,
+                     created_at,
+                     MAX(updated_at) OVER (
+                         PARTITION BY {key}, name
+                     ) AS updated_at,
+                     disk_path, forked_from, machine_id
+                 FROM candidate_repos repos
+                 ORDER BY {key}, name,
+                     CASE WHEN position('/' in id) > 0 THEN 1 ELSE 0 END,
+                     created_at ASC, id ASC
+             )
+             SELECT d.id, d.name, d.owner_did, d.description, d.is_public,
+                 d.default_branch, d.created_at, d.updated_at, d.disk_path,
+                 d.forked_from, d.machine_id
+             FROM deduped d
+             WHERE d.id = ANY($1)
+             ORDER BY d.updated_at DESC",
+            key = OWNER_KEY_CASE_SQL
+        )
+    }
+
     /// All repos with star counts, mirror-deduplicated via `DEDUP_CTE` and
     /// ordered newest-first, optionally filtered to one owner. Returns the full
-    /// set (no SQL pagination): the listing surface filters by per-caller `"/"`
+    /// set (no SQL pagination): the listing surface filters by per-caller \"/\"
     /// visibility in Rust and paginates after, so neither the page nor the count
     /// leaks a repo the caller may not read (#97).
     ///
@@ -1601,7 +1632,6 @@ impl Db {
         );
         let rows = sqlx::query(&sql)
             .bind(owner_key)
-            .bind(None::<&[String]>)
             .fetch_all(&self.pool)
             .await?;
 
@@ -1630,7 +1660,6 @@ impl Db {
         );
         let rows = sqlx::query(&sql)
             .bind(None::<&str>)
-            .bind(None::<&[String]>)
             .fetch_all(&self.pool)
             .await?;
 
@@ -1643,18 +1672,8 @@ impl Db {
         if repo_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let sql = format!(
-            "{}
-             SELECT d.id, d.name, d.owner_did, d.description, d.is_public,
-                 d.default_branch, d.created_at, d.updated_at, d.disk_path,
-                 d.forked_from, d.machine_id
-             FROM deduped d
-             WHERE d.id = ANY($2)
-             ORDER BY d.updated_at DESC",
-            Self::dedup_cte()
-        );
+        let sql = Self::scoped_dedup_sql();
         let rows = sqlx::query(&sql)
-            .bind(None::<&str>)
             .bind(repo_ids)
             .fetch_all(&self.pool)
             .await?;
@@ -5557,12 +5576,73 @@ mod dedup_db_tests {
         db.create_repo(&requested).await.unwrap();
         db.create_repo(&unrelated).await.unwrap();
 
+        // Empty input returns empty without querying.
+        let empty = db.list_repos_deduped_by_ids(&[]).await.unwrap();
+        assert!(empty.is_empty());
+
         let out = db
             .list_repos_deduped_by_ids(std::slice::from_ref(&requested.id))
             .await
             .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, requested.id);
+
+        // Deduplication order of operations:
+        // Canonical row and mirror row for the same group: canonical wins.
+        let canonical = rec(
+            "canonical-pair-id",
+            "did:key:z6MkPairOwner",
+            "pair-repo",
+            "canonical",
+            "2026-01-10T00:00:00Z",
+            "2026-01-10T00:00:00Z",
+        );
+        let mirror = rec(
+            "z6MkPairOwner/pair-repo",
+            "z6MkPairOwner",
+            "pair-repo",
+            "mirror",
+            "2026-01-11T00:00:00Z",
+            "2026-01-11T00:00:00Z",
+        );
+        db.create_repo(&canonical).await.unwrap();
+        db.create_repo(&mirror).await.unwrap();
+
+        // Requesting canonical returns canonical survivor.
+        let out_can = db
+            .list_repos_deduped_by_ids(std::slice::from_ref(&canonical.id))
+            .await
+            .unwrap();
+        assert_eq!(out_can.len(), 1);
+        assert_eq!(out_can[0].id, canonical.id);
+
+        // Requesting mirror returns empty because canonical survivor wins and
+        // mirror id does not match the survivor.
+        let out_mir = db
+            .list_repos_deduped_by_ids(std::slice::from_ref(&mirror.id))
+            .await
+            .unwrap();
+        assert!(out_mir.is_empty());
+
+        // Requesting both returns canonical survivor once.
+        let out_both = db
+            .list_repos_deduped_by_ids(&[canonical.id.clone(), mirror.id.clone()])
+            .await
+            .unwrap();
+        assert_eq!(out_both.len(), 1);
+        assert_eq!(out_both[0].id, canonical.id);
+
+        // Quarantined mirror is withheld even if requested by ID.
+        db.upsert_mirror_repo("z6MkQuar", "quar-repo", "/srv/quar", None, true)
+            .await
+            .unwrap();
+        let quar_id = "z6MkQuar/quar-repo".to_string();
+
+        let out_quar = db
+            .list_repos_deduped_by_ids(std::slice::from_ref(&quar_id))
+            .await
+            .unwrap();
+        assert!(out_quar.is_empty());
     }
 
     /// A PRIVATE canonical repo and a PUBLIC mirror row for the same
@@ -6552,6 +6632,124 @@ mod list_tasks_keyset_plan_tests {
             page.len() as i64, BATCH,
             "populated pending+assignee stream must fill a batch so the plan is not a tiny one-row special case"
         );
+    }
+}
+
+/// #327 / #396 review: the scoped repository lookup must follow the requested
+/// logical groups and resolve candidates through the owner-key/name index without
+/// scanning and discarding the entire unrelated population.
+#[cfg(test)]
+mod scoped_repo_lookup_plan_tests {
+    use super::Db;
+    use serde_json::Value;
+    use sqlx::PgPool;
+
+    const POPULATED_ROWS: i32 = 4000;
+
+    fn plan_walk(plan: &Value, visit: &mut impl FnMut(&Value)) {
+        visit(plan);
+        if let Some(children) = plan.get("Plans").and_then(Value::as_array) {
+            for child in children {
+                plan_walk(child, visit);
+            }
+        }
+    }
+
+    fn assert_scoped_repo_plan(plan: &Value, mode: &str) {
+        let mut saw_seqscan = false;
+        let mut saw_index = false;
+        plan_walk(plan, &mut |node| {
+            let node_type = node.get("Node Type").and_then(Value::as_str).unwrap_or("");
+            let relation = node
+                .get("Relation Name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if node_type == "Seq Scan" && relation == "repos" {
+                saw_seqscan = true;
+            }
+            if node_type.contains("Index") && relation == "repos" {
+                saw_index = true;
+            }
+        });
+        assert!(
+            saw_index && !saw_seqscan,
+            "{mode}: scoped repo lookup must use index scans on repos, not sequential scans over all repos: {plan}"
+        );
+    }
+
+    async fn seed_populated_repos(pool: &PgPool) {
+        sqlx::query(
+            "INSERT INTO repos (
+                 id, name, owner_did, description, is_public, default_branch,
+                 created_at, updated_at, disk_path, forked_from, machine_id, quarantined
+             )
+             SELECT
+                 'repo-plan-' || g,
+                 'repo-name-' || g,
+                 'did:key:z6MkOwner' || g,
+                 'desc',
+                 true,
+                 'main',
+                 '2026-01-01T00:00:00Z',
+                 '2026-01-01T00:00:00Z',
+                 '/disk/' || g,
+                 NULL,
+                 'mach1',
+                 false
+             FROM generate_series(1, $1) AS g",
+        )
+        .bind(POPULATED_ROWS)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("ANALYZE repos").execute(pool).await.unwrap();
+    }
+
+    async fn explain_scoped_repo_lookup(pool: &PgPool, force_generic: bool) -> Value {
+        let mut conn = pool.acquire().await.unwrap();
+        if force_generic {
+            sqlx::query("SET plan_cache_mode = force_generic_plan")
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+        } else {
+            sqlx::query("SET plan_cache_mode = force_custom_plan")
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+        }
+        let sql = format!("EXPLAIN (FORMAT JSON) {}", Db::scoped_dedup_sql());
+        let explained = sqlx::query_scalar::<_, Value>(&sql)
+            .bind(&["repo-plan-1".to_string()][..])
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("RESET plan_cache_mode")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let root = match &explained {
+            Value::Array(arr) => arr.first().cloned(),
+            Value::String(s) => serde_json::from_str(s).ok(),
+            other => Some(other.clone()),
+        };
+        root.as_ref()
+            .and_then(|obj| obj.get("Plan"))
+            .cloned()
+            .expect("EXPLAIN (FORMAT JSON) returns [{\"Plan\": ...}]")
+    }
+
+    #[sqlx::test]
+    async fn scoped_repo_lookup_uses_indexes_for_custom_and_generic_plans(pool: PgPool) {
+        let db = Db::for_testing(pool.clone());
+        db.migrate().await.unwrap();
+        seed_populated_repos(&pool).await;
+
+        let custom_plan = explain_scoped_repo_lookup(&pool, false).await;
+        assert_scoped_repo_plan(&custom_plan, "custom-plan");
+
+        let generic_plan = explain_scoped_repo_lookup(&pool, true).await;
+        assert_scoped_repo_plan(&generic_plan, "generic-plan");
     }
 }
 
