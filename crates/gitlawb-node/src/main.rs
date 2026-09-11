@@ -110,7 +110,7 @@ async fn main() -> Result<()> {
 
     if !config.public_read {
         warn!(
-            "GITLAWB_PUBLIC_READ=false is reserved; per-repository private-read enforcement is not wired in alpha"
+            "GITLAWB_PUBLIC_READ=false has no effect; reads are gated per repository by is_public and path-scoped visibility rules, not this flag"
         );
     }
 
