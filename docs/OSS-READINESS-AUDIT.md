@@ -146,7 +146,7 @@ Risks:
 ## Obvious live-network priorities
 
 1. Implement repo write authorization: owner checks, UCAN capability checks, and clear delegation semantics for push/PR/issue/bounty operations.
-2. Implement private-read enforcement or remove private repo affordances until it exists.
+2. Private reads are already enforced per repository (`is_public` plus path-scoped rules); retire the reserved and inert `GITLAWB_PUBLIC_READ` flag or document it as permanently reserved.
 3. Add UCAN revocation/blocklisting and operator docs for emergency key compromise.
 4. Harden peer registration and outbound fetch behavior against SSRF and peer-list poisoning.
 5. Add Docker/installer/release smoke tests to CI.
