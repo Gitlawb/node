@@ -116,9 +116,10 @@ fn loopback_http_host(url: &str) -> Option<String> {
 /// Refuse to sign a request destined for a cleartext hop off this machine
 /// unless the operator has opted in. `GITLAWB_ALLOW_INSECURE_HTTP` exists for a
 /// private LAN where the operator has decided that is acceptable; its presence
-/// alone opts in, matching git-remote-gitlawb's guard for the same hop. The
+/// alone opts in, matching the variable git-remote-gitlawb's guard uses for
+/// the same hop. This guard is stricter than the helper's in one respect: the
 /// loopback exemption does not apply when a proxy would carry the request
-/// off-machine anyway; `proxy_env` is the proxy state the client was built
+/// off-machine anyway. `proxy_env` is the proxy state the client was built
 /// with, so the guard judges the same routing the client will use.
 fn ensure_signing_transport(
     node_base: &str,
