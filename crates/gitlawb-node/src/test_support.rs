@@ -1475,7 +1475,12 @@ mod tests {
                 )
                 .with_state(state.clone())
         };
-        let body = || Body::from(r#"{"url":"https://replica.example.com/me"}"#.to_string());
+        let replica_url = "https://replica.example.com/me";
+        let body = || Body::from(format!(r#"{{"url":"{replica_url}"}}"#));
+        let leaks = |bytes: &[u8]| {
+            let text = String::from_utf8_lossy(bytes);
+            text.contains(replica_url) || text.contains(&priv_repo.id)
+        };
 
         // Private repo, non-reader stranger: register → 404, nothing written.
         let resp = router()
@@ -1491,6 +1496,13 @@ mod tests {
             resp.status(),
             StatusCode::NOT_FOUND,
             "a non-reader must not register on a private repo"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !leaks(&bytes),
+            "a denied register body must not leak the replica url or repo data"
         );
         assert!(
             state
@@ -1516,6 +1528,13 @@ mod tests {
             resp.status(),
             StatusCode::NOT_FOUND,
             "a non-reader must not unregister on a private repo"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !leaks(&bytes),
+            "a denied unregister body must not leak the replica url or repo data"
         );
 
         // Private repo, listed reader: register → 201, unregister → 200.
@@ -1618,7 +1637,12 @@ mod tests {
 
         let router = app(pool).await;
         let path = format!("/api/v1/repos/{short}/sig-repl-priv/replicas");
+        let replica_url = "https://replica.example.com/e2e";
         let reg_body: &[u8] = br#"{"url":"https://replica.example.com/e2e"}"#;
+        let leaks = |bytes: &[u8]| {
+            let text = String::from_utf8_lossy(bytes);
+            text.contains(replica_url) || text.contains(&repo.id)
+        };
         let signed_req = |kp: &Keypair, method: &str, body: &'static [u8]| {
             let signed = sign_request(kp, method, &path, body);
             Request::builder()
@@ -1643,6 +1667,13 @@ mod tests {
             StatusCode::NOT_FOUND,
             "a verified non-reader must not register on a private repo"
         );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !leaks(&bytes),
+            "a denied register body must not leak the replica url or repo data"
+        );
         assert!(
             state.db.list_replicas(&repo.id).await.unwrap().is_empty(),
             "a denied register must not create a replica row"
@@ -1658,6 +1689,13 @@ mod tests {
             resp.status(),
             StatusCode::NOT_FOUND,
             "a verified non-reader must not unregister on a private repo"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !leaks(&bytes),
+            "a denied unregister body must not leak the replica url or repo data"
         );
 
         // Listed reader: PUT → 201, DELETE → 200.
