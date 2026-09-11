@@ -534,20 +534,20 @@ fn read_upload_pack_round<R: Read>(stdin: &mut R) -> Result<(Vec<u8>, RoundEnd)>
     }
 }
 
-/// Read one git-receive-pack request: the command list's pkt-lines (each
-/// re-emitted into the body, up to and including the terminating flush), the
-/// negotiated extra sections, then the pack ONLY when a command carries a
-/// non-zero new-oid.
+/// Read one git-receive-pack request: optional `shallow` lines, then EITHER a
+/// command list (pkt-lines terminated by a flush) or a push-cert block
+/// (pkt-lines terminated by a "push-cert-end" line), then the negotiated
+/// push-options block, then the pack ONLY when a command carries a non-zero
+/// new-oid.
 ///
 /// A delete-only push sends no pack, and git holds its write pipe open waiting
 /// for the report-status response, so a plain read_to_end deadlocks the two
-/// (#369). When the negotiated capabilities include them, two more
-/// pkt-line sections sit between the command flush and the pack: a
-/// push-options block (terminated by its own flush) and a push-cert block
-/// (terminated by a "push-cert-end" pkt-line, not a flush). Both are consumed
-/// here, since git writes them before it ever blocks on the response. EOF at
-/// any point also ends the read, covering git versions that close the pipe
-/// early.
+/// (#369). A signed push is the other trap: when the client sends a push-cert
+/// it sends NO command list at all (the commands live inside the cert), so the
+/// request starts with a "push-cert" line and no flush ever arrives. The
+/// negotiated capability list is on the push-cert line, or on the first
+/// command line after its NUL when there is no cert. EOF at any point also
+/// ends the read, covering git versions that close the pipe early.
 fn read_receive_pack_request<R: Read>(stdin: &mut R) -> Result<Vec<u8>> {
     /// Read one pkt-line into `body` (length prefix + data), returning its data
     /// or `None` on flush or EOF. Malformed lengths bail rather than collapse
@@ -580,21 +580,40 @@ fn read_receive_pack_request<R: Read>(stdin: &mut R) -> Result<Vec<u8>> {
         Ok(Some(data))
     }
 
-    let mut body = Vec::new();
-    let mut caps = String::new();
-    let mut pack_expected = false;
-    // Command list: "<40-hex old> <40-hex new> <refname>[\0caps]" pkt-lines to
-    // a flush. The first command's NUL-suffixed tail is the negotiated
-    // capability list.
-    while let Some(data) = read_pkt(stdin, &mut body)? {
-        if data.len() >= 82
+    /// "<40-hex old> <40-hex new> <refname>" — the command shape, whether it
+    /// appears in a command list or inside a push-cert.
+    fn is_command(data: &[u8]) -> bool {
+        data.len() >= 82
             && data[..40].iter().all(|b| b.is_ascii_hexdigit())
             && data[40] == b' '
             && data[41..81].iter().all(|b| b.is_ascii_hexdigit())
             && data[81] == b' '
-        {
+    }
+
+    let mut body = Vec::new();
+    let mut caps = String::new();
+    let mut pack_expected = false;
+    let mut in_cert = false;
+    loop {
+        let Some(data) = read_pkt(stdin, &mut body)? else {
+            // Flush ends a command list; EOF ends anything. A cert has no
+            // legal flush inside it, so the same break covers malformed
+            // input without hanging.
+            break;
+        };
+        if !in_cert && data.starts_with(b"push-cert") {
+            in_cert = true;
             if let Some(nul) = data.iter().position(|&b| b == 0) {
-                if caps.is_empty() {
+                caps = String::from_utf8_lossy(&data[nul + 1..]).into_owned();
+            }
+            continue;
+        }
+        if in_cert && data == b"push-cert-end\n" {
+            break;
+        }
+        if is_command(&data) {
+            if caps.is_empty() {
+                if let Some(nul) = data.iter().position(|&b| b == 0) {
                     caps = String::from_utf8_lossy(&data[nul + 1..]).into_owned();
                 }
             }
@@ -603,15 +622,11 @@ fn read_receive_pack_request<R: Read>(stdin: &mut R) -> Result<Vec<u8>> {
             }
         }
     }
+    // When both are negotiated the push-options block follows the cert; when
+    // only options are negotiated it follows the command flush. Either way it
+    // is pkt-lines to a flush.
     if caps.split(' ').any(|c| c.starts_with("push-options")) {
-        while let Some(_opt) = read_pkt(stdin, &mut body)? {}
-    }
-    if caps.split(' ').any(|c| c.starts_with("push-cert")) {
-        while let Some(line) = read_pkt(stdin, &mut body)? {
-            if line == b"push-cert-end\n" {
-                break;
-            }
-        }
+        while read_pkt(stdin, &mut body)?.is_some() {}
     }
     if pack_expected {
         stdin
@@ -2165,21 +2180,21 @@ mod tests {
         );
     }
 
-    /// A signed delete-only push places the cert AFTER the command flush as
-    /// pkt-lines ending in a "push-cert-end" pkt-line (not a flush), and sends
-    /// no pack. The reader must consume the cert and still return without
-    /// waiting on the pipe.
+    /// A signed delete-only push sends NO command list: the request starts
+    /// with the "push-cert" line, the commands live inside the cert, and the
+    /// cert ends with a "push-cert-end" pkt-line (not a flush). The reader
+    /// must return after push-cert-end without waiting on the pipe.
     #[test]
     fn signed_delete_only_push_returns_after_push_cert_end() {
         let old = "a".repeat(40);
         let zero = "0".repeat(40);
         let mut seed = Vec::new();
-        seed.extend_from_slice(&pkt(&format!(
-            "{old} {zero} refs/heads/gone\0 report-status-v2 push-cert\n"
-        )));
-        seed.extend_from_slice(b"0000"); // command flush
+        seed.extend_from_slice(&pkt("push-cert\0 report-status-v2 push-cert\n"));
         seed.extend_from_slice(&pkt("certificate version 0.1\n"));
         seed.extend_from_slice(&pkt("pusher did:key:z6Mk\n"));
+        seed.extend_from_slice(&pkt("\n")); // empty line ends the headers
+        seed.extend_from_slice(&pkt(&format!("{old} {zero} refs/heads/gone\n")));
+        seed.extend_from_slice(&pkt("sig-line\n"));
         seed.extend_from_slice(&pkt("push-cert-end\n"));
         // git now blocks for the report; the pipe stays open.
 
@@ -2207,18 +2222,17 @@ mod tests {
         );
     }
 
-    /// A signed pack-bearing push: commands, flush, cert block, then the pack.
-    /// Everything after the command flush must land in the body.
+    /// A signed pack-bearing push: cert with the commands inside, then the
+    /// pack. Everything must land in the body.
     #[test]
     fn signed_pack_push_keeps_cert_and_pack() {
         let old = "a".repeat(40);
         let new = "b".repeat(40);
         let mut stream = Vec::new();
-        stream.extend_from_slice(&pkt(&format!(
-            "{old} {new} refs/heads/main\0 report-status-v2 push-cert\n"
-        )));
-        stream.extend_from_slice(b"0000");
+        stream.extend_from_slice(&pkt("push-cert\0 report-status-v2 push-cert\n"));
         stream.extend_from_slice(&pkt("certificate version 0.1\n"));
+        stream.extend_from_slice(&pkt("\n"));
+        stream.extend_from_slice(&pkt(&format!("{old} {new} refs/heads/main\n")));
         stream.extend_from_slice(&pkt("push-cert-end\n"));
         stream.extend_from_slice(b"PACK\x00\x00\x00\x02fakepack");
 
@@ -2230,8 +2244,9 @@ mod tests {
         );
     }
 
-    /// A negotiated push-options block is pkt-lines ending in its own flush,
-    /// sitting between the command flush and whatever follows.
+    /// A negotiated push-options block is pkt-lines ending in its own flush.
+    /// With no cert it follows the command flush; with a cert it follows
+    /// push-cert-end.
     #[test]
     fn receive_pack_request_consumes_a_push_options_block() {
         let old = "a".repeat(40);
@@ -2241,6 +2256,33 @@ mod tests {
             "{old} {new} refs/heads/main\0 report-status-v2 push-options\n"
         )));
         stream.extend_from_slice(b"0000"); // command flush
+        stream.extend_from_slice(&pkt("ci.skip\n"));
+        stream.extend_from_slice(b"0000"); // options flush
+        stream.extend_from_slice(b"PACK\x00\x00\x00\x02fakepack");
+
+        let mut stdin = io::Cursor::new(stream);
+        let body = read_receive_pack_request(&mut stdin).unwrap();
+        assert!(body.windows(7).any(|w| w == b"ci.skip"), "options survived");
+        assert!(
+            body.ends_with(b"PACK\x00\x00\x00\x02fakepack"),
+            "the pack lands after the options block"
+        );
+    }
+
+    /// Cert and options together: the cert comes first and the options block
+    /// sits between push-cert-end and the pack.
+    #[test]
+    fn signed_push_with_options_reads_cert_then_options_then_pack() {
+        let old = "a".repeat(40);
+        let new = "b".repeat(40);
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&pkt(
+            "push-cert\0 report-status-v2 push-cert push-options\n",
+        ));
+        stream.extend_from_slice(&pkt("certificate version 0.1\n"));
+        stream.extend_from_slice(&pkt("\n"));
+        stream.extend_from_slice(&pkt(&format!("{old} {new} refs/heads/main\n")));
+        stream.extend_from_slice(&pkt("push-cert-end\n"));
         stream.extend_from_slice(&pkt("ci.skip\n"));
         stream.extend_from_slice(b"0000"); // options flush
         stream.extend_from_slice(b"PACK\x00\x00\x00\x02fakepack");
