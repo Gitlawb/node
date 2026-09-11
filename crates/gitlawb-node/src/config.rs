@@ -55,7 +55,10 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_KEY", default_value = "~/.gitlawb/identity.pem")]
     pub key_path: String,
 
-    /// Reserved for private-read mode; per-repo read enforcement is not wired in alpha
+    /// Reserved and currently inert: read access is enforced per repository
+    /// through `is_public` and path-scoped visibility rules, not this flag.
+    /// Setting it to false changes nothing; make a repo private through its
+    /// own visibility instead.
     #[arg(long, env = "GITLAWB_PUBLIC_READ", default_value_t = true)]
     pub public_read: bool,
 
@@ -1421,6 +1424,28 @@ mod tests {
             ["true"],
             "owner-only push must be the declared default; a node started with no \
              configuration cannot accept a push from a self-minted key"
+        );
+    }
+
+    /// #338: GITLAWB_PUBLIC_READ is inert, so its help must not claim read
+    /// enforcement is missing; it must tell the operator the flag changes
+    /// nothing and where the real control lives.
+    #[test]
+    fn public_read_help_describes_the_flag_as_inert() {
+        use clap::CommandFactory;
+        let cmd = Config::command();
+        let arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "public_read")
+            .expect("the argument must exist");
+        let help = arg.get_help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(
+            !help.contains("not wired"),
+            "the help still claims read enforcement is unwired: {help}"
+        );
+        assert!(
+            help.contains("inert"),
+            "the help must say the flag is inert so an operator does not rely on it: {help}"
         );
     }
 

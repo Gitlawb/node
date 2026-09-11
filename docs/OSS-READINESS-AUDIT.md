@@ -95,7 +95,7 @@ Live-network blockers to prioritize:
 - GraphQL POST is still open for compatibility; GraphQL mutations should get mutation-aware auth before it becomes a public write API surface.
 - Push authorization is still not capability-complete. A valid DID signature is authentication, not authorization. Owner checks are now enforced on every branch, protected or not (`GITLAWB_ENFORCE_OWNER_PUSH`, on by default); what remains is that a UCAN `git/push` capability is not yet honored, so a delegated or CI key cannot push.
 - UCAN chain validation is incomplete and UCAN revocation/blocklisting is not implemented as an operator feature.
-- Private repository reads are not enforced. `is_public` and `GITLAWB_PUBLIC_READ` exist, but per-repository private-read behavior is not wired.
+- Private repository reads are enforced per repository through `is_public` and path-scoped visibility rules. `GITLAWB_PUBLIC_READ` remains reserved and inert.
 - Peer URLs are self-asserted by DIDs. Signatures prove control of the DID key when present, not ownership/safety of the announced URL.
 - Outbound peer fetch/ping/sync paths should be reviewed for SSRF protections before accepting arbitrary public peer registrations.
 
