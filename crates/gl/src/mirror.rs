@@ -255,6 +255,58 @@ mod tests {
         assert!(dest.join("HEAD").exists());
     }
 
+    // #417 end-to-end: the real trigger is `std::env::temp_dir()` itself
+    // returning a non-UTF-8 path (a TMPDIR with non-UTF-8 bytes), because the
+    // mirror dest is built from it. Env is process-global, so this test
+    // re-execs the test binary in a child with a non-UTF-8 TMPDIR rather than
+    // mutating this process's env.
+    #[cfg(unix)]
+    #[test]
+    fn test_clone_mirror_under_non_utf8_tmpdir() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        if std::env::var_os("GL_MIRROR_NONUTF8_TMPDIR").is_none() {
+            // Parent: a source repo under a normal path, a TMPDIR whose name
+            // is not UTF-8, and a child run of this same test under that env.
+            let parent = tempfile::TempDir::new().unwrap();
+            let src = parent.path().join("src.git");
+            let st = Command::new("git")
+                .args(["init", "--bare"])
+                .arg(&src)
+                .status()
+                .unwrap();
+            assert!(st.success());
+            let bad_tmp = parent.path().join(OsStr::from_bytes(b"tmp-\xff"));
+            std::fs::create_dir_all(&bad_tmp).unwrap();
+
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "mirror::tests::test_clone_mirror_under_non_utf8_tmpdir",
+                    "--exact",
+                ])
+                .env("GL_MIRROR_NONUTF8_TMPDIR", "1")
+                .env("GL_MIRROR_SRC", &src)
+                .env("TMPDIR", &bad_tmp)
+                .status()
+                .unwrap();
+            assert!(status.success(), "child failed under non-UTF-8 TMPDIR");
+            return;
+        }
+
+        // Child: the same path shape run() computes — temp_dir() joined with
+        // the mirror dest. It must be non-UTF-8 or the test proves nothing.
+        let src = std::env::var("GL_MIRROR_SRC").unwrap();
+        let tmp_root = std::env::temp_dir().join("gl-mirror-child");
+        let dest = tmp_root.join("repo");
+        assert!(
+            dest.to_str().is_none(),
+            "fixture broken: dest under a non-UTF-8 TMPDIR must be non-UTF-8"
+        );
+        clone_mirror(&src, &dest).unwrap();
+        assert!(dest.join("HEAD").exists());
+    }
+
     #[tokio::test]
     async fn test_create_repo_conflict_error() {
         let mut server = mockito::Server::new_async().await;
