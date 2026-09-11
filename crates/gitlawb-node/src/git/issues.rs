@@ -187,9 +187,11 @@ pub fn list_issues(repo_path: &Path) -> Result<Vec<String>> {
         .output()
         .context("failed to run git for-each-ref")?;
 
+    // for-each-ref exits 0 with empty output when no refs match, so a nonzero
+    // exit is a real enumeration failure, not "no issues yet".
     if !list_output.status.success() {
-        // No issues yet
-        return Ok(vec![]);
+        let stderr = String::from_utf8_lossy(&list_output.stderr);
+        anyhow::bail!("git for-each-ref failed: {}", stderr.trim());
     }
 
     let refs_str = String::from_utf8_lossy(&list_output.stdout);
@@ -445,6 +447,15 @@ mod tests {
         init_repo(&dir);
         assert!(read_issue_blob(dir.path(), "refs/heads/main").is_err());
         assert!(read_issue_blob(dir.path(), "refs/gitlawb/issues/../x").is_err());
+    }
+
+    // #426: a failed for-each-ref enumeration is an error, not an empty list.
+    #[test]
+    fn test_list_issues_on_non_repo_errors_instead_of_empty() {
+        let dir = TempDir::new().unwrap();
+        let not_a_repo = dir.path().join("not-a-repo");
+        std::fs::create_dir_all(&not_a_repo).unwrap();
+        assert!(list_issues(&not_a_repo).is_err());
     }
 
     // #426: a ref that resolves but whose object is corrupt is a read error,
