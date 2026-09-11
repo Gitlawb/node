@@ -75,6 +75,14 @@ pub fn seal_blob(plaintext: &[u8], recipients: &[VerifyingKey]) -> Result<Vec<u8
     if recipients.is_empty() {
         return Err(anyhow::anyhow!("seal_blob: no recipients"));
     }
+    // Same bound open_blob enforces: an envelope over the cap could never be
+    // opened, so refuse to seal it (#419).
+    if recipients.len() > MAX_RECIPIENTS {
+        return Err(anyhow::anyhow!(
+            "seal_blob: {} recipients, over the {MAX_RECIPIENTS} cap",
+            recipients.len()
+        ));
+    }
     let mut content_key = [0u8; 32];
     OsRng.fill_bytes(&mut content_key);
     let body_cipher = XChaCha20Poly1305::new_from_slice(&content_key)
@@ -358,6 +366,20 @@ mod tests {
         assert!(
             !err.to_string().contains("over the"),
             "at-cap envelope must reach the scan, got: {err}"
+        );
+    }
+
+    #[test]
+    fn seal_refuses_a_recipient_list_over_the_cap() {
+        // An envelope over the cap can never be opened, so seal must reject it
+        // instead of minting one.
+        let keys: Vec<VerifyingKey> = (0..MAX_RECIPIENTS + 1)
+            .map(|_| Keypair::generate().verifying_key())
+            .collect();
+        let err = seal_blob(b"blob", &keys).unwrap_err();
+        assert!(
+            err.to_string().contains("recipients"),
+            "expected the recipient-cap error, got: {err}"
         );
     }
 }
