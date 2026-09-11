@@ -73,53 +73,105 @@ fn issue_ref_name_is_safe(ref_name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// Resolve a ref name without putting it on a command line: enumerate refs
+/// (constant argv) and match in memory. A nonzero exit propagates, so "cannot
+/// determine" is an error rather than a quiet `false`.
+fn ref_name_resolves(repo_path: &Path, ref_name: &str) -> Result<bool> {
+    // allow-unbounded-git: failure-path existence recheck, module convention.
+    let out = Command::new("git")
+        .args(["for-each-ref", "--format=%(refname)"])
+        .current_dir(repo_path)
+        .output()
+        .context("failed to run git for-each-ref")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("git for-each-ref failed: {}", stderr.trim());
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    Ok(stdout.lines().any(|line| line.trim() == ref_name))
+}
+
 /// Read the blob behind an issue ref.
 ///
 /// `Ok(None)` means the ref itself is absent. A ref that resolves but whose
 /// object cannot be read (corrupt object, unreadable store, a mid-read gc) is
-/// an error, not an absence: `git cat-file` exits nonzero for both cases, so
-/// the ref is re-resolved to tell them apart. `rev-parse` resolves the name
-/// without reading the object, which is exactly the split needed (#426).
+/// an error, not an absence (#426).
+///
+/// The ref name reaches git on stdin, never argv: `cat-file --batch` answers
+/// `<oid> <type> <size>\n<body>\n` for a readable object and
+/// `<spec> missing\n` for an absent ref or an unreadable object alike, so the
+/// `missing` case is re-resolved by name enumeration to tell them apart.
 fn read_issue_blob(repo_path: &Path, ref_name: &str) -> Result<Option<String>> {
-    anyhow::ensure!(
-        issue_ref_name_is_safe(ref_name),
-        "refusing issue ref outside the issues namespace: {ref_name}"
-    );
+    if !issue_ref_name_is_safe(ref_name) {
+        anyhow::bail!("refusing issue ref outside the issues namespace: {ref_name}");
+    }
+
     // allow-unbounded-git: this module's spawns predate the bounded runner and
     // its callers run inside issue handlers that already hold the repo guard.
-    let cat_output = Command::new("git")
-        .args(["cat-file", "blob", ref_name])
+    let mut child = Command::new("git")
+        .args(["cat-file", "--batch"])
         .current_dir(repo_path)
-        .output()
-        .context("failed to run git cat-file")?;
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to spawn git cat-file --batch")?;
 
-    if cat_output.status.success() {
-        return Ok(Some(
-            String::from_utf8_lossy(&cat_output.stdout).to_string(),
-        ));
+    use std::io::Write;
+    // Reap the child even when the write fails so a stdin error cannot drop an
+    // unwaited Child and leak a zombie (#53).
+    let write_result = match child.stdin.take() {
+        Some(mut stdin) => stdin
+            .write_all(ref_name.as_bytes())
+            .and_then(|()| stdin.write_all(b"\n")),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "git cat-file --batch stdin unavailable",
+        )),
+    };
+    let output = child
+        .wait_with_output()
+        .context("git cat-file --batch failed")?;
+    write_result.context("failed to write ref name to git cat-file stdin")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git cat-file --batch failed: {}", stderr.trim());
     }
 
-    // allow-unbounded-git: failure-path existence recheck, at most one extra
-    // spawn per failed read.
-    let resolves = Command::new("git")
-        .args(["rev-parse", "--verify", "--quiet", ref_name])
-        .current_dir(repo_path)
-        .output()
-        .context("failed to run git rev-parse")?;
-
-    // --quiet exits 1 only for "ref does not resolve"; any other failure is a
-    // real problem (not a repo, unreadable refs) and must propagate.
-    match resolves.status.code() {
-        Some(0) => {}
-        Some(1) => return Ok(None),
-        _ => {
-            let stderr = String::from_utf8_lossy(&resolves.stderr);
-            anyhow::bail!("git rev-parse failed for {ref_name}: {}", stderr.trim());
-        }
+    // "<spec> missing\n" covers an absent ref and an unreadable object; only a
+    // ref that still resolves is the error case.
+    let missing = format!("{ref_name} missing\n");
+    if output.stdout.as_slice() == missing.as_bytes() {
+        return match ref_name_resolves(repo_path, ref_name)? {
+            true => anyhow::bail!("issue ref resolves but its object is unreadable: {ref_name}"),
+            false => Ok(None),
+        };
     }
 
-    let stderr = String::from_utf8_lossy(&cat_output.stderr);
-    anyhow::bail!("git cat-file failed for {ref_name}: {}", stderr.trim());
+    // Header: "<oid> <type> <size>\n" then exactly <size> bytes plus a newline.
+    let header_end = output
+        .stdout
+        .iter()
+        .position(|b| *b == b'\n')
+        .context("unexpected git cat-file --batch output")?;
+    let header = String::from_utf8_lossy(&output.stdout[..header_end]);
+    let mut parts = header.split(' ');
+    parts.next();
+    let obj_type = parts.next().unwrap_or("");
+    if obj_type != "blob" {
+        anyhow::bail!("issue ref {ref_name} resolves to a non-blob object");
+    }
+    let size: usize = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .context("unexpected git cat-file --batch header")?;
+    let body = &output.stdout[header_end + 1..];
+    anyhow::ensure!(
+        body.len() >= size,
+        "truncated git cat-file --batch body for {ref_name}"
+    );
+    Ok(Some(String::from_utf8_lossy(&body[..size]).to_string()))
 }
 
 /// List all issue refs and return their JSON content.
@@ -374,9 +426,8 @@ mod tests {
         assert_eq!(close_issue(dir.path(), "nosuch00").unwrap(), None);
     }
 
-    // #426: the rev-parse recheck must treat only exit 1 as "ref absent"; a
-    // probe that itself fails (a directory that is not a repo exits 128) is an
-    // error, not a quiet None.
+    // #426: a directory that is not a repo makes `cat-file --batch` exit
+    // nonzero; that failure is an error, not a quiet None.
     #[test]
     fn test_issue_read_on_non_repo_errors_instead_of_none() {
         let dir = TempDir::new().unwrap();
@@ -385,8 +436,9 @@ mod tests {
         assert!(read_issue_blob(&not_a_repo, "refs/gitlawb/issues/deadbeef").is_err());
     }
 
-    // #426: the ref passed to the git spawns is constrained to the issues
-    // namespace and a safe charset before it reaches a command line.
+    // #426: the ref name is constrained to the issues namespace and a safe
+    // charset before it is fed to git, even on stdin (a newline would smuggle
+    // a second `--batch` spec).
     #[test]
     fn test_issue_read_rejects_ref_outside_issues_namespace() {
         let dir = TempDir::new().unwrap();
