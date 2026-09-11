@@ -49,6 +49,13 @@ use serde::{Deserialize, Serialize};
 const MAGIC: &[u8] = b"GLENC";
 const VERSION: u8 = 2;
 
+/// Upper bound on the blinded recipient list. The envelope author controls
+/// this count and `open_blob` pays one X25519 exchange per entry before it can
+/// answer "not a recipient", so the count has to be capped rather than
+/// optimized (#419). Legitimate envelopes carry a handful of authorized
+/// readers, so 256 is far above real use.
+const MAX_RECIPIENTS: usize = 256;
+
 #[derive(Serialize, Deserialize)]
 struct Recipient {
     eph: String,   // base64 ephemeral x25519 pubkey (32B)
@@ -67,6 +74,14 @@ struct Header {
 pub fn seal_blob(plaintext: &[u8], recipients: &[VerifyingKey]) -> Result<Vec<u8>> {
     if recipients.is_empty() {
         return Err(anyhow::anyhow!("seal_blob: no recipients"));
+    }
+    // Same bound open_blob enforces: an envelope over the cap could never be
+    // opened, so refuse to seal it (#419).
+    if recipients.len() > MAX_RECIPIENTS {
+        return Err(anyhow::anyhow!(
+            "seal_blob: {} recipients, over the {MAX_RECIPIENTS} cap",
+            recipients.len()
+        ));
     }
     let mut content_key = [0u8; 32];
     OsRng.fill_bytes(&mut content_key);
@@ -126,6 +141,14 @@ pub fn open_blob(envelope: &[u8], keypair: &Keypair) -> Result<Vec<u8>> {
     let header: Header =
         serde_json::from_slice(envelope.get(p..p + hlen).context("truncated header")?)
             .context("decode header")?;
+    // Reject before the recipient scan: every entry below is an X25519
+    // exchange, and a non-recipient would run the whole list (#419).
+    if header.recipients.len() > MAX_RECIPIENTS {
+        return Err(anyhow::anyhow!(
+            "envelope carries {} recipients, over the {MAX_RECIPIENTS} cap",
+            header.recipients.len()
+        ));
+    }
     let body = &envelope[p + hlen..];
 
     let my_x = XSecret::from(*x25519_secret_from_seed(&keypair.to_seed()));
@@ -292,5 +315,71 @@ mod tests {
         let mut header: serde_json::Value = serde_json::from_slice(header_bytes).unwrap();
         header["nonce"] = bad_nonce;
         assert!(open_blob(&reframe(&header), &reader).is_err());
+    }
+
+    #[test]
+    fn over_cap_recipient_list_is_rejected_before_the_scan() {
+        // #419: the envelope author controls the recipient count and each entry
+        // costs an X25519 exchange, so the list is capped. Reframe a valid
+        // envelope with MAX_RECIPIENTS + 1 junk entries.
+        let reader = Keypair::generate();
+        let env = seal_blob(b"private blob contents", &[reader.verifying_key()]).unwrap();
+
+        let mut p = MAGIC.len() + 1;
+        let hlen = u32::from_le_bytes(env[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        let header_bytes = &env[p..p + hlen];
+        let body = &env[p + hlen..];
+
+        let mut header: serde_json::Value = serde_json::from_slice(header_bytes).unwrap();
+        let junk = serde_json::json!({
+            "eph": B64.encode([0u8; 32]),
+            "nonce": B64.encode([0u8; 24]),
+            "wrap": B64.encode([0u8; 48]),
+        });
+        header["recipients"] = serde_json::Value::Array(vec![junk.clone(); MAX_RECIPIENTS + 1]);
+
+        let hj = serde_json::to_vec(&header).unwrap();
+        let mut fat = Vec::new();
+        fat.extend_from_slice(MAGIC);
+        fat.push(VERSION);
+        fat.extend_from_slice(&(hj.len() as u32).to_le_bytes());
+        fat.extend_from_slice(&hj);
+        fat.extend_from_slice(body);
+
+        let err = open_blob(&fat, &reader).unwrap_err();
+        assert!(
+            err.to_string().contains("recipients"),
+            "expected the recipient-cap error, got: {err}"
+        );
+
+        // Exactly at the cap the envelope is still processed end to end.
+        header["recipients"] = serde_json::Value::Array(vec![junk; MAX_RECIPIENTS]);
+        let hj = serde_json::to_vec(&header).unwrap();
+        let mut at_cap = Vec::new();
+        at_cap.extend_from_slice(MAGIC);
+        at_cap.push(VERSION);
+        at_cap.extend_from_slice(&(hj.len() as u32).to_le_bytes());
+        at_cap.extend_from_slice(&hj);
+        at_cap.extend_from_slice(body);
+        let err = open_blob(&at_cap, &reader).unwrap_err();
+        assert!(
+            !err.to_string().contains("over the"),
+            "at-cap envelope must reach the scan, got: {err}"
+        );
+    }
+
+    #[test]
+    fn seal_refuses_a_recipient_list_over_the_cap() {
+        // An envelope over the cap can never be opened, so seal must reject it
+        // instead of minting one.
+        let keys: Vec<VerifyingKey> = (0..MAX_RECIPIENTS + 1)
+            .map(|_| Keypair::generate().verifying_key())
+            .collect();
+        let err = seal_blob(b"blob", &keys).unwrap_err();
+        assert!(
+            err.to_string().contains("recipients"),
+            "expected the recipient-cap error, got: {err}"
+        );
     }
 }
