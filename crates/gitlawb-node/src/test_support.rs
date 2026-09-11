@@ -1427,6 +1427,262 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "absent repo → 404");
     }
 
+    /// #435: register_replica / unregister_replica apply the same read-visibility
+    /// gate as list_replicas. Both mutate caller-bound replica metadata and their
+    /// responses disclose the replica count, so a non-reader of a private repo
+    /// gets the same 404 as a missing repo and nothing is written. Authorized
+    /// readers keep self-registering and self-removing.
+    #[sqlx::test]
+    async fn replica_register_unregister_are_read_visibility_gated(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        let owner = "did:key:zREPMUTOWNERRRRRRRRRRRRRRRRRRRRRRRRRR";
+        let reader = "did:key:zREPMUTREADERRRRRRRRRRRRRRRRRRRRRRRRR";
+        let stranger = "did:key:zREPMUTSTRGRRRRRRRRRRRRRRRRRRRRRRRRR";
+        let state = test_state(pool).await;
+
+        let mut priv_repo = seed_repo(owner, "repmut-priv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private repo");
+        let pub_repo = seed_repo(owner, "repmut-pub");
+        state
+            .db
+            .create_repo(&pub_repo)
+            .await
+            .expect("seed public repo");
+        // A listed reader of the private repo keeps mutation rights.
+        state
+            .db
+            .set_visibility_rule(
+                &priv_repo.id,
+                "/",
+                VisibilityMode::B,
+                &[reader.to_string()],
+                owner,
+            )
+            .await
+            .expect("seed reader rule");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/replicas",
+                    axum::routing::put(crate::api::replicas::register_replica)
+                        .delete(crate::api::replicas::unregister_replica),
+                )
+                .with_state(state.clone())
+        };
+        let body = || Body::from(r#"{"url":"https://replica.example.com/me"}"#.to_string());
+
+        // Private repo, non-reader stranger: register → 404, nothing written.
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::PUT,
+                &format!("/api/v1/repos/{owner}/repmut-priv/replicas"),
+                body(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-reader must not register on a private repo"
+        );
+        assert!(
+            state
+                .db
+                .list_replicas(&priv_repo.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a denied register must not create a replica row"
+        );
+
+        // Private repo, non-reader stranger: unregister → 404.
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner}/repmut-priv/replicas"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-reader must not unregister on a private repo"
+        );
+
+        // Private repo, listed reader: register → 201, unregister → 200.
+        let resp = router()
+            .oneshot(signed_request_as(
+                reader,
+                Method::PUT,
+                &format!("/api/v1/repos/{owner}/repmut-priv/replicas"),
+                body(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a listed reader keeps self-registration on a private repo"
+        );
+        let resp = router()
+            .oneshot(signed_request_as(
+                reader,
+                Method::DELETE,
+                &format!("/api/v1/repos/{owner}/repmut-priv/replicas"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a listed reader keeps self-removal on a private repo"
+        );
+
+        // Public repo, authenticated stranger: register → 201.
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::PUT,
+                &format!("/api/v1/repos/{owner}/repmut-pub/replicas"),
+                body(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "public-repo registration stays open to any authenticated replica"
+        );
+
+        // Owner self-registration is still refused.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::PUT,
+                &format!("/api/v1/repos/{owner}/repmut-pub/replicas"),
+                body(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "the owner still cannot register as their own replica"
+        );
+    }
+
+    /// #435 end-to-end: drive the replica mutations through the PRODUCTION
+    /// router (`app` → require_signature → handler) with real RFC-9421
+    /// signatures, so the whole verify-then-authorize stack is exercised, not
+    /// just the handler with an injected DID. A stranger on a private repo
+    /// gets the same 404 as a missing repo with nothing written; a listed
+    /// reader registers and removes itself.
+    #[sqlx::test]
+    async fn replica_mutations_enforce_visibility_through_real_signature_e2e(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let owner_kp = Keypair::generate();
+        let owner_did = owner_kp.did().to_string();
+        // Short owner form in the path keeps the signed @path byte-identical
+        // to what the node sees (no colons) while did_matches still resolves.
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let stranger_kp = Keypair::generate();
+        let reader_kp = Keypair::generate();
+        let reader_did = reader_kp.did().to_string();
+
+        let state = test_state(pool.clone()).await;
+        let mut repo = seed_repo(&owner_did, "sig-repl-priv");
+        repo.is_public = false;
+        state
+            .db
+            .create_repo(&repo)
+            .await
+            .expect("seed private repo");
+        state
+            .db
+            .set_visibility_rule(&repo.id, "/", VisibilityMode::B, &[reader_did], &owner_did)
+            .await
+            .expect("seed reader rule");
+
+        let router = app(pool).await;
+        let path = format!("/api/v1/repos/{short}/sig-repl-priv/replicas");
+        let reg_body: &[u8] = br#"{"url":"https://replica.example.com/e2e"}"#;
+        let signed_req = |kp: &Keypair, method: &str, body: &'static [u8]| {
+            let signed = sign_request(kp, method, &path, body);
+            Request::builder()
+                .method(method)
+                .uri(&path)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header("content-digest", signed.content_digest)
+                .header("signature-input", signed.signature_input)
+                .header("signature", signed.signature)
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        // Stranger (verified signature, not a reader) → 404, no row written.
+        let resp = router
+            .clone()
+            .oneshot(signed_req(&stranger_kp, "PUT", reg_body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a verified non-reader must not register on a private repo"
+        );
+        assert!(
+            state.db.list_replicas(&repo.id).await.unwrap().is_empty(),
+            "a denied register must not create a replica row"
+        );
+
+        // Stranger DELETE → 404.
+        let resp = router
+            .clone()
+            .oneshot(signed_req(&stranger_kp, "DELETE", b""))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a verified non-reader must not unregister on a private repo"
+        );
+
+        // Listed reader: PUT → 201, DELETE → 200.
+        let resp = router
+            .clone()
+            .oneshot(signed_req(&reader_kp, "PUT", reg_body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a listed reader registers through the real middleware"
+        );
+        let resp = router
+            .clone()
+            .oneshot(signed_req(&reader_kp, "DELETE", b""))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a listed reader unregisters through the real middleware"
+        );
+    }
+
     /// #94 sibling: list_labels is read-visibility-gated. A public repo's labels
     /// stay anonymously listable; a private repo's label names must not leak to a
     /// non-reader (404). A listed reader of the private repo reads the label; the
