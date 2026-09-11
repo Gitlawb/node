@@ -63,12 +63,75 @@ fn is_insecure_remote(url: &str) -> bool {
     true
 }
 
+/// True when `no_proxy` covers `host`: a `*` entry, an exact match, or a
+/// domain suffix match (`example.com` covers `a.example.com`).
+fn no_proxy_covers(host: &str, no_proxy: &str) -> bool {
+    no_proxy
+        .split(',')
+        .map(str::trim)
+        .map(|e| e.trim_start_matches('.'))
+        .filter(|e| !e.is_empty())
+        .any(|e| e == "*" || host == e || host.ends_with(&format!(".{e}")))
+}
+
+/// True when a plaintext request to a loopback `host` would still leave this
+/// machine. reqwest reads HTTP_PROXY/ALL_PROXY (and lowercase) at client
+/// build; a configured proxy without a NO_PROXY entry for the host carries the
+/// signed request off-machine in cleartext, which is the leak this module
+/// guards against.
+fn loopback_goes_off_machine(host: &str) -> bool {
+    let proxied = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
+    if !proxied {
+        return false;
+    }
+    let no_proxy = std::env::var("NO_PROXY")
+        .or_else(|_| std::env::var("no_proxy"))
+        .unwrap_or_default();
+    !no_proxy_covers(host, &no_proxy)
+}
+
+/// The normalized host when `url` is an `http://` loopback address, else None.
+/// Same loopback rules as [`is_insecure_remote`].
+fn loopback_http_host(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url.trim()).ok()?;
+    if parsed.scheme() != "http" {
+        return None;
+    }
+    let host = parsed
+        .host_str()?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host == "localhost" {
+        return Some(host);
+    }
+    let bare = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    let ip = bare.parse::<std::net::IpAddr>().ok()?;
+    if ip.is_loopback() {
+        return Some(bare);
+    }
+    if let std::net::IpAddr::V6(v6) = ip {
+        if v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()) {
+            return Some(bare);
+        }
+    }
+    None
+}
+
 /// Refuse to sign a request destined for a cleartext hop off this machine
 /// unless the operator has opted in. `GITLAWB_ALLOW_INSECURE_HTTP` exists for a
 /// private LAN where the operator has decided that is acceptable; its presence
-/// alone opts in, matching git-remote-gitlawb's guard for the same hop.
+/// alone opts in, matching git-remote-gitlawb's guard for the same hop. The
+/// loopback exemption does not apply when a proxy would carry the request
+/// off-machine anyway.
 fn ensure_signing_transport(node_base: &str, allow_insecure: bool) -> Result<()> {
-    if allow_insecure || !is_insecure_remote(node_base) {
+    let insecure = is_insecure_remote(node_base)
+        || loopback_http_host(node_base).is_some_and(|h| loopback_goes_off_machine(&h));
+    if allow_insecure || !insecure {
         return Ok(());
     }
     anyhow::bail!(
@@ -1464,5 +1527,81 @@ mod tests {
             let _env = InsecureHttpEnv::set(None);
             assert!(!insecure_http_allowed());
         }
+    }
+
+    #[test]
+    fn no_proxy_covers_matches_exact_suffix_and_star() {
+        assert!(no_proxy_covers("localhost", "localhost,127.0.0.1"));
+        assert!(no_proxy_covers("127.0.0.1", "localhost, 127.0.0.1"));
+        assert!(no_proxy_covers("a.example.com", ".example.com"));
+        assert!(no_proxy_covers("a.example.com", "example.com"));
+        assert!(no_proxy_covers("anything", "*"));
+        assert!(!no_proxy_covers("localhost", "127.0.0.1"));
+        assert!(!no_proxy_covers("127.0.0.1", ""));
+        assert!(!no_proxy_covers("notevil.com", "evil.com"));
+    }
+
+    /// A proxied loopback plaintext hop must be refused. The env plumbing is
+    /// checked in a re-execed child so the process-global proxy vars never
+    /// touch sibling tests' reqwest clients.
+    #[test]
+    fn proxied_loopback_http_is_refused() {
+        if std::env::var_os("GL_PROXY_CHILD").is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::http::tests::proxied_loopback_http_is_refused",
+                ])
+                .env("GL_PROXY_CHILD", "1")
+                .env("HTTP_PROXY", "http://10.9.9.9:3128")
+                .env_remove("http_proxy")
+                .env_remove("ALL_PROXY")
+                .env_remove("all_proxy")
+                .env_remove("NO_PROXY")
+                .env_remove("no_proxy")
+                .env_remove("GITLAWB_ALLOW_INSECURE_HTTP")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "child failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let err =
+            ensure_signing_transport("http://127.0.0.1:1", insecure_http_allowed()).unwrap_err();
+        assert!(
+            err.to_string().contains("plaintext http"),
+            "a proxy without NO_PROXY carries the signed request off-machine: {err}"
+        );
+    }
+
+    /// And NO_PROXY covering the host restores the loopback exemption.
+    #[test]
+    fn proxied_loopback_with_no_proxy_is_allowed() {
+        if std::env::var_os("GL_PROXY_CHILD2").is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::http::tests::proxied_loopback_with_no_proxy_is_allowed",
+                ])
+                .env("GL_PROXY_CHILD2", "1")
+                .env("HTTP_PROXY", "http://10.9.9.9:3128")
+                .env("NO_PROXY", "localhost,127.0.0.1")
+                .env_remove("GITLAWB_ALLOW_INSECURE_HTTP")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "child failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        assert!(
+            ensure_signing_transport("http://127.0.0.1:1", insecure_http_allowed()).is_ok(),
+            "NO_PROXY covering the host keeps the request on this machine"
+        );
     }
 }
