@@ -61,6 +61,18 @@ pub fn create_issue(repo_path: &Path, issue_id: &str, json: &str) -> Result<()> 
     Ok(())
 }
 
+/// Issue ids are UUIDs; refs under `refs/gitlawb/issues/` only ever carry
+/// `[0-9a-zA-Z_-]` names. Anything else is not a value we pass to git.
+fn issue_ref_name_is_safe(ref_name: &str) -> bool {
+    let Some(id) = ref_name.strip_prefix("refs/gitlawb/issues/") else {
+        return false;
+    };
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// Read the blob behind an issue ref.
 ///
 /// `Ok(None)` means the ref itself is absent. A ref that resolves but whose
@@ -69,6 +81,10 @@ pub fn create_issue(repo_path: &Path, issue_id: &str, json: &str) -> Result<()> 
 /// the ref is re-resolved to tell them apart. `rev-parse` resolves the name
 /// without reading the object, which is exactly the split needed (#426).
 fn read_issue_blob(repo_path: &Path, ref_name: &str) -> Result<Option<String>> {
+    anyhow::ensure!(
+        issue_ref_name_is_safe(ref_name),
+        "refusing issue ref outside the issues namespace: {ref_name}"
+    );
     // allow-unbounded-git: this module's spawns predate the bounded runner and
     // its callers run inside issue handlers that already hold the repo guard.
     let cat_output = Command::new("git")
@@ -91,8 +107,15 @@ fn read_issue_blob(repo_path: &Path, ref_name: &str) -> Result<Option<String>> {
         .output()
         .context("failed to run git rev-parse")?;
 
-    if !resolves.status.success() {
-        return Ok(None);
+    // --quiet exits 1 only for "ref does not resolve"; any other failure is a
+    // real problem (not a repo, unreadable refs) and must propagate.
+    match resolves.status.code() {
+        Some(0) => {}
+        Some(1) => return Ok(None),
+        _ => {
+            let stderr = String::from_utf8_lossy(&resolves.stderr);
+            anyhow::bail!("git rev-parse failed for {ref_name}: {}", stderr.trim());
+        }
     }
 
     let stderr = String::from_utf8_lossy(&cat_output.stderr);
@@ -349,6 +372,27 @@ mod tests {
         init_repo(&dir);
         assert_eq!(get_issue(dir.path(), "nosuch00").unwrap(), None);
         assert_eq!(close_issue(dir.path(), "nosuch00").unwrap(), None);
+    }
+
+    // #426: the rev-parse recheck must treat only exit 1 as "ref absent"; a
+    // probe that itself fails (a directory that is not a repo exits 128) is an
+    // error, not a quiet None.
+    #[test]
+    fn test_issue_read_on_non_repo_errors_instead_of_none() {
+        let dir = TempDir::new().unwrap();
+        let not_a_repo = dir.path().join("not-a-repo");
+        std::fs::create_dir_all(&not_a_repo).unwrap();
+        assert!(read_issue_blob(&not_a_repo, "refs/gitlawb/issues/deadbeef").is_err());
+    }
+
+    // #426: the ref passed to the git spawns is constrained to the issues
+    // namespace and a safe charset before it reaches a command line.
+    #[test]
+    fn test_issue_read_rejects_ref_outside_issues_namespace() {
+        let dir = TempDir::new().unwrap();
+        init_repo(&dir);
+        assert!(read_issue_blob(dir.path(), "refs/heads/main").is_err());
+        assert!(read_issue_blob(dir.path(), "refs/gitlawb/issues/../x").is_err());
     }
 
     // #426: a ref that resolves but whose object is corrupt is a read error,
