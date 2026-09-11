@@ -271,9 +271,11 @@ impl NodeClient {
     /// to be authenticated. Mirrors the conditional signing of post/put/delete.
     pub async fn get_maybe_signed(&self, path: &str) -> Result<reqwest::Response> {
         let url = format!("{}{}", self.node_url, path);
+        if self.keypair.is_some() {
+            ensure_signing_transport(&self.node_url, insecure_http_allowed(), &self.proxy_env)?;
+        }
         let mut req = self.inner.get(&url);
         if let Some(kp) = &self.keypair {
-            ensure_signing_transport(&self.node_url, insecure_http_allowed(), &self.proxy_env)?;
             let signed = sign_request(kp, "GET", path, b"");
             req = req
                 .header("Content-Digest", signed.content_digest)
@@ -348,6 +350,9 @@ impl NodeClient {
         proof: Option<&str>,
     ) -> Result<reqwest::Response> {
         let url = format!("{}{}", self.node_url, path);
+        if self.keypair.is_some() {
+            ensure_signing_transport(&self.node_url, insecure_http_allowed(), &self.proxy_env)?;
+        }
         let mut req = self
             .inner
             .request(method.parse().expect("valid HTTP method"), &url)
@@ -355,7 +360,6 @@ impl NodeClient {
             .body(body.to_vec());
 
         if let Some(kp) = &self.keypair {
-            ensure_signing_transport(&self.node_url, insecure_http_allowed(), &self.proxy_env)?;
             let signed = sign_request(kp, method, path, body);
             req = req
                 .header("Content-Digest", signed.content_digest)
