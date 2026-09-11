@@ -64,32 +64,23 @@ fn is_insecure_remote(url: &str) -> bool {
 }
 
 /// True when `no_proxy` covers `host`: a `*` entry, an exact match, or a
-/// domain suffix match (`example.com` covers `a.example.com`).
+/// domain suffix match (`example.com` covers `a.example.com`). Entries match
+/// case-insensitively, as DNS names are.
 fn no_proxy_covers(host: &str, no_proxy: &str) -> bool {
     no_proxy
         .split(',')
         .map(str::trim)
-        .map(|e| e.trim_start_matches('.'))
+        .map(|e| e.trim_start_matches('.').to_ascii_lowercase())
         .filter(|e| !e.is_empty())
         .any(|e| e == "*" || host == e || host.ends_with(&format!(".{e}")))
 }
 
 /// True when a plaintext request to a loopback `host` would still leave this
-/// machine. reqwest reads HTTP_PROXY/ALL_PROXY (and lowercase) at client
-/// build; a configured proxy without a NO_PROXY entry for the host carries the
-/// signed request off-machine in cleartext, which is the leak this module
-/// guards against.
-fn loopback_goes_off_machine(host: &str) -> bool {
-    let proxied = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
-        .iter()
-        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
-    if !proxied {
-        return false;
-    }
-    let no_proxy = std::env::var("NO_PROXY")
-        .or_else(|_| std::env::var("no_proxy"))
-        .unwrap_or_default();
-    !no_proxy_covers(host, &no_proxy)
+/// machine under the proxy env the client was built with. A configured proxy
+/// without a NO_PROXY entry for the host carries the signed request
+/// off-machine in cleartext, which is the leak this module guards against.
+fn loopback_goes_off_machine(host: &str, proxy_env: &(bool, String)) -> bool {
+    proxy_env.0 && !no_proxy_covers(host, &proxy_env.1)
 }
 
 /// The normalized host when `url` is an `http://` loopback address, else None.
@@ -127,10 +118,15 @@ fn loopback_http_host(url: &str) -> Option<String> {
 /// private LAN where the operator has decided that is acceptable; its presence
 /// alone opts in, matching git-remote-gitlawb's guard for the same hop. The
 /// loopback exemption does not apply when a proxy would carry the request
-/// off-machine anyway.
-fn ensure_signing_transport(node_base: &str, allow_insecure: bool) -> Result<()> {
+/// off-machine anyway; `proxy_env` is the proxy state the client was built
+/// with, so the guard judges the same routing the client will use.
+fn ensure_signing_transport(
+    node_base: &str,
+    allow_insecure: bool,
+    proxy_env: &(bool, String),
+) -> Result<()> {
     let insecure = is_insecure_remote(node_base)
-        || loopback_http_host(node_base).is_some_and(|h| loopback_goes_off_machine(&h));
+        || loopback_http_host(node_base).is_some_and(|h| loopback_goes_off_machine(&h, proxy_env));
     if allow_insecure || !insecure {
         return Ok(());
     }
@@ -189,6 +185,11 @@ fn same_origin_redirect(attempt: reqwest::redirect::Attempt<'_>) -> reqwest::red
 
 pub struct NodeClient {
     inner: reqwest::Client,
+    /// Proxy env state captured at client build, so the transport guard judges
+    /// the same routing the client was built with. `(proxied, no_proxy)` where
+    /// `proxied` means HTTP_PROXY/ALL_PROXY was set and `no_proxy` is the raw
+    /// NO_PROXY value.
+    proxy_env: (bool, String),
     pub node_url: String,
     keypair: Option<Keypair>,
 }
@@ -212,10 +213,17 @@ impl NodeClient {
             .user_agent(format!("gl/{} gitlawb-cli", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("failed to build HTTP client");
+        let proxied = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
+            .iter()
+            .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
+        let no_proxy = std::env::var("NO_PROXY")
+            .or_else(|_| std::env::var("no_proxy"))
+            .unwrap_or_default();
         Self {
             inner,
             node_url: node_url.into(),
             keypair,
+            proxy_env: (proxied, no_proxy),
         }
     }
 
@@ -246,7 +254,7 @@ impl NodeClient {
             .keypair
             .as_ref()
             .context("get_signed requires an identity keypair")?;
-        ensure_signing_transport(&self.node_url, insecure_http_allowed())?;
+        ensure_signing_transport(&self.node_url, insecure_http_allowed(), &self.proxy_env)?;
         let signed = sign_request(kp, "GET", path, b"");
         let req = self
             .inner
@@ -265,7 +273,7 @@ impl NodeClient {
         let url = format!("{}{}", self.node_url, path);
         let mut req = self.inner.get(&url);
         if let Some(kp) = &self.keypair {
-            ensure_signing_transport(&self.node_url, insecure_http_allowed())?;
+            ensure_signing_transport(&self.node_url, insecure_http_allowed(), &self.proxy_env)?;
             let signed = sign_request(kp, "GET", path, b"");
             req = req
                 .header("Content-Digest", signed.content_digest)
@@ -347,7 +355,7 @@ impl NodeClient {
             .body(body.to_vec());
 
         if let Some(kp) = &self.keypair {
-            ensure_signing_transport(&self.node_url, insecure_http_allowed())?;
+            ensure_signing_transport(&self.node_url, insecure_http_allowed(), &self.proxy_env)?;
             let signed = sign_request(kp, method, path, body);
             req = req
                 .header("Content-Digest", signed.content_digest)
@@ -1463,16 +1471,18 @@ mod tests {
 
     #[test]
     fn signing_transport_refuses_plaintext_remote() {
-        let err = ensure_signing_transport("http://10.0.0.36:7777", false).unwrap_err();
+        let no_proxy_env = (false, String::new());
+        let err =
+            ensure_signing_transport("http://10.0.0.36:7777", false, &no_proxy_env).unwrap_err();
         assert!(
             err.to_string().contains("plaintext http")
                 && err.to_string().contains("GITLAWB_ALLOW_INSECURE_HTTP"),
             "the refusal names the risk and the opt-in: {err}"
         );
         // Opted in, loopback, and https all pass.
-        assert!(ensure_signing_transport("http://10.0.0.36:7777", true).is_ok());
-        assert!(ensure_signing_transport("http://localhost:7545", false).is_ok());
-        assert!(ensure_signing_transport("https://node.gitlawb.com", false).is_ok());
+        assert!(ensure_signing_transport("http://10.0.0.36:7777", true, &no_proxy_env).is_ok());
+        assert!(ensure_signing_transport("http://localhost:7545", false, &no_proxy_env).is_ok());
+        assert!(ensure_signing_transport("https://node.gitlawb.com", false, &no_proxy_env).is_ok());
     }
 
     /// A signed call against a plaintext remote errors out before any request
@@ -1541,36 +1551,58 @@ mod tests {
         assert!(!no_proxy_covers("notevil.com", "evil.com"));
     }
 
+    /// Re-exec this test binary running exactly `child_test` under the given
+    /// env, and prove the child actually ran one test rather than filter-
+    /// matching nothing (a wrong `--exact` path exits 0 vacuously).
+    fn run_env_child(child_test: &str, envs: &[(&str, &str)]) {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", child_test, "--nocapture"]);
+        // Clear any inherited proxy state first, then apply the case's env;
+        // env_remove after envs would silently undo a provided NO_PROXY.
+        for k in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+            "GITLAWB_ALLOW_INSECURE_HTTP",
+        ] {
+            cmd.env_remove(k);
+        }
+        cmd.envs(envs.iter().copied());
+        let out = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must run the test, not exit green on a filter miss. \
+             stdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     /// A proxied loopback plaintext hop must be refused. The env plumbing is
     /// checked in a re-execed child so the process-global proxy vars never
     /// touch sibling tests' reqwest clients.
-    #[test]
-    fn proxied_loopback_http_is_refused() {
+    #[tokio::test]
+    async fn proxied_loopback_http_is_refused() {
         if std::env::var_os("GL_PROXY_CHILD").is_none() {
-            let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "tests::http::tests::proxied_loopback_http_is_refused",
-                ])
-                .env("GL_PROXY_CHILD", "1")
-                .env("HTTP_PROXY", "http://10.9.9.9:3128")
-                .env_remove("http_proxy")
-                .env_remove("ALL_PROXY")
-                .env_remove("all_proxy")
-                .env_remove("NO_PROXY")
-                .env_remove("no_proxy")
-                .env_remove("GITLAWB_ALLOW_INSECURE_HTTP")
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "child failed: {}",
-                String::from_utf8_lossy(&out.stderr)
+            run_env_child(
+                "http::tests::proxied_loopback_http_is_refused",
+                &[
+                    ("GL_PROXY_CHILD", "1"),
+                    ("HTTP_PROXY", "http://10.9.9.9:3128"),
+                ],
             );
             return;
         }
-        let err =
-            ensure_signing_transport("http://127.0.0.1:1", insecure_http_allowed()).unwrap_err();
+        let client = NodeClient::new("http://127.0.0.1:1", Some(test_keypair()));
+        let err = client.get_signed("/api/v1/x").await.unwrap_err();
         assert!(
             err.to_string().contains("plaintext http"),
             "a proxy without NO_PROXY carries the signed request off-machine: {err}"
@@ -1578,30 +1610,24 @@ mod tests {
     }
 
     /// And NO_PROXY covering the host restores the loopback exemption.
-    #[test]
-    fn proxied_loopback_with_no_proxy_is_allowed() {
+    #[tokio::test]
+    async fn proxied_loopback_with_no_proxy_is_allowed() {
         if std::env::var_os("GL_PROXY_CHILD2").is_none() {
-            let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "tests::http::tests::proxied_loopback_with_no_proxy_is_allowed",
-                ])
-                .env("GL_PROXY_CHILD2", "1")
-                .env("HTTP_PROXY", "http://10.9.9.9:3128")
-                .env("NO_PROXY", "localhost,127.0.0.1")
-                .env_remove("GITLAWB_ALLOW_INSECURE_HTTP")
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "child failed: {}",
-                String::from_utf8_lossy(&out.stderr)
+            run_env_child(
+                "http::tests::proxied_loopback_with_no_proxy_is_allowed",
+                &[
+                    ("GL_PROXY_CHILD2", "1"),
+                    ("HTTP_PROXY", "http://10.9.9.9:3128"),
+                    ("NO_PROXY", "localhost,127.0.0.1"),
+                ],
             );
             return;
         }
+        let client = NodeClient::new("http://127.0.0.1:1", Some(test_keypair()));
+        let err = client.get_signed("/api/v1/x").await.unwrap_err();
         assert!(
-            ensure_signing_transport("http://127.0.0.1:1", insecure_http_allowed()).is_ok(),
-            "NO_PROXY covering the host keeps the request on this machine"
+            !err.to_string().contains("plaintext http"),
+            "NO_PROXY covering the host keeps the request on this machine: {err}"
         );
     }
 }
