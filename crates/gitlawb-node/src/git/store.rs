@@ -150,12 +150,20 @@ pub fn log(repo_path: &Path, refname: &str, limit: usize) -> Result<Vec<CommitIn
         let resolved = Command::new("git")
             .args(["rev-parse", "--verify", "--quiet", refname])
             .current_dir(repo_path)
-            .output();
-        if matches!(resolved, Ok(ref o) if o.status.success()) {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("git log failed for {refname}: {}", stderr.trim());
+            .output()
+            .context("failed to run git rev-parse")?;
+        // --quiet exits 1 only for "ref does not resolve"; other failures
+        // (not a repo, broken config) are real errors, not an empty history.
+        match resolved.status.code() {
+            Some(1) => return Ok(vec![]),
+            Some(0) => {}
+            _ => {
+                let stderr = String::from_utf8_lossy(&resolved.stderr);
+                anyhow::bail!("git rev-parse failed for {refname}: {}", stderr.trim());
+            }
         }
-        return Ok(vec![]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git log failed for {refname}: {}", stderr.trim());
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2083,5 +2091,21 @@ mod tests {
         std::fs::write(&obj, b"garbage").unwrap();
 
         assert!(super::log(work, "HEAD", 10).is_err());
+    }
+
+    /// The rev-parse recheck inside `log` must distinguish "ref missing"
+    /// (exit 1 -> empty history) from a real probe failure (exit 128 on a
+    /// non-repo -> error), not fold both into `Ok(vec![])`.
+    #[test]
+    fn log_probe_failure_on_a_non_repo_errors_instead_of_empty() {
+        let td = tempfile::TempDir::new().unwrap();
+        // A directory that is not a git repo at all: `git log` fails and the
+        // `rev-parse` recheck fails with 128, which is not "missing ref".
+        let not_a_repo = td.path().join("not-a-repo");
+        std::fs::create_dir_all(&not_a_repo).unwrap();
+        assert!(
+            super::log(&not_a_repo, "HEAD", 10).is_err(),
+            "a rev-parse probe failure must not read as an empty repo"
+        );
     }
 }
