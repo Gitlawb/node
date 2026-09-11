@@ -238,8 +238,12 @@ pub fn resolve_issue_id(repo_path: &Path, id_or_prefix: &str) -> Result<Option<S
         .output()
         .context("failed to run git for-each-ref")?;
 
+    // for-each-ref exits 0 with empty output when nothing matches, so a
+    // nonzero exit is a real enumeration failure (e.g. not a repo), not
+    // "issue not found".
     if !list.status.success() {
-        return Ok(None);
+        let stderr = String::from_utf8_lossy(&list.stderr);
+        anyhow::bail!("git for-each-ref failed: {}", stderr.trim());
     }
 
     let output = String::from_utf8_lossy(&list.stdout);
@@ -456,6 +460,17 @@ mod tests {
         let not_a_repo = dir.path().join("not-a-repo");
         std::fs::create_dir_all(&not_a_repo).unwrap();
         assert!(list_issues(&not_a_repo).is_err());
+    }
+
+    // #426: the same enumeration failure inside resolve_issue_id must reach
+    // get_issue/close_issue as an error, not a "not found" None.
+    #[test]
+    fn test_get_and_close_on_non_repo_error_instead_of_none() {
+        let dir = TempDir::new().unwrap();
+        let not_a_repo = dir.path().join("not-a-repo");
+        std::fs::create_dir_all(&not_a_repo).unwrap();
+        assert!(get_issue(&not_a_repo, "nosuch00").is_err());
+        assert!(close_issue(&not_a_repo, "nosuch00").is_err());
     }
 
     // #426: a ref that resolves but whose object is corrupt is a read error,
