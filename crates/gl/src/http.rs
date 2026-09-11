@@ -19,6 +19,74 @@ const MAX_ICAPTCHA_RETRIES: usize = 2;
 /// response body, so it bounds a slow download and not just a slow handshake.
 const TOTAL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Whether `url` would send a signed request off this machine in cleartext.
+///
+/// True only for `http://` to a non-loopback host. RFC 9421 signs the request
+/// but does not encrypt it, so on a plaintext hop the `Signature` header and
+/// the body are both readable, and a captured signature is replayable for its
+/// freshness window against any host.
+///
+/// Loopback is decided from the parsed address rather than a string match, so
+/// `127.0.0.2`, `[::1]` and an IPv4-mapped `[::ffff:127.0.0.1]` are all
+/// recognised as this machine. A value that does not parse, or that is not
+/// http(s), is not this guard's business and returns false: it fails later with
+/// its own error, and naming it a TLS problem would misdirect the reader.
+fn is_insecure_remote(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url.trim()) else {
+        return false;
+    };
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host == "localhost" {
+        return false;
+    }
+    // host_str() keeps the brackets on an IPv6 literal.
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        if ip.is_loopback() {
+            return false;
+        }
+        // An IPv4-mapped IPv6 literal hides a v4 loopback from is_loopback().
+        if let std::net::IpAddr::V6(v6) = ip {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                if v4.is_loopback() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Refuse to sign a request destined for a cleartext hop off this machine
+/// unless the operator has opted in. `GITLAWB_ALLOW_INSECURE_HTTP` exists for a
+/// private LAN where the operator has decided that is acceptable; its presence
+/// alone opts in, matching git-remote-gitlawb's guard for the same hop.
+fn ensure_signing_transport(node_base: &str, allow_insecure: bool) -> Result<()> {
+    if allow_insecure || !is_insecure_remote(node_base) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to send a signed request to {node_base} over plaintext http.\n\
+         The request is signed but not encrypted, so the Signature header and \
+         the body are readable by anyone on the path, and a captured signature \
+         can be replayed.\n\
+         Use https://, or set GITLAWB_ALLOW_INSECURE_HTTP=1 to accept the risk \
+         (for a trusted private network only)."
+    )
+}
+
+/// The operator opt-in for a plaintext remote, read at request time so a test
+/// or shell can set it without rebuilding the client.
+fn insecure_http_allowed() -> bool {
+    std::env::var_os("GITLAWB_ALLOW_INSECURE_HTTP").is_some()
+}
+
 /// Follow a redirect only when it stays on the origin that issued it AND re-issues the
 /// identical request-target, and only for as long as the chain bound allows.
 ///
@@ -115,6 +183,7 @@ impl NodeClient {
             .keypair
             .as_ref()
             .context("get_signed requires an identity keypair")?;
+        ensure_signing_transport(&self.node_url, insecure_http_allowed())?;
         let signed = sign_request(kp, "GET", path, b"");
         let req = self
             .inner
@@ -133,6 +202,7 @@ impl NodeClient {
         let url = format!("{}{}", self.node_url, path);
         let mut req = self.inner.get(&url);
         if let Some(kp) = &self.keypair {
+            ensure_signing_transport(&self.node_url, insecure_http_allowed())?;
             let signed = sign_request(kp, "GET", path, b"");
             req = req
                 .header("Content-Digest", signed.content_digest)
@@ -214,6 +284,7 @@ impl NodeClient {
             .body(body.to_vec());
 
         if let Some(kp) = &self.keypair {
+            ensure_signing_transport(&self.node_url, insecure_http_allowed())?;
             let signed = sign_request(kp, method, path, body);
             req = req
                 .header("Content-Digest", signed.content_digest)
@@ -1267,5 +1338,131 @@ mod tests {
         // against being widened into a blanket Cf stripper.
         let out = sanitize_node_msg("ok \u{0627}\u{200D}b");
         assert_eq!(out, "ok \u{0627}\u{200D}b");
+    }
+
+    // ── #413 plaintext-remote signing guard ──────────────────────────────
+
+    /// Holds [`ICAPTCHA_ENV_LOCK`] while it points `GITLAWB_ALLOW_INSECURE_HTTP`
+    /// at `value` (or removes it), restoring the prior value on drop.
+    struct InsecureHttpEnv {
+        _lock: MutexGuard<'static, ()>,
+        prev: Option<OsString>,
+    }
+
+    impl InsecureHttpEnv {
+        fn set(value: Option<&str>) -> Self {
+            let lock = ICAPTCHA_ENV_LOCK.lock().unwrap();
+            let prev = std::env::var_os("GITLAWB_ALLOW_INSECURE_HTTP");
+            match value {
+                Some(v) => std::env::set_var("GITLAWB_ALLOW_INSECURE_HTTP", v),
+                None => std::env::remove_var("GITLAWB_ALLOW_INSECURE_HTTP"),
+            }
+            InsecureHttpEnv { _lock: lock, prev }
+        }
+    }
+
+    impl Drop for InsecureHttpEnv {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("GITLAWB_ALLOW_INSECURE_HTTP", v),
+                None => std::env::remove_var("GITLAWB_ALLOW_INSECURE_HTTP"),
+            }
+        }
+    }
+
+    #[test]
+    fn insecure_remote_flags_only_plaintext_off_machine() {
+        // Loopback of every spelling is this machine and exempt.
+        for url in [
+            "http://localhost",
+            "http://localhost:7545",
+            "http://127.0.0.1:7545",
+            "http://127.0.0.2",
+            "http://[::1]",
+            "http://[::ffff:127.0.0.1]",
+            // https to anywhere is encrypted; the guard is not its business.
+            "https://node.gitlawb.com",
+            // Not a URL: unparseable input fails later with its own error.
+            "not a url",
+        ] {
+            assert!(!is_insecure_remote(url), "{url} must not be flagged");
+        }
+        // Plaintext http off this machine is the flagged shape.
+        for url in [
+            "http://10.0.0.36:7777",
+            "http://node.example.com",
+            "http://[fd00::1]",
+            "http://127.0.0.1.evil.example",
+        ] {
+            assert!(is_insecure_remote(url), "{url} must be flagged");
+        }
+    }
+
+    #[test]
+    fn signing_transport_refuses_plaintext_remote() {
+        let err = ensure_signing_transport("http://10.0.0.36:7777", false).unwrap_err();
+        assert!(
+            err.to_string().contains("plaintext http")
+                && err.to_string().contains("GITLAWB_ALLOW_INSECURE_HTTP"),
+            "the refusal names the risk and the opt-in: {err}"
+        );
+        // Opted in, loopback, and https all pass.
+        assert!(ensure_signing_transport("http://10.0.0.36:7777", true).is_ok());
+        assert!(ensure_signing_transport("http://localhost:7545", false).is_ok());
+        assert!(ensure_signing_transport("https://node.gitlawb.com", false).is_ok());
+    }
+
+    /// A signed call against a plaintext remote errors out before any request
+    /// leaves; the refusal must beat the send. `.invalid` NXDOMAINs fast, so a
+    /// missed guard surfaces as a DNS error rather than a slow timeout.
+    #[tokio::test]
+    async fn get_signed_refuses_plaintext_remote_before_sending() {
+        let _env = InsecureHttpEnv::set(None);
+        let client = NodeClient::new("http://gl-nonexistent-node.invalid", Some(test_keypair()));
+        let err = client.get_signed("/api/v1/x").await.unwrap_err();
+        assert!(
+            err.to_string().contains("plaintext http"),
+            "expected the transport refusal, got: {err}"
+        );
+    }
+
+    /// With the opt-in set, the same call passes the guard and fails later on
+    /// the unresolvable host, proving the env var unblocks the send rather than
+    /// merely being read.
+    #[tokio::test]
+    async fn get_signed_proceeds_when_insecure_http_opted_in() {
+        let _env = InsecureHttpEnv::set(Some("1"));
+        let client = NodeClient::new("http://gl-nonexistent-node.invalid", Some(test_keypair()));
+        let err = client.get_signed("/api/v1/x").await.unwrap_err();
+        assert!(
+            !err.to_string().contains("plaintext http"),
+            "the opt-in should let the request attempt the hop, got: {err}"
+        );
+    }
+
+    /// Unsigned calls are not this guard's business: no keypair means no
+    /// signature to leak, and the request proceeds to its own failure.
+    #[tokio::test]
+    async fn unsigned_call_to_plaintext_remote_is_ungated() {
+        let _env = InsecureHttpEnv::set(None);
+        let client = NodeClient::new("http://gl-nonexistent-node.invalid", None);
+        let err = client.post("/api/v1/x", b"{}").await.unwrap_err();
+        assert!(
+            !err.to_string().contains("plaintext http"),
+            "an unsigned request should not hit the signing guard, got: {err}"
+        );
+    }
+
+    /// The opt-in is presence-based, matching the remote helper's read.
+    #[test]
+    fn insecure_http_allowed_reads_the_env_var() {
+        {
+            let _env = InsecureHttpEnv::set(Some("1"));
+            assert!(insecure_http_allowed());
+        }
+        {
+            let _env = InsecureHttpEnv::set(None);
+            assert!(!insecure_http_allowed());
+        }
     }
 }
