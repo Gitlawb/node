@@ -141,7 +141,21 @@ pub fn log(repo_path: &Path, refname: &str, limit: usize) -> Result<Vec<CommitIn
         .context("failed to run git log")?;
 
     if !output.status.success() {
-        return Ok(vec![]); // empty repo
+        // An unresolvable ref means a genuinely empty repo. A ref that
+        // resolves but fails to log is a read failure (corrupt object store, a
+        // gc mid-read): report it rather than passing an empty log off as no
+        // history (#400). rev-parse resolves the name without reading objects.
+        // allow-unbounded-git: failure-path existence recheck; module
+        // convention, at most one extra spawn per failed log.
+        let resolved = Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", refname])
+            .current_dir(repo_path)
+            .output();
+        if matches!(resolved, Ok(ref o) if o.status.success()) {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("git log failed for {refname}: {}", stderr.trim());
+        }
+        return Ok(vec![]);
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2024,5 +2038,50 @@ mod tests {
             matches!(res, Ok(None)),
             "a clean `missing` twice on a readable store is a genuine absence; got {res:?}"
         );
+    }
+
+    // #400: `log` may fold a failed `git log` into Ok(vec![]) only when the ref
+    // genuinely does not resolve (an empty repo). A ref that resolves but
+    // fails to read is an error, not an empty history.
+    #[test]
+    fn log_empty_is_empty_and_resolved_ref_read_failure_errors() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work: &Path = td.path();
+        let g = |args: &[&str]| {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(work)
+                .status()
+                .unwrap()
+                .success());
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+
+        // No commits: nothing resolves, so a failed log is a real empty repo.
+        assert!(super::log(work, "HEAD", 10).unwrap().is_empty());
+
+        std::fs::write(work.join("f.txt"), b"x\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "c1"]);
+        assert_eq!(super::log(work, "HEAD", 10).unwrap().len(), 1);
+
+        // Corrupt the object the branch resolves to: `git log` fails but
+        // `rev-parse --verify` still resolves the name, so the failure must
+        // surface as an error rather than an empty history.
+        let oid = {
+            let o = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        let obj = work.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+        std::fs::remove_file(&obj).unwrap();
+        std::fs::write(&obj, b"garbage").unwrap();
+
+        assert!(super::log(work, "HEAD", 10).is_err());
     }
 }
