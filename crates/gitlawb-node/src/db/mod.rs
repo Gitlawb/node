@@ -1599,7 +1599,7 @@ impl Db {
 
     /// All repos with star counts, mirror-deduplicated via `DEDUP_CTE` and
     /// ordered newest-first, optionally filtered to one owner. Returns the full
-    /// set (no SQL pagination): the listing surface filters by per-caller \"/\"
+    /// set (no SQL pagination): the listing surface filters by per-caller `"/"`
     /// visibility in Rust and paginates after, so neither the page nor the count
     /// leaks a repo the caller may not read (#97).
     ///
