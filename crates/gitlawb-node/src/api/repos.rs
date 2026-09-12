@@ -625,6 +625,10 @@ pub async fn get_blob(
     );
     let mut response = Response::new(axum::body::Body::from_stream(stream));
     response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response.headers_mut().insert(
         header::CONTENT_TYPE,
         axum::http::HeaderValue::from_static(mime),
     );
@@ -4069,6 +4073,7 @@ mod tests {
             "application/json; charset=utf-8"
         );
         assert_eq!(response.headers()[header::CONTENT_LENGTH], "13");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..], b"{\"hello\":123}");
     }
