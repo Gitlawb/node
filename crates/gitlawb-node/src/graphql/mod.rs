@@ -379,22 +379,21 @@ mod tests {
     #[tokio::test]
     async fn production_limits_reject_mutation_aliases_and_large_lists() {
         let schema = production_test_schema();
-        for field in [
-            "claimTask(id: \"missing\", assigneeDid: \"did:key:test\") { id }",
-            "refUpdates(limit: 200) { repo }",
-            "tasks(limit: 200) { id }",
-            "reposPage(limit: 200) { nodes { name } }",
+        for (prefix, count, field) in [
+            ("mutation", 8, "claimTask(id: \"missing\", assigneeDid: \"did:key:test\") { id }"),
+            ("mutation", 8, "createTask(delegatorDid: \"did:key:test\", input: { kind: \"test\", capability: \"test\" }) { id }"),
+            ("mutation", 8, "completeTask(id: \"missing\", byDid: \"did:key:test\", input: {}) { id }"),
+            ("mutation", 8, "failTask(id: \"missing\", byDid: \"did:key:test\", input: {}) { id }"),
+            ("query", 8, "task(id: \"missing\") { id }"),
+            ("query", 2, "refUpdates(limit: 200) { repo }"),
+            ("query", 2, "tasks(limit: 200) { id }"),
+            ("query", 2, "reposPage(limit: 200) { nodes { name } }"),
+            ("query", 8, "reposPage(limit: 1) { nodes { name } }"),
         ] {
-            let count = if field.starts_with("claim") { 8 } else { 2 };
             let fields = (0..count)
                 .map(|n| format!("r{n}: {field}"))
                 .collect::<Vec<_>>()
                 .join(" ");
-            let prefix = if field.starts_with("claim") {
-                "mutation"
-            } else {
-                "query"
-            };
             let response = schema.execute(format!("{prefix} {{ {fields} }}")).await;
             assert_eq!(response.errors.len(), 1, "{:?}", response.errors);
             assert_eq!(response.errors[0].message, "Query is too complex.");
