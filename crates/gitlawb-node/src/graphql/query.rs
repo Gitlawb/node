@@ -206,6 +206,7 @@ impl QueryRoot {
 #[cfg(test)]
 mod tests {
     use crate::db::{Db, ReceivedRefUpdate, RepoRecord};
+    use base64::Engine;
     use chrono::Utc;
     use sqlx::PgPool;
     use std::sync::Arc;
@@ -502,7 +503,15 @@ mod tests {
                     || response.errors[0].message == "invalid repository cursor"
             );
         }
-        assert!(super::parse_repo_cursor(&"a".repeat(4097)).is_err());
+        // Valid base64 and valid cursor JSON: only the length guard rejects it.
+        let oversized = super::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&("did:key:reader", "a".repeat(3100))).unwrap());
+        assert!(oversized.len() > 4096);
+        assert!(serde_json::from_slice::<(String, String)>(
+            &super::URL_SAFE_NO_PAD.decode(&oversized).unwrap()
+        )
+        .is_ok());
+        assert!(super::parse_repo_cursor(&oversized).is_err());
     }
 
     async fn db(pool: PgPool) -> Arc<Db> {
