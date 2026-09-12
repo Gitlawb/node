@@ -520,7 +520,8 @@ pub async fn get_blob(
 ) -> Result<Response> {
     use axum::http::header;
 
-    // Unnormalized paths ("../..", "./", "//") can't resolve in `git show`
+    // Unnormalized paths ("../..", "./", "//") are invalid in the ref:path
+    // input sent to `git cat-file --batch-check`,
     // and crawlers combinatorially explode them from relative links — that's
     // a client error, not a 500.
     let file_path = file_path.trim_matches('/');

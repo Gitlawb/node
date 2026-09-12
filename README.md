@@ -340,6 +340,7 @@ GET /{owner}/{repo}/info/refs
 POST /{owner}/{repo}/git-upload-pack
 ```
 
+REST blob reads serve file content only; directory and gitlink paths return 404.
 Body delivery has its own allowance equal to `GITLAWB_GIT_SERVICE_TIMEOUT_SECS`.
 If delivery exceeds it, the response is interrupted and its admission slots are released.
 
