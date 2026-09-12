@@ -1321,10 +1321,14 @@ exit 1
         run(&["add", "hello.txt"]);
         run(&["commit", "-qm", "initial"]);
         run(&["branch", "-M", "custom-feature"]);
+        run(&["branch", "aaa-earlier"]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert_eq!(
+            super::resolve_head_bounded("git", work, "aaa-earlier", deadline).unwrap(),
+            "HEAD"
+        );
         // Detach or point HEAD to an unborn branch so HEAD itself does not resolve.
         run(&["symbolic-ref", "HEAD", "refs/heads/unborn-branch"]);
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
 
         // 1. Preferred branch arm: "custom-feature" resolves to refs/heads/custom-feature.
         let resolved =
@@ -1349,8 +1353,31 @@ exit 1
             super::BoundedFileRead::Found(b"hello".to_vec())
         );
 
-        // 3. for-each-ref fallback arm: rename "master" to "isolated-branch" (neither main, master, nor develop).
+        // Main must precede master, which must precede develop; all precede
+        // the alphabetically earlier branch chosen by for-each-ref.
+        run(&["branch", "develop", "master"]);
+        run(&["branch", "main", "master"]);
+        assert_eq!(
+            super::resolve_head_bounded("git", work, "nonexistent", deadline).unwrap(),
+            "refs/heads/main"
+        );
+        run(&["branch", "-m", "main", "z-retired-main"]);
+        assert_eq!(
+            super::resolve_head_bounded("git", work, "nonexistent", deadline).unwrap(),
+            "refs/heads/master"
+        );
         run(&["branch", "-M", "master", "isolated-branch"]);
+        assert_eq!(
+            super::resolve_head_bounded("git", work, "nonexistent", deadline).unwrap(),
+            "refs/heads/develop"
+        );
+        run(&["branch", "-m", "develop", "z-retired-develop"]);
+        assert_eq!(
+            super::resolve_head_bounded("git", work, "nonexistent", deadline).unwrap(),
+            "refs/heads/aaa-earlier"
+        );
+        run(&["branch", "-m", "aaa-earlier", "z-retired-earlier"]);
+        // 3. for-each-ref fallback arm: only a nonstandard branch remains.
         let resolved_isolated =
             super::resolve_head_bounded("git", work, "nonexistent", deadline).unwrap();
         assert_eq!(resolved_isolated, "refs/heads/isolated-branch");
