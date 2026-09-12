@@ -1302,6 +1302,193 @@ exit 1
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bounded_file_read_guards_size_mismatch_and_metadata_parse() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let td = tempfile::TempDir::new().unwrap();
+        let script = td.path().join("fakegit");
+        let write_fake = |body: &str| {
+            std::fs::write(&script, body).unwrap();
+            let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script, permissions).unwrap();
+        };
+
+        let oid = "c".repeat(40);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        // 1. Size mismatch (emitted bytes fewer than declared size):
+        // Declares 20 bytes, emits 5 bytes ("hello"). max_bytes is 64 (so exceeded is false).
+        write_fake(&format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"rev-parse\" ]; then echo {oid}; exit 0; fi\n\
+             if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"--batch-check\" ]; then read spec; echo \"{oid} blob 20\"; exit 0; fi\n\
+             if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"blob\" ]; then printf hello; exit 0; fi\n\
+             exit 1\n"
+        ));
+        let err = super::read_file_bounded(
+            script.to_str().unwrap(),
+            td.path(),
+            "main",
+            "mismatch.txt",
+            64,
+            deadline,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("size changed between metadata and content reads"),
+            "expected size mismatch error, got: {err:#}"
+        );
+
+        // 2. Metadata parse: missing fields (only 2 fields, no size)
+        write_fake(&format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"rev-parse\" ]; then echo {oid}; exit 0; fi\n\
+             if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"--batch-check\" ]; then read spec; echo \"{oid} blob\"; exit 0; fi\n\
+             exit 1\n"
+        ));
+        let err = super::read_file_bounded(
+            script.to_str().unwrap(),
+            td.path(),
+            "main",
+            "bad.txt",
+            64,
+            deadline,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("omitted the object size"),
+            "expected missing fields error, got: {err:#}"
+        );
+
+        // 3. Metadata parse: non-hex OID
+        write_fake(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"rev-parse\" ]; then echo nothex; exit 0; fi\n\
+             if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"--batch-check\" ]; then read spec; echo \"not-a-valid-hex-oid-1234567890123456789012 blob 10\"; exit 0; fi\n\
+             exit 1\n"
+        );
+        let err = super::read_file_bounded(
+            script.to_str().unwrap(),
+            td.path(),
+            "main",
+            "bad.txt",
+            64,
+            deadline,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid object metadata"),
+            "expected non-hex oid error, got: {err:#}"
+        );
+
+        // 4. Metadata parse: trailing fields
+        write_fake(&format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"rev-parse\" ]; then echo {oid}; exit 0; fi\n\
+             if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"--batch-check\" ]; then read spec; echo \"{oid} blob 10 trailing-junk\"; exit 0; fi\n\
+             exit 1\n"
+        ));
+        let err = super::read_file_bounded(
+            script.to_str().unwrap(),
+            td.path(),
+            "main",
+            "bad.txt",
+            64,
+            deadline,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid object metadata"),
+            "expected trailing fields error, got: {err:#}"
+        );
+
+        // 5. Metadata parse: multi-record output
+        write_fake(&format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"rev-parse\" ]; then echo {oid}; exit 0; fi\n\
+             if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"--batch-check\" ]; then read spec; echo \"{oid} blob 10\n{oid} blob 10\"; exit 0; fi\n\
+             exit 1\n"
+        ));
+        let err = super::read_file_bounded(
+            script.to_str().unwrap(),
+            td.path(),
+            "main",
+            "bad.txt",
+            64,
+            deadline,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("multiple object metadata records"),
+            "expected multi-record error, got: {err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blob_metadata_bounded_reprobe_budget_exhaustion_returns_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let td = tempfile::TempDir::new().unwrap();
+        let script = td.path().join("fakegit");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"--batch-check\" ]; then sleep 0.05; read spec; echo \"$spec missing\"; exit 0; fi\n\
+             exit 1\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
+        let err = super::blob_metadata_bounded(
+            script.to_str().unwrap(),
+            td.path(),
+            "spec",
+            b"spec\n",
+            deadline,
+        )
+        .unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::git::smart_http::GitServiceTimeout>()
+                .is_some(),
+            "exhausted reprobe budget must return GitServiceTimeout, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn read_file_bounded_denies_non_blob_paths() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(work)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::create_dir(work.join("subfolder")).unwrap();
+        std::fs::write(work.join("subfolder/file.txt"), b"contents").unwrap();
+        run(&["add", "subfolder"]);
+        run(&["commit", "-qm", "add directory"]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        // "subfolder" resolves to a tree object in git, not a blob.
+        let read =
+            super::read_file_bounded("git", work, "main", "subfolder", 1024, deadline).unwrap();
+        assert_eq!(read, super::BoundedFileRead::Missing);
+    }
+
     #[test]
     fn resolve_head_bounded_covers_all_fallback_arms() {
         let td = tempfile::TempDir::new().unwrap();

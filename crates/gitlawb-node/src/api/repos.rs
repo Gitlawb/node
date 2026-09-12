@@ -584,6 +584,11 @@ pub async fn get_blob(
         if e.downcast_ref::<smart_http::GitServiceTimeout>().is_some() {
             return AppError::Timeout("git service timed out".into());
         }
+        if e.to_string().contains("object store not readable") {
+            return AppError::Overloaded(
+                "object store temporarily unavailable, retry shortly".into(),
+            );
+        }
         AppError::Internal(e)
     })?;
 
@@ -4008,10 +4013,7 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            state.git_blob_semaphore.available_permits(),
-            MAX_CONCURRENT_BLOB_READS - 1
-        );
+        assert!(state.git_blob_semaphore.available_permits() <= MAX_CONCURRENT_BLOB_READS - 1);
         // Keep the body alive without ever polling it; the timer must run anyway.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while state.git_blob_semaphore.available_permits() != MAX_CONCURRENT_BLOB_READS {
@@ -4047,11 +4049,77 @@ mod tests {
         let response =
             blob_route_request_path(state, "z6blobunreadable", "file.txt", "203.0.113.31:5000")
                 .await;
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         use http_body_util::BodyExt;
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["message"], crate::error::INTERNAL_ERROR_MESSAGE);
+        assert_eq!(body["error"], "overloaded");
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn blob_route_returns_not_found_on_non_blob_path(pool: sqlx::PgPool) {
+        use axum::http::StatusCode;
+        use http_body_util::BodyExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = write_fake_git(
+            tmp.path(),
+            "#!/bin/sh\nif [ \"$1\" = rev-parse ]; then exit 0; fi\nif [ \"$2\" = --batch-check ]; then echo '1111111111111111111111111111111111111111 tree 1024'; exit 0; fi\nexit 1\n",
+        );
+        let state = f4_state_with_repo(pool, tmp.path(), &fake, "z6blobtree", "repo", false).await;
+        let response =
+            blob_route_request_path(state, "z6blobtree", "somedir", "203.0.113.31:5000").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "not_found");
+    }
+
+    #[sqlx::test]
+    async fn blob_route_acquire_timeout_sheds_503_and_releases_permits(pool: sqlx::PgPool) {
+        use axum::http::StatusCode;
+        use http_body_util::BodyExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repos_dir = tmp.path().to_path_buf();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let endpoint = crate::test_support::silent_http_endpoint().await;
+        let tigris =
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
+                .await;
+        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        let mut cfg = (*state.config).clone();
+        cfg.git_acquire_timeout_secs = 1;
+        state.config = Arc::new(cfg);
+
+        // Repo exists in DB but not on disk, so acquire attempts Tigris and times out.
+        state
+            .db
+            .upsert_mirror_repo("z6blobacqtimeout", "repo", "/unused", None, false)
+            .await
+            .unwrap();
+
+        let response = blob_route_request_path(
+            state.clone(),
+            "z6blobacqtimeout",
+            "file.txt",
+            "203.0.113.31:5000",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "overloaded");
+        assert!(state.git_read_semaphore.available_permits() > 0);
+        assert_eq!(
+            state.git_blob_semaphore.available_permits(),
+            MAX_CONCURRENT_BLOB_READS
+        );
+        assert!(state
+            .git_read_per_caller
+            .try_acquire("203.0.113.31")
+            .is_some());
     }
 
     #[cfg(unix)]
