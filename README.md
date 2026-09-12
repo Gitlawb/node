@@ -340,6 +340,9 @@ GET /{owner}/{repo}/info/refs
 POST /{owner}/{repo}/git-upload-pack
 ```
 
+Body delivery has its own allowance equal to `GITLAWB_GIT_SERVICE_TIMEOUT_SECS`.
+If delivery exceeds it, the response is interrupted and its admission slots are released.
+
 Signed write routes include:
 
 ```txt

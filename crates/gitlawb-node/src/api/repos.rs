@@ -55,6 +55,73 @@ impl futures::Stream for BlobResponseStream {
     }
 }
 
+/// The producer owns admission and the full blob; its timer runs even when
+/// the HTTP server stops polling the body. Only one copied chunk is queued.
+struct BlobDeliveryStream {
+    receiver: tokio::sync::mpsc::Receiver<Bytes>,
+    producer: tokio::task::JoinHandle<std::io::Result<()>>,
+    finished: bool,
+}
+
+impl BlobDeliveryStream {
+    fn new(mut source: BlobResponseStream, timeout: std::time::Duration) -> Self {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let producer = tokio::spawn(async move {
+            use futures::StreamExt;
+            let delivery = async {
+                while let Some(Ok(chunk)) = source.next().await {
+                    if sender.send(chunk).await.is_err() {
+                        return;
+                    }
+                }
+                // Keep admission until the last queued chunk is consumed, even
+                // for a one-chunk response whose first send never had to wait.
+                let _drained = sender.reserve().await;
+            };
+            tokio::time::timeout(timeout, delivery).await.map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "blob delivery timed out")
+            })
+        });
+        Self {
+            receiver,
+            producer,
+            finished: false,
+        }
+    }
+}
+
+impl futures::Stream for BlobDeliveryStream {
+    type Item = std::io::Result<Bytes>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::future::Future;
+        use std::task::Poll;
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(None);
+        }
+        if let Some(chunk) = std::task::ready!(this.receiver.poll_recv(cx)) {
+            return Poll::Ready(Some(Ok(chunk)));
+        }
+        let result = std::task::ready!(std::pin::Pin::new(&mut this.producer).poll(cx));
+        this.finished = true;
+        match result {
+            Ok(Ok(())) => Poll::Ready(None),
+            Ok(Err(error)) => Poll::Ready(Some(Err(error))),
+            Err(_) => Poll::Ready(Some(Err(std::io::Error::other("blob delivery failed")))),
+        }
+    }
+}
+
+impl Drop for BlobDeliveryStream {
+    fn drop(&mut self) {
+        self.producer.abort();
+    }
+}
+
 /// The set of blob OIDs withheld from **anonymous** replication for a repo, or
 /// `None` when the repo must not replicate at all (private / mode A /
 /// undetermined — fail closed). This is the anonymous replication gate:
@@ -551,6 +618,10 @@ pub async fn get_blob(
         _blob_permit: blob_permit,
         _caller_permit: caller_permit,
     };
+    let stream = BlobDeliveryStream::new(
+        stream,
+        std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+    );
     let mut response = Response::new(axum::body::Body::from_stream(stream));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -3476,6 +3547,64 @@ mod tests {
         assert!(callers.try_acquire("source").is_some());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn blob_delivery_deadline_releases_admission_without_body_polls() {
+        use futures::StreamExt;
+        for (chunks, read_first_chunk) in [(1, false), (8, false), (8, true)] {
+            let git = Arc::new(tokio::sync::Semaphore::new(1));
+            let blob = Arc::new(tokio::sync::Semaphore::new(1));
+            let callers = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+            let source = BlobResponseStream {
+                content: Bytes::from(vec![b'x'; BLOB_RESPONSE_CHUNK_BYTES * chunks]),
+                _git_permit: git.clone().try_acquire_owned().unwrap(),
+                _blob_permit: blob.clone().try_acquire_owned().unwrap(),
+                _caller_permit: callers.try_acquire("source"),
+            };
+            let mut stream = BlobDeliveryStream::new(source, std::time::Duration::from_secs(10));
+            tokio::task::yield_now().await;
+            if read_first_chunk {
+                assert_eq!(
+                    stream.next().await.unwrap().unwrap().len(),
+                    BLOB_RESPONSE_CHUNK_BYTES
+                );
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(blob.available_permits(), 0);
+            tokio::time::advance(std::time::Duration::from_secs(11)).await;
+            tokio::task::yield_now().await;
+            // The body still exists and has not been polled during the deadline.
+            assert_eq!(git.available_permits(), 1);
+            assert_eq!(blob.available_permits(), 1);
+            assert!(callers.try_acquire("source").is_some());
+            assert!(stream.next().await.unwrap().is_ok()); // one queued chunk
+            let error = stream.next().await.unwrap().unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert!(stream.next().await.is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blob_delivery_disconnect_releases_admission_before_deadline() {
+        let git = Arc::new(tokio::sync::Semaphore::new(1));
+        let blob = Arc::new(tokio::sync::Semaphore::new(1));
+        let callers = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        let stream = BlobDeliveryStream::new(
+            BlobResponseStream {
+                content: Bytes::from(vec![b'x'; BLOB_RESPONSE_CHUNK_BYTES * 8]),
+                _git_permit: git.clone().try_acquire_owned().unwrap(),
+                _blob_permit: blob.clone().try_acquire_owned().unwrap(),
+                _caller_permit: callers.try_acquire("source"),
+            },
+            std::time::Duration::from_secs(600),
+        );
+        tokio::task::yield_now().await;
+        drop(stream);
+        tokio::task::yield_now().await;
+        assert_eq!(git.available_permits(), 1);
+        assert_eq!(blob.available_permits(), 1);
+        assert!(callers.try_acquire("source").is_some());
+    }
+
     #[test]
     fn upload_pack_request_finalizes_only_with_done_pktline() {
         let want = "0032want 1111111111111111111111111111111111111111\n";
@@ -3854,6 +3983,40 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"], "not_found");
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn blob_route_delivery_uses_configured_timeout(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = write_fake_git(tmp.path(), "#!/bin/sh\nif [ \"$1\" = rev-parse ]; then exit 0; fi\nif [ \"$2\" = --batch-check ]; then echo '1111111111111111111111111111111111111111 blob 524288'; exit 0; fi\nhead -c 524288 /dev/zero\n");
+        let mut state =
+            f4_state_with_repo(pool, tmp.path(), &fake, "z6blobdelivery", "repo", false).await;
+        let mut config = (*state.config).clone();
+        config.git_service_timeout_secs = 1;
+        state.config = Arc::new(config);
+        let response = blob_route_request_path(
+            state.clone(),
+            "z6blobdelivery",
+            "file.txt",
+            "203.0.113.31:5000",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state.git_blob_semaphore.available_permits(),
+            MAX_CONCURRENT_BLOB_READS - 1
+        );
+        // Keep the body alive without ever polling it; the timer must run anyway.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.git_blob_semaphore.available_permits() != MAX_CONCURRENT_BLOB_READS {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("configured deadline must release blob admission");
+        use http_body_util::BodyExt;
+        assert!(response.into_body().collect().await.is_err());
     }
 
     #[cfg(unix)]
