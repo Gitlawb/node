@@ -67,7 +67,7 @@ impl QueryRoot {
 
     /// Bounded visible repositories ordered by owner and name. Continue with
     /// endCursor while hasNextPage is true. Pages are not a database snapshot.
-    #[graphql(complexity = "50 + (limit.clamp(1, 200) as usize) * child_complexity")]
+    #[graphql(complexity = "50 + (limit.clamp(1, 200) as usize) + child_complexity")]
     async fn repos_page(
         &self,
         ctx: &Context<'_>,

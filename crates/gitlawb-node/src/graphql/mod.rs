@@ -401,6 +401,26 @@ mod tests {
         }
     }
 
+    #[sqlx::test]
+    async fn production_repos_page_serves_the_documented_maximum(pool: sqlx::PgPool) {
+        let db = Arc::new(Db::for_testing(pool));
+        db.run_migrations().await.unwrap();
+        let schema = production_test_schema_with_db(db);
+        for selection in [
+            "nodes { name }",
+            "nodes { name ownerDid } hasNextPage endCursor",
+        ] {
+            let response = schema
+                .execute(format!("{{ reposPage(limit: 200) {{ {selection} }} }}"))
+                .await;
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+            assert_eq!(
+                response.data.into_json().unwrap()["reposPage"]["nodes"],
+                serde_json::json!([])
+            );
+        }
+    }
+
     #[tokio::test]
     async fn seven_root_aliases_are_accepted() {
         struct Root(Arc<AtomicUsize>);
