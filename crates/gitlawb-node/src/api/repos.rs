@@ -3858,6 +3858,36 @@ mod tests {
 
     #[cfg(unix)]
     #[sqlx::test]
+    async fn blob_route_unreadable_pack_is_opaque_error(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = write_fake_git(tmp.path(), "#!/bin/sh\nif [ \"$1\" = rev-parse ]; then exit 0; fi\nread spec\necho \"$spec missing\"\n");
+        let state =
+            f4_state_with_repo(pool, tmp.path(), &fake, "z6blobunreadable", "repo", false).await;
+        let record = state
+            .db
+            .get_repo("z6blobunreadable", "repo")
+            .await
+            .unwrap()
+            .unwrap();
+        let path = state
+            .repo_store
+            .acquire(&record.owner_did, &record.name)
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink("removed-pack", path.join("objects/pack/unreadable.pack"))
+            .unwrap();
+        let response =
+            blob_route_request_path(state, "z6blobunreadable", "file.txt", "203.0.113.31:5000")
+                .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        use http_body_util::BodyExt;
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["message"], crate::error::INTERNAL_ERROR_MESSAGE);
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
     async fn blob_route_returns_200_with_expected_headers_and_content(pool: sqlx::PgPool) {
         use axum::http::{header, StatusCode};
         use http_body_util::BodyExt;

@@ -298,34 +298,8 @@ pub fn read_file_bounded(
     let refname = resolve_head_bounded(git_bin, repo_path, preferred_branch, deadline)?;
     let spec = format!("{refname}:{file_path}");
     let stdin = format!("{spec}\n");
-    let (status, stdout, stderr) = crate::git::visibility_pack::run_bounded_git_raw(
-        git_bin,
-        &["cat-file", "--batch-check"],
-        repo_path,
-        stdin.as_bytes(),
-        deadline,
-    )?;
-    if !status.success() {
-        bail!(
-            "git cat-file --batch-check failed: {}",
-            String::from_utf8_lossy(&stderr)
-        );
-    }
-
-    let stderr = String::from_utf8_lossy(&stderr);
-    if stderr
-        .lines()
-        .any(|line| line.starts_with("error:") || line.starts_with("fatal:"))
-    {
-        bail!("git cat-file --batch-check reported: {}", stderr.trim());
-    }
-
-    let output = String::from_utf8(stdout).context("git returned non-UTF-8 object metadata")?;
-    let mut lines = output.lines();
-    let line = lines.next().unwrap_or_default().trim();
-    if lines.next().is_some() {
-        bail!("git returned multiple object metadata records");
-    }
+    let output = blob_metadata_bounded(git_bin, repo_path, &spec, stdin.as_bytes(), deadline)?;
+    let line = output.trim();
     if line.split_whitespace().last() == Some("missing") {
         return Ok(BoundedFileRead::Missing);
     }
@@ -379,8 +353,70 @@ pub fn read_file_bounded(
             content.len()
         );
     }
-
     Ok(BoundedFileRead::Found(content))
+}
+
+fn blob_metadata_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    spec: &str,
+    stdin: &[u8],
+    deadline: std::time::Instant,
+) -> Result<String> {
+    let probe_started = std::time::Instant::now();
+    for attempt in 0..2 {
+        let (status, stdout, stderr) = crate::git::visibility_pack::run_bounded_git_raw(
+            git_bin,
+            &["cat-file", "--batch-check"],
+            repo_path,
+            stdin,
+            deadline,
+        )?;
+        if !status.success() {
+            bail!(
+                "git cat-file --batch-check failed: {}",
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+
+        let stderr = String::from_utf8_lossy(&stderr);
+        if stderr
+            .lines()
+            .any(|line| line.starts_with("error:") || line.starts_with("fatal:"))
+        {
+            bail!("git cat-file --batch-check reported: {}", stderr.trim());
+        }
+
+        let output = String::from_utf8(stdout).context("git returned non-UTF-8 object metadata")?;
+        let mut lines = output.lines();
+        let line = lines.next().unwrap_or_default().trim();
+        if lines.next().is_some() {
+            bail!("git returned multiple object metadata records");
+        }
+        if line.split_whitespace().last() == Some("missing") {
+            // A clean missing response also occurs for unreadable packs. Use the
+            // same out-of-band check as object_type_bounded, then confirm once.
+            let worktree_git = repo_path.join(".git");
+            let git_dir = if worktree_git.is_dir() {
+                worktree_git.as_path()
+            } else {
+                repo_path
+            };
+            if !object_store_readable(git_dir, spec) {
+                bail!("git cat-file inconclusive: object store not readable");
+            }
+            if attempt == 0 {
+                if deadline.saturating_duration_since(std::time::Instant::now())
+                    < probe_started.elapsed()
+                {
+                    return Err(crate::git::smart_http::GitServiceTimeout.into());
+                }
+                continue;
+            }
+        }
+        return Ok(output);
+    }
+    unreachable!("the confirming probe returns its result")
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1035,6 +1071,28 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
 
+    #[cfg(unix)]
+    fn write_blob_probe_fixture(dir: &Path, content: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        let script = dir.join("fakegit");
+        // Write in a child so parallel tests cannot inherit an open writable
+        // script descriptor when they fork (which would cause ETXTBSY).
+        let mut writer = Command::new("sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "fixture-writer"])
+            .arg(&script)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        writer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(content.as_bytes())
+            .unwrap();
+        assert!(writer.wait().unwrap().success());
+        script
+    }
+
     #[test]
     fn bounded_file_read_rejects_packed_blob_and_preserves_allowed_content() {
         let td = tempfile::TempDir::new().unwrap();
@@ -1080,6 +1138,82 @@ mod tests {
             )
             .unwrap(),
             super::BoundedFileRead::Found(content)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_file_read_confirms_missing_and_recovers_after_reprobe() {
+        for recover in [false, true] {
+            let td = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir(td.path().join("objects")).unwrap();
+            let oid = "a".repeat(40);
+            let script = write_blob_probe_fixture(
+                td.path(),
+                &format!(
+                    r#"#!/bin/sh
+if [ "$1" = rev-parse ]; then echo {oid}; exit 0; fi
+if [ "$2" = --batch-check ]; then
+  read spec
+  echo probe >> probes
+  if [ -f probed ] && [ "{recover}" = true ]; then echo '{oid} blob 5'; else echo "$spec missing"; fi
+  touch probed
+  exit 0
+fi
+if [ "$2" = blob ]; then printf hello; exit 0; fi
+exit 1
+"#
+                ),
+            );
+            let result = super::read_file_bounded(
+                script.to_str().unwrap(),
+                td.path(),
+                "main",
+                "hello.txt",
+                1024,
+                std::time::Instant::now() + std::time::Duration::from_secs(10),
+            )
+            .unwrap();
+            assert_eq!(
+                result,
+                if recover {
+                    super::BoundedFileRead::Found(b"hello".to_vec())
+                } else {
+                    super::BoundedFileRead::Missing
+                }
+            );
+            assert_eq!(
+                std::fs::read_to_string(td.path().join("probes"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_file_read_does_not_report_missing_for_unreadable_pack() {
+        use std::os::unix::fs::symlink;
+        let td = tempfile::TempDir::new().unwrap();
+        let pack = td.path().join("objects/pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        // A disappearing pack is unopenable even when CI runs as root.
+        symlink("removed-during-repack", pack.join("unreadable.pack")).unwrap();
+        let script = write_blob_probe_fixture(td.path(), "#!/bin/sh\nif [ \"$1\" = rev-parse ]; then exit 0; fi\nread spec\necho \"$spec missing\"\n");
+        let error = super::read_file_bounded(
+            script.to_str().unwrap(),
+            td.path(),
+            "main",
+            "hello.txt",
+            1024,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("object store not readable"),
+            "{error:#}"
         );
     }
 
