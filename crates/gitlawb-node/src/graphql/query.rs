@@ -3,9 +3,26 @@ use std::sync::Arc;
 
 use crate::db::Db;
 
-use super::types::{AgentTaskType, RefUpdateType, RepoType};
+use super::types::{AgentTaskReadType, RefUpdateType, RepoType, TaskPageType};
 
 pub struct QueryRoot;
+
+/// Debit the per-IP task-read brake for one task field, mirroring the
+/// `rate_limit_by_ip` layer on `task_read_routes`. Both surfaces run the same
+/// #268 visibility gate and pay the same queries before answering, so an
+/// anonymous prober must not get an unbraked lane by asking over GraphQL
+/// (#327 review).
+///
+/// A schema built without the brake (unit tests, subscriptions) is not braked,
+/// exactly as `rate_limit_by_ip` is a no-op without its extension.
+async fn task_read_brake(ctx: &Context<'_>, field: &str) -> Result<()> {
+    match ctx.data::<crate::rate_limit::TaskReadBrake>() {
+        Ok(brake) if !brake.check(field).await => Err(async_graphql::Error::new(
+            crate::rate_limit::RATE_LIMIT_MESSAGE,
+        )),
+        _ => Ok(()),
+    }
+}
 
 #[Object]
 impl QueryRoot {
@@ -112,29 +129,73 @@ impl QueryRoot {
         assignee_did: Option<String>,
         #[graphql(
             default = 50,
-            desc = "Max 200; larger requests are clamped to 200 (no error). Negative values clamp to 0."
+            desc = "Max 200; larger requests are clamped to 200 (no error). Negative values clamp to 0. Use `nextCursor` to read past the clamp."
         )]
         limit: i64,
-    ) -> Result<Vec<AgentTaskType>> {
+        #[graphql(
+            desc = "Opaque continuation token from a previous page's `nextCursor`. Must be presented with the same `status`/`assigneeDid` filter that issued it."
+        )]
+        cursor: Option<String>,
+    ) -> Result<TaskPageType> {
+        use crate::api::task_cursor::{self, TaskCursorKey, TaskFilter};
+
+        task_read_brake(ctx, "tasks").await?;
         let db = ctx.data_unchecked::<Arc<Db>>();
-        // Clamp before SQL: a negative LIMIT is a client fault that Postgres
-        // rejects with 2201W, which would otherwise trip the opaque DB path
-        // and write an error-level log on every probe (#250 review).
-        let limit = limit.clamp(0, 200);
-        let tasks = db
-            .list_tasks(status.as_deref(), assignee_did.as_deref(), limit)
-            .await
-            .map_err(crate::graphql::graphql_db_err)?;
-        Ok(tasks.into_iter().map(AgentTaskType::from).collect())
+        // #268: gate rows via the same collector the REST list route uses (like
+        // `ref_updates` shares `collect_visible_ref_updates` with its REST feed),
+        // so the two surfaces cannot drift. The collector clamps `limit` itself,
+        // including the negative-LIMIT case #250 called out for this resolver.
+        let caller = ctx
+            .data::<crate::auth::AuthenticatedDid>()
+            .ok()
+            .map(|d| d.0.as_str());
+        let key = ctx.data_unchecked::<TaskCursorKey>();
+        let filter = TaskFilter {
+            status: status.as_deref(),
+            assignee_did: assignee_did.as_deref(),
+        };
+        let resume = cursor
+            .as_deref()
+            .map(|token| task_cursor::decode(key, filter, caller, token))
+            .transpose()
+            .map_err(crate::graphql::graphql_app_err)?;
+        let result = crate::api::tasks::collect_visible_tasks(
+            db,
+            status.as_deref(),
+            assignee_did.as_deref(),
+            limit,
+            resume.as_ref(),
+            caller,
+        )
+        .await
+        .map_err(crate::graphql::graphql_app_err)?;
+        Ok(TaskPageType {
+            next_cursor: result
+                .next_position
+                .as_ref()
+                .map(|pos| task_cursor::encode(key, filter, caller, pos)),
+            items: result
+                .tasks
+                .into_iter()
+                .map(AgentTaskReadType::from)
+                .collect(),
+            has_more: result.has_more,
+            incomplete: result.incomplete,
+        })
     }
 
-    async fn task(&self, ctx: &Context<'_>, id: String) -> Result<Option<AgentTaskType>> {
+    async fn task(&self, ctx: &Context<'_>, id: String) -> Result<Option<AgentTaskReadType>> {
+        task_read_brake(ctx, "task").await?;
         let db = ctx.data_unchecked::<Arc<Db>>();
-        let t = db
-            .get_task(&id)
+        // #268: same gate as the REST get route, via the shared helper.
+        let caller = ctx
+            .data::<crate::auth::AuthenticatedDid>()
+            .ok()
+            .map(|d| d.0.as_str());
+        let t = crate::api::tasks::get_visible_task(db, &id, caller)
             .await
-            .map_err(crate::graphql::graphql_db_err)?;
-        Ok(t.map(AgentTaskType::from))
+            .map_err(crate::graphql::graphql_app_err)?;
+        Ok(t.map(AgentTaskReadType::from))
     }
 }
 
@@ -153,10 +214,14 @@ mod tests {
         Arc::new(db)
     }
 
+    fn cursor_key() -> crate::api::task_cursor::TaskCursorKey {
+        crate::api::task_cursor::TaskCursorKey::derive(&[42u8; 32])
+    }
+
     fn schema(db: Arc<Db>) -> super::super::GitlawbSchema {
         let (ref_tx, _) = tokio::sync::broadcast::channel(16);
         let (task_tx, _) = tokio::sync::broadcast::channel(16);
-        super::super::build_schema(db, ref_tx, task_tx)
+        super::super::build_schema(db, ref_tx, task_tx, cursor_key())
     }
 
     fn repo(id: &str, owner_did: &str, name: &str, is_public: bool) -> RepoRecord {
@@ -466,7 +531,7 @@ mod tests {
     async fn tasks_negative_limit_clamped(pool: PgPool) {
         let db = db(pool).await;
         let schema = schema(db);
-        let resp = anon(&schema, "{ tasks(limit: -1) { id } }").await;
+        let resp = anon(&schema, "{ tasks(limit: -1) { items { id } } }").await;
         assert!(
             resp.errors.is_empty(),
             "negative limit must clamp, not fail: {:?}",
@@ -500,18 +565,409 @@ mod tests {
             .unwrap();
         }
         let schema = schema(db);
-        let resp = anon(&schema, "{ tasks(limit: 5000) { id } }").await;
+        // Queried as the delegator, not anonymously: since #268 the task read
+        // surface is visibility-gated, and an anonymous caller sees none of
+        // these repo-less tasks at all. The clamp is what this test pins, so it
+        // needs a caller who can legitimately see all 201 rows.
+        let resp = authed(&schema, "{ tasks(limit: 5000) { items { id } } }", OWNER).await;
         assert_eq!(count_tasks(&resp), 200, "limit above 200 must clamp to 200");
     }
 
-    fn count_tasks(resp: &async_graphql::Response) -> usize {
+    /// Seed one repo-less task carrying a `ucan_token`, so a leak on any read
+    /// surface is visible in the response body.
+    async fn seed_task(db: &Db, id: &str, delegator: &str) {
+        let now = Utc::now().to_rfc3339();
+        db.create_task(&crate::db::AgentTask {
+            id: id.into(),
+            repo_id: None,
+            kind: "build".into(),
+            status: "pending".into(),
+            delegator_did: delegator.into(),
+            assignee_did: None,
+            capability: "repo:write".into(),
+            ucan_token: Some("SECRET-UCAN-TOKEN".into()),
+            payload: None,
+            result: None,
+            created_at: now.clone(),
+            updated_at: now,
+            deadline: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    /// #268: the `tasks` resolver must delegate to the gated collector, not
+    /// query the DB directly. A repo-less task belonging to someone else is
+    /// invisible to an anonymous caller. `tasks_negative_limit_clamped` cannot
+    /// catch a resolver that stops calling `collect_visible_tasks` because it
+    /// seeds no rows — this seeds one, so the gate is load-bearing here.
+    #[sqlx::test]
+    async fn tasks_repo_less_task_hidden_from_anon(pool: PgPool) {
+        let db = db(pool).await;
+        seed_task(&db, "t1", OWNER).await;
+        let schema = schema(db);
+        let resp = anon(&schema, "{ tasks { items { id } } }").await;
+        assert_eq!(
+            count_tasks(&resp),
+            0,
+            "anon must not enumerate another party's repo-less task"
+        );
+        assert!(
+            !format!("{:?}", resp.data).contains("SECRET-UCAN-TOKEN"),
+            "no ucan token may reach an anonymous caller"
+        );
+    }
+
+    /// #268 sibling for the single-task resolver: an invisible task reads as
+    /// `null`, indistinguishable from one that does not exist.
+    #[sqlx::test]
+    async fn task_by_id_is_null_for_anon(pool: PgPool) {
+        let db = db(pool).await;
+        seed_task(&db, "t1", OWNER).await;
+        let schema = schema(db);
+        let resp = anon(&schema, r#"{ task(id: "t1") { id } }"#).await;
         assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
         let async_graphql::Value::Object(obj) = &resp.data else {
             panic!("data not an object: {:?}", resp.data);
         };
-        let async_graphql::Value::List(rows) = obj.get("tasks").expect("tasks key") else {
-            panic!("tasks not a list");
+        assert_eq!(
+            obj.get("task"),
+            Some(&async_graphql::Value::Null),
+            "an invisible task must read as null, got {:?}",
+            obj.get("task")
+        );
+    }
+
+    /// #268: `ucanToken` is absent from the read type's schema entirely, so the
+    /// delegator cannot request it either. Asking for it is a validation error,
+    /// which pins the redaction at the schema level rather than per-resolver.
+    #[sqlx::test]
+    async fn task_read_schema_has_no_ucan_token_field(pool: PgPool) {
+        let db = db(pool).await;
+        seed_task(&db, "t1", OWNER).await;
+        let schema = schema(db);
+        let resp = authed(&schema, r#"{ task(id: "t1") { id ucanToken } }"#, OWNER).await;
+        assert!(
+            !resp.errors.is_empty(),
+            "ucanToken must not exist on the task read type"
+        );
+    }
+
+    #[sqlx::test]
+    async fn tasks_find_older_visible_row_behind_denied_window(pool: PgPool) {
+        let db = db(pool).await;
+        db.create_repo(&repo("public-repo", OWNER, "public", true))
+            .await
+            .unwrap();
+        let visible = crate::db::AgentTask {
+            id: "visible".into(),
+            repo_id: Some("public-repo".into()),
+            kind: "build".into(),
+            status: "pending".into(),
+            delegator_did: OWNER.into(),
+            assignee_did: None,
+            capability: "repo:write".into(),
+            ucan_token: None,
+            payload: None,
+            result: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            deadline: None,
         };
-        rows.len()
+        db.create_task(&visible).await.unwrap();
+        for i in 0..200 {
+            let mut hidden = visible.clone();
+            hidden.id = format!("hidden-{i:03}");
+            hidden.repo_id = None;
+            hidden.created_at = "2026-01-02T00:00:00Z".into();
+            hidden.updated_at = hidden.created_at.clone();
+            db.create_task(&hidden).await.unwrap();
+        }
+
+        let schema = schema(db);
+        let resp = anon(&schema, "{ tasks(limit: 1) { items { id } incomplete } }").await;
+        assert_eq!(count_tasks(&resp), 1);
+        assert!(!task_incomplete(&resp));
+        assert!(format!("{:?}", resp.data).contains("visible"));
+    }
+
+    /// The GraphQL surface must page past a denied window on server-issued
+    /// cursors alone, exactly as REST does (#327 review). Before this, the
+    /// only cursor a caller could hold named the last row they saw, so the
+    /// query stalled at `incomplete: true` forever and never reached
+    /// `past-ceiling`.
+    #[sqlx::test]
+    async fn tasks_page_past_candidate_ceiling_on_server_cursors(pool: PgPool) {
+        let db = db(pool).await;
+        db.create_repo(&repo("public-repo", OWNER, "public", true))
+            .await
+            .unwrap();
+        let visible_newer = crate::db::AgentTask {
+            id: "newer-visible".into(),
+            repo_id: Some("public-repo".into()),
+            kind: "build".into(),
+            status: "pending".into(),
+            delegator_did: OWNER.into(),
+            assignee_did: None,
+            capability: "repo:write".into(),
+            ucan_token: None,
+            payload: None,
+            result: None,
+            created_at: "2026-01-03T00:00:00Z".into(),
+            updated_at: "2026-01-03T00:00:00Z".into(),
+            deadline: None,
+        };
+        db.create_task(&visible_newer).await.unwrap();
+        for i in 0..1500 {
+            let mut hidden = visible_newer.clone();
+            hidden.id = format!("hidden-{i:04}");
+            hidden.repo_id = None;
+            hidden.created_at = "2026-01-02T00:00:00Z".into();
+            hidden.updated_at = hidden.created_at.clone();
+            db.create_task(&hidden).await.unwrap();
+        }
+
+        let mut visible_older = visible_newer.clone();
+        visible_older.id = "past-ceiling".into();
+        visible_older.created_at = "2026-01-01T00:00:00Z".into();
+        visible_older.updated_at = visible_older.created_at.clone();
+        db.create_task(&visible_older).await.unwrap();
+
+        let schema = schema(db);
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for request in 0..10 {
+            let query = match &cursor {
+                Some(c) => format!(
+                    r#"{{ tasks(limit: 1, cursor: "{c}") {{ items {{ id }} hasMore incomplete nextCursor }} }}"#
+                ),
+                None => {
+                    "{ tasks(limit: 1) { items { id } hasMore incomplete nextCursor } }".to_string()
+                }
+            };
+            let resp = anon(&schema, &query).await;
+            let rendered = format!("{:?}", resp.data);
+            assert!(
+                !rendered.contains("hidden-"),
+                "request {request} disclosed a denied row: {rendered}"
+            );
+            for item in task_items(&resp) {
+                let async_graphql::Value::Object(row) = item else {
+                    panic!("task item not an object");
+                };
+                seen.push(row.get("id").unwrap().to_string().replace('"', ""));
+            }
+            // Short page with more behind it is the scan wall, and says so.
+            if task_page_bool(&resp, "hasMore") && task_items(&resp).is_empty() {
+                assert!(
+                    task_incomplete(&resp),
+                    "request {request}: an empty page with rows behind it is a paused scan"
+                );
+            }
+            match task_page_cursor(&resp) {
+                Some(c) => cursor = Some(c),
+                None => {
+                    assert!(!task_page_bool(&resp, "hasMore"));
+                    assert!(!task_incomplete(&resp));
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            seen,
+            vec!["newer-visible".to_string(), "past-ceiling".to_string()],
+            "both visible rows must be reachable using only server-issued cursors"
+        );
+    }
+
+    /// REST and GraphQL mint the same tokens from the same node key, so a
+    /// cursor must not be usable against a filter it was not issued for, and
+    /// must render the same single rejection every other bad cursor renders.
+    #[sqlx::test]
+    async fn tasks_rejects_unusable_cursor(pool: PgPool) {
+        use crate::api::task_cursor::{self, TaskFilter, TaskPosition};
+
+        let db = db(pool).await;
+        let schema = schema(db);
+
+        let wrong_filter = task_cursor::encode(
+            &cursor_key(),
+            TaskFilter {
+                status: Some("pending"),
+                assignee_did: None,
+            },
+            None,
+            &TaskPosition::new("2026-01-01T00:00:00Z", "t1"),
+        );
+        let foreign = task_cursor::encode(
+            &crate::api::task_cursor::TaskCursorKey::derive(&[9u8; 32]),
+            TaskFilter {
+                status: None,
+                assignee_did: None,
+            },
+            None,
+            &TaskPosition::new("2026-01-01T00:00:00Z", "t1"),
+        );
+
+        for (label, query) in [
+            (
+                "garbage",
+                r#"{ tasks(cursor: "not-a-cursor") { items { id } } }"#.to_string(),
+            ),
+            (
+                "another node's key",
+                format!(r#"{{ tasks(cursor: "{foreign}") {{ items {{ id }} }} }}"#),
+            ),
+            (
+                "different filter",
+                format!(r#"{{ tasks(cursor: "{wrong_filter}") {{ items {{ id }} }} }}"#),
+            ),
+        ] {
+            let resp = anon(&schema, &query).await;
+            assert_eq!(
+                resp.errors.len(),
+                1,
+                "{label}: must be rejected, not treated as page one"
+            );
+            assert!(
+                resp.errors[0].message.contains("invalid or expired cursor"),
+                "{label}: unexpected message {:?}",
+                resp.errors[0].message
+            );
+        }
+
+        let resp = anon(
+            &schema,
+            &format!(
+                r#"{{ tasks(status: "pending", cursor: "{wrong_filter}") {{ items {{ id }} }} }}"#
+            ),
+        )
+        .await;
+        assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
+    }
+
+    #[sqlx::test]
+    async fn tasks_anonymous_denial_hides_repoless_task_and_leaks_no_token(pool: PgPool) {
+        let db = db(pool).await;
+        let task = crate::db::AgentTask {
+            id: "t1".into(),
+            repo_id: None,
+            kind: "code-review".into(),
+            status: "pending".into(),
+            delegator_did: "did:key:z6MkDelegator".into(),
+            assignee_did: None,
+            capability: "agent:task".into(),
+            ucan_token: Some("secret-ucan-token".into()),
+            payload: Some("payload".into()),
+            result: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            deadline: None,
+        };
+        db.create_task(&task).await.unwrap();
+
+        let schema = schema(db);
+        let query = "{ tasks { items { id } } }";
+        let resp = anon(&schema, query).await;
+        assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
+        assert_eq!(count_tasks(&resp), 0);
+        let rendered = format!("{:?}", resp.data);
+        assert!(!rendered.contains("secret-ucan-token"));
+    }
+
+    #[sqlx::test]
+    async fn task_anonymous_denial_returns_null_and_leaks_no_token(pool: PgPool) {
+        let db = db(pool).await;
+        let task = crate::db::AgentTask {
+            id: "t1".into(),
+            repo_id: None,
+            kind: "code-review".into(),
+            status: "pending".into(),
+            delegator_did: "did:key:z6MkDelegator".into(),
+            assignee_did: None,
+            capability: "agent:task".into(),
+            ucan_token: Some("secret-ucan-token".into()),
+            payload: Some("payload".into()),
+            result: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            deadline: None,
+        };
+        db.create_task(&task).await.unwrap();
+
+        let schema = schema(db);
+        let query = r#"{ task(id: "t1") { id } }"#;
+        let resp = anon(&schema, query).await;
+        assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
+        let async_graphql::Value::Object(obj) = &resp.data else {
+            panic!("data not an object: {:?}", resp.data);
+        };
+        assert_eq!(obj.get("task"), Some(&async_graphql::Value::Null));
+        let rendered = format!("{:?}", resp.data);
+        assert!(!rendered.contains("secret-ucan-token"));
+    }
+
+    fn task_page_bool(resp: &async_graphql::Response, field: &str) -> bool {
+        assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
+        let async_graphql::Value::Object(obj) = &resp.data else {
+            panic!("data not an object: {:?}", resp.data);
+        };
+        let async_graphql::Value::Object(page) = obj.get("tasks").expect("tasks key") else {
+            panic!("tasks not an object");
+        };
+        let async_graphql::Value::Boolean(value) = page.get(field).expect("field present") else {
+            panic!("{field} not a bool");
+        };
+        *value
+    }
+
+    fn task_page_cursor(resp: &async_graphql::Response) -> Option<String> {
+        assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
+        let async_graphql::Value::Object(obj) = &resp.data else {
+            panic!("data not an object: {:?}", resp.data);
+        };
+        let async_graphql::Value::Object(page) = obj.get("tasks").expect("tasks key") else {
+            panic!("tasks not an object");
+        };
+        match page.get("nextCursor").expect("nextCursor key") {
+            async_graphql::Value::Null => None,
+            async_graphql::Value::String(c) => Some(c.clone()),
+            other => panic!("nextCursor not a string: {other:?}"),
+        }
+    }
+
+    fn task_items(resp: &async_graphql::Response) -> &Vec<async_graphql::Value> {
+        assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
+        let async_graphql::Value::Object(obj) = &resp.data else {
+            panic!("data not an object: {:?}", resp.data);
+        };
+        let async_graphql::Value::Object(page) = obj.get("tasks").expect("tasks key") else {
+            panic!("tasks not an object");
+        };
+        let async_graphql::Value::List(rows) = page.get("items").expect("items key") else {
+            panic!("items not a list");
+        };
+        rows
+    }
+
+    fn count_tasks(resp: &async_graphql::Response) -> usize {
+        task_items(resp).len()
+    }
+
+    fn task_incomplete(resp: &async_graphql::Response) -> bool {
+        assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
+        let async_graphql::Value::Object(obj) = &resp.data else {
+            panic!("data not an object: {:?}", resp.data);
+        };
+        let async_graphql::Value::Object(page) = obj.get("tasks").expect("tasks key") else {
+            panic!("tasks not an object");
+        };
+        let async_graphql::Value::Boolean(incomplete) =
+            page.get("incomplete").expect("incomplete key")
+        else {
+            panic!("incomplete not a bool");
+        };
+        *incomplete
     }
 }

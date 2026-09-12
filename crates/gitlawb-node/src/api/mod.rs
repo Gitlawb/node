@@ -22,6 +22,7 @@ pub mod replicas;
 pub mod repos;
 pub mod resolve;
 pub mod stars;
+pub mod task_cursor;
 pub mod tasks;
 pub mod visibility;
 pub mod webhooks;

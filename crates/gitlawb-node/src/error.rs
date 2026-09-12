@@ -12,6 +12,9 @@ pub enum AppError {
     #[error("repo already exists: {0}")]
     RepoExists(String),
 
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     #[error("not found: {0}")]
     NotFound(String),
 
@@ -156,6 +159,7 @@ impl IntoResponse for AppError {
                 "repo_exists",
                 format!("repository '{r}' already exists"),
             ),
+            AppError::Conflict(msg) => (StatusCode::CONFLICT, "conflict", msg.clone()),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "not_found", msg.clone()),
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "not_an_agent", msg.clone()),
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg.clone()),
@@ -260,6 +264,16 @@ pub type Result<T> = std::result::Result<T, AppError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conflict_maps_to_409() {
+        assert_eq!(
+            AppError::Conflict("task not claimable".into())
+                .into_response()
+                .status(),
+            StatusCode::CONFLICT
+        );
+    }
 
     #[test]
     fn timeout_maps_to_504_distinct_from_git_500() {

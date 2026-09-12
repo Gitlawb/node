@@ -497,10 +497,12 @@ mod tests {
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
             .expect("lazy pool creation should not fail");
         let db = Arc::new(crate::db::Db::for_testing(pool.clone()));
+        let task_cursor_key = crate::api::task_cursor::TaskCursorKey::derive(&keypair.to_seed());
         let schema = Arc::new(graphql::build_schema(
             db.clone(),
             ref_tx.clone(),
             task_tx.clone(),
+            task_cursor_key.clone(),
         ));
         crate::state::AppState {
             config: Arc::new(Config::parse_from(["gitlawb-node"])),
@@ -512,6 +514,7 @@ mod tests {
             ref_update_tx: ref_tx,
             task_event_tx: task_tx,
             graphql_schema: schema,
+            task_cursor_key,
             machine_id: None,
             repo_store: crate::git::repo_store::RepoStore::for_testing(PathBuf::from("/tmp"), pool),
             rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
@@ -545,6 +548,7 @@ mod tests {
             git_ipfs_walk_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             git_ipfs_walk_per_caller:
                 crate::rate_limit::PerCallerConcurrency::with_default_max_keys(16),
+            task_read_rate_limiter: RateLimiter::new(1200, Duration::from_secs(3600)),
             git_bin: "git".to_string(),
         }
     }
