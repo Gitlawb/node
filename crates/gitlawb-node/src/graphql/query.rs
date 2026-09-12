@@ -274,11 +274,13 @@ mod tests {
     #[sqlx::test]
     async fn repos_legacy_accepts_exactly_the_visible_bound(pool: PgPool) {
         let db = db(pool).await;
+        let base_time = Utc::now();
         for index in 0..crate::db::MAX_VISIBLE_REPO_PAGE_SIZE {
             let name = format!("repo-{index:03}");
-            db.create_repo(&repo(&name, OWNER, &name, true))
-                .await
-                .unwrap();
+            let mut r = repo(&name, OWNER, &name, true);
+            // Distinct timestamps: repo-000 is oldest, repo-199 is newest.
+            r.updated_at = base_time + chrono::Duration::seconds(index as i64);
+            db.create_repo(&r).await.unwrap();
         }
         db.create_repo(&repo("hidden", OWNER, "hidden", false))
             .await
@@ -294,6 +296,70 @@ mod tests {
         assert!(
             !names.contains(&"hidden"),
             "hidden repo must be excluded from legacy repos response"
+        );
+        let expected_names: Vec<String> = (0..crate::db::MAX_VISIBLE_REPO_PAGE_SIZE)
+            .rev()
+            .map(|index| format!("repo-{index:03}"))
+            .collect();
+        assert_eq!(
+            names,
+            expected_names
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>(),
+            "legacy repos must retain activity ordering (most recently updated first)"
+        );
+    }
+
+    #[sqlx::test]
+    async fn repos_page_pagination_crosses_owner_boundary(pool: PgPool) {
+        let db = db(pool).await;
+        let owner1 = "did:key:z6MkaOwner1";
+        let owner2 = "did:key:z6MkbOwner2";
+        db.create_repo(&repo("r1", owner1, "a-repo", true))
+            .await
+            .unwrap();
+        db.create_repo(&repo("r2", owner1, "b-repo", true))
+            .await
+            .unwrap();
+        db.create_repo(&repo("r3", owner2, "c-repo", true))
+            .await
+            .unwrap();
+        db.create_repo(&repo("r4", owner2, "d-repo", true))
+            .await
+            .unwrap();
+
+        let schema = schema(db);
+        let page1_resp = anon(
+            &schema,
+            "{ reposPage(limit: 2) { nodes { name ownerDid } hasNextPage endCursor } }",
+        )
+        .await;
+        assert!(page1_resp.errors.is_empty(), "{:?}", page1_resp.errors);
+        let p1 = page1_resp.data.into_json().unwrap()["reposPage"].clone();
+        assert_eq!(p1["hasNextPage"], true);
+        assert_eq!(
+            p1["nodes"],
+            serde_json::json!([
+                {"name": "a-repo", "ownerDid": owner1},
+                {"name": "b-repo", "ownerDid": owner1},
+            ])
+        );
+        let cursor = p1["endCursor"].as_str().unwrap();
+
+        let page2_query = format!(
+            "{{ reposPage(limit: 2, after: \"{cursor}\") {{ nodes {{ name ownerDid }} hasNextPage endCursor }} }}"
+        );
+        let page2_resp = anon(&schema, &page2_query).await;
+        assert!(page2_resp.errors.is_empty(), "{:?}", page2_resp.errors);
+        let p2 = page2_resp.data.into_json().unwrap()["reposPage"].clone();
+        assert_eq!(p2["hasNextPage"], false);
+        assert_eq!(
+            p2["nodes"],
+            serde_json::json!([
+                {"name": "c-repo", "ownerDid": owner2},
+                {"name": "d-repo", "ownerDid": owner2},
+            ])
         );
     }
 

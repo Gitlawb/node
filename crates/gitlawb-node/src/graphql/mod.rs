@@ -18,8 +18,9 @@ pub type GitlawbSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
 // bounding validation work and the number of resolver selections per request.
 const GRAPHQL_MAX_COMPLEXITY: usize = 400;
 // The current public schema is shallow; this leaves headroom for composed
-// clients without allowing recursively nested documents to grow unchecked.
-const GRAPHQL_MAX_DEPTH: usize = 12;
+// clients and the canonical getIntrospectionQuery without allowing
+// recursively nested documents to grow unchecked.
+const GRAPHQL_MAX_DEPTH: usize = 14;
 
 fn apply_query_limits<Query, Mutation, Subscription>(
     builder: SchemaBuilder<Query, Mutation, Subscription>,
@@ -465,36 +466,174 @@ mod tests {
 
     #[tokio::test]
     async fn ordinary_schema_introspection_remains_available() {
-        let schema =
-            apply_query_limits(Schema::build(QueryRoot, EmptyMutation, EmptySubscription)).finish();
-        let response = schema
-            .execute(
-                r#"
-                query IntrospectionQuery {
-                    __schema {
-                        queryType {
-                            name
-                            fields {
-                                name
-                                type {
-                                    kind
-                                    name
-                                    ofType { kind name }
-                                }
-                            }
-                        }
-                    }
+        let schema = production_test_schema();
+        let canonical_introspection = r#"
+            query IntrospectionQuery {
+              __schema {
+                queryType { name }
+                mutationType { name }
+                subscriptionType { name }
+                types {
+                  ...FullType
                 }
-                "#,
-            )
-            .await;
+                directives {
+                  name
+                  description
+                  locations
+                  args {
+                    ...InputValue
+                  }
+                }
+              }
+            }
 
+            fragment FullType on __Type {
+              kind
+              name
+              description
+              fields(includeDeprecated: true) {
+                name
+                description
+                args {
+                  ...InputValue
+                }
+                type {
+                  ...TypeRef
+                }
+                isDeprecated
+                deprecationReason
+              }
+              inputFields {
+                ...InputValue
+              }
+              interfaces {
+                ...TypeRef
+              }
+              enumValues(includeDeprecated: true) {
+                name
+                description
+                isDeprecated
+                deprecationReason
+              }
+              possibleTypes {
+                ...TypeRef
+              }
+            }
+
+            fragment InputValue on __InputValue {
+              name
+              description
+              type { ...TypeRef }
+              defaultValue
+            }
+
+            fragment TypeRef on __Type {
+              kind
+              name
+              ofType {
+                kind
+                name
+                ofType {
+                  kind
+                  name
+                  ofType {
+                    kind
+                    name
+                    ofType {
+                      kind
+                      name
+                      ofType {
+                        kind
+                        name
+                        ofType {
+                          kind
+                          name
+                          ofType {
+                            kind
+                            name
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+        "#;
+        let response = schema.execute(canonical_introspection).await;
         assert!(
             response.errors.is_empty(),
-            "graphql errors: {:?}",
+            "canonical introspection query failed against production schema: {:?}",
             response.errors
         );
         assert_ne!(response.data, Value::Null);
+    }
+
+    #[tokio::test]
+    async fn ref_updates_and_tasks_single_alias_max_limit_complexity_contract() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        pool.close().await;
+        let (ref_tx, _) = tokio::sync::broadcast::channel(16);
+        let (task_tx, _) = tokio::sync::broadcast::channel(16);
+        let schema = build_schema(Arc::new(Db::for_testing(pool)), ref_tx, task_tx);
+
+        // refUpdates(limit: 200):
+        // Single-field selection has child_complexity 1 -> cost 50 + 200 * 1 = 250 <= 400.
+        // It passes validation and reaches the resolver (which yields db error on lazy pool).
+        let single_ref = schema.execute("{ refUpdates(limit: 200) { repo } }").await;
+        assert!(
+            !single_ref
+                .errors
+                .iter()
+                .any(|e| e.message == "Query is too complex."),
+            "single-field refUpdates at max limit 200 must pass complexity validation: {:?}",
+            single_ref.errors
+        );
+        assert!(
+            single_ref
+                .errors
+                .iter()
+                .any(|e| e.message == GRAPHQL_DB_ERROR_MESSAGE),
+            "single-field refUpdates at max limit 200 must reach the resolver: {:?}",
+            single_ref.errors
+        );
+
+        // Two-field selection has child_complexity 2 -> cost 50 + 200 * 2 = 450 > 400 (rejected before resolver).
+        let multi_ref = schema
+            .execute("{ refUpdates(limit: 200) { repo refName } }")
+            .await;
+        assert_eq!(multi_ref.data, async_graphql::Value::Null);
+        assert_eq!(multi_ref.errors.len(), 1);
+        assert_eq!(multi_ref.errors[0].message, "Query is too complex.");
+
+        // tasks(limit: 200):
+        // Single-field selection has child_complexity 1 -> cost 50 + 200 * 1 = 250 <= 400.
+        // It passes validation and reaches the resolver.
+        let single_task = schema.execute("{ tasks(limit: 200) { id } }").await;
+        assert!(
+            !single_task
+                .errors
+                .iter()
+                .any(|e| e.message == "Query is too complex."),
+            "single-field tasks at max limit 200 must pass complexity validation: {:?}",
+            single_task.errors
+        );
+        assert!(
+            single_task
+                .errors
+                .iter()
+                .any(|e| e.message == GRAPHQL_DB_ERROR_MESSAGE),
+            "single-field tasks at max limit 200 must reach the resolver: {:?}",
+            single_task.errors
+        );
+
+        // Two-field selection has child_complexity 2 -> cost 50 + 200 * 2 = 450 > 400 (rejected before resolver).
+        let multi_task = schema.execute("{ tasks(limit: 200) { id status } }").await;
+        assert_eq!(multi_task.data, async_graphql::Value::Null);
+        assert_eq!(multi_task.errors.len(), 1);
+        assert_eq!(multi_task.errors[0].message, "Query is too complex.");
     }
 
     #[derive(Clone, Copy)]
@@ -522,7 +661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_depth_limit_accepts_twelve_and_rejects_thirteen() {
+    async fn query_depth_limit_accepts_fourteen_and_rejects_fifteen() {
         let calls = Arc::new(AtomicUsize::new(0));
         let schema = apply_query_limits(Schema::build(
             CountingQuery(Arc::clone(&calls)),
@@ -557,22 +696,22 @@ mod tests {
     #[tokio::test]
     async fn production_schema_enforces_depth_limit() {
         let schema = production_test_schema();
-        // Depth 12 is accepted through the production build_schema path.
-        let of_types_12 = (0..7).fold("name".to_string(), |acc, _| format!("ofType {{ {acc} }}"));
-        let query_12 =
-            format!("{{ __schema {{ types {{ fields {{ type {{ {of_types_12} }} }} }} }} }}");
-        let accepted = schema.execute(&query_12).await;
+        // Depth 14 is accepted through the production build_schema path.
+        let of_types_14 = (0..9).fold("name".to_string(), |acc, _| format!("ofType {{ {acc} }}"));
+        let query_14 =
+            format!("{{ __schema {{ types {{ fields {{ type {{ {of_types_14} }} }} }} }} }}");
+        let accepted = schema.execute(&query_14).await;
         assert!(accepted.errors.is_empty(), "{:?}", accepted.errors);
 
-        // Construct an introspection query of depth 13 using __schema.
+        // Construct an introspection query of depth 15 using __schema.
         // 1: __schema
         // 2: types
         // 3: fields
         // 4: type
-        // 5..12: ofType (8 times)
-        // 13: name
-        // Total depth = 13 > GRAPHQL_MAX_DEPTH (12).
-        let of_types = (0..8).fold("name".to_string(), |acc, _| format!("ofType {{ {acc} }}"));
+        // 5..14: ofType (10 times)
+        // 15: name
+        // Total depth = 15 > GRAPHQL_MAX_DEPTH (14).
+        let of_types = (0..10).fold("name".to_string(), |acc, _| format!("ofType {{ {acc} }}"));
         let query = format!("{{ __schema {{ types {{ fields {{ type {{ {of_types} }} }} }} }} }}");
 
         let rejected = schema.execute(&query).await;
