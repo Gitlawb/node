@@ -6658,6 +6658,7 @@ mod scoped_repo_lookup_plan_tests {
     fn assert_scoped_repo_plan(plan: &Value, mode: &str) {
         let mut saw_seqscan = false;
         let mut saw_index = false;
+        let mut discarded = 0.0_f64;
         plan_walk(plan, &mut |node| {
             let node_type = node.get("Node Type").and_then(Value::as_str).unwrap_or("");
             let relation = node
@@ -6670,11 +6671,38 @@ mod scoped_repo_lookup_plan_tests {
             if node_type.contains("Index") && relation == "repos" {
                 saw_index = true;
             }
+            discarded += node
+                .get("Rows Removed by Filter")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                * node
+                    .get("Actual Loops")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(1.0);
         });
         assert!(
             saw_index && !saw_seqscan,
             "{mode}: scoped repo lookup must use index scans on repos, not sequential scans over all repos: {plan}"
         );
+        assert!(
+            discarded < 100.0,
+            "{mode}: scoped lookup discarded unrelated rows: {discarded}: {plan}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "discarded unrelated rows")]
+    fn scoped_plan_rejects_the_previous_full_index_scan() {
+        // The previous membership filter used the right index but discarded
+        // every unrelated row. Pin that observed plan shape, not just Seq Scan.
+        let plan = serde_json::json!({
+            "Node Type": "Index Scan",
+            "Relation Name": "repos",
+            "Index Name": "idx_repos_owner_key_name",
+            "Rows Removed by Filter": 3999,
+            "Actual Loops": 1
+        });
+        assert_scoped_repo_plan(&plan, "previous-plan");
     }
 
     async fn seed_populated_repos(pool: &PgPool) {
@@ -6718,10 +6746,24 @@ mod scoped_repo_lookup_plan_tests {
                 .await
                 .unwrap();
         }
-        let sql = format!("EXPLAIN (FORMAT JSON) {}", Db::scoped_dedup_sql());
-        let explained = sqlx::query_scalar::<_, Value>(&sql)
-            .bind(&["repo-plan-1".to_string()][..])
+        // EXPLAIN of a literal SELECT does not exercise the prepared-plan cache.
+        let sql = format!(
+            "PREPARE scoped_repo_plan(text[]) AS {}",
+            Db::scoped_dedup_sql()
+        );
+        sqlx::query(&sql).execute(&mut *conn).await.unwrap();
+        let explained = sqlx::query_scalar::<_, Value>(
+            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE scoped_repo_plan(ARRAY['repo-plan-1']::text[])"
+        )
             .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        let counters: (i64, i64) = sqlx::query_as(
+            "SELECT generic_plans, custom_plans FROM pg_prepared_statements WHERE name = 'scoped_repo_plan'"
+        ).fetch_one(&mut *conn).await.unwrap();
+        assert_eq!(counters, if force_generic { (1, 0) } else { (0, 1) });
+        sqlx::query("DEALLOCATE scoped_repo_plan")
+            .execute(&mut *conn)
             .await
             .unwrap();
         sqlx::query("RESET plan_cache_mode")
