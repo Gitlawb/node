@@ -6,6 +6,9 @@ use std::time::Duration;
 use tracing::info;
 use uuid::Uuid;
 
+/// Maximum visible repositories per page, plus one internal look-ahead row.
+pub(crate) const MAX_VISIBLE_REPO_PAGE_SIZE: usize = 200;
+
 // ── Public data types ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1537,6 +1540,57 @@ impl Db {
             .fetch_all(&self.pool)
             .await?;
 
+        Ok(rows.into_iter().map(row_to_repo).collect())
+    }
+
+    /// A bounded, mirror-deduplicated page ordered by owner key and repository
+    /// name. Apply root visibility before LIMIT: private rows must not consume
+    /// page slots or influence continuation metadata. The root-rule predicate
+    /// mirrors `visibility::listable_at_root`; a differential test pins it.
+    /// Cursors only select a position and never confer read authority.
+    pub async fn list_visible_repos_page(
+        &self,
+        caller: Option<&str>,
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<RepoRecord>> {
+        let sql = format!(
+            "{}
+             SELECT d.id, d.name, d.owner_did, d.description, d.is_public,
+                 d.default_branch, d.created_at, d.updated_at, d.disk_path,
+                 d.forked_from, d.machine_id
+             FROM deduped d
+             LEFT JOIN LATERAL (
+                 SELECT reader_dids FROM visibility_rules v
+                 WHERE v.repo_id = d.id AND v.path_glob ~ '^/*([*][*])*$'
+                 ORDER BY v.path_glob DESC LIMIT 1
+             ) root_rule ON TRUE
+             WHERE (
+                 ($2::text IS NOT NULL AND ({key}) = $2)
+                 OR CASE WHEN root_rule.reader_dids IS NULL THEN d.is_public
+                    WHEN jsonb_typeof(root_rule.reader_dids::jsonb) = 'array' THEN
+                        COALESCE(root_rule.reader_dids::jsonb ? $3::text, FALSE)
+                        AND NOT EXISTS (
+                            SELECT 1 FROM jsonb_array_elements(root_rule.reader_dids::jsonb) reader
+                            WHERE jsonb_typeof(reader) <> 'string'
+                        )
+                    ELSE FALSE END
+             )
+             AND ($4::text IS NULL OR (({key}), d.name) > ($4, $5::text))
+             ORDER BY ({key}), d.name
+             LIMIT $6",
+            Self::dedup_cte(),
+            key = OWNER_KEY_CASE_SQL,
+        );
+        let rows = sqlx::query(&sql)
+            .bind(None::<&str>)
+            .bind(caller.map(normalize_owner_key))
+            .bind(caller)
+            .bind(after.map(|(owner, _)| normalize_owner_key(owner)))
+            .bind(after.map(|(_, name)| name))
+            .bind(limit.min(MAX_VISIBLE_REPO_PAGE_SIZE + 1) as i64)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows.into_iter().map(row_to_repo).collect())
     }
 

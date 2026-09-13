@@ -22,6 +22,7 @@ pub struct MutationRoot;
 
 #[Object]
 impl MutationRoot {
+    #[graphql(complexity = "50 + child_complexity")]
     async fn create_task(
         &self,
         ctx: &Context<'_>,
@@ -58,6 +59,7 @@ impl MutationRoot {
         Ok(AgentTaskType::from(task))
     }
 
+    #[graphql(complexity = "50 + child_complexity")]
     async fn claim_task(
         &self,
         ctx: &Context<'_>,
@@ -87,6 +89,7 @@ impl MutationRoot {
         Ok(AgentTaskType::from(task))
     }
 
+    #[graphql(complexity = "50 + child_complexity")]
     async fn complete_task(
         &self,
         ctx: &Context<'_>,
@@ -129,6 +132,7 @@ impl MutationRoot {
         Ok(AgentTaskType::from(task))
     }
 
+    #[graphql(complexity = "50 + child_complexity")]
     async fn fail_task(
         &self,
         ctx: &Context<'_>,

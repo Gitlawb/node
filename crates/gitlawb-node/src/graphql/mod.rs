@@ -3,7 +3,7 @@ pub mod query;
 pub mod subscription;
 pub mod types;
 
-use async_graphql::Schema;
+use async_graphql::{Schema, SchemaBuilder};
 use std::sync::Arc;
 
 use crate::db::Db;
@@ -13,6 +13,22 @@ use query::QueryRoot;
 use subscription::SubscriptionRoot;
 
 pub type GitlawbSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
+
+// Keep ordinary schema discovery and application queries usable while
+// bounding validation work and the number of resolver selections per request.
+const GRAPHQL_MAX_COMPLEXITY: usize = 400;
+// The current public schema is shallow; this leaves headroom for composed
+// clients and the canonical getIntrospectionQuery without allowing
+// recursively nested documents to grow unchecked.
+const GRAPHQL_MAX_DEPTH: usize = 14;
+
+fn apply_query_limits<Query, Mutation, Subscription>(
+    builder: SchemaBuilder<Query, Mutation, Subscription>,
+) -> SchemaBuilder<Query, Mutation, Subscription> {
+    builder
+        .limit_complexity(GRAPHQL_MAX_COMPLEXITY)
+        .limit_depth(GRAPHQL_MAX_DEPTH)
+}
 
 /// Client-facing message for GraphQL resolver failures that wrap a real
 /// `sqlx::Error`. The real error is logged server-side; never put sqlx/Postgres
@@ -81,7 +97,7 @@ pub fn build_schema(
     ref_update_tx: tokio::sync::broadcast::Sender<RefUpdateBroadcast>,
     task_event_tx: tokio::sync::broadcast::Sender<TaskEventBroadcast>,
 ) -> GitlawbSchema {
-    Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
+    apply_query_limits(Schema::build(QueryRoot, MutationRoot, SubscriptionRoot))
         .data(db)
         .data(ref_update_tx)
         .data(task_event_tx)
@@ -91,6 +107,8 @@ pub fn build_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_graphql::{EmptyMutation, EmptySubscription, Object, Value};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn graphql_db_err_opaques_sqlx_chain() {
@@ -158,6 +176,548 @@ mod tests {
         assert_eq!(err.message, GRAPHQL_DB_ERROR_MESSAGE);
         assert!(!err.message.contains(path));
         assert!(!err.message.contains("failed to open"));
+    }
+
+    fn production_test_schema() -> GitlawbSchema {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        production_test_schema_with_db(Arc::new(Db::for_testing(pool)))
+    }
+
+    fn production_test_schema_with_db(db: Arc<Db>) -> GitlawbSchema {
+        build_schema(
+            db,
+            tokio::sync::broadcast::channel(1).0,
+            tokio::sync::broadcast::channel(1).0,
+        )
+    }
+
+    #[tokio::test]
+    async fn ref_update_subscription_alias_budget() {
+        assert_subscription_alias_budget("refUpdates { repo }").await;
+    }
+
+    #[tokio::test]
+    async fn task_event_subscription_alias_budget() {
+        assert_subscription_alias_budget("taskEvents { taskId }").await;
+    }
+
+    async fn assert_subscription_alias_budget(field: &str) {
+        use futures::StreamExt;
+        use std::time::Duration;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        let (ref_tx, _) = tokio::sync::broadcast::channel(16);
+        let (task_tx, _) = tokio::sync::broadcast::channel(16);
+        let schema = build_schema(
+            Arc::new(Db::for_testing(pool)),
+            ref_tx.clone(),
+            task_tx.clone(),
+        );
+        for count in [7, 8] {
+            let fields = (0..count)
+                .map(|n| format!("r{n}: {field}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let query = format!("subscription {{ {fields} }}");
+            let mut responses = Box::pin(schema.execute_stream(query));
+            if count == 8 {
+                let response = tokio::time::timeout(Duration::from_secs(1), responses.next())
+                    .await
+                    .expect("over-budget subscriptions must reject before waiting for events")
+                    .expect("the validation error must be returned");
+                assert_eq!(response.errors.len(), 1);
+                assert_eq!(response.errors[0].message, "Query is too complex.");
+                assert_eq!(ref_tx.receiver_count() + task_tx.receiver_count(), 0);
+                continue;
+            }
+            // Poll the accepted operation far enough to register its receivers.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), responses.next())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(ref_tx.receiver_count() + task_tx.receiver_count(), 7);
+            let _ = ref_tx.send(RefUpdateBroadcast {
+                repo: "owner/repo".into(),
+                ref_name: "refs/heads/main".into(),
+                old_sha: "0".repeat(40),
+                new_sha: "1".repeat(40),
+                pusher_did: "did:key:test".into(),
+                node_did: "did:key:node".into(),
+                timestamp: "2026-01-01T00:00:00Z".into(),
+                owner_did: "did:key:test".into(),
+            });
+            let _ = task_tx.send(TaskEventBroadcast {
+                task_id: "task".into(),
+                old_status: "pending".into(),
+                new_status: "claimed".into(),
+                by_did: "did:key:test".into(),
+                at: "2026-01-01T00:00:00Z".into(),
+            });
+            let response = tokio::time::timeout(Duration::from_secs(1), responses.next())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+            assert_ne!(response.data, Value::Null);
+            drop(responses);
+            assert_eq!(ref_tx.receiver_count() + task_tx.receiver_count(), 0);
+        }
+    }
+
+    #[sqlx::test]
+    async fn production_mutation_budget_accepts_seven_and_rejects_eight(pool: sqlx::PgPool) {
+        let db = Arc::new(Db::for_testing(pool));
+        db.run_migrations().await.unwrap();
+        let caller = "did:key:reviewer";
+        let now = chrono::Utc::now().to_rfc3339();
+        for index in 0..8 {
+            db.create_task(&crate::db::AgentTask {
+                id: format!("task-{index}"),
+                repo_id: None,
+                kind: "test".into(),
+                status: "pending".into(),
+                delegator_did: caller.into(),
+                assignee_did: None,
+                capability: "test".into(),
+                ucan_token: None,
+                payload: None,
+                result: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                deadline: None,
+            })
+            .await
+            .unwrap();
+        }
+        let schema = production_test_schema_with_db(db.clone());
+        for count in [8, 7] {
+            let fields = (0..count)
+                .map(|n| {
+                    format!("r{n}: claimTask(id: \"task-{n}\", assigneeDid: \"{caller}\") {{ id }}")
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let response = schema
+                .execute(
+                    async_graphql::Request::new(format!("mutation {{ {fields} }}"))
+                        .data(crate::auth::AuthenticatedDid(caller.into())),
+                )
+                .await;
+            if count == 8 {
+                assert_eq!(response.errors.len(), 1);
+                assert_eq!(response.errors[0].message, "Query is too complex.");
+                assert_eq!(
+                    db.list_tasks(Some("pending"), None, 8).await.unwrap().len(),
+                    8
+                );
+                continue;
+            }
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+            assert_eq!(
+                response
+                    .data
+                    .into_json()
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .len(),
+                7
+            );
+            assert_eq!(
+                db.list_tasks(Some("claimed"), Some(caller), 8)
+                    .await
+                    .unwrap()
+                    .len(),
+                7
+            );
+            assert_eq!(
+                db.get_task("task-7").await.unwrap().unwrap().status,
+                "pending"
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn production_list_cost_scales_with_the_same_alias_count(pool: sqlx::PgPool) {
+        let db = Arc::new(Db::for_testing(pool));
+        db.run_migrations().await.unwrap();
+        let schema = production_test_schema_with_db(db);
+        for (field, selection) in [
+            ("refUpdates", "repo"),
+            ("tasks", "id"),
+            ("reposPage", "nodes { name }"),
+        ] {
+            for limit in [1, 200] {
+                let fields = (0..2)
+                    .map(|n| format!("r{n}: {field}(limit: {limit}) {{ {selection} }}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let response = schema.execute(format!("{{ {fields} }}")).await;
+                if limit == 200 {
+                    assert_eq!(response.errors.len(), 1);
+                    assert_eq!(response.errors[0].message, "Query is too complex.");
+                    continue;
+                }
+                assert!(response.errors.is_empty(), "{field}: {:?}", response.errors);
+                assert_eq!(
+                    response
+                        .data
+                        .into_json()
+                        .unwrap()
+                        .as_object()
+                        .unwrap()
+                        .len(),
+                    2
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn production_limits_reject_mutation_aliases_and_large_lists() {
+        let schema = production_test_schema();
+        for (prefix, count, field) in [
+            ("mutation", 8, "claimTask(id: \"missing\", assigneeDid: \"did:key:test\") { id }"),
+            ("mutation", 8, "createTask(delegatorDid: \"did:key:test\", input: { kind: \"test\", capability: \"test\" }) { id }"),
+            ("mutation", 8, "completeTask(id: \"missing\", byDid: \"did:key:test\", input: {}) { id }"),
+            ("mutation", 8, "failTask(id: \"missing\", byDid: \"did:key:test\", input: {}) { id }"),
+            ("query", 8, "task(id: \"missing\") { id }"),
+            ("query", 2, "refUpdates(limit: 200) { repo }"),
+            ("query", 2, "tasks(limit: 200) { id }"),
+            ("query", 2, "reposPage(limit: 200) { nodes { name } }"),
+            ("query", 8, "reposPage(limit: 1) { nodes { name } }"),
+        ] {
+            let fields = (0..count)
+                .map(|n| format!("r{n}: {field}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let response = schema.execute(format!("{prefix} {{ {fields} }}")).await;
+            assert_eq!(response.errors.len(), 1, "{:?}", response.errors);
+            assert_eq!(response.errors[0].message, "Query is too complex.");
+        }
+    }
+
+    #[sqlx::test]
+    async fn production_repos_page_serves_the_documented_maximum(pool: sqlx::PgPool) {
+        let db = Arc::new(Db::for_testing(pool));
+        db.run_migrations().await.unwrap();
+        let schema = production_test_schema_with_db(db);
+        for selection in [
+            "nodes { name }",
+            "nodes { name ownerDid } hasNextPage endCursor",
+        ] {
+            let response = schema
+                .execute(format!("{{ reposPage(limit: 200) {{ {selection} }} }}"))
+                .await;
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+            assert_eq!(
+                response.data.into_json().unwrap()["reposPage"]["nodes"],
+                serde_json::json!([])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn seven_root_aliases_are_accepted() {
+        struct Root(Arc<AtomicUsize>);
+        #[Object]
+        impl Root {
+            #[graphql(complexity = "50 + child_complexity")]
+            async fn repos(&self) -> Vec<Nested> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                vec![Nested]
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let schema = apply_query_limits(Schema::build(
+            Root(calls.clone()),
+            EmptyMutation,
+            EmptySubscription,
+        ))
+        .finish();
+        let fields = (0..7)
+            .map(|n| format!("r{n}: repos {{ value }}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let response = schema.execute(format!("{{ {fields} }}")).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert_eq!(calls.load(Ordering::Relaxed), 7);
+    }
+
+    #[tokio::test]
+    async fn expensive_root_aliases_are_rejected_before_database_access() {
+        // Use the production builder with a lazy pool: rejection must precede DB access.
+        let schema = production_test_schema();
+        let fields = (0..8)
+            .map(|n| format!("r{n}: repos {{ name }}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let response = schema.execute(format!("{{ {fields} }}")).await;
+
+        assert_eq!(response.data, Value::Null);
+        assert_eq!(response.errors.len(), 1);
+        assert_eq!(response.errors[0].message, "Query is too complex.");
+    }
+
+    #[tokio::test]
+    async fn ordinary_schema_introspection_remains_available() {
+        let schema = production_test_schema();
+        let canonical_introspection = r#"
+            query IntrospectionQuery {
+              __schema {
+                queryType { name }
+                mutationType { name }
+                subscriptionType { name }
+                types {
+                  ...FullType
+                }
+                directives {
+                  name
+                  description
+                  locations
+                  args {
+                    ...InputValue
+                  }
+                }
+              }
+            }
+
+            fragment FullType on __Type {
+              kind
+              name
+              description
+              fields(includeDeprecated: true) {
+                name
+                description
+                args {
+                  ...InputValue
+                }
+                type {
+                  ...TypeRef
+                }
+                isDeprecated
+                deprecationReason
+              }
+              inputFields {
+                ...InputValue
+              }
+              interfaces {
+                ...TypeRef
+              }
+              enumValues(includeDeprecated: true) {
+                name
+                description
+                isDeprecated
+                deprecationReason
+              }
+              possibleTypes {
+                ...TypeRef
+              }
+            }
+
+            fragment InputValue on __InputValue {
+              name
+              description
+              type { ...TypeRef }
+              defaultValue
+            }
+
+            fragment TypeRef on __Type {
+              kind
+              name
+              ofType {
+                kind
+                name
+                ofType {
+                  kind
+                  name
+                  ofType {
+                    kind
+                    name
+                    ofType {
+                      kind
+                      name
+                      ofType {
+                        kind
+                        name
+                        ofType {
+                          kind
+                          name
+                          ofType {
+                            kind
+                            name
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+        "#;
+        let response = schema.execute(canonical_introspection).await;
+        assert!(
+            response.errors.is_empty(),
+            "canonical introspection query failed against production schema: {:?}",
+            response.errors
+        );
+        assert_ne!(response.data, Value::Null);
+    }
+
+    #[tokio::test]
+    async fn ref_updates_and_tasks_single_alias_max_limit_complexity_contract() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        pool.close().await;
+        let (ref_tx, _) = tokio::sync::broadcast::channel(16);
+        let (task_tx, _) = tokio::sync::broadcast::channel(16);
+        let schema = build_schema(Arc::new(Db::for_testing(pool)), ref_tx, task_tx);
+
+        // refUpdates(limit: 200):
+        // Single-field selection has child_complexity 1 -> cost 50 + 200 * 1 = 250 <= 400.
+        // It passes validation and reaches the resolver (which yields db error on lazy pool).
+        let single_ref = schema.execute("{ refUpdates(limit: 200) { repo } }").await;
+        assert!(
+            !single_ref
+                .errors
+                .iter()
+                .any(|e| e.message == "Query is too complex."),
+            "single-field refUpdates at max limit 200 must pass complexity validation: {:?}",
+            single_ref.errors
+        );
+        assert!(
+            single_ref
+                .errors
+                .iter()
+                .any(|e| e.message == GRAPHQL_DB_ERROR_MESSAGE),
+            "single-field refUpdates at max limit 200 must reach the resolver: {:?}",
+            single_ref.errors
+        );
+
+        // Two-field selection has child_complexity 2 -> cost 50 + 200 * 2 = 450 > 400 (rejected before resolver).
+        let multi_ref = schema
+            .execute("{ refUpdates(limit: 200) { repo refName } }")
+            .await;
+        assert_eq!(multi_ref.data, async_graphql::Value::Null);
+        assert_eq!(multi_ref.errors.len(), 1);
+        assert_eq!(multi_ref.errors[0].message, "Query is too complex.");
+
+        // tasks(limit: 200):
+        // Single-field selection has child_complexity 1 -> cost 50 + 200 * 1 = 250 <= 400.
+        // It passes validation and reaches the resolver.
+        let single_task = schema.execute("{ tasks(limit: 200) { id } }").await;
+        assert!(
+            !single_task
+                .errors
+                .iter()
+                .any(|e| e.message == "Query is too complex."),
+            "single-field tasks at max limit 200 must pass complexity validation: {:?}",
+            single_task.errors
+        );
+        assert!(
+            single_task
+                .errors
+                .iter()
+                .any(|e| e.message == GRAPHQL_DB_ERROR_MESSAGE),
+            "single-field tasks at max limit 200 must reach the resolver: {:?}",
+            single_task.errors
+        );
+
+        // Two-field selection has child_complexity 2 -> cost 50 + 200 * 2 = 450 > 400 (rejected before resolver).
+        let multi_task = schema.execute("{ tasks(limit: 200) { id status } }").await;
+        assert_eq!(multi_task.data, async_graphql::Value::Null);
+        assert_eq!(multi_task.errors.len(), 1);
+        assert_eq!(multi_task.errors[0].message, "Query is too complex.");
+    }
+
+    #[derive(Clone, Copy)]
+    struct Nested;
+
+    #[Object]
+    impl Nested {
+        async fn child(&self) -> Nested {
+            Nested
+        }
+
+        async fn value(&self) -> i32 {
+            1
+        }
+    }
+
+    struct CountingQuery(Arc<AtomicUsize>);
+
+    #[Object]
+    impl CountingQuery {
+        async fn nested(&self) -> Nested {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Nested
+        }
+    }
+
+    #[tokio::test]
+    async fn query_depth_limit_accepts_fourteen_and_rejects_fifteen() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let schema = apply_query_limits(Schema::build(
+            CountingQuery(Arc::clone(&calls)),
+            EmptyMutation,
+            EmptySubscription,
+        ))
+        .finish();
+        let query_at_depth = |depth: usize| {
+            let selection = (2..depth).fold("value".to_string(), |selection, _| {
+                format!("child {{ {selection} }}")
+            });
+            format!("{{ nested {{ {selection} }} }}")
+        };
+
+        let accepted = schema.execute(query_at_depth(GRAPHQL_MAX_DEPTH)).await;
+
+        assert!(
+            accepted.errors.is_empty(),
+            "depth {GRAPHQL_MAX_DEPTH} should be accepted: {:?}",
+            accepted.errors
+        );
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 1);
+
+        let rejected = schema.execute(query_at_depth(GRAPHQL_MAX_DEPTH + 1)).await;
+
+        assert_eq!(rejected.data, Value::Null);
+        assert_eq!(rejected.errors.len(), 1);
+        assert_eq!(rejected.errors[0].message, "Query is nested too deep.");
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn production_schema_enforces_depth_limit() {
+        let schema = production_test_schema();
+        // Depth 14 is accepted through the production build_schema path.
+        let of_types_14 = (0..9).fold("name".to_string(), |acc, _| format!("ofType {{ {acc} }}"));
+        let query_14 =
+            format!("{{ __schema {{ types {{ fields {{ type {{ {of_types_14} }} }} }} }} }}");
+        let accepted = schema.execute(&query_14).await;
+        assert!(accepted.errors.is_empty(), "{:?}", accepted.errors);
+
+        // Construct an introspection query of depth 15 using __schema.
+        // 1: __schema
+        // 2: types
+        // 3: fields
+        // 4: type
+        // 5..14: ofType (10 times)
+        // 15: name
+        // Total depth = 15 > GRAPHQL_MAX_DEPTH (14).
+        let of_types = (0..10).fold("name".to_string(), |acc, _| format!("ofType {{ {acc} }}"));
+        let query = format!("{{ __schema {{ types {{ fields {{ type {{ {of_types} }} }} }} }} }}");
+
+        let rejected = schema.execute(&query).await;
+        assert_eq!(rejected.data, async_graphql::Value::Null);
+        assert_eq!(rejected.errors.len(), 1);
+        assert_eq!(rejected.errors[0].message, "Query is nested too deep.");
     }
 
     /// Every `.map_err(` in the GraphQL query/mutation resolvers must route

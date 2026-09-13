@@ -20,6 +20,7 @@ impl SubscriptionRoot {
     /// `if announce` block, `api/repos.rs`). This is a single-point invariant —
     /// any new sender to `ref_update_tx` MUST be `announce`-gated, or private-repo
     /// ref metadata leaks here to unauthenticated subscribers (#112/#114 class).
+    #[graphql(complexity = "50 + child_complexity")]
     async fn ref_updates(
         &self,
         ctx: &Context<'_>,
@@ -46,6 +47,7 @@ impl SubscriptionRoot {
         })
     }
 
+    #[graphql(complexity = "50 + child_complexity")]
     async fn task_events(
         &self,
         ctx: &Context<'_>,
