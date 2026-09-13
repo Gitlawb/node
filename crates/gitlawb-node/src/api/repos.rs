@@ -584,7 +584,10 @@ pub async fn get_blob(
         if e.downcast_ref::<smart_http::GitServiceTimeout>().is_some() {
             return AppError::Timeout("git service timed out".into());
         }
-        if e.to_string().contains("object store not readable") {
+        if matches!(
+            e.downcast_ref::<store::ProbeError>(),
+            Some(store::ProbeError::Transient(_))
+        ) {
             return AppError::Overloaded(
                 "object store temporarily unavailable, retry shortly".into(),
             );
@@ -4087,7 +4090,10 @@ mod tests {
         let tigris =
             crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
                 .await;
-        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
+        let lock_pool =
+            crate::git::repo_store::build_lock_pool(&pool, 4, std::time::Duration::from_secs(5));
+        state.repo_store =
+            crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), lock_pool);
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
         let mut cfg = (*state.config).clone();
         cfg.git_acquire_timeout_secs = 1;
@@ -4111,15 +4117,12 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"], "overloaded");
-        assert!(state.git_read_semaphore.available_permits() > 0);
+        assert_eq!(state.git_read_semaphore.available_permits(), 64);
         assert_eq!(
             state.git_blob_semaphore.available_permits(),
             MAX_CONCURRENT_BLOB_READS
         );
-        assert!(state
-            .git_read_per_caller
-            .try_acquire("203.0.113.31")
-            .is_some());
+        assert_eq!(state.git_read_per_caller.tracked_keys(), 0);
     }
 
     #[cfg(unix)]

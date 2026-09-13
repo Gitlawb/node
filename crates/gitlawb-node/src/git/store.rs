@@ -403,7 +403,10 @@ fn blob_metadata_bounded(
                 repo_path
             };
             if !object_store_readable(git_dir, spec) {
-                bail!("git cat-file inconclusive: object store not readable");
+                return Err(ProbeError::Transient(anyhow::anyhow!(
+                    "git cat-file inconclusive: object store not readable"
+                ))
+                .into());
             }
             if attempt == 0 {
                 if deadline.saturating_duration_since(std::time::Instant::now())
@@ -1410,7 +1413,7 @@ exit 1
         write_fake(&format!(
             "#!/bin/sh\n\
              if [ \"$1\" = \"rev-parse\" ]; then echo {oid}; exit 0; fi\n\
-             if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"--batch-check\" ]; then read spec; echo \"{oid} blob 10\n{oid} blob 10\"; exit 0; fi\n\
+             if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"--batch-check\" ]; then read spec; printf '%s\\n%s\\n' '{oid} blob 10' '{oid} blob 10'; exit 0; fi\n\
              exit 1\n"
         ));
         let err = super::read_file_bounded(
@@ -1434,22 +1437,35 @@ exit 1
         use std::os::unix::fs::PermissionsExt;
 
         let td = tempfile::TempDir::new().unwrap();
-        let script = td.path().join("fakegit");
+        let bare = td.path().join("bare.git");
+        std::fs::create_dir_all(bare.join("objects/pack")).unwrap();
+        let log = td.path().join("spawns.log");
+        let fake = td.path().join("fakegit");
         std::fs::write(
-            &script,
-            "#!/bin/sh\n\
-             if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"--batch-check\" ]; then sleep 0.05; read spec; echo \"$spec missing\"; exit 0; fi\n\
-             exit 1\n",
+            &fake,
+            format!(
+                "#!/bin/sh\n\
+                 echo call >> {}\n\
+                 if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"--batch-check\" ]; then \
+                     read spec; \
+                     sleep 0.15; \
+                     printf '%s\\n' \"$spec missing\"; \
+                     exit 0; \
+                 fi\n\
+                 exit 1\n",
+                log.display()
+            ),
         )
         .unwrap();
-        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
         permissions.set_mode(0o755);
-        std::fs::set_permissions(&script, permissions).unwrap();
+        std::fs::set_permissions(&fake, permissions).unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
+        let budget = std::time::Duration::from_millis(200);
+        let deadline = std::time::Instant::now() + budget;
         let err = super::blob_metadata_bounded(
-            script.to_str().unwrap(),
-            td.path(),
+            fake.to_str().unwrap(),
+            &bare,
             "spec",
             b"spec\n",
             deadline,
@@ -1459,6 +1475,13 @@ exit 1
             err.downcast_ref::<crate::git::smart_http::GitServiceTimeout>()
                 .is_some(),
             "exhausted reprobe budget must return GitServiceTimeout, got: {err:#}"
+        );
+        let spawns = std::fs::read_to_string(&log)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        assert_eq!(
+            spawns, 1,
+            "a confirming probe must not be spawned when remaining budget is insufficient"
         );
     }
 
