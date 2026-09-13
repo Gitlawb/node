@@ -275,11 +275,14 @@ mod tests {
     async fn repos_legacy_accepts_exactly_the_visible_bound(pool: PgPool) {
         let db = db(pool).await;
         let base_time = Utc::now();
-        for index in 0..crate::db::MAX_VISIBLE_REPO_PAGE_SIZE {
+        let total = crate::db::MAX_VISIBLE_REPO_PAGE_SIZE;
+        for index in 0..total {
             let name = format!("repo-{index:03}");
             let mut r = repo(&name, OWNER, &name, true);
-            // Distinct timestamps: repo-000 is oldest, repo-199 is newest.
-            r.updated_at = base_time + chrono::Duration::seconds(index as i64);
+            // Anti-correlate updated_at with name, creation order, and index
+            // so only ordering by updated_at DESC can satisfy the expectation.
+            let offset = (index * 37) % total;
+            r.updated_at = base_time + chrono::Duration::seconds(offset as i64);
             db.create_repo(&r).await.unwrap();
         }
         db.create_repo(&repo("hidden", OWNER, "hidden", false))
@@ -291,14 +294,16 @@ mod tests {
             .as_array()
             .unwrap()
             .clone();
-        assert_eq!(repos.len(), crate::db::MAX_VISIBLE_REPO_PAGE_SIZE);
+        assert_eq!(repos.len(), total);
         let names: Vec<_> = repos.iter().filter_map(|r| r["name"].as_str()).collect();
         assert!(
             !names.contains(&"hidden"),
             "hidden repo must be excluded from legacy repos response"
         );
-        let expected_names: Vec<String> = (0..crate::db::MAX_VISIBLE_REPO_PAGE_SIZE)
-            .rev()
+        let mut expected_indices = (0..total).collect::<Vec<_>>();
+        expected_indices.sort_by_key(|&idx| std::cmp::Reverse((idx * 37) % total));
+        let expected_names: Vec<String> = expected_indices
+            .into_iter()
             .map(|index| format!("repo-{index:03}"))
             .collect();
         assert_eq!(
@@ -316,16 +321,18 @@ mod tests {
         let db = db(pool).await;
         let owner1 = "did:key:z6MkaOwner1";
         let owner2 = "did:key:z6MkbOwner2";
-        db.create_repo(&repo("r1", owner1, "a-repo", true))
+        // Seed owner2 repos with a name ("a-repo") that sorts before owner1's cursor name ("z-repo")
+        // to ensure (owner_did, name) tuple ordering is required across page boundaries.
+        db.create_repo(&repo("r1", owner1, "b-repo", true))
             .await
             .unwrap();
-        db.create_repo(&repo("r2", owner1, "b-repo", true))
+        db.create_repo(&repo("r2", owner1, "z-repo", true))
             .await
             .unwrap();
-        db.create_repo(&repo("r3", owner2, "c-repo", true))
+        db.create_repo(&repo("r3", owner2, "a-repo", true))
             .await
             .unwrap();
-        db.create_repo(&repo("r4", owner2, "d-repo", true))
+        db.create_repo(&repo("r4", owner2, "c-repo", true))
             .await
             .unwrap();
 
@@ -341,8 +348,8 @@ mod tests {
         assert_eq!(
             p1["nodes"],
             serde_json::json!([
-                {"name": "a-repo", "ownerDid": owner1},
                 {"name": "b-repo", "ownerDid": owner1},
+                {"name": "z-repo", "ownerDid": owner1},
             ])
         );
         let cursor = p1["endCursor"].as_str().unwrap();
@@ -357,8 +364,8 @@ mod tests {
         assert_eq!(
             p2["nodes"],
             serde_json::json!([
+                {"name": "a-repo", "ownerDid": owner2},
                 {"name": "c-repo", "ownerDid": owner2},
-                {"name": "d-repo", "ownerDid": owner2},
             ])
         );
     }
