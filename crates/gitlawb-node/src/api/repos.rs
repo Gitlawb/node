@@ -4013,7 +4013,7 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(state.git_blob_semaphore.available_permits() <= MAX_CONCURRENT_BLOB_READS - 1);
+        assert!(state.git_blob_semaphore.available_permits() < MAX_CONCURRENT_BLOB_READS);
         // Keep the body alive without ever polling it; the timer must run anyway.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while state.git_blob_semaphore.available_permits() != MAX_CONCURRENT_BLOB_READS {
