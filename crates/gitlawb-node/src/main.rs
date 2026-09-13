@@ -444,6 +444,9 @@ async fn main() -> Result<()> {
         peer_write_rate_limiter,
         shutdown_tx: shutdown_tx.clone(),
         git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_git_ops)),
+        git_blob_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            crate::api::repos::MAX_CONCURRENT_BLOB_READS,
+        )),
         git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(
             config.max_concurrent_git_pushes,
         )),

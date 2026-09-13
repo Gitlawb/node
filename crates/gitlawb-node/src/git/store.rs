@@ -213,21 +213,213 @@ pub fn ls_tree(repo_path: &Path, refname: &str, tree_path: &str) -> Result<Vec<T
     Ok(entries)
 }
 
-/// Read the contents of a file blob at refname:path.
-pub fn read_file(repo_path: &Path, refname: &str, file_path: &str) -> Result<Vec<u8>> {
-    let spec = format!("{refname}:{file_path}");
-    let output = Command::new("git")
-        .args(["show", &spec])
-        .current_dir(repo_path)
-        .output()
-        .context("failed to run git show")?;
+#[derive(Debug, PartialEq, Eq)]
+pub enum BoundedFileRead {
+    Found(Vec<u8>),
+    Missing,
+    TooLarge { size: u64, max: u64 },
+}
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git show failed: {stderr}");
+fn ref_resolves_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    refname: &str,
+    deadline: std::time::Instant,
+) -> Result<bool> {
+    let commit = format!("{refname}^{{commit}}");
+    let (status, _, _) = crate::git::visibility_pack::run_bounded_git_raw(
+        git_bin,
+        &["rev-parse", "--verify", &commit],
+        repo_path,
+        &[],
+        deadline,
+    )?;
+    Ok(status.success())
+}
+
+/// Resolve the same ref preference as [`resolve_head`] without running an unbounded
+/// child on an async worker. Every command shares the caller's deadline.
+fn resolve_head_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    preferred_branch: &str,
+    deadline: std::time::Instant,
+) -> Result<String> {
+    if ref_resolves_bounded(git_bin, repo_path, "HEAD", deadline)? {
+        return Ok("HEAD".into());
     }
 
-    Ok(output.stdout)
+    let preferred = format!("refs/heads/{preferred_branch}");
+    if ref_resolves_bounded(git_bin, repo_path, &preferred, deadline)? {
+        return Ok(preferred);
+    }
+
+    for candidate in ["refs/heads/main", "refs/heads/master", "refs/heads/develop"] {
+        if candidate != preferred.as_str()
+            && ref_resolves_bounded(git_bin, repo_path, candidate, deadline)?
+        {
+            return Ok(candidate.into());
+        }
+    }
+
+    let out = crate::git::visibility_pack::run_bounded_git(
+        git_bin,
+        &[
+            "for-each-ref",
+            "--count=1",
+            "--format=%(refname)",
+            "refs/heads/",
+        ],
+        repo_path,
+        &[],
+        deadline,
+    )?;
+    let first = String::from_utf8(out).context("git returned a non-UTF-8 ref name")?;
+    let first = first.trim();
+    Ok(if first.is_empty() { "HEAD" } else { first }.to_string())
+}
+
+/// Read one file for the REST blob endpoint without materializing unbounded child
+/// output. The mutable ref is resolved to one immutable blob OID, its declared size is
+/// checked before content capture, and the stdout drain retains at most `max_bytes`.
+/// All Git children share `deadline`; async callers must invoke this in `spawn_blocking`.
+pub fn read_file_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    preferred_branch: &str,
+    file_path: &str,
+    max_bytes: u64,
+    deadline: std::time::Instant,
+) -> Result<BoundedFileRead> {
+    if file_path.contains('\r') || file_path.contains('\n') {
+        bail!("file path contains a line break");
+    }
+
+    let refname = resolve_head_bounded(git_bin, repo_path, preferred_branch, deadline)?;
+    let spec = format!("{refname}:{file_path}");
+    let stdin = format!("{spec}\n");
+    let output = blob_metadata_bounded(git_bin, repo_path, &spec, stdin.as_bytes(), deadline)?;
+    let line = output.trim();
+    if line.split_whitespace().last() == Some("missing") {
+        return Ok(BoundedFileRead::Missing);
+    }
+
+    let mut parts = line.split_whitespace();
+    let oid = parts.next().context("git omitted the blob object ID")?;
+    let kind = parts.next().context("git omitted the object type")?;
+    let size = parts
+        .next()
+        .context("git omitted the object size")?
+        .parse::<u64>()
+        .context("git returned an invalid object size")?;
+    if parts.next().is_some()
+        || !matches!(oid.len(), 40 | 64)
+        || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("git returned invalid object metadata");
+    }
+    if kind != "blob" {
+        return Ok(BoundedFileRead::Missing);
+    }
+    if size > max_bytes {
+        return Ok(BoundedFileRead::TooLarge {
+            size,
+            max: max_bytes,
+        });
+    }
+
+    let max_stdout = usize::try_from(max_bytes).context("blob limit exceeds platform capacity")?;
+    let (status, content, stderr, exceeded) =
+        crate::git::visibility_pack::run_bounded_git_raw_capped(
+            git_bin,
+            &["cat-file", "blob", oid],
+            repo_path,
+            &[],
+            deadline,
+            max_stdout,
+        )?;
+    if !status.success() {
+        bail!(
+            "git cat-file blob failed: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+    if exceeded {
+        bail!("git emitted blob content beyond the served size limit");
+    }
+    if content.len() as u64 != size {
+        bail!(
+            "git blob size changed between metadata and content reads (expected {size}, got {})",
+            content.len()
+        );
+    }
+    Ok(BoundedFileRead::Found(content))
+}
+
+fn blob_metadata_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    spec: &str,
+    stdin: &[u8],
+    deadline: std::time::Instant,
+) -> Result<String> {
+    let probe_started = std::time::Instant::now();
+    for attempt in 0..2 {
+        let (status, stdout, stderr) = crate::git::visibility_pack::run_bounded_git_raw(
+            git_bin,
+            &["cat-file", "--batch-check"],
+            repo_path,
+            stdin,
+            deadline,
+        )?;
+        if !status.success() {
+            bail!(
+                "git cat-file --batch-check failed: {}",
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+
+        let stderr = String::from_utf8_lossy(&stderr);
+        if stderr
+            .lines()
+            .any(|line| line.starts_with("error:") || line.starts_with("fatal:"))
+        {
+            bail!("git cat-file --batch-check reported: {}", stderr.trim());
+        }
+
+        let output = String::from_utf8(stdout).context("git returned non-UTF-8 object metadata")?;
+        let mut lines = output.lines();
+        let line = lines.next().unwrap_or_default().trim();
+        if lines.next().is_some() {
+            bail!("git returned multiple object metadata records");
+        }
+        if line.split_whitespace().last() == Some("missing") {
+            // A clean missing response also occurs for unreadable packs. Use the
+            // same out-of-band check as object_type_bounded, then confirm once.
+            let worktree_git = repo_path.join(".git");
+            let git_dir = if worktree_git.is_dir() {
+                worktree_git.as_path()
+            } else {
+                repo_path
+            };
+            if !object_store_readable(git_dir, spec) {
+                return Err(ProbeError::Transient(anyhow::anyhow!(
+                    "git cat-file inconclusive: object store not readable"
+                ))
+                .into());
+            }
+            if attempt == 0 {
+                if deadline.saturating_duration_since(std::time::Instant::now())
+                    < probe_started.elapsed()
+                {
+                    return Err(crate::git::smart_http::GitServiceTimeout.into());
+                }
+                continue;
+            }
+        }
+        return Ok(output);
+    }
+    unreachable!("the confirming probe returns its result")
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -881,6 +1073,557 @@ mod tests {
     use super::branch_diff_names;
     use std::path::Path;
     use std::process::Command;
+
+    #[cfg(unix)]
+    fn write_blob_probe_fixture(dir: &Path, content: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        let script = dir.join("fakegit");
+        // Write in a child so parallel tests cannot inherit an open writable
+        // script descriptor when they fork (which would cause ETXTBSY).
+        let mut writer = Command::new("sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "fixture-writer"])
+            .arg(&script)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        writer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(content.as_bytes())
+            .unwrap();
+        assert!(writer.wait().unwrap().success());
+        script
+    }
+
+    #[test]
+    fn bounded_file_read_rejects_packed_blob_and_preserves_allowed_content() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(work)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        let content = vec![b'a'; 64 * 1024];
+        std::fs::write(work.join("large.txt"), &content).unwrap();
+        run(&["add", "large.txt"]);
+        run(&["commit", "-qm", "add blob"]);
+        run(&["gc", "-q"]);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        assert_eq!(
+            super::read_file_bounded("git", work, "main", "large.txt", 1024, deadline).unwrap(),
+            super::BoundedFileRead::TooLarge {
+                size: content.len() as u64,
+                max: 1024,
+            }
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        assert_eq!(
+            super::read_file_bounded(
+                "git",
+                work,
+                "main",
+                "large.txt",
+                content.len() as u64,
+                deadline,
+            )
+            .unwrap(),
+            super::BoundedFileRead::Found(content)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_file_read_confirms_missing_and_recovers_after_reprobe() {
+        for recover in [false, true] {
+            let td = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir(td.path().join("objects")).unwrap();
+            let oid = "a".repeat(40);
+            let script = write_blob_probe_fixture(
+                td.path(),
+                &format!(
+                    r#"#!/bin/sh
+if [ "$1" = rev-parse ]; then echo {oid}; exit 0; fi
+if [ "$2" = --batch-check ]; then
+  read spec
+  echo probe >> probes
+  if [ -f probed ] && [ "{recover}" = true ]; then echo '{oid} blob 5'; else echo "$spec missing"; fi
+  touch probed
+  exit 0
+fi
+if [ "$2" = blob ]; then printf hello; exit 0; fi
+exit 1
+"#
+                ),
+            );
+            let result = super::read_file_bounded(
+                script.to_str().unwrap(),
+                td.path(),
+                "main",
+                "hello.txt",
+                1024,
+                std::time::Instant::now() + std::time::Duration::from_secs(10),
+            )
+            .unwrap();
+            assert_eq!(
+                result,
+                if recover {
+                    super::BoundedFileRead::Found(b"hello".to_vec())
+                } else {
+                    super::BoundedFileRead::Missing
+                }
+            );
+            assert_eq!(
+                std::fs::read_to_string(td.path().join("probes"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_file_read_does_not_report_missing_for_unreadable_pack() {
+        use std::os::unix::fs::symlink;
+        let td = tempfile::TempDir::new().unwrap();
+        let pack = td.path().join("objects/pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        // A disappearing pack is unopenable even when CI runs as root.
+        symlink("removed-during-repack", pack.join("unreadable.pack")).unwrap();
+        let script = write_blob_probe_fixture(td.path(), "#!/bin/sh\nif [ \"$1\" = rev-parse ]; then exit 0; fi\nread spec\necho \"$spec missing\"\n");
+        let error = super::read_file_bounded(
+            script.to_str().unwrap(),
+            td.path(),
+            "main",
+            "hello.txt",
+            1024,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("object store not readable"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_file_read_does_not_capture_rejected_content() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let td = tempfile::TempDir::new().unwrap();
+        let marker = td.path().join("content-called");
+        let oid = "a".repeat(40);
+        let script = td.path().join("fakegit");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = \"rev-parse\" ]; then echo {oid}; exit 0; fi\n\
+                 if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"--batch-check\" ]; then read spec; echo \"{oid} blob 4096\"; exit 0; fi\n\
+                 if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"blob\" ]; then touch \"{}\"; printf x; exit 0; fi\n\
+                 exit 1\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let result = super::read_file_bounded(
+            script.to_str().unwrap(),
+            td.path(),
+            "main",
+            "large.txt",
+            1024,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            super::BoundedFileRead::TooLarge {
+                size: 4096,
+                max: 1024,
+            }
+        );
+        assert!(
+            !marker.exists(),
+            "content command must not run after an oversized metadata result"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_file_read_caps_content_that_exceeds_preflight_size() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let td = tempfile::TempDir::new().unwrap();
+        let oid = "b".repeat(40);
+        let script = td.path().join("fakegit");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = \"rev-parse\" ]; then echo {oid}; exit 0; fi\n\
+                 if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"--batch-check\" ]; then read spec; echo \"{oid} blob 3\"; exit 0; fi\n\
+                 if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"blob\" ] && [ \"$3\" = \"{oid}\" ]; then printf 0123456789abcdef0123456789abcdef; exit 0; fi\n\
+                 exit 1\n"
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let err = super::read_file_bounded(
+            script.to_str().unwrap(),
+            td.path(),
+            "main",
+            "large.txt",
+            16,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("beyond the served size limit"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_file_read_guards_size_mismatch_and_metadata_parse() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let td = tempfile::TempDir::new().unwrap();
+        let script = td.path().join("fakegit");
+        let write_fake = |body: &str| {
+            std::fs::write(&script, body).unwrap();
+            let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script, permissions).unwrap();
+        };
+
+        let oid = "c".repeat(40);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        // 1. Size mismatch (emitted bytes fewer than declared size):
+        // Declares 20 bytes, emits 5 bytes ("hello"). max_bytes is 64 (so exceeded is false).
+        write_fake(&format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"rev-parse\" ]; then echo {oid}; exit 0; fi\n\
+             if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"--batch-check\" ]; then read spec; echo \"{oid} blob 20\"; exit 0; fi\n\
+             if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"blob\" ]; then printf hello; exit 0; fi\n\
+             exit 1\n"
+        ));
+        let err = super::read_file_bounded(
+            script.to_str().unwrap(),
+            td.path(),
+            "main",
+            "mismatch.txt",
+            64,
+            deadline,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("size changed between metadata and content reads"),
+            "expected size mismatch error, got: {err:#}"
+        );
+
+        // 2. Metadata parse: missing fields (only 2 fields, no size)
+        write_fake(&format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"rev-parse\" ]; then echo {oid}; exit 0; fi\n\
+             if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"--batch-check\" ]; then read spec; echo \"{oid} blob\"; exit 0; fi\n\
+             exit 1\n"
+        ));
+        let err = super::read_file_bounded(
+            script.to_str().unwrap(),
+            td.path(),
+            "main",
+            "bad.txt",
+            64,
+            deadline,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("omitted the object size"),
+            "expected missing fields error, got: {err:#}"
+        );
+
+        // 3. Metadata parse: non-hex OID
+        write_fake(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"rev-parse\" ]; then echo nothex; exit 0; fi\n\
+             if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"--batch-check\" ]; then read spec; echo \"not-a-valid-hex-oid-1234567890123456789012 blob 10\"; exit 0; fi\n\
+             exit 1\n"
+        );
+        let err = super::read_file_bounded(
+            script.to_str().unwrap(),
+            td.path(),
+            "main",
+            "bad.txt",
+            64,
+            deadline,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid object metadata"),
+            "expected non-hex oid error, got: {err:#}"
+        );
+
+        // 4. Metadata parse: trailing fields
+        write_fake(&format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"rev-parse\" ]; then echo {oid}; exit 0; fi\n\
+             if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"--batch-check\" ]; then read spec; echo \"{oid} blob 10 trailing-junk\"; exit 0; fi\n\
+             exit 1\n"
+        ));
+        let err = super::read_file_bounded(
+            script.to_str().unwrap(),
+            td.path(),
+            "main",
+            "bad.txt",
+            64,
+            deadline,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid object metadata"),
+            "expected trailing fields error, got: {err:#}"
+        );
+
+        // 5. Metadata parse: multi-record output
+        write_fake(&format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"rev-parse\" ]; then echo {oid}; exit 0; fi\n\
+             if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"--batch-check\" ]; then read spec; printf '%s\\n%s\\n' '{oid} blob 10' '{oid} blob 10'; exit 0; fi\n\
+             exit 1\n"
+        ));
+        let err = super::read_file_bounded(
+            script.to_str().unwrap(),
+            td.path(),
+            "main",
+            "bad.txt",
+            64,
+            deadline,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("multiple object metadata records"),
+            "expected multi-record error, got: {err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blob_metadata_bounded_reprobe_budget_exhaustion_returns_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let td = tempfile::TempDir::new().unwrap();
+        let bare = td.path().join("bare.git");
+        std::fs::create_dir_all(bare.join("objects/pack")).unwrap();
+        let log = td.path().join("spawns.log");
+        let fake = td.path().join("fakegit");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\n\
+                 echo call >> {}\n\
+                 if [ \"$1\" = \"cat-file\" ] && [ \"$2\" = \"--batch-check\" ]; then \
+                     read spec; \
+                     sleep 0.15; \
+                     printf '%s\\n' \"$spec missing\"; \
+                     exit 0; \
+                 fi\n\
+                 exit 1\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+
+        let budget = std::time::Duration::from_millis(200);
+        let deadline = std::time::Instant::now() + budget;
+        let err = super::blob_metadata_bounded(
+            fake.to_str().unwrap(),
+            &bare,
+            "spec",
+            b"spec\n",
+            deadline,
+        )
+        .unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::git::smart_http::GitServiceTimeout>()
+                .is_some(),
+            "exhausted reprobe budget must return GitServiceTimeout, got: {err:#}"
+        );
+        let spawns = std::fs::read_to_string(&log)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        assert_eq!(
+            spawns, 1,
+            "a confirming probe must not be spawned when remaining budget is insufficient"
+        );
+    }
+
+    #[test]
+    fn read_file_bounded_denies_non_blob_paths() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(work)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::create_dir(work.join("subfolder")).unwrap();
+        std::fs::write(work.join("subfolder/file.txt"), b"contents").unwrap();
+        run(&["add", "subfolder"]);
+        run(&["commit", "-qm", "add directory"]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        // "subfolder" resolves to a tree object in git, not a blob.
+        let read =
+            super::read_file_bounded("git", work, "main", "subfolder", 1024, deadline).unwrap();
+        assert_eq!(read, super::BoundedFileRead::Missing);
+    }
+
+    #[test]
+    fn resolve_head_bounded_covers_all_fallback_arms() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(work)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(work.join("hello.txt"), b"hello").unwrap();
+        run(&["add", "hello.txt"]);
+        run(&["commit", "-qm", "initial"]);
+        run(&["branch", "-M", "custom-feature"]);
+        run(&["branch", "aaa-earlier"]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert_eq!(
+            super::resolve_head_bounded("git", work, "aaa-earlier", deadline).unwrap(),
+            "HEAD"
+        );
+        // Detach or point HEAD to an unborn branch so HEAD itself does not resolve.
+        run(&["symbolic-ref", "HEAD", "refs/heads/unborn-branch"]);
+
+        // 1. Preferred branch arm: "custom-feature" resolves to refs/heads/custom-feature.
+        let resolved =
+            super::resolve_head_bounded("git", work, "custom-feature", deadline).unwrap();
+        assert_eq!(resolved, "refs/heads/custom-feature");
+        let read =
+            super::read_file_bounded("git", work, "custom-feature", "hello.txt", 1024, deadline)
+                .unwrap();
+        assert_eq!(read, super::BoundedFileRead::Found(b"hello".to_vec()));
+
+        // 2. Candidate branch arm (main, master, develop): create "master".
+        run(&["branch", "-M", "custom-feature", "master"]);
+        // Asking for a nonexistent preferred branch falls back to "master".
+        let resolved_master =
+            super::resolve_head_bounded("git", work, "nonexistent", deadline).unwrap();
+        assert_eq!(resolved_master, "refs/heads/master");
+        let read_master =
+            super::read_file_bounded("git", work, "nonexistent", "hello.txt", 1024, deadline)
+                .unwrap();
+        assert_eq!(
+            read_master,
+            super::BoundedFileRead::Found(b"hello".to_vec())
+        );
+
+        // Main must precede master, which must precede develop; all precede
+        // the alphabetically earlier branch chosen by for-each-ref.
+        run(&["branch", "develop", "master"]);
+        run(&["branch", "main", "master"]);
+        assert_eq!(
+            super::resolve_head_bounded("git", work, "nonexistent", deadline).unwrap(),
+            "refs/heads/main"
+        );
+        run(&["branch", "-m", "main", "z-retired-main"]);
+        assert_eq!(
+            super::resolve_head_bounded("git", work, "nonexistent", deadline).unwrap(),
+            "refs/heads/master"
+        );
+        run(&["branch", "-M", "master", "isolated-branch"]);
+        assert_eq!(
+            super::resolve_head_bounded("git", work, "nonexistent", deadline).unwrap(),
+            "refs/heads/develop"
+        );
+        run(&["branch", "-m", "develop", "z-retired-develop"]);
+        assert_eq!(
+            super::resolve_head_bounded("git", work, "nonexistent", deadline).unwrap(),
+            "refs/heads/aaa-earlier"
+        );
+        run(&["branch", "-m", "aaa-earlier", "z-retired-earlier"]);
+        // 3. for-each-ref fallback arm: only a nonstandard branch remains.
+        let resolved_isolated =
+            super::resolve_head_bounded("git", work, "nonexistent", deadline).unwrap();
+        assert_eq!(resolved_isolated, "refs/heads/isolated-branch");
+        let read_isolated =
+            super::read_file_bounded("git", work, "nonexistent", "hello.txt", 1024, deadline)
+                .unwrap();
+        assert_eq!(
+            read_isolated,
+            super::BoundedFileRead::Found(b"hello".to_vec())
+        );
+
+        // 4. Empty refs fallback: a completely empty repo with unborn HEAD.
+        let td_empty = tempfile::TempDir::new().unwrap();
+        let run_empty = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(td_empty.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_empty(&["init", "-q"]);
+        let resolved_empty =
+            super::resolve_head_bounded("git", td_empty.path(), "nonexistent", deadline).unwrap();
+        assert_eq!(resolved_empty, "HEAD");
+        let read_empty = super::read_file_bounded(
+            "git",
+            td_empty.path(),
+            "nonexistent",
+            "hello.txt",
+            1024,
+            deadline,
+        )
+        .unwrap();
+        assert_eq!(read_empty, super::BoundedFileRead::Missing);
+    }
 
     #[test]
     fn branch_diff_names_lists_changed_paths() {

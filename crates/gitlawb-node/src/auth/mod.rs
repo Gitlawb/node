@@ -532,6 +532,9 @@ mod tests {
             peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            git_blob_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                crate::api::repos::MAX_CONCURRENT_BLOB_READS,
+            )),
             git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             git_push_advert_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             git_encrypt_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),

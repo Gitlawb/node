@@ -2,7 +2,7 @@ use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::Json;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use std::sync::Arc;
 
 use crate::auth::{caller_authorized_to_push, AuthenticatedDid};
@@ -20,6 +20,107 @@ use crate::webhooks;
 
 /// The git all-zeros object id — the create/delete sentinel in a ref update.
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
+
+/// REST blob responses share the same served-object ceiling as `/ipfs/{cid}`.
+const MAX_SERVED_BLOB_BYTES: u64 = crate::api::ipfs::MAX_SERVED_OBJECT_BYTES;
+
+/// A dedicated pool bounds retained REST blob bodies independently of smart-HTTP
+/// traffic. At the per-response ceiling, the default caps live blob data at 128 MiB.
+pub(crate) const MAX_CONCURRENT_BLOB_READS: usize = 4;
+
+const BLOB_RESPONSE_CHUNK_BYTES: usize = 64 * 1024;
+
+struct BlobResponseStream {
+    content: Bytes,
+    _git_permit: tokio::sync::OwnedSemaphorePermit,
+    _blob_permit: tokio::sync::OwnedSemaphorePermit,
+    _caller_permit: Option<crate::rate_limit::PerCallerPermit>,
+}
+
+impl futures::Stream for BlobResponseStream {
+    type Item = std::result::Result<Bytes, std::convert::Infallible>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.content.is_empty() {
+            return std::task::Poll::Ready(None);
+        }
+        let len = this.content.len().min(BLOB_RESPONSE_CHUNK_BYTES);
+        let chunk = Bytes::copy_from_slice(&this.content[..len]);
+        this.content.advance(len);
+        std::task::Poll::Ready(Some(Ok(chunk)))
+    }
+}
+
+/// The producer owns admission and the full blob; its timer runs even when
+/// the HTTP server stops polling the body. Only one copied chunk is queued.
+struct BlobDeliveryStream {
+    receiver: tokio::sync::mpsc::Receiver<Bytes>,
+    producer: tokio::task::JoinHandle<std::io::Result<()>>,
+    finished: bool,
+}
+
+impl BlobDeliveryStream {
+    fn new(mut source: BlobResponseStream, timeout: std::time::Duration) -> Self {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let producer = tokio::spawn(async move {
+            use futures::StreamExt;
+            let delivery = async {
+                while let Some(Ok(chunk)) = source.next().await {
+                    if sender.send(chunk).await.is_err() {
+                        return;
+                    }
+                }
+                // Keep admission until the last queued chunk is consumed, even
+                // for a one-chunk response whose first send never had to wait.
+                let _drained = sender.reserve().await;
+            };
+            tokio::time::timeout(timeout, delivery).await.map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "blob delivery timed out")
+            })
+        });
+        Self {
+            receiver,
+            producer,
+            finished: false,
+        }
+    }
+}
+
+impl futures::Stream for BlobDeliveryStream {
+    type Item = std::io::Result<Bytes>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::future::Future;
+        use std::task::Poll;
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(None);
+        }
+        if let Some(chunk) = std::task::ready!(this.receiver.poll_recv(cx)) {
+            return Poll::Ready(Some(Ok(chunk)));
+        }
+        let result = std::task::ready!(std::pin::Pin::new(&mut this.producer).poll(cx));
+        this.finished = true;
+        match result {
+            Ok(Ok(())) => Poll::Ready(None),
+            Ok(Err(error)) => Poll::Ready(Some(Err(error))),
+            Err(_) => Poll::Ready(Some(Err(std::io::Error::other("blob delivery failed")))),
+        }
+    }
+}
+
+impl Drop for BlobDeliveryStream {
+    fn drop(&mut self) {
+        self.producer.abort();
+    }
+}
 
 /// The set of blob OIDs withheld from **anonymous** replication for a repo, or
 /// `None` when the repo must not replicate at all (private / mode A /
@@ -413,47 +514,99 @@ pub async fn list_commits(
 pub async fn get_blob(
     State(state): State<AppState>,
     Path((owner, name, file_path)): Path<(String, String, String)>,
+    crate::rate_limit::PeerAddr(peer): crate::rate_limit::PeerAddr,
+    headers: axum::http::HeaderMap,
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Response> {
     use axum::http::header;
-    use axum::response::IntoResponse;
 
-    // Unnormalized paths ("../..", "./", "//") can't resolve in `git show`
+    // Unnormalized paths ("../..", "./", "//") are invalid in the ref:path
+    // input sent to `git cat-file --batch-check`,
     // and crawlers combinatorially explode them from relative links — that's
     // a client error, not a 500.
     let file_path = file_path.trim_matches('/');
     if file_path.is_empty()
-        || file_path
-            .split('/')
-            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        || file_path.split('/').any(|seg| {
+            seg.is_empty() || seg == "." || seg == ".." || seg.chars().any(char::is_control)
+        })
     {
         return Err(AppError::BadRequest("invalid file path".into()));
     }
+
+    // Charge the source and acquire blob/global read permits before any database work.
+    // The OwnedSemaphorePermits release on drop if authorization or subsequent work fails.
+    let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
+    let caller_permit = acquire_read_caller_permit(
+        &state.git_read_per_caller,
+        caller_key.as_deref(),
+        &name,
+        "REST blob",
+    )?;
+    let blob_permit = git_permit(&state.git_blob_semaphore)?;
+    let permit = git_permit(&state.git_read_semaphore)?;
 
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
     let gate_path = format!("/{file_path}");
     let (record, _rules) =
         crate::api::authorize_repo_read(&state, &owner, &name, caller, &gate_path).await?;
 
-    let disk_path = state
-        .repo_store
-        .acquire(&record.owner_did, &record.name)
-        .await
-        .map_err(|e| AppError::Git(e.to_string()))?;
-    let head_ref = store::resolve_head(&disk_path, &record.default_branch);
-    let content = store::read_file(&disk_path, &head_ref, file_path).map_err(|e| {
-        let msg = e.to_string();
-        // `git show ref:path` on a path absent from the tree is a 404,
-        // not a server error
-        if msg.contains("does not exist in")
-            || msg.contains("invalid object name")
-            || msg.contains("exists on disk, but not in")
-        {
-            AppError::NotFound(format!("file not found: {file_path}"))
-        } else {
-            AppError::Git(msg)
+    let acquire_deadline = std::time::Duration::from_secs(state.config.git_acquire_timeout_secs);
+    let disk_path = tokio::time::timeout(
+        acquire_deadline,
+        state.repo_store.acquire(&record.owner_did, &record.name),
+    )
+    .await
+    .map_err(|_elapsed| {
+        tracing::warn!(repo = %name, "repo acquire timed out; shedding blob request with 503");
+        AppError::Overloaded("git service acquisition timed out, retry shortly".into())
+    })?
+    .map_err(AppError::Internal)?;
+
+    let default_branch = record.default_branch.clone();
+    let read_path = file_path.to_string();
+    let git_bin = state.git_bin.clone();
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+    let (read, permit, blob_permit, caller_permit) = tokio::task::spawn_blocking(move || {
+        let read = store::read_file_bounded(
+            &git_bin,
+            &disk_path,
+            &default_branch,
+            &read_path,
+            MAX_SERVED_BLOB_BYTES,
+            deadline,
+        );
+        (read, permit, blob_permit, caller_permit)
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("blob read task failed: {e}")))?;
+    let read = read.map_err(|e| {
+        if e.downcast_ref::<smart_http::GitServiceTimeout>().is_some() {
+            return AppError::Timeout("git service timed out".into());
         }
+        if matches!(
+            e.downcast_ref::<store::ProbeError>(),
+            Some(store::ProbeError::Transient(_))
+        ) {
+            return AppError::Overloaded(
+                "object store temporarily unavailable, retry shortly".into(),
+            );
+        }
+        AppError::Internal(e)
     })?;
+
+    let content = match read {
+        store::BoundedFileRead::Found(content) => content,
+        store::BoundedFileRead::Missing => {
+            return Err(AppError::NotFound(format!("file not found: {file_path}")));
+        }
+        store::BoundedFileRead::TooLarge { size, max } => {
+            tracing::warn!(repo = %name, path = %file_path, size, max, "REST blob exceeds served size limit");
+            return Err(AppError::PayloadTooLarge(format!(
+                "file exceeds the maximum served size of {max} bytes"
+            )));
+        }
+    };
 
     // Guess content type
     let mime = match file_path.rsplit('.').next() {
@@ -467,7 +620,32 @@ pub async fn get_blob(
         _ => "application/octet-stream",
     };
 
-    Ok(([(header::CONTENT_TYPE, mime)], content).into_response())
+    let content_len = content.len();
+    let stream = BlobResponseStream {
+        content: Bytes::from(content),
+        _git_permit: permit,
+        _blob_permit: blob_permit,
+        _caller_permit: caller_permit,
+    };
+    let stream = BlobDeliveryStream::new(
+        stream,
+        std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+    );
+    let mut response = Response::new(axum::body::Body::from_stream(stream));
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(mime),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        axum::http::HeaderValue::from_str(&content_len.to_string())
+            .expect("a decimal content length is a valid header value"),
+    );
+    Ok(response)
 }
 
 /// GET /api/v1/repos/:owner/:repo/tree  (root listing)
@@ -3343,6 +3521,103 @@ mod tests {
     const OWNER_SHORT: &str = "z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
     const STRANGER_DID: &str = "did:key:z6Mkffonly5tranger0000000000000000000000000000000";
 
+    #[tokio::test]
+    async fn blob_response_holds_admission_until_the_body_is_dropped() {
+        use futures::StreamExt;
+
+        let git = Arc::new(tokio::sync::Semaphore::new(1));
+        let blob = Arc::new(tokio::sync::Semaphore::new(1));
+        let callers = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        let source = vec![b'x'; BLOB_RESPONSE_CHUNK_BYTES * 2];
+        let source_start = source.as_ptr() as usize;
+        let source_end = source_start + source.len();
+        let mut stream = BlobResponseStream {
+            content: Bytes::from(source),
+            _git_permit: git.clone().try_acquire_owned().unwrap(),
+            _blob_permit: blob.clone().try_acquire_owned().unwrap(),
+            _caller_permit: callers.try_acquire("source"),
+        };
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.len(), BLOB_RESPONSE_CHUNK_BYTES);
+        assert!(git.clone().try_acquire_owned().is_err());
+        assert!(blob.clone().try_acquire_owned().is_err());
+        assert!(callers.try_acquire("source").is_none());
+
+        let second = stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.is_none());
+        for chunk in [&first, &second] {
+            let chunk_start = chunk.as_ptr() as usize;
+            assert!(
+                chunk_start < source_start || chunk_start >= source_end,
+                "emitted chunks must not retain the full source allocation"
+            );
+        }
+
+        drop(stream);
+        assert!(git.try_acquire_owned().is_ok());
+        assert!(blob.try_acquire_owned().is_ok());
+        assert!(callers.try_acquire("source").is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blob_delivery_deadline_releases_admission_without_body_polls() {
+        use futures::StreamExt;
+        for (chunks, read_first_chunk) in [(1, false), (8, false), (8, true)] {
+            let git = Arc::new(tokio::sync::Semaphore::new(1));
+            let blob = Arc::new(tokio::sync::Semaphore::new(1));
+            let callers = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+            let source = BlobResponseStream {
+                content: Bytes::from(vec![b'x'; BLOB_RESPONSE_CHUNK_BYTES * chunks]),
+                _git_permit: git.clone().try_acquire_owned().unwrap(),
+                _blob_permit: blob.clone().try_acquire_owned().unwrap(),
+                _caller_permit: callers.try_acquire("source"),
+            };
+            let mut stream = BlobDeliveryStream::new(source, std::time::Duration::from_secs(10));
+            tokio::task::yield_now().await;
+            if read_first_chunk {
+                assert_eq!(
+                    stream.next().await.unwrap().unwrap().len(),
+                    BLOB_RESPONSE_CHUNK_BYTES
+                );
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(blob.available_permits(), 0);
+            tokio::time::advance(std::time::Duration::from_secs(11)).await;
+            tokio::task::yield_now().await;
+            // The body still exists and has not been polled during the deadline.
+            assert_eq!(git.available_permits(), 1);
+            assert_eq!(blob.available_permits(), 1);
+            assert!(callers.try_acquire("source").is_some());
+            assert!(stream.next().await.unwrap().is_ok()); // one queued chunk
+            let error = stream.next().await.unwrap().unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert!(stream.next().await.is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blob_delivery_disconnect_releases_admission_before_deadline() {
+        let git = Arc::new(tokio::sync::Semaphore::new(1));
+        let blob = Arc::new(tokio::sync::Semaphore::new(1));
+        let callers = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        let stream = BlobDeliveryStream::new(
+            BlobResponseStream {
+                content: Bytes::from(vec![b'x'; BLOB_RESPONSE_CHUNK_BYTES * 8]),
+                _git_permit: git.clone().try_acquire_owned().unwrap(),
+                _blob_permit: blob.clone().try_acquire_owned().unwrap(),
+                _caller_permit: callers.try_acquire("source"),
+            },
+            std::time::Duration::from_secs(600),
+        );
+        tokio::task::yield_now().await;
+        drop(stream);
+        tokio::task::yield_now().await;
+        assert_eq!(git.available_permits(), 1);
+        assert_eq!(blob.available_permits(), 1);
+        assert!(callers.try_acquire("source").is_some());
+    }
+
     #[test]
     fn upload_pack_request_finalizes_only_with_done_pktline() {
         let want = "0032want 1111111111111111111111111111111111111111\n";
@@ -3486,6 +3761,392 @@ mod tests {
             1,
             "a fresh filtered clone (want+done) must count exactly one"
         );
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn blob_cat_file_failure_is_opaque(pool: sqlx::PgPool) {
+        use http_body_util::BodyExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        for (index, failure) in [
+            "echo 'private-git-stderr /internal/repo.git' >&2; exit 1",
+            "echo 'error: private-git-stderr /internal/repo.git' >&2; exit 0",
+            "if [ \"$2\" = --batch-check ]; then echo '1111111111111111111111111111111111111111 blob 1'; exit 0; fi\necho 'private-git-stderr /internal/repo.git' >&2; exit 1",
+        ].iter().enumerate() {
+            let fake = write_fake_git(tmp.path(), &format!(
+                "#!/bin/sh\nif [ \"$1\" = rev-parse ]; then exit 0; fi\n{failure}\n"
+            ));
+            let owner = format!("z6bloberror{index}");
+            let state = f4_state_with_repo(pool.clone(), tmp.path(), &fake, &owner, "repo", false).await;
+            let response = blob_route_request(state, &owner, "203.0.113.31:5000").await;
+            assert_eq!(response.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["message"], crate::error::INTERNAL_ERROR_MESSAGE);
+            let body = body.to_string();
+            assert!(!body.contains("private-git-stderr"));
+            assert!(!body.contains("/internal/repo.git"));
+        }
+    }
+
+    async fn blob_route_request_path(
+        state: AppState,
+        owner: &str,
+        path: &str,
+        peer: &str,
+    ) -> Response {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let router = axum::Router::new()
+            .route(
+                "/repos/{owner}/{repo}/blob/{*path}",
+                axum::routing::get(get_blob),
+            )
+            .with_state(state);
+        let mut request = Request::builder()
+            .uri(format!("/repos/{owner}/repo/blob/{path}"))
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(peer.parse::<std::net::SocketAddr>().unwrap()));
+        router.oneshot(request).await.unwrap()
+    }
+
+    async fn blob_route_request(state: AppState, owner: &str, peer: &str) -> Response {
+        blob_route_request_path(state, owner, "file.txt", peer).await
+    }
+
+    #[sqlx::test]
+    async fn blob_acquire_failure_is_opaque(pool: sqlx::PgPool) {
+        use http_body_util::BodyExt;
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state
+            .db
+            .upsert_mirror_repo("z6blobacquire", "repo", "/unused", None, false)
+            .await
+            .unwrap();
+        // An invalid configured storage root makes the real acquire() fail before Git.
+        let tmp = tempfile::TempDir::new().unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(
+            tmp.path().join("private-storage").join("..").join("repos"),
+            pool,
+        );
+        let response = blob_route_request(state, "z6blobacquire", "203.0.113.31:5000").await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["message"], crate::error::INTERNAL_ERROR_MESSAGE);
+        assert!(!body.to_string().contains("parent-directory"));
+    }
+
+    #[tokio::test]
+    async fn blob_capacity_sheds_before_database_access() {
+        use axum::http::StatusCode;
+        use http_body_util::BodyExt;
+        for capacity in ["caller", "blob", "global"] {
+            let mut state = crate::test_support::test_state_lazy();
+            // A misplaced DB lookup returns db_unavailable immediately, without a timeout.
+            state.db.pool().close().await;
+            state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+            state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+            let caller_slot = (capacity == "caller").then(|| {
+                state
+                    .git_read_per_caller
+                    .try_acquire("203.0.113.31")
+                    .unwrap()
+            });
+            if capacity == "blob" {
+                state.git_blob_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+            }
+            if capacity == "global" {
+                state.git_read_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+            }
+            let response =
+                blob_route_request(state.clone(), "z6blobcap", "203.0.113.31:5000").await;
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{capacity}"
+            );
+            assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"], "overloaded", "{capacity}");
+            if capacity == "caller" {
+                let other =
+                    blob_route_request(state.clone(), "z6blobcap", "203.0.113.32:5000").await;
+                assert_eq!(other.status(), StatusCode::SERVICE_UNAVAILABLE);
+                let bytes = other.into_body().collect().await.unwrap().to_bytes();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["error"], crate::error::DB_UNAVAILABLE_CODE);
+                drop(caller_slot);
+                let released = blob_route_request(state, "z6blobcap", "203.0.113.31:5000").await;
+                assert_eq!(released.status(), StatusCode::SERVICE_UNAVAILABLE);
+                let bytes = released.into_body().collect().await.unwrap().to_bytes();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["error"], crate::error::DB_UNAVAILABLE_CODE);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn blob_route_maps_oversize_and_timeout(pool: sqlx::PgPool) {
+        use axum::http::StatusCode;
+        use http_body_util::BodyExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        for (owner, command, expected) in [
+            (
+                "z6blobsize",
+                format!(
+                    "echo '1111111111111111111111111111111111111111 blob {}'",
+                    MAX_SERVED_BLOB_BYTES + 1
+                ),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (
+                "z6blobtime",
+                "exec sleep 30".into(),
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+        ] {
+            let fake = write_fake_git(
+                tmp.path(),
+                &format!("#!/bin/sh\nif [ \"$1\" = rev-parse ]; then exit 0; fi\n{command}\n"),
+            );
+            let mut state =
+                f4_state_with_repo(pool.clone(), tmp.path(), &fake, owner, "repo", false).await;
+            let mut config = (*state.config).clone();
+            config.git_service_timeout_secs = 1;
+            state.config = std::sync::Arc::new(config);
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                blob_route_request(state.clone(), owner, "203.0.113.31:5000"),
+            )
+            .await
+            .expect("blob deadline must terminate the Git child");
+            assert_eq!(response.status(), expected);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body["error"],
+                if expected == StatusCode::PAYLOAD_TOO_LARGE {
+                    "payload_too_large"
+                } else {
+                    "git_timeout"
+                }
+            );
+            assert!(state.git_read_semaphore.available_permits() > 0);
+            assert!(state.git_blob_semaphore.available_permits() > 0);
+            assert!(state
+                .git_read_per_caller
+                .try_acquire("203.0.113.31")
+                .is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_route_rejects_invalid_paths() {
+        use axum::http::StatusCode;
+        use http_body_util::BodyExt;
+        let state = crate::test_support::test_state_lazy();
+        for invalid_path in [
+            "file%01.txt",
+            "file%1f.txt",
+            "foo/%2e%2e/bar.txt",
+            "foo/%2e/bar.txt",
+            "foo//bar.txt",
+        ] {
+            let response =
+                blob_route_request_path(state.clone(), "z6test", invalid_path, "203.0.113.31:5000")
+                    .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "path: {invalid_path:?}"
+            );
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"], "bad_request");
+        }
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn blob_route_returns_not_found_on_missing_blob(pool: sqlx::PgPool) {
+        use axum::http::StatusCode;
+        use http_body_util::BodyExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = write_fake_git(
+            tmp.path(),
+            "#!/bin/sh\nif [ \"$1\" = rev-parse ]; then exit 0; fi\nif [ \"$2\" = --batch-check ]; then echo 'missing'; exit 0; fi\nexit 1\n",
+        );
+        let state =
+            f4_state_with_repo(pool, tmp.path(), &fake, "z6blobmissing", "repo", false).await;
+        let response =
+            blob_route_request_path(state, "z6blobmissing", "missing.txt", "203.0.113.31:5000")
+                .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "not_found");
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn blob_route_delivery_uses_configured_timeout(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = write_fake_git(tmp.path(), "#!/bin/sh\nif [ \"$1\" = rev-parse ]; then exit 0; fi\nif [ \"$2\" = --batch-check ]; then echo '1111111111111111111111111111111111111111 blob 524288'; exit 0; fi\nhead -c 524288 /dev/zero\n");
+        let mut state =
+            f4_state_with_repo(pool, tmp.path(), &fake, "z6blobdelivery", "repo", false).await;
+        let mut config = (*state.config).clone();
+        config.git_service_timeout_secs = 1;
+        state.config = Arc::new(config);
+        let response = blob_route_request_path(
+            state.clone(),
+            "z6blobdelivery",
+            "file.txt",
+            "203.0.113.31:5000",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.git_blob_semaphore.available_permits() < MAX_CONCURRENT_BLOB_READS);
+        // Keep the body alive without ever polling it; the timer must run anyway.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.git_blob_semaphore.available_permits() != MAX_CONCURRENT_BLOB_READS {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("configured deadline must release blob admission");
+        use http_body_util::BodyExt;
+        assert!(response.into_body().collect().await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn blob_route_unreadable_pack_is_opaque_error(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = write_fake_git(tmp.path(), "#!/bin/sh\nif [ \"$1\" = rev-parse ]; then exit 0; fi\nread spec\necho \"$spec missing\"\n");
+        let state =
+            f4_state_with_repo(pool, tmp.path(), &fake, "z6blobunreadable", "repo", false).await;
+        let record = state
+            .db
+            .get_repo("z6blobunreadable", "repo")
+            .await
+            .unwrap()
+            .unwrap();
+        let path = state
+            .repo_store
+            .acquire(&record.owner_did, &record.name)
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink("removed-pack", path.join("objects/pack/unreadable.pack"))
+            .unwrap();
+        let response =
+            blob_route_request_path(state, "z6blobunreadable", "file.txt", "203.0.113.31:5000")
+                .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        use http_body_util::BodyExt;
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "overloaded");
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn blob_route_returns_not_found_on_non_blob_path(pool: sqlx::PgPool) {
+        use axum::http::StatusCode;
+        use http_body_util::BodyExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = write_fake_git(
+            tmp.path(),
+            "#!/bin/sh\nif [ \"$1\" = rev-parse ]; then exit 0; fi\nif [ \"$2\" = --batch-check ]; then echo '1111111111111111111111111111111111111111 tree 1024'; exit 0; fi\nexit 1\n",
+        );
+        let state = f4_state_with_repo(pool, tmp.path(), &fake, "z6blobtree", "repo", false).await;
+        let response =
+            blob_route_request_path(state, "z6blobtree", "somedir", "203.0.113.31:5000").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "not_found");
+    }
+
+    #[sqlx::test]
+    async fn blob_route_acquire_timeout_sheds_503_and_releases_permits(pool: sqlx::PgPool) {
+        use axum::http::StatusCode;
+        use http_body_util::BodyExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repos_dir = tmp.path().to_path_buf();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let endpoint = crate::test_support::silent_http_endpoint().await;
+        let tigris =
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
+                .await;
+        let lock_pool =
+            crate::git::repo_store::build_lock_pool(&pool, 4, std::time::Duration::from_secs(5));
+        state.repo_store =
+            crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), lock_pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        let mut cfg = (*state.config).clone();
+        cfg.git_acquire_timeout_secs = 1;
+        state.config = Arc::new(cfg);
+
+        // Repo exists in DB but not on disk, so acquire attempts Tigris and times out.
+        state
+            .db
+            .upsert_mirror_repo("z6blobacqtimeout", "repo", "/unused", None, false)
+            .await
+            .unwrap();
+
+        let response = blob_route_request_path(
+            state.clone(),
+            "z6blobacqtimeout",
+            "file.txt",
+            "203.0.113.31:5000",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "overloaded");
+        assert_eq!(state.git_read_semaphore.available_permits(), 64);
+        assert_eq!(
+            state.git_blob_semaphore.available_permits(),
+            MAX_CONCURRENT_BLOB_READS
+        );
+        assert_eq!(state.git_read_per_caller.tracked_keys(), 0);
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn blob_route_returns_200_with_expected_headers_and_content(pool: sqlx::PgPool) {
+        use axum::http::{header, StatusCode};
+        use http_body_util::BodyExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = write_fake_git(
+            tmp.path(),
+            "#!/bin/sh\nif [ \"$1\" = rev-parse ]; then exit 0; fi\nif [ \"$2\" = --batch-check ]; then echo '1111111111111111111111111111111111111111 blob 13'; exit 0; fi\nprintf '{\"hello\":123}'; exit 0\n",
+        );
+        let state = f4_state_with_repo(pool, tmp.path(), &fake, "z6blobhappy", "repo", false).await;
+        let response =
+            blob_route_request_path(state, "z6blobhappy", "data.json", "203.0.113.31:5000").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/json; charset=utf-8"
+        );
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "13");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"{\"hello\":123}");
     }
 
     #[test]

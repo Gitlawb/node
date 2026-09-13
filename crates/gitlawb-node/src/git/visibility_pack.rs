@@ -29,6 +29,29 @@ const WALK_TIMEOUT: Duration = Duration::from_secs(600);
 #[cfg(unix)]
 const WATCHDOG_TERM_GRACE: Duration = Duration::from_secs(1);
 
+/// Drain stdout completely while retaining no more than `limit` bytes. Continuing to
+/// drain after the retained buffer is full prevents a child from deadlocking on its
+/// stdout pipe without allowing its output to keep growing resident memory.
+fn drain_stdout(
+    reader: &mut impl std::io::Read,
+    limit: Option<usize>,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut out = Vec::new();
+    let mut exceeded = false;
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            return Ok((out, exceeded));
+        }
+        let retained = limit
+            .map(|limit| read.min(limit.saturating_sub(out.len())))
+            .unwrap_or(read);
+        out.extend_from_slice(&chunk[..retained]);
+        exceeded |= retained < read;
+    }
+}
+
 /// Run one git child under a shared `deadline` with process-group teardown,
 /// BLOCKING, and return its stdout. The child runs in its own process group; a
 /// watchdog thread SIGTERMs (lets git clean up its `*.lock` files), then SIGKILLs,
@@ -67,13 +90,14 @@ fn child_terminated_without_reaping(pid: i32) -> bool {
 }
 
 #[cfg(unix)]
-pub(crate) fn run_bounded_git_raw(
+fn run_bounded_git_raw_with_limit(
     git_bin: &str,
     args: &[&str],
     repo_path: &Path,
     stdin_bytes: &[u8],
     deadline: Instant,
-) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    stdout_limit: Option<usize>,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>, bool)> {
     use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
     use std::sync::mpsc::RecvTimeoutError;
@@ -149,14 +173,13 @@ pub(crate) fn run_bounded_git_raw(
         err
     });
     let mut stdout = child.stdout.take().context("git stdout was not piped")?;
-    let mut out = Vec::new();
+    let read_result = drain_stdout(&mut stdout, stdout_limit);
     // Blocking drain, unblocked by the child closing stdout on exit. The watchdog's
     // SIGTERM/SIGKILL is what makes a hung child exit; a git wedged in uninterruptible
     // (D-state) I/O survives even SIGKILL, so this drain and the wait below can block
     // until the kernel returns, pinning the walk thread and its permit. That residual
     // is unreachable in userspace (no signal reaps a D-state process) and matches the
     // async `reap_group_on_timeout`, which likewise only warns and gives up there.
-    let read_result = stdout.read_to_end(&mut out);
     // The drain has returned, but that only means all stdout write ends are closed —
     // NOT that the child has exited. A group member, or the leader itself, can close
     // stdout and keep running; standing the watchdog down on the drain alone (as the
@@ -183,7 +206,7 @@ pub(crate) fn run_bounded_git_raw(
     let status = child.wait().context("git wait failed")?;
     let err = err_reader.join().unwrap_or_default();
     let _ = writer.join();
-    read_result.context("failed to read git stdout")?;
+    let (out, stdout_exceeded) = read_result.context("failed to read git stdout")?;
     // The watchdog runs off a wall clock that can race a child finishing right at the
     // deadline. A child that exited on its own (success) is not a timeout even if the
     // watchdog fired late; only a child that did not exit successfully is a genuine
@@ -191,7 +214,44 @@ pub(crate) fn run_bounded_git_raw(
     if killed && !status.success() {
         return Err(crate::git::smart_http::GitServiceTimeout.into());
     }
+    Ok((status, out, err, stdout_exceeded))
+}
+
+#[cfg(unix)]
+pub(crate) fn run_bounded_git_raw(
+    git_bin: &str,
+    args: &[&str],
+    repo_path: &Path,
+    stdin_bytes: &[u8],
+    deadline: Instant,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    let (status, out, err, _) =
+        run_bounded_git_raw_with_limit(git_bin, args, repo_path, stdin_bytes, deadline, None)?;
     Ok((status, out, err))
+}
+
+/// Run a bounded git child while retaining at most `max_stdout_bytes` from stdout.
+/// The pipe is still drained after the limit so the child cannot block on a full pipe;
+/// `true` in the fourth tuple field reports that bytes were discarded. This is the
+/// output-side companion to the process deadline for callers serving attacker-chosen
+/// objects: a child that emits more than its preflight size cannot grow memory past the
+/// caller's ceiling.
+pub(crate) fn run_bounded_git_raw_capped(
+    git_bin: &str,
+    args: &[&str],
+    repo_path: &Path,
+    stdin_bytes: &[u8],
+    deadline: Instant,
+    max_stdout_bytes: usize,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>, bool)> {
+    run_bounded_git_raw_with_limit(
+        git_bin,
+        args,
+        repo_path,
+        stdin_bytes,
+        deadline,
+        Some(max_stdout_bytes),
+    )
 }
 
 /// Bounded git returning only stdout, `bail!`ing on any nonzero exit. The thin
@@ -227,13 +287,14 @@ pub(crate) fn run_bounded_git(
 /// the Unix version's signature and result semantics so every caller compiles on all
 /// targets (#174).
 #[cfg(not(unix))]
-pub(crate) fn run_bounded_git_raw(
+fn run_bounded_git_raw_with_limit(
     git_bin: &str,
     args: &[&str],
     repo_path: &Path,
     stdin_bytes: &[u8],
     deadline: Instant,
-) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    stdout_limit: Option<usize>,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>, bool)> {
     use std::io::{Read, Write};
     use std::sync::mpsc::RecvTimeoutError;
 
@@ -283,8 +344,7 @@ pub(crate) fn run_bounded_git_raw(
         })
     };
 
-    let mut out = Vec::new();
-    let read_result = stdout.read_to_end(&mut out);
+    let read_result = drain_stdout(&mut stdout, stdout_limit);
     // The drain has returned (child exited or was killed), so taking the lock here
     // cannot deadlock against the watchdog.
     let status = child
@@ -296,10 +356,23 @@ pub(crate) fn run_bounded_git_raw(
     let killed = watchdog.join().unwrap_or(false);
     let err = err_reader.join().unwrap_or_default();
     let _ = writer.join();
-    read_result.context("failed to read git stdout")?;
+    let (out, stdout_exceeded) = read_result.context("failed to read git stdout")?;
     if killed && !status.success() {
         return Err(crate::git::smart_http::GitServiceTimeout.into());
     }
+    Ok((status, out, err, stdout_exceeded))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn run_bounded_git_raw(
+    git_bin: &str,
+    args: &[&str],
+    repo_path: &Path,
+    stdin_bytes: &[u8],
+    deadline: Instant,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    let (status, out, err, _) =
+        run_bounded_git_raw_with_limit(git_bin, args, repo_path, stdin_bytes, deadline, None)?;
     Ok((status, out, err))
 }
 
@@ -1224,6 +1297,15 @@ pub fn withheld_blob_recipients_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stdout_drain_discards_bytes_past_the_retention_limit() {
+        let mut input = std::io::Cursor::new(b"0123456789".to_vec());
+        let (out, exceeded) = drain_stdout(&mut input, Some(4)).unwrap();
+        assert_eq!(out, b"0123");
+        assert!(exceeded);
+        assert_eq!(input.position(), 10, "the pipe must still be fully drained");
+    }
 
     /// Write an executable fake `git` shell script into `dir` and return its path,
     /// so a test can drive the walk's process-group teardown without a real git and
