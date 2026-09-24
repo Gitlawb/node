@@ -1658,6 +1658,7 @@ struct IdentifyPeerAddresses {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct IdentifyAddressChanges {
     added: Vec<Multiaddr>,
+    refreshed: Vec<Multiaddr>,
     removed: Vec<(PeerId, Multiaddr)>,
 }
 
@@ -1712,11 +1713,14 @@ impl IdentifyAddressBook {
                 }
             }
         }
-        // Global eviction follows refresh recency, so an active address does
-        // not lose its slot just because it was originally admitted first.
+        // Record refreshed addresses so the Identify handler can re-admit
+        // them to Kademlia. Kademlia may have dropped a retained address
+        // after a failed dial or never kept it for a full k-bucket, and a
+        // TTL refresh alone would never re-add it.
         for address in refreshed {
             self.remove_insertion_token(peer_id, &address);
-            self.insertion_order.push_back((peer_id, address));
+            self.insertion_order.push_back((peer_id, address.clone()));
+            changes.refreshed.push(address);
         }
 
         let mut new_addresses = self
@@ -1773,10 +1777,13 @@ impl IdentifyAddressBook {
             }
 
             if self.address_count >= IDENTIFY_GLOBAL_ADDRESS_LIMIT {
-                let Some(evicted) = self.evict_oldest(peer_id) else {
-                    break;
-                };
-                changes.removed.push(evicted);
+                // Reject the admission instead of evicting another peer's
+                // entry: cross-peer eviction lets a flood of new identities
+                // push honest peers' addresses out of the book and, when the
+                // evicted address is their last one, out of the Kademlia
+                // routing table. Per-peer eviction above still applies to the
+                // reporting peer's own addresses.
+                break;
             }
 
             if let Some(state) = self.peers.get_mut(&peer_id) {
@@ -1841,28 +1848,6 @@ impl IdentifyAddressBook {
         }
         state.addresses = retained;
         expired
-    }
-
-    fn evict_oldest(&mut self, preserve_peer: PeerId) -> Option<(PeerId, Multiaddr)> {
-        while let Some((peer_id, address)) = self.insertion_order.pop_front() {
-            let Some(state) = self.peers.get_mut(&peer_id) else {
-                continue;
-            };
-            let Some(index) = state
-                .addresses
-                .iter()
-                .position(|tracked| tracked.address == address)
-            else {
-                continue;
-            };
-            let evicted = state.addresses.remove(index)?.address;
-            self.address_count -= 1;
-            if state.addresses.is_empty() && peer_id != preserve_peer {
-                self.peers.remove(&peer_id);
-            }
-            return Some((peer_id, evicted));
-        }
-        None
     }
 
     fn remove_insertion_token(&mut self, peer_id: PeerId, address: &Multiaddr) {
@@ -4394,7 +4379,7 @@ pub async fn start(
                                         .remove_address(&removed_peer, &addr);
                                 }
                             }
-                            for addr in changes.added {
+                            for addr in changes.refreshed.into_iter().chain(changes.added) {
                                 swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                             }
                         }
@@ -4562,7 +4547,7 @@ mod tests {
     }
 
     #[test]
-    fn identify_global_eviction_preserves_refreshed_addresses() {
+    fn identify_global_budget_rejects_new_admissions() {
         let now = Instant::now();
         let mut book = IdentifyAddressBook::default();
         let peers = (0..IDENTIFY_GLOBAL_ADDRESS_LIMIT)
@@ -4580,15 +4565,23 @@ mod tests {
             now + IDENTIFY_ADDRESS_WINDOW,
             &[new_address.clone(), refreshed.clone()],
         );
-        assert_eq!(changes.added, vec![new_address]);
-        assert_eq!(changes.removed, vec![peers[1].clone()]);
-        assert!(book.peers[peer]
-            .addresses
-            .iter()
-            .any(|a| &a.address == refreshed));
+        // The budget is full: the new address is rejected rather than
+        // evicting another peer's entry, and the refreshed address keeps its
+        // slot and is reported for re-admission to Kademlia.
+        assert!(changes.added.is_empty());
+        assert!(changes.removed.is_empty());
+        assert_eq!(changes.refreshed, vec![(*refreshed).clone()]);
+        assert_eq!(book.peers.len(), IDENTIFY_GLOBAL_ADDRESS_LIMIT);
         assert_eq!(book.address_count, IDENTIFY_GLOBAL_ADDRESS_LIMIT);
         assert_eq!(book.insertion_order.len(), book.address_count);
-        assert_eq!(book.peers.len(), IDENTIFY_GLOBAL_ADDRESS_LIMIT - 1);
+        assert_eq!(
+            book.peers[peer]
+                .addresses
+                .iter()
+                .map(|a| &a.address)
+                .collect::<Vec<_>>(),
+            vec![refreshed]
+        );
     }
 
     #[test]
@@ -4691,8 +4684,19 @@ mod tests {
             now + IDENTIFY_ADDRESS_WINDOW,
             std::slice::from_ref(&address),
         );
-        assert_eq!(changes.added, vec![address]);
-        assert_eq!(changes.removed, vec![(peer_id, first_address)]);
+        // The global budget is full, so the admission is rejected and the
+        // peer's existing entry is left alone.
+        assert!(changes.added.is_empty());
+        assert!(changes.removed.is_empty());
+        assert_eq!(
+            book.peers[&peer_id]
+                .addresses
+                .iter()
+                .map(|a| &a.address)
+                .collect::<Vec<_>>(),
+            vec![&first_address]
+        );
+        assert_eq!(book.address_count, IDENTIFY_GLOBAL_ADDRESS_LIMIT);
     }
 
     #[test]
@@ -4711,6 +4715,9 @@ mod tests {
         let refresh = book.update(peer_id, refreshed, std::slice::from_ref(&address));
         assert!(refresh.added.is_empty());
         assert!(refresh.removed.is_empty());
+        // Refreshed addresses are reported so the Identify handler re-adds
+        // them to Kademlia even though they were not newly admitted.
+        assert_eq!(refresh.refreshed, vec![address.clone()]);
         assert!(book
             .expire(now + IDENTIFY_ADDRESS_TTL + Duration::from_secs(1))
             .is_empty());
