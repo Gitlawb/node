@@ -1123,19 +1123,27 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE pin_repair_sweep ADD COLUMN IF NOT EXISTS discovery_cursor_id TEXT NOT NULL DEFAULT ''",
         ],
     },
+    // Reservation: versions 27 and 28 are provisional and on hold. The runner
+    // keys the applied set on the integer alone, so a version another in-flight
+    // branch also claims is skipped in full on whichever side merges second:
+    // no error, no warning, while the schema quietly misses what this branch
+    // intended to create. Gitlawb/node#384 (still open) claims 27-35 under
+    // different names, so this PR's 27/28 numbering must not move to a new
+    // ceiling in a vacuum: hold until #384's claimed range lands or clears,
+    // then take versions strictly above that high-water.
     Migration {
         version: 27,
         name: "agent_tasks_assignee_key_didkey_aware",
         stmts: &[
             // Filtering agent_tasks by assignee normalizes did:key values via
             // ASSIGNEE_DID_CASE_SQL, making the raw idx_agent_tasks_assignee
-            // index unusable. Swap the index: drop the raw column index and
-            // build the matching expression index so list queries use an Index Cond.
-            // The CASE must stay byte-identical to ASSIGNEE_DID_CASE_SQL so
-            // Postgres matches it.
+            // index unusable, so drop it. The matching expression index is NOT
+            // built here: v28 builds the keyset-ordered variants directly, and
+            // a single-column expression index would exist for exactly one
+            // step while every deploy pays a full scan-and-sort to build it.
+            // v28's DROP INDEX IF EXISTS idx_agent_tasks_assignee_key stays as
+            // a defensive cleanup for databases that ran a pre-fix v27.
             "DROP INDEX IF EXISTS idx_agent_tasks_assignee",
-            // Keep byte-identical to ASSIGNEE_DID_CASE_SQL so Postgres uses the index.
-            "CREATE INDEX IF NOT EXISTS idx_agent_tasks_assignee_key ON agent_tasks ((CASE WHEN assignee_did LIKE 'did:key:%' AND position(':' in substr(assignee_did, 9)) = 0 THEN substr(assignee_did, 9) ELSE assignee_did END))",
         ],
     },
     Migration {
@@ -1151,9 +1159,11 @@ const MIGRATIONS: &[Migration] = &[
             // and DESC are load-bearing and must match the query. The CASE in the
             // assignee indexes must stay byte-identical to ASSIGNEE_DID_CASE_SQL.
             //
-            // Drop the single-column idx_agent_tasks_assignee_key from v27 and
-            // idx_agent_tasks_status from v1 so the planner never picks a
-            // non-keyset index that requires an in-memory Sort before LIMIT.
+            // Drop the single-column idx_agent_tasks_assignee_key (v27 no longer
+            // builds it, but the DROP stays as a defensive cleanup for
+            // databases that ran a pre-fix v27) and idx_agent_tasks_status
+            // from v1 so the planner never picks a non-keyset index that
+            // requires an in-memory Sort before LIMIT.
             "DROP INDEX IF EXISTS idx_agent_tasks_assignee_key",
             "DROP INDEX IF EXISTS idx_agent_tasks_status",
             "CREATE INDEX IF NOT EXISTS idx_agent_tasks_created_at_id ON agent_tasks (created_at DESC, id DESC)",
@@ -5142,15 +5152,11 @@ mod migration_tests {
     }
 
     #[sqlx::test]
-    async fn migration_v27_creates_assignee_expression_index(pool: sqlx::PgPool) {
+    async fn migration_v27_drops_raw_assignee_index(pool: sqlx::PgPool) {
         let db = super::Db::for_testing(pool);
         db.migrate().await.unwrap();
 
-        // Roll back: drop the expression index, restore the raw index, forget v27.
-        sqlx::query("DROP INDEX IF EXISTS idx_agent_tasks_assignee_key")
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        // Roll back: restore the raw index, forget v27.
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_agent_tasks_assignee ON agent_tasks(assignee_did)",
         )
@@ -5165,17 +5171,6 @@ mod migration_tests {
         // Re-run migration.
         db.migrate().await.unwrap();
 
-        let idx_exists: (bool,) = sqlx::query_as(
-            "SELECT EXISTS(
-                SELECT 1 FROM pg_indexes
-                WHERE tablename = 'agent_tasks' AND indexname = 'idx_agent_tasks_assignee_key'
-            )",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-        assert!(idx_exists.0, "idx_agent_tasks_assignee_key must exist");
-
         let old_idx_exists: (bool,) = sqlx::query_as(
             "SELECT EXISTS(
                 SELECT 1 FROM pg_indexes
@@ -5188,6 +5183,22 @@ mod migration_tests {
         assert!(
             !old_idx_exists.0,
             "idx_agent_tasks_assignee must be dropped"
+        );
+
+        // v27 no longer builds the single-column expression index; v28 builds
+        // the keyset-ordered variants directly.
+        let expr_idx_exists: (bool,) = sqlx::query_as(
+            "SELECT EXISTS(
+                SELECT 1 FROM pg_indexes
+                WHERE tablename = 'agent_tasks' AND indexname = 'idx_agent_tasks_assignee_key'
+            )",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            !expr_idx_exists.0,
+            "idx_agent_tasks_assignee_key must never be built by v27"
         );
 
         let recorded: (i64,) =

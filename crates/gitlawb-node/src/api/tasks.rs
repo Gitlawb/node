@@ -444,16 +444,14 @@ pub(crate) async fn get_visible_task(
 /// claim open (unassigned) tasks, including repo-less tasks or tasks on
 /// publicly-accessible repositories, without those task bodies being enumerable
 /// on unassigned read listings (#327 review). If a task is pre-assigned to a
-/// specific DID, only that designated assignee (or delegator) may claim it.
+/// specific DID, only that designated assignee may claim it, matching the
+/// conditional write in `claim_task` (no delegator exemption on either side).
 pub(crate) fn task_claimable(
     task: &AgentTask,
     caller: &str,
     repos_by_id: &HashMap<String, RepoRecord>,
     rules_by_repo: &HashMap<String, Vec<VisibilityRule>>,
 ) -> bool {
-    if crate::api::did_matches(caller, &task.delegator_did) {
-        return true;
-    }
     if let Some(assignee) = task.assignee_did.as_deref() {
         return crate::api::did_matches(caller, assignee);
     }

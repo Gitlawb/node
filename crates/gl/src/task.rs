@@ -779,6 +779,35 @@ mod tests {
             .unwrap();
     }
 
+    /// Pins `error_for_status` in `fetch_tasks`: a denied list read must
+    /// surface instead of rendering as an empty page. Deleting that call
+    /// keeps the suite green without this test: the 403 body below is a
+    /// well-formed empty page, so only the status check turns it into an
+    /// error.
+    #[tokio::test]
+    async fn test_list_tasks_server_error_surfaces() {
+        let mut server = mockito::Server::new_async().await;
+
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/v1/tasks\\?".to_string()),
+            )
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tasks":[],"has_more":false,"incomplete":false,"next_cursor":null}"#)
+            .create_async()
+            .await;
+
+        let err = fetch_tasks(&client_for(&server), None, None, 50, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("403"),
+            "a denied list read must surface the status, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_delegator_list_tasks_is_signed() {
         let mut server = mockito::Server::new_async().await;
