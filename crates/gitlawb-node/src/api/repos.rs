@@ -4834,6 +4834,157 @@ mod tests {
         );
     }
 
+    async fn json_body(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    fn federated_request() -> axum::http::Request<axum::body::Body> {
+        let mut request = axum::http::Request::builder()
+            .uri("/api/v1/repos/federated")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            "203.0.113.42:5000".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        request
+    }
+
+    /// Pins the federated response contract end to end: the envelope fields
+    /// (`count`, `nodes_queried`, `truncated`) and the per-repo annotations
+    /// (`node_url`, `node_did`, `local`) are asserted on an actual HTTP 200
+    /// body driven through `build_router`, not on a self-constructed value.
+    #[sqlx::test]
+    async fn federated_route_envelope_annotates_repos_on_real_200_body(pool: sqlx::PgPool) {
+        use tower::ServiceExt;
+
+        let state = crate::test_support::test_state(pool).await;
+        let node_did = state.node_did.to_string();
+        state
+            .db
+            .create_repo(&repo_owned_by(&node_did))
+            .await
+            .expect("seed local repo");
+
+        let router = crate::server::build_router(state);
+        let response = router.oneshot(federated_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+
+        assert_eq!(body["count"].as_u64(), Some(1));
+        assert_eq!(
+            body["nodes_queried"].as_u64(),
+            Some(1),
+            "no peers seeded, only the local node was queried"
+        );
+        assert_eq!(body["truncated"].as_bool(), Some(false));
+        let repo = &body["repos"][0];
+        assert_eq!(repo["name"].as_str(), Some("demo"));
+        assert_eq!(repo["local"].as_bool(), Some(true));
+        assert_eq!(repo["node_did"].as_str(), Some(node_did.as_str()));
+        assert!(
+            repo["node_url"].as_str().is_some_and(|u| !u.is_empty()),
+            "local repos must carry the node's URL, got {repo}"
+        );
+    }
+
+    /// `truncated` must be observable on the wire when the peer table holds
+    /// more rows than `MAX_FEDERATED_PEERS`. The peers point at an unreachable
+    /// address, so no live peer is needed; the count check fires before any
+    /// fetch is attempted.
+    #[sqlx::test]
+    async fn federated_route_reports_truncated_when_peer_table_overflows(pool: sqlx::PgPool) {
+        use tower::ServiceExt;
+
+        let state = crate::test_support::test_state(pool.clone()).await;
+        sqlx::query("INSERT INTO peers (did, http_url, last_ping_ok, announced_at) SELECT 'peer-' || n, 'http://127.0.0.1:1/', TRUE, '2026-01-01T00:00:00Z' FROM generate_series(1, $1) n")
+            .bind(MAX_FEDERATED_PEERS as i64 + 2)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let response = router.oneshot(federated_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["truncated"].as_bool(),
+            Some(true),
+            "more peers than the bound must surface as truncated"
+        );
+        assert_eq!(body["nodes_queried"].as_u64(), Some(1));
+    }
+
+    /// A single unreachable peer must still flip `truncated` on the wire via
+    /// the failed-fetch path, even though the peer table stays under the
+    /// bound. Guards the `aggregate.truncated = true` on fetch failure.
+    #[sqlx::test]
+    async fn federated_route_reports_truncated_when_peer_fetch_fails(pool: sqlx::PgPool) {
+        use tower::ServiceExt;
+
+        let state = crate::test_support::test_state(pool.clone()).await;
+        sqlx::query("INSERT INTO peers (did, http_url, last_ping_ok, announced_at) VALUES ('did:key:deadpeer', 'http://127.0.0.1:1/', TRUE, '2026-01-01T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let response = router.oneshot(federated_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["truncated"].as_bool(),
+            Some(true),
+            "a failed peer fetch must surface as truncated"
+        );
+        assert_eq!(body["nodes_queried"].as_u64(), Some(1));
+    }
+
+    /// Peer repos must carry `node_url`, `node_did` and `local: false` on the
+    /// real response body. Guards `enrich_federated_repo`: dropping an
+    /// annotation there must turn this red.
+    #[sqlx::test]
+    async fn federated_route_annotates_peer_repos_on_real_200_body(pool: sqlx::PgPool) {
+        use tower::ServiceExt;
+
+        let mut peer_server = mockito::Server::new_async().await;
+        let peer_mock = peer_server
+            .mock("GET", "/api/v1/repos")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"[{"id": "peer-repo-1", "name": "from-peer"}]"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let state = crate::test_support::test_state(pool.clone()).await;
+        sqlx::query("INSERT INTO peers (did, http_url, last_ping_ok, announced_at) VALUES ('did:key:peer1', $1, TRUE, '2026-01-01T00:00:00Z')")
+            .bind(peer_server.url())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let response = router.oneshot(federated_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["truncated"].as_bool(), Some(false));
+        assert_eq!(body["nodes_queried"].as_u64(), Some(2));
+        let repo = body["repos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"].as_str() == Some("peer-repo-1"))
+            .expect("peer repo present in federated body");
+        assert_eq!(repo["node_url"].as_str(), Some(peer_server.url().as_str()));
+        assert_eq!(repo["node_did"].as_str(), Some("did:key:peer1"));
+        assert_eq!(repo["local"].as_bool(), Some(false));
+        peer_mock.assert_async().await;
+    }
+
     #[test]
     fn upload_pack_request_finalizes_only_with_done_pktline() {
         let want = "0032want 1111111111111111111111111111111111111111\n";
