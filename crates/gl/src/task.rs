@@ -1858,9 +1858,12 @@ mod tests {
 
         let client = NodeClient::new(server.url(), None);
         let err = fetch_tasks(&client, None, None, 1, None).await.unwrap_err();
+        // Must hit the declared Content-Length pre-check ("declared"), not
+        // the streamed accumulation guard: with_body sends a Content-Length
+        // above the budget, pinning the pre-check arm.
         assert!(err
             .to_string()
-            .contains("task response exceeds byte budget"));
+            .contains("task response exceeds byte budget (declared"));
     }
 
     #[tokio::test]
