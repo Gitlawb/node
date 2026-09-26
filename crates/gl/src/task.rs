@@ -1871,15 +1871,20 @@ mod tests {
             .mock("GET", "/api/v1/tasks?limit=1")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(large_payload)
+            .with_chunked_body(move |w: &mut dyn std::io::Write| {
+                w.write_all(large_payload.as_bytes())
+            })
             .create_async()
             .await;
 
         let client = NodeClient::new(server.url(), None);
         let err = fetch_tasks(&client, None, None, 1, None).await.unwrap_err();
+        // Must hit the streamed accumulation guard ("exceeded"), not the
+        // declared Content-Length check: with_chunked_body sends no
+        // Content-Length, pinning the no-length path.
         assert!(err
             .to_string()
-            .contains("task response exceeds byte budget"));
+            .contains("task response exceeds byte budget (exceeded"));
     }
 
     // ── Identity failure zero-network-request tests (#327 review) ────
