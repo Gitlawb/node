@@ -457,28 +457,87 @@ pub async fn dispute_bounty(
 }
 
 /// GET /api/v1/bounties/stats
-pub async fn bounty_stats(State(state): State<AppState>) -> Result<Json<BountyStatsResponse>> {
-    let open = state.db.count_bounties_by_status("open").await.unwrap_or(0);
-    let claimed = state
-        .db
-        .count_bounties_by_status("claimed")
-        .await
-        .unwrap_or(0);
-    let completed = state
-        .db
-        .count_bounties_by_status("completed")
-        .await
-        .unwrap_or(0);
+pub async fn bounty_stats(
+    State(state): State<AppState>,
+    auth: Option<Extension<AuthenticatedDid>>,
+) -> Result<Json<BountyStatsResponse>> {
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let mut memo = std::collections::HashMap::new();
+    let mut open = 0i64;
+    let mut claimed = 0i64;
+    let mut completed = 0i64;
+    let mut agent_earnings: std::collections::HashMap<String, (i64, i64)> = std::collections::HashMap::new();
 
-    let leaders = state.db.bounty_leaderboard(10).await.unwrap_or_default();
-    let leaderboard = leaders
+    let page_size = 200i64;
+    let mut cursor: Option<(String, String)> = None;
+
+    loop {
+        let after = cursor.as_ref().map(|(ts, id)| (ts.as_str(), id.as_str()));
+        let bounties = state
+            .db
+            .list_bounties(
+                None,
+                None,
+                None,
+                page_size,
+                after.map(|(ts, _)| ts),
+                after.map(|(_, id)| id),
+            )
+            .await?;
+        if bounties.is_empty() {
+            break;
+        }
+
+        let last = bounties.last().unwrap();
+        for b in &bounties {
+            let key = format!("{}/{}", b.repo_owner, b.repo_name);
+            let admitted = if let Some(&result) = memo.get(&key) {
+                result
+            } else {
+                let result = crate::api::authorize_repo_read(
+                    &state,
+                    &b.repo_owner,
+                    &b.repo_name,
+                    caller,
+                    "/",
+                )
+                .await
+                .is_ok();
+                memo.insert(key, result);
+                result
+            };
+
+            if admitted {
+                match b.status.as_str() {
+                    "open" => open += 1,
+                    "claimed" => claimed += 1,
+                    "completed" => {
+                        completed += 1;
+                        if let Some(ref claimant) = b.claimant_did {
+                            let entry = agent_earnings.entry(claimant.clone()).or_insert((0, 0));
+                            entry.0 += 1;
+                            entry.1 += b.amount;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        cursor = Some((last.created_at.clone(), last.id.clone()));
+    }
+
+    let mut leaderboard: Vec<AgentBountyEntry> = agent_earnings
         .into_iter()
-        .map(|(did, cnt, total)| AgentBountyEntry {
+        .map(|(did, (cnt, total))| AgentBountyEntry {
             did,
             completed: cnt,
             total_earned: total,
         })
         .collect();
+
+    leaderboard.sort_by(|a, b| b.total_earned.cmp(&a.total_earned).then_with(|| b.completed.cmp(&a.completed)));
+    leaderboard.truncate(10);
 
     Ok(Json(BountyStatsResponse {
         open,
@@ -492,8 +551,63 @@ pub async fn bounty_stats(State(state): State<AppState>) -> Result<Json<BountySt
 pub async fn agent_bounty_stats(
     State(state): State<AppState>,
     Path(did): Path<String>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let (count, total) = state.db.agent_bounty_stats(&did).await.unwrap_or((0, 0));
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let mut memo = std::collections::HashMap::new();
+    let mut count = 0i64;
+    let mut total = 0i64;
+
+    let page_size = 200i64;
+    let mut cursor: Option<(String, String)> = None;
+
+    loop {
+        let after = cursor.as_ref().map(|(ts, id)| (ts.as_str(), id.as_str()));
+        let bounties = state
+            .db
+            .list_bounties(
+                None,
+                None,
+                Some("completed"),
+                page_size,
+                after.map(|(ts, _)| ts),
+                after.map(|(_, id)| id),
+            )
+            .await?;
+        if bounties.is_empty() {
+            break;
+        }
+
+        let last = bounties.last().unwrap();
+        for b in &bounties {
+            if b.claimant_did.as_deref().is_some_and(|c| crate::api::did_matches(&did, c)) {
+                let key = format!("{}/{}", b.repo_owner, b.repo_name);
+                let admitted = if let Some(&result) = memo.get(&key) {
+                    result
+                } else {
+                    let result = crate::api::authorize_repo_read(
+                        &state,
+                        &b.repo_owner,
+                        &b.repo_name,
+                        caller,
+                        "/",
+                    )
+                    .await
+                    .is_ok();
+                    memo.insert(key, result);
+                    result
+                };
+
+                if admitted {
+                    count += 1;
+                    total += b.amount;
+                }
+            }
+        }
+
+        cursor = Some((last.created_at.clone(), last.id.clone()));
+    }
+
     Ok(Json(serde_json::json!({
         "did": did,
         "completed_bounties": count,
