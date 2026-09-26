@@ -791,7 +791,7 @@ mod tests {
         let _m = server
             .mock(
                 "GET",
-                mockito::Matcher::Regex(r"/api/v1/tasks\\?".to_string()),
+                mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()),
             )
             .with_status(403)
             .with_header("content-type", "application/json")
@@ -802,9 +802,16 @@ mod tests {
         let err = fetch_tasks(&client_for(&server), None, None, 50, None)
             .await
             .unwrap_err();
-        assert!(
-            err.to_string().contains("403"),
-            "a denied list read must surface the status, got: {err}"
+        // Assert the status itself, not a substring of the rendered error:
+        // the reqwest message embeds the mock server URL, whose random port
+        // can spuriously contain "403".
+        let status = err
+            .downcast_ref::<reqwest::Error>()
+            .and_then(|e| e.status());
+        assert_eq!(
+            status,
+            Some(reqwest::StatusCode::FORBIDDEN),
+            "a denied list read must surface the 403 status, got: {err}"
         );
     }
 

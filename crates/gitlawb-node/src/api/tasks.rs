@@ -2261,6 +2261,68 @@ mod visible_tasks_tests {
         );
     }
 
+    /// Pins the delegator deny on a pre-assigned claim: the delegator
+    /// claiming a task assigned to someone else gets the opaque 404 at the
+    /// pre-check, not a misdescribing 409 at the write. Goes RED if a
+    /// delegator exemption is restored at the head of `task_claimable`,
+    /// which would reintroduce the pre-check/write mismatch.
+    #[sqlx::test]
+    async fn claim_task_delegator_cannot_claim_preassigned_task(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("public-repo", DELEGATOR, "public", true))
+            .await
+            .unwrap();
+        let mut assigned = task("preassigned", Some("public-repo"), DELEGATOR);
+        assigned.assignee_did = Some(ASSIGNEE.into());
+        state.db.create_task(&assigned).await.unwrap();
+
+        let delegator_resp = full_task_router(state.clone())
+            .oneshot(signed_request_as(
+                DELEGATOR,
+                Method::POST,
+                "/api/v1/tasks/preassigned/claim",
+                Body::from(format!(r#"{{"assignee_did":"{DELEGATOR}"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            delegator_resp.status(),
+            StatusCode::NOT_FOUND,
+            "the delegator must receive opaque not-found when attempting to claim a task pre-assigned to someone else"
+        );
+        let delegator_body = body_json(delegator_resp).await;
+        assert!(!delegator_body.to_string().contains(SECRET_UCAN));
+        assert_eq!(
+            state
+                .db
+                .get_task("preassigned")
+                .await
+                .unwrap()
+                .unwrap()
+                .assignee_did
+                .as_deref(),
+            Some(ASSIGNEE),
+            "delegator claim must leave the designated assignee in place"
+        );
+
+        // The designated assignee can still claim the task.
+        let assignee_resp = full_task_router(state.clone())
+            .oneshot(signed_request_as(
+                ASSIGNEE,
+                Method::POST,
+                "/api/v1/tasks/preassigned/claim",
+                Body::from(format!(r#"{{"assignee_did":"{ASSIGNEE}"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(assignee_resp.status(), StatusCode::OK);
+        let claimed = body_json(assignee_resp).await;
+        assert_eq!(claimed["status"], "claimed");
+        assert_eq!(claimed["assignee_did"], ASSIGNEE);
+    }
+
     /// `create_task` stores the supplied assignee form unchanged. Claim binds
     /// the authenticated DID (typically `did:key:...`) and list filters pass
     /// the query string through. Both SQL comparisons must collapse the
