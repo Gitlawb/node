@@ -460,11 +460,16 @@ pub(crate) fn task_claimable(
         // Unscoped open task (no repo_id) is claimable by any authenticated agent
         return true;
     };
+    // Fail closed when the task's repo cannot be resolved to a locally-hosted
+    // repo: slash-form ids are mirror rows and a repo the node does not host
+    // carries no visibility rules, so neither can establish claim eligibility.
+    // This mirrors the fail-closed check `task_visible` already runs on the
+    // same row class; unscoped repo-less tasks stay claimable by design.
     if repo_id.contains('/') {
-        return true;
+        return false;
     }
     let Some(record) = repos_by_id.get(repo_id) else {
-        return true;
+        return false;
     };
     let rules = rules_by_repo
         .get(&record.id)
@@ -2092,6 +2097,55 @@ mod visible_tasks_tests {
             "claiming an invisible private-repo task must 404, not succeed or leak via 409"
         );
         assert_not_found_envelope(&body_json(claim_resp).await);
+    }
+
+    /// Fail-closed claim gate: an unassigned task whose `repo_id` is slash-form
+    /// (mirror row) or names a repo this node does not host is claimable by
+    /// nobody, matching `task_visible`'s fail-closed check on the same row
+    /// class. Goes RED if `task_claimable` re-opens the unknown-repo arms: the
+    /// stranger's claim would succeed and steal the task.
+    #[sqlx::test]
+    async fn claim_task_on_unresolvable_repo_task_returns_404_and_keeps_assignee(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_task(&task("slash-task", Some("owner/mirror-repo"), DELEGATOR))
+            .await
+            .unwrap();
+        state
+            .db
+            .create_task(&task("ghost-task", Some("ghost-repo"), DELEGATOR))
+            .await
+            .unwrap();
+
+        for task_id in ["slash-task", "ghost-task"] {
+            let claim_resp = full_task_router(state.clone())
+                .oneshot(signed_request_as(
+                    STRANGER,
+                    Method::POST,
+                    &format!("/api/v1/tasks/{task_id}/claim"),
+                    Body::from(format!(r#"{{"assignee_did":"{STRANGER}"}}"#)),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                claim_resp.status(),
+                StatusCode::NOT_FOUND,
+                "claiming an unresolvable-repo task must 404, not succeed or leak via 409"
+            );
+            assert_not_found_envelope(&body_json(claim_resp).await);
+            assert_eq!(
+                state
+                    .db
+                    .get_task(task_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .assignee_did,
+                None,
+                "a denied claim must leave the task's assignee unchanged"
+            );
+        }
     }
 
     #[sqlx::test]
