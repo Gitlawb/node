@@ -4856,6 +4856,9 @@ mod tests {
     /// (`count`, `nodes_queried`, `truncated`) and the per-repo annotations
     /// (`node_url`, `node_did`, `local`) are asserted on an actual HTTP 200
     /// body driven through `build_router`, not on a self-constructed value.
+    /// The seeded repo is deliberately owned by a DID other than the node:
+    /// the envelope must carry the node's DID, so a regression that reports
+    /// the owner DID instead would fail the `node_did` assertion.
     #[sqlx::test]
     async fn federated_route_envelope_annotates_repos_on_real_200_body(pool: sqlx::PgPool) {
         use tower::ServiceExt;
@@ -4864,7 +4867,7 @@ mod tests {
         let node_did = state.node_did.to_string();
         state
             .db
-            .create_repo(&repo_owned_by(&node_did))
+            .create_repo(&repo_owned_by("did:key:z6MkEnvelopeOwnerNotTheNode"))
             .await
             .expect("seed local repo");
 
@@ -4891,15 +4894,32 @@ mod tests {
     }
 
     /// `truncated` must be observable on the wire when the peer table holds
-    /// more rows than `MAX_FEDERATED_PEERS`. The peers point at an unreachable
-    /// address, so no live peer is needed; the count check fires before any
-    /// fetch is attempted.
+    /// more rows than `MAX_FEDERATED_PEERS`. Every seeded peer points at the
+    /// same reachable stub returning `[]`, so no fetch can fail and no peer
+    /// page can report truncation: the count bound is the only reason the
+    /// body says `truncated`. The `nodes_queried` assertion pins the fetch
+    /// side: every peer inside the bound is queried, and dropping the count
+    /// bound would report `truncated: false`.
     #[sqlx::test]
     async fn federated_route_reports_truncated_when_peer_table_overflows(pool: sqlx::PgPool) {
         use tower::ServiceExt;
 
+        let mut peer_server = mockito::Server::new_async().await;
+        let peer_mock = peer_server
+            .mock("GET", "/api/v1/repos")
+            .match_query(mockito::Matcher::Exact(format!(
+                "limit={MAX_FEDERATED_PEER_REPOS}&offset=0"
+            )))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[]")
+            .expect(MAX_FEDERATED_PEERS)
+            .create_async()
+            .await;
+
         let state = crate::test_support::test_state(pool.clone()).await;
-        sqlx::query("INSERT INTO peers (did, http_url, last_ping_ok, announced_at) SELECT 'peer-' || n, 'http://127.0.0.1:1/', TRUE, '2026-01-01T00:00:00Z' FROM generate_series(1, $1) n")
+        sqlx::query("INSERT INTO peers (did, http_url, last_ping_ok, announced_at) SELECT 'peer-' || n, $1, TRUE, '2026-01-01T00:00:00Z' FROM generate_series(1, $2) n")
+            .bind(peer_server.url())
             .bind(MAX_FEDERATED_PEERS as i64 + 2)
             .execute(&pool)
             .await
@@ -4914,7 +4934,12 @@ mod tests {
             Some(true),
             "more peers than the bound must surface as truncated"
         );
-        assert_eq!(body["nodes_queried"].as_u64(), Some(1));
+        assert_eq!(
+            body["nodes_queried"].as_u64(),
+            Some(1 + MAX_FEDERATED_PEERS as u64),
+            "the stub is reachable, so every peer inside the bound is queried"
+        );
+        peer_mock.assert_async().await;
     }
 
     /// A single unreachable peer must still flip `truncated` on the wire via
@@ -4952,7 +4977,13 @@ mod tests {
         let mut peer_server = mockito::Server::new_async().await;
         let peer_mock = peer_server
             .mock("GET", "/api/v1/repos")
-            .match_query(mockito::Matcher::Any)
+            // Pin the outbound peer query parameters: production must request
+            // the bounded page. Dropping the parameters stops matching this
+            // mock, so the peer fetch fails and the body reports
+            // `truncated: true` instead of `false` below.
+            .match_query(mockito::Matcher::Exact(format!(
+                "limit={MAX_FEDERATED_PEER_REPOS}&offset=0"
+            )))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"[{"id": "peer-repo-1", "name": "from-peer"}]"#)
