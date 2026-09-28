@@ -62,6 +62,18 @@ const STREAM_DOMAIN: &[u8] = b"gitlawb/tasks-cursor-stream/v1";
 /// token short enough to sit in a query string.
 const TAG_LEN: usize = 16;
 
+/// Padding bucket for the serialized cursor payload, in bytes. The keystream
+/// XORs the plaintext byte for byte, so token length would otherwise track
+/// payload length and leak the named row's field widths to a holder who
+/// cannot decrypt anything. 128 comfortably covers the widest realistic
+/// payload: a 35-char nanosecond-precision RFC3339 timestamp
+/// (`to_rfc3339()` never renders longer), a 36-char server-minted UUID, and
+/// the fixed JSON envelope plus a 10-digit expiry, which together stay under
+/// 100 bytes. Should a future payload ever exceed the bucket, the length
+/// rounds up to the next multiple instead of failing, so `encode` never
+/// breaks — it just mints a longer token.
+const PAYLOAD_BUCKET: usize = 128;
+
 /// How long an issued cursor stays acceptable. Keyset positions never go stale
 /// on their own — `created_at`/`id` are immutable — so this is not a
 /// correctness bound. It bounds how long a token stays valid across a node
@@ -216,6 +228,14 @@ fn apply_keystream(key: &TaskCursorKey, iv: &[u8; TAG_LEN], buf: &mut [u8]) {
 }
 
 /// Mint a token resuming at `position` for `filter`, usable only by `caller`.
+///
+/// The serialized payload is padded with trailing whitespace to a fixed
+/// bucket before the SIV tag is computed: the keystream preserves plaintext
+/// length, so an unpadded payload would let the token's length leak the
+/// named row's field widths (a 32-char `to_rfc3339()` rendering mints a
+/// shorter token than a 35-char one). `decode` tolerates the padding because
+/// `serde_json` ignores trailing whitespace, and the tag covers the padded
+/// bytes, so a token minted before padding landed still verifies.
 pub fn encode(
     key: &TaskCursorKey,
     filter: TaskFilter<'_>,
@@ -228,6 +248,8 @@ pub fn encode(
         e: chrono::Utc::now().timestamp() + CURSOR_TTL_SECS,
     })
     .expect("cursor payload is plain strings and an integer");
+    let padded_len = payload.len().next_multiple_of(PAYLOAD_BUCKET);
+    payload.resize(padded_len, b' ');
     let iv = siv(key, filter, caller, &payload);
     apply_keystream(key, &iv, &mut payload);
     format!(
@@ -334,6 +356,42 @@ mod tests {
         assert!(
             serde_json::from_slice::<serde_json::Value>(&raw).is_err(),
             "token body must not be parseable as JSON"
+        );
+    }
+
+    /// The keystream preserves plaintext length, so without the fixed-width
+    /// padding a token naming a 35-char timestamp would be measurably longer
+    /// than one naming a 32-char one: the holder would learn the withheld
+    /// row's field widths without decrypting anything. Mint the same shape
+    /// both ways and require identical token length.
+    #[test]
+    fn token_length_does_not_vary_with_position_width() {
+        let k = key();
+        // Ids are server-minted fixed-length UUIDs; the timestamp is the
+        // width that varies in production (`to_rfc3339()` renders 35 chars
+        // with nanoseconds, 32 without fractional seconds).
+        let id = "b3f7a1c2-4d5e-4f6a-8b9c-0d1e2f3a4b5c";
+        let narrow = encode(
+            &k,
+            unfiltered(),
+            None,
+            &TaskPosition::new("2026-01-03T00:00:00+00:00", id),
+        );
+        let wide = encode(
+            &k,
+            unfiltered(),
+            None,
+            &TaskPosition::new("2026-01-03T00:00:00.123456789+00:00", id),
+        );
+        assert_eq!(
+            narrow.len(),
+            wide.len(),
+            "tokens must not leak the named row's field widths: {narrow} vs {wide}"
+        );
+        // The padded token still decodes to the exact stored string.
+        assert_eq!(
+            decode(&k, unfiltered(), None, &wide).unwrap(),
+            TaskPosition::new("2026-01-03T00:00:00.123456789+00:00", id)
         );
     }
 
