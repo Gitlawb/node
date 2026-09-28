@@ -1250,6 +1250,18 @@ mod tests {
         .await;
     }
 
+    /// Use a rooted path without a Windows drive prefix in the remote fixture.
+    /// The destination still resolves on the temp directory's current drive,
+    /// while the remote's relative path contains no illegal colon component.
+    fn absolute_slug_path(path: &Path) -> String {
+        assert!(path.is_absolute());
+        path.components()
+            .filter(|part| !matches!(part, std::path::Component::Prefix(_)))
+            .collect::<std::path::PathBuf>()
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
     #[sqlx::test]
     async fn process_batch_rejects_slug_escaping_repos_dir(pool: PgPool) {
         // The verified escape from #272: `PathBuf::join` discards everything
@@ -1265,12 +1277,13 @@ mod tests {
         // fails on but leaves the parent it created, so assert on both.
         let outside = TempDir::new().unwrap();
         let escape_dir = outside.path().join("nest");
-        let slug = format!("a/{}/escape", escape_dir.display());
+        let escape_path = absolute_slug_path(&escape_dir);
+        let slug = format!("a/{escape_path}/escape");
         let escape_target = escape_dir.join("escape.git");
 
         // Serve the composed URL for real, so a run without the guard genuinely
         // clones outside the root rather than merely failing at git.
-        let rel = format!("a{}/escape", escape_dir.display());
+        let rel = format!("a{escape_path}/escape");
         let (_remote, peer_url) = rooted_remote(&[&rel]);
 
         let did = "did:key:z6MkAttacker";
@@ -1390,6 +1403,7 @@ mod tests {
     // ── canonical containment before the git call (issue #272) ───────────────
 
     /// Every ref in `repo`, as one string, for a before/after comparison.
+    #[cfg(unix)]
     fn refs_of(repo: &Path) -> String {
         let out = Command::new("git")
             .args(["-C", repo.to_str().unwrap(), "for-each-ref"])
@@ -1722,6 +1736,7 @@ mod tests {
     /// starvation tests is fixed rather than dependent on how fast the loop
     /// runs. Two rows enqueued in the same microsecond would otherwise order
     /// arbitrarily.
+    #[cfg(unix)]
     async fn enqueue_at(db: &Db, pool: &PgPool, repo: &str, did: &str, enqueued_at: &str) {
         enqueue(db, repo, did).await;
         sqlx::query("UPDATE sync_queue SET enqueued_at = $1 WHERE repo = $2")
@@ -1915,7 +1930,8 @@ mod tests {
 
         let outside = TempDir::new().unwrap();
         let escape_dir = outside.path().join("nest");
-        let slug = format!("a/{}/gitlawb-probe", escape_dir.display());
+        let escape_path = absolute_slug_path(&escape_dir);
+        let slug = format!("a/{escape_path}/gitlawb-probe");
         let escape_target = escape_dir.join("gitlawb-probe.git");
 
         // Two things this fixture must get right or the test is green for the
@@ -1926,7 +1942,7 @@ mod tests {
         // run without the guard genuinely clones outside the root instead of
         // just failing at git. Db::upsert_peer cannot seed this row: it gates on
         // is_public_http_url, which rejects file://.
-        let rel = format!("a{}/gitlawb-probe", escape_dir.display());
+        let rel = format!("a{escape_path}/gitlawb-probe");
         let (_remote, peer_url) = rooted_remote(&[&rel]);
         let did = "did:key:z6MkAttacker";
         seed_local_peer(&pool, did, &peer_url).await;

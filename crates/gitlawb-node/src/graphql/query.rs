@@ -1,57 +1,154 @@
 use async_graphql::{Context, Object, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use std::sync::Arc;
 
-use crate::db::Db;
+use crate::api::events::MAX_VISIBLE_REF_UPDATES;
+use crate::db::{Db, RepoRecord, MAX_VISIBLE_REPO_PAGE_SIZE, MAX_VISIBLE_TASK_PAGE_SIZE};
 
-use super::types::{AgentTaskType, RefUpdateType, RepoType};
+use super::types::{AgentTaskType, RefUpdateType, RepoPageType, RepoType};
+
+fn repo_type(repo: RepoRecord) -> RepoType {
+    RepoType {
+        name: repo.name,
+        owner_did: repo.owner_did,
+        description: repo.description,
+        default_branch: repo.default_branch,
+        created_at: repo.created_at.to_rfc3339(),
+    }
+}
+
+fn repo_cursor(repo: &RepoRecord) -> String {
+    URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&(&repo.owner_did, &repo.name))
+            .expect("a pair of strings is JSON serializable"),
+    )
+}
+
+fn parse_repo_cursor(cursor: &str) -> Result<(String, String)> {
+    // A position contains only public response fields, not a database id or
+    // authority. Every page re-evaluates visibility for the current caller.
+    if cursor.len() > 4096 {
+        return Err(async_graphql::Error::new("invalid repository cursor"));
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| async_graphql::Error::new("invalid repository cursor"))?;
+    let position: (String, String) = serde_json::from_slice(&bytes)
+        .map_err(|_| async_graphql::Error::new("invalid repository cursor"))?;
+    // PostgreSQL text cannot contain NUL. Reject it as malformed input before
+    // binding either cursor component, rather than reporting a database error.
+    if position.0.contains('\0') || position.1.contains('\0') {
+        return Err(async_graphql::Error::new("invalid repository cursor"));
+    }
+    Ok(position)
+}
 
 pub struct QueryRoot;
 
 #[Object]
 impl QueryRoot {
+    // DB-backed roots carry a base cost so aliases consume the request budget
+    // even when each alias selects only one inexpensive response field.
+    // `repos` performs the same full corpus scan as a max-size `reposPage`
+    // (list_visible_repos_page with MAX_VISIBLE_REPO_PAGE_SIZE + 1), so it
+    // is priced as the full page it is, not as a cheap alias.
+    #[graphql(complexity = "50 + MAX_VISIBLE_REPO_PAGE_SIZE + child_complexity")]
+    /// Complete visible repository list, up to the documented maximum number
+    /// of entries. Larger lists must use reposPage; this field returns an
+    /// error instead of truncating silently.
     async fn repos(&self, ctx: &Context<'_>) -> Result<Vec<RepoType>> {
         let db = ctx.data_unchecked::<Arc<Db>>();
-        let repos = db
-            .list_all_repos_deduped()
-            .await
-            .map_err(crate::graphql::graphql_db_err)?;
-
-        // Apply the same "/" visibility gate the REST/per-repo endpoints use so
-        // this surface does not enumerate private repos (#97). The caller DID is
-        // threaded onto the context by optional_signature; absent = anonymous.
         let caller = ctx
             .data::<crate::auth::AuthenticatedDid>()
             .ok()
             .map(|d| d.0.as_str());
-        let ids: Vec<String> = repos.iter().map(|r| r.id.clone()).collect();
-        let rules_by_repo = db
-            .list_visibility_rules_for_repos(&ids)
+        let mut repos = db
+            .list_visible_repos_page(caller, None, MAX_VISIBLE_REPO_PAGE_SIZE + 1)
             .await
             .map_err(crate::graphql::graphql_db_err)?;
-
-        Ok(repos
-            .into_iter()
-            .filter(|r| {
-                let rules = rules_by_repo.get(&r.id).map(Vec::as_slice).unwrap_or(&[]);
-                crate::visibility::listable_at_root(rules, r.is_public, &r.owner_did, caller)
-            })
-            .map(|r| RepoType {
-                name: r.name,
-                owner_did: r.owner_did,
-                description: r.description,
-                default_branch: r.default_branch,
-                created_at: r.created_at.to_rfc3339(),
-            })
-            .collect())
+        if repos.len() > MAX_VISIBLE_REPO_PAGE_SIZE {
+            return Err(async_graphql::Error::new(format!(
+                "repository list exceeds {} entries; use reposPage with limit and after",
+                MAX_VISIBLE_REPO_PAGE_SIZE
+            )));
+        }
+        // Preserve the legacy activity ordering for complete, small lists.
+        repos.sort_by_key(|repo| std::cmp::Reverse(repo.updated_at));
+        Ok(repos.into_iter().map(repo_type).collect())
     }
 
+    /// Bounded visible repositories ordered by owner and name. Continue with
+    /// endCursor while hasNextPage is true. Pages are not a database snapshot.
+    // Every page sorts the full deduplicated corpus under COLLATE "C"
+    // (list_visible_repos_page documents the accepted O(total repos) bound),
+    // so the price charges the scan, not the emitted rows: a limit:1 page
+    // costs the same as a max-size page, the way `repos` is priced.
+    #[graphql(complexity = "50 + MAX_VISIBLE_REPO_PAGE_SIZE + child_complexity")]
+    async fn repos_page(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(
+            default = 50,
+            desc = "Page size from 1 to the documented maximum; other values are rejected."
+        )]
+        limit: i64,
+        after: Option<String>,
+    ) -> Result<RepoPageType> {
+        if !(1..=MAX_VISIBLE_REPO_PAGE_SIZE as i64).contains(&limit) {
+            return Err(async_graphql::Error::new(format!(
+                "limit must be between 1 and {}",
+                MAX_VISIBLE_REPO_PAGE_SIZE
+            )));
+        }
+        let after = after.as_deref().map(parse_repo_cursor).transpose()?;
+        let caller = ctx
+            .data::<crate::auth::AuthenticatedDid>()
+            .ok()
+            .map(|d| d.0.as_str());
+        let db = ctx.data_unchecked::<Arc<Db>>();
+        let mut repos = db
+            .list_visible_repos_page(
+                caller,
+                after
+                    .as_ref()
+                    .map(|(owner, name)| (owner.as_str(), name.as_str())),
+                limit as usize + 1,
+            )
+            .await
+            .map_err(crate::graphql::graphql_db_err)?;
+        let has_next_page = repos.len() > limit as usize;
+        repos.truncate(limit as usize);
+        let end_cursor = repos.last().map(repo_cursor);
+        Ok(RepoPageType {
+            nodes: repos.into_iter().map(repo_type).collect(),
+            has_next_page,
+            end_cursor,
+        })
+    }
+
+    // Complexity is additive with a base reflecting the collector's fixed scan:
+    // every request loads the full deduped repo set, the quarantined set, and
+    // the visibility rules, then walks up to max(limit, 2048) event rows past
+    // withheld ones, regardless of `limit`. A multiplicative price both
+    // undercharged limit:1 (51 for that fixed work) and made a request at the
+    // documented maximum unreachable (two fields at max limit cost 450 > 400).
+    //
+    // Decision on the collector floor (review #465, 3rd round): the up-to-2048
+    // walk is bounded constant overhead that does not scale with `limit`, so
+    // it is priced in the fixed base, not the limit term; the limit term
+    // prices only the emitted rows. Pricing the walk at face value in the base
+    // would put every refUpdates query over the 400 budget and make the field
+    // unusable, so the base prices that fixed scan as a lump sum instead.
+    #[graphql(
+        complexity = "100 + (limit.clamp(0, MAX_VISIBLE_REF_UPDATES) as usize) + child_complexity"
+    )]
     async fn ref_updates(
         &self,
         ctx: &Context<'_>,
         repo: Option<String>,
         #[graphql(
             default = 20,
-            desc = "Max 200; larger requests return the newest 200 rows (no continuation cursor)."
+            desc = "Requests above the documented maximum return the newest rows up to that maximum (no continuation cursor)."
         )]
         limit: i64,
     ) -> Result<Vec<RefUpdateType>> {
@@ -105,6 +202,14 @@ impl QueryRoot {
         Ok(resolved)
     }
 
+    // Complexity is additive: list_tasks is a single LIMIT-bounded query whose
+    // cost does not scale with the selected fields, so the price is the base
+    // plus the clamped limit plus the child fields. A multiplicative price
+    // made a request at the documented maximum unreachable (two fields at max
+    // limit cost 450 > 400).
+    #[graphql(
+        complexity = "50 + (limit.clamp(0, MAX_VISIBLE_TASK_PAGE_SIZE) as usize) + child_complexity"
+    )]
     async fn tasks(
         &self,
         ctx: &Context<'_>,
@@ -112,7 +217,7 @@ impl QueryRoot {
         assignee_did: Option<String>,
         #[graphql(
             default = 50,
-            desc = "Max 200; larger requests are clamped to 200 (no error). Negative values clamp to 0."
+            desc = "Requests above the documented maximum are clamped to it (no error). Negative values clamp to 0."
         )]
         limit: i64,
     ) -> Result<Vec<AgentTaskType>> {
@@ -120,7 +225,7 @@ impl QueryRoot {
         // Clamp before SQL: a negative LIMIT is a client fault that Postgres
         // rejects with 2201W, which would otherwise trip the opaque DB path
         // and write an error-level log on every probe (#250 review).
-        let limit = limit.clamp(0, 200);
+        let limit = limit.clamp(0, MAX_VISIBLE_TASK_PAGE_SIZE);
         let tasks = db
             .list_tasks(status.as_deref(), assignee_did.as_deref(), limit)
             .await
@@ -128,6 +233,7 @@ impl QueryRoot {
         Ok(tasks.into_iter().map(AgentTaskType::from).collect())
     }
 
+    #[graphql(complexity = "50 + child_complexity")]
     async fn task(&self, ctx: &Context<'_>, id: String) -> Result<Option<AgentTaskType>> {
         let db = ctx.data_unchecked::<Arc<Db>>();
         let t = db
@@ -141,11 +247,531 @@ impl QueryRoot {
 #[cfg(test)]
 mod tests {
     use crate::db::{Db, ReceivedRefUpdate, RepoRecord};
+    use base64::Engine;
     use chrono::Utc;
     use sqlx::PgPool;
     use std::sync::Arc;
 
     const OWNER: &str = "did:key:z6MkOwner";
+
+    #[sqlx::test]
+    async fn repos_legacy_rejects_overflow_and_pages_reach_every_visible_repo(pool: PgPool) {
+        let db = db(pool).await;
+        let total = crate::db::MAX_VISIBLE_REPO_PAGE_SIZE + 5;
+        for index in 0..total {
+            let name = format!("repo-{index:03}");
+            db.create_repo(&repo(&name, OWNER, &name, true))
+                .await
+                .unwrap();
+        }
+        // The SQL helper itself must bound materialization, even for a caller
+        // accidentally requesting an unlimited page.
+        assert_eq!(
+            db.list_visible_repos_page(None, None, usize::MAX)
+                .await
+                .unwrap()
+                .len(),
+            crate::db::MAX_VISIBLE_REPO_PAGE_SIZE + 1
+        );
+        let schema = schema(db);
+        let legacy = anon(&schema, "{ repos { name } }").await;
+        assert_eq!(legacy.errors.len(), 1);
+        assert!(legacy.errors[0].message.contains("use reposPage"));
+        assert_eq!(legacy.data, async_graphql::Value::Null);
+
+        let mut cursor = None;
+        let mut names = Vec::new();
+        loop {
+            let response = schema.execute(
+                async_graphql::Request::new(
+                    "query($after: String) { reposPage(limit: 50, after: $after) { nodes { name } hasNextPage endCursor } }",
+                ).variables(async_graphql::Variables::from_json(serde_json::json!({"after": cursor}))),
+            ).await;
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+            let json = response.data.into_json().unwrap();
+            let page = &json["reposPage"];
+            let rows = page["nodes"].as_array().unwrap();
+            assert!(rows.len() <= 50);
+            names.extend(
+                rows.iter()
+                    .map(|row| row["name"].as_str().unwrap().to_owned()),
+            );
+            if !page["hasNextPage"].as_bool().unwrap() {
+                break;
+            }
+            let next = page["endCursor"].as_str().unwrap().to_owned();
+            assert_ne!(cursor.as_ref(), Some(&next));
+            cursor = Some(next);
+            assert!(names.len() <= crate::db::MAX_VISIBLE_REPO_PAGE_SIZE);
+        }
+        assert_eq!(
+            names,
+            (0..total)
+                .map(|index| format!("repo-{index:03}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[sqlx::test]
+    async fn repos_legacy_accepts_exactly_the_visible_bound(pool: PgPool) {
+        let db = db(pool).await;
+        let base_time = Utc::now();
+        let total = crate::db::MAX_VISIBLE_REPO_PAGE_SIZE;
+        for index in 0..total {
+            let name = format!("repo-{index:03}");
+            let mut r = repo(&name, OWNER, &name, true);
+            // Anti-correlate updated_at with name, creation order, and index
+            // so only ordering by updated_at DESC can satisfy the expectation.
+            let offset = (index * 37) % total;
+            r.updated_at = base_time + chrono::Duration::seconds(offset as i64);
+            db.create_repo(&r).await.unwrap();
+        }
+        db.create_repo(&repo("hidden", OWNER, "hidden", false))
+            .await
+            .unwrap();
+        let response = anon(&schema(db), "{ repos { name } }").await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let repos = response.data.into_json().unwrap()["repos"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(repos.len(), total);
+        let names: Vec<_> = repos.iter().filter_map(|r| r["name"].as_str()).collect();
+        assert!(
+            !names.contains(&"hidden"),
+            "hidden repo must be excluded from legacy repos response"
+        );
+        let mut expected_indices = (0..total).collect::<Vec<_>>();
+        expected_indices.sort_by_key(|&idx| std::cmp::Reverse((idx * 37) % total));
+        let expected_names: Vec<String> = expected_indices
+            .into_iter()
+            .map(|index| format!("repo-{index:03}"))
+            .collect();
+        assert_eq!(
+            names,
+            expected_names
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>(),
+            "legacy repos must retain activity ordering (most recently updated first)"
+        );
+    }
+
+    #[sqlx::test]
+    async fn repos_page_pagination_crosses_owner_boundary(pool: PgPool) {
+        let db = db(pool).await;
+        let owner1 = "did:key:z6MkaOwner1";
+        let owner2 = "did:key:z6MkbOwner2";
+        let earlier_owner = "did:web:example.com";
+        // This owner sorts first only after did:key normalization. Its name
+        // sorts past the first cursor, so an unqualified OR name predicate
+        // would incorrectly serve it again on the next page.
+        //
+        // Rows are inserted out of order and not in reverse asserted order.
+        // Assigned IDs do not track name order, and owner2 contains both
+        // "B-repo" and "a-repo" whose byte order (B < a) differs from their
+        // case-folded order (a < b), ensuring lower(d.name) cannot satisfy
+        // the keyset query. Sized to 6 entries so the last page is full-sized
+        // (limit 2), proving hasNextPage distinguishes a full terminal page.
+        db.create_repo(&repo("r5", owner2, "c-repo", true))
+            .await
+            .unwrap();
+        db.create_repo(&repo("r9", earlier_owner, "zz-repo", true))
+            .await
+            .unwrap();
+        db.create_repo(&repo("r3", owner2, "B-repo", true))
+            .await
+            .unwrap();
+        db.create_repo(&repo("r8", owner1, "z-repo", true))
+            .await
+            .unwrap();
+        db.create_repo(&repo("r2", owner1, "b-repo", true))
+            .await
+            .unwrap();
+        db.create_repo(&repo("r1", owner2, "a-repo", true))
+            .await
+            .unwrap();
+
+        let schema = schema(db);
+        let page1_resp = anon(
+            &schema,
+            "{ reposPage(limit: 2) { nodes { name ownerDid } hasNextPage endCursor } }",
+        )
+        .await;
+        assert!(page1_resp.errors.is_empty(), "{:?}", page1_resp.errors);
+        let p1 = page1_resp.data.into_json().unwrap()["reposPage"].clone();
+        assert_eq!(p1["hasNextPage"], true);
+        assert_eq!(
+            p1["nodes"],
+            serde_json::json!([
+                {"name": "zz-repo", "ownerDid": earlier_owner},
+                {"name": "b-repo", "ownerDid": owner1},
+            ])
+        );
+        let cursor = p1["endCursor"].as_str().unwrap();
+
+        let page2_query = format!(
+            "{{ reposPage(limit: 2, after: \"{cursor}\") {{ nodes {{ name ownerDid }} hasNextPage endCursor }} }}"
+        );
+        let page2_resp = anon(&schema, &page2_query).await;
+        assert!(page2_resp.errors.is_empty(), "{:?}", page2_resp.errors);
+        let p2 = page2_resp.data.into_json().unwrap()["reposPage"].clone();
+        assert_eq!(p2["hasNextPage"], true);
+        assert_eq!(
+            p2["nodes"],
+            serde_json::json!([
+                {"name": "z-repo", "ownerDid": owner1},
+                {"name": "B-repo", "ownerDid": owner2},
+            ])
+        );
+        let cursor = p2["endCursor"].as_str().unwrap();
+        let page3_query = format!(
+            "{{ reposPage(limit: 2, after: \"{cursor}\") {{ nodes {{ name ownerDid }} hasNextPage endCursor }} }}"
+        );
+        let page3_resp = anon(&schema, &page3_query).await;
+        assert!(page3_resp.errors.is_empty(), "{:?}", page3_resp.errors);
+        let p3 = page3_resp.data.into_json().unwrap()["reposPage"].clone();
+        assert_eq!(p3["hasNextPage"], false);
+        assert_eq!(
+            p3["nodes"],
+            serde_json::json!([
+                {"name": "a-repo", "ownerDid": owner2},
+                {"name": "c-repo", "ownerDid": owner2},
+            ])
+        );
+    }
+
+    #[sqlx::test]
+    async fn repos_page_at_documented_maximum_distinguishes_terminal_page(pool: PgPool) {
+        let db = db(pool).await;
+        let total = crate::db::MAX_VISIBLE_REPO_PAGE_SIZE;
+        for index in 0..total {
+            let name = format!("repo-{index:03}");
+            db.create_repo(&repo(&name, OWNER, &name, true))
+                .await
+                .unwrap();
+        }
+        let schema = schema(db.clone());
+        let query =
+            format!("{{ reposPage(limit: {total}) {{ nodes {{ name }} hasNextPage endCursor }} }}");
+        let resp200 = anon(&schema, &query).await;
+        assert!(resp200.errors.is_empty(), "{:?}", resp200.errors);
+        let p200 = resp200.data.into_json().unwrap()["reposPage"].clone();
+        assert_eq!(p200["hasNextPage"], false);
+        let nodes200 = p200["nodes"].as_array().unwrap().clone();
+        assert_eq!(nodes200.len(), total);
+
+        // Adding row 201 keeps page 1 content identical while flipping hasNextPage to true.
+        let name201 = format!("repo-{total:03}");
+        db.create_repo(&repo(&name201, OWNER, &name201, true))
+            .await
+            .unwrap();
+        let resp201 = anon(&schema, &query).await;
+        assert!(resp201.errors.is_empty(), "{:?}", resp201.errors);
+        let p201 = resp201.data.into_json().unwrap()["reposPage"].clone();
+        assert_eq!(p201["hasNextPage"], true);
+        assert_eq!(p201["nodes"], p200["nodes"]);
+        assert_eq!(p201["endCursor"], p200["endCursor"]);
+    }
+
+    #[sqlx::test]
+    async fn repos_page_visibility_matches_the_shared_gate(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        let db = db(pool).await;
+        let reader = "did:key:zReader";
+        for (id, public) in [
+            ("open", true),
+            ("private", false),
+            ("root-deny", true),
+            ("root-reader", false),
+            ("subtree", true),
+            ("root-tie", true),
+            ("odd-star", true),
+            ("malformed-readers", true),
+            ("non-array-readers", true),
+            ("non-string-reader", true),
+            ("quarantined", true),
+        ] {
+            db.create_repo(&repo(id, OWNER, id, public)).await.unwrap();
+        }
+        // Canonical and mirror copies must still collapse before pagination.
+        db.create_repo(&repo("z6MkOwner/open", "z6MkOwner", "open", true))
+            .await
+            .unwrap();
+        db.create_repo(&repo(
+            "other-method",
+            "did:web:z6MkOwner",
+            "other-method",
+            false,
+        ))
+        .await
+        .unwrap();
+        db.set_repo_quarantine("quarantined", true).await.unwrap();
+        for (id, glob, readers) in [
+            ("root-deny", "/", vec![]),
+            ("root-reader", "/**", vec![reader.to_owned()]),
+            ("subtree", "/secret/**", vec![]),
+            ("root-tie", "/", vec![reader.to_owned()]),
+            ("root-tie", "/**", vec![]),
+            ("odd-star", "/*", vec![]),
+            ("malformed-readers", "/", vec![]),
+            ("non-array-readers", "/", vec![]),
+            ("non-string-reader", "/", vec![]),
+        ] {
+            db.set_visibility_rule(id, glob, VisibilityMode::B, &readers, OWNER)
+                .await
+                .unwrap();
+        }
+        // The typed setter cannot create malformed JSON, but existing TEXT rows
+        // can contain it. Such a rule must deny this repo, not abort the page.
+        // All three deny arms of the reader_dids predicate are pinned here:
+        // (a) invalid JSON, (b) valid JSON that is not an array, (c) an array
+        // containing a non-string member. The Rust gate parses reader_dids as
+        // Vec<String> with unwrap_or_default(), so (b) and (c) also fail to
+        // parse and deny; the SQL CASE must agree on every shape.
+        let rows = sqlx::query("UPDATE visibility_rules SET reader_dids = $1 WHERE repo_id = $2")
+            .bind("not JSON")
+            .bind("malformed-readers")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows.rows_affected(), 1);
+        let rows = sqlx::query("UPDATE visibility_rules SET reader_dids = $1 WHERE repo_id = $2")
+            .bind("\"just-a-string\"")
+            .bind("non-array-readers")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows.rows_affected(), 1);
+        // The named reader is listed, but the non-string member poisons the
+        // whole list: both sides must still deny them.
+        let rows = sqlx::query("UPDATE visibility_rules SET reader_dids = $1 WHERE repo_id = $2")
+            .bind("[\"did:key:zReader\", 42]")
+            .bind("non-string-reader")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows.rows_affected(), 1);
+        let all = db.list_all_repos_deduped().await.unwrap();
+        for caller in [
+            None,
+            Some(OWNER),
+            Some("z6MkOwner"),
+            Some(reader),
+            Some("zReader"),
+            Some("did:web:z6MkOwner"),
+        ] {
+            let mut expected = Vec::new();
+            for record in &all {
+                let rules = db.list_visibility_rules(&record.id).await.unwrap();
+                if crate::visibility::listable_at_root(
+                    &rules,
+                    record.is_public,
+                    &record.owner_did,
+                    caller,
+                ) {
+                    expected.push(record.id.clone());
+                }
+            }
+            expected.sort();
+            let mut actual = db
+                .list_visible_repos_page(caller, None, usize::MAX)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|record| record.id)
+                .collect::<Vec<_>>();
+            actual.sort();
+            assert_eq!(actual, expected, "caller {caller:?}");
+        }
+        let schema = schema(db);
+        for caller in [None, Some("did:key:zUnauthorized")] {
+            let query = "{ repos { name } }";
+            let response = match caller {
+                None => anon(&schema, query).await,
+                Some(caller) => authed(&schema, query, caller).await,
+            };
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+            let mut names: Vec<String> = response.data.into_json().unwrap()["repos"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|repo| repo["name"].as_str().unwrap().to_owned())
+                .collect();
+            names.sort();
+            assert_eq!(names, ["odd-star", "open", "subtree"]);
+        }
+        let query = "{ reposPage(limit: 1) { nodes { name ownerDid } hasNextPage endCursor } }";
+        let response = anon(&schema, query).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let json = response.data.into_json().unwrap();
+        let page = &json["reposPage"];
+        assert_eq!(
+            page["nodes"],
+            serde_json::json!([{"name": "odd-star", "ownerDid": OWNER}])
+        );
+        assert_eq!(page["hasNextPage"], true);
+        let cursor = super::parse_repo_cursor(page["endCursor"].as_str().unwrap()).unwrap();
+        assert_eq!(cursor, (OWNER.to_owned(), "odd-star".to_owned()));
+        assert!(!json.to_string().contains("private"));
+        assert!(!json.to_string().contains("quarantined"));
+
+        // Route-level check with unauthorized authenticated caller:
+        // Excludes private, quarantined, and root-deny repos, matching anonymous behavior.
+        let all_query = "{ reposPage(limit: 50) { nodes { name } hasNextPage } }";
+        let unauth_response = authed(&schema, all_query, "did:key:zUnauthorized").await;
+        assert!(
+            unauth_response.errors.is_empty(),
+            "{:?}",
+            unauth_response.errors
+        );
+        let unauth_json = unauth_response.data.into_json().unwrap();
+        let unauth_names: Vec<&str> = unauth_json["reposPage"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n["name"].as_str())
+            .collect();
+        assert_eq!(unauth_names, vec!["odd-star", "open", "subtree"]);
+        let unauth_str = unauth_json.to_string();
+        assert!(!unauth_str.contains("private"));
+        assert!(!unauth_str.contains("quarantined"));
+        assert!(!unauth_str.contains("root-deny"));
+        assert!(!unauth_str.contains("root-reader"));
+        assert!(!unauth_str.contains("root-tie"));
+
+        // Reader caller gets root-reader and root-tie, but still excludes private, quarantined, root-deny.
+        let reader_response = authed(&schema, all_query, reader).await;
+        assert!(
+            reader_response.errors.is_empty(),
+            "{:?}",
+            reader_response.errors
+        );
+        let reader_json = reader_response.data.into_json().unwrap();
+        let reader_names: Vec<&str> = reader_json["reposPage"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n["name"].as_str())
+            .collect();
+        assert_eq!(
+            reader_names,
+            vec!["odd-star", "open", "root-reader", "subtree"]
+        );
+        let reader_str = reader_json.to_string();
+        assert!(!reader_str.contains("private"));
+        assert!(!reader_str.contains("quarantined"));
+        assert!(!reader_str.contains("root-deny"));
+        assert!(!reader_str.contains("root-tie"));
+    }
+
+    #[sqlx::test]
+    async fn repos_page_rechecks_cursor_authority_and_exact_boundary(pool: PgPool) {
+        let db = db(pool).await;
+        let visible = repo("visible", OWNER, "a-visible", true);
+        db.create_repo(&visible).await.unwrap();
+        db.create_repo(&repo("hidden", OWNER, "z-private", false))
+            .await
+            .unwrap();
+        let schema = schema(db);
+        let first = anon(
+            &schema,
+            "{ reposPage(limit: 1) { nodes { name } hasNextPage endCursor } }",
+        )
+        .await;
+        assert!(first.errors.is_empty());
+        let first = first.data.into_json().unwrap();
+        assert_eq!(first["reposPage"]["hasNextPage"], false);
+        let query = format!(
+            "{{ reposPage(limit: 1, after: \"{}\") {{ nodes {{ name }} hasNextPage endCursor }} }}",
+            super::repo_cursor(&visible)
+        );
+        let owner = authed(&schema, &query, OWNER).await;
+        assert!(owner.errors.is_empty());
+        assert_eq!(
+            owner.data.into_json().unwrap()["reposPage"]["nodes"][0]["name"],
+            "z-private"
+        );
+        let anon = anon(&schema, &query).await;
+        assert!(anon.errors.is_empty());
+        assert_eq!(
+            anon.data.into_json().unwrap()["reposPage"],
+            serde_json::json!({
+                "nodes": [], "hasNextPage": false, "endCursor": null
+            })
+        );
+        let unauth = authed(&schema, &query, "did:key:zUnauthorized").await;
+        assert!(unauth.errors.is_empty());
+        assert_eq!(
+            unauth.data.into_json().unwrap()["reposPage"],
+            serde_json::json!({
+                "nodes": [], "hasNextPage": false, "endCursor": null
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn repos_page_rejects_nul_cursors_before_database_access() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        let schema = schema(Arc::new(Db::for_testing(pool)));
+        for position in [("did:key:zOwner\0", "repo"), ("did:key:zOwner", "repo\0")] {
+            let cursor = super::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&position).unwrap());
+            let query = format!("{{ reposPage(after: \"{cursor}\") {{ hasNextPage }} }}");
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(1), anon(&schema, &query))
+                    .await
+                    .expect("invalid cursors must be rejected without accessing the database");
+            assert_eq!(response.errors.len(), 1);
+            assert_eq!(response.errors[0].message, "invalid repository cursor");
+            assert_eq!(response.data, async_graphql::Value::Null);
+        }
+        let position = ("did:key:zOwner", "repo");
+        let cursor = super::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&position).unwrap());
+        assert_eq!(
+            super::parse_repo_cursor(&cursor).unwrap(),
+            (position.0.to_owned(), position.1.to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn repos_page_rejects_invalid_inputs_before_database_access() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        let schema = schema(Arc::new(Db::for_testing(pool)));
+        let over_max = crate::db::MAX_VISIBLE_REPO_PAGE_SIZE + 1;
+        for query in [
+            "{ reposPage(limit: 0) { hasNextPage } }".to_owned(),
+            "{ reposPage(limit: -1) { hasNextPage } }".to_owned(),
+            format!("{{ reposPage(limit: {over_max}) {{ hasNextPage }} }}"),
+            "{ reposPage(after: \"invalid!\") { hasNextPage } }".to_owned(),
+        ] {
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(1), anon(&schema, &query))
+                    .await
+                    .unwrap();
+            assert_eq!(response.errors.len(), 1);
+            let expected_limit_message = format!(
+                "limit must be between 1 and {}",
+                crate::db::MAX_VISIBLE_REPO_PAGE_SIZE
+            );
+            assert!(
+                response.errors[0].message == expected_limit_message
+                    || response.errors[0].message == "invalid repository cursor"
+            );
+        }
+        // Valid base64 and valid cursor JSON: only the length guard rejects it.
+        let oversized = super::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&("did:key:reader", "a".repeat(3100))).unwrap());
+        assert!(oversized.len() > 4096);
+        assert!(serde_json::from_slice::<(String, String)>(
+            &super::URL_SAFE_NO_PAD.decode(&oversized).unwrap()
+        )
+        .is_ok());
+        assert!(super::parse_repo_cursor(&oversized).is_err());
+    }
 
     async fn db(pool: PgPool) -> Arc<Db> {
         let db = Db::for_testing(pool);
@@ -475,12 +1101,13 @@ mod tests {
         assert_eq!(count_tasks(&resp), 0);
     }
 
-    /// #255: ceiling of the tasks(limit) clamp must be held (schema promises Max 200).
+    /// #255: ceiling of the tasks(limit) clamp must be held (schema promises the
+    /// documented maximum).
     #[sqlx::test]
-    async fn tasks_limit_ceiling_clamped_to_200(pool: PgPool) {
+    async fn tasks_limit_ceiling_clamped_to_max(pool: PgPool) {
         let db = db(pool).await;
         let now = Utc::now().to_rfc3339();
-        for i in 0..201 {
+        for i in 0..crate::db::MAX_VISIBLE_TASK_PAGE_SIZE + 1 {
             db.create_task(&crate::db::AgentTask {
                 id: format!("task-ceil-{i}"),
                 repo_id: None,
@@ -501,7 +1128,49 @@ mod tests {
         }
         let schema = schema(db);
         let resp = anon(&schema, "{ tasks(limit: 5000) { id } }").await;
-        assert_eq!(count_tasks(&resp), 200, "limit above 200 must clamp to 200");
+        assert_eq!(
+            count_tasks(&resp),
+            crate::db::MAX_VISIBLE_TASK_PAGE_SIZE as usize,
+            "limit above the maximum must clamp to MAX_VISIBLE_TASK_PAGE_SIZE"
+        );
+    }
+
+    /// A limit above MAX_VISIBLE_REF_UPDATES must reach the resolver clamped,
+    /// not be rejected: the complexity formula clamps the priced limit (so the
+    /// document passes validation) and the shared collector clamps the rows
+    /// (so at most MAX_VISIBLE_REF_UPDATES come back). Removing the formula
+    /// clamp prices the raw limit and rejects the document; removing the
+    /// collector clamp returns unbounded rows. Mirrors
+    /// tasks_limit_ceiling_clamped_to_max.
+    #[sqlx::test]
+    async fn ref_updates_limit_ceiling_clamped_to_max(pool: PgPool) {
+        use crate::api::events::MAX_VISIBLE_REF_UPDATES;
+        let db = db(pool).await;
+        db.create_repo(&repo("r1", OWNER, "widget", true))
+            .await
+            .unwrap();
+        let total = MAX_VISIBLE_REF_UPDATES as usize + 1;
+        for i in 0..total {
+            let mut row = ref_row(&format!("ceil{i}"), "z6MkOwner/widget");
+            row.timestamp = format!("2026-07-01T10:{:02}:{:02}+00:00", i / 60, i % 60);
+            db.insert_ref_update(&row).await.unwrap();
+        }
+        let schema = schema(db);
+        let query = format!(
+            "{{ refUpdates(limit: {}) {{ repo }} }}",
+            MAX_VISIBLE_REF_UPDATES + 4800
+        );
+        let resp = anon(&schema, &query).await;
+        assert!(
+            resp.errors.is_empty(),
+            "limit above the maximum must clamp, not fail: {:?}",
+            resp.errors
+        );
+        assert_eq!(
+            count(&resp),
+            MAX_VISIBLE_REF_UPDATES as usize,
+            "limit above the maximum must clamp to MAX_VISIBLE_REF_UPDATES"
+        );
     }
 
     fn count_tasks(resp: &async_graphql::Response) -> usize {

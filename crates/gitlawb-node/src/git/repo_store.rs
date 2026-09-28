@@ -118,7 +118,7 @@ impl RepoStore {
     /// Test-only: every guard from this store parks in `release` right before the
     /// `pg_advisory_unlock` await, until `gate` is notified. Dropping the future
     /// while it is parked reproduces a client disconnect inside `release`.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn with_pre_unlock_gate(mut self, gate: Arc<tokio::sync::Notify>) -> Self {
         self.pre_unlock_gate = Some(gate);
         self
@@ -126,7 +126,7 @@ impl RepoStore {
 
     /// Test-only: how many write guards from this store have reached the Tigris upload
     /// site. See [`RepoWriteGuard::release`].
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn tigris_upload_site_reached(&self) -> usize {
         self.upload_site_reached
             .load(std::sync::atomic::Ordering::SeqCst)
