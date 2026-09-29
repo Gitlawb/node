@@ -773,6 +773,101 @@ mod tests {
         assert!(super::parse_repo_cursor(&oversized).is_err());
     }
 
+    #[tokio::test]
+    async fn parse_repo_cursor_rejects_wrong_shape_json() {
+        // Valid base64 and valid JSON, but not a (String, String) pair: the
+        // wrong-shape arm must report "invalid repository cursor", exactly,
+        // before any database access.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        let schema = schema(Arc::new(Db::for_testing(pool)));
+        for payload in [
+            serde_json::json!(["only-one"]),
+            serde_json::json!(["a", "b", "c"]),
+            serde_json::json!({"owner": "x", "name": "y"}),
+            serde_json::json!(42),
+            serde_json::json!(["a", 1]),
+        ] {
+            let cursor = super::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+            let err = super::parse_repo_cursor(&cursor).unwrap_err();
+            assert_eq!(err.message, "invalid repository cursor");
+            let query = format!("{{ reposPage(after: \"{cursor}\") {{ hasNextPage }} }}");
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(1), anon(&schema, &query))
+                    .await
+                    .expect("wrong-shape cursors must be rejected without accessing the database");
+            assert_eq!(response.errors.len(), 1);
+            assert_eq!(response.errors[0].message, "invalid repository cursor");
+            assert_eq!(response.data, async_graphql::Value::Null);
+        }
+    }
+
+    #[tokio::test]
+    async fn longest_repo_name_cursor_round_trips() {
+        // #465 4th round: a cursor the server emits must always parse back.
+        // Repo names are bounded at the create/fork/mirror write paths, so the
+        // longest admissible name must produce a cursor under the 4096-byte
+        // parse limit.
+        let name = "a".repeat(crate::db::MAX_REPO_NAME_LEN);
+        let record = repo("long", OWNER, &name, true);
+        let cursor = super::repo_cursor(&record);
+        assert!(
+            cursor.len() <= 4096,
+            "emitted cursor must stay under the parse limit: {}",
+            cursor.len()
+        );
+        assert_eq!(
+            super::parse_repo_cursor(&cursor).unwrap(),
+            (OWNER.to_owned(), name)
+        );
+    }
+
+    /// A negative refUpdates(limit) must be accepted and clamped to zero rows,
+    /// like tasks(limit: -1): the complexity formula's `limit.clamp(0, ...)`
+    /// prices it at the floor and the shared collector returns before any
+    /// database access. Mirrors tasks_negative_limit_clamped.
+    #[tokio::test]
+    async fn ref_updates_negative_limit_clamped() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        let schema = schema(Arc::new(Db::for_testing(pool)));
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            anon(&schema, "{ refUpdates(limit: -1) { repo } }"),
+        )
+        .await
+        .expect("negative limit must clamp without accessing the database");
+        assert!(
+            resp.errors.is_empty(),
+            "negative limit must clamp, not fail: {:?}",
+            resp.errors
+        );
+        assert_eq!(count(&resp), 0);
+    }
+
+    /// The mirror write path binds peer-supplied names verbatim, so it must
+    /// enforce the same bound as the local write paths: an overlong peer name
+    /// would otherwise make reposPage emit an unparseable cursor. The
+    /// rejection happens before any database access.
+    #[tokio::test]
+    async fn mirror_repo_rejects_overlong_name() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        let db = Db::for_testing(pool);
+        let name = "b".repeat(crate::db::MAX_REPO_NAME_LEN + 1);
+        let err = db
+            .upsert_mirror_repo("z6MkLong", &name, "/tmp/long", None, false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds"),
+            "unexpected error: {err}"
+        );
+    }
+
     async fn db(pool: PgPool) -> Arc<Db> {
         let db = Db::for_testing(pool);
         db.run_migrations().await.unwrap();

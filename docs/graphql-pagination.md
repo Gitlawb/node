@@ -21,10 +21,10 @@ query Repositories($after: String) {
 
 Start with `after: null`. When `hasNextPage` is true, pass the returned
 `endCursor` as `after` on the next request. Stop when `hasNextPage` is false.
-An empty page has a null `endCursor`. The default limit is 50; limits below
-1 or above the maximum page size are rejected (see Query budgets below).
-Malformed cursors, including decoded owner or name strings containing NUL,
-return `invalid repository cursor` before database access.
+An empty page has a null `endCursor`. The default limit is 50 and the maximum
+page size is 200; limits below 1 or above 200 are rejected (see Query budgets
+below). Malformed cursors, including decoded owner or name strings containing
+NUL, return `invalid repository cursor` before database access.
 
 Pages are ordered by normalized owner DID and repository name. Visibility and
 mirror deduplication are applied in the database before limiting the page;
@@ -67,8 +67,10 @@ smaller. The constants live in `crates/gitlawb-node/src/graphql/mod.rs`.
   - `task`, mutations, subscriptions: 50 + child fields.
 
   A document whose total exceeds 400 is rejected with
-  `Query is too complex.` before any resolver runs, so requesting many
-  fields or aliases may require a smaller page or fewer aliases.
+  `Query is too complex.` before any resolver runs, so an over-budget
+  document needs fewer aliases or fewer child fields. A smaller `limit` does
+  not help `reposPage` or `repos`: both are priced at the full
+  `MAX_VISIBLE_REPO_PAGE_SIZE` scan regardless of `limit`.
 
 - **Depth cap: 14 per document** (`GRAPHQL_MAX_DEPTH`). Documents nested
   deeper than 14 selections are rejected with `Query is nested too deep.`

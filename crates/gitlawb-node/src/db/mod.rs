@@ -9,6 +9,13 @@ use uuid::Uuid;
 /// Maximum visible repositories per page, plus one internal look-ahead row.
 pub(crate) const MAX_VISIBLE_REPO_PAGE_SIZE: usize = 200;
 
+/// Maximum repository name length in bytes. `repo_cursor` embeds the name in
+/// a base64(JSON) cursor that `parse_repo_cursor` rejects over 4096 bytes, so
+/// every write path must bound the name: a cursor the server emits must
+/// always parse back (#465 4th round). 100 bytes keeps the longest possible
+/// cursor an order of magnitude under the parse limit.
+pub(crate) const MAX_REPO_NAME_LEN: usize = 100;
+
 /// Maximum agent tasks returned per query. Shared by the GraphQL `tasks`
 /// complexity meter and the resolver clamp so they can't drift.
 pub(crate) const MAX_VISIBLE_TASK_PAGE_SIZE: i64 = 200;
@@ -1578,6 +1585,16 @@ impl Db {
         machine_id: Option<&str>,
         quarantined: bool,
     ) -> Result<()> {
+        // Peer-supplied names are bound like the local write paths: an
+        // unbounded name would make reposPage emit a cursor longer than the
+        // 4096-byte parse limit, dead-ending pagination for every caller past
+        // that row (#465 4th round). The sync caller drops the error and skips
+        // the mirror.
+        if name.len() > MAX_REPO_NAME_LEN {
+            anyhow::bail!(
+                "mirror repo name exceeds {MAX_REPO_NAME_LEN} bytes: refusing to register"
+            );
+        }
         let now = Utc::now().to_rfc3339();
         let id = format!("{owner_short}/{name}");
         // `quarantined` is set only on first insert (the admission decision).
