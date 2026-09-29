@@ -742,24 +742,39 @@ mod tests {
             .unwrap();
         let schema = schema(Arc::new(Db::for_testing(pool)));
         let over_max = crate::db::MAX_VISIBLE_REPO_PAGE_SIZE + 1;
-        for query in [
-            "{ reposPage(limit: 0) { hasNextPage } }".to_owned(),
-            "{ reposPage(limit: -1) { hasNextPage } }".to_owned(),
-            format!("{{ reposPage(limit: {over_max}) {{ hasNextPage }} }}"),
-            "{ reposPage(after: \"invalid!\") { hasNextPage } }".to_owned(),
+        let expected_limit_message = format!(
+            "limit must be between 1 and {}",
+            crate::db::MAX_VISIBLE_REPO_PAGE_SIZE
+        );
+        // Each input pins its own rejection message: the loop must not accept
+        // either message for every query, or a misattributed message (e.g. the
+        // limit arm returning "invalid repository cursor") stays invisible.
+        for (query, expected_message) in [
+            (
+                "{ reposPage(limit: 0) { hasNextPage } }".to_owned(),
+                expected_limit_message.clone(),
+            ),
+            (
+                "{ reposPage(limit: -1) { hasNextPage } }".to_owned(),
+                expected_limit_message.clone(),
+            ),
+            (
+                format!("{{ reposPage(limit: {over_max}) {{ hasNextPage }} }}"),
+                expected_limit_message.clone(),
+            ),
+            (
+                "{ reposPage(after: \"invalid!\") { hasNextPage } }".to_owned(),
+                "invalid repository cursor".to_owned(),
+            ),
         ] {
             let response =
                 tokio::time::timeout(std::time::Duration::from_secs(1), anon(&schema, &query))
                     .await
                     .unwrap();
             assert_eq!(response.errors.len(), 1);
-            let expected_limit_message = format!(
-                "limit must be between 1 and {}",
-                crate::db::MAX_VISIBLE_REPO_PAGE_SIZE
-            );
-            assert!(
-                response.errors[0].message == expected_limit_message
-                    || response.errors[0].message == "invalid repository cursor"
+            assert_eq!(
+                response.errors[0].message, expected_message,
+                "wrong rejection message for query: {query}"
             );
         }
         // Valid base64 and valid cursor JSON: only the length guard rejects it.

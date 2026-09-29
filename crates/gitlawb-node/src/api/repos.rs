@@ -237,6 +237,16 @@ pub struct InfoRefsQuery {
 /// restricted, and the length is bounded so every cursor the server emits
 /// parses back: `repo_cursor` embeds the name in a base64(JSON) cursor that
 /// `parse_repo_cursor` rejects over 4096 bytes (#465 4th round).
+///
+/// This is the API-side validator, and it deliberately differs from the
+/// stricter disk-side `validate_repo_name` in `git/repo_store.rs`: this one
+/// admits names the store rejects (empty, leading `-`, non-ASCII
+/// alphanumeric) and rejects `.`, which the store allows. The divergence
+/// predates this bound (#412 owns the fork half), so a store-rejected name
+/// still fails later at `repo_store.init` after the proof is spent. Do not
+/// "fix" the divergence here; the length bound below is the one that keeps
+/// emitted cursors parseable, and it is shared via `MAX_REPO_NAME_LEN` so the
+/// two validators cannot drift apart on length.
 fn validate_repo_name(name: &str) -> Result<()> {
     // Sanitize name: alphanumeric, hyphens, underscores only
     if !name
@@ -4321,6 +4331,33 @@ mod tests {
         // Empty names were already admissible before the length bound; the
         // bound does not change that.
         assert!(validate_repo_name("").is_ok());
+    }
+
+    #[tokio::test]
+    async fn create_repo_rejects_overlong_name_through_handler() {
+        // Pins the wiring: `create_repo` must call `validate_repo_name`
+        // before any database access. The lazy state never connects, so
+        // deleting the call site would let the handler proceed to `get_repo`
+        // and fail with a connection error instead of BadRequest.
+        let state = crate::test_support::test_state_lazy();
+        let overlong = "a".repeat(crate::db::MAX_REPO_NAME_LEN + 1);
+        let err = create_repo(
+            State(state),
+            Extension(AuthenticatedDid(OWNER_DID.to_owned())),
+            axum::http::HeaderMap::new(),
+            Json(CreateRepoRequest {
+                name: overlong,
+                description: None,
+                is_public: true,
+                default_branch: "main".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::BadRequest(ref msg) if msg.contains("at most")),
+            "overlong name through create_repo must be a 400, got: {err:?}"
+        );
     }
 
     #[test]

@@ -1717,8 +1717,11 @@ fn validate_repo_name(repo_name: &str) -> Result<()> {
     if repo_name.is_empty() {
         anyhow::bail!("repo_name is empty");
     }
-    if repo_name.len() > 100 {
-        anyhow::bail!("repo_name exceeds 100 chars");
+    // Byte bound shared with the API-side validator via `MAX_REPO_NAME_LEN`:
+    // the two validators differ on charset by design, but must not drift on
+    // length, or an API-admitted name fails here after the proof is spent.
+    if repo_name.len() > crate::db::MAX_REPO_NAME_LEN {
+        anyhow::bail!("repo_name exceeds {} chars", crate::db::MAX_REPO_NAME_LEN);
     }
     // Repo names are `[A-Za-z0-9._-]+` minus path-traversal traps.
     if repo_name.contains("..") {
