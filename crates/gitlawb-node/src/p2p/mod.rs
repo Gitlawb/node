@@ -4478,6 +4478,64 @@ mod tests {
     }
 
     #[test]
+    fn identify_fully_rejected_peer_leaves_no_row_at_full_budget() {
+        let now = Instant::now();
+        let mut book = IdentifyAddressBook::default();
+        // Fill the global budget with one-address peers.
+        for index in 0..IDENTIFY_GLOBAL_ADDRESS_LIMIT {
+            let peer = PeerId::random();
+            let address = identify_address(peer, 1, 10_000 + index as u16);
+            book.update(peer, now, std::slice::from_ref(&address));
+        }
+        assert_eq!(book.address_count, IDENTIFY_GLOBAL_ADDRESS_LIMIT);
+        // A fresh peer reporting at saturation has every candidate rejected
+        // by the global-budget check. The row created by or_insert_with must
+        // be dropped: a zero-address row is invisible to address_count and
+        // would otherwise linger until the expiry tick.
+        let fresh = PeerId::random();
+        let fresh_address = identify_address(fresh, 2, 30_000);
+        let changes = book.update(fresh, now, std::slice::from_ref(&fresh_address));
+        assert!(changes.added.is_empty());
+        assert!(!book.peers.contains_key(&fresh));
+        assert_eq!(book.address_count, IDENTIFY_GLOBAL_ADDRESS_LIMIT);
+    }
+
+    #[test]
+    fn identify_update_reports_expired_addresses_as_removed() {
+        let peer = PeerId::random();
+        let now = Instant::now();
+        let address = identify_address(peer, 1, 10_000);
+        let mut book = IdentifyAddressBook::default();
+        book.update(peer, now, std::slice::from_ref(&address));
+        // An update past the TTL expires the stale address through
+        // expire_peer and reports it in changes.removed so the Identify
+        // handler can drop it from Kademlia.
+        let changes = book.update(
+            peer,
+            now + IDENTIFY_ADDRESS_TTL + Duration::from_secs(1),
+            std::slice::from_ref(&address),
+        );
+        assert_eq!(changes.removed, vec![(peer, address.clone())]);
+        assert_eq!(changes.added, vec![address]);
+    }
+
+    #[test]
+    fn identify_expire_drops_rows_emptied_by_expiry() {
+        let peer = PeerId::random();
+        let now = Instant::now();
+        let address = identify_address(peer, 1, 10_000);
+        let mut book = IdentifyAddressBook::default();
+        book.update(peer, now, std::slice::from_ref(&address));
+        assert!(book.peers.contains_key(&peer));
+        // Once every address in the row has expired, expire() must drop the
+        // row itself, matching the empty-row drop in update().
+        let removed = book.expire(now + IDENTIFY_ADDRESS_TTL + Duration::from_secs(1));
+        assert_eq!(removed, vec![(peer, address)]);
+        assert!(!book.peers.contains_key(&peer));
+        assert_eq!(book.address_count, 0);
+    }
+
+    #[test]
     fn identify_report_processing_stops_at_the_input_limit() {
         let peer = PeerId::random();
         let now = Instant::now();
@@ -4554,6 +4612,13 @@ mod tests {
     fn identify_per_peer_eviction_applies_at_full_global_budget() {
         let now = Instant::now();
         let mut book = IdentifyAddressBook::default();
+        // One filler peer goes in before the victim so the evicted address
+        // is not also the globally-oldest insertion. If saturation evicted
+        // the globally-oldest entry instead of the victim's own oldest,
+        // the sentinel's address would be the one removed.
+        let sentinel = PeerId::random();
+        let sentinel_address = identify_address(sentinel, 200, 19_999);
+        book.update(sentinel, now, std::slice::from_ref(&sentinel_address));
         // The victim peer holds a full per-peer row while the rest of the
         // global budget is filled by one-address peers.
         let victim = PeerId::random();
@@ -4561,7 +4626,7 @@ mod tests {
             .map(|index| identify_address(victim, index as u8 + 1, 10_000 + index as u16))
             .collect();
         book.update(victim, now, &victim_addresses);
-        for index in 0..IDENTIFY_GLOBAL_ADDRESS_LIMIT - IDENTIFY_ADDRESS_LIMIT {
+        for index in 0..IDENTIFY_GLOBAL_ADDRESS_LIMIT - IDENTIFY_ADDRESS_LIMIT - 1 {
             let peer = PeerId::random();
             let address = identify_address(peer, 200, 20_000 + index as u16);
             book.update(peer, now, &[address]);
@@ -4584,6 +4649,16 @@ mod tests {
         assert_eq!(changes.removed, vec![(victim, victim_addresses[0].clone())]);
         assert_eq!(book.address_count, IDENTIFY_GLOBAL_ADDRESS_LIMIT);
         assert_eq!(book.peers[&victim].addresses.len(), IDENTIFY_ADDRESS_LIMIT);
+        // The sentinel was inserted first; per-peer eviction must leave it
+        // alone. A global-oldest eviction policy would have removed it.
+        assert_eq!(
+            book.peers[&sentinel]
+                .addresses
+                .iter()
+                .map(|a| &a.address)
+                .collect::<Vec<_>>(),
+            vec![&sentinel_address]
+        );
     }
 
     #[test]
