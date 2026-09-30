@@ -4825,6 +4825,46 @@ mod tests {
     }
 
     #[test]
+    fn identify_refresh_reports_only_addresses_in_the_report() {
+        let peer_id = PeerId::random();
+        let now = Instant::now();
+        let reported = identify_address(peer_id, 1, 10_000);
+        let unreported = identify_address(peer_id, 2, 20_000);
+        let mut book = IdentifyAddressBook::default();
+
+        // Admit both addresses up front so the peer holds two.
+        assert_eq!(
+            book.update(peer_id, now, &[reported.clone(), unreported.clone()])
+                .added
+                .len(),
+            2
+        );
+
+        // A later report carrying only one of the two addresses must refresh
+        // just that one: pins the negative direction of the refresh
+        // predicate, so an address the peer stopped advertising keeps its
+        // original TTL instead of being refreshed back onto the Kademlia
+        // re-admit path on every report.
+        let report_at = now + IDENTIFY_ADDRESS_TTL - Duration::from_secs(1);
+        let changes = book.update(peer_id, report_at, std::slice::from_ref(&reported));
+        assert!(changes.added.is_empty());
+        assert!(changes.removed.is_empty());
+        assert_eq!(changes.refreshed, vec![reported.clone()]);
+
+        // The unreported address still expires at its original TTL, while
+        // the refreshed address survives until its refreshed TTL.
+        assert_eq!(
+            book.expire(now + IDENTIFY_ADDRESS_TTL + Duration::from_secs(1)),
+            vec![(peer_id, unreported)]
+        );
+        assert!(book.expire(report_at + Duration::from_secs(1)).is_empty());
+        assert_eq!(
+            book.expire(report_at + IDENTIFY_ADDRESS_TTL + Duration::from_secs(1)),
+            vec![(peer_id, reported)]
+        );
+    }
+
+    #[test]
     fn identify_addresses_reject_foreign_peer_suffixes() {
         let peer_id = PeerId::random();
         let other_peer_id = PeerId::random();
