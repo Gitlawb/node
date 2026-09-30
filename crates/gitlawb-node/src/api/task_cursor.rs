@@ -232,7 +232,7 @@ fn apply_keystream(key: &TaskCursorKey, iv: &[u8; TAG_LEN], buf: &mut [u8]) {
 /// The serialized payload is padded with trailing whitespace to a fixed
 /// bucket before the SIV tag is computed: the keystream preserves plaintext
 /// length, so an unpadded payload would let the token's length leak the
-/// named row's field widths (a 32-char `to_rfc3339()` rendering mints a
+/// named row's field widths (a 25-char `to_rfc3339()` rendering mints a
 /// shorter token than a 35-char one). `decode` tolerates the padding because
 /// `serde_json` ignores trailing whitespace, and the tag covers the padded
 /// bytes, so a token minted before padding landed still verifies.
@@ -369,7 +369,7 @@ mod tests {
         let k = key();
         // Ids are server-minted fixed-length UUIDs; the timestamp is the
         // width that varies in production (`to_rfc3339()` renders 35 chars
-        // with nanoseconds, 32 without fractional seconds).
+        // with nanoseconds, 25 without fractional seconds).
         let id = "b3f7a1c2-4d5e-4f6a-8b9c-0d1e2f3a4b5c";
         let narrow = encode(
             &k,
@@ -392,6 +392,86 @@ mod tests {
         assert_eq!(
             decode(&k, unfiltered(), None, &wide).unwrap(),
             TaskPosition::new("2026-01-03T00:00:00.123456789+00:00", id)
+        );
+    }
+
+    /// A token minted before the fixed-width padding landed (unpadded payload,
+    /// tag over the raw bytes) must still verify: `decode` MACs whatever
+    /// plaintext the keystream recovers and `serde_json` tolerates the
+    /// missing trailing whitespace. This pins the back-compat claim in the
+    /// `encode` docstring using the pre-change recipe directly.
+    #[test]
+    fn unpadded_legacy_token_still_verifies() {
+        let k = key();
+        let filter = unfiltered();
+        let position = TaskPosition::new("2026-01-03T00:00:00+00:00", "legacy-task");
+        // Pre-padding recipe: serialize, tag, and encrypt with no padding.
+        let mut payload = serde_json::to_vec(&CursorPayload {
+            t: &position.created_at,
+            i: &position.id,
+            e: chrono::Utc::now().timestamp() + CURSOR_TTL_SECS,
+        })
+        .expect("cursor payload is plain strings and an integer");
+        assert!(
+            payload.len() < PAYLOAD_BUCKET,
+            "fixture must stay under one bucket so the legacy shape is unpadded"
+        );
+        let iv = siv(&k, filter, None, &payload);
+        apply_keystream(&k, &iv, &mut payload);
+        let token = format!(
+            "{CURSOR_PREFIX}.{}.{}",
+            URL_SAFE_NO_PAD.encode(iv),
+            URL_SAFE_NO_PAD.encode(&payload)
+        );
+        assert_eq!(
+            decode(&k, filter, None, &token).unwrap(),
+            position,
+            "pre-padding token must verify under the current decode"
+        );
+    }
+
+    /// The `PAYLOAD_BUCKET` docstring promises an oversized payload rounds up
+    /// to the next multiple instead of failing. Mint a position whose id
+    /// pushes the serialized payload past one bucket and require the token
+    /// to round-trip (at two buckets).
+    #[test]
+    fn oversized_payload_rounds_up_to_next_bucket() {
+        let k = key();
+        // ~140-char id: payload crosses the 128-byte bucket.
+        let long_id = "a".repeat(140);
+        let position = TaskPosition::new("2026-01-03T00:00:00+00:00", long_id.clone());
+        let probe = serde_json::to_vec(&CursorPayload {
+            t: &position.created_at,
+            i: &position.id,
+            e: 1_700_000_000,
+        })
+        .expect("cursor payload is plain strings and an integer");
+        assert!(
+            probe.len() > PAYLOAD_BUCKET,
+            "fixture payload must exceed one bucket: {} bytes",
+            probe.len()
+        );
+        assert!(
+            probe.len() <= 2 * PAYLOAD_BUCKET,
+            "fixture payload must fit in two buckets: {} bytes",
+            probe.len()
+        );
+        let token = encode(&k, unfiltered(), None, &position);
+        assert_eq!(
+            decode(&k, unfiltered(), None, &token).unwrap(),
+            position,
+            "oversized payload must round-trip at two buckets"
+        );
+        // Two buckets of ciphertext must be longer than one bucket's worth.
+        let single = encode(
+            &k,
+            unfiltered(),
+            None,
+            &TaskPosition::new("2026-01-03T00:00:00+00:00", "task-a"),
+        );
+        assert!(
+            token.len() > single.len(),
+            "two-bucket token must be longer than a one-bucket token"
         );
     }
 
