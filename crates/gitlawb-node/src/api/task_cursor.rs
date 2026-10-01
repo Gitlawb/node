@@ -40,7 +40,9 @@
 //! therefore part of the MAC input, so a token presented by anyone else fails
 //! to verify rather than under-reporting.
 //!
-//! Wire form: `v1.<payload>.<tag>`, both parts base64url unpadded.
+//! Wire form: `v1.<iv>.<body>`, both parts base64url unpadded: the 16-byte
+//! synthetic IV (the truncated MAC, which also seeds the keystream) and the
+//! padded, encrypted JSON payload.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -66,10 +68,10 @@ const TAG_LEN: usize = 16;
 /// XORs the plaintext byte for byte, so token length would otherwise track
 /// payload length and leak the named row's field widths to a holder who
 /// cannot decrypt anything. 128 comfortably covers the widest realistic
-/// payload: a 35-char nanosecond-precision RFC3339 timestamp
-/// (`to_rfc3339()` never renders longer), a 36-char server-minted UUID, and
-/// the fixed JSON envelope plus a 10-digit expiry, which together stay under
-/// 100 bytes. Should a future payload ever exceed the bucket, the length
+/// payload: a 35-char RFC3339 timestamp (`to_rfc3339()` renders 29 chars at
+/// millisecond precision and 32 at microsecond, 35 only with all nine
+/// fractional digits), a 36-char server-minted UUID, and the fixed JSON
+/// envelope plus a 10-digit expiry, which together total 101 bytes. Should a future payload ever exceed the bucket, the length
 /// rounds up to the next multiple instead of failing, so `encode` never
 /// breaks — it just mints a longer token.
 const PAYLOAD_BUCKET: usize = 128;
@@ -399,32 +401,23 @@ mod tests {
     /// tag over the raw bytes) must still verify: `decode` MACs whatever
     /// plaintext the keystream recovers and `serde_json` tolerates the
     /// missing trailing whitespace. This pins the back-compat claim in the
-    /// `encode` docstring using the pre-change recipe directly.
+    /// `encode` docstring with a frozen v1 artifact, so a change to the v1
+    /// recipe (domains, serialization, padding) breaks this test instead of
+    /// silently re-deriving under the new internals.
+    ///
+    /// Fixture expiry is fixed at 2100-01-01 (`4102444800`): it must stay in
+    /// the future whenever the test runs.
     #[test]
     fn unpadded_legacy_token_still_verifies() {
         let k = key();
         let filter = unfiltered();
         let position = TaskPosition::new("2026-01-03T00:00:00+00:00", "legacy-task");
-        // Pre-padding recipe: serialize, tag, and encrypt with no padding.
-        let mut payload = serde_json::to_vec(&CursorPayload {
-            t: &position.created_at,
-            i: &position.id,
-            e: chrono::Utc::now().timestamp() + CURSOR_TTL_SECS,
-        })
-        .expect("cursor payload is plain strings and an integer");
-        assert!(
-            payload.len() < PAYLOAD_BUCKET,
-            "fixture must stay under one bucket so the legacy shape is unpadded"
-        );
-        let iv = siv(&k, filter, None, &payload);
-        apply_keystream(&k, &iv, &mut payload);
-        let token = format!(
-            "{CURSOR_PREFIX}.{}.{}",
-            URL_SAFE_NO_PAD.encode(iv),
-            URL_SAFE_NO_PAD.encode(&payload)
-        );
+        // Pre-padding recipe minted once and frozen: serialize with no
+        // padding, tag, and encrypt. Deterministic by construction (SIV needs
+        // no randomness), so this literal is stable across runs.
+        let token = "v1.ILJyy7JZScm_h-HM1-CggA.l4kJUoHTbqSGTVKL0DP4hORnbOS1_gHYV2fwJYXd2QtM-6TBMCKh-wvluIiaEYC9rUSUPVSteAKkp7jBCmK_bR2D";
         assert_eq!(
-            decode(&k, filter, None, &token).unwrap(),
+            decode(&k, filter, None, token).unwrap(),
             position,
             "pre-padding token must verify under the current decode"
         );
@@ -462,16 +455,14 @@ mod tests {
             position,
             "oversized payload must round-trip at two buckets"
         );
-        // Two buckets of ciphertext must be longer than one bucket's worth.
-        let single = encode(
-            &k,
-            unfiltered(),
-            None,
-            &TaskPosition::new("2026-01-03T00:00:00+00:00", "task-a"),
-        );
-        assert!(
-            token.len() > single.len(),
-            "two-bucket token must be longer than a one-bucket token"
+        // The padded body must be exactly two buckets, not merely longer
+        // than one: the padding claim is an exact width, not a direction.
+        let body = token.split('.').nth(2).expect("token has a body part");
+        let raw = URL_SAFE_NO_PAD.decode(body).unwrap();
+        assert_eq!(
+            raw.len(),
+            2 * PAYLOAD_BUCKET,
+            "oversized payload must pad to exactly two buckets"
         );
     }
 
