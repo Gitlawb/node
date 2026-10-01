@@ -331,6 +331,17 @@ mod tests {
         let pos = TaskPosition::new("2026-01-03T00:00:00.123456789+00:00", "task-a");
         let token = encode(&k, unfiltered(), None, &pos);
         assert_eq!(decode(&k, unfiltered(), None, &token).unwrap(), pos);
+        // A sub-bucket payload pads to exactly one bucket: the padding
+        // claim is an exact width, and every other width assertion here is
+        // bucket-relative, so only an absolute check catches a pad that
+        // skips "next multiple" or a drifted bucket constant.
+        let body = token.split('.').nth(2).expect("token has a body part");
+        let raw = URL_SAFE_NO_PAD.decode(body).unwrap();
+        assert_eq!(
+            raw.len(),
+            PAYLOAD_BUCKET,
+            "normal token must pad to exactly one bucket"
+        );
     }
 
     /// The whole point of the token is that the caller may hold it without
@@ -402,8 +413,11 @@ mod tests {
     /// plaintext the keystream recovers and `serde_json` tolerates the
     /// missing trailing whitespace. This pins the back-compat claim in the
     /// `encode` docstring with a frozen v1 artifact, so a change to the v1
-    /// recipe (domains, serialization, padding) breaks this test instead of
-    /// silently re-deriving under the new internals.
+    /// recipe pins (domains, MAC input, keystream, segment layout, field
+    /// names) breaks this test instead of silently re-deriving under the
+    /// new internals. It does not pin the padding: `decode` never consults
+    /// `PAYLOAD_BUCKET` and the fixture is unpadded, so the padding-width
+    /// claim belongs to `oversized_payload_rounds_up_to_next_bucket`.
     ///
     /// Fixture expiry is fixed at 2100-01-01 (`4102444800`): it must stay in
     /// the future whenever the test runs.
@@ -420,6 +434,16 @@ mod tests {
             decode(&k, filter, None, token).unwrap(),
             position,
             "pre-padding token must verify under the current decode"
+        );
+        // The fixture is a genuine pre-padding artifact, so its decoded
+        // body must stay below one bucket: a literal re-minted under the
+        // padded recipe would retire this back-compat pin silently.
+        let body = token.split('.').nth(2).expect("token has a body part");
+        let raw = URL_SAFE_NO_PAD.decode(body).unwrap();
+        assert!(
+            raw.len() < PAYLOAD_BUCKET,
+            "legacy fixture must be the unpadded shape: {} bytes",
+            raw.len()
         );
     }
 
