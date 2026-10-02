@@ -1,7 +1,7 @@
 {
   "$comment": "Canonical seed list for the Gitlawb network. Merged with GITLAWB_BOOTSTRAP_PEERS at startup. PRs to add public nodes welcome.",
   "version": 1,
-  "updated": "2026-06-30",
+  "updated": "2026-10-02",
   "peers": [
     {
       "name": "gitlawb",
@@ -42,6 +42,14 @@
       "http_url": "https://rapybus-gitlawb.com",
       "p2p_multiaddr": null,
       "added": "2026-05-16"
+    },
+    {
+      "name": "moonwake-ledger",
+      "operator": "Moonwake Ledger",
+      "did": "did:key:z6Mkh9AZ46Z3RkGZfFCom5vzX2535f54d6G2o2ZGkCqjwW8K",
+      "http_url": "https://node.moonwakeledger.com",
+      "p2p_multiaddr": "/dns4/node.moonwakeledger.com/udp/7546/quic-v1/p2p/12D3KooW9z8FrBRvP4xXx1mjaaCUWUvZ6T1qyEXQMNcpXtkbTXhA",
+      "added": "2026-10-02"
     }
   ]
 }
