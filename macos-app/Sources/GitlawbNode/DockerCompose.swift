@@ -62,7 +62,7 @@ class DockerCompose {
     private static func migrateRetiredImage(atPath path: String) {
         guard let existing = try? String(contentsOfFile: path, encoding: .utf8) else { return }
         let migrated = existing.replacingOccurrences(
-            of: #"ghcr\.io/gitlawb/node(?![A-Za-z0-9_./-])"#,
+            of: #"(?<![A-Za-z0-9_./-])ghcr\.io/gitlawb/node(?![A-Za-z0-9_./-])"#,
             with: "ghcr.io/twigpine/node",
             options: .regularExpression
         )
