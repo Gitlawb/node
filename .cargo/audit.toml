@@ -36,14 +36,14 @@ ignore = [
     # the build, at which point it becomes a real reachable advisory.
     "RUSTSEC-2023-0071", # rsa Marvin attack (no fix; not linked in our build)
 
-    # crypto-bigint 0.4.9 / 0.5.5 (secret-dependent branches in operations meant
+    # crypto-bigint 0.5.5 (secret-dependent branches in operations meant
     # to be constant-time). REACHABLE accepted risk, on two paths:
     # - alloy-signer -> elliptic-curve 0.13 -> crypto-bigint 0.5: the k256
     #   PrivateKeySigner that signs transactions in `gl name`
     #   (crates/gl/src/name.rs) and the node operator
     #   (crates/gitlawb-node/src/operator.rs).
     # - aws-sigv4 (`sigv4a` feature, crates/gitlawb-node/Cargo.toml) ->
-    #   crypto-bigint 0.5 and p256 0.11 -> crypto-bigint 0.4: SigV4a key
+    #   crypto-bigint 0.5 (directly and via p256 0.13): SigV4a key
     #   derivation, used only for requests to endpoints that require SigV4a
     #   (e.g. S3 Multi-Region Access Points).
     # Exploiting it needs local timing observation of those signing operations.
