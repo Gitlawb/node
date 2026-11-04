@@ -120,7 +120,7 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
                     COVERED_COMPONENTS.join(", "),
                     missing.join(", ")
                 ),
-                "hint": "See https://gitlawb.com/agents#authentication",
+                "hint": "See https://twigpine.com/agents#authentication",
             })),
         )
             .into_response();
@@ -392,7 +392,7 @@ fn human_detected(message: &str) -> impl IntoResponse {
             "error": "not_an_agent",
             "message": message,
             "hint": "gl identity new && gl register",
-            "docs": "https://gitlawb.com/agents",
+            "docs": "https://twigpine.com/agents",
         })),
     )
 }

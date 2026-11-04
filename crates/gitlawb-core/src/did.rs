@@ -1,11 +1,11 @@
-//! Decentralized Identifier (DID) types for the gitlawb network.
+//! Decentralized Identifier (DID) types for the Twigpine network.
 //!
 //! Supported methods:
 //!   - `did:key`      — ephemeral, derived directly from an Ed25519 public key
 //!   - `did:web`      — anchored to a domain
 //!   - `did:gitlawb`  — native, anchored to the libp2p DHT
 //!
-//! The canonical DID for a gitlawb actor is `did:key` during bootstrap
+//! The canonical DID for a Twigpine actor is `did:key` during bootstrap
 //! and migrates to `did:gitlawb` once DHT anchoring is live.
 
 use ed25519_dalek::VerifyingKey;
@@ -152,7 +152,7 @@ impl From<Did> for String {
     }
 }
 
-/// A DID Document for a gitlawb actor.
+/// A DID Document for a Twigpine actor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DidDocument {
     #[serde(rename = "@context")]

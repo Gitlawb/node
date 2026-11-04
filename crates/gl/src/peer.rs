@@ -20,14 +20,22 @@ pub struct PeerArgs {
 pub enum PeerCmd {
     /// List known peers on the node
     List {
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
     },
     /// Announce yourself to a peer node (adds you to their peer list)
     Add {
         /// The URL of the peer node to announce to
         peer_url: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -36,14 +44,22 @@ pub enum PeerCmd {
     Ping {
         /// The DID of the peer to ping
         did: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
     },
     /// Resolve a DID to its node URL and p2p info (checks local cache then Kademlia DHT)
     Resolve {
         /// The DID to resolve (e.g. did:key:z6Mk...)
         did: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
     },
 }

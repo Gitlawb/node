@@ -15,7 +15,11 @@ pub struct ChangelogArgs {
     /// Maximum number of events to show
     #[arg(long, default_value = "20")]
     pub limit: usize,
-    #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+    #[arg(
+        long,
+        default_value = "https://node.twigpine.com",
+        env = "GITLAWB_NODE"
+    )]
     pub node: String,
     #[arg(long)]
     pub dir: Option<PathBuf>,
@@ -31,7 +35,7 @@ pub async fn run(args: ChangelogArgs) -> Result<()> {
     };
 
     if repo.is_empty() {
-        anyhow::bail!("no repo specified — pass <repo> or run from inside a gitlawb repo");
+        anyhow::bail!("no repo specified — pass <repo> or run from inside a Twigpine repo");
     }
 
     let (owner, name) = if let Some((o, n)) = repo.split_once('/') {

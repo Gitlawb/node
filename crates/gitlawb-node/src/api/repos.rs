@@ -5434,7 +5434,7 @@ mod tests {
             "9d92186a",
             "did:key:z6Mkwbud",
             "nipmod",
-            "Decentralized npm for agents on Gitlawb",
+            "Decentralized npm for agents on Twigpine",
             "2026-01-15T00:00:00Z",
         );
 
@@ -5448,7 +5448,7 @@ mod tests {
         );
         assert_eq!(
             rec.description.as_deref(),
-            Some("Decentralized npm for agents on Gitlawb"),
+            Some("Decentralized npm for agents on Twigpine"),
             "canonical description and metadata survive, not the mirror placeholder",
         );
         assert_eq!(*stars, 7, "star count follows the canonical row");

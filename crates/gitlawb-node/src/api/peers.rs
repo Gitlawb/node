@@ -532,7 +532,7 @@ mod tests {
 
     #[test]
     fn accepts_public_https_and_http() {
-        assert!(is_public_http_url("https://node.gitlawb.com"));
+        assert!(is_public_http_url("https://node.twigpine.com"));
         assert!(is_public_http_url("https://manila.gitlawb.com/"));
         assert!(is_public_http_url("http://203.0.113.10:7545"));
     }
@@ -556,7 +556,7 @@ mod tests {
             "http://[::1]:7545",
             "http://gitlawb-node.internal:7545",
             "http://my-node.local/",
-            "ftp://node.gitlawb.com",
+            "ftp://node.twigpine.com",
             "not-a-url",
             "",
             // Trailing-dot FQDN of an internal host.
