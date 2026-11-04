@@ -8,11 +8,13 @@
 #   git diff --name-only --no-renames BASE HEAD | scripts/ci-surfaces.sh
 #   scripts/ci-surfaces.sh --all      # every surface, whole workspace
 #
-# Prints GITHUB_OUTPUT lines (key=value). Fail-safe direction: anything this
-# script cannot attribute precisely widens the run, never narrows it. A global
-# Rust input or an unknown crate directory runs the Rust jobs on the whole
-# workspace; the CI wiring itself (pr-checks.yml, codeql.yml, this script)
-# runs every surface.
+# Prints GITHUB_OUTPUT lines (key=value). Each surface runs only for the paths
+# listed for it below, so a path no surface lists (docs, README, infra/, any
+# other workflow) runs no PR Checks job. Within the Rust surface, a change this
+# script cannot attribute to specific crates widens rather than narrows: a
+# global Rust input or an unknown crate directory runs the Rust jobs on the
+# whole workspace. The CI wiring itself (pr-checks.yml, codeql.yml, this
+# script) runs every surface.
 # Non-PR events (push to main, merge_group, workflow_dispatch, schedule) are
 # expected to pass --all, so main and the merge queue keep full coverage.
 #
@@ -46,6 +48,24 @@ for manifest in "$ROOT"/crates/*/Cargo.toml; do
   deps_of[$dir]="$(sed -n 's#.*path *= *"\.\./\([^"/]*\)".*#\1#p' "$manifest" | tr '\n' ' ')"
 done
 
+# Files outside crates/ that a crate compiles in (include_str!/include_bytes!),
+# path -> crate dir. A change to one is a change to that crate, so its tests
+# run. Candidates (keep those that resolve outside crates/<dir>/):
+#   git grep -nE 'include_(str|bytes)!\("(\.\./){2,}' crates
+declare -A embedded_in=(
+  [bootstrap-peers.json]=gitlawb-node
+)
+
+# Mark a crate dir as touched; a dir this checkout does not know (removed or
+# renamed crate) widens the Rust jobs to the whole workspace.
+touch_crate() {
+  if [ -n "${pkg_of[$1]:-}" ]; then
+    touched[$1]=1
+  else
+    full_rust=true
+  fi
+}
+
 full_rust=false
 rust=false
 docker=false
@@ -70,12 +90,10 @@ for path in "${changed[@]}"; do
       full_rust=true ;;
     crates/*/*)
       dir="${path#crates/}"
-      dir="${dir%%/*}"
-      if [ -n "${pkg_of[$dir]:-}" ]; then
-        touched[$dir]=1
-      else
-        # A crate dir this checkout does not know (removed or renamed crate).
-        full_rust=true
+      touch_crate "${dir%%/*}" ;;
+    *)
+      if [ -n "${embedded_in[$path]:-}" ]; then
+        touch_crate "${embedded_in[$path]}"
       fi ;;
   esac
 
