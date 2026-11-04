@@ -66,7 +66,7 @@ variable "snapshot_retain_count" {
 variable "image_repo" {
   description = "Container image repository for the node. Ignored when create_ecr_repo is true (the module-managed ECR repo is used instead)."
   type        = string
-  default     = "ghcr.io/gitlawb/node"
+  default     = "ghcr.io/twigpine/node"
 }
 
 variable "create_ecr_repo" {
