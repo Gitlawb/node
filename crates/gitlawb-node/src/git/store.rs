@@ -746,13 +746,149 @@ pub fn read_object(repo_path: &Path, sha256_hex: &str) -> Result<Option<(String,
     Ok(Some((obj_type, content)))
 }
 
+/// Outcome of validating a stored branch-field value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitRefValidationError {
+    /// Caller supplied a name that is not a valid local branch name.
+    Invalid(String),
+    /// Git could not be executed to validate the name.
+    GitUnavailable(String),
+}
+
+impl std::fmt::Display for GitRefValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(msg) | Self::GitUnavailable(msg) => f.write_str(msg),
+        }
+    }
+}
+
+/// Reject revision shorthands and pseudoref names that `git check-ref-format
+/// --branch` accepts but that git later interprets as symbolic revisions rather
+/// than literal local branch names.
+fn reject_revision_shorthand(name: &str) -> Option<&'static str> {
+    if name == "@" {
+        return Some("branch ref must not be a revision shorthand");
+    }
+    if name.starts_with("@{") {
+        return Some("branch ref must not be a reflog revision expression");
+    }
+    const PSEUDOREFS: &[&str] = &[
+        "FETCH_HEAD",
+        "ORIG_HEAD",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "RERERE_MERGE_HEAD",
+        "REBASE_HEAD",
+        "REVERT_HEAD",
+        "BISECT_HEAD",
+        "AUTO_MERGE",
+    ];
+    if PSEUDOREFS.contains(&name) {
+        return Some("branch ref must not be a git pseudoref name");
+    }
+    None
+}
+
+/// Validate a git *branch name* before it is stored or passed to git subprocesses.
+/// Delegates to `git check-ref-format --branch`, then rejects fully qualified
+/// ref paths, revision-namespace shorthands (`heads/`, `tags/`, `remotes/`), and
+/// symbolic names that git would reinterpret at the sink.
+///
+/// At diff/merge sinks, validated short names are passed as `refs/heads/{name}` so
+/// grammar-valid revision shorthands cannot retarget another ref namespace. The
+/// merge worktree checks out the local branch name instead, so merge commits
+/// advance refs/heads/{target}. Symbolic revision names (`HEAD`), option-shaped
+/// trailing dots, and other invalid forms are rejected by check-ref-format itself.
+/// Revision shorthands that pass the grammar check (`@`, `@{-1}`, pseudorefs) are
+/// rejected explicitly because git treats them as symbolic revisions when bare.
+///
+/// Storage boundaries call this via [`validate_git_ref_with_git`] with the configured
+/// git binary. Sink functions call [`validate_git_ref`] (system `git`) then prefix
+/// before building argv, so the property holds for every caller and every row,
+/// including legacy rows and any writer that skipped the boundary check.
+pub fn validate_git_ref(name: &str) -> std::result::Result<(), GitRefValidationError> {
+    validate_git_ref_with_git("git", name)
+}
+
+pub(crate) fn validate_git_ref_with_git(
+    git_bin: &str,
+    name: &str,
+) -> std::result::Result<(), GitRefValidationError> {
+    if name.is_empty() {
+        return Err(GitRefValidationError::Invalid(
+            "branch ref must not be empty".into(),
+        ));
+    }
+    if name.starts_with("refs/") {
+        return Err(GitRefValidationError::Invalid(
+            "branch ref must be a local branch name, not a fully qualified ref".into(),
+        ));
+    }
+    if name.starts_with("heads/") || name.starts_with("tags/") || name.starts_with("remotes/") {
+        return Err(GitRefValidationError::Invalid(
+            "branch ref must be a local branch name, not a revision shorthand".into(),
+        ));
+    }
+    if let Some(reason) = reject_revision_shorthand(name) {
+        return Err(GitRefValidationError::Invalid(reason.into()));
+    }
+    // allow-unbounded-git: stateless check-ref-format on a user-supplied name; no repo acquire or concurrency permit
+    let output = Command::new(git_bin)
+        .args(["check-ref-format", "--branch", name])
+        .output()
+        .map_err(|e| {
+            // allow-unbounded-git: stateless check-ref-format on user-supplied name; no repo acquire
+            GitRefValidationError::GitUnavailable(format!(
+                "failed to run git check-ref-format: {e}"
+            ))
+        })?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(GitRefValidationError::Invalid(stderr.trim().to_string()))
+    }
+}
+
+/// Reject both refs at the sink, so an option-shaped ref can never reach a git
+/// argv element regardless of how it was stored.
+fn map_ref_validation_to_anyhow(which: &str, err: GitRefValidationError) -> anyhow::Error {
+    match err {
+        GitRefValidationError::Invalid(msg) => {
+            anyhow::anyhow!("invalid {which} branch ref: {msg}")
+        }
+        GitRefValidationError::GitUnavailable(msg) => anyhow::anyhow!("{msg}"),
+    }
+}
+
+fn guard_refs(target_branch: &str, source_branch: &str) -> Result<()> {
+    validate_git_ref(target_branch).map_err(|e| map_ref_validation_to_anyhow("target", e))?;
+    validate_git_ref(source_branch).map_err(|e| map_ref_validation_to_anyhow("source", e))?;
+    Ok(())
+}
+
+/// Stored short branch names are passed to git as explicit local-branch refs so a
+/// syntax-valid name cannot be reinterpreted as a revision shorthand at the sink.
+fn local_branch_ref(short_name: &str) -> String {
+    format!("refs/heads/{short_name}")
+}
+
 /// Get the diff between two branches: changes on source_branch not in target_branch.
 pub fn branch_diff(repo_path: &Path, target_branch: &str, source_branch: &str) -> Result<String> {
+    guard_refs(target_branch, source_branch)?;
+    let target = local_branch_ref(target_branch);
+    let source = local_branch_ref(source_branch);
     let output = Command::new("git")
-        .args(["diff", &format!("{target_branch}...{source_branch}")])
+        .args(["diff", &format!("{target}...{source}")])
         .current_dir(repo_path)
         .output()
         .context("failed to run git diff")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git diff failed: {stderr}");
+    }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
@@ -765,13 +901,11 @@ pub fn branch_diff_names(
     target_branch: &str,
     source_branch: &str,
 ) -> Result<Vec<String>> {
+    guard_refs(target_branch, source_branch)?;
+    let target = local_branch_ref(target_branch);
+    let source = local_branch_ref(source_branch);
     let output = Command::new("git")
-        .args([
-            "diff",
-            "--name-only",
-            "-z",
-            &format!("{target_branch}...{source_branch}"),
-        ])
+        .args(["diff", "--name-only", "-z", &format!("{target}...{source}")])
         .current_dir(repo_path)
         .output()
         .context("failed to run git diff --name-only")?;
@@ -799,18 +933,78 @@ pub fn merge_branch(
     author_did: &str,
     pr_title: &str,
 ) -> Result<String> {
+    guard_refs(target_branch, source_branch)?;
+    let source_ref = local_branch_ref(source_branch);
+    let target_ref = local_branch_ref(target_branch);
     let worktree_path = repo_path.join("_merge_worktree");
 
-    // Clean up any leftover worktree
-    if worktree_path.exists() {
+    let remove_worktree = || {
+        // Two --force flags, not one. A single --force refuses a LOCKED worktree
+        // ("cannot remove a locked working tree") and `git worktree prune` skips
+        // locked registrations too, so with one flag a locked leftover survives
+        // the whole cleanup and wedges this endpoint for good. With both flags a
+        // separate prune adds nothing: over every leftover state that can reach
+        // here (registered/unregistered x directory present/gone/locked/corrupt)
+        // `remove -f -f` plus the removal below already clears the registration.
         let _ = Command::new("git")
-            .args(["worktree", "remove", "--force", "_merge_worktree"])
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                "--force",
+                "_merge_worktree",
+            ])
             .current_dir(repo_path)
             .output();
         let _ = std::fs::remove_dir_all(&worktree_path);
+    };
+
+    // Clean up any leftover worktree. This cannot be gated on the directory
+    // existing: a registration whose directory is gone is the one state
+    // `worktree add` refuses outright ("missing but already registered"), and
+    // it is reachable from the cleanup above, so gating on .exists() would let
+    // one failed removal wedge every later merge on this repo.
+    remove_worktree();
+
+    // The merge must land on the LOCAL target branch, so the worktree has to end
+    // up attached to exactly refs/heads/{target}. validate_git_ref proves
+    // branch-name grammar only: it does not prove refs/heads/{target} exists,
+    // and it cannot stop git's revision DWIM rules from resolving the same
+    // short name in another namespace (refs/tags/{name}, refs/remotes/...). If
+    // DWIM won, `worktree add` would check out a detached HEAD at the foreign
+    // ref, the merge would succeed on that disposable HEAD, and cleanup would
+    // discard the commit without ever advancing refs/heads/{target}.
+    //
+    // (1) Require the exact local ref before creating the worktree. show-ref
+    // --verify matches the full refname literally — no DWIM, no abbreviation —
+    // so a same-named tag with no local branch fails here instead of being
+    // silently resolved.
+    //
+    // allow-unbounded-git: read-only `show-ref --verify` on one literal refname,
+    // no network and no object walk. It also sits alongside the pre-existing bare
+    // `git diff`, `git merge` and `git rev-parse` spawns in this same function,
+    // all under the same acquire_write lock, so bounding only this one would not
+    // change the function's exposure. Bounding merge_branch as a whole is a
+    // separate change against already-reviewed code, tracked as follow-up.
+    let target_exists = Command::new("git")
+        .args(["show-ref", "--verify", "--quiet", &target_ref])
+        .current_dir(repo_path)
+        .output()
+        .context("failed to run git show-ref")?;
+    if !target_exists.status.success() {
+        bail!("target branch {target_ref} does not exist as a local branch");
     }
 
-    // Create worktree on target branch
+    // (2) Check out the local target branch in the worktree. The bare short
+    // name is what makes git attach HEAD to the branch (passing
+    // refs/heads/{name} would detach, so a successful merge would not advance
+    // refs/heads/{target}); step (1) guarantees the branch exists, so an
+    // attached checkout is the only acceptable outcome — verified right below.
+    //
+    // allow-unbounded-git: local `worktree add`, no network. Same reasoning as the
+    // show-ref spawn above: the surrounding function's other git children are
+    // already bare under this lock, so this one is not the thing that would need
+    // bounding first.
     let wt = Command::new("git")
         .args(["worktree", "add", "_merge_worktree", target_branch])
         .current_dir(repo_path)
@@ -823,12 +1017,31 @@ pub fn merge_branch(
         );
     }
 
+    // The worktree's HEAD must be a symbolic ref to exactly refs/heads/{target}.
+    // A detached or differently-attached HEAD means git resolved the name as
+    // something other than the local target branch; a merge committed on it
+    // would be thrown away by cleanup, so refuse before merging rather than
+    // relying on any denylist of symbolic shapes.
+    //
+    // allow-unbounded-git: read-only `symbolic-ref` resolving one local HEAD, no
+    // network. Same reasoning as the two spawns above.
+    let head_ref = Command::new("git")
+        .args(["symbolic-ref", "--quiet", "HEAD"])
+        .current_dir(&worktree_path)
+        .output()
+        .context("failed to run git symbolic-ref")?;
+    let head_ref_name = String::from_utf8_lossy(&head_ref.stdout).trim().to_string();
+    if !head_ref.status.success() || head_ref_name != target_ref {
+        remove_worktree();
+        bail!("merge worktree is not attached to {target_ref} (HEAD is {head_ref_name:?})");
+    }
+
     // Run merge in worktree
     let merge = Command::new("git")
         .args([
             "merge",
             "--no-ff",
-            source_branch,
+            &source_ref,
             "-m",
             &format!(
                 "Merge branch '{}' into {} ({})",
@@ -846,11 +1059,7 @@ pub fn merge_branch(
     let success = merge.status.success();
 
     // Always remove worktree
-    let _ = Command::new("git")
-        .args(["worktree", "remove", "--force", "_merge_worktree"])
-        .current_dir(repo_path)
-        .output();
-    let _ = std::fs::remove_dir_all(&worktree_path);
+    remove_worktree();
 
     if !success {
         bail!(
@@ -859,12 +1068,24 @@ pub fn merge_branch(
         );
     }
 
-    // Get new HEAD of target branch
+    // (3) The merge only counts if the exact target ref now points at a commit.
+    // Plain `rev-parse` echoes an unresolvable token back on stdout with a
+    // nonzero exit status, so an unchecked call here would hand the literal
+    // string "refs/heads/{target}" upward as an apparently valid merge SHA and
+    // the caller would mark the PR merged and fire the webhook. --verify plus
+    // ^{commit} plus an explicit status check turn "target ref missing or not a
+    // commit" into a hard failure before any of that happens.
     let head = Command::new("git")
-        .args(["rev-parse", &format!("refs/heads/{target_branch}")])
+        .args(["rev-parse", "--verify", &format!("{target_ref}^{{commit}}")])
         .current_dir(repo_path)
         .output()
         .context("failed to get merge commit")?;
+    if !head.status.success() {
+        bail!(
+            "merge completed but {target_ref} does not resolve to a commit: {}",
+            String::from_utf8_lossy(&head.stderr)
+        );
+    }
 
     Ok(String::from_utf8_lossy(&head.stdout).trim().to_string())
 }
@@ -878,7 +1099,73 @@ pub fn repo_disk_path(repos_dir: &Path, owner_did: &str, repo_name: &str) -> Pat
 
 #[cfg(test)]
 mod tests {
-    use super::branch_diff_names;
+    use super::{validate_git_ref, validate_git_ref_with_git, GitRefValidationError};
+
+    #[test]
+    fn validate_git_ref_accepts_normal_branch_names() {
+        for good in [
+            "main",
+            "feature/foo",
+            "release-1.2",
+            "v1.0.0",
+            "user/fix-bug",
+            "feature@",
+            "user@host",
+        ] {
+            assert!(
+                validate_git_ref(good).is_ok(),
+                "{good:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_git_ref_rejects_option_injection_and_malformed_refs() {
+        for bad in [
+            "",
+            "HEAD",
+            "@",
+            "@{-1}",
+            "FETCH_HEAD",
+            "MERGE_HEAD",
+            "feature.",
+            "feature/x.",
+            "refs/heads/main",
+            "refs/tags/v1",
+            "refs/heads/--output=/tmp/x",
+            "heads/main",
+            "tags/v1",
+            "remotes/origin/main",
+            "--output=/tmp/x",
+            "-rf",
+            "a b",
+            "a..b",
+            "a~b",
+            "refs/heads/@{x}",
+            "foo.lock",
+            "/leading",
+            "trailing/",
+            "a//b",
+        ] {
+            let err = validate_git_ref(bad).expect_err("{bad:?} should be rejected");
+            assert!(
+                matches!(err, GitRefValidationError::Invalid(_)),
+                "{bad:?} should be an invalid-name rejection, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_git_ref_spawn_failure_is_git_unavailable_not_invalid() {
+        let err = validate_git_ref_with_git("/nonexistent/gitlawb-git", "main")
+            .expect_err("missing git binary should fail");
+        assert!(
+            matches!(err, GitRefValidationError::GitUnavailable(_)),
+            "spawn failure must not be classified as invalid input, got {err:?}"
+        );
+    }
+
+    use super::{branch_diff_names, merge_branch};
     use std::path::Path;
     use std::process::Command;
 
@@ -2024,5 +2311,260 @@ mod tests {
             matches!(res, Ok(None)),
             "a clean `missing` twice on a readable store is a genuine absence; got {res:?}"
         );
+    }
+
+    /// CodeRabbit #379: `merge_branch`'s leftover-worktree cleanup ran only when the
+    /// `_merge_worktree` DIRECTORY still existed. A directory that is gone while
+    /// `$GIT_DIR/worktrees/_merge_worktree` still holds its registration is precisely
+    /// the state `git worktree add` refuses ("is a missing but already registered
+    /// worktree", exit 128), and it is self-inflicted: `remove_worktree` deletes the
+    /// directory even when the `git worktree remove` before it failed. Once a repo is
+    /// in that state every later merge on it fails permanently. REVERT PROOF (RED):
+    /// put the cleanup call back behind `if worktree_path.exists()` and this test
+    /// fails at the merge below with "missing but already registered".
+    #[test]
+    fn merge_branch_recovers_from_a_stale_worktree_registration() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let g = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        g(&["init", "-q"], &work);
+        g(&["config", "user.email", "t@t"], &work);
+        g(&["config", "user.name", "t"], &work);
+        std::fs::write(work.join("base.txt"), b"base\n").unwrap();
+        g(&["add", "."], &work);
+        g(&["commit", "-qm", "base"], &work);
+        let main = {
+            let o = Command::new("git")
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        g(&["checkout", "-q", "-b", "feature"], &work);
+        std::fs::write(work.join("feat.txt"), b"feat\n").unwrap();
+        g(&["add", "."], &work);
+        g(&["commit", "-qm", "feat"], &work);
+        g(&["checkout", "-q", &main], &work);
+
+        let bare = td.path().join("bare.git");
+        g(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        // Reproduce the stuck state exactly: register the worktree, then delete its
+        // directory without unregistering it. This is what a failed `worktree remove`
+        // followed by the unconditional `remove_dir_all` leaves behind.
+        //
+        // `gc.worktreePruneExpire=never` is set on purpose. Recovery must not depend on
+        // git's prune expiry policy: a registration this fresh would sit inside any
+        // sane expiry window, so a cleanup that only pruned on expiry would leave the
+        // repo wedged. Both `worktree remove --force` and `worktree prune` unregister a
+        // worktree whose gitdir target is gone regardless of this setting, and pinning
+        // it here keeps that true if either call is ever changed.
+        g(&["config", "gc.worktreePruneExpire", "never"], &bare);
+        g(&["worktree", "add", "_merge_worktree", &main], &bare);
+        std::fs::remove_dir_all(bare.join("_merge_worktree")).unwrap();
+        assert!(
+            bare.join("worktrees/_merge_worktree").exists(),
+            "fixture must leave the registration behind"
+        );
+
+        let before = Command::new("git")
+            .args(["rev-parse", &format!("refs/heads/{main}")])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        let before = String::from_utf8_lossy(&before.stdout).trim().to_string();
+
+        let merged = merge_branch(&bare, &main, "feature", "did:key:zTest", "t")
+            .expect("a stale worktree registration must not wedge the merge endpoint");
+
+        let after = Command::new("git")
+            .args(["rev-parse", &format!("refs/heads/{main}")])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        let after = String::from_utf8_lossy(&after.stdout).trim().to_string();
+        assert_ne!(before, after, "the merge must advance refs/heads/{main}");
+        assert_eq!(after, merged, "the returned sha must be the new branch tip");
+    }
+
+    /// Companion to the stale-registration case: the leftover worktree is also LOCKED.
+    /// `git worktree remove --force` (ONE flag) refuses a locked worktree outright, and
+    /// `git worktree prune` skips locked registrations too, so with a single --force the
+    /// cleanup makes no progress and `worktree add` keeps failing. REVERT PROOF (RED):
+    /// drop either --force from remove_worktree and this test fails.
+    #[test]
+    fn merge_branch_recovers_from_a_locked_stale_worktree() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let g = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        g(&["init", "-q"], &work);
+        g(&["config", "user.email", "t@t"], &work);
+        g(&["config", "user.name", "t"], &work);
+        std::fs::write(work.join("base.txt"), b"base\n").unwrap();
+        g(&["add", "."], &work);
+        g(&["commit", "-qm", "base"], &work);
+        let main = {
+            let o = Command::new("git")
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        g(&["checkout", "-q", "-b", "feature"], &work);
+        std::fs::write(work.join("feat.txt"), b"feat\n").unwrap();
+        g(&["add", "."], &work);
+        g(&["commit", "-qm", "feat"], &work);
+        g(&["checkout", "-q", &main], &work);
+
+        let bare = td.path().join("bare.git");
+        g(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        g(&["worktree", "add", "_merge_worktree", &main], &bare);
+        g(&["worktree", "lock", "_merge_worktree"], &bare);
+        std::fs::remove_dir_all(bare.join("_merge_worktree")).unwrap();
+
+        let before = Command::new("git")
+            .args(["rev-parse", &format!("refs/heads/{main}")])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        let before = String::from_utf8_lossy(&before.stdout).trim().to_string();
+
+        let merged = merge_branch(&bare, &main, "feature", "did:key:zTest", "t")
+            .expect("a locked leftover worktree must not wedge the merge endpoint");
+
+        let after = Command::new("git")
+            .args(["rev-parse", &format!("refs/heads/{main}")])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        let after = String::from_utf8_lossy(&after.stdout).trim().to_string();
+        assert_ne!(before, after, "the merge must advance refs/heads/{main}");
+        assert_eq!(after, merged, "the returned sha must be the new branch tip");
+    }
+
+    /// The third leftover shape: a `_merge_worktree` DIRECTORY with no registration
+    /// behind it, which is what a crash between `worktree add` creating the directory
+    /// and git recording it leaves. `git worktree remove` refuses this one outright
+    /// ("is not a working tree"), so the `remove_dir_all` in remove_worktree is the
+    /// only thing that clears it and `worktree add` otherwise fails on the existing
+    /// path. REVERT PROOF (RED): drop the remove_dir_all from remove_worktree and this
+    /// test fails.
+    #[test]
+    fn merge_branch_recovers_from_an_unregistered_leftover_directory() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let g = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        g(&["init", "-q"], &work);
+        g(&["config", "user.email", "t@t"], &work);
+        g(&["config", "user.name", "t"], &work);
+        std::fs::write(work.join("base.txt"), b"base\n").unwrap();
+        g(&["add", "."], &work);
+        g(&["commit", "-qm", "base"], &work);
+        let main = {
+            let o = Command::new("git")
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        g(&["checkout", "-q", "-b", "feature"], &work);
+        std::fs::write(work.join("feat.txt"), b"feat\n").unwrap();
+        g(&["add", "."], &work);
+        g(&["commit", "-qm", "feat"], &work);
+        g(&["checkout", "-q", &main], &work);
+
+        let bare = td.path().join("bare.git");
+        g(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        // A directory in the way, with nothing registered behind it.
+        std::fs::create_dir_all(bare.join("_merge_worktree")).unwrap();
+        std::fs::write(bare.join("_merge_worktree/leftover.txt"), b"junk\n").unwrap();
+        assert!(
+            !bare.join("worktrees/_merge_worktree").exists(),
+            "fixture must leave no registration, only the directory"
+        );
+
+        let before = Command::new("git")
+            .args(["rev-parse", &format!("refs/heads/{main}")])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        let before = String::from_utf8_lossy(&before.stdout).trim().to_string();
+
+        let merged = merge_branch(&bare, &main, "feature", "did:key:zTest", "t")
+            .expect("an unregistered leftover directory must not wedge the merge endpoint");
+
+        let after = Command::new("git")
+            .args(["rev-parse", &format!("refs/heads/{main}")])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        let after = String::from_utf8_lossy(&after.stdout).trim().to_string();
+        assert_ne!(before, after, "the merge must advance refs/heads/{main}");
+        assert_eq!(after, merged, "the returned sha must be the new branch tip");
     }
 }
