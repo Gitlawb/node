@@ -449,3 +449,198 @@ mod lock_pool_shed_tests {
         );
     }
 }
+
+/// #426: end-to-end at the handler seam. A corrupt object store behind a
+/// resolving issue ref used to look identical to an absent issue: get returned
+/// a fake 404, close returned a fake 404 after releasing the write guard, and
+/// list silently under-reported. All three must now surface a git error.
+#[cfg(test)]
+mod corrupt_store_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use sqlx::PgPool;
+    use tempfile::TempDir;
+
+    fn seed_repo(owner_did: &str, name: &str) -> crate::db::RepoRecord {
+        let now = Utc::now();
+        crate::db::RepoRecord {
+            id: Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: format!("/tmp/{name}"),
+            forked_from: None,
+            machine_id: None,
+        }
+    }
+
+    /// A state whose repo store roots in `repos_dir`, so the test can lay down
+    /// a real repo and then corrupt it without touching /tmp.
+    async fn state_with_repos_dir(pool: &PgPool, repos_dir: &std::path::Path) -> AppState {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store =
+            crate::git::repo_store::RepoStore::for_testing(repos_dir.to_path_buf(), pool.clone());
+        state
+    }
+
+    /// Bare repo at the store's expected path, holding one issue ref.
+    fn bare_repo_with_issue(
+        repos_dir: &std::path::Path,
+        owner: &str,
+        name: &str,
+    ) -> (std::path::PathBuf, String) {
+        let repo_path = repos_dir
+            .join(owner.replace([':', '/'], "_"))
+            .join(format!("{name}.git"));
+        std::fs::create_dir_all(&repo_path).unwrap();
+        let out = std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&repo_path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let issue_id = "aaaabbbb-0000-0000-0000-000000000000".to_string();
+        git_issues::create_issue(
+            &repo_path,
+            &issue_id,
+            &serde_json::json!({
+                "id": issue_id,
+                "title": "t",
+                "status": "open",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        (repo_path, issue_id)
+    }
+
+    /// Delete the blob object behind the issue ref and put garbage in its
+    /// place: `cat-file` fails while `rev-parse` still resolves the ref.
+    fn corrupt_issue_object(repo_path: &std::path::Path, issue_id: &str) {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", &format!("refs/gitlawb/issues/{issue_id}")])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        let oid = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        let obj = repo_path.join("objects").join(&oid[..2]).join(&oid[2..]);
+        std::fs::remove_file(&obj).unwrap();
+        std::fs::write(&obj, b"garbage").unwrap();
+    }
+
+    /// The regression: closing over a corrupt store used to return a fake 404
+    /// (or panic deeper in). It must reach the caller as a git 500, and the
+    /// handler must return rather than unwind.
+    #[sqlx::test]
+    async fn close_issue_on_corrupt_store_returns_git_error_not_panic(pool: PgPool) {
+        let owner = "did:key:zISSUECORRUPTCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let dir = TempDir::new().unwrap();
+        let state = state_with_repos_dir(&pool, dir.path()).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "corrupt-close"))
+            .await
+            .expect("seed repo");
+        let (repo_path, issue_id) = bare_repo_with_issue(dir.path(), owner, "corrupt-close");
+        corrupt_issue_object(&repo_path, &issue_id);
+
+        let err = close_issue(
+            State(state),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), "corrupt-close".to_string(), issue_id)),
+        )
+        .await
+        .expect_err("a corrupt store must error, not panic or 404");
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a read failure is a git 500, not a fake not-found"
+        );
+    }
+
+    /// get on a corrupt store: 500, not the 404 the fold used to produce.
+    #[sqlx::test]
+    async fn get_issue_on_corrupt_store_returns_500_not_404(pool: PgPool) {
+        let owner = "did:key:zISSUECORRUPTGETDDDDDDDDDDDDDDDDDDDDDDD";
+        let dir = TempDir::new().unwrap();
+        let state = state_with_repos_dir(&pool, dir.path()).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "corrupt-get"))
+            .await
+            .expect("seed repo");
+        let (repo_path, issue_id) = bare_repo_with_issue(dir.path(), owner, "corrupt-get");
+        corrupt_issue_object(&repo_path, &issue_id);
+
+        let err = get_issue(
+            State(state),
+            Path((owner.to_string(), "corrupt-get".to_string(), issue_id)),
+            None,
+        )
+        .await
+        .expect_err("a corrupt store must error, not 404");
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+    }
+
+    /// list on a corrupt store must fail outright; a 200 that silently drops
+    /// the unreadable issue is the other half of the fold.
+    #[sqlx::test]
+    async fn list_issues_on_corrupt_store_returns_git_error(pool: PgPool) {
+        let owner = "did:key:zISSUECORRUPTLISTEEEEEEEEEEEEEEEEEEEEEE";
+        let dir = TempDir::new().unwrap();
+        let state = state_with_repos_dir(&pool, dir.path()).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "corrupt-list"))
+            .await
+            .expect("seed repo");
+        let (repo_path, issue_id) = bare_repo_with_issue(dir.path(), owner, "corrupt-list");
+        corrupt_issue_object(&repo_path, &issue_id);
+
+        let err = list_issues(
+            State(state),
+            Path((owner.to_string(), "corrupt-list".to_string())),
+            None,
+        )
+        .await
+        .expect_err("a corrupt store must error, not under-report");
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+    }
+
+    /// Must-not direction: a genuinely absent issue still gets the 404.
+    #[sqlx::test]
+    async fn get_issue_on_absent_ref_still_returns_404(pool: PgPool) {
+        let owner = "did:key:zISSUEABSENTFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+        let dir = TempDir::new().unwrap();
+        let state = state_with_repos_dir(&pool, dir.path()).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "absent-get"))
+            .await
+            .expect("seed repo");
+        bare_repo_with_issue(dir.path(), owner, "absent-get");
+
+        let err = get_issue(
+            State(state),
+            Path((
+                owner.to_string(),
+                "absent-get".to_string(),
+                "ffffffff-0000-0000-0000-000000000000".to_string(),
+            )),
+            None,
+        )
+        .await
+        .expect_err("a missing issue is still not-found");
+        assert_eq!(err.into_response().status(), StatusCode::NOT_FOUND);
+    }
+}
