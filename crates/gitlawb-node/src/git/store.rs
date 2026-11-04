@@ -141,7 +141,29 @@ pub fn log(repo_path: &Path, refname: &str, limit: usize) -> Result<Vec<CommitIn
         .context("failed to run git log")?;
 
     if !output.status.success() {
-        return Ok(vec![]); // empty repo
+        // An unresolvable ref means a genuinely empty repo. A ref that
+        // resolves but fails to log is a read failure (corrupt object store, a
+        // gc mid-read): report it rather than passing an empty log off as no
+        // history (#400). rev-parse resolves the name without reading objects.
+        // allow-unbounded-git: failure-path existence recheck; module
+        // convention, at most one extra spawn per failed log.
+        let resolved = Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", refname])
+            .current_dir(repo_path)
+            .output()
+            .context("failed to run git rev-parse")?;
+        // --quiet exits 1 only for "ref does not resolve"; other failures
+        // (not a repo, broken config) are real errors, not an empty history.
+        match resolved.status.code() {
+            Some(1) => return Ok(vec![]),
+            Some(0) => {}
+            _ => {
+                let stderr = String::from_utf8_lossy(&resolved.stderr);
+                anyhow::bail!("git rev-parse failed for {refname}: {}", stderr.trim());
+            }
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git log failed for {refname}: {}", stderr.trim());
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2023,6 +2045,67 @@ mod tests {
         assert!(
             matches!(res, Ok(None)),
             "a clean `missing` twice on a readable store is a genuine absence; got {res:?}"
+        );
+    }
+
+    // #400: `log` may fold a failed `git log` into Ok(vec![]) only when the ref
+    // genuinely does not resolve (an empty repo). A ref that resolves but
+    // fails to read is an error, not an empty history.
+    #[test]
+    fn log_empty_is_empty_and_resolved_ref_read_failure_errors() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work: &Path = td.path();
+        let g = |args: &[&str]| {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(work)
+                .status()
+                .unwrap()
+                .success());
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+
+        // No commits: nothing resolves, so a failed log is a real empty repo.
+        assert!(super::log(work, "HEAD", 10).unwrap().is_empty());
+
+        std::fs::write(work.join("f.txt"), b"x\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "c1"]);
+        assert_eq!(super::log(work, "HEAD", 10).unwrap().len(), 1);
+
+        // Corrupt the object the branch resolves to: `git log` fails but
+        // `rev-parse --verify` still resolves the name, so the failure must
+        // surface as an error rather than an empty history.
+        let oid = {
+            let o = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        let obj = work.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+        std::fs::remove_file(&obj).unwrap();
+        std::fs::write(&obj, b"garbage").unwrap();
+
+        assert!(super::log(work, "HEAD", 10).is_err());
+    }
+
+    /// The rev-parse recheck inside `log` must distinguish "ref missing"
+    /// (exit 1 -> empty history) from a real probe failure (exit 128 on a
+    /// non-repo -> error), not fold both into `Ok(vec![])`.
+    #[test]
+    fn log_probe_failure_on_a_non_repo_errors_instead_of_empty() {
+        let td = tempfile::TempDir::new().unwrap();
+        // A directory that is not a git repo at all: `git log` fails and the
+        // `rev-parse` recheck fails with 128, which is not "missing ref".
+        let not_a_repo = td.path().join("not-a-repo");
+        std::fs::create_dir_all(&not_a_repo).unwrap();
+        assert!(
+            super::log(&not_a_repo, "HEAD", 10).is_err(),
+            "a rev-parse probe failure must not read as an empty repo"
         );
     }
 }
