@@ -129,6 +129,18 @@ pub fn list_issues(repo_path: &Path) -> Result<Vec<String>> {
 /// Returns Ok(Some(full_id)) on unique match, Ok(None) if not found,
 /// Err if the prefix is ambiguous (matches more than one issue).
 pub fn resolve_issue_id(repo_path: &Path, id_or_prefix: &str) -> Result<Option<String>> {
+    // The id comes from the request path and is spliced into a git revision and a
+    // for-each-ref pattern below. Issue ids are UUIDs, so accept only ASCII
+    // alphanumerics and '-': anything else (`^{blob}`, `@{0}`, `*`, `/`, `..`) is
+    // revision or glob syntax, never an issue id, and is reported as not found.
+    if id_or_prefix.is_empty()
+        || !id_or_prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Ok(None);
+    }
+
     // Try exact match first — fast path for callers passing the full UUID.
     let exact_ref = format!("refs/gitlawb/issues/{id_or_prefix}");
     let check = Command::new("git")
@@ -268,6 +280,35 @@ mod tests {
         .unwrap();
         let resolved = resolve_issue_id(dir.path(), "abc12345").unwrap();
         assert_eq!(resolved, Some(full_id.to_string()));
+    }
+
+    #[test]
+    fn test_resolve_rejects_revision_syntax() {
+        let dir = TempDir::new().unwrap();
+        init_repo(&dir);
+        let full_id = "abc12345-0000-0000-0000-000000000000";
+        create_issue(
+            dir.path(),
+            full_id,
+            r#"{"id":"abc12345-0000-0000-0000-000000000000","status":"open"}"#,
+        )
+        .unwrap();
+        // Each of these resolves to (or globs over) the issue blob in git, but none
+        // is an issue id, so the lookup must not accept it.
+        for crafted in [
+            "abc12345-0000-0000-0000-000000000000^{blob}",
+            "abc12345-0000-0000-0000-000000000000^{}",
+            "abc12345-0000-0000-0000-000000000000~0",
+            "*",
+            "",
+        ] {
+            assert_eq!(
+                resolve_issue_id(dir.path(), crafted).unwrap(),
+                None,
+                "{crafted:?}"
+            );
+            assert_eq!(get_issue(dir.path(), crafted).unwrap(), None, "{crafted:?}");
+        }
     }
 
     #[test]
