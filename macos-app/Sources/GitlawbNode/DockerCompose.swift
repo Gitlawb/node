@@ -42,13 +42,33 @@ class DockerCompose {
         if let repo = repoWithCompose {
             return repo.appendingPathComponent("docker-compose.yml").path
         }
-        // Fallback: (re)generate the compose file with the pre-built image each time,
-        // so an app upgrade also upgrades the stack it runs.
+        // Fallback: the app's own compose file with the pre-built image. Generate it
+        // on first use. Afterwards keep it: it is the only place an operator can pass
+        // settings the generated environment block omits (e.g.
+        // GITLAWB_OPERATOR_STRICT_MODE), so only the retired image path is migrated.
         let userPath = Config.shared.dataDirectory.appendingPathComponent("docker-compose.yml").path
-        try? FileManager.default.createDirectory(at: Config.shared.dataDirectory, withIntermediateDirectories: true)
-        let content = Self.generateComposeFile()
-        try? content.write(toFile: userPath, atomically: true, encoding: .utf8)
+        if FileManager.default.fileExists(atPath: userPath) {
+            Self.migrateRetiredImage(atPath: userPath)
+        } else {
+            try? FileManager.default.createDirectory(at: Config.shared.dataDirectory, withIntermediateDirectories: true)
+            let content = Self.generateComposeFile()
+            try? content.write(toFile: userPath, atomically: true, encoding: .utf8)
+        }
         return userPath
+    }
+
+    /// Rewrites references to the pre-rename image, which no longer serves anonymous
+    /// pulls, to the image `release.yml` publishes. Tags and digests are kept.
+    private static func migrateRetiredImage(atPath path: String) {
+        guard let existing = try? String(contentsOfFile: path, encoding: .utf8) else { return }
+        let migrated = existing.replacingOccurrences(
+            of: #"ghcr\.io/gitlawb/node(?![A-Za-z0-9_./-])"#,
+            with: "ghcr.io/twigpine/node",
+            options: .regularExpression
+        )
+        if migrated != existing {
+            try? migrated.write(toFile: path, atomically: true, encoding: .utf8)
+        }
     }
 
     /// Project directory for docker compose (needed for `build: .` context).

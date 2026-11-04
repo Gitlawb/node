@@ -30,10 +30,9 @@ class Config {
 
     /// Path to the gitlawb-node repo clone (for local builds), or nil when there is none.
     ///
-    /// Must not fall back to `dataDirectory`: the app writes its generated compose
-    /// file there, and treating that file as a repo's own would stop it from ever
-    /// being regenerated, pinning upgraded installs to the compose (and image)
-    /// they first started with.
+    /// Must not fall back to `dataDirectory`: the app's generated compose file lives
+    /// there, and treating it as a repo's own would skip `DockerCompose`'s handling
+    /// of that file (first-use generation and image migration).
     var repoPath: URL? {
         if !repoPathString.isEmpty {
             return URL(fileURLWithPath: repoPathString)
