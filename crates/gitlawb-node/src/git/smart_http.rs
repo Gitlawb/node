@@ -868,6 +868,24 @@ mod tests {
     use std::process::Command;
     use tempfile::TempDir;
 
+    #[test]
+    fn service_to_command_maps_allowlist_and_rejects_passthrough() {
+        assert_eq!(
+            service_to_command("git-upload-pack").unwrap(),
+            "upload-pack"
+        );
+        assert_eq!(
+            service_to_command("git-receive-pack").unwrap(),
+            "receive-pack"
+        );
+        for bad in ["git-fetch-pack", "--version", "upload-pack", ""] {
+            assert!(
+                service_to_command(bad).is_err(),
+                "must reject passthrough for {bad:?}"
+            );
+        }
+    }
+
     /// List OIDs in a pack by writing it to a temp dir and running verify-pack.
     pub(super) fn pack_object_ids(pack: &[u8]) -> std::collections::HashSet<String> {
         let dir = TempDir::new().unwrap();
