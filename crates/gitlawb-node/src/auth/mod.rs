@@ -141,7 +141,7 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
                     COVERED_COMPONENTS.join(", "),
                     missing.join(", ")
                 ),
-                "hint": "See https://gitlawb.com/agents#authentication",
+                "hint": "See https://twigpine.com/agents#authentication",
             })),
         )
             .into_response();
@@ -186,17 +186,34 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
         .unwrap_or("/")
         .to_string();
 
-    let content_digest = parts
+    // Required, never defaulted. The signing string is rebuilt from the request,
+    // so an absent header would make the covered `content-digest` empty on both
+    // sides: verification would pass and the digest-versus-body comparison below
+    // would have nothing to compare, leaving a signed request free to carry a
+    // body its signature never covered. `sign_request` always emits the header,
+    // so refusing here costs no conforming client anything.
+    let content_digest = match parts
         .headers
         .get("content-digest")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    {
+        Some(v) => v.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "missing_content_digest",
+                    "message": "Content-Digest header is required on a signed request",
+                })),
+            )
+                .into_response()
+        }
+    };
 
     let mut request_values: HashMap<String, String> = HashMap::new();
     request_values.insert("@method".to_string(), method);
     request_values.insert("@path".to_string(), path_and_query);
-    request_values.insert("content-digest".to_string(), content_digest);
+    request_values.insert("content-digest".to_string(), content_digest.clone());
 
     // The @signature-params value is the part of Signature-Input after "sig1="
     let sig_params_value = sig_input.strip_prefix("sig1=").unwrap_or(&sig_input);
@@ -241,23 +258,18 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
             .into_response();
     }
 
-    // Verify Content-Digest matches the actual request body
-    if let Some(claimed) = parts
-        .headers
-        .get("content-digest")
-        .and_then(|v| v.to_str().ok())
-    {
-        let actual = compute_content_digest(&body_bytes);
-        if claimed != actual {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": "content_digest_mismatch",
-                    "message": "Content-Digest does not match request body",
-                })),
-            )
-                .into_response();
-        }
+    // Verify Content-Digest matches the actual request body. Unconditional: the
+    // header's presence was established above, so there is no branch here that
+    // skips the comparison.
+    if content_digest != compute_content_digest(&body_bytes) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "content_digest_mismatch",
+                "message": "Content-Digest does not match request body",
+            })),
+        )
+            .into_response();
     }
 
     tracing::info!(did = %sig.key_id, "✓ authenticated request");
@@ -404,7 +416,7 @@ fn human_detected(message: &str) -> impl IntoResponse {
             "error": "not_an_agent",
             "message": message,
             "hint": "gl identity new && gl register",
-            "docs": "https://gitlawb.com/agents",
+            "docs": "https://twigpine.com/agents",
         })),
     )
 }
@@ -566,6 +578,7 @@ mod tests {
         use clap::Parser;
 
         let keypair = Keypair::generate();
+        let scan_token_key = crate::state::AppState::derive_scan_token_key(&keypair);
         let (ref_tx, _) = tokio::sync::broadcast::channel(1);
         let (task_tx, _) = tokio::sync::broadcast::channel(1);
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -592,6 +605,17 @@ mod tests {
             rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
             create_ip_rate_limiter: RateLimiter::new(1000, Duration::from_secs(3600)),
             push_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+            close_issue_rate_limiter: RateLimiter::new(120, Duration::from_secs(3600)),
+            ipfs_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+            ipfs_work_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+            ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
+            ipfs_max_legacy_probes: crate::api::ipfs::MAX_LEGACY_PROBES_PER_REQUEST,
+            ipfs_legacy_scan_page_rows: crate::api::ipfs::LEGACY_SCAN_PAGE_ROWS,
+            ipfs_max_legacy_scan_rows: crate::api::ipfs::MAX_LEGACY_SCAN_ROWS_PER_REQUEST,
+            ipfs_max_legacy_scan_rule_bytes:
+                crate::api::ipfs::MAX_LEGACY_SCAN_RULE_BYTES_PER_REQUEST,
+            ipfs_scan_token_key: Arc::new(scan_token_key),
+            ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
             push_limiter_trust: crate::rate_limit::TrustedProxy::None,
             sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
             peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
@@ -610,7 +634,6 @@ mod tests {
             git_ipfs_walk_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             git_ipfs_walk_per_caller:
                 crate::rate_limit::PerCallerConcurrency::with_default_max_keys(16),
-            ipfs_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
             git_bin: "git".to_string(),
         }
     }
@@ -701,5 +724,76 @@ mod tests {
         let body_bytes = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body_json["error"], "invalid_ucan");
+    }
+
+    /// A request that signs `content-digest` as the EMPTY string and then sends
+    /// no Content-Digest header at all must be refused before any handler runs.
+    ///
+    /// This is the whole point of requiring the header rather than defaulting it:
+    /// the middleware rebuilds the signing string from the request, so an absent
+    /// header makes the covered digest empty on both sides. The Ed25519 check
+    /// passes, the body-versus-digest comparison is skipped for want of a header,
+    /// and a signed request carries a body the signature never covered.
+    #[tokio::test]
+    async fn signed_request_without_content_digest_is_rejected() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static REACHED: AtomicBool = AtomicBool::new(false);
+
+        let kp = Keypair::generate();
+        let did = kp.did();
+        let created = chrono::Utc::now().timestamp();
+        let signature_input = format!(
+            r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created={created}"#
+        );
+        let sig_params_value = &signature_input["sig1=".len()..];
+
+        let mut values: HashMap<String, String> = HashMap::new();
+        values.insert("@method".to_string(), "POST".to_string());
+        values.insert("@path".to_string(), "/x".to_string());
+        // Exactly what the middleware derives when the header is absent.
+        values.insert("content-digest".to_string(), String::new());
+        let signing_string =
+            build_signing_string(COVERED_COMPONENTS, sig_params_value, &values).unwrap();
+        let signature = format!(
+            "sig1=:{}:",
+            STANDARD.encode(kp.sign(signing_string.as_bytes()).to_bytes())
+        );
+
+        let app = Router::new()
+            .route(
+                "/x",
+                axum::routing::post(|| async {
+                    REACHED.store(true, Ordering::SeqCst);
+                    StatusCode::OK
+                }),
+            )
+            .layer(middleware::from_fn(require_signature));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/x")
+            .header("signature-input", signature_input)
+            .header("signature", signature)
+            .body(Body::from("a body no signature covers"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a signed request with no Content-Digest header must be refused"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["error"], "missing_content_digest",
+            "the refusal must name the absent Content-Digest header"
+        );
+        assert!(
+            !REACHED.load(Ordering::SeqCst),
+            "the handler must never see a request whose body no signature covers"
+        );
     }
 }

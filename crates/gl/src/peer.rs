@@ -20,14 +20,22 @@ pub struct PeerArgs {
 pub enum PeerCmd {
     /// List known peers on the node
     List {
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
     },
     /// Announce yourself to a peer node (adds you to their peer list)
     Add {
         /// The URL of the peer node to announce to
         peer_url: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -36,14 +44,22 @@ pub enum PeerCmd {
     Ping {
         /// The DID of the peer to ping
         did: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
     },
     /// Resolve a DID to its node URL and p2p info (checks local cache then Kademlia DHT)
     Resolve {
         /// The DID to resolve (e.g. did:key:z6Mk...)
         did: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
     },
 }
@@ -199,7 +215,7 @@ async fn cmd_add(peer_url: String, node: String, dir: Option<PathBuf>) -> Result
     // in the command: bound the read, and defang the message before it reaches
     // the terminal through the error return. An announce reply is a DID, a URL
     // and a count, so 8 KiB is well past what the shape needs.
-    let raw = read_body_capped(resp, 8 * 1024).await;
+    let raw = read_body_capped(resp, 8 * 1024).await.text;
 
     if let Some(failure) = remote_announce_failure(status, &raw) {
         anyhow::bail!("{failure}");
@@ -237,7 +253,7 @@ async fn cmd_add(peer_url: String, node: String, dir: Option<PathBuf>) -> Result
                 // node (or a MITM on plain http) must not force an unbounded
                 // read. A body that does not parse stays `Null`, which still
                 // routes a non-success status to the warning.
-                let raw = read_body_capped(resp, 8 * 1024).await;
+                let raw = read_body_capped(resp, 8 * 1024).await.text;
                 let result: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
                 let (is_warning, line) = local_add_report(status, &result);
                 if is_warning {

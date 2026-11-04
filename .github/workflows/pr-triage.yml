@@ -124,7 +124,7 @@ jobs:
               "",
               lines,
               "",
-              "See [CONTRIBUTING.md](https://github.com/Gitlawb/node/blob/main/CONTRIBUTING.md). Update the PR and these notes will clear automatically.",
+              "See [CONTRIBUTING.md](https://github.com/Twigpine/node/blob/main/CONTRIBUTING.md). Update the PR and these notes will clear automatically.",
             ].join("\n");
 
             await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body: comment });

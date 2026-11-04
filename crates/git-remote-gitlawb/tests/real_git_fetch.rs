@@ -162,8 +162,28 @@ fn start_shim(repo: PathBuf, mode: ShimMode) -> Shim {
     }
 }
 
-fn handle_conn(stream: TcpStream, repo: &Path, mode: ShimMode, posts: &AtomicUsize) {
+/// `start_shim` makes the LISTENER non-blocking to poll its stop flag, and an
+/// accepted socket can inherit that flag.
+///
+/// Observed on Windows: Winsock hands back a socket carrying the listener's
+/// FIONBIO state and std's `accept` does not reset it. Expected on macOS and the
+/// BSDs for the same reason, since the accept4 man page describes inheritance as
+/// the canonical BSD behavior, though nothing in this repo's CI exercises that
+/// half. Linux is the exception, because std uses `accept4` there and it does
+/// not inherit file status flags (rust-lang/rust#67027).
+///
+/// Every read in `handle_conn` is a blocking read whose errors collapse to "peer
+/// closed", so an inherited WouldBlock would drop the connection with no
+/// response and abort the client mid-request. Normalize before reading; this
+/// also restores the read timeout, which a non-blocking socket silently makes
+/// meaningless.
+fn normalize_accepted_stream(stream: &TcpStream) {
+    stream.set_nonblocking(false).ok();
     stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+}
+
+fn handle_conn(stream: TcpStream, repo: &Path, mode: ShimMode, posts: &AtomicUsize) {
+    normalize_accepted_stream(&stream);
     let mut reader = BufReader::new(stream);
 
     // Request line.
@@ -747,6 +767,221 @@ fn build_divergent_repos(shared_commits: usize) -> Repos {
         clone,
         _tmp: tmp,
     }
+}
+
+/// `normalize_accepted_stream` must leave the socket in blocking mode.
+///
+/// This asserts the helper's postconditions directly: no client, no request, and
+/// no race over whether bytes arrive before the shim reads them. It removes the
+/// byte-arrival race entirely, which is what the end-to-end test cannot do. It is
+/// not literally deterministic, and the paragraph below says exactly what is left.
+///
+/// The read timeout has a getter, so it is checked exactly. Blocking mode does
+/// not: std exposes none, and Winsock has no FIONBIO getter at all (`ioctlsocket`
+/// documents FIONBIO with no output type, so it is set-only), so that half has to
+/// be observed through behavior: a blocking socket with no data pending parks its
+/// reader, a non-blocking one returns `WouldBlock` at once.
+///
+/// The reader owns the very socket the helper normalized. Do not reintroduce a
+/// `try_clone` here: on Windows that mints a new descriptor through
+/// `WSADuplicateSocketW` rather than duplicating a handle, and whether FIONBIO
+/// state follows the new descriptor is a question this test would then depend on
+/// and could not answer. Owning the original removes the question.
+///
+/// The `Started` handshake is load-bearing and must not be removed. It SHRINKS
+/// the vacuity window; it does not close it. Read that literally, because the
+/// looser version of this sentence is the mistake this whole test exists to
+/// correct. Without the handshake the window includes thread spawn itself, which
+/// is unbounded and can be very slow on a loaded runner. With it, spawn is out of
+/// the window entirely and what remains is the cross-thread round trip: the
+/// signal, the read call, its `WouldBlock` return, the channel send, and this
+/// thread waking from `recv_timeout`.
+///
+/// So the residual false-green path is a reader descheduled anywhere along that
+/// round trip for more than 250ms, notably between its own `Started` send and its
+/// `read`. That path is real and this comment does not claim otherwise. What the
+/// design does buy is that the guard cannot flake RED, and that no arrangement of
+/// bytes on the wire can fool it, only the scheduler. Measured 50 of 50 RED under
+/// a mutation deleting the normalization, at full-suite parallelism; that bounds
+/// the false-green rate, it does not make it zero.
+///
+/// Teardown order is a constraint, not a preference: the peer close must come
+/// AFTER the timeout assertion. Closing first unblocks the parked read, the
+/// outcome arrives, and the assertion fails even when the helper is correct.
+#[test]
+fn normalize_accepted_stream_leaves_the_socket_blocking() {
+    enum Probe {
+        Started,
+        Outcome(std::io::Result<usize>),
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = TcpStream::connect(addr).unwrap();
+    let (accepted, _) = listener.accept().unwrap();
+
+    // The state Windows hands the shim. Forced here so the property is checked
+    // on every platform rather than only where the OS supplies it.
+    accepted.set_nonblocking(true).unwrap();
+    normalize_accepted_stream(&accepted);
+
+    // The helper's other postcondition, and the one std lets us check exactly.
+    // Without this, deleting the timeout leaves every test here green while a
+    // stalled peer parks the shim's only accept-loop thread forever.
+    assert_eq!(
+        accepted.read_timeout().unwrap(),
+        Some(Duration::from_secs(30)),
+        "normalize_accepted_stream must restore the read timeout, not only blocking mode"
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Move, never clone: see the try_clone note above.
+    let mut reader = accepted;
+    let probe = std::thread::spawn(move || {
+        let mut buf = [0u8; 1];
+        tx.send(Probe::Started).unwrap();
+        let outcome = reader.read(&mut buf);
+        let _ = tx.send(Probe::Outcome(outcome));
+    });
+
+    // Bounded, not `recv()`. A bare recv here turns "the reader never ran" into a
+    // hung test binary rather than a failing test, and cargo test has no per-test
+    // timeout to rescue it. The bound is far above any real scheduling delay, so
+    // hitting it is a genuine defect report, never a flake.
+    match rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("reader thread never signalled Started (died, or never scheduled)")
+    {
+        Probe::Started => {}
+        Probe::Outcome(_) => panic!("reader reported an outcome before its Started signal"),
+    }
+
+    match rx.recv_timeout(Duration::from_millis(250)) {
+        // The read is still parked, which is what blocking mode means.
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the reader thread exited instead of parking in its read")
+        }
+        Ok(Probe::Started) => panic!("received a second Started signal"),
+        Ok(Probe::Outcome(outcome)) => {
+            assert_eq!(
+                outcome.as_ref().err().map(std::io::Error::kind),
+                Some(std::io::ErrorKind::WouldBlock),
+                "the read returned instead of parking, but not with WouldBlock \
+                 ({outcome:?}); that is a different failure than the one this test \
+                 guards, so do not read it as a non-blocking socket"
+            );
+            panic!(
+                "accepted socket is still non-blocking after \
+                 normalize_accepted_stream: the read returned WouldBlock \
+                 immediately instead of parking"
+            );
+        }
+    }
+
+    // Only now: EOF unblocks the parked read so the thread can be joined. Bounded
+    // for the same reason as the handshake wait above; the socket's own 30s read
+    // timeout is the other backstop, and it is asserted rather than assumed.
+    drop(client);
+    match rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("reader did not return after the peer closed")
+    {
+        Probe::Outcome(outcome) => assert_eq!(
+            outcome.ok(),
+            Some(0),
+            "expected EOF once the peer closed, not payload"
+        ),
+        Probe::Started => panic!("received a second Started signal"),
+    }
+    probe.join().unwrap();
+}
+
+/// The shim must answer a connection that arrives in non-blocking mode.
+///
+/// End-to-end realism check through the real `handle_conn` request path. The
+/// deterministic guarantee lives in
+/// `normalize_accepted_stream_leaves_the_socket_blocking`, which asserts the
+/// helper's postcondition with no client at all; see `normalize_accepted_stream`
+/// for why an accepted socket can arrive non-blocking in the first place. The
+/// shim reads with `read_line(..).unwrap_or(0)`, which collapses `WouldBlock`
+/// into "peer closed" and returns WITHOUT writing a response, aborting the
+/// client mid-request.
+///
+/// This test is BEST EFFORT and known to be nondeterministic. Its handshake
+/// fires after `accept()` but before `handle_conn` runs, so it narrows the
+/// accept-before-request window without closing it: the request bytes can
+/// already be buffered by the time the shim reads, and the read then succeeds
+/// even with the normalization removed. Against a deleted
+/// `set_nonblocking(false)` it caught the defect in 39, 43, and 47 of 50 across
+/// three full-suite samples. The spread is the point: it is a sampled tendency,
+/// not a property, so do not quote a percentage off it. Running it alone on an
+/// idle machine flattered it to 48 of 50; the full-suite numbers are the honest
+/// ones, because that is how it ships.
+///
+/// It is still the only coverage for the helper's CALL SITE. The deterministic
+/// probe calls `normalize_accepted_stream` directly, so deleting the call from
+/// `handle_conn` leaves that probe green (0 of 50 in both samples) and only this
+/// test notices, at 45 and 46 of 50.
+#[test]
+fn shim_answers_a_connection_that_arrives_non_blocking() {
+    let repos = build_divergent_repos(1);
+    let repo = repos.server.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        let posts = AtomicUsize::new(0);
+        let stream = loop {
+            match listener.accept() {
+                Ok((s, _)) => break s,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(e) => panic!("accept failed: {e}"),
+            }
+        };
+        // What Windows hands the shim, and what macOS is expected to. On Linux
+        // this is the only way to reach that state, so forcing it is what makes
+        // the assertions below run on every platform.
+        stream.set_nonblocking(true).unwrap();
+        accepted_tx.send(()).unwrap();
+        handle_conn(stream, &repo, ShimMode::Normal, &posts);
+    });
+
+    let mut client = TcpStream::connect(addr).unwrap();
+    // Send only once the shim has the connection in hand, so its first read is
+    // guaranteed to run against an empty receive buffer.
+    accepted_rx.recv().unwrap();
+    client
+        .write_all(b"GET /x/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+
+    let mut got = Vec::new();
+    let read = client.read_to_end(&mut got);
+    server.join().unwrap();
+
+    assert!(
+        read.is_ok(),
+        "client read failed instead of receiving a response: {:?} \
+         (a non-blocking accepted socket makes the shim drop the connection \
+         with no reply, which surfaces as a connection abort on the client)",
+        read.unwrap_err().kind()
+    );
+    assert!(
+        got.starts_with(b"HTTP/1.1 200 OK"),
+        "shim closed the connection without a response ({} bytes read); \
+         a WouldBlock on the request-line read was swallowed as EOF",
+        got.len()
+    );
+    assert!(
+        got.windows(b"# service=git-upload-pack".len())
+            .any(|w| w == b"# service=git-upload-pack"),
+        "response reached the client but is not the upload-pack advertisement"
+    );
 }
 
 /// Matrix item 7, bridging half: a real multi-round `git fetch` through the

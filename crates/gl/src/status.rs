@@ -10,7 +10,11 @@ use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
 pub struct StatusArgs {
-    #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+    #[arg(
+        long,
+        default_value = "https://node.twigpine.com",
+        env = "GITLAWB_NODE"
+    )]
     pub node: String,
     #[arg(long)]
     pub dir: Option<PathBuf>,
@@ -51,7 +55,7 @@ pub async fn run(args: StatusArgs) -> Result<()> {
         }
     }
 
-    // ── Current git repo + gitlawb remote ─────────────────────────────────
+    // ── Current git repo + Twigpine remote ─────────────────────────────────
     let remote = detect_gitlawb_remote();
     match &remote {
         Some((did, repo)) => {
@@ -59,7 +63,7 @@ pub async fn run(args: StatusArgs) -> Result<()> {
             println!("  repo      {short_did}/{repo}");
         }
         None => {
-            println!("  repo      (not in a gitlawb repo — no gitlawb:// remote)");
+            println!("  repo      (not in a Twigpine repo — no gitlawb:// remote)");
         }
     }
 

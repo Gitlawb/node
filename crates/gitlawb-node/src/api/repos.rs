@@ -3,6 +3,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use axum::Json;
 use bytes::Bytes;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::auth::{caller_authorized_to_push, AuthenticatedDid};
@@ -21,24 +22,24 @@ use crate::webhooks;
 /// The git all-zeros object id — the create/delete sentinel in a ref update.
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 
-/// The set of blob OIDs withheld from **anonymous** replication for a repo, or
-/// `None` when the repo must not replicate at all (private / mode A /
-/// undetermined — fail closed). This is the anonymous replication gate:
-/// `caller` is hard-coded to `None` and there is intentionally no caller
-/// parameter, which distinguishes it from the per-caller read-serve projection
-/// in `git_upload_pack` (which passes the real caller). Both the push pin path
-/// and the reconciliation sweep call this helper so the two cannot drift on
-/// what is withheld. `rules` is the already-fetched visibility-rule snapshot
+/// The set of blob and withheld-subtree tree OIDs withheld from **anonymous**
+/// replication for a repo, or `None` when the repo must not replicate at all
+/// (private / mode A / undetermined, fail closed). This is the anonymous
+/// replication gate: `caller` is hard-coded to `None` and there is intentionally
+/// no caller parameter, which distinguishes it from the per-caller read-serve
+/// projection in `git_upload_pack` (which passes the real caller). Both the push
+/// pin path and the reconciliation sweep call this helper so the two cannot drift
+/// on what is withheld. `rules` is the already-fetched visibility-rule snapshot
 /// (callers fetch once and may reuse it, e.g. for encrypt-then-pin).
 ///
 /// Returns `(announce, withheld)`: `announce` is whether the repo may be
 /// announced/replicated to the anonymous public at all (also gates gossip and
-/// Arweave anchoring downstream), and `withheld` is the anonymous withheld blob
-/// set when announceable (`None` when not announceable). A failed/panicked
-/// withheld walk fails closed on both axes: `announce` is forced false and
-/// `withheld` is `None`, so an unvetted push neither replicates blobs nor
-/// announces. Returning both keeps the gate's announce decision a single
-/// source rather than recomputing it at each call site.
+/// Arweave anchoring downstream), and `withheld` is the anonymous withheld object
+/// set (blobs and withheld-subtree trees) when announceable (`None` when not
+/// announceable). A failed/panicked withheld walk fails closed on both axes:
+/// `announce` is forced false and `withheld` is `None`, so an unvetted push
+/// neither replicates objects nor announces. Returning both keeps the gate's
+/// announce decision a single source rather than recomputing it at each call site.
 ///
 /// The walk arm runs under a `git_encrypt_semaphore` admission permit (#174 F4):
 /// by the time the receive-pack tail calls this, the handler's write permit has
@@ -64,13 +65,13 @@ async fn replication_withheld_set(
     }
     let withheld = match rules {
         // No path-scoped rule can withhold anything (covers the empty-rules and
-        // root-only-rules cases), so skip the full withheld_blob_oids walk and
+        // root-only-rules cases), so skip the full withheld_object_oids walk and
         // withhold nothing. The predicate's safety-invariant test guards that
         // this short-circuit matches what the walk would have returned.
         Some(rules) if !visibility_pack::has_path_scoped_rule(&rules) => {
             Some(std::collections::HashSet::new())
         }
-        // withheld_blob_oids walks every ref with blocking `git ls-tree`; keep
+        // withheld_object_oids walks every ref with blocking `git ls-tree`; keep
         // that off the async worker thread.
         Some(rules) => {
             let owner_did = owner_did.to_string();
@@ -83,18 +84,18 @@ async fn replication_withheld_set(
                 // The permit lives inside the blocking closure: a started walk
                 // always completes holding it.
                 let _permit = permit;
-                crate::git::visibility_pack::withheld_blob_oids_bounded(
+                crate::git::visibility_pack::withheld_object_oids_bounded(
                     &disk_path, &git_bin, timeout, &rules, is_public, &owner_did, None,
                 )
             })
             .await
             .map_err(|e| {
-                tracing::warn!(err = %e, "withheld_blob_oids task panicked; skipping replication")
+                tracing::warn!(err = %e, "withheld_object_oids task panicked; skipping replication")
             })
             .ok()
             .and_then(|r| {
                 r.map_err(|e| {
-                    tracing::warn!(err = %e, "withheld_blob_oids failed; skipping replication")
+                    tracing::warn!(err = %e, "withheld_object_oids failed; skipping replication")
                 })
                 .ok()
             })
@@ -111,16 +112,17 @@ async fn replication_withheld_set(
     }
 }
 
-/// The replicable object set for a full-scan pin fallback, failing closed (#99).
+/// The replicable object set for a full-scan pin fallback, failing closed (#99, #172).
 /// The full-scan candidate set includes dangling objects the reachable-only
 /// withheld set never classified, so compute the reachable visibility-allowed
-/// blob set and the all-blob universe off the async worker and keep only
-/// non-blobs plus allowed blobs. Any error in either walk (or a task panic)
+/// blob set, the reachable visibility-allowed tree set, and the all-blob plus
+/// all-tree universes off the async worker and keep only commits/tags plus
+/// allowed blobs plus allowed trees. Any error in any walk (or a task panic)
 /// pins nothing this push, mirroring the degraded-path shape of
 /// `replication_withheld_set`.
 ///
 /// Always walks (there is no no-git arm), so the whole blocking scan runs under
-/// one `git_encrypt_semaphore` admission permit (#174 F4) — see
+/// one `git_encrypt_semaphore` admission permit (#174 F4): see
 /// `acquire_scan_permit` for the defer rationale and the honest residuals.
 #[allow(clippy::too_many_arguments)]
 async fn fail_closed_full_scan_objects(
@@ -139,15 +141,16 @@ async fn fail_closed_full_scan_objects(
         crate::state::acquire_scan_permit(encrypt_sem, &disk_path, "fail-closed full scan").await;
     tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
         let _permit = permit;
-        // One whole-scan deadline shared across both phases (#174 F4). A fresh
-        // `Instant::now() + timeout` for phase 2 let a large-but-successful phase 1 plus
-        // a full phase 2 hold the scan permit ~2x the configured budget. Sharing the
-        // deadline caps total occupancy at ~1x: phase 1 runs against the remaining
-        // budget, and if it consumes the budget phase 2 gets what is left and fails
-        // closed (pins nothing) rather than over-holding — the safe direction. The cost
-        // is honest: a genuinely large repo whose phase 1 nears the budget under-pins
-        // this push rather than the previous silent ~2x hold; size the budget so both
-        // phases normally fit.
+        // One whole-scan deadline shared across every phase (#174 F4). A fresh
+        // `Instant::now() + timeout` for a later phase let a large-but-successful
+        // earlier phase plus a full later phase hold the scan permit ~Nx the
+        // configured budget. Sharing the deadline caps total occupancy at ~1x:
+        // each phase runs against the remaining budget, and if an earlier phase
+        // consumes the budget a later one gets what is left and fails closed
+        // (pins nothing) rather than over-holding, the safe direction. The cost
+        // is honest: a genuinely large repo whose first phase nears the budget
+        // under-pins this push rather than the previous silent ~2x hold; size the
+        // budget so the blob walk, tree walk, and typed enumeration normally fit.
         let deadline = std::time::Instant::now() + timeout;
         let allowed = crate::git::visibility_pack::replicable_blob_set_bounded(
             &disk_path,
@@ -157,19 +160,32 @@ async fn fail_closed_full_scan_objects(
             is_public,
             &owner_did,
         )?;
-        let all_blobs = crate::git::push_delta::all_blob_oids(&disk_path, &git_bin, deadline)?;
+        let allowed_trees = crate::git::visibility_pack::replicable_tree_set_bounded(
+            &disk_path,
+            &git_bin,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            &rules,
+            is_public,
+            &owner_did,
+        )?;
+        let (all_blobs, all_trees) =
+            crate::git::push_delta::all_blob_and_tree_oids(&disk_path, &git_bin, deadline)?;
         Ok(crate::git::visibility_pack::replicable_objects_fail_closed(
-            candidates, &allowed, &all_blobs,
+            candidates,
+            &allowed,
+            &all_blobs,
+            &allowed_trees,
+            &all_trees,
         ))
     })
     .await
     .map_err(|e| {
-        tracing::warn!(err = %e, "fail-closed blob walk task panicked; pinning nothing this push")
+        tracing::warn!(err = %e, "fail-closed object walk task panicked; pinning nothing this push")
     })
     .ok()
     .and_then(|r| {
         r.map_err(|e| {
-            tracing::warn!(err = %e, "fail-closed blob walk failed; pinning nothing this push")
+            tracing::warn!(err = %e, "fail-closed object walk failed; pinning nothing this push")
         })
         .ok()
     })
@@ -241,6 +257,12 @@ pub async fn create_repo(
             "repo name must contain only alphanumeric characters, hyphens, and underscores".into(),
         ));
     }
+
+    // default_branch is caller-supplied and becomes a PR's target_branch when the
+    // PR omits one, which is interpolated into a git revision argument. Validate
+    // it as a ref so it cannot begin with '-' and inject a git option downstream.
+    crate::api::validate_git_ref_with_git(&state.git_bin, &req.default_branch)
+        .map_err(crate::api::map_git_ref_validation_error)?;
 
     // Owner is the authenticated agent's DID
     let owner_did = auth.0;
@@ -692,8 +714,17 @@ pub async fn git_info_refs(
         git_permit(&state.git_read_semaphore)?
     };
 
-    // For receive-pack (push), download the latest from Tigris so the client
-    // sees the same refs that acquire_write() will operate on.
+    // For receive-pack (push), read the latest from Tigris so the client sees
+    // the same refs that acquire_write() will operate on. A NON-MUTATING
+    // snapshot, not `acquire_fresh`: the advertisement runs WITHOUT the advisory
+    // lock, and acquire_fresh downloads and publishes into the live repo path
+    // (removing the existing directory and renaming the extract into place), so
+    // an unlocked advertisement could delete or swap the directory under a
+    // concurrent guarded write. In the worst ordering the guarded write has
+    // finished but `release` has not compressed the tree, and the guarded
+    // release uploads the replaced old tree with its still-valid ETag and
+    // reports success, losing the accepted write. The snapshot unpacks into a
+    // throwaway temp dir that is served from and then removed.
     //
     // Bound the acquire under `git_acquire_timeout_secs`: the concurrency permit is
     // already held above, and `git_service_timeout_secs` only starts once git spawns,
@@ -703,28 +734,46 @@ pub async fn git_info_refs(
     // so the shed frees the slot; return a bounded 503.
     let acquire_deadline = std::time::Duration::from_secs(state.config.git_acquire_timeout_secs);
     let acquire_fut = async {
-        if service == "git-receive-pack" {
+        let res = if service == "git-receive-pack" {
             state
                 .repo_store
-                .acquire_fresh(&record.owner_did, &record.name)
+                .read_snapshot(&record.owner_did, &record.name)
                 .await
+                .map(|s| (s.path().to_path_buf(), Some(s)))
         } else {
             state
                 .repo_store
                 .acquire(&record.owner_did, &record.name)
                 .await
-        }
+                .map(|p| (p, None))
+        };
+        res.map_err(|e| {
+            if is_expected_transient_acquire_failure(&e) {
+                tracing::warn!(repo = %name, service = %service, err = %e, "repo acquire failed");
+            } else {
+                tracing::error!(repo = %name, service = %service, err = %e, "repo acquire failed");
+            }
+            // This closure bypasses the `From<anyhow::Error>` chain, so a typed
+            // refusal would otherwise be stringified into a 500 `git_error`. Route
+            // just that one case through `From` and leave every other failure on
+            // exactly today's behavior: this call site also serves the read path via
+            // `acquire`, whose error vocabulary is out of scope here.
+            if e.is::<crate::git::repo_store::RepoUnavailable>() {
+                AppError::from(e)
+            } else {
+                AppError::Git(e.to_string())
+            }
+        })
     };
-    let disk_path = tokio::time::timeout(acquire_deadline, acquire_fut)
+    // The snapshot (if any) is kept alive for the whole handler scope below: its
+    // Drop removes the temp dir it was unpacked into, so dropping it here would
+    // delete the directory `info_refs` is about to serve from.
+    let (disk_path, _snapshot_keepalive) = tokio::time::timeout(acquire_deadline, acquire_fut)
         .await
         .map_err(|_elapsed| {
             tracing::warn!(repo = %name, service = %service, "repo acquire timed out; shedding with 503");
             AppError::Overloaded("git service acquisition timed out, retry shortly".into())
-        })?
-        .map_err(|e| {
-            tracing::error!(repo = %name, service = %service, err = %e, "repo acquire failed");
-            AppError::Git(e.to_string())
-        })?;
+        })??;
 
     // Move the admission permits into the guard so they release only after the spawned
     // git process group is confirmed reaped, on complete/timeout/disconnect — not the
@@ -912,6 +961,248 @@ async fn run_encrypt_pin_task(
     }
 }
 
+/// Test-only entry point: build an [`EncryptTaskCtx`] from a test `AppState` (with
+/// an overridable `ipfs_api` for a mock Kubo server and an explicit `disk_path` for
+/// the fixture repo) and run the real drain task. Keeps `EncryptTaskCtx` and
+/// `run_encrypt_pin_task` private to this module.
+///
+/// `owner_did` and `repo_name` must name the real seeded row: the drain re-fetches
+/// the record by owner/name every lap, so a blank name resolves `Gone` and every
+/// lap would pin nothing.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_encrypt_pin_task_for_test(
+    state: &AppState,
+    guard: crate::state::EncryptInflightGuard,
+    disk_path: std::path::PathBuf,
+    repo_id: String,
+    owner_did: String,
+    repo_name: String,
+    ipfs_api: String,
+    snapshot_objects: Vec<String>,
+    snapshot_rules: Option<Vec<crate::db::VisibilityRule>>,
+    snapshot_is_public: bool,
+) {
+    let ctx = EncryptTaskCtx {
+        ipfs_api,
+        repo_path: disk_path,
+        db: state.db.clone(),
+        repo_id,
+        owner_did,
+        repo_name,
+        irys_url: String::new(),
+        http_client: std::sync::Arc::clone(&state.http_client),
+        node_did: state.node_did.to_string(),
+        node_keypair: std::sync::Arc::clone(&state.node_keypair),
+        git_bin: state.git_bin.clone(),
+        git_timeout: std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+        encrypt_sem: state.git_encrypt_semaphore.clone(),
+        pin_sem: state.pin_semaphore.clone(),
+    };
+    run_encrypt_pin_task(
+        ctx,
+        guard,
+        snapshot_objects,
+        snapshot_rules,
+        snapshot_is_public,
+    )
+    .await;
+}
+
+/// Test-only fault-injection seam for the drain re-reads in
+/// `resolve_drain_object_list`. The behavior worth testing lives on the `Err` arm of
+/// the two re-reads, which a real Postgres pool will not produce on demand, so the two
+/// reads go through the wrappers below and consult this table first. Keyed by `repo_id`
+/// (a fresh uuid per test) so tests running in parallel in one process cannot see each
+/// other's injections, and it also records the ATTEMPT counts the retry-bound
+/// assertions key on.
+#[cfg(test)]
+pub(crate) mod drain_faults {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    #[derive(Default, Clone, Copy, Debug)]
+    pub(crate) struct Counters {
+        pub(crate) repo_read_failures_left: usize,
+        pub(crate) rules_read_failures_left: usize,
+        pub(crate) repo_read_attempts: usize,
+        pub(crate) rules_read_attempts: usize,
+        pub(crate) reread_exhausted: bool,
+    }
+
+    fn table() -> &'static Mutex<HashMap<String, Counters>> {
+        static TABLE: OnceLock<Mutex<HashMap<String, Counters>>> = OnceLock::new();
+        TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Make the next `repo_read_failures` repo re-reads and the next
+    /// `rules_read_failures` rule re-reads for `repo_id` return `Err`, then succeed.
+    pub(crate) fn inject(repo_id: &str, repo_read_failures: usize, rules_read_failures: usize) {
+        table().lock().unwrap().insert(
+            repo_id.to_string(),
+            Counters {
+                repo_read_failures_left: repo_read_failures,
+                rules_read_failures_left: rules_read_failures,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Observed attempt counts (and remaining injections) for `repo_id`.
+    pub(crate) fn counters(repo_id: &str) -> Counters {
+        table()
+            .lock()
+            .unwrap()
+            .get(repo_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Whether the drain re-read loop exhausted its retry budget for `repo_id`.
+    pub(crate) fn reread_exhausted(repo_id: &str) -> bool {
+        table()
+            .lock()
+            .unwrap()
+            .get(repo_id)
+            .map(|c| c.reread_exhausted)
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn mark_reread_exhausted(repo_id: &str) {
+        table()
+            .lock()
+            .unwrap()
+            .entry(repo_id.to_string())
+            .or_default()
+            .reread_exhausted = true;
+    }
+
+    /// Production-path hook: count one repo re-read attempt, return whether it must fail.
+    pub(crate) fn take_repo_read(repo_id: &str) -> bool {
+        let mut map = table().lock().unwrap();
+        let c = map.entry(repo_id.to_string()).or_default();
+        c.repo_read_attempts += 1;
+        if c.repo_read_failures_left > 0 {
+            c.repo_read_failures_left -= 1;
+            return true;
+        }
+        false
+    }
+
+    /// Production-path hook: count one rules re-read attempt, return whether it must fail.
+    pub(crate) fn take_rules_read(repo_id: &str) -> bool {
+        let mut map = table().lock().unwrap();
+        let c = map.entry(repo_id.to_string()).or_default();
+        c.rules_read_attempts += 1;
+        if c.rules_read_failures_left > 0 {
+            c.rules_read_failures_left -= 1;
+            return true;
+        }
+        false
+    }
+}
+
+/// The drain's repo re-read, behind the test-only fault seam above.
+async fn drain_get_repo(ctx: &EncryptTaskCtx) -> anyhow::Result<Option<RepoRecord>> {
+    #[cfg(test)]
+    if drain_faults::take_repo_read(&ctx.repo_id) {
+        return Err(anyhow::anyhow!("injected repo re-read failure"));
+    }
+    ctx.db.get_repo(&ctx.owner_did, &ctx.repo_name).await
+}
+
+/// The drain's visibility-rule re-read, behind the test-only fault seam above.
+async fn drain_list_rules(
+    ctx: &EncryptTaskCtx,
+    record_id: &str,
+) -> anyhow::Result<Vec<crate::db::VisibilityRule>> {
+    #[cfg(test)]
+    if drain_faults::take_rules_read(&ctx.repo_id) {
+        return Err(anyhow::anyhow!("injected visibility-rule re-read failure"));
+    }
+    ctx.db.list_visibility_rules(record_id).await
+}
+
+/// Attempts allowed for the drain re-read before the lap gives up. The coalesced
+/// push's work is already out of the pending slot (`finish_or_take_pending` took it
+/// in the same critical section that kept the key), and there is no reconciliation
+/// sweep to re-derive it: a transient read error must be RETRIED here or that push's
+/// pin/encrypt pass is gone. The bound keeps a sustained outage from spinning
+/// forever; on exhaustion the work is still lost (the pre-existing residual), but
+/// the give-up is logged at ERROR so it is observable instead of silent.
+const DRAIN_REREAD_MAX_ATTEMPTS: usize = 3;
+
+/// Backoff before the next re-read attempt. Doubles per attempt.
+const DRAIN_REREAD_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The outcome of the drain's fresh state re-read, keeping the three cases distinct
+/// that a single `Err => None` collapses into one: a usable refresh, a repo that
+/// genuinely no longer exists (terminal, and NOT a retry), and a transient read
+/// failure (retryable).
+enum DrainRefresh {
+    State {
+        /// Boxed only to keep the enum small: `RepoRecord` dwarfs the other two
+        /// variants, which carry nothing (clippy::large_enum_variant).
+        record: Box<RepoRecord>,
+        rules: Vec<crate::db::VisibilityRule>,
+    },
+    Gone,
+    Failed,
+}
+
+/// Re-read repo state for a drain lap, retrying transient read errors.
+///
+/// Both reads are retryable and neither may be read as an absence: an `Err` from the
+/// repo row is not "the repo is gone", and an `Err` from the rule list is not "this
+/// repo has no rules" (`.ok()` made those indistinguishable, and a `None` rule set
+/// makes `replication_withheld_set` return `None`, which skips the entire lap). Only
+/// `Ok(None)` on the repo row is a terminal absence, and it consumes no retry budget.
+///
+/// The whole `RepoRecord` comes back, not just its rules and flags: the caller writes
+/// against `record.id` from this FRESH re-fetch, never `ctx.repo_id` frozen at spawn.
+async fn drain_refresh_state(ctx: &EncryptTaskCtx) -> DrainRefresh {
+    let mut backoff = DRAIN_REREAD_BACKOFF;
+    for attempt in 1..=DRAIN_REREAD_MAX_ATTEMPTS {
+        let record = match drain_get_repo(ctx).await {
+            Ok(Some(rec)) => Box::new(rec),
+            Ok(None) => return DrainRefresh::Gone,
+            Err(e) => {
+                tracing::warn!(
+                    repo = %ctx.repo_id, err = %e, attempt,
+                    "coalesced drain: repo re-read failed; retrying"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+                continue;
+            }
+        };
+        // record.id, never the spawn-time ctx.repo_id: the record above is re-fetched
+        // fresh by owner/name, and a delete+re-create between spawn and drain gives
+        // the row a NEW id - rules read against the stale id come back empty and
+        // would fail open for the new row.
+        match drain_list_rules(ctx, &record.id).await {
+            Ok(rules) => return DrainRefresh::State { record, rules },
+            Err(e) => {
+                tracing::warn!(
+                    repo = %ctx.repo_id, err = %e, attempt,
+                    "coalesced drain: visibility-rule re-read failed; retrying"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+        }
+    }
+    tracing::error!(
+        repo = %ctx.repo_id,
+        attempts = DRAIN_REREAD_MAX_ATTEMPTS,
+        "coalesced drain: re-read failed on every attempt; the coalesced push's \
+         pin/encrypt pass is dropped (no reconciliation sweep re-derives it)"
+    );
+    #[cfg(test)]
+    drain_faults::mark_reread_exhausted(&ctx.repo_id);
+    DrainRefresh::Failed
+}
+
 /// Resolve a coalesced-drain iteration's replicable object list. Re-fetches the
 /// repo record and visibility rules FRESH — rules tightened between the coalesced
 /// push and its drain must be honored, fail closed: a newly-withheld blob is not
@@ -932,29 +1223,27 @@ async fn resolve_drain_object_list(
     Option<Vec<crate::db::VisibilityRule>>,
     bool,
 )> {
-    let record = match ctx.db.get_repo(&ctx.owner_did, &ctx.repo_name).await {
-        Ok(Some(r)) => r,
-        Ok(None) => {
+    // Both re-reads are bounded-retried: a transient blip must not discard the
+    // coalesced push's work (`finish_or_take_pending` already took it out of the
+    // pending slot and no sweep re-derives it). The rules come back from the same
+    // refresh, read against the FRESH record.id, never the spawn-time ctx.repo_id.
+    let (record, rules_opt) = match drain_refresh_state(ctx).await {
+        DrainRefresh::State { record, rules } => (*record, Some(rules)),
+        DrainRefresh::Gone => {
             tracing::warn!(
                 repo = %ctx.repo_id,
                 "coalesced drain: repo record is gone; dropping the pending work"
             );
             return None;
         }
-        Err(e) => {
+        DrainRefresh::Failed => {
             tracing::warn!(
                 repo = %ctx.repo_id,
-                err = %e,
                 "coalesced drain: repo re-fetch failed; pinning nothing (fail closed)"
             );
             return None;
         }
     };
-    // record.id, never the spawn-time ctx.repo_id: the record above is re-fetched
-    // fresh by owner/name, and a delete+re-create between spawn and drain gives
-    // the row a NEW id — rules read against the stale id come back empty and
-    // would fail open for the new row.
-    let rules_opt = ctx.db.list_visibility_rules(&record.id).await.ok();
     let (_announce, withheld) = replication_withheld_set(
         ctx.encrypt_sem.clone(),
         rules_opt.clone(),
@@ -1141,12 +1430,27 @@ async fn pinata_object_list_for_refs(
 /// retained list memory is not bounded by this pool. Bounding that is a real change to
 /// the capture shape and is deliberately not attempted here; the Pinata twin below
 /// avoids it by acquiring BEFORE it derives its list.
+// Nine because the merge of #173 and #174 landed both sets of arguments on one
+// signature: #174's pin-admission permit plus #173's git seam and pin provenance.
+// Each is a distinct value the pin loop needs and none is derivable from another, so
+// a wrapper struct here would only rename the same nine fields.
+//
+// `batch_budget` is the ninth and is passed rather than read from the constant so the
+// permit-release regression can drive a short budget. Hardcoding `PIN_BATCH_BUDGET`
+// here made that test cost 120s of wall clock, and the only cheaper shapes were
+// vacuous: a lock released before the budget returns at the same time whether or not
+// the loop is bounded, which proves nothing. Production passes the constant.
+#[allow(clippy::too_many_arguments)]
 async fn pin_new_objects_gated(
     pin_sem: &Arc<tokio::sync::Semaphore>,
     ipfs_api: &str,
     repo_path: &std::path::Path,
+    git_bin: &str,
+    git_timeout: std::time::Duration,
     object_list: Vec<String>,
     db: &Arc<crate::db::Db>,
+    repo_id: &str,
+    batch_budget: std::time::Duration,
 ) -> Vec<(String, String)> {
     // Nothing to pin: answer before taking a permit (#174 F2b). The permit bounds how
     // many pin loops run concurrently, and an empty list does no pinning, so parking
@@ -1164,12 +1468,12 @@ async fn pin_new_objects_gated(
     crate::ipfs_pin::pin_new_objects(
         ipfs_api,
         repo_path,
-        // The literal, not `state.git_bin`: tests point that at a fake walk git, and
-        // this is the same choice `api/ipfs`'s bounded call sites already document.
-        "git",
+        git_bin,
+        git_timeout,
         object_list,
         db,
-        crate::ipfs_pin::PIN_BATCH_BUDGET,
+        repo_id,
+        batch_budget,
     )
     .await
 }
@@ -1189,8 +1493,19 @@ async fn pin_and_encrypt_objects(
         &ctx.pin_sem,
         &ctx.ipfs_api,
         &ctx.repo_path,
+        // The literal, not `ctx.git_bin`: that knob is the WALK binary, and tests point
+        // it at a fake that answers `rev-list` and friends. Routing the pin path's
+        // `cat-file` read through it would ask that fake to impersonate cat-file too.
+        // Same choice, for the same reason, as `api/ipfs`'s bounded call sites. The
+        // parameter stays so the seam is still drivable from a test.
+        "git",
+        ctx.git_timeout,
         object_list,
         &ctx.db,
+        // The drain's repo id, never `ctx.repo_id` frozen at spawn (#174 U3): pin
+        // provenance must name the row the reader will resolve against.
+        repo_id,
+        crate::ipfs_pin::PIN_BATCH_BUDGET,
     )
     .await;
     if !pinned.is_empty() {
@@ -1269,10 +1584,59 @@ async fn pin_and_encrypt_objects(
     }
 }
 
+/// Map an `acquire_write` failure to the right `AppError`. An exhausted repo write-lock
+/// POOL is a capacity signal, not a broken repo, so it sheds 503 + Retry-After the same
+/// way the admission caps around it do; it used to fall into the generic git 500, which
+/// tells the client nothing about retrying (#173 F1). Lock contention and a refused
+/// under-lock refresh are transient and map to fixed-body 503s via [`RepoBusy`] and
+/// [`RepoUnavailable`]; only genuine untyped git failures stay on the 500 path.
+///
+/// Shared with every `acquire_write` caller (`receive-pack`, `api/issues.rs`,
+/// `api/pulls.rs`) so the write-acquisition contract cannot drift between routes.
+pub(crate) fn acquire_write_app_error(err: &anyhow::Error, repo: &str) -> AppError {
+    if err
+        .downcast_ref::<crate::git::repo_store::LockPoolBusy>()
+        .is_some()
+    {
+        tracing::warn!(repo = %repo, err = %err, "write-lock pool exhausted; shedding with 503");
+        AppError::Overloaded("git write locks at capacity, retry shortly".into())
+    } else if is_expected_transient_acquire_failure(err) {
+        tracing::warn!(repo = %repo, err = %err, "acquire_write failed");
+        if err
+            .downcast_ref::<crate::git::repo_store::RepoBusy>()
+            .is_some()
+        {
+            AppError::RepoBusy
+        } else {
+            AppError::RepoUnavailable
+        }
+    } else {
+        tracing::error!(repo = %repo, err = %err, "acquire_write failed");
+        AppError::Git(err.to_string())
+    }
+}
+
 /// Map an error from a `smart_http` git service call to the right `AppError`:
 /// [`smart_http::GitServiceTimeout`] to 504, a malformed client request to 400,
 /// anything else to a 500 git error. Pure (no logging) so it is unit-testable;
 /// callers add their own tracing.
+/// Acquire failures that are ordinary and transient: lock contention
+/// ([`RepoBusy`]) and an under-lock refresh that could not reach object storage
+/// ([`RepoUnavailable`]). Both already log at their raise site and both map to a
+/// retryable 503, so the handler layer logs them at warn rather than paging.
+/// Best-effort, like the database startup classifier: anything this cannot
+/// recognize counts as NOT transient and keeps its error-level log.
+///
+/// [`RepoBusy`]: crate::git::repo_store::RepoBusy
+/// [`RepoUnavailable`]: crate::git::repo_store::RepoUnavailable
+fn is_expected_transient_acquire_failure(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<crate::git::repo_store::RepoBusy>()
+        .is_some()
+        || err
+            .downcast_ref::<crate::git::repo_store::RepoUnavailable>()
+            .is_some()
+}
+
 fn git_service_app_error(err: &anyhow::Error) -> AppError {
     if err
         .downcast_ref::<smart_http::GitServiceTimeout>()
@@ -1780,7 +2144,7 @@ pub async fn git_receive_pack(
         "parsed ref updates from pack"
     );
 
-    // ── Owner-only push enforcement (opt-in: GITLAWB_ENFORCE_OWNER_PUSH) ──
+    // ── Owner-only push enforcement (on by default; GITLAWB_ENFORCE_OWNER_PUSH) ──
     // Runs before branch protection on purpose: when enabled, a non-owner is
     // rejected here regardless of whether the target branch is protected, so a
     // single rejection never yields two different error bodies. The identity is
@@ -1903,9 +2267,12 @@ pub async fn git_receive_pack(
     // (INV-10) and a saturated pool sheds 503 before spawning git.
     //
     // Per-source sub-cap first (#174 P1-d): one source IP cannot occupy the whole write
-    // pool via many slow pushes. Owner enforcement defaults off, so any valid did:key is
-    // accepted (auth != authz) and the push rate limiter bounds arrival RATE, not in-flight
-    // concurrency. Keyed on the resolved source IP, NEVER the signed DID (a DID farm defeats
+    // pool via many slow pushes. The push rate limiter bounds arrival RATE, not in-flight
+    // concurrency, so this cap is what bounds occupancy. Owner enforcement is on by
+    // default now, but it is not what makes this cap load-bearing: an operator may turn it
+    // off for a rolling upgrade, and even with it on a single owner can open many
+    // concurrent slow pushes to their own repo.
+    // Keyed on the resolved source IP, NEVER the signed DID (a DID farm defeats
     // a DID key); no resolvable key -> global write pool only. Then the global write permit:
     // pushes draw from the dedicated WRITE pool, separate from reads, and it is held for the
     // whole op (moved into the AdmissionGuard below).
@@ -1925,11 +2292,14 @@ pub async fn git_receive_pack(
     // exhausted Postgres pool (so the 60-count never advances) — and the write permit
     // is held the whole time, draining the pool (#174 P1-2). The outer
     // `tokio::time::timeout` cancels a mid-sleep/mid-`fetch_one` future, so it bounds
-    // both the loop and a hung iteration without any repo_store.rs change (KTD3). The
+    // both the loop and a hung iteration. Cancelling here is only safe because
+    // acquire_write holds its advisory lock on a connection from a pool whose
+    // `after_release` hook unlocks (#173): the dropped future used to leave the lock
+    // held with no guard alive to release it, wedging later pushes to that repo. The
     // permit is a handler local here (moved into the AdmissionGuard only after this),
     // so the early return on timeout drops it and frees the slot; shed a bounded 503.
     let acquire_deadline = std::time::Duration::from_secs(state.config.git_acquire_timeout_secs);
-    let guard = tokio::time::timeout(
+    let mut guard = tokio::time::timeout(
         acquire_deadline,
         state
             .repo_store
@@ -1940,10 +2310,7 @@ pub async fn git_receive_pack(
         tracing::warn!(repo = %name, "acquire_write timed out; shedding with 503");
         AppError::Overloaded("git service acquisition timed out, retry shortly".into())
     })?
-    .map_err(|e| {
-        tracing::error!(repo = %name, err = %e, "acquire_write failed");
-        AppError::Git(e.to_string())
-    })?;
+    .map_err(|e| acquire_write_app_error(&e, name))?;
     let disk_path = guard.path().to_path_buf();
     tracing::debug!(repo = %name, path = %disk_path.display(), "running git receive-pack");
     let body_len = body.len();
@@ -1953,13 +2320,41 @@ pub async fn git_receive_pack(
     // instant a disconnect drops this future while the detached reaper runs (#174 P1-a).
     // The handler keeps no copy. This is independent of the write-lock `guard.release`
     // below: admission tracks the git process lifetime, the write lock tracks the repo.
+    //
+    // The WRITE LOCK rides the same seam (#173 F2). `guard.release(..)` below is only
+    // reached if `receive_pack` returns, so on a client disconnect the guard would drop
+    // with the future and the lock pool's `after_release` hook would free the advisory
+    // lock immediately, while `KillGroupOnDrop`'s detached reaper is still giving the
+    // group its ~2s SIGTERM grace. A second push admitted in that window puts two
+    // `git receive-pack` groups on one repo, which is exactly what the timeout path
+    // reaps to prevent ("a caller releasing a write lock can't race them"). Sharing the
+    // guard rather than moving it outright is what lets the SUCCESS path still reclaim
+    // it for the Tigris upload: the copy retained here can only DELAY release, never
+    // perform it early, because the handler reaches the take below only after
+    // `receive_pack` has returned (group reaped or disarmed). On the disconnect path
+    // this copy dies with the future and the reaper's copy is last, so the lock frees
+    // after the reap with no upload, which is the release(success = false) semantics an
+    // interrupted push must have.
+    // THE SPLIT (#285 U3). Settling the tree and freeing the advisory lock do not
+    // have to happen at the same moment, and only the unlock has to wait for the
+    // reaper. The guard below is shared, so on a disconnect its last copy is the
+    // one riding `KillGroupOnDrop`, and a settlement done from `RepoWriteGuard::drop`
+    // would therefore land only after the process group is torn down. `acquire`
+    // takes no advisory lock on its way to the live tree, so a read inside that
+    // window would be served refs no publish ever confirmed. Holding the
+    // settlement in THIS future puts the marker on disk at the disconnect instant,
+    // while the reaper still holds the lock. The success path disarms it below,
+    // after `release` has classified the tree itself.
+    let mut settlement = guard.take_settlement();
+    let guard = std::sync::Arc::new(std::sync::Mutex::new(Some(guard)));
     // Clone (a) of the write lease rides this AdmissionGuard: on a client disconnect the
     // guard moves into KillGroupOnDrop's detached reaper, so the lease frees only after
     // the receive-pack group is reaped — NOT at the disconnect instant (which is exactly
     // when RepoWriteGuard::Drop frees the pg lock). Tying the lease to RepoWriteGuard
     // instead would drop it at disconnect and reopen the F3 race.
-    let admission =
-        smart_http::AdmissionGuard::new(_permit, _caller_permit).with_lease(lease.clone());
+    let admission = smart_http::AdmissionGuard::new(_permit, _caller_permit)
+        .with_hold(std::sync::Arc::clone(&guard))
+        .with_lease(lease.clone());
     let receive_result = smart_http::receive_pack(
         &state.git_bin,
         &disk_path,
@@ -2012,25 +2407,51 @@ pub async fn git_receive_pack(
     // would return 200 to the pusher before the durable copy lands, which is a larger
     // change to the client contract than the window it closes.
     let push_succeeded = receive_result.is_ok();
+    let publish_durability = PublishDurabilitySlot::new();
+    // Reclaim the write lock from the shared cell (#173 F2). This is only reachable
+    // once `receive_pack` has returned, so the admission guard's copy can only ever
+    // DELAY release, never perform it early; on the disconnect path this line is not
+    // reached at all and the reaper's copy is last.
+    let reclaimed = guard
+        .lock()
+        .expect("repo write-lock mutex poisoned")
+        .take()
+        .expect("the write lock is only taken here, and only once");
     if push_succeeded {
+        // Arm on the guard's OWN publish stage, so a disconnect anywhere in
+        // `release` is classified by how far the publish actually got rather
+        // than by the mere fact that release was entered.
+        publish_durability.arm_for_release(reclaimed.publish_stage());
         tokio::spawn(post_receive_replication_tail(
             state.clone(),
             record.clone(),
             ref_updates.clone(),
             disk_path.clone(),
             auth.0.to_string(),
+            Some(publish_durability.arc()),
         ));
     }
-
-    // Always release the advisory lock — even on error — to prevent stale locks
-    // from blocking subsequent pushes. Only upload to Tigris when the push
-    // succeeded; uploading a half-applied repo would propagate corruption.
-    guard.release(push_succeeded).await;
+    // Short-circuit on a refused publish BEFORE anything downstream observes
+    // the push. The pack is on local disk but not in object storage, so
+    // touching the repo, recording the push, bumping trust, issuing ref
+    // certificates or answering 200 would all be reporting a write no other
+    // node can read.
+    let outcome = reclaimed.release(push_succeeded).await;
+    // `release` classified the tree on whatever outcome it reached, so this
+    // future's copy of the settlement must not classify it a second time: a
+    // definite refusal has already deleted the tree and cleared its marker.
+    if let Some(settlement) = settlement.as_mut() {
+        settlement.disarm();
+    }
+    if push_succeeded {
+        publish_durability.record(outcome).await;
+    }
+    outcome.into_result()?;
     // Clean path: clone (a) already dropped inside run_git_service when the receive-pack
     // group was reaped; clone (b) held here spanned the success-only Tigris upload that
     // ran inside release() above. Drop it now so a second same-repo push proceeds the
     // moment this write is durable, rather than at end of the (longer) handler tail. On
-    // the disconnect path this line is never reached — clone (a) rides the reaper (F3).
+    // the disconnect path this line is never reached: clone (a) rides the reaper (F3).
     drop(lease);
 
     let result = receive_result.map_err(|e| {
@@ -2142,18 +2563,177 @@ pub async fn git_receive_pack(
 /// the per-repo-coalesced pin/encrypt task, and this push's own Pinata + announce
 /// task. Split out of `git_receive_pack` so the ordering the coalescing gate depends
 /// on is directly testable; the handler spawns it and returns.
+/// Records the release-side publish outcome for the detached post-receive tail.
+///
+/// The subtle case is the one this type exists for: the handler future is
+/// DROPPED, so `release` never returns and `record` is never called. The slot
+/// then has to classify an attempt whose outcome nobody will ever report, and
+/// the only honest source for that is the publish STAGE — how far the attempt
+/// had actually got when it was abandoned.
+///
+/// Tracking "release started" instead was the defect. `release` awaits a blocking
+/// compression before the conditional PUT is constructed, so a cancellation
+/// there is a definite "no publication was attempted", yet every cancellation
+/// after the flag was set recorded `UploadUnknowable` — which the tail accepted,
+/// and then went on to do IPFS, Pinata, P2P, GraphQL, Arweave and peer work for
+/// refs that existed only in a rejected local write.
+struct PublishDurabilitySlot {
+    inner: Arc<std::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>>,
+    recorded: std::sync::atomic::AtomicBool,
+    /// The stage of the release this slot is armed for. `None` until the release
+    /// is about to be awaited, which is what makes a drop before that point leave
+    /// the slot empty and the tail fail closed.
+    stage: std::sync::Mutex<Option<Arc<crate::git::publish::PublishStageCell>>>,
+}
+
+impl PublishDurabilitySlot {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(None)),
+            recorded: std::sync::atomic::AtomicBool::new(false),
+            stage: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Arm the slot against the guard's publish stage, immediately before the
+    /// release is awaited.
+    fn arm_for_release(&self, stage: Arc<crate::git::publish::PublishStageCell>) {
+        *self.stage.lock().expect("publish stage slot poisoned") = Some(stage);
+    }
+
+    fn arc(&self) -> Arc<std::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>> {
+        Arc::clone(&self.inner)
+    }
+
+    async fn record(&self, outcome: crate::git::repo_store::ReleaseOutcome) {
+        *self
+            .inner
+            .lock()
+            .expect("publish durability mutex poisoned") = Some(outcome);
+        self.recorded
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for PublishDurabilitySlot {
+    fn drop(&mut self) {
+        if self.recorded.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let Some(stage) = self
+            .stage
+            .lock()
+            .expect("publish stage slot poisoned")
+            .clone()
+        else {
+            // Dropped before the release was even armed. Leave the slot empty so
+            // the tail fails closed on the wait below.
+            return;
+        };
+        use crate::git::publish::PublishStage;
+        use crate::git::repo_store::ReleaseOutcome;
+        let outcome = match stage.get() {
+            // The store answered. Cancellation after that point loses the
+            // handler's response, not the write, so the tail may run.
+            //
+            // `NoBackend` joins it: with no object storage configured there is
+            // no publication to confirm and the pack on local disk is the
+            // durable copy, which is exactly what `ReleaseOutcome::Released`
+            // already means for a release that had nothing to upload.
+            PublishStage::Published { .. } | PublishStage::NoBackend => ReleaseOutcome::Released,
+            // THE FINDING. Compression was still running, so the conditional PUT
+            // was never constructed and no publication was ever attempted. This
+            // is a definite refusal, not an unknowable one, and the tail must
+            // skip every replication effect.
+            PublishStage::Idle | PublishStage::PreparingArchive | PublishStage::Refused => {
+                ReleaseOutcome::UploadFailed
+            }
+            // Genuinely in flight. Nothing here can reconcile it — a `Drop` impl
+            // cannot await a HEAD — so it stays unknowable, which the tail refuses
+            // because it requires `Released`. The write is still on local disk and
+            // the next writer's under-lock refresh resolves it.
+            PublishStage::PutDispatched { .. } | PublishStage::Ambiguous { .. } => {
+                ReleaseOutcome::UploadUnknowable
+            }
+        };
+        let mut slot = self
+            .inner
+            .lock()
+            .expect("publish durability mutex poisoned");
+        if slot.is_none() {
+            *slot = Some(outcome);
+        }
+    }
+}
+
+/// May the detached replication tail run?
+///
+/// ONLY on `Released`, which is the outcome that means the store acknowledged
+/// this attempt (directly, or through the release-side reconciliation that
+/// matched the attempt id against what the store holds). `UploadUnknowable` used
+/// to pass here, which let the tail pin, announce and publish refs whose archive
+/// may never have landed; an unresolved dispatch has to be reconciled to this
+/// attempt's own generation before it counts as confirmation, and the place that
+/// can do it is `release`, not this predicate.
+async fn publish_durability_confirmed(
+    slot: &Option<Arc<std::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>>>,
+    wait: std::time::Duration,
+) -> bool {
+    let Some(slot) = slot else {
+        return true;
+    };
+    let confirmed = |outcome: Option<crate::git::repo_store::ReleaseOutcome>| {
+        matches!(
+            outcome,
+            Some(crate::git::repo_store::ReleaseOutcome::Released)
+        )
+    };
+    let start = std::time::Instant::now();
+    loop {
+        let outcome = *slot.lock().expect("publish durability mutex poisoned");
+        if outcome.is_some() {
+            return confirmed(outcome);
+        }
+        if start.elapsed() >= wait {
+            // No outcome within the release-side transfer bound plus slack. Fail
+            // closed when the slot is still empty; an abandoned handler installs
+            // its stage's verdict via PublishDurabilitySlot::drop, so the tail
+            // resolves promptly rather than waiting out the full bound.
+            return confirmed(*slot.lock().expect("publish durability mutex poisoned"));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 async fn post_receive_replication_tail(
     state: AppState,
     record: RepoRecord,
     ref_updates: Vec<RefUpdate>,
     disk_path: std::path::PathBuf,
     did: String,
+    publish_durability: Option<
+        Arc<std::sync::Mutex<Option<crate::git::repo_store::ReleaseOutcome>>>,
+    >,
 ) {
+    let durability_wait = std::time::Duration::from_secs(
+        state
+            .config
+            .lock_held_transfer_timeout_secs
+            .saturating_add(5),
+    );
+    if !publish_durability_confirmed(&publish_durability, durability_wait).await {
+        tracing::warn!(
+            repo = %record.id,
+            "skipping post-receive tail: publish durability was not confirmed"
+        );
+        return;
+    }
+
     // Replication enforcement (Phase 2): decide once per push whether the public
-    // may read this repo at all and, if so, which blob OIDs must not leave the
-    // node. `withheld == None` means this push pins nothing (private / mode A /
-    // undetermined, or a walk that failed): skip every pin so even commit and tree
-    // objects (which withheld_blob_oids never lists) stay local. Fail closed: a
+    // may read this repo at all and, if so, which blob and withheld-subtree tree
+    // OIDs must not leave the node. `withheld == None` means this push pins nothing
+    // (private / mode A / undetermined, or a walk that failed): skip every pin so
+    // even commit and tag objects (which the withheld walk never lists) stay local. Fail closed: a
     // private or undetermined repo never leaks. The announce decision that gates
     // the network-facing sends is taken separately, below.
     let rules_opt = state.db.list_visibility_rules(&record.id).await.ok();
@@ -2343,6 +2923,7 @@ async fn post_receive_replication_tail(
         let pinata_upload_url = state.config.pinata_upload_url.clone();
         let repo_path_clone = disk_path.clone();
         let db_clone = state.db.clone();
+        let repo_id = record.id.clone();
         let http_client = Arc::clone(&state.http_client);
         let node_did_str = state.node_did.to_string();
         let repo_slug = format!(
@@ -2431,8 +3012,10 @@ async fn post_receive_replication_tail(
                         // The literal, not `state.git_bin`: tests point that at a fake
                         // walk git, and this read must run the real one.
                         "git",
+                        pinata_git_timeout,
                         object_list,
                         &db_clone,
+                        &repo_id,
                         crate::ipfs_pin::PIN_BATCH_BUDGET,
                     )
                     .await,
@@ -2461,6 +3044,11 @@ async fn post_receive_replication_tail(
                 if announce {
                     if let Some(p2p) = &p2p_handle {
                         p2p.publish_ref_update(crate::p2p::RefUpdateEvent {
+                            // Named, not literal: the ingest gate compares `v`
+                            // against this same constant, so a bump has to move
+                            // both ends together rather than leaving the emitter
+                            // on a version the gate no longer accepts.
+                            v: crate::p2p::CURRENT_REF_UPDATE_VERSION,
                             node_did: node_did_str.clone(),
                             pusher_did: pusher_did_clone.clone(),
                             repo: repo_slug.clone(),
@@ -2471,6 +3059,15 @@ async fn post_receive_replication_tail(
                             timestamp: chrono::Utc::now().to_rfc3339(),
                             cert_id: None,
                             cid: cid.map(|s| s.to_string()),
+                            // Left unsigned here on purpose. The swarm loop
+                            // signs the event with the node keypair via
+                            // `p2p::signed_publish_bytes` immediately before it
+                            // publishes, and skips the publish outright if
+                            // signing fails, so the wire always carries a
+                            // signature even though this construction site does
+                            // not. Setting one here would be signed over a
+                            // payload the publisher has not finished building.
+                            sig: None,
                         })
                         .await;
                     }
@@ -2697,6 +3294,203 @@ pub async fn list_federated_repos(
 
 // ── Fork ──────────────────────────────────────────────────────────────────
 
+/// Removes a fork's local mirror clone on every exit until disarmed after the
+/// database row commits — but ONLY while that clone still belongs to the attempt
+/// the guard was built for.
+///
+/// The bare `remove_dir_all` this replaces authorized itself with the path alone.
+/// Two attempts at the same logical fork share one path, so a failed attempt
+/// unwinding late could remove the directory a successor had already published
+/// and inserted a row for.
+struct ForkCloneGuard {
+    path: Option<PathBuf>,
+    attempt: crate::git::publish::PublishAttemptId,
+}
+
+const FORK_CREATE_CONFIRM_ATTEMPTS: u32 = 5;
+
+/// Who owns the logical fork name once `create_repo` has reported an error.
+///
+/// The distinction the previous `Option<RepoRecord>` could not draw is between
+/// "my insert committed" and "somebody's insert committed". Only the first
+/// entitles this request to answer 201 with that row, and only the third
+/// entitles it to compensate.
+enum ForkRowConfirmation {
+    /// THIS attempt's row is present: the insert committed and the error was a
+    /// transport-level report of a successful write.
+    Ours(Box<crate::db::RepoRecord>),
+    /// A different attempt owns the name. This request's archive, disk path and
+    /// fork provenance do not belong to that row, so it must not be returned,
+    /// and that attempt's resources must not be compensated.
+    Foreign,
+    /// Nothing owns the name.
+    Absent,
+}
+
+/// After `create_repo` fails, re-read the row with bounded retries so a
+/// transport-level error does not skip archive compensation when the insert never
+/// landed, and so a successful insert is not mistaken for a failure.
+///
+/// Keyed on `record_id` FIRST. Owner/name identifies a namespace, not an attempt:
+/// a concurrent ordinary create, a mirror registration or a retry can insert a
+/// different row under the same logical name, and treating that as proof of our
+/// own commit returned 201 carrying somebody else's row.
+async fn confirm_fork_repo_row(
+    db: &crate::db::Db,
+    record_id: &str,
+    owner_short: &str,
+    fork_name: &str,
+) -> anyhow::Result<ForkRowConfirmation> {
+    let mut delay = std::time::Duration::from_millis(25);
+    for attempt in 0..FORK_CREATE_CONFIRM_ATTEMPTS {
+        let looked_up = async {
+            if let Some(ours) = db.get_repo_by_id(record_id).await? {
+                return Ok::<_, anyhow::Error>(ForkRowConfirmation::Ours(Box::new(ours)));
+            }
+            Ok(match db.get_repo(owner_short, fork_name).await? {
+                Some(_) => ForkRowConfirmation::Foreign,
+                None => ForkRowConfirmation::Absent,
+            })
+        }
+        .await;
+        match looked_up {
+            Ok(confirmation) => return Ok(confirmation),
+            Err(e) if attempt + 1 < FORK_CREATE_CONFIRM_ATTEMPTS => {
+                tracing::warn!(
+                    fork = %fork_name,
+                    attempt,
+                    err = %e,
+                    "fork create_repo confirmation lookup failed — retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay = delay
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_secs(1));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("loop returns on every attempt")
+}
+
+/// When the confirmation lookup stays unavailable after bounded retries, keep
+/// retrying in the background and compensate only after establishing that no row
+/// exists for this fork name.
+///
+/// The `None` observation is still racy on its own — a successor can commit
+/// between the read and the deletions, and did, which let recovery for a failed
+/// fork erase a succeeding attempt's repository. What makes it safe is that the
+/// compensation it calls is now conditional on the object and the directory still
+/// carrying THIS attempt's identity, so a successor that commits at any point
+/// after the read keeps both.
+#[allow(clippy::too_many_arguments)]
+async fn schedule_fork_create_recovery(
+    db: std::sync::Arc<crate::db::Db>,
+    repo_store: crate::git::repo_store::RepoStore,
+    record_id: String,
+    owner_short: String,
+    fork_name: String,
+    owner_did: String,
+    disk_path: std::path::PathBuf,
+    attempt: crate::git::publish::PublishAttemptId,
+) {
+    let mut delay = std::time::Duration::from_millis(250);
+    for n in 0..12 {
+        match confirm_fork_repo_row(&db, &record_id, &owner_short, &fork_name).await {
+            Ok(ForkRowConfirmation::Ours(_)) => {
+                tracing::info!(
+                    fork = %fork_name,
+                    attempt = n,
+                    "fork create_repo recovery found this attempt's row — no compensation"
+                );
+                return;
+            }
+            Ok(ForkRowConfirmation::Foreign) => {
+                tracing::info!(
+                    fork = %fork_name,
+                    attempt = n,
+                    "fork create_repo recovery found another attempt's row under this name — \
+                     compensating only what this attempt still owns"
+                );
+                repo_store
+                    .compensate_fork_archive(&owner_did, &fork_name, disk_path.as_path(), &attempt)
+                    .await;
+                return;
+            }
+            Ok(ForkRowConfirmation::Absent) => {
+                tracing::warn!(
+                    fork = %fork_name,
+                    attempt = n,
+                    "fork create_repo recovery confirmed no row — compensating orphan archive"
+                );
+                repo_store
+                    .compensate_fork_archive(&owner_did, &fork_name, disk_path.as_path(), &attempt)
+                    .await;
+                return;
+            }
+            Err(e) if n + 1 < 12 => {
+                tracing::warn!(
+                    fork = %fork_name,
+                    attempt = n,
+                    err = %e,
+                    "fork create_repo recovery lookup failed — retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay = delay
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_secs(30));
+            }
+            Err(e) => {
+                tracing::error!(
+                    fork = %fork_name,
+                    err = %e,
+                    "fork create_repo recovery gave up — orphan archive may remain until operator cleanup"
+                );
+                return;
+            }
+        }
+    }
+}
+
+impl ForkCloneGuard {
+    fn new(
+        path: crate::git::repo_store::ValidatedRepoDiskPath,
+        attempt: crate::git::publish::PublishAttemptId,
+    ) -> Self {
+        let path = path.into_path_buf();
+        // Stamp the directory before anything can fail, so every later cleanup
+        // (this guard's Drop, the handler's compensation, the background
+        // recovery) has an ownership answer to consult.
+        crate::git::repo_store::claim_fork_disk_path(&path, &attempt);
+        Self {
+            path: Some(path),
+            attempt,
+        }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        self.path
+            .as_deref()
+            .expect("fork clone guard disarmed while still in use")
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for ForkCloneGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            crate::git::repo_store::remove_fork_clone_if_ours(
+                &path,
+                &self.attempt,
+                "fork attempt cleanup",
+            );
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ForkRepoRequest {
     pub name: Option<String>, // defaults to source repo name
@@ -2767,7 +3561,12 @@ pub async fn fork_repo(
         .await
         .map_err(|e| AppError::Git(e.to_string()))?;
 
-    let disk_path = store::repo_disk_path(&state.config.repos_dir, &forker_did, &fork_name);
+    let disk_path = crate::git::repo_store::validated_repo_disk_path(
+        &state.config.repos_dir,
+        &forker_did,
+        &fork_name,
+    )
+    .map_err(|e| AppError::BadRequest(e.to_string()))?;
 
     // Clone the source repo as a mirror
     let output = std::process::Command::new("git")
@@ -2787,15 +3586,134 @@ pub async fn fork_repo(
         )));
     }
 
-    // Upload fork to Tigris
-    state
+    // ONE identity for the whole workflow: the DB row id this request will
+    // insert is also the attempt id stamped into the object's metadata and onto
+    // the disk clone. That is what lets confirmation ask "is my row there" rather
+    // than "is a row there", and lets every cleanup ask "is this still mine"
+    // rather than "does this name resolve".
+    let record_id = Uuid::new_v4().to_string();
+    let attempt = crate::git::publish::PublishAttemptId::from_owned(record_id.clone());
+
+    let mut clone_guard = ForkCloneGuard::new(disk_path.clone(), attempt.clone());
+
+    // Upload fork to Tigris. Create-only: a refused precondition means an orphan
+    // archive already sits under this key (a failed create_repo or another
+    // writer), and proceeding would create a DB record whose archive is shadowed
+    // by bytes that are not this fork. Refuse rather than accept a fork other
+    // nodes would fetch as unrelated content. The clone guard removes the local
+    // mirror on every DEFINITE upload failure path.
+    if let Err(e) = state
         .repo_store
-        .release_after_write(&forker_did, &fork_name)
-        .await;
+        .release_after_write(&forker_did, &fork_name, &attempt)
+        .await
+    {
+        match e {
+            crate::git::tigris::UploadError::PreconditionLost { status } => {
+                // One reconciliation before refusing: an SDK-level retry, or a
+                // duplicated dispatch, can land THIS attempt's bytes and then see
+                // the create-only fence refuse the second copy. The stored object
+                // carrying our own attempt id says the publish succeeded, and
+                // refusing it would fence the fork name behind our own work.
+                match state
+                    .repo_store
+                    .fork_attempt_landed(&forker_did, &fork_name, &attempt)
+                    .await
+                {
+                    Ok(true) => {
+                        tracing::info!(
+                            fork = %fork_name,
+                            status,
+                            "fork create-only PUT was refused but the stored archive is this \
+                             attempt's own — continuing"
+                        );
+                    }
+                    Ok(false) => {
+                        tracing::warn!(
+                            forker = %forker_did,
+                            fork = %fork_name,
+                            status,
+                            "fork refused: an archive already exists under the fork's key"
+                        );
+                        return Err(AppError::RepoExists(fork_name.clone()));
+                    }
+                    // The store could not be asked whether the stored archive is ours,
+                    // so "not ours" is not an answer we have. Reporting a permanent name
+                    // conflict from a transient store failure sends the client away from
+                    // a name that may well be free; refuse retryably instead.
+                    //
+                    // The clone guard is deliberately NOT disarmed here. Unlike the
+                    // ambiguous arm below, a lost precondition proves this attempt's PUT
+                    // was refused, so the local clone protects nothing the store does not
+                    // already hold. Keeping it would wedge the fork name: the retry this
+                    // 503 invites re-clones into the same destination and fails because
+                    // it exists, and the leftover carries a dead attempt's stamp that no
+                    // cleanup will ever claim. Let Drop remove it.
+                    Err(e) => {
+                        tracing::warn!(
+                            forker = %forker_did,
+                            fork = %fork_name,
+                            status,
+                            err = %e,
+                            "fork refused retryably: the store could not be asked whether the \
+                             archive under the fork's key is this attempt's own"
+                        );
+                        return Err(AppError::RepoUnavailable);
+                    }
+                }
+            }
+            crate::git::tigris::UploadError::NotPublished(other) => {
+                // Proven not to have committed. Dropping the clone (on the
+                // guard's Drop) is safe, and the fork name is left free.
+                return Err(AppError::Git(format!("fork upload failed: {other:#}")));
+            }
+            crate::git::tigris::UploadError::Ambiguous { source, .. } => {
+                // THE DURABLE FAILURE MODE. The create-only PUT can commit and
+                // the response can still be lost or unparseable. Compensating
+                // that as a definite failure dropped the only local clone and
+                // skipped the DB insert, and every retry then saw the orphan
+                // object and returned RepoExists — the fork name unusable until
+                // an operator intervened.
+                //
+                // Ask the store instead. The attempt id travelled with the bytes,
+                // so "did MY write land" is answerable even when "did my request
+                // succeed" is not.
+                match state
+                    .repo_store
+                    .fork_attempt_landed(&forker_did, &fork_name, &attempt)
+                    .await
+                {
+                    Ok(true) => {
+                        tracing::warn!(
+                            fork = %fork_name,
+                            err = %source,
+                            "fork upload lost its response but the stored archive is this \
+                             attempt's own — recovering the committed publish"
+                        );
+                    }
+                    // Not (yet) ours, or unreachable. The request may still be in
+                    // flight, so nothing here may be destroyed: keep the clone,
+                    // keep whatever is stored, and refuse retryably. Disarming the
+                    // guard is what preserves the only local copy.
+                    Ok(false) | Err(_) => {
+                        clone_guard.disarm();
+                        tracing::warn!(
+                            forker = %forker_did,
+                            fork = %fork_name,
+                            err = %source,
+                            "fork upload outcome is unknowable — leaving the clone and any \
+                             stored object in place for reconciliation rather than \
+                             compensating a write that may have landed"
+                        );
+                        return Err(AppError::RepoUnavailable);
+                    }
+                }
+            }
+        }
+    }
 
     let now = Utc::now();
     let record = crate::db::RepoRecord {
-        id: Uuid::new_v4().to_string(),
+        id: record_id.clone(),
         name: fork_name.clone(),
         owner_did: forker_did.clone(),
         description: source.description.clone(),
@@ -2803,12 +3721,92 @@ pub async fn fork_repo(
         default_branch: source.default_branch.clone(),
         created_at: now,
         updated_at: now,
-        disk_path: disk_path.to_string_lossy().to_string(),
+        disk_path: clone_guard.path().to_string_lossy().to_string(),
         forked_from: Some(source.id.clone()),
         machine_id: state.machine_id.clone(),
     };
 
-    state.db.create_repo(&record).await?;
+    if let Err(e) = state.db.create_repo(&record).await {
+        match confirm_fork_repo_row(&state.db, &record_id, forker_short, &fork_name).await {
+            Ok(ForkRowConfirmation::Ours(committed)) => {
+                clone_guard.disarm();
+                tracing::warn!(
+                    fork = %fork_name,
+                    forker = %forker_did,
+                    "fork create_repo returned an error but THIS attempt's row is present — treating as success"
+                );
+                return Ok((
+                    StatusCode::CREATED,
+                    Json(to_response(&committed, &state, 0)),
+                ));
+            }
+            Ok(ForkRowConfirmation::Foreign) => {
+                // A concurrent create, mirror registration or retry owns the
+                // name. Returning its row would hand this caller a repository
+                // whose archive, disk path and fork provenance are not the ones
+                // this request produced. Refuse, and compensate only what this
+                // attempt still owns — the guard and `compensate_fork_archive`
+                // both check ownership, so the successor's object and directory
+                // survive.
+                tracing::warn!(
+                    fork = %fork_name,
+                    forker = %forker_did,
+                    "fork create_repo lost the name to another attempt — refusing rather than \
+                     claiming its row"
+                );
+                clone_guard.disarm();
+                state
+                    .repo_store
+                    .compensate_fork_archive(&forker_did, &fork_name, disk_path.as_path(), &attempt)
+                    .await;
+                return Err(AppError::RepoExists(fork_name.clone()));
+            }
+            Ok(ForkRowConfirmation::Absent) => {
+                clone_guard.disarm();
+                state
+                    .repo_store
+                    .compensate_fork_archive(&forker_did, &fork_name, disk_path.as_path(), &attempt)
+                    .await;
+                return Err(e.into());
+            }
+            Err(lookup_err) => {
+                clone_guard.disarm();
+                let db = std::sync::Arc::clone(&state.db);
+                let repo_store = state.repo_store.clone();
+                let owner_short = forker_short.to_string();
+                let fork_name_cl = fork_name.clone();
+                let owner_did = forker_did.clone();
+                let disk_path_cl = disk_path.as_path().to_path_buf();
+                let record_id_cl = record_id.clone();
+                let attempt_cl = attempt.clone();
+                tokio::spawn(async move {
+                    schedule_fork_create_recovery(
+                        db,
+                        repo_store,
+                        record_id_cl,
+                        owner_short,
+                        fork_name_cl,
+                        owner_did,
+                        disk_path_cl,
+                        attempt_cl,
+                    )
+                    .await;
+                });
+                tracing::warn!(
+                    fork = %fork_name,
+                    create_err = %e,
+                    lookup_err = %lookup_err,
+                    "fork create_repo failed and confirmation lookup stayed unavailable — scheduled recovery"
+                );
+                return Err(AppError::RepoUnavailable);
+            }
+        }
+    }
+
+    clone_guard.disarm();
+    // The row is committed: this directory is now the repository, not an
+    // attempt's staging area, and nothing may ever compensate it away.
+    crate::git::repo_store::release_fork_disk_claim(disk_path.as_path());
 
     // Persist the proof so the fork carries it when it propagates to peers.
     if let Some(p) = verified_proof {
@@ -3046,6 +4044,232 @@ mod tests {
     const OWNER_SHORT: &str = "z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
     const STRANGER_DID: &str = "did:key:z6Mkffonly5tranger0000000000000000000000000000000";
 
+    use crate::git::publish::{PublishAttemptId, PublishStage, PublishStageCell};
+    use crate::git::repo_store::ReleaseOutcome;
+
+    /// A slot armed against a stage cell the test drives directly, which is the
+    /// only way to reach the abandoned-handler arms without a live push.
+    fn armed_slot(stage: PublishStage) -> (PublishDurabilitySlot, Arc<PublishStageCell>) {
+        let cell = Arc::new(PublishStageCell::new());
+        cell.set(stage);
+        let slot = PublishDurabilitySlot::new();
+        slot.arm_for_release(Arc::clone(&cell));
+        (slot, cell)
+    }
+
+    /// P1 FINDING 1, at the type level. A handler cancelled while the archive is
+    /// still being compressed has NOT attempted publication: the conditional PUT
+    /// is not constructed until compression returns. Recording that as
+    /// `UploadUnknowable` is what let the detached tail do IPFS, Pinata, P2P,
+    /// GraphQL, Arweave and peer work for refs that exist only in a local write
+    /// the store never saw.
+    #[test]
+    fn slot_drop_during_compression_records_a_definite_non_publication() {
+        let (slot, _cell) = armed_slot(PublishStage::PreparingArchive);
+        let arc = slot.arc();
+        drop(slot);
+        assert_eq!(
+            *arc.lock().expect("publish durability mutex poisoned"),
+            Some(ReleaseOutcome::UploadFailed),
+            "a cancellation before the PUT was dispatched must be recorded as a definite \
+             non-publication, not as unknowable durability"
+        );
+    }
+
+    /// The other side of the same boundary: once the request is on the wire, the
+    /// outcome genuinely is unknowable, and a `Drop` impl cannot await a HEAD to
+    /// resolve it. Unknowable is honest here — and the tail refuses it anyway,
+    /// because the tail requires `Released`.
+    #[test]
+    fn slot_drop_after_dispatch_records_unknowable() {
+        let (slot, _cell) = armed_slot(PublishStage::PutDispatched {
+            attempt: PublishAttemptId::new(),
+        });
+        let arc = slot.arc();
+        drop(slot);
+        assert_eq!(
+            *arc.lock().expect("publish durability mutex poisoned"),
+            Some(ReleaseOutcome::UploadUnknowable),
+            "a dispatched PUT may still commit, so the drop must not claim it definitely failed"
+        );
+    }
+
+    /// A disconnect AFTER the store acknowledged the publish loses the response,
+    /// not the write. The tail must still run: this is the case the stage model
+    /// gains over the old flag, which could only ever say "unknowable" here.
+    #[test]
+    fn slot_drop_after_the_store_acknowledged_records_released() {
+        let (slot, _cell) = armed_slot(PublishStage::Published {
+            attempt: PublishAttemptId::new(),
+            etag: Some("\"e1\"".to_string()),
+        });
+        let arc = slot.arc();
+        drop(slot);
+        assert_eq!(
+            *arc.lock().expect("publish durability mutex poisoned"),
+            Some(ReleaseOutcome::Released),
+            "a confirmed publish is durable regardless of what happened to the handler"
+        );
+    }
+
+    /// A node with no object storage configured has nothing to publish, so the
+    /// pack on local disk IS the durable copy and a disconnect must not withhold
+    /// the tail. Distinct from `Idle`, where a publish was possible and never
+    /// started; collapsing the two turns every Tigris-less deployment's pushes
+    /// into un-replicated ones.
+    #[test]
+    fn slot_drop_with_no_storage_backend_records_released() {
+        let (slot, _cell) = armed_slot(PublishStage::NoBackend);
+        let arc = slot.arc();
+        drop(slot);
+        assert_eq!(
+            *arc.lock().expect("publish durability mutex poisoned"),
+            Some(ReleaseOutcome::Released),
+            "with no backend there is no publication to confirm, so the tail must run"
+        );
+    }
+
+    #[test]
+    fn publish_durability_slot_drop_leaves_empty_before_release_starts() {
+        let slot = PublishDurabilitySlot::new();
+        let arc = slot.arc();
+        drop(slot);
+        assert_eq!(
+            *arc.lock().expect("publish durability mutex poisoned"),
+            None,
+            "dropping before release starts must not synthesize durability for the tail"
+        );
+    }
+
+    #[test]
+    fn publish_durability_slot_drop_waits_for_contended_mutex() {
+        let (slot, _cell) = armed_slot(PublishStage::PutDispatched {
+            attempt: PublishAttemptId::new(),
+        });
+        let arc = slot.arc();
+        let holder = {
+            let arc = Arc::clone(&arc);
+            std::thread::spawn(move || {
+                let _guard = arc.lock().expect("publish durability mutex poisoned");
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        drop(slot);
+        holder.join().expect("mutex holder thread");
+        let outcome = *arc.lock().expect("publish durability mutex poisoned");
+        assert_eq!(
+            outcome,
+            Some(ReleaseOutcome::UploadUnknowable),
+            "drop must block until it can install its verdict, not give up on try_lock"
+        );
+    }
+
+    /// The tail must resolve promptly on an abandoned handler rather than wait
+    /// out the whole transfer bound — it just resolves to a REFUSAL now.
+    #[tokio::test]
+    async fn publish_durability_confirmed_refuses_quickly_after_unrecorded_slot_drop() {
+        let start = std::time::Instant::now();
+        let (slot, _cell) = armed_slot(PublishStage::PreparingArchive);
+        let arc = slot.arc();
+        drop(slot);
+        let confirmed =
+            publish_durability_confirmed(&Some(arc), std::time::Duration::from_millis(50)).await;
+        assert!(
+            !confirmed,
+            "a cancellation before dispatch must not admit the replication tail"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(200),
+            "the tail must not wait out the full transfer bound once the slot carries a verdict"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_durability_confirmed_fails_closed_when_release_never_records() {
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let confirmed =
+            publish_durability_confirmed(&Some(slot), std::time::Duration::from_millis(30)).await;
+        assert!(
+            !confirmed,
+            "an empty slot after the bounded wait must not admit the tail; only an installed \
+             Released outcome may"
+        );
+    }
+
+    /// P1 FINDING 1, at the gate. The tail replicates to IPFS, Pinata, P2P,
+    /// GraphQL, Arweave and peers, all of which publish refs to other nodes. Only
+    /// a CONFIRMED publish may license that. `UploadUnknowable` used to pass here,
+    /// which is what carried an unattempted (and an unreconciled) write into the
+    /// network.
+    #[tokio::test]
+    async fn publish_durability_confirmed_accepts_only_released() {
+        let slot = Arc::new(std::sync::Mutex::new(Some(ReleaseOutcome::Released)));
+        assert!(
+            publish_durability_confirmed(&Some(slot), std::time::Duration::from_millis(5)).await
+        );
+
+        for refused in [
+            ReleaseOutcome::UploadUnknowable,
+            ReleaseOutcome::UploadFailed,
+            ReleaseOutcome::Fenced,
+        ] {
+            let slot = Arc::new(std::sync::Mutex::new(Some(refused)));
+            assert!(
+                !publish_durability_confirmed(&Some(slot), std::time::Duration::from_millis(5))
+                    .await,
+                "{refused:?} is not a confirmed publish and must not admit the tail"
+            );
+        }
+    }
+
+    #[test]
+    fn fork_clone_guard_removes_its_own_mirror_on_drop() {
+        let root = tempfile::TempDir::new().unwrap();
+        let validated = crate::git::repo_store::validated_repo_disk_path(
+            root.path(),
+            "did:key:testfork",
+            "fork",
+        )
+        .expect("test fork path must validate");
+        std::fs::create_dir_all(validated.as_path()).unwrap();
+        {
+            let _guard = ForkCloneGuard::new(validated.clone(), PublishAttemptId::new());
+            assert!(validated.exists());
+        }
+        assert!(
+            !validated.exists(),
+            "dropping the fork clone guard must remove the mirror directory it stamped"
+        );
+    }
+
+    /// P1 FINDING 3, the filesystem half. Two attempts at one logical fork share
+    /// a disk path. A late-unwinding attempt must not remove the directory a
+    /// SUCCESSOR now owns — the successor has already published its archive and
+    /// returned 201 for it.
+    #[test]
+    fn fork_clone_guard_leaves_a_successors_mirror_alone() {
+        let root = tempfile::TempDir::new().unwrap();
+        let validated = crate::git::repo_store::validated_repo_disk_path(
+            root.path(),
+            "did:key:testfork",
+            "fork",
+        )
+        .expect("test fork path must validate");
+        std::fs::create_dir_all(validated.as_path()).unwrap();
+
+        let loser = ForkCloneGuard::new(validated.clone(), PublishAttemptId::new());
+        // The successor claims the path while the loser is still unwinding.
+        let successor = PublishAttemptId::new();
+        crate::git::repo_store::claim_fork_disk_path(validated.as_path(), &successor);
+
+        drop(loser);
+        assert!(
+            validated.exists(),
+            "a failed attempt must not delete the directory a successor now owns"
+        );
+    }
+
     #[test]
     fn upload_pack_request_finalizes_only_with_done_pktline() {
         let want = "0032want 1111111111111111111111111111111111111111\n";
@@ -3226,6 +4450,55 @@ mod tests {
         // Releasing the permit frees the slot for the next request.
         drop(p1);
         assert!(git_permit(&sem).is_ok());
+    }
+
+    #[test]
+    fn is_expected_transient_matches_both_typed_refusals() {
+        // The real raise shape wraps the marker in a `.context()` layer naming the
+        // owner slug and repo, so the downcast has to survive that wrapping.
+        let busy = anyhow::Error::new(crate::git::repo_store::RepoBusy)
+            .context("another write is in progress for alice/demo");
+        assert!(is_expected_transient_acquire_failure(&busy));
+
+        let unavailable = anyhow::Error::new(crate::git::repo_store::RepoUnavailable)
+            .context("could not read the archive HEAD for alice/demo");
+        assert!(is_expected_transient_acquire_failure(&unavailable));
+    }
+
+    #[test]
+    fn is_expected_transient_rejects_unrelated_failures() {
+        // Anything the classifier cannot recognize keeps paging at error level.
+        let other = anyhow::anyhow!("disk on fire");
+        assert!(!is_expected_transient_acquire_failure(&other));
+    }
+
+    #[test]
+    fn acquire_write_app_error_maps_transient_markers_to_retryable_503() {
+        let busy = anyhow::Error::new(crate::git::repo_store::RepoBusy)
+            .context("another write is in progress for alice/demo");
+        assert!(matches!(
+            acquire_write_app_error(&busy, "demo"),
+            AppError::RepoBusy
+        ));
+
+        let unavailable = anyhow::Error::new(crate::git::repo_store::RepoUnavailable)
+            .context("could not read the archive HEAD for alice/demo");
+        assert!(matches!(
+            acquire_write_app_error(&unavailable, "demo"),
+            AppError::RepoUnavailable
+        ));
+
+        let pool = anyhow::Error::new(crate::git::repo_store::LockPoolBusy);
+        assert!(matches!(
+            acquire_write_app_error(&pool, "demo"),
+            AppError::Overloaded(_)
+        ));
+
+        let other = anyhow::anyhow!("disk on fire");
+        assert!(matches!(
+            acquire_write_app_error(&other, "demo"),
+            AppError::Git(_)
+        ));
     }
 
     fn repo_owned_by(owner_did: &str) -> crate::db::RepoRecord {
@@ -3586,6 +4859,229 @@ mod tests {
         );
     }
 
+    /// #172: first-push delta (empty old tips, `full_scan == false`) must drop the
+    /// withheld-subtree tree. The withheld set comes from `replication_withheld_set`,
+    /// the production wrapper all three delta call sites already use.
+    #[tokio::test]
+    async fn first_push_delta_drops_withheld_subtree_tree() {
+        use std::process::Command;
+        use std::time::Duration;
+
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        let run = |args: &[&str], dir: &std::path::Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        std::fs::create_dir_all(work.join("public")).unwrap();
+        std::fs::create_dir_all(work.join("secret")).unwrap();
+        std::fs::write(work.join("public/a.txt"), b"public bytes\n").unwrap();
+        std::fs::write(work.join("secret/b.txt"), b"TOP SECRET\n").unwrap();
+        run(&["init", "-q"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        run(&["add", "."], &work);
+        run(&["commit", "-qm", "init"], &work);
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+        let oid = |rev: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "rev-parse {rev}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let head = oid("HEAD");
+        let root_tree = oid("HEAD^{tree}");
+        let public_tree = oid("HEAD:public");
+        let public_blob = oid("HEAD:public/a.txt");
+        let secret_tree = oid("HEAD:secret");
+        let secret_blob = oid("HEAD:secret/b.txt");
+
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
+        let pin_set = crate::git::push_delta::resolve_candidates_for_push(
+            sem.clone(),
+            bare.clone(),
+            vec![head.clone()],
+            vec![],
+            "git".into(),
+            Duration::from_secs(600),
+            false,
+        )
+        .await;
+        assert!(
+            !pin_set.full_scan,
+            "a first push of a commit tip must take the delta path, not full-scan"
+        );
+        assert!(
+            pin_set.candidates.contains(&secret_tree) && pin_set.candidates.contains(&secret_blob),
+            "precondition: the first-push delta includes the withheld tree and blob, \
+             so a later drop is a filter hit, not a missing-candidate skip"
+        );
+
+        let (_announce, withheld) = replication_withheld_set(
+            sem,
+            Some(vec![vis_rule("/secret/**", &[])]),
+            OWNER_DID,
+            true,
+            bare,
+            "git".into(),
+            Duration::from_secs(600),
+        )
+        .await;
+        let withheld = withheld
+            .expect("announceable public repo with a path-scoped rule must yield a withheld set");
+        let replicable =
+            crate::git::visibility_pack::replicable_objects(pin_set.candidates, &withheld);
+        assert!(
+            replicable.contains(&head) && replicable.contains(&root_tree),
+            "commit and root tree still replicate"
+        );
+        assert!(
+            replicable.contains(&public_tree) && replicable.contains(&public_blob),
+            "public tree and blob still replicate"
+        );
+        assert!(
+            !replicable.contains(&secret_tree),
+            "withheld-subtree tree must not survive the first-push delta pin set (#172)"
+        );
+        assert!(
+            !replicable.contains(&secret_blob),
+            "withheld blob still drops"
+        );
+    }
+
+    /// #172: full-scan fallback drops a withheld-subtree tree and a dangling tree,
+    /// keeping the commit, root tree, public tree, and public blob.
+    #[tokio::test]
+    async fn full_scan_drops_withheld_and_dangling_trees() {
+        use std::io::Write;
+        use std::process::Command;
+        use std::time::Duration;
+
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        let run = |args: &[&str], dir: &std::path::Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        std::fs::create_dir_all(work.join("public")).unwrap();
+        std::fs::create_dir_all(work.join("secret")).unwrap();
+        std::fs::write(work.join("public/a.txt"), b"public bytes\n").unwrap();
+        std::fs::write(work.join("secret/b.txt"), b"TOP SECRET\n").unwrap();
+        run(&["init", "-q"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        run(&["add", "."], &work);
+        run(&["commit", "-qm", "init"], &work);
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+        let oid = |rev: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "rev-parse {rev}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let head = oid("HEAD");
+        let root_tree = oid("HEAD^{tree}");
+        let public_tree = oid("HEAD:public");
+        let public_blob = oid("HEAD:public/a.txt");
+        let secret_tree = oid("HEAD:secret");
+        let secret_blob = oid("HEAD:secret/b.txt");
+
+        let mut child = Command::new("git")
+            .args(["mktree"])
+            .current_dir(&bare)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(
+            child.stdin.as_mut().unwrap(),
+            "100644 blob {secret_blob}\tdangling-only-unreferenced.txt"
+        )
+        .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "git mktree");
+        let dangling_tree = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(600);
+        let candidates = crate::git::push_delta::list_all_objects(&bare, "git", deadline).unwrap();
+        assert!(
+            candidates.contains(&dangling_tree),
+            "precondition: dangling tree is in the full-scan universe"
+        );
+        assert!(
+            candidates.contains(&secret_tree) && candidates.contains(&secret_blob),
+            "precondition: full-scan universe includes the withheld tree and blob"
+        );
+
+        let replicable = fail_closed_full_scan_objects(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+            bare,
+            vec![vis_rule("/secret/**", &[])],
+            true,
+            OWNER_DID.to_string(),
+            candidates,
+            "git".into(),
+            Duration::from_secs(600),
+        )
+        .await;
+        assert!(replicable.contains(&head), "HEAD commit kept");
+        assert!(replicable.contains(&root_tree), "root tree kept");
+        assert!(replicable.contains(&public_tree), "public tree kept");
+        assert!(replicable.contains(&public_blob), "public blob kept");
+        assert!(
+            !replicable.contains(&secret_tree),
+            "withheld-subtree tree dropped on full-scan (#172)"
+        );
+        assert!(
+            !replicable.contains(&secret_blob),
+            "withheld blob dropped on full-scan"
+        );
+        assert!(
+            !replicable.contains(&dangling_tree),
+            "dangling tree dropped on full-scan (#172, #99 geometry for trees)"
+        );
+    }
+
     /// #174 (serve-path 504, vetted by execution): a hung withheld-blob walk on the
     /// upload-pack POST maps to 504, not a generic 500. Real repo dir on disk (so
     /// acquire's fast path returns it) + a path-scoped rule (so the walk runs) +
@@ -3938,7 +5434,7 @@ mod tests {
             "9d92186a",
             "did:key:z6Mkwbud",
             "nipmod",
-            "Decentralized npm for agents on Gitlawb",
+            "Decentralized npm for agents on Twigpine",
             "2026-01-15T00:00:00Z",
         );
 
@@ -3952,7 +5448,7 @@ mod tests {
         );
         assert_eq!(
             rec.description.as_deref(),
-            Some("Decentralized npm for agents on Gitlawb"),
+            Some("Decentralized npm for agents on Twigpine"),
             "canonical description and metadata survive, not the mirror placeholder",
         );
         assert_eq!(*stars, 7, "star count follows the canonical row");
@@ -4993,6 +6489,13 @@ mod tests {
     /// task the global slot stays occupied until the walk finishes; on the pre-fix code
     /// the handler-local permits drop on future-drop and the slot frees instantly (RED),
     /// letting disconnect-spam exceed the cap while real git work keeps running.
+    ///
+    /// Unix-only: the fake git is a `/bin/sh` script made executable through
+    /// `PermissionsExt::set_mode`, and the hung `rev-list` is reaped with
+    /// `libc::kill(SIGKILL)`. Neither exists on Windows, so without this gate the
+    /// whole `gitlawb-node` test target fails to compile there (#228) and no test
+    /// in the crate can run on a Windows checkout.
+    #[cfg(unix)]
     #[sqlx::test]
     async fn upload_pack_permit_held_through_walk_after_disconnect(pool: sqlx::PgPool) {
         use axum::body::Body;
@@ -5588,8 +7091,9 @@ mod tests {
 
     /// #174 U4 (P1-d, RED-before/GREEN-after): the authenticated receive-pack POST
     /// carries a per-source WRITE sub-cap so one source IP cannot monopolize the write
-    /// pool with many slow pushes (owner enforcement defaults off, so disposable DIDs
-    /// are free). Global write pool has capacity; the source is pre-held at its single
+    /// pool with many slow pushes (the cap keys on source IP, not the DID, so it holds
+    /// whether or not owner enforcement is on — and it can be turned off for a rolling
+    /// upgrade). Global write pool has capacity; the source is pre-held at its single
     /// write slot. A push from THAT source sheds (Overloaded/503) — which also proves
     /// the PeerAddr+HeaderMap extractors resolve a key (without them the key is None and
     /// the cap is inert, never shedding). A push from a DIFFERENT source is NOT shed by
@@ -5615,7 +7119,10 @@ mod tests {
             .await
             .unwrap();
 
-        let did = "did:key:z6MkReceivePackWriteCapProofDidAAAAAAAAAA";
+        // Owner of the `rp4` row, so the push reaches the per-source write cap instead
+        // of stopping at the owner-push gate (on by default). `did_matches` collapses
+        // the `did:key:` prefix against the bare stored owner.
+        let did = "did:key:z6rp4wr";
         let capped: SocketAddr = "203.0.113.44:5000".parse().unwrap();
         let other: SocketAddr = "203.0.113.45:5000".parse().unwrap();
 
@@ -5683,22 +7190,12 @@ mod tests {
     /// stays pinned past the deadline. Restore to return GREEN.
     #[sqlx::test]
     async fn receive_pack_acquire_deadline_sheds_and_releases_permit(pool: sqlx::PgPool) {
+        use crate::git::repo_store::advisory_lock_key;
         use axum::extract::{Path, State};
         use axum::Extension;
         use std::net::SocketAddr;
         use std::sync::Arc;
         use tokio::sync::Semaphore;
-
-        // Reproduce acquire_write's session-level advisory-lock key exactly so the
-        // second-connection lock collides with the handler's pg_try_advisory_lock
-        // (repo_store.rs: advisory_lock_key over owner_slug then repo_name).
-        fn advisory_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            owner_slug.hash(&mut hasher);
-            repo_name.hash(&mut hasher);
-            hasher.finish() as i64
-        }
 
         let owner = "z6acqdead";
         let name = "acq1";
@@ -5744,7 +7241,10 @@ mod tests {
             .await
             .expect("hold the advisory lock on the second connection");
 
-        let did = "did:key:z6MkAcquireDeadlineProofDidAAAAAAAAAAAAAAAA";
+        // Owner of the seeded rows, so the push reaches `acquire_write` instead of
+        // stopping at the owner-push gate (on by default). `did_matches` collapses the
+        // `did:key:` prefix against the bare `owner` above.
+        let did = "did:key:z6acqdead";
         let peer: SocketAddr = "203.0.113.61:5000".parse().unwrap();
 
         let sem = state.git_write_semaphore.clone();
@@ -5862,6 +7362,423 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn pid_alive(pid: i32) -> bool {
+        // SAFETY: kill(2) with signal 0 only probes; it takes integers and borrows no
+        // Rust memory.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// SIGKILL the recorded pids if the test unwinds, so a RED run leaks no orphan.
+    #[cfg(unix)]
+    struct KillOnPanic(Vec<i32>);
+    #[cfg(unix)]
+    impl Drop for KillOnPanic {
+        fn drop(&mut self) {
+            for pid in &self.0 {
+                // SAFETY: as above.
+                unsafe {
+                    libc::kill(*pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    /// Is the repo write lock takeable from an INDEPENDENT session right now? Session
+    /// advisory locks are re-entrant within their own session, so this must not run on
+    /// any connection the code under test might be using.
+    #[cfg(unix)]
+    async fn write_lock_is_takeable(pool: &sqlx::PgPool, key: i64) -> bool {
+        let mut probe = pool.acquire().await.expect("probe connection");
+        let taken: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(&mut *probe)
+            .await
+            .expect("probe try-lock");
+        if taken.0 {
+            sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(key)
+                .execute(&mut *probe)
+                .await
+                .expect("probe unlock");
+        }
+        taken.0
+    }
+
+    /// #173 F2 (RED-before/GREEN-after): on a CLIENT DISCONNECT the repo write lock must
+    /// stay held until the receive-pack process group is confirmed reaped.
+    ///
+    /// The handler's `guard.release(..)` line is only reached if `receive_pack` returns.
+    /// When the request future is dropped mid-push the guard drops instead, and (since
+    /// #173 U1 gave the lock pool an `after_release` hook) that FREES the advisory lock
+    /// immediately, while `KillGroupOnDrop`'s detached reaper is still giving the group
+    /// its ~2s SIGTERM grace. A second `acquire_write` admitted inside that window puts
+    /// two `git receive-pack` groups on one repo. `smart_http.rs` states the invariant
+    /// the other way round on the timeout path: "a caller releasing a write lock can't
+    /// race them".
+    ///
+    /// Real seam, not a stand-in: the production `git_receive_pack` handler, a fake git
+    /// whose descendant IGNORES SIGTERM (so the group genuinely survives the grace and
+    /// the window is ~2s wide, not a scheduling artifact), and the lock probed from an
+    /// independent session. RED before the fix: the lock is takeable while the group is
+    /// still alive. GREEN after: takeable only once the group is gone.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_disconnect_holds_the_write_lock_until_the_group_is_reaped(
+        pool: sqlx::PgPool,
+    ) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let owner = "z6disc";
+        let name = "dc1";
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let descfile = tmp.path().join("desc.pid");
+        // The leader dies on the group SIGTERM; its descendant traps SIGTERM and loops
+        // (bounded at ~30s so a RED run leaks nothing permanent), so the group is only
+        // gone once the reaper escalates to SIGKILL. The descendant inherits the stdout
+        // pipe, which keeps drive_git_child's read_to_end pending until we drop.
+        let body = format!(
+            "#!/bin/sh\n\
+             sh -c 'trap \"\" TERM; echo $$ > \"{}\"; i=0; while [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done' &\n\
+             wait\n",
+            descfile.display()
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.git_bin = git_bin;
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir.path().to_path_buf(),
+            None,
+            crate::git::repo_store::build_lock_pool(&pool, 4, std::time::Duration::from_secs(5)),
+            std::time::Duration::from_secs(300),
+        );
+        let mut cfg = (*state.config).clone();
+        // Long enough that the git-service timeout is never what ends this push; the
+        // disconnect is.
+        cfg.git_service_timeout_secs = 600;
+        // Lock-path test, not owner-push authorization: pin off so the default-on gate
+        // does not reject the proof DID before receive-pack runs.
+        cfg.enforce_owner_push = false;
+        state.config = std::sync::Arc::new(cfg);
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/tmp/z6disc-dc1", None, false)
+            .await
+            .unwrap();
+
+        // The mirror row stores the short owner as owner_did, so the slug is the owner.
+        // Import the production derivation rather than hand-copying it: a local copy
+        // silently diverged when the key moved to SHA-256 (#210).
+        use crate::git::repo_store::advisory_lock_key;
+        let key = advisory_lock_key(&owner.replace([':', '/'], "_"), name);
+        // Probe from a pool that is NOT the store's lock pool and NOT the harness pool.
+        let probe = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy_with((*pool.connect_options()).clone());
+
+        assert!(
+            write_lock_is_takeable(&probe, key).await,
+            "the write lock must be free before the push"
+        );
+
+        // Drive the handler a slice at a time until the fake git's SIGTERM-ignoring
+        // descendant records its pid, i.e. receive-pack is genuinely running under the
+        // write lock. `Ok(_)` means the handler returned early; stop polling then, since
+        // re-polling a completed future panics.
+        //
+        // Retried on a miss for the same reason `smart_http`'s disconnect tests retry:
+        // under `cargo test` fork-storm load a freshly written fake `git` can transiently
+        // fail to exec (ETXTBSY, a concurrent worker forked while its write fd was open),
+        // which leaves no pid. A losing attempt's future is dropped, which reaps whatever
+        // spawned and releases its write lock, so retries do not leak. The winning
+        // attempt's future is kept PENDING: dropping it below is the disconnect under test.
+        const SPAWN_ATTEMPTS: u64 = 12;
+        let (fut, desc) = {
+            let mut attempt = 0u64;
+            loop {
+                attempt += 1;
+                let _ = std::fs::remove_file(&descfile);
+                let mut fut = Box::pin(git_receive_pack(
+                    State(state.clone()),
+                    Path((owner.to_string(), name.to_string())),
+                    Extension(crate::auth::AuthenticatedDid("did:key:z6disc".to_string())),
+                    crate::rate_limit::PeerAddr(Some(
+                        "203.0.113.81:5000".parse::<SocketAddr>().unwrap(),
+                    )),
+                    axum::http::HeaderMap::new(),
+                    axum::body::Bytes::from_static(b"0000"),
+                ));
+                let mut found: Option<i32> = None;
+                for _ in 0..500 {
+                    let finished =
+                        tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut)
+                            .await
+                            .is_ok();
+                    if let Some(p) = std::fs::read_to_string(&descfile)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<i32>().ok())
+                    {
+                        found = Some(p);
+                        break;
+                    }
+                    if finished {
+                        break;
+                    }
+                }
+                match found {
+                    Some(p) => break (fut, p),
+                    None => {
+                        drop(fut);
+                        assert!(
+                            attempt < SPAWN_ATTEMPTS,
+                            "the push never reached receive-pack after {SPAWN_ATTEMPTS} \
+                             attempts (persistent failure, not a transient runner miss)"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(100 * attempt)).await;
+                    }
+                }
+            }
+        };
+        let _cleanup = KillOnPanic(vec![desc]);
+        assert!(
+            pid_alive(desc),
+            "the receive-pack group must be running before the disconnect"
+        );
+        assert!(
+            !write_lock_is_takeable(&probe, key).await,
+            "the write lock must be held while receive-pack runs"
+        );
+
+        // Client disconnect: drop the request future mid-receive-pack.
+        drop(fut);
+
+        let mut takeable_while_group_alive = false;
+        let mut freed_after_reap = false;
+        for _ in 0..800 {
+            let takeable = write_lock_is_takeable(&probe, key).await;
+            let group_alive = pid_alive(desc);
+            if takeable && group_alive {
+                takeable_while_group_alive = true;
+            }
+            if takeable && !group_alive {
+                freed_after_reap = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Clean up regardless so a RED run leaves no orphan behind.
+        // SAFETY: kill(2) takes integers only.
+        unsafe {
+            libc::kill(desc, libc::SIGKILL);
+        }
+        assert!(
+            !takeable_while_group_alive,
+            "the repo write lock was takeable while a receive-pack group was still alive \
+             on that repo: a second push can enter and two git receive-pack groups run \
+             against one repo (#173 F2)"
+        );
+        assert!(
+            freed_after_reap,
+            "the write lock must be released once the disconnected push's group is reaped"
+        );
+        // The other half of the disconnect invariant, and the reason the guard rides the
+        // reaper rather than being released there: an interrupted push must not publish a
+        // half-applied repo. The guard is gone by now (the lock above only frees when it
+        // is), so the upload site has had its whole chance to be reached. The positive
+        // control is `receive_pack_success_reclaims_and_releases_the_write_lock`, which
+        // observes the same counter at 1: without it, a zero here would pass on any build
+        // where an upload is simply impossible.
+        assert_eq!(
+            state.repo_store.tigris_upload_site_reached(),
+            0,
+            "a push interrupted by a client disconnect must not reach the Tigris upload \
+             site: publishing a half-applied repo propagates it to every node that later \
+             downloads it (#173 F2)"
+        );
+    }
+
+    /// #173 F2, the other half: carrying the write lock through the admission seam must
+    /// NOT cost the success path its `release(true)`. A push that completes normally has
+    /// to reclaim the lock and release it explicitly (that is what performs the Tigris
+    /// upload), synchronously, not leave it to the pool's `after_release` net. The lock
+    /// is probed immediately after the handler returns, with no polling, so a fix that
+    /// only ever dropped the guard would fail here.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_success_reclaims_and_releases_the_write_lock(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let owner = "z6succ";
+        let name = "sc1";
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A receive-pack that succeeds. It DRAINS stdin first: exiting while the handler
+        // is still writing the request body would EPIPE that write, which
+        // `drive_git_child` surfaces as an error after a successful exit status, making
+        // the push fail for a reason that has nothing to do with the lock under test.
+        let git_bin = write_fake_git(tmp.path(), "#!/bin/sh\ncat >/dev/null\nexit 0\n");
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.git_bin = git_bin;
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir.path().to_path_buf(),
+            None,
+            crate::git::repo_store::build_lock_pool(&pool, 4, std::time::Duration::from_secs(5)),
+            std::time::Duration::from_secs(300),
+        );
+        let mut cfg = (*state.config).clone();
+        cfg.enforce_owner_push = false;
+        state.config = std::sync::Arc::new(cfg);
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/tmp/z6succ-sc1", None, false)
+            .await
+            .unwrap();
+
+        use crate::git::repo_store::advisory_lock_key;
+        let key = advisory_lock_key(&owner.replace([':', '/'], "_"), name);
+        let probe = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy_with((*pool.connect_options()).clone());
+
+        // Retried ONLY on the ETXTBSY exec race a freshly written fake `git` hits under
+        // fork-storm load (a concurrent test worker forked while its write fd was open).
+        // Narrow on purpose: any other failure still fails the assertion below loudly.
+        const SPAWN_ATTEMPTS: u64 = 12;
+        let mut result = None;
+        for attempt in 1..=SPAWN_ATTEMPTS {
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                git_receive_pack(
+                    State(state.clone()),
+                    Path((owner.to_string(), name.to_string())),
+                    Extension(crate::auth::AuthenticatedDid("did:key:z6succ".to_string())),
+                    crate::rate_limit::PeerAddr(Some(
+                        "203.0.113.83:5000".parse::<SocketAddr>().unwrap(),
+                    )),
+                    axum::http::HeaderMap::new(),
+                    axum::body::Bytes::from_static(b"0000"),
+                ),
+            )
+            .await
+            .expect("the push must return");
+            let exec_race =
+                matches!(&outcome, Err(AppError::Git(m)) if m.contains("Text file busy"));
+            if exec_race && attempt < SPAWN_ATTEMPTS {
+                tokio::time::sleep(std::time::Duration::from_millis(100 * attempt)).await;
+                continue;
+            }
+            result = Some(outcome);
+            break;
+        }
+        let result = result.expect("one attempt must have produced an outcome");
+        assert!(
+            result.is_ok(),
+            "the fake receive-pack succeeds, so the handler must too; got {result:?}"
+        );
+
+        // No polling: `release` unlocks on the connection that took the lock, so the
+        // lock is free the instant the handler returns. Falling back to the async
+        // `after_release` net would not satisfy this.
+        assert!(
+            write_lock_is_takeable(&probe, key).await,
+            "a completed push must reclaim its write lock and release it synchronously"
+        );
+        // POSITIVE CONTROL for the disconnect case's "no upload" assertion. A push that
+        // completed does reach the Tigris upload site, exactly once, so the zero the
+        // disconnect test observes is a real difference between the two paths rather than
+        // an artifact of tests running with no Tigris client configured. Exactly once,
+        // not at least once: a retried exec race releases with success = false and must
+        // not count.
+        assert_eq!(
+            state.repo_store.tigris_upload_site_reached(),
+            1,
+            "a completed push must reach the Tigris upload site once"
+        );
+    }
+
+    /// #173 F1 (RED-before/GREEN-after): an exhausted repo write-lock POOL is a capacity
+    /// signal, so the push must shed 503 + Retry-After (Overloaded) like every other
+    /// admission path here, not report a 500 git error. Both directions: the shed with
+    /// the single lock-pool connection occupied by a guard on a DIFFERENT repo (so this
+    /// is pool capacity, not advisory-lock contention), and the must-not case once that
+    /// connection is back. Before the fix `acquire_write`'s checkout failure fell into
+    /// the generic `AppError::Git` arm (500, no Retry-After).
+    #[sqlx::test]
+    async fn receive_pack_lock_pool_exhaustion_sheds_503_not_500(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let owner = "z6lockpool";
+        let name = "lp1";
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let mut cfg = (*state.config).clone();
+        cfg.enforce_owner_push = false;
+        state.config = std::sync::Arc::new(cfg);
+        // One lock-pool connection, short checkout timeout so the exhaustion surfaces
+        // promptly rather than at the handler's own acquire deadline.
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            std::path::PathBuf::from("/tmp/gitlawb-lockpool-shed"),
+            None,
+            crate::git::repo_store::build_lock_pool(&pool, 1, std::time::Duration::from_secs(1)),
+            std::time::Duration::from_secs(300),
+        );
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/tmp/z6lockpool-lp1", None, false)
+            .await
+            .unwrap();
+
+        let did = "did:key:z6lockpool";
+        let peer: SocketAddr = "203.0.113.71:5000".parse().unwrap();
+
+        // Occupy the only lock-pool connection with a write on an UNRELATED repo.
+        let held = state
+            .repo_store
+            .acquire_write(owner, "other-repo")
+            .await
+            .expect("the first write takes the only lock-pool connection");
+
+        let shed = git_receive_pack(
+            State(state.clone()),
+            Path((owner.to_string(), name.to_string())),
+            Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            crate::rate_limit::PeerAddr(Some(peer)),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        )
+        .await;
+        assert!(
+            matches!(shed, Err(AppError::Overloaded(_))),
+            "an exhausted lock pool must shed 503 + Retry-After, not a 500 git error; \
+             got {shed:?}"
+        );
+
+        // MUST-NOT: with the pool free again, the push is not shed as capacity (it fails
+        // later on the nonexistent on-disk repo, which is a git error, not Overloaded).
+        let _ = held.release(false).await;
+        let admitted = git_receive_pack(
+            State(state.clone()),
+            Path((owner.to_string(), name.to_string())),
+            Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            crate::rate_limit::PeerAddr(Some("203.0.113.72:5000".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        )
+        .await;
+        assert!(
+            !matches!(admitted, Err(AppError::Overloaded(_))),
+            "with the lock pool free, a push must not be shed as capacity; got {admitted:?}"
+        );
+    }
+
     /// #174 U5 (P1-e, RED-before/GREEN-after): the post-push encryption walk acquires a
     /// `git_encrypt_semaphore` permit before running, so completed pushes cannot spawn
     /// unbounded concurrent full-history walks. With the pool exhausted the gated walk
@@ -5870,6 +7787,11 @@ mod tests {
     /// sheds — releasing the permit lets the SAME walk run and pin (durability stays
     /// fail-closed). Exercises the gating seam directly; the detached push task calls
     /// this exact helper.
+    ///
+    /// Unix-only for the same reason as
+    /// `upload_pack_permit_held_through_walk_after_disconnect`: the fake git is a
+    /// `/bin/sh` script made executable through `PermissionsExt::set_mode` (#228).
+    #[cfg(unix)]
     #[tokio::test]
     async fn encrypt_walk_defers_when_pool_exhausted() {
         use std::sync::Arc;
@@ -6135,7 +8057,7 @@ mod tests {
         // (cat-file --batch-all-objects) sleeps 1.5s. With a 2s whole-scan budget the
         // shared deadline leaves phase 2 only ~0.5s, so it is reaped; a fresh 2s budget
         // would let it finish.
-        let body = "#!/bin/sh\ncase \"$1\" in\n  rev-parse) echo deadbeef ;;\n  rev-list) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;\n  ls-tree) sleep 1.5 ;;\n  cat-file) case \"$*\" in *--batch-all-objects*) sleep 1.5 ;; *) : ;; esac ;;\n  *) : ;;\nesac\nexit 0\n";
+        let body = "#!/bin/sh\ncase \"$1\" in\n  rev-parse) echo deadbeef ;;\n  rev-list) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;\n  ls-tree) case \"$*\" in *-rzt*) : ;; *) sleep 1.5 ;; esac ;;\n  cat-file) case \"$*\" in *--batch-all-objects*) sleep 1.5 ;; *) : ;; esac ;;\n  *) : ;;\nesac\nexit 0\n";
         let git_bin = write_fake_git(tmp.path(), body);
         // A candidate that is NOT a blob (never appears in all_blob_oids): kept by
         // replicable_objects_fail_closed only if phase 2 actually ran to completion.
@@ -6158,6 +8080,45 @@ mod tests {
             "a large-but-successful phase 1 must leave phase 2 only the SHARED whole-scan \
              remainder, so it reaps and the scan fails closed; got {objs:?} (a fresh phase-2 \
              budget completed the scan and kept the candidate — the ~2x-budget bug)"
+        );
+    }
+
+    /// #172 / #174 F4 sibling: a successful blob walk that nearly exhausts the
+    /// shared budget must leave the tree allowed-set walk only the remainder, so
+    /// the scan pins nothing. Distinguishes `ls-tree -rzt` (tree) from `ls-tree -rz`
+    /// (blob). Load-bearing together with a fresh timeout on both the tree walk and
+    /// the typed enumeration: those two later phases completing independently would
+    /// keep the non-blob non-tree candidate.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn full_scan_shares_one_deadline_with_tree_allowed_set_walk() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Blob ls-tree -rz sleeps 1.5s; tree ls-tree -rzt sleeps 1.5s; cat-file is
+        // instant. With a 2s whole-scan budget the tree walk is reaped.
+        let body = "#!/bin/sh\ncase \"$1\" in\n  rev-parse) echo deadbeef ;;\n  rev-list) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;\n  ls-tree) case \"$*\" in *-rzt*) sleep 1.5 ;; *) sleep 1.5 ;; esac ;;\n  cat-file) : ;;\n  *) : ;;\nesac\nexit 0\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        let candidates = vec!["cccccccccccccccccccccccccccccccccccccccc".to_string()];
+
+        let sem: Arc<Semaphore> = Arc::new(Semaphore::new(1));
+        let objs = fail_closed_full_scan_objects(
+            sem,
+            tmp.path().to_path_buf(),
+            vec![vis_rule("/secret/**", &[])],
+            true,
+            OWNER_DID.to_string(),
+            candidates,
+            git_bin,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            objs.is_empty(),
+            "a large-but-successful blob walk must leave the tree allowed-set walk only \
+             the SHARED remainder, so it reaps and the scan fails closed; got {objs:?}"
         );
     }
 
@@ -6186,7 +8147,17 @@ mod tests {
         let objects = vec!["0123456789abcdef0123456789abcdef01234567".to_string()];
         let blocked = tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            pin_new_objects_gated(&pin_sem, "", tmp.path(), objects.clone(), &db),
+            pin_new_objects_gated(
+                &pin_sem,
+                "",
+                tmp.path(),
+                "git",
+                std::time::Duration::from_secs(30),
+                objects.clone(),
+                &db,
+                "repo-gated-a",
+                crate::ipfs_pin::PIN_BATCH_BUDGET,
+            ),
         )
         .await;
         assert!(
@@ -6198,11 +8169,104 @@ mod tests {
         drop(held);
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            pin_new_objects_gated(&pin_sem, "", tmp.path(), objects, &db),
+            pin_new_objects_gated(
+                &pin_sem,
+                "",
+                tmp.path(),
+                "git",
+                std::time::Duration::from_secs(30),
+                objects,
+                &db,
+                "repo-gated-b",
+                crate::ipfs_pin::PIN_BATCH_BUDGET,
+            ),
         )
         .await
         .expect("the pin loop completes once admission frees");
         assert!(out.is_empty(), "an empty ipfs_api pins nothing");
+    }
+
+    /// #173 F3, at the layer that actually owns the permit. `pin_new_objects_gated`
+    /// holds the global `pin_semaphore` across the whole `ipfs_pin::pin_new_objects`
+    /// call, so a DB call inside that loop with no deadline parked a global pin slot
+    /// for as long as the query was stuck; once every slot was so held, post-push
+    /// replication stopped for every repo on the node. With the loop's DB calls
+    /// bounded by the batch deadline the call returns at ~the batch budget and the
+    /// permit comes back, even though the table is still locked.
+    ///
+    /// The endpoint is a LIVE mockito server, not the `""` the sibling test above
+    /// uses. `ipfs_pin::pin_new_objects` returns `vec![]` immediately on an empty
+    /// `ipfs_api`, so an empty-string copy would never reach `is_pinned`, never touch
+    /// the locked table, and pass identically with the bound deleted. The mock is at
+    /// `.expect(0)` because a stalled pinned-status check must not fall through to an
+    /// add.
+    ///
+    /// The budget is passed in (1500ms) rather than read from `PIN_BATCH_BUDGET`.
+    /// Before that seam existed this test cost 120s of wall clock, because the bound
+    /// it asserts IS the batch budget and the gate hardcoded the production constant.
+    /// 1500ms is deliberately above `PIN_READ_FLOOR` (1100ms): below the floor
+    /// `batch_budget_gate` breaks the loop as its first statement, so the run would
+    /// never reach a DB call and would pass with the bound deleted.
+    #[sqlx::test]
+    async fn pin_new_objects_gated_frees_permit_after_stalled_db(pool: sqlx::PgPool) {
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let db = state.db.clone();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pin_sem = Arc::new(Semaphore::new(1));
+
+        let mut server = mockito::Server::new_async().await;
+        let add = server
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"Hash":"QmShouldNotHappen"}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        // `ACCESS EXCLUSIVE` conflicts with the `ACCESS SHARE` every SELECT needs, so
+        // `is_pinned` blocks at lock acquisition regardless of row count. Held for the
+        // whole call: a lock released early would let the pre-fix bare await finish too,
+        // and the test would prove nothing.
+        let mut lock = pool.acquire().await.unwrap();
+        sqlx::raw_sql("BEGIN; LOCK TABLE pinned_cids IN ACCESS EXCLUSIVE MODE;")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+
+        let objects = vec!["0123456789abcdef0123456789abcdef01234567".to_string()];
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(150),
+            pin_new_objects_gated(
+                &pin_sem,
+                &server.url(),
+                tmp.path(),
+                "git",
+                std::time::Duration::from_secs(30),
+                objects,
+                &db,
+                "repo-gated-stalled-db",
+                std::time::Duration::from_millis(1500),
+            ),
+        )
+        .await
+        .expect(
+            "a stalled DB must cost the pin loop its batch budget, not the lock's \
+             lifetime: an unbounded await inside the loop holds this permit past every \
+             budget",
+        );
+
+        assert!(out.is_empty(), "a stalled pinned-status check pins nothing");
+        assert_eq!(
+            pin_sem.available_permits(),
+            1,
+            "the global pin permit must be back once the bounded loop returns"
+        );
+        add.assert_async().await;
+
+        sqlx::raw_sql("ROLLBACK").execute(&mut *lock).await.unwrap();
     }
 
     /// #174 F2b: the pin permit bounds how many pin loops run concurrently, so a call
@@ -6227,7 +8291,17 @@ mod tests {
 
         let out = tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            pin_new_objects_gated(&pin_sem, "", tmp.path(), vec![], &db),
+            pin_new_objects_gated(
+                &pin_sem,
+                "",
+                tmp.path(),
+                "git",
+                std::time::Duration::from_secs(30),
+                vec![],
+                &db,
+                "repo-gated-empty",
+                crate::ipfs_pin::PIN_BATCH_BUDGET,
+            ),
         )
         .await
         .expect("an empty object list must not wait on pin admission (#174 F2b)");
@@ -6370,15 +8444,17 @@ mod tests {
         // Scan pool of ONE: at most one post-receive walk may run at a time.
         state.git_encrypt_semaphore = Arc::new(Semaphore::new(1));
 
-        let did = "did:key:z6MkF4BurstPusherAAAAAAAAAAAAAAAAAAAAAAAA";
         let new_sha = "1111111111111111111111111111111111111111";
+        // The two repos have different owners, and owner-only push is on by default,
+        // so each push signs as the owner of the repo it targets. The subject here is
+        // the scan pool serializing two concurrent bursts, not authorization.
         let push = |owner: &'static str, name: &'static str, peer: &'static str| {
             let state = state.clone();
             tokio::spawn(async move {
                 git_receive_pack(
                     State(state),
                     Path((owner.to_string(), name.to_string())),
-                    Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                    Extension(crate::auth::AuthenticatedDid(format!("did:key:{owner}"))),
                     crate::rate_limit::PeerAddr(Some(peer.parse::<SocketAddr>().unwrap())),
                     axum::http::HeaderMap::new(),
                     ref_update_body(new_sha),
@@ -6471,7 +8547,7 @@ mod tests {
                 State(state),
                 Path(("z6f4fast".to_string(), "f1".to_string())),
                 Extension(crate::auth::AuthenticatedDid(
-                    "did:key:z6MkF4FastPusherAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                    "did:key:z6f4fast".to_string(),
                 )),
                 crate::rate_limit::PeerAddr(Some(peer)),
                 axum::http::HeaderMap::new(),
@@ -6531,7 +8607,7 @@ mod tests {
                 State(state),
                 Path(("z6f4park".to_string(), "p1".to_string())),
                 Extension(crate::auth::AuthenticatedDid(
-                    "did:key:z6MkF4ParkPusherAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                    "did:key:z6f4park".to_string(),
                 )),
                 crate::rate_limit::PeerAddr(Some(peer)),
                 axum::http::HeaderMap::new(),
@@ -7750,7 +9826,7 @@ mod tests {
         // + flush-only body -> no post-receive scans to muddy the observation.
         let state =
             f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f3repo", "r1", false).await;
-        let did = "did:key:z6MkF3PusherAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let did = "did:key:z6f3repo";
 
         // Push A: drive its handler future in slices until it reaches receive-pack and the
         // fake records its descendant pid (A now holds the lease and is hung).
@@ -7873,7 +9949,7 @@ mod tests {
         let git_bin = write_fake_git(tmp.path(), body);
         let state =
             f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f3clean", "c1", false).await;
-        let did = "did:key:z6MkF3CleanPusherAAAAAAAAAAAAAAAAAAAAAAAA";
+        let did = "did:key:z6f3clean";
 
         let push = |st: AppState, peer: &'static str| async move {
             tokio::time::timeout(
@@ -7967,7 +10043,7 @@ mod tests {
         // free, and a pool-holding waiter (B, pre-fix) would drain it to zero. Sizing to
         // 1 would 503 B on the pool before it could block on the lease, hiding the bug.
         state.git_write_semaphore = Arc::new(Semaphore::new(2));
-        let did = "did:key:z6MkF3DosPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let did = "did:key:z6f3dos";
 
         // Push A: drive its handler future in slices until it reaches receive-pack (it now
         // holds the lease and one write permit and is hung). available_permits() drops to 1.
@@ -8176,7 +10252,7 @@ mod tests {
             "the identity key must differ from the row id, or this test proves nothing"
         );
 
-        let did = "did:key:z6MkU2KeyPusherAAAAAAAAAAAAAAAAAAAAAAAA";
+        let did = "did:key:z6u2key";
         let peer: SocketAddr = "203.0.113.91:5000".parse().unwrap();
         let handle = tokio::spawn({
             let st = state.clone();
@@ -8257,7 +10333,7 @@ mod tests {
             State(state),
             Path(("z6ovflow".to_string(), "o1".to_string())),
             Extension(crate::auth::AuthenticatedDid(
-                "did:key:z6MkOverflowPusherAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                "did:key:z6ovflow".to_string(),
             )),
             crate::rate_limit::PeerAddr(Some("203.0.113.90:5000".parse::<SocketAddr>().unwrap())),
             axum::http::HeaderMap::new(),
@@ -8304,7 +10380,7 @@ mod tests {
             let r = state.db.get_repo("z6u1cap", "c1").await.unwrap().unwrap();
             crate::state::repo_identity_key(&r.owner_did, &r.name)
         };
-        let did = "did:key:z6MkU1CapPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let did = "did:key:z6u1cap";
         let push = |peer: SocketAddr| {
             let st = state.clone();
             let did = did.to_string();
@@ -8408,7 +10484,7 @@ mod tests {
             crate::state::repo_identity_key(&r.owner_did, &r.name)
         };
         f1_add_repo(&state, "z6u1two", "r2").await;
-        let did = "did:key:z6MkU1TwoPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let did = "did:key:z6u1two";
         let src: SocketAddr = "203.0.113.84:5000".parse().unwrap();
         let push = |repo: &'static str| {
             let st = state.clone();
@@ -8469,8 +10545,11 @@ mod tests {
     /// the per-source permit above the park, four parked pushes deny every push on the
     /// node for up to 1260s.
     ///
-    /// Same one source IP for all three pushes (the collapsed-key shape), distinct pusher
-    /// DIDs, per-source cap 2 so the holder plus a parked push would exhaust it.
+    /// Same one source IP for all three pushes (the collapsed-key shape), per-source
+    /// cap 2 so the holder plus a parked push would exhaust it. A and B are the owner
+    /// of `n1`; C is a second tenant, `z6u1nat2`, pushing to its own `n2` — owner-only
+    /// push means a tenant is identified by the repo it may write, not by an arbitrary
+    /// DID, and the cap keys on the resolved peer address rather than either.
     #[cfg(unix)]
     #[sqlx::test]
     async fn u1_parked_push_does_not_shed_another_pusher_behind_the_same_ip(pool: sqlx::PgPool) {
@@ -8489,16 +10568,22 @@ mod tests {
             let r = state.db.get_repo("z6u1nat", "n1").await.unwrap().unwrap();
             crate::state::repo_identity_key(&r.owner_did, &r.name)
         };
-        f1_add_repo(&state, "z6u1nat", "n2").await;
-        // Every pusher arrives from the one edge IP, so they share a source key.
+        // n2 belongs to a DIFFERENT owner, so the third push is a genuinely different
+        // tenant — which is what this test is named for. Owner-only push forces each
+        // push to sign as the owner of the repo it targets, so the tenants are
+        // distinguished by which repo they push to rather than by an arbitrary DID.
+        f1_add_repo(&state, "z6u1nat2", "n2").await;
+        // Every pusher arrives from the one edge IP, so they share a source key: the
+        // per-source cap keys on the resolved peer address and never on the DID, which
+        // is exactly the property under test.
         let edge: SocketAddr = "203.0.113.85:5000".parse().unwrap();
-        let push = |pusher: &'static str, repo: &'static str| {
+        let push = |owner: &'static str, repo: &'static str| {
             let st = state.clone();
             async move {
                 git_receive_pack(
                     State(st),
-                    Path(("z6u1nat".to_string(), repo.to_string())),
-                    Extension(crate::auth::AuthenticatedDid(pusher.to_string())),
+                    Path((owner.to_string(), repo.to_string())),
+                    Extension(crate::auth::AuthenticatedDid(format!("did:key:{owner}"))),
                     crate::rate_limit::PeerAddr(Some(edge)),
                     axum::http::HeaderMap::new(),
                     axum::body::Bytes::from_static(b"0000"),
@@ -8507,18 +10592,12 @@ mod tests {
             }
         };
 
-        let handle_a = tokio::spawn(push(
-            "did:key:z6MkU1NatPusherOneAAAAAAAAAAAAAAAAAAAAAA",
-            "n1",
-        ));
+        let handle_a = tokio::spawn(push("z6u1nat", "n1"));
         assert!(
             f1_wait_for(F1_BACKSTOP, || a_inpack.exists()).await,
             "pusher one never reached receive-pack within {F1_BACKSTOP:?}"
         );
-        let handle_b = tokio::spawn(push(
-            "did:key:z6MkU1NatPusherTwoAAAAAAAAAAAAAAAAAAAAAA",
-            "n1",
-        ));
+        let handle_b = tokio::spawn(push("z6u1nat", "n1"));
         assert!(
             f1_wait_for(F1_BACKSTOP, || state.repo_write_leases.waiters_for(&repo1)
                 == 1)
@@ -8526,13 +10605,10 @@ mod tests {
             "pusher two never parked on n1's contended lease within {F1_BACKSTOP:?}"
         );
 
-        // A third, unrelated pusher behind the same edge IP, on a different repo.
-        let c = tokio::time::timeout(
-            F1_BACKSTOP,
-            push("did:key:z6MkU1NatPusherThreeAAAAAAAAAAAAAAAAAA", "n2"),
-        )
-        .await
-        .expect("an unrelated pusher's push to an uncontended repo must not park");
+        // A third pusher — a different tenant — behind the same edge IP, on its own repo.
+        let c = tokio::time::timeout(F1_BACKSTOP, push("z6u1nat2", "n2"))
+            .await
+            .expect("an unrelated pusher's push to an uncontended repo must not park");
         let resp = c.unwrap_or_else(|e| {
             panic!(
                 "U1 scenario 3 RED: one repo's parked push shed an UNRELATED pusher's push \
@@ -8582,7 +10658,11 @@ mod tests {
                 .unwrap();
         }
 
-        let did = "did:key:z6MkF1KeyPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        // The pusher must be the repos' owner: this test is about the write-cap key's
+        // shape, so the push has to reach the cap rather than stop at the owner-push
+        // gate, which is on by default. `did_matches` collapses the `did:key:` prefix,
+        // so this is the same identity as the bare `z6f1key` the rows are owned by.
+        let did = "did:key:z6f1key";
         let capped: SocketAddr = "203.0.113.65:5000".parse().unwrap();
         let other: SocketAddr = "203.0.113.66:5000".parse().unwrap();
         let _slot = state
@@ -8614,10 +10694,13 @@ mod tests {
             );
         }
         let r = push(other, "k2").await;
+        // Positive, for the same reason as `f1_write_cap_is_inert_without_a_resolvable
+        // _source_key`: `!matches!(.., Overloaded)` is satisfied by a Forbidden, so a
+        // gate that started rejecting this pusher would leave the test green and inert.
         assert!(
-            !matches!(r, Err(AppError::Overloaded(_))),
+            matches!(r, Err(AppError::Git(_))),
             "a different source must not be shed on any repo while the capped source \
-             holds its slot; got {r:?}"
+             holds its slot, and must reach git; got {r:?}"
         );
     }
 
@@ -8652,17 +10735,22 @@ mod tests {
             State(state.clone()),
             Path(("z6f1none".to_string(), "n1".to_string())),
             Extension(crate::auth::AuthenticatedDid(
-                "did:key:z6MkF1NoKeyPusherAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                "did:key:z6f1none".to_string(),
             )),
             crate::rate_limit::PeerAddr(None),
             axum::http::HeaderMap::new(),
             axum::body::Bytes::from_static(b"0000"),
         )
         .await;
+        // Assert the POSITIVE outcome, not the absence of one error. Reaching git on
+        // the missing on-disk repo is proof the request cleared BOTH the owner gate
+        // and the per-caller cap. The previous shape — `!matches!(r, Overloaded)` —
+        // was satisfied by any other error, so when owner-only push began rejecting
+        // this pusher the test kept reporting ok while measuring nothing.
         assert!(
-            !matches!(r, Err(AppError::Overloaded(_))),
+            matches!(r, Err(AppError::Git(_))),
             "a caller with no resolvable source key must fall back to the global write \
-             pool only, never shed on the per-caller cap; got {r:?}"
+             pool only, never shed on the per-caller cap, and must reach git; got {r:?}"
         );
     }
 
@@ -8683,7 +10771,7 @@ mod tests {
         let mut state =
             f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f1seq", "s1", false).await;
         state.git_write_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
-        let did = "did:key:z6MkF1SeqPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let did = "did:key:z6f1seq";
         let src: SocketAddr = "203.0.113.68:5000".parse().unwrap();
 
         for attempt in 1..=2 {
@@ -8789,6 +10877,43 @@ mod tests {
 
     const F2A_PUSHER: &str = "did:key:z6MkF2aPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
+    /// When publish durability is fenced, the tail must not run walks or take
+    /// coalescing keys before returning.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn post_receive_tail_skips_all_work_when_publish_fenced(pool: sqlx::PgPool) {
+        let repo = tempfile::TempDir::new().unwrap();
+        let bin = tempfile::TempDir::new().unwrap();
+        let log = bin.path().join("git.log");
+        let git_bin = f2a_logging_git(bin.path(), &log);
+        u5_init_repo(repo.path());
+        let c1 = u5_commit_file(repo.path(), "a.txt", "one\n");
+        let (state, rec) = f2a_state(pool, &git_bin, "z6f2afence", "fence-repo", false).await;
+        let slot = Arc::new(std::sync::Mutex::new(Some(
+            crate::git::repo_store::ReleaseOutcome::Fenced,
+        )));
+        post_receive_replication_tail(
+            state.clone(),
+            rec,
+            f2a_update("refs/heads/main", &c1),
+            repo.path().to_path_buf(),
+            F2A_PUSHER.to_string(),
+            Some(slot),
+        )
+        .await;
+        assert_eq!(
+            f2a_walks(&log),
+            0,
+            "a fenced publish must not run the replication walk; log:\n{}",
+            f2a_log(&log)
+        );
+        assert_eq!(
+            state.encrypt_inflight.len(),
+            0,
+            "a fenced publish must not take the per-repo coalescing key"
+        );
+    }
+
     /// Scenario 1 (the finding). A second rapid push to the same repo coalesces
     /// WITHOUT running the withheld walk. Asserted on the walk's git children, not
     /// on the `Coalesced` outcome: with `try_begin` below the walk (the pre-fix
@@ -8818,6 +10943,7 @@ mod tests {
             f2a_update("refs/heads/main", &c2),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
         )
         .await;
         let after_first = f2a_walks(&log);
@@ -8838,6 +10964,7 @@ mod tests {
             f2a_update("refs/heads/second", &c1),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
         )
         .await;
 
@@ -8911,6 +11038,7 @@ mod tests {
             f2a_update("refs/heads/main", &c2),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
         )
         .await;
 
@@ -8992,6 +11120,7 @@ mod tests {
             f2a_update("refs/heads/main", &c2),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
         ));
         f2a_wait_for(|| started.exists(), "the admitted push's walk to start").await;
 
@@ -9105,6 +11234,7 @@ mod tests {
             }],
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
         )
         .await;
 
@@ -9187,7 +11317,9 @@ mod tests {
         (state, log)
     }
 
-    const P2_PUSHER: &str = "did:key:z6MkP2TailPusherAAAAAAAAAAAAAAAAAAAAAA";
+    // No shared pusher constant: the two P2 tests own different repos (`z6p2tail`
+    // and `z6p2fail`), and owner-only push is on by default, so the identity has to
+    // follow the repo each push targets rather than being fixed for both.
 
     fn p2_push(
         state: &AppState,
@@ -9200,7 +11332,7 @@ mod tests {
         git_receive_pack(
             State(state.clone()),
             Path((owner.to_string(), name.to_string())),
-            Extension(crate::auth::AuthenticatedDid(P2_PUSHER.to_string())),
+            Extension(crate::auth::AuthenticatedDid(format!("did:key:{owner}"))),
             crate::rate_limit::PeerAddr(Some("203.0.113.90:5000".parse::<SocketAddr>().unwrap())),
             axum::http::HeaderMap::new(),
             axum::body::Bytes::from_static(b"0000"),
@@ -9333,6 +11465,699 @@ mod tests {
         );
     }
 
+    // ── #285 P1 finding 1: cancellation before the PUT is dispatched ───────
+
+    /// A minimal object-store stub that COUNTS PUTs and answers every HEAD 404.
+    ///
+    /// Not a semantics mock: the whole claim of the tests below is that no PUT
+    /// ever arrives, so the only thing it has to do faithfully is notice one.
+    async fn p3_put_counting_store() -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/{*key}",
+            axum::routing::any({
+                let puts = Arc::clone(&puts);
+                move |method: axum::http::Method, _body: axum::body::Bytes| {
+                    let puts = Arc::clone(&puts);
+                    async move {
+                        if method == axum::http::Method::PUT {
+                            puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            return axum::http::StatusCode::OK;
+                        }
+                        // Nothing is stored, so the acquire-side refresh takes the
+                        // create-only arm and downloads nothing.
+                        axum::http::StatusCode::NOT_FOUND
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (endpoint, puts, server)
+    }
+
+    /// A push handler whose release-side publish parks INSIDE the blocking
+    /// compression, which is the window the finding is about: the conditional PUT
+    /// is not constructed until compression returns, so a handler cancelled here
+    /// definitely never attempted publication.
+    ///
+    /// Path-scoped for the same reason as `p2_parked_release_state`: the tail's
+    /// withheld walk is the observable, and without a path-scoped rule
+    /// `replication_withheld_set` takes the no-walk shortcut and spawns no git.
+    ///
+    /// The bare repo is created directly rather than through `repo_store.init`,
+    /// which would spawn a background create-only upload of its own and pollute
+    /// the PUT count this test reads.
+    #[cfg(unix)]
+    async fn p3_compression_gated_state(
+        pool: sqlx::PgPool,
+        tmp: &std::path::Path,
+        owner: &str,
+        name: &str,
+        gate: Arc<crate::git::tigris::BlockingGate>,
+    ) -> (
+        AppState,
+        std::path::PathBuf,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let log = tmp.join("git.log");
+        let git_bin = f2a_logging_git(tmp, &log);
+        let repos_dir = tmp.join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let (endpoint, puts, server) = p3_put_counting_store().await;
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.git_bin = git_bin;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir.clone(),
+            Some(
+                crate::git::tigris::TigrisClient::for_testing_with_endpoint(
+                    "test-bucket",
+                    &endpoint,
+                )
+                .with_compress_gate(gate),
+            ),
+            pool.clone(),
+            std::time::Duration::from_secs(300),
+        );
+        state
+            .db
+            .upsert_mirror_repo(owner, name, &format!("/unused-{owner}-{name}"), None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "/secret/**",
+                crate::db::VisibilityMode::B,
+                &["did:key:z6MkP3TailReaderAAAAAAAAAAAAAAAAAAAAAA".to_string()],
+                &rec.owner_did,
+            )
+            .await
+            .unwrap();
+        let bare =
+            crate::git::repo_store::validated_repo_disk_path(&repos_dir, &rec.owner_did, name)
+                .expect("test repo path");
+        crate::git::store::init_bare(&bare).expect("a bare repo on disk");
+        (state, log, puts, server)
+    }
+
+    /// #285 P1 FINDING 1 (RED-before/GREEN-after). A client disconnect while the
+    /// release-side archive is still being COMPRESSED must not count as publish
+    /// durability.
+    ///
+    /// `TigrisClient::upload` awaits `spawn_blocking(compress_repo)` and does not
+    /// construct, let alone send, the conditional PUT until that returns. So a
+    /// handler dropped in this window definitively never attempted publication —
+    /// and the detached tail must do NOTHING: no IPFS/Pinata pin, no P2P
+    /// announcement, no GraphQL publication, no Arweave work, no peer
+    /// notification, all for refs that exist only in a local write the store
+    /// never saw.
+    ///
+    /// Load-bearing: with the slot recording `UploadUnknowable` for every
+    /// cancellation after release starts (the pre-fix shape), the tail is
+    /// admitted and its withheld walk's `for-each-ref` appears in the git log
+    /// (RED). Reading the publish STAGE instead classifies this as a definite
+    /// non-publication and the walk never runs (GREEN).
+    ///
+    /// The existing `receive_pack_tail_survives_a_disconnect_during_release`
+    /// parks at the pre-unlock point, which is AFTER the upload, so it cannot
+    /// reach this boundary at all.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_cancelled_during_compression_publishes_nothing_and_runs_no_tail(
+        pool: sqlx::PgPool,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Shut: every compression from this store parks until the gate opens.
+        let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
+        let (state, log, puts, server) =
+            p3_compression_gated_state(pool, tmp.path(), "z6p3comp", "c1", Arc::clone(&gate)).await;
+
+        let mut fut = Box::pin(p2_push(&state, "z6p3comp", "c1"));
+        let mut ran = false;
+        for _ in 0..1000 {
+            let step = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            assert!(
+                step.is_err(),
+                "the handler must park inside the release-side compression, not return"
+            );
+            if p2_logged(&log, "receive-pack") {
+                ran = true;
+                break;
+            }
+        }
+        assert!(ran, "the push must reach receive-pack");
+        // Settle: the handler is now inside `release`, blocked on the gate with
+        // no PUT constructed.
+        for _ in 0..10 {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+        }
+        assert_eq!(
+            puts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "compression has not finished, so no PUT can have been built yet"
+        );
+
+        // THE DISCONNECT, inside the compression window.
+        drop(fut);
+
+        // Give the tail every chance to misbehave. Pre-fix it is admitted the
+        // instant the slot's Drop installs its verdict, so this window is far
+        // more than enough for the walk to show up.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        assert!(
+            !p2_logged(&log, "for-each-ref"),
+            "RED: a push cancelled before its PUT was even constructed still ran the \
+             replication tail. Nothing was published, so pinning, announcing and \
+             replicating these refs advertises a write no other node can read. git log:\n{}",
+            f2a_log(&log)
+        );
+        assert_eq!(
+            puts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no PUT may have reached the store at any point"
+        );
+
+        // Release the parked blocking task so the runtime can tear down cleanly.
+        gate.open();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        server.abort();
+    }
+
+    /// THE CONTROL, and what makes the assertion above attributable. Same setup,
+    /// same handler, but nothing holds the gate: the publish completes, the store
+    /// sees the PUT, and the tail DOES run its walk.
+    ///
+    /// Without this, a green negative would prove only that the walk never runs
+    /// in this harness, not that the CANCELLATION is what stops it.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_that_completes_its_publish_still_runs_the_tail(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Open from the start: this control must publish for real.
+        let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
+        gate.open();
+        let (state, log, puts, server) =
+            p3_compression_gated_state(pool, tmp.path(), "z6p3ctrl", "c1", gate).await;
+
+        p2_push(&state, "z6p3ctrl", "c1")
+            .await
+            .expect("an uncontended push must succeed");
+
+        assert_eq!(
+            puts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the release must have published exactly once"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !p2_logged(&log, "for-each-ref") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a confirmed publish must admit the replication tail; git log:\n{}",
+                f2a_log(&log)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        server.abort();
+    }
+
+    // ── #285 U3: the abandoned write path settles the live tree ────────────
+    //
+    // The sibling above proves the replication TAIL is withheld when a push is
+    // cancelled before its PUT is dispatched. Nothing yet stops the next READ
+    // from serving the very refs that tail refused to announce: the write guard
+    // drops without classifying the tree, so `acquire` finds a live directory,
+    // no marker, and hands it out.
+
+    /// The sidecar marker path for a live tree, derived the way production
+    /// derives it (`.{name}.git.quarantine` beside the validated path) rather
+    /// than returned by the state builder.
+    #[cfg(unix)]
+    fn p3_quarantine_marker(
+        repos_dir: &std::path::Path,
+        owner_did: &str,
+        name: &str,
+    ) -> std::path::PathBuf {
+        let live = crate::git::repo_store::validated_repo_disk_path(repos_dir, owner_did, name)
+            .expect("test repo path");
+        let file = live
+            .file_name()
+            .expect("a live tree always has a file name")
+            .to_string_lossy()
+            .to_string();
+        live.parent()
+            .expect("a live tree always has a parent")
+            .join(format!(".{file}.quarantine"))
+    }
+
+    /// #285 U3, gap-driving. A push cancelled inside the release-side
+    /// compression definitely never attempted publication, so the refs it wrote
+    /// exist only on this node's disk. The next read must not serve them.
+    ///
+    /// The p3 store answers every HEAD 404, so there is nothing stored to serve
+    /// in their place: the correct outcome is that the abandoned tree is gone,
+    /// not that a stale copy is handed out.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_cancelled_during_compression_leaves_no_servable_refs(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
+        let (state, log, puts, server) =
+            p3_compression_gated_state(pool, tmp.path(), "z6p3quar", "c1", Arc::clone(&gate)).await;
+        let rec = state.db.get_repo("z6p3quar", "c1").await.unwrap().unwrap();
+        let repos_dir = tmp.path().join("repos");
+        let live =
+            crate::git::repo_store::validated_repo_disk_path(&repos_dir, &rec.owner_did, "c1")
+                .expect("test repo path")
+                .into_path_buf();
+        let marker = p3_quarantine_marker(&repos_dir, &rec.owner_did, "c1");
+
+        let mut fut = Box::pin(p2_push(&state, "z6p3quar", "c1"));
+        let mut ran = false;
+        for _ in 0..1000 {
+            let step = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            assert!(
+                step.is_err(),
+                "the handler must park inside the release-side compression, not return"
+            );
+            if p2_logged(&log, "receive-pack") {
+                ran = true;
+                break;
+            }
+        }
+        assert!(ran, "the push must reach receive-pack");
+        for _ in 0..10 {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+        }
+        assert_eq!(
+            puts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "compression has not finished, so no PUT can have been built yet"
+        );
+
+        // THE DISCONNECT, inside the compression window.
+        drop(fut);
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        // Release the orphaned compression BEFORE the assertions. The guard has
+        // already dropped, so nothing below depends on the gate, and a failing
+        // assertion would otherwise leave a blocking task parked forever and
+        // hang the runtime teardown instead of reporting.
+        gate.open();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert!(
+            marker.exists(),
+            "a push cancelled before its PUT was dispatched must leave a marker beside the live tree"
+        );
+        // The read resolves the marker: a definite non-publication, so the tree
+        // is dropped and the stored generation (there is none here) is what
+        // would serve.
+        let _ = state.repo_store.acquire(&rec.owner_did, "c1").await;
+        assert!(
+            !live.exists(),
+            "a push cancelled before its PUT was dispatched left its refs servable on the live path"
+        );
+
+        server.abort();
+    }
+
+    /// #285 U3, gap-driving. The disconnect one step earlier: receive-pack has
+    /// already APPLIED a ref and the client goes away before `release` is ever
+    /// entered, so the publish stage is still `Idle`. The guard rides the
+    /// admission guard into the detached reaper, so it drops once the git group
+    /// is torn down, and at that point the tree carries refs no PUT ever
+    /// described.
+    ///
+    /// The fake git applies the ref and then hangs, which is what puts the
+    /// disconnect in that window; argv is
+    /// `<bin> receive-pack --stateless-rpc <repo path>`, so `$3` is the tree.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_disconnected_after_refs_are_applied_leaves_no_servable_refs(
+        pool: sqlx::PgPool,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
+        let (mut state, _log, _puts, server) =
+            p3_compression_gated_state(pool, tmp.path(), "z6p3disc", "c1", Arc::clone(&gate)).await;
+        // Its own directory: `write_fake_git` always writes `fakegit`, and the
+        // state builder has already put the logging shim at that name.
+        let gitdir = tmp.path().join("hanging-git");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        state.git_bin = write_fake_git(
+            &gitdir,
+            r#"#!/bin/sh
+case "$1" in
+  receive-pack)
+    mkdir -p "$3/refs/heads"
+    printf '%s\n' 1111111111111111111111111111111111111111 > "$3/refs/heads/main"
+    sleep 30
+    ;;
+  *) : ;;
+esac
+exit 0
+"#,
+        );
+
+        let rec = state.db.get_repo("z6p3disc", "c1").await.unwrap().unwrap();
+        let repos_dir = tmp.path().join("repos");
+        let live =
+            crate::git::repo_store::validated_repo_disk_path(&repos_dir, &rec.owner_did, "c1")
+                .expect("test repo path")
+                .into_path_buf();
+        let marker = p3_quarantine_marker(&repos_dir, &rec.owner_did, "c1");
+        let ref_path = live.join("refs").join("heads").join("main");
+
+        let mut fut = Box::pin(p2_push(&state, "z6p3disc", "c1"));
+        let mut applied = false;
+        for _ in 0..2000 {
+            let step = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            assert!(
+                step.is_err(),
+                "the handler must park inside the hanging receive-pack, not return"
+            );
+            if ref_path.exists() {
+                applied = true;
+                break;
+            }
+        }
+        assert!(applied, "the push must apply its ref before the disconnect");
+
+        // THE DISCONNECT, after the refs landed and before release is entered.
+        drop(fut);
+        // Nothing below depends on the gate: this disconnect never reaches
+        // release, so no compression is parked on it. Opened here anyway so a
+        // failing assertion reports rather than hanging the teardown.
+        gate.open();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a push disconnected after receive-pack applied its refs must mark the tree, or acquire serves refs object storage does not hold"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let _ = state.repo_store.acquire(&rec.owner_did, "c1").await;
+        assert!(
+            !ref_path.exists(),
+            "refs applied by a disconnected push must not be served"
+        );
+
+        server.abort();
+    }
+
+    /// #285 U3, the REAP WINDOW. The sibling above waits for the marker before
+    /// it reads, so it proves the settled state and cannot see the interval
+    /// between the disconnect and the settlement. This one reads inside that
+    /// interval: `RepoWriteGuard::drop` runs on the guard clone that rode the
+    /// admission guard into `KillGroupOnDrop`'s detached reaper, so the marker
+    /// cannot exist until the receive-pack group is torn down, and `acquire`
+    /// takes no advisory lock on the way to the live tree.
+    ///
+    /// The read happens immediately after the handler future is dropped, while
+    /// the fake receive-pack is still sleeping, so the guard is still alive in
+    /// the reaper.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_read_inside_the_reap_window_serves_no_abandoned_refs(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
+        let (mut state, _log, _puts, server) = p3_compression_gated_state(
+            pool.clone(),
+            tmp.path(),
+            "z6p3rwin",
+            "c1",
+            Arc::clone(&gate),
+        )
+        .await;
+        let gitdir = tmp.path().join("hanging-git");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        // Ignores SIGTERM and re-parks after each interrupted `sleep`, so the
+        // process group outlives the reaper's grace period and only SIGKILL ends
+        // it. A plain `sleep 30` does NOT hold this window open: the group kill
+        // TERMs the sleep, the shell falls through the case and exits, and the
+        // reaper can free the advisory lock before the probe below runs, which
+        // turns this test into its own INCONCLUSIVE branch instead of an
+        // observation of the window it names.
+        state.git_bin = write_fake_git(
+            &gitdir,
+            r#"#!/bin/sh
+trap '' TERM
+case "$1" in
+  receive-pack)
+    mkdir -p "$3/refs/heads"
+    printf '%s\n' 1111111111111111111111111111111111111111 > "$3/refs/heads/main"
+    i=0
+    while [ "$i" -lt 300 ]; do
+      sleep 1
+      i=$((i+1))
+    done
+    ;;
+  *) : ;;
+esac
+exit 0
+"#,
+        );
+
+        let rec = state.db.get_repo("z6p3rwin", "c1").await.unwrap().unwrap();
+        let repos_dir = tmp.path().join("repos");
+        let marker = p3_quarantine_marker(&repos_dir, &rec.owner_did, "c1");
+        let live =
+            crate::git::repo_store::validated_repo_disk_path(&repos_dir, &rec.owner_did, "c1")
+                .expect("test repo path")
+                .into_path_buf();
+        let ref_path = live.join("refs").join("heads").join("main");
+
+        let mut fut = Box::pin(p2_push(&state, "z6p3rwin", "c1"));
+        let mut applied = false;
+        for _ in 0..2000 {
+            let step = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            assert!(
+                step.is_err(),
+                "the handler must park inside the hanging receive-pack, not return"
+            );
+            if ref_path.exists() {
+                applied = true;
+                break;
+            }
+        }
+        assert!(applied, "the push must apply its ref before the disconnect");
+
+        // THE DISCONNECT. Nothing parks on the gate here, opened only so a
+        // failing assertion reports instead of hanging teardown.
+        drop(fut);
+        gate.open();
+        tokio::task::yield_now().await;
+
+        // THE PROBE, inside the window. What makes the read INSIDE it is that the
+        // receive-pack group is still being reaped, and the write lock rides that
+        // reaper: the guard's last copy is held by `KillGroupOnDrop`, so the
+        // advisory lock is still taken at this instant. Sampled before the read,
+        // from an independent session, and filtered to this test's own database,
+        // which `#[sqlx::test]` gives it exclusively.
+        //
+        // Keying conclusiveness on the LOCK rather than on the marker's absence:
+        // the marker is what the settlement writes, so requiring it to be missing
+        // would demand the very state the fix removes, and no correct
+        // implementation could satisfy it.
+        let locks_held: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' \
+             AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count the advisory locks this test's database holds");
+        let marker_before = marker.exists();
+        let served = state.repo_store.acquire(&rec.owner_did, "c1").await;
+        let refs_after = ref_path.exists();
+        let served_ok = served.is_ok();
+
+        assert!(
+            locks_held.0 >= 1,
+            "INCONCLUSIVE: the write lock was already free when the probe ran, so the \
+             reaper had finished and this read never observed the reap window"
+        );
+        // THE FIX'S OWN PROPERTY, asserted rather than only reported. The marker
+        // has to be on disk at the DISCONNECT instant, which is what moving the
+        // settlement out of the reaper-held guard buys; without this the test
+        // reddens only through the refs below, which a settlement arriving late
+        // can still satisfy by accident once the reaper catches up.
+        assert!(
+            marker_before,
+            "the settlement must land at the disconnect, not at reaper exit: no quarantine \
+             marker existed when the probe read inside the reap window (acquire={served:?})"
+        );
+        // Unconditional on the refs, not `!(served_ok && refs_after)`. That form
+        // also passed when `acquire` failed for a reason unrelated to the
+        // withholding while the abandoned refs were still sitting on the live
+        // tree, which is a pass for the wrong reason.
+        assert!(
+            !refs_after,
+            "a read inside the reap window left the abandoned refs on the live tree: \
+             marker_before={marker_before}, acquire={served:?}, served_ok={served_ok}"
+        );
+
+        server.abort();
+    }
+
+    /// THE CONTROL for both of the above. Same builder, no disconnect: the
+    /// publish completes, the store acknowledges the PUT, and the tree stays
+    /// readable with nothing withholding it. Without this a green refusal above
+    /// would prove only that this harness never serves.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_that_completes_its_publish_leaves_the_tree_servable(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let gate = Arc::new(crate::git::tigris::BlockingGate::shut());
+        gate.open();
+        let (state, _log, puts, server) =
+            p3_compression_gated_state(pool, tmp.path(), "z6p3serv", "c1", gate).await;
+        let rec = state.db.get_repo("z6p3serv", "c1").await.unwrap().unwrap();
+        let repos_dir = tmp.path().join("repos");
+        let marker = p3_quarantine_marker(&repos_dir, &rec.owner_did, "c1");
+
+        p2_push(&state, "z6p3serv", "c1")
+            .await
+            .expect("an uncontended push must succeed");
+        assert_eq!(
+            puts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the release must have published exactly once"
+        );
+
+        let served = state.repo_store.acquire(&rec.owner_did, "c1").await;
+        assert!(
+            served.is_ok() && !marker.exists(),
+            "a confirmed publish must leave the tree readable with no marker"
+        );
+
+        server.abort();
+    }
+
+    // ── #285 P1 finding 3: fork confirmation is bound to the attempt ───────
+
+    /// A repo row under `owner/name` owned by some OTHER attempt.
+    async fn p3_seed_foreign_row(
+        state: &AppState,
+        owner_did: &str,
+        name: &str,
+    ) -> crate::db::RepoRecord {
+        let now = Utc::now();
+        let rec = crate::db::RepoRecord {
+            id: Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: format!("/unused/{name}"),
+            forked_from: None,
+            machine_id: None,
+        };
+        state
+            .db
+            .create_repo(&rec)
+            .await
+            .expect("seed the other row");
+        rec
+    }
+
+    /// #285 P1 FINDING 3, interleaving (a): another row COMMITS UNDER THE NAME
+    /// before this attempt's confirmation runs.
+    ///
+    /// The ordering is the barrier: the successor's insert completes, and only
+    /// then does the failed attempt look up. Keyed on owner/name, that lookup
+    /// answered "a row exists" and the request returned 201 carrying the
+    /// successor's row — even though its own uploaded archive, disk path and fork
+    /// provenance belong to no row at all. Keyed on `record.id` it cannot.
+    #[sqlx::test]
+    async fn fork_confirmation_never_claims_a_concurrent_attempts_row(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let owner = "did:key:z6MkForkIdentityAAAAAAAAAAAAAAAAAAAAAAAA";
+        let short = crate::db::normalize_owner_key(owner);
+        let name = "contested-fork";
+
+        // Interleaving: the successor commits first.
+        let successor = p3_seed_foreign_row(&state, owner, name).await;
+
+        // Then this attempt, whose own insert did NOT land, confirms.
+        let mine = Uuid::new_v4().to_string();
+        let confirmation = confirm_fork_repo_row(&state.db, &mine, short, name)
+            .await
+            .expect("the lookup itself succeeds");
+        match confirmation {
+            ForkRowConfirmation::Foreign => {}
+            ForkRowConfirmation::Ours(row) => panic!(
+                "the failed attempt claimed the successor's row {} as its own commit",
+                row.id
+            ),
+            ForkRowConfirmation::Absent => {
+                panic!("a row for this name does exist, so Absent would license compensation")
+            }
+        }
+        assert_ne!(successor.id, mine);
+    }
+
+    /// The must-do direction: when this attempt's OWN insert did commit, the
+    /// confirmation has to recognize it, or a transport-level error on a
+    /// successful write would turn into a spurious failure plus compensation of
+    /// a live repository.
+    #[sqlx::test]
+    async fn fork_confirmation_recognizes_this_attempts_own_committed_row(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let owner = "did:key:z6MkForkIdentityBBBBBBBBBBBBBBBBBBBBBBBB";
+        let short = crate::db::normalize_owner_key(owner);
+        let name = "my-fork";
+
+        let mine = p3_seed_foreign_row(&state, owner, name).await;
+        match confirm_fork_repo_row(&state.db, &mine.id, short, name)
+            .await
+            .expect("lookup")
+        {
+            ForkRowConfirmation::Ours(row) => assert_eq!(row.id, mine.id),
+            other => panic!(
+                "this attempt's own row must confirm as Ours, got {}",
+                match other {
+                    ForkRowConfirmation::Foreign => "Foreign",
+                    ForkRowConfirmation::Absent => "Absent",
+                    ForkRowConfirmation::Ours(_) => unreachable!(),
+                }
+            ),
+        }
+    }
+
+    /// And the third arm: nothing owns the name, which is the only state that
+    /// licenses compensation at all.
+    #[sqlx::test]
+    async fn fork_confirmation_reports_absent_when_nothing_owns_the_name(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let short = "z6MkForkIdentityCCCCCCCCCCCCCCCCCCCCCCCC";
+        assert!(matches!(
+            confirm_fork_repo_row(&state.db, &Uuid::new_v4().to_string(), short, "nobody-here")
+                .await
+                .expect("lookup"),
+            ForkRowConfirmation::Absent
+        ));
+    }
+
     /// Scenario 5 (trap 3, fail-closed). On a repo whose withheld walk is failing, a
     /// coalesced push must not publish. Before the gate moved, every push on such a
     /// repo got `announce = false` from its own walk; a coalesced push has no walk, so
@@ -9381,6 +12206,7 @@ mod tests {
             }],
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
         )
         .await;
 
@@ -9436,6 +12262,7 @@ mod tests {
             f2a_update("refs/heads/main", &c1),
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
         )
         .await;
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -9477,6 +12304,7 @@ mod tests {
             }],
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
         )
         .await;
 
@@ -9574,6 +12402,7 @@ mod tests {
             }],
             repo.path().to_path_buf(),
             F2A_PUSHER.to_string(),
+            None,
         )
         .await;
 

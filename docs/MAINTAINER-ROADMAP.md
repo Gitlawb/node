@@ -1,6 +1,6 @@
 # Maintainer roadmap
 
-Gitlawb node is live software. People are already using the network, so maintainer work should optimize for uptime, compatibility, and predictable rollouts before feature velocity.
+Twigpine node is live software. People are already using the network, so maintainer work should optimize for uptime, compatibility, and predictable rollouts before feature velocity.
 
 Mission: when code is pushed to a node, the node should not go down, and the network should be able to serve git content like a resilient delivery layer.
 
@@ -38,8 +38,8 @@ Owner focus: node reliability.
 
 Owner focus: protocol/auth.
 
-- Implement repo write authorization: repo owner checks, protected branches, UCAN capability checks, and clear delegation semantics.
-- Implement private-read enforcement or remove private-repo affordances until it exists.
+- Close default-open repo write authorization and wire trusted UCAN delegation into repository permissions.
+- Close the remaining visibility gaps: restrict or document task, pin, and anchor metadata routes, and publish an irreversible-publication policy.
 - Add UCAN revocation or blocklisting, with an emergency compromised-key runbook.
 - Add mutation-aware GraphQL auth before GraphQL becomes a public write API surface.
 - Harden peer registration and outbound peer calls against SSRF and peer-list poisoning.

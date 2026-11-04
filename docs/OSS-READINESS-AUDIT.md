@@ -3,6 +3,11 @@
 Date: 2026-05-28
 Repo state inspected: `main` tracking `origin/main`, starting at `b12c6bc feat: per-DID rate limiting on creation endpoints (10/hour) (#13)`.
 
+> **Historical snapshot.** This audit describes the repository at the commit above. Its
+> statements about incomplete UCAN chain validation and absent per-repository read
+> enforcement have been superseded; see [`SECURITY.md`](../SECURITY.md) for the current
+> security posture.
+
 ## Commands run
 
 ```sh
@@ -48,8 +53,8 @@ Recommended next CI additions:
 
 Fixed in this pass:
 
-- `install.sh` now downloads from `Gitlawb/node`, matches release asset names (`gitlawb-node-<version>-<target>.tar.gz`), handles `--version vX.Y.Z`, extracts the packaged directory, verifies checksums, and installs `gl`, `git-remote-gitlawb`, and `gitlawb-node` when present.
-- `docs/RUN-A-NODE.md` now matches the README Rust requirement (`1.91+`) and the release workflow's GHCR image path (`ghcr.io/gitlawb/node:latest`).
+- `install.sh` now downloads from `Twigpine/node`, matches release asset names (`gitlawb-node-<version>-<target>.tar.gz`), handles `--version vX.Y.Z`, extracts the packaged directory, verifies checksums, and installs `gl`, `git-remote-gitlawb`, and `gitlawb-node` when present.
+- `docs/RUN-A-NODE.md` now matches the README Rust requirement (`1.91+`) and the release workflow's GHCR image path (`ghcr.io/twigpine/node:latest`).
 - `docs/ECONOMICS.md` no longer claims this repo ships a `keeper-distribute.yml` workflow that is not present.
 - `.env.example` now distinguishes HTTP bootstrap peers from libp2p multiaddrs and documents seed-list opt-out.
 - `scripts/build-bins.sh` now writes to `dist/bin` instead of a missing `web/public/bin` path.
@@ -57,8 +62,8 @@ Fixed in this pass:
 
 Remaining doc caveats:
 
-- Public docs URLs (`gitlawb.com/install.sh`, `docs.gitlawb.com`) were not verified in this local pass.
-- `git-remote-gitlawb` defaults to `http://127.0.0.1:7545`, while most `gl` commands default to `https://node.gitlawb.com`; the docs should be explicit about setting `GITLAWB_NODE` for public-network cloning/fetching.
+- Public docs URLs (`twigpine.com/install.sh`, `docs.gitlawb.com`) were not verified in this local pass.
+- `git-remote-gitlawb` defaults to `http://127.0.0.1:7545`, while most `gl` commands default to `https://node.twigpine.com`; the docs should be explicit about setting `GITLAWB_NODE` for public-network cloning/fetching.
 
 ## Docker and self-hosting readiness
 
@@ -88,7 +93,7 @@ Fixed or staged in this pass:
 Live-network blockers to prioritize:
 
 - GraphQL POST is still open for compatibility; GraphQL mutations should get mutation-aware auth before it becomes a public write API surface.
-- Push authorization is still not capability-complete. A valid DID signature is authentication, not authorization; unprotected repo branches do not yet enforce owner/UCAN capability checks.
+- Push authorization is still not capability-complete. A valid DID signature is authentication, not authorization. Owner checks are now enforced on every branch, protected or not (`GITLAWB_ENFORCE_OWNER_PUSH`, on by default); what remains is that a UCAN `git/push` capability is not yet honored, so a delegated or CI key cannot push.
 - UCAN chain validation is incomplete and UCAN revocation/blocklisting is not implemented as an operator feature.
 - Private repository reads are not enforced. `is_public` and `GITLAWB_PUBLIC_READ` exist, but per-repository private-read behavior is not wired.
 - Peer URLs are self-asserted by DIDs. Signatures prove control of the DID key when present, not ownership/safety of the announced URL.

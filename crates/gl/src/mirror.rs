@@ -3,7 +3,7 @@
 //! Flow:
 //!   1. Parse source URL → derive repo name (or use --repo override)
 //!   2. `git clone --mirror <source>` into a temp dir
-//!   3. Create the repo on the gitlawb node (authenticated)
+//!   3. Create the repo on the Twigpine node (authenticated)
 //!   4. `git push --mirror gitlawb://<did>/<name>`
 //!   5. Clean up temp dir
 
@@ -22,15 +22,19 @@ pub struct MirrorArgs {
     /// Source repository URL (https://github.com/owner/repo, GitLab, or any public git URL)
     pub source: String,
 
-    /// Name to use on gitlawb (default: last path segment of source URL, .git suffix stripped)
+    /// Name to use on Twigpine (default: last path segment of source URL, .git suffix stripped)
     #[arg(long)]
     pub repo: Option<String>,
 
-    /// Optional description for the gitlawb repo
+    /// Optional description for the Twigpine repo
     #[arg(long, short)]
     pub description: Option<String>,
 
-    #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+    #[arg(
+        long,
+        default_value = "https://node.twigpine.com",
+        env = "GITLAWB_NODE"
+    )]
     pub node: String,
 
     #[arg(long)]
@@ -62,7 +66,7 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
     let owner_did = kp.did().to_string();
 
     println!("Mirroring {source}");
-    println!("  → gitlawb repo: {name}");
+    println!("  → Twigpine repo: {name}");
     println!();
 
     // ── 3. git clone --mirror into a temp dir ─────────────────────────────
@@ -89,8 +93,8 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
         bail!("git clone --mirror failed\nCheck that the source URL is accessible: {source}");
     }
 
-    // ── 4. Create the repo on gitlawb ─────────────────────────────────────
-    println!("Creating repo on gitlawb node...");
+    // ── 4. Create the repo on Twigpine ─────────────────────────────────────
+    println!("Creating repo on Twigpine node...");
     let client = NodeClient::new(&args.node, Some(kp));
 
     let body = serde_json::to_vec(&json!({
@@ -113,7 +117,7 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
         bail!("failed to create repo ({status}): {msg}");
     }
 
-    // ── 5. git push --mirror to gitlawb ───────────────────────────────────
+    // ── 5. git push --mirror to Twigpine ───────────────────────────────────
     let gitlawb_url = format!("gitlawb://{owner_did}/{name}");
     println!("Pushing to {gitlawb_url}...");
 
@@ -125,7 +129,7 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
         .context("failed to run git push")?;
 
     if !push_status.success() {
-        bail!("git push --mirror failed\nThe repo was created on gitlawb but the push did not complete.\nYou can retry with:\n  cd {path} && git push --mirror {gitlawb_url}",
+        bail!("git push --mirror failed\nThe repo was created on Twigpine but the push did not complete.\nYou can retry with:\n  cd {path} && git push --mirror {gitlawb_url}",
             path = mirror_path.display());
     }
 
@@ -134,7 +138,7 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
     println!();
     println!("✓ Mirror complete: {name}");
     println!("  Clone:  git clone {gitlawb_url}");
-    println!("  View:   https://gitlawb.com/{owner_short}/{name}");
+    println!("  View:   https://twigpine.com/{owner_short}/{name}");
 
     Ok(())
 }

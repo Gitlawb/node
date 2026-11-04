@@ -11,7 +11,11 @@ pub struct SyncArgs {
     pub cmd: SyncCmd,
 
     /// Node URL
-    #[arg(long, env = "GITLAWB_NODE", default_value = "https://node.gitlawb.com")]
+    #[arg(
+        long,
+        env = "GITLAWB_NODE",
+        default_value = "https://node.twigpine.com"
+    )]
     pub node: String,
 
     /// Identity directory for signed sync trigger requests
@@ -46,7 +50,7 @@ pub async fn run(args: SyncArgs) -> Result<()> {
             if !status.is_success() {
                 // Bound the read: a hostile or broken node must not force an
                 // unbounded allocation just to surface a denial (INV-6, read half).
-                let raw = read_body_capped(resp, 8 * 1024).await;
+                let raw = read_body_capped(resp, 8 * 1024).await.text;
                 let msg = serde_json::from_str::<serde_json::Value>(&raw)
                     .ok()
                     .and_then(|v| {
@@ -261,7 +265,7 @@ mod tests {
             .create_async()
             .await;
         let resp = reqwest::get(format!("{}/big", server.url())).await.unwrap();
-        let out = read_body_capped(resp, 8192).await;
+        let out = read_body_capped(resp, 8192).await.text;
         assert!(out.len() <= 8192, "read not bounded: {} bytes", out.len());
         assert!(!out.is_empty(), "expected some body");
     }
