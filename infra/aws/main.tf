@@ -164,8 +164,9 @@ resource "aws_iam_instance_profile" "node" {
 # ---------------------------------------------------------------------------
 
 resource "aws_security_group" "node" {
+  # description is ForceNew: changing it replaces the in-use group, so keep the original text.
   name        = "${var.name_prefix}-sg"
-  description = "Twigpine node: HTTP API + libp2p UDP"
+  description = "gitlawb node: HTTP API + libp2p UDP"
   vpc_id      = data.aws_subnet.selected.vpc_id # follows subnet_id overrides into non-default VPCs
   tags        = local.common_tags
 
