@@ -2642,13 +2642,13 @@ mod tests {
     #[sqlx::test]
     async fn create_pr_rejects_resolved_target_from_poisoned_default_branch(pool: PgPool) {
         let owner = "did:key:zPRDEFPOISONAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        let state = test_state(pool).await;
+        let state = test_state(pool.clone()).await;
         let repo = seed_repo(owner, "def-poison-repo");
         state.db.create_repo(&repo).await.expect("seed repo");
         sqlx::query("UPDATE repos SET default_branch = $1 WHERE id = $2")
             .bind("HEAD")
             .bind(&repo.id)
-            .execute(state.db.pool())
+            .execute(&pool)
             .await
             .expect("poison default_branch");
 
