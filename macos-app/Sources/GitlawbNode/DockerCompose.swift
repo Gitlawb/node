@@ -39,11 +39,11 @@ class DockerCompose {
     /// Path to the docker-compose.yml — uses the repo's file if available, otherwise generates one.
     var composeFilePath: String {
         // Prefer the repo's own docker-compose.yml (supports `build: .`)
-        let repoCompose = Config.shared.repoPath.appendingPathComponent("docker-compose.yml")
-        if FileManager.default.fileExists(atPath: repoCompose.path) {
-            return repoCompose.path
+        if let repo = repoWithCompose {
+            return repo.appendingPathComponent("docker-compose.yml").path
         }
-        // Fallback: generate a compose file with pre-built image
+        // Fallback: (re)generate the compose file with the pre-built image each time,
+        // so an app upgrade also upgrades the stack it runs.
         let userPath = Config.shared.dataDirectory.appendingPathComponent("docker-compose.yml").path
         try? FileManager.default.createDirectory(at: Config.shared.dataDirectory, withIntermediateDirectories: true)
         let content = Self.generateComposeFile()
@@ -53,11 +53,14 @@ class DockerCompose {
 
     /// Project directory for docker compose (needed for `build: .` context).
     var projectDirectory: String {
-        let repoCompose = Config.shared.repoPath.appendingPathComponent("docker-compose.yml")
-        if FileManager.default.fileExists(atPath: repoCompose.path) {
-            return Config.shared.repoPath.path
-        }
-        return Config.shared.dataDirectory.path
+        (repoWithCompose ?? Config.shared.dataDirectory).path
+    }
+
+    /// The repo clone, if there is one and it has its own docker-compose.yml.
+    private var repoWithCompose: URL? {
+        guard let repo = Config.shared.repoPath else { return nil }
+        let compose = repo.appendingPathComponent("docker-compose.yml")
+        return FileManager.default.fileExists(atPath: compose.path) ? repo : nil
     }
 
     /// Path to the .env file with user configuration.

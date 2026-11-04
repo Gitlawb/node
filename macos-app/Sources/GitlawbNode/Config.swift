@@ -28,8 +28,13 @@ class Config {
 
     // MARK: - Paths
 
-    /// Path to the gitlawb-node repo clone (for local builds).
-    var repoPath: URL {
+    /// Path to the gitlawb-node repo clone (for local builds), or nil when there is none.
+    ///
+    /// Must not fall back to `dataDirectory`: the app writes its generated compose
+    /// file there, and treating that file as a repo's own would stop it from ever
+    /// being regenerated, pinning upgraded installs to the compose (and image)
+    /// they first started with.
+    var repoPath: URL? {
         if !repoPathString.isEmpty {
             return URL(fileURLWithPath: repoPathString)
         }
@@ -48,7 +53,7 @@ class Config {
            FileManager.default.fileExists(atPath: dockerfile.path) {
             return repoRoot
         }
-        return dataDirectory
+        return nil
     }
 
     var dataDirectory: URL {
