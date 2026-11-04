@@ -14,7 +14,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::did::Did;
 use crate::identity::Keypair;
@@ -67,11 +67,20 @@ impl HttpSignature {
         let components_str = &rest[open + 1..close];
         let params_str = &rest[close + 1..]; // starts with ';'
 
-        // "\"@method\" \"@path\" \"content-digest\"" → ["@method", "@path", "content-digest"]
-        let components: Vec<String> = components_str
-            .split_whitespace()
-            .map(|s| s.trim_matches('"').to_string())
-            .collect();
+        // RFC 9421 §2.1: a component identifier appears at most once. Gitlawb
+        // only supports bare names; parameters are rejected so reordered
+        // equivalent forms cannot bypass duplicate detection as distinct strings.
+        let mut components = Vec::new();
+        let mut seen = HashSet::new();
+        for token in components_str.split_whitespace() {
+            let name = parse_covered_component(token)?;
+            if !seen.insert(name.clone()) {
+                return Err(Error::HttpSignature(format!(
+                    "duplicate covered component '{name}' in Signature-Input"
+                )));
+            }
+            components.push(name);
+        }
 
         let params = parse_params(params_str)?;
 
@@ -203,6 +212,33 @@ pub fn compute_content_digest(body: &[u8]) -> String {
     format!("sha-256=:{}:", STANDARD.encode(hasher.finalize()))
 }
 
+/// Parse one covered-component token from Signature-Input's parenthesized list.
+///
+/// Gitlawb only supports bare component names (`"@method"`, `"@path"`,
+/// `"content-digest"`). RFC 9421 permits parameters on identifiers; they are
+/// rejected rather than accepted in a form `missing_components()` and
+/// `build_signing_string()` cannot handle consistently.
+fn parse_covered_component(token: &str) -> Result<String> {
+    let token = token.trim();
+    let open = token
+        .strip_prefix('"')
+        .ok_or_else(|| Error::HttpSignature("component must be a quoted string".into()))?;
+    let close = open
+        .find('"')
+        .ok_or_else(|| Error::HttpSignature("unterminated component string".into()))?;
+    let name = &open[..close];
+    if name.is_empty() {
+        return Err(Error::HttpSignature("empty component name".into()));
+    }
+    let trailing = open[close + 1..].trim();
+    if !trailing.is_empty() {
+        return Err(Error::HttpSignature(format!(
+            "component parameters are not supported on '{name}'"
+        )));
+    }
+    Ok(name.to_string())
+}
+
 /// Parse `;key="value";key2=value` parameter string into a map.
 fn parse_params(s: &str) -> Result<HashMap<String, String>> {
     let mut map = HashMap::new();
@@ -270,6 +306,91 @@ mod tests {
         let missing = sig.missing_components();
         assert!(missing.contains(&"@path"));
         assert!(missing.contains(&"content-digest"));
+    }
+
+    /// RFC 9421 §2.1: a component identifier must not appear twice in the
+    /// covered list. Repeating one is not a way to say anything, but it does
+    /// repeat a line in the signing string, so the size of what a verifier
+    /// builds (and what a node persists alongside a claim) is set by how many
+    /// times the caller chose to write the same name.
+    #[test]
+    fn parse_rejects_component_parameters() {
+        let kp = Keypair::generate();
+        let did = kp.did();
+        let sig_input = format!(
+            r#"sig1=("@method" "@path" "content-digest";sf);keyid="{did}";alg="ed25519";created=1000"#
+        );
+        let err = HttpSignature::parse(
+            &sig_input,
+            "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:",
+        )
+        .expect_err("parameterized components must be refused");
+        assert!(
+            err.to_string().contains("component parameters"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_reordered_equivalent_component_parameters() {
+        let kp = Keypair::generate();
+        let did = kp.did();
+        let sig_input = format!(
+            r#"sig1=("content-digest";sf;tr "content-digest";tr;sf "@method" "@path");keyid="{did}";alg="ed25519";created=1000"#
+        );
+        let err = HttpSignature::parse(
+            &sig_input,
+            "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:",
+        )
+        .expect_err("reordered equivalent parameters must not bypass as distinct components");
+        assert!(
+            err.to_string().contains("component parameters"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_many_distinct_components_completes_quickly() {
+        use std::time::{Duration, Instant};
+
+        let kp = Keypair::generate();
+        let did = kp.did();
+        let names: Vec<String> = (0..20_000).map(|i| format!("\"c{i}\"")).collect();
+        let inner = names.join(" ");
+        let sig_input = format!(r#"sig1=({inner});keyid="{did}";alg="ed25519";created=1000"#);
+        let start = Instant::now();
+        let result = HttpSignature::parse(
+            &sig_input,
+            "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:",
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "duplicate tracking must stay linear, took {elapsed:?}"
+        );
+        assert!(result.is_ok(), "distinct names should parse: {:?}", result);
+    }
+
+    #[test]
+    fn parse_rejects_duplicate_components() {
+        let kp = Keypair::generate();
+        let did = kp.did();
+        let sig_input = format!(
+            r#"sig1=("@method" "@path" "@path" "content-digest");keyid="{did}";alg="ed25519";created=1000"#
+        );
+        let err = HttpSignature::parse(&sig_input, "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:")
+            .expect_err("a repeated component must be refused");
+        assert!(
+            err.to_string().contains("duplicate"),
+            "the error must name the duplication, got: {err}"
+        );
+
+        // The control: the same list without the repeat still parses.
+        let ok = format!(
+            r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created=1000"#
+        );
+        HttpSignature::parse(&ok, "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:")
+            .expect("a distinct component list must still parse");
     }
 
     #[test]

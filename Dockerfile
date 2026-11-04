@@ -75,6 +75,7 @@ WORKDIR /data
 
 ENV GITLAWB_REPOS_DIR=/data/repos \
     GITLAWB_KEY=/data/keys/identity.pem \
+    GITLAWB_P2P_KEY=/data/keys/p2p.key \
     GITLAWB_HOST=0.0.0.0 \
     GITLAWB_PORT=7545 \
     GITLAWB_P2P_PORT=7546
