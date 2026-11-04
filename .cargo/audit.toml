@@ -35,4 +35,13 @@ ignore = [
     # ever built with the `mysql` feature, or any other consumer of rsa enters
     # the build, at which point it becomes a real reachable advisory.
     "RUSTSEC-2023-0071", # rsa Marvin attack (no fix; not linked in our build)
+
+    # crypto-bigint 0.4.9 / 0.5.5 (timing variability in constant-time ops).
+    # The fix is crypto-bigint >=0.7.6, which no compatible dependent uses:
+    # alloy-signer (gl, gitlawb-node) requires elliptic-curve 0.13 ->
+    # crypto-bigint 0.5 in every release including 2.5.0, and aws-sigv4 only
+    # moves to crypto-bigint 0.7 in >=1.5, which requires Rust 1.94.1 (above
+    # our 1.91 MSRV). REMOVE once alloy ships on elliptic-curve >=0.14 and the
+    # MSRV allows aws-sigv4 >=1.5 (verified 2026-11-03).
+    "RUSTSEC-2026-0387", # crypto-bigint timing variability (no compatible fix)
 ]
