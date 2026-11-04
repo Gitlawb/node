@@ -9,8 +9,10 @@
 #   scripts/ci-surfaces.sh --all      # every surface, whole workspace
 #
 # Prints GITHUB_OUTPUT lines (key=value). Fail-safe direction: anything this
-# script cannot attribute precisely (a global Rust input, an unknown crate
-# directory, the CI wiring itself) widens to the full suite, never narrows.
+# script cannot attribute precisely widens the run, never narrows it. A global
+# Rust input or an unknown crate directory runs the Rust jobs on the whole
+# workspace; the CI wiring itself (pr-checks.yml, codeql.yml, this script)
+# runs every surface.
 # Non-PR events (push to main, merge_group, workflow_dispatch, schedule) are
 # expected to pass --all, so main and the merge queue keep full coverage.
 #
