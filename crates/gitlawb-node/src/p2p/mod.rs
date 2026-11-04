@@ -7639,7 +7639,7 @@ mod tests {
 
         // The receiver first, so its subscription precedes the dial.
         let b = start(
-            &key_b.did().to_string(),
+            identity::Keypair::generate_ed25519(),
             0,
             vec![],
             Arc::new(Db::for_testing(pool.clone())),
@@ -7669,7 +7669,7 @@ mod tests {
             .expect("the listen addr must parse");
 
         let a = start(
-            &did_a,
+            identity::Keypair::generate_ed25519(),
             0,
             vec![b_addr],
             Arc::new(Db::for_testing(pool.clone())),
