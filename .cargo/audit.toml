@@ -36,12 +36,22 @@ ignore = [
     # the build, at which point it becomes a real reachable advisory.
     "RUSTSEC-2023-0071", # rsa Marvin attack (no fix; not linked in our build)
 
-    # crypto-bigint 0.4.9 / 0.5.5 (timing variability in constant-time ops).
-    # The fix is crypto-bigint >=0.7.6, which no compatible dependent uses:
-    # alloy-signer (gl, gitlawb-node) requires elliptic-curve 0.13 ->
-    # crypto-bigint 0.5 in every release including 2.5.0, and aws-sigv4 only
-    # moves to crypto-bigint 0.7 in >=1.5, which requires Rust 1.94.1 (above
-    # our 1.91 MSRV). REMOVE once alloy ships on elliptic-curve >=0.14 and the
-    # MSRV allows aws-sigv4 >=1.5 (verified 2026-11-03).
+    # crypto-bigint 0.4.9 / 0.5.5 (secret-dependent branches in operations meant
+    # to be constant-time). REACHABLE accepted risk, on two paths:
+    # - alloy-signer -> elliptic-curve 0.13 -> crypto-bigint 0.5: the k256
+    #   PrivateKeySigner that signs transactions in `gl name`
+    #   (crates/gl/src/name.rs) and the node operator
+    #   (crates/gitlawb-node/src/operator.rs).
+    # - aws-sigv4 (`sigv4a` feature, crates/gitlawb-node/Cargo.toml) ->
+    #   crypto-bigint 0.5 and p256 0.11 -> crypto-bigint 0.4: SigV4a key
+    #   derivation, used only for requests to endpoints that require SigV4a
+    #   (e.g. S3 Multi-Region Access Points).
+    # Exploiting it needs local timing observation of those signing operations.
+    # The fix is crypto-bigint >=0.7.6, and no compatible dependent uses it:
+    # every alloy-signer release (through 2.5.0) requires elliptic-curve ^0.13,
+    # and aws-sigv4 1.6.4 is the first release on crypto-bigint 0.7 (1.5.x -
+    # 1.6.3 still require ^0.5.4), but it needs Rust 1.94.1, above our 1.91 MSRV
+    # (verified 2026-11-03). REMOVE only when Cargo.lock has no crypto-bigint
+    # below 0.7.6: `grep -A1 'name = "crypto-bigint"' Cargo.lock`.
     "RUSTSEC-2026-0387", # crypto-bigint timing variability (no compatible fix)
 ]
