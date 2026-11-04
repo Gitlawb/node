@@ -1832,6 +1832,39 @@ mod tests {
         }
     }
 
+    // #411: layers 1-3 of validated_repo_disk_path were only reachable through
+    // arguments, and layer 1 refused them all, so the Component walk ran on no
+    // test. Drive it through repos_dir: the allowlist never sees it, join does
+    // not normalize it, and the component-wise starts_with still matches the
+    // unnormalized prefix, so ParentDir/CurDir land on the walk itself.
+    #[test]
+    fn component_walk_rejects_parent_dir_in_repos_dir() {
+        let dir = TempDir::new().unwrap();
+        let repos_dir = dir.path().join("a").join("..");
+        assert!(
+            validated_repo_disk_path(&repos_dir, "did:key:z6MkAlice", "hello").is_err(),
+            "repos_dir containing '..' must be rejected by the component walk"
+        );
+    }
+
+    #[test]
+    fn component_walk_rejects_cur_dir_in_repos_dir() {
+        // Interior '.' segments never reach the walk: components() drops them.
+        // A leading '.' on a relative repos_dir is the one that survives.
+        let repos_dir = Path::new(".").join("repos");
+        assert!(
+            validated_repo_disk_path(&repos_dir, "did:key:z6MkAlice", "hello").is_err(),
+            "relative repos_dir starting with '.' must be rejected by the component walk"
+        );
+    }
+
+    #[test]
+    fn component_walk_accepts_clean_repos_dir() {
+        let dir = TempDir::new().unwrap();
+        let path = validated_repo_disk_path(dir.path(), "did:key:z6MkAlice", "hello").unwrap();
+        assert!(path.ends_with("hello.git"));
+    }
+
     // ── advisory_lock_key stability ─────────────────────────────────────────
 
     #[test]
