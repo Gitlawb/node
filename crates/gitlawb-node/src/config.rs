@@ -67,7 +67,9 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_BOOTSTRAP_PEERS", value_delimiter = ',')]
     pub bootstrap_peers: Vec<String>,
 
-    /// Require RFC 9421 signatures on peer announce/sync write routes.
+    /// Require a peer write to prove its DID on any transport: RFC 9421
+    /// signatures on the peer announce/sync write routes, and a payload
+    /// signature on gossip ref-update events.
     /// Keep false during rolling upgrades so existing live nodes can still gossip.
     #[arg(
         long,
