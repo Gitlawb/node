@@ -5,8 +5,15 @@
 # Rust jobs test only the affected crates.
 #
 # Usage:
-#   git diff --name-only --no-renames BASE HEAD | scripts/ci-surfaces.sh
+#   git diff -z --name-only --no-renames BASE HEAD | scripts/ci-surfaces.sh
 #   scripts/ci-surfaces.sh --all      # every surface, whole workspace
+#
+# Input is NUL-terminated paths (`git diff -z`). Without -z, git C-quotes any
+# path with non-ASCII, tab, quote or newline characters ("crates/gl/\303\251.rs"),
+# which would match no surface and skip every job; newline-delimited input
+# also cannot carry a path that contains a newline. Input that does not end in
+# NUL (e.g. a plain `git diff --name-only`) is rejected rather than misread.
+# scripts/test-ci-surfaces.sh pins the mapping.
 #
 # Prints GITHUB_OUTPUT lines (key=value). Each surface runs only for the paths
 # listed for it below, so a path no surface lists (docs, README, infra/, any
@@ -27,15 +34,21 @@ all=false
 if [ "${1:-}" = "--all" ]; then
   all=true
 elif [ "$#" -ne 0 ]; then
-  echo "usage: $0 [--all] < changed-paths" >&2
+  echo "usage: $0 [--all] < NUL-terminated-changed-paths" >&2
   exit 2
 fi
 
 changed=()
 if [ "$all" = false ]; then
-  while IFS= read -r line; do
-    [ -n "$line" ] && changed+=("$line")
+  path=""
+  while IFS= read -r -d '' path; do
+    [ -n "$path" ] && changed+=("$path")
   done
+  # read leaves any unterminated tail in $path.
+  if [ -n "$path" ]; then
+    echo "ci-surfaces.sh: input is not NUL-terminated; pipe \`git diff -z --name-only\`" >&2
+    exit 2
+  fi
 fi
 
 # Workspace crates, derived from crates/*/Cargo.toml so a new crate is picked

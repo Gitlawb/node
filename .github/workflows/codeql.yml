@@ -52,8 +52,10 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            git diff --name-only --no-renames HEAD^1 HEAD | tee /dev/stderr \
-              | scripts/ci-surfaces.sh > surfaces.out
+            # -z: literal paths; plain --name-only C-quotes unusual names.
+            git diff -z --name-only --no-renames HEAD^1 HEAD > changed-paths
+            tr '\0' '\n' < changed-paths >&2
+            scripts/ci-surfaces.sh < changed-paths > surfaces.out
           else
             scripts/ci-surfaces.sh --all > surfaces.out
           fi
