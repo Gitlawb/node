@@ -524,7 +524,7 @@ Output:
 
 ```txt
 dist/Twigpine Node.app
-dist/Twigpine Node.dmg
+dist/GitlawbNode-macOS.dmg
 ```
 
 Features:

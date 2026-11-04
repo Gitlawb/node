@@ -54,7 +54,7 @@ Recommended next CI additions:
 Fixed in this pass:
 
 - `install.sh` now downloads from `Twigpine/node`, matches release asset names (`gitlawb-node-<version>-<target>.tar.gz`), handles `--version vX.Y.Z`, extracts the packaged directory, verifies checksums, and installs `gl`, `git-remote-gitlawb`, and `gitlawb-node` when present.
-- `docs/RUN-A-NODE.md` now matches the README Rust requirement (`1.91+`) and the release workflow's GHCR image path (`ghcr.io/gitlawb/node:latest`).
+- `docs/RUN-A-NODE.md` now matches the README Rust requirement (`1.91+`) and the release workflow's GHCR image path (`ghcr.io/twigpine/node:latest`).
 - `docs/ECONOMICS.md` no longer claims this repo ships a `keeper-distribute.yml` workflow that is not present.
 - `.env.example` now distinguishes HTTP bootstrap peers from libp2p multiaddrs and documents seed-list opt-out.
 - `scripts/build-bins.sh` now writes to `dist/bin` instead of a missing `web/public/bin` path.

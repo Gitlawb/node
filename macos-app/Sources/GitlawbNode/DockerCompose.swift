@@ -280,7 +280,7 @@ services:
     restart: unless-stopped
 
   node:
-    image: ghcr.io/gitlawb/node:latest
+    image: ghcr.io/twigpine/node:latest
     depends_on:
       postgres:
         condition: service_healthy

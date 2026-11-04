@@ -69,7 +69,7 @@ docker run -d \
   -e GITLAWB_CONTRACT_NODE_STAKING=$GITLAWB_CONTRACT_NODE_STAKING \
   -e GITLAWB_CHAIN_RPC_URL=$GITLAWB_CHAIN_RPC_URL \
   -e GITLAWB_OPERATOR_STRICT_MODE=true \
-  ghcr.io/gitlawb/node:latest
+  ghcr.io/twigpine/node:latest
 ```
 
 ### Option B — docker-compose
