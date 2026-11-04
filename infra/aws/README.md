@@ -1,4 +1,4 @@
-# gitlawb node on AWS (Terraform)
+# Twigpine node on AWS (Terraform)
 
 Single EC2 instance running the published node image + Postgres via Docker
 compose, with a persistent encrypted EBS volume, Elastic IP, SSM access, and

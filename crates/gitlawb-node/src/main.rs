@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
 
     info!("╔══════════════════════════════════════════╗");
     info!(
-        "║         gitlawb node v{}             ║",
+        "║         Twigpine node v{}            ║",
         env!("CARGO_PKG_VERSION")
     );
     info!("╚══════════════════════════════════════════╝");

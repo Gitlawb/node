@@ -1,6 +1,6 @@
 [package]
 name = "gl"
-description = "The gitlawb CLI — identity management, node control, MCP server"
+description = "The Twigpine CLI — identity management, node control, MCP server"
 version = "0.7.1" # x-release-please-version
 edition.workspace = true
 rust-version.workspace = true

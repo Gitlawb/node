@@ -1,4 +1,4 @@
-# Single-EC2 gitlawb node: Docker compose (node + postgres) on Amazon Linux 2023,
+# Single-EC2 Twigpine node: Docker compose (node + postgres) on Amazon Linux 2023,
 # persistent EBS data volume, Elastic IP, SSM access, daily snapshots.
 
 # ---------------------------------------------------------------------------
@@ -165,7 +165,7 @@ resource "aws_iam_instance_profile" "node" {
 
 resource "aws_security_group" "node" {
   name        = "${var.name_prefix}-sg"
-  description = "gitlawb node: HTTP API + libp2p UDP"
+  description = "Twigpine node: HTTP API + libp2p UDP"
   vpc_id      = data.aws_subnet.selected.vpc_id # follows subnet_id overrides into non-default VPCs
   tags        = local.common_tags
 
@@ -399,7 +399,7 @@ resource "aws_iam_role_policy_attachment" "dlm" {
 }
 
 resource "aws_dlm_lifecycle_policy" "data" {
-  description        = "Daily snapshots of the gitlawb data volume"
+  description        = "Daily snapshots of the Twigpine data volume"
   execution_role_arn = aws_iam_role.dlm.arn
   state              = "ENABLED"
   tags               = local.common_tags

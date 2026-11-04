@@ -1,6 +1,6 @@
 //! HTTP Signatures (RFC 9421) for gitlawb.
 //!
-//! Every write request to a gitlawb node must be signed by the actor's
+//! Every write request to a Twigpine node must be signed by the actor's
 //! Ed25519 private key. The signature covers:
 //!   - `@method`         — HTTP method (uppercase)
 //!   - `@path`           — request path and query
@@ -20,7 +20,7 @@ use crate::did::Did;
 use crate::identity::Keypair;
 use crate::{Error, Result};
 
-/// The component identifiers covered by every gitlawb signature.
+/// The component identifiers covered by every Twigpine signature.
 pub const COVERED_COMPONENTS: &[&str] = &["@method", "@path", "content-digest"];
 
 /// The three headers produced by RFC 9421 signing.

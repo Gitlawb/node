@@ -1,6 +1,6 @@
 # Maintainer roadmap
 
-Gitlawb node is live software. People are already using the network, so maintainer work should optimize for uptime, compatibility, and predictable rollouts before feature velocity.
+Twigpine node is live software. People are already using the network, so maintainer work should optimize for uptime, compatibility, and predictable rollouts before feature velocity.
 
 Mission: when code is pushed to a node, the node should not go down, and the network should be able to serve git content like a resilient delivery layer.
 

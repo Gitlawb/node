@@ -1,10 +1,10 @@
-# Gitlawb Node
+# Twigpine Node
 
 **Decentralized git infrastructure for developers, AI agents, and app delivery.**
 
-Gitlawb Node is the open-source node software behind the Gitlawb network. It lets anyone run a self-hosted node, publish repositories under a DID, sign writes with Ed25519 HTTP signatures, replicate git activity across peers, and move toward a resilient app-delivery network where code and build assets can be served closer to users.
+Twigpine Node is the open-source node software behind the Twigpine network. It lets anyone run a self-hosted node, publish repositories under a DID, sign writes with Ed25519 HTTP signatures, replicate git activity across peers, and move toward a resilient app-delivery network where code and build assets can be served closer to users.
 
-Gitlawb is not trying to be only "another git host." The long-term direction is:
+Twigpine is not trying to be only "another git host." The long-term direction is:
 
 ```txt
 Decentralized GitHub
@@ -24,17 +24,17 @@ This is a Rust workspace with six crates:
 | Crate | Purpose |
 |---|---|
 | `gitlawb-node` | The node daemon: Axum HTTP server, git smart-HTTP, Postgres metadata, libp2p gossip, optional S3/Tigris/IPFS/Arweave/Base PoS hooks. |
-| `gl` | The Gitlawb CLI for identity, repos, issues, PRs, bounties, tasks, peers, node status, MCP, and setup flows. |
-| `git-remote-gitlawb` | Git remote helper for `gitlawb://` URLs, so normal `git clone`, `git fetch`, and `git push` can talk to Gitlawb nodes. |
+| `gl` | The Twigpine CLI for identity, repos, issues, PRs, bounties, tasks, peers, node status, MCP, and setup flows. |
+| `git-remote-gitlawb` | Git remote helper for `gitlawb://` URLs, so normal `git clone`, `git fetch`, and `git push` can talk to Twigpine nodes. |
 | `gitlawb-core` | Shared primitives: Ed25519 identities, `did:key`, CIDs, RFC 9421 HTTP signatures, certificates, and UCAN tokens. |
 | `gitlawb-attest` | Pluggable external provenance attestations for ref-update certificates. |
 | `icaptcha-client` | Client for the iCaptcha proof-of-intelligence flow used to protect spam-prone writes. |
 
 ---
 
-## Why Gitlawb Nodes?
+## Why Twigpine Nodes?
 
-Most git hosting today depends on a small number of centralized platforms. Gitlawb Nodes are designed for a different model:
+Most git hosting today depends on a small number of centralized platforms. Twigpine Nodes are designed for a different model:
 
 - **Own your identity**: every user, agent, and node is an Ed25519 keypair represented as `did:key:z6Mk...`.
 - **Signed writes by default**: write requests use RFC 9421 HTTP Signatures instead of passwords.
@@ -47,7 +47,7 @@ Most git hosting today depends on a small number of centralized platforms. Gitla
 
 ## Current status
 
-Gitlawb Node is live early infrastructure. It is useful today, but some security and reliability features are intentionally staged for compatibility with existing nodes.
+Twigpine Node is live early infrastructure. It is useful today, but some security and reliability features are intentionally staged for compatibility with existing nodes.
 
 Good today:
 
@@ -87,7 +87,7 @@ See:
 The fastest path is Docker Compose. It starts a node and Postgres.
 
 ```bash
-git clone https://github.com/Gitlawb/node.git
+git clone https://github.com/Twigpine/node.git
 cd node
 cp .env.example .env
 docker compose up -d
@@ -132,10 +132,10 @@ npm install -g @gitlawb/gl
 brew install gitlawb/tap/gl
 
 # curl (macOS / Linux)
-curl -fsSL https://gitlawb.com/install.sh | sh
+curl -fsSL https://twigpine.com/install.sh | sh
 
 # PowerShell (Windows)
-irm https://gitlawb.com/install.ps1 | iex
+irm https://twigpine.com/install.ps1 | iex
 ```
 
 Or build from source:
@@ -178,7 +178,7 @@ gl register --node http://localhost:7545
 Create a repo:
 
 ```bash
-gl repo create my-repo --description "My first Gitlawb repo" --node http://localhost:7545
+gl repo create my-repo --description "My first Twigpine repo" --node http://localhost:7545
 ```
 
 Use the git remote helper:
@@ -192,7 +192,7 @@ For public-network use, make sure `GITLAWB_NODE` points to the node you want. Th
 
 ### Full lifecycle against an iCaptcha-enforcing node
 
-Public nodes (e.g. `node.gitlawb.com`) require two things on writes:
+Public nodes (e.g. `node.twigpine.com`) require two things on writes:
 
 1. **RFC 9421 HTTP Signatures**: every write is signed by your identity key. `gl`
    and the `git-remote-gitlawb` helper do this automatically. An old/unsigned CLI
@@ -205,8 +205,8 @@ Public nodes (e.g. `node.gitlawb.com`) require two things on writes:
 
 ```bash
 gl identity new                                   # create did:key identity
-gl register      --node https://node.gitlawb.com  # signed + auto-solves iCaptcha
-gl repo create memlawb --node https://node.gitlawb.com   # signed + auto-solves iCaptcha
+gl register      --node https://node.twigpine.com  # signed + auto-solves iCaptcha
+gl repo create memlawb --node https://node.twigpine.com   # signed + auto-solves iCaptcha
 git push  origin2 main                            # origin2 = gitlawb://<your-did>/memlawb (signed)
 git clone gitlawb://<your-did>/memlawb            # public read, no proof needed
 gl doctor                                         # preflight: identity, node, version, iCaptcha
@@ -430,7 +430,7 @@ Legacy-pin window: releases before the CID-resolver work stored the provider CID
 
 ## Optional node staking
 
-Gitlawb Node includes optional Base L2 node-operator hooks. Operators can register a node DID, stake `$GITLAWB`, and post heartbeats.
+Twigpine Node includes optional Base L2 node-operator hooks. Operators can register a node DID, stake `$GITLAWB`, and post heartbeats.
 
 PoS is disabled unless these are configured:
 
@@ -500,8 +500,8 @@ Build:
 Output:
 
 ```txt
-dist/Gitlawb Node.app
-dist/Gitlawb Node.dmg
+dist/Twigpine Node.app
+dist/Twigpine Node.dmg
 ```
 
 Features:
@@ -515,7 +515,7 @@ Features:
 Unsigned local build:
 
 ```bash
-xattr -cr "dist/Gitlawb Node.app"
+xattr -cr "dist/Twigpine Node.app"
 ```
 
 ---

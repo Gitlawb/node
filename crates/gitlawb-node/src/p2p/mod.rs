@@ -5,7 +5,7 @@
 //!   - Real-time ref-update events via Gossipsub
 //!
 //! The node's PeerId is derived from its Ed25519 identity keypair,
-//! so the gitlawb DID and libp2p PeerId share the same key.
+//! so the Twigpine DID and libp2p PeerId share the same key.
 
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
@@ -279,7 +279,7 @@ pub struct RefUpdateEvent {
     /// verification path.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub v: u32,
-    /// gitlawb DID of the node publishing the event
+    /// Twigpine DID of the node publishing the event
     pub node_did: String,
     /// DID of the agent who pushed
     pub pusher_did: String,
@@ -779,7 +779,7 @@ pub(crate) async fn ingest_ref_update(
     }
 }
 
-/// A DID record stored in the Kademlia DHT — maps a gitlawb DID to a node.
+/// A DID record stored in the Kademlia DHT — maps a Twigpine DID to a node.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DidRecord {
     pub did: String,

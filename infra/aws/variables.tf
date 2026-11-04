@@ -86,7 +86,7 @@ variable "image_tag" {
 # ---------------------------------------------------------------------------
 
 variable "icaptcha_mode" {
-  description = "iCaptcha gate mode: off | shadow | enforce. The live gitlawb network enforces."
+  description = "iCaptcha gate mode: off | shadow | enforce. The live Twigpine network enforces."
   type        = string
   default     = "enforce"
 }

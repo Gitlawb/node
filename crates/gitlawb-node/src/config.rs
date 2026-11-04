@@ -29,7 +29,7 @@ use std::path::PathBuf;
 pub const GIT_SERVICE_TIMEOUT_SECS_MAX: u64 = 100 * 365 * 24 * 60 * 60;
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "gitlawb-node", about = "gitlawb node daemon", version)]
+#[command(name = "gitlawb-node", about = "Twigpine node daemon", version)]
 pub struct Config {
     /// Directory where bare git repositories are stored
     #[arg(long, env = "GITLAWB_REPOS_DIR", default_value = "./data/repos")]

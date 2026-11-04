@@ -2,7 +2,7 @@
 //!
 //! Runs a JSON-RPC 2.0 server over stdin/stdout using LSP-style
 //! `Content-Length` framing.  Exposes 15 tools that give LLM agents
-//! structured access to the gitlawb network.
+//! structured access to the Twigpine network.
 //!
 //! # Tools
 //!   identity_show    — current agent DID
@@ -56,7 +56,11 @@ pub enum McpCmd {
     /// Start the MCP server (stdin/stdout JSON-RPC)
     Serve {
         /// Node URL to connect to
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         /// Identity directory
         #[arg(long)]
@@ -181,12 +185,12 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "node_info",
-            "description": "Get metadata about the connected gitlawb node: DID, version, network, protocols.",
+            "description": "Get metadata about the connected Twigpine node: DID, version, network, protocols.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "node_health",
-            "description": "Check if the gitlawb node is alive and responding.",
+            "description": "Check if the Twigpine node is alive and responding.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -204,12 +208,12 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "repo_list",
-            "description": "List all repositories on the connected gitlawb node.",
+            "description": "List all repositories on the connected Twigpine node.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "repo_list_federated",
-            "description": "List repositories across ALL nodes in the gitlawb network (federation). Returns repos from this node and all known peer nodes, each annotated with node_url and node_did.",
+            "description": "List repositories across ALL nodes in the Twigpine network (federation). Returns repos from this node and all known peer nodes, each annotated with node_url and node_did.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -262,7 +266,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "agent_register",
-            "description": "Register this agent with the gitlawb node to get a bootstrap UCAN token.",
+            "description": "Register this agent with the Twigpine node to get a bootstrap UCAN token.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -278,7 +282,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "agent_capabilities",
-            "description": "List all available UCAN capability strings in the gitlawb protocol.",
+            "description": "List all available UCAN capability strings in the Twigpine protocol.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {

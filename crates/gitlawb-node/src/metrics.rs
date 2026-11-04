@@ -1,4 +1,4 @@
-//! Prometheus metrics for the gitlawb node.
+//! Prometheus metrics for the Twigpine node.
 //!
 //! Exposes a small, deliberately conservative set of counters and histograms
 //! that cover the questions an operator actually asks of a live node:
