@@ -1,5 +1,7 @@
 ANS-104 golden vectors, captured from arbundles 0.10.x.
 
+To regenerate: run `npm ci` in scripts/, then `node ans104_golden_ed25519.mjs`.
+
 Ed25519 vector (the interop pin used by
 `ans104::tests::dataitem_matches_arbundles_golden_vector`):
   captured by  = scripts/ans104_golden_ed25519.mjs (deterministic seed
