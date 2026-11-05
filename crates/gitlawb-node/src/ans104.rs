@@ -71,6 +71,11 @@
 //! the serialized Avro buffer (the same bytes the binary frame
 //! carries), folded as a single blob via [`deep_hash_chunk`].
 //!
+//! `tags_serialized` is the original Avro payload for a parsed item,
+//! authoritative only while it still decodes to exactly `tags`. If
+//! `tags` is changed after parse, `deep_hash` and `to_binary` fail
+//! closed (one shared check, `avro_tags_block`).
+//!
 //! The pin for this shape is the test
 //! `dataitem_matches_arbundles_golden_vector` against a real
 //! `arbundles`-signed Ed25519 item captured in
@@ -83,9 +88,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha384};
 
 /// The signature type byte for Ed25519. ANS-104 defines several
-/// signature algorithms; the node primarily emits or verifies
-/// Ed25519 but parses/signs/verifies any other supported type
-/// through the binary frame.
+/// signature algorithms. Binary parsing accepts the spec signature
+/// types (1 to 4), but `sign_data_item` and `verify_data_item` on this
+/// slice support Ed25519 (sigtype 2) only. The Ethereum golden output
+/// is illustrative and non-normative (see
+/// `scripts/ans104_golden_output.txt`).
 pub const SIGNATURE_TYPE_ED25519: u8 = 2;
 #[allow(dead_code)] // used by the binary golden-vector test; clippy sees no caller at the bin-build level
 pub const SIGNATURE_TYPE_ETHEREUM: u8 = 3;
@@ -146,6 +153,11 @@ pub struct DataItem {
     /// re-encoding. `None` for items built locally or from JSON,
     /// which encode via `encode_tags_block`. Skipped by serde: the
     /// JSON projection carries tags, not the Avro bytes.
+    ///
+    /// Authoritative only while it still decodes to exactly `tags`
+    /// (same count, same pairs). If `tags` is changed after parse,
+    /// `deep_hash` and `to_binary` fail closed instead of using the
+    /// stale bytes.
     #[serde(skip)]
     pub raw_tags: Option<Vec<u8>>,
 }
@@ -295,6 +307,43 @@ impl DataItem {
         Ok(URL_SAFE_NO_PAD.encode(id))
     }
 
+    /// The Avro tag block to hash and encode, with its tag count. The
+    /// single source for both `deep_hash` and `to_binary` so they
+    /// cannot drift.
+    ///
+    /// `raw_tags` is authoritative only while it still decodes to
+    /// exactly `tags` (same count, same decoded pairs). If `tags` was
+    /// changed after parse, this fails closed rather than hashing or
+    /// emitting bytes that no longer describe the item. With
+    /// `raw_tags == None` the single-block encoding of `tags` is used.
+    fn avro_tags_block(&self) -> Result<(Vec<u8>, usize)> {
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = self
+            .tags
+            .iter()
+            .map(|t| -> Result<(Vec<u8>, Vec<u8>)> {
+                let name = URL_SAFE_NO_PAD
+                    .decode(t.name.as_bytes())
+                    .with_context(|| "decoding tag name")?;
+                let value = URL_SAFE_NO_PAD
+                    .decode(t.value.as_bytes())
+                    .with_context(|| "decoding tag value")?;
+                Ok((name, value))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        match &self.raw_tags {
+            Some(raw) => {
+                let decoded = decode_tags(raw, pairs.len()).with_context(|| {
+                    "ANS-104 tags were modified after parse: raw tag bytes no longer match"
+                })?;
+                if decoded != pairs {
+                    bail!("ANS-104 tags were modified after parse: raw tag bytes no longer match");
+                }
+                Ok((raw.clone(), pairs.len()))
+            }
+            None => Ok((encode_tags_block(&pairs), pairs.len())),
+        }
+    }
+
     /// Return the 48-byte SHA-384 deep-hash of the data item with
     /// the signature field cleared. The signature is computed over
     /// these raw 48 bytes (Ed25519 with signature_type = 2).
@@ -347,20 +396,6 @@ impl DataItem {
             .decode(self.data.as_bytes())
             .with_context(|| "decoding data for deep-hash")?;
 
-        let raw_tags: Vec<(Vec<u8>, Vec<u8>)> = self
-            .tags
-            .iter()
-            .map(|t| -> Result<(Vec<u8>, Vec<u8>)> {
-                let name = URL_SAFE_NO_PAD
-                    .decode(t.name.as_bytes())
-                    .with_context(|| "decoding tag name for deep-hash")?;
-                let value = URL_SAFE_NO_PAD
-                    .decode(t.value.as_bytes())
-                    .with_context(|| "decoding tag value for deep-hash")?;
-                Ok((name, value))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
         let target: Vec<u8> = if self.target.is_empty() {
             Vec::new()
         } else {
@@ -383,15 +418,27 @@ impl DataItem {
                 Err(_) => self.anchor.as_bytes().to_vec(),
             }
         };
+        // Same widths `to_binary` enforces, so signing fails early
+        // instead of signing an item that cannot be encoded.
+        if !target.is_empty() && target.len() != 32 {
+            bail!(
+                "ANS-104 deep-hash: target is {} bytes, expected 32 or empty",
+                target.len()
+            );
+        }
+        if !anchor.is_empty() && anchor.len() != 32 {
+            bail!(
+                "ANS-104 deep-hash: anchor is {} bytes, expected 32 or empty",
+                anchor.len()
+            );
+        }
 
         // 8-element fold matching arbundles. The tags slot is the
         // serialized Avro buffer as a flat blob: the original payload
-        // when parsed from binary, otherwise the single-block encoding
-        // of the local tags.
-        let tags_block: Vec<u8> = match &self.raw_tags {
-            Some(raw) => raw.clone(),
-            None => encode_tags_block(&raw_tags),
-        };
+        // when parsed from binary and still consistent with `tags`,
+        // otherwise the single-block encoding of the local tags (see
+        // `avro_tags_block`).
+        let (tags_block, _) = self.avro_tags_block()?;
 
         let fields: Vec<DeepHashChunk> = vec![
             DeepHashChunk::Blob(b"dataitem".to_vec()),
@@ -587,27 +634,11 @@ impl DataItem {
             .with_context(|| "decoding data for to_binary")?;
 
         // Tag block: re-emit the original Avro payload when the item
-        // was parsed from binary (multi-block or size-prefixed forms
-        // survive byte-exact); otherwise encode the single-block form.
-        let tags_block: Vec<u8> = match &self.raw_tags {
-            Some(raw) => raw.clone(),
-            None => {
-                let tag_pairs: Vec<(Vec<u8>, Vec<u8>)> = self
-                    .tags
-                    .iter()
-                    .map(|t| -> Result<(Vec<u8>, Vec<u8>)> {
-                        let n = URL_SAFE_NO_PAD
-                            .decode(t.name.as_bytes())
-                            .with_context(|| "decoding tag name for to_binary")?;
-                        let v = URL_SAFE_NO_PAD
-                            .decode(t.value.as_bytes())
-                            .with_context(|| "decoding tag value for to_binary")?;
-                        Ok((n, v))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                encode_tags_block(&tag_pairs)
-            }
-        };
+        // was parsed from binary and `tags` still matches it (multi-block
+        // or size-prefixed forms survive byte-exact); otherwise encode
+        // the single-block form. The frame's tag count comes from the
+        // same validated pairs.
+        let (tags_block, tag_count) = self.avro_tags_block()?;
 
         // Length computation.
         let len = 2
@@ -629,7 +660,7 @@ impl DataItem {
         out.extend_from_slice(&target_bytes);
         out.push(if anchor_bytes.is_empty() { 0 } else { 1 });
         out.extend_from_slice(&anchor_bytes);
-        out.extend_from_slice(&(self.tags.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(tag_count as u64).to_le_bytes());
         out.extend_from_slice(&(tags_block.len() as u64).to_le_bytes());
         out.extend_from_slice(&tags_block);
         out.extend_from_slice(&data_bytes);
@@ -877,7 +908,8 @@ fn sha384(data: &[u8]) -> [u8; 48] {
     hasher.finalize().into()
 }
 
-/// Sign an unsigned data item with the given Ed25519 keypair. Sets
+/// Sign an unsigned data item with the given Ed25519 keypair (the
+/// only signing type on this slice; sigtype is forced to 2). Sets
 /// `signature` to the base64url-encoded Ed25519 signature over the
 /// 48-byte deep-hash. Does NOT mutate the rest of the item.
 #[allow(dead_code)] // production caller is the bundler upload, the next slice
@@ -900,6 +932,8 @@ pub fn sign_data_item(
 }
 
 /// Verify a parsed data item against an expected Ed25519 public key.
+/// Ed25519 (sigtype 2) is the only verifiable type on this slice;
+/// other parsed types are rejected.
 ///
 /// Returns `Ok(())` if the signature is valid for the deep-hash, and
 /// `Err` otherwise. The error chain names the specific failure mode
@@ -1419,6 +1453,108 @@ mod tests {
         sign_data_item(&mut item, &kp).expect("sign");
         assert_eq!(item.signature_type, SIGNATURE_TYPE_ED25519);
         verify_data_item(&item, &pk).expect("signed item verifies");
+    }
+
+    /// Build a signed item, encode it, and parse it back so the
+    /// result carries `raw_tags`.
+    fn parsed_signed_item(kp: &Keypair) -> (DataItem, Vec<u8>) {
+        let pk = kp.verifying_key().to_bytes();
+        let mut item = DataItem::new_unsigned(&pk, "", "", sample_tags(), b"payload".to_vec());
+        sign_data_item(&mut item, kp).expect("sign");
+        let bin = item.to_binary().expect("encode");
+        let parsed = DataItem::from_binary(&bin).expect("parse");
+        assert!(parsed.raw_tags.is_some());
+        (parsed, bin)
+    }
+
+    /// Mutating `tags` after parse must not silently keep hashing or
+    /// encoding the stale `raw_tags`.
+    #[test]
+    fn tags_modified_after_parse_fail_closed() {
+        let kp = Keypair::generate();
+        let pk = kp.verifying_key().to_bytes();
+
+        // Pushed tag.
+        let (mut pushed, _) = parsed_signed_item(&kp);
+        pushed.tags.push(DataItemTag {
+            name: URL_SAFE_NO_PAD.encode(b"Extra"),
+            value: URL_SAFE_NO_PAD.encode(b"tag"),
+        });
+        assert!(pushed.deep_hash().is_err(), "deep_hash must fail closed");
+        assert!(verify_data_item(&pushed, &pk).is_err(), "verify must fail");
+        assert!(pushed.to_binary().is_err(), "to_binary must fail closed");
+
+        // Changed value, same count.
+        let (mut changed, _) = parsed_signed_item(&kp);
+        changed.tags[0].value = URL_SAFE_NO_PAD.encode(b"other");
+        assert!(changed.deep_hash().is_err(), "deep_hash must fail closed");
+        assert!(verify_data_item(&changed, &pk).is_err(), "verify must fail");
+        assert!(changed.to_binary().is_err(), "to_binary must fail closed");
+    }
+
+    /// Positive control: an untouched parsed item still verifies and
+    /// re-encodes byte-exact.
+    #[test]
+    fn untouched_parsed_item_verifies_and_round_trips() {
+        let kp = Keypair::generate();
+        let pk = kp.verifying_key().to_bytes();
+        let (parsed, bin) = parsed_signed_item(&kp);
+        verify_data_item(&parsed, &pk).expect("verifies");
+        assert_eq!(parsed.to_binary().expect("encode"), bin);
+    }
+
+    /// A locally built item (no `raw_tags`) is unaffected by the
+    /// consistency check.
+    #[test]
+    fn local_item_without_raw_tags_is_unaffected() {
+        let kp = Keypair::generate();
+        let pk = kp.verifying_key().to_bytes();
+        let mut item = DataItem::new_unsigned(&pk, "", "", sample_tags(), b"x".to_vec());
+        assert!(item.raw_tags.is_none());
+        sign_data_item(&mut item, &kp).expect("sign");
+        verify_data_item(&item, &pk).expect("verifies");
+        let bin = item.to_binary().expect("encode");
+        let back = DataItem::from_binary(&bin).expect("parse");
+        assert_eq!(back.tags, item.tags);
+    }
+
+    /// Signing must reject target and anchor widths that `to_binary`
+    /// would later refuse.
+    #[test]
+    fn sign_rejects_bad_target_and_anchor_widths() {
+        let kp = Keypair::generate();
+        let pk = kp.verifying_key().to_bytes();
+
+        let anchor24 = URL_SAFE_NO_PAD.encode([7u8; 24]);
+        let mut item = DataItem::new_unsigned(&pk, "", &anchor24, sample_tags(), b"x".to_vec());
+        let err = sign_data_item(&mut item, &kp).expect_err("24-byte anchor");
+        assert!(format!("{err:#}").contains("anchor is 24 bytes"), "{err:#}");
+
+        let target31 = URL_SAFE_NO_PAD.encode([7u8; 31]);
+        let mut item = DataItem::new_unsigned(&pk, &target31, "", sample_tags(), b"x".to_vec());
+        let err = sign_data_item(&mut item, &kp).expect_err("31-byte target");
+        assert!(format!("{err:#}").contains("target is 31 bytes"), "{err:#}");
+    }
+
+    /// 32-byte target and anchor (and empty ones) still sign and encode.
+    #[test]
+    fn sign_accepts_32_byte_and_empty_target_and_anchor() {
+        let kp = Keypair::generate();
+        let pk = kp.verifying_key().to_bytes();
+        let t = URL_SAFE_NO_PAD.encode([1u8; 32]);
+        let a = URL_SAFE_NO_PAD.encode([2u8; 32]);
+        for (target, anchor) in [(&t[..], &a[..]), ("", ""), (&t[..], ""), ("", &a[..])] {
+            let mut item =
+                DataItem::new_unsigned(&pk, target, anchor, sample_tags(), b"x".to_vec());
+            sign_data_item(&mut item, &kp).expect("sign");
+            verify_data_item(&item, &pk).expect("verify");
+            item.to_binary().expect("encode");
+        }
+        // Legacy verbatim 32-char non-base64url anchor still works.
+        let legacy = "!".repeat(32);
+        let mut item = DataItem::new_unsigned(&pk, "", &legacy, sample_tags(), b"x".to_vec());
+        sign_data_item(&mut item, &kp).expect("sign legacy anchor");
+        item.to_binary().expect("encode legacy anchor");
     }
 }
 
