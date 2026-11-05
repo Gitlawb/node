@@ -528,15 +528,19 @@ job=npm-publish
           # wrapper. E404 means the package has never been published, so this
           # release gets latest; any other lookup failure must fail closed
           # rather than guess at the dist-tag and risk moving latest backward.
+          # stderr goes to a file so a warning on a successful lookup cannot
+          # leak into registry_latest; it is read only when the lookup fails.
+          npm_err="$(mktemp)"
+          trap 'rm -f -- "$npm_err"' EXIT
           for pkg in gl-darwin-arm64 gl-darwin-x64 gl-linux-arm64 gl-linux-x64 gl; do
             name="@gitlawb/$pkg"
             if npm view "$name@$VERSION" version >/dev/null 2>&1; then
               echo "==> $name@$VERSION already published, skipping"
               continue
             fi
-            registry_latest="$(npm view "$name" dist-tags.latest 2>&1)" || {
-              if ! grep -q E404 <<<"$registry_latest"; then
-                printf '%s\n' "$registry_latest" >&2
+            registry_latest="$(npm view "$name" dist-tags.latest 2>"$npm_err")" || {
+              if ! grep -q E404 "$npm_err"; then
+                cat "$npm_err" >&2
                 echo "::error::npm dist-tags lookup failed for $name; not guessing the dist-tag"
                 exit 1
               fi
@@ -991,6 +995,88 @@ if [ -s "$stale_reads" ]; then
     "post-resolve steps read release-please outputs instead of the resolver's:" \
     >&2
   cat "$stale_reads" >&2
+  exit 1
+fi
+
+# Behavioral check of the Publish step's dist-tag decision. The run block is
+# extracted from the workflow and run against a stub npm, so nothing is
+# published. The lookup's stderr must not leak into the registry latest on a
+# successful call (a warning there once made a new release look older and
+# published it under backfill).
+publish_script="$test_tmp/publish-step.sh"
+awk '
+  /^job=npm-publish$/ { want = 1; next }
+  /^job=/ { want = 0 }
+  /^      - name:/ { in_publish = ($0 ~ /^      - name:[[:space:]]*Publish[[:space:]]*$/) }
+  want && in_publish && /^        run: \|$/ { in_run = 1; next }
+  want && in_run && /^$/ { exit }
+  want && in_run { sub(/^          /, ""); print }
+' "$actual_resolver_steps" > "$publish_script"
+if ! grep -q 'npm publish' "$publish_script"; then
+  printf '%s\n' "could not extract the npm-publish run block" >&2
+  exit 1
+fi
+
+publish_bin="$test_tmp/publish-bin"
+mkdir -p "$publish_bin"
+cat > "$publish_bin/npm" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  view)
+    case "$2" in
+      *@*/*@*) exit 1 ;; # "<name>@<version>": not yet published
+    esac
+    case "${NPM_MODE:?NPM_MODE unset}" in
+      warn_ok)
+        echo "npm warn config something is deprecated" >&2
+        echo "${NPM_LATEST:?}"
+        ;;
+      clean_ok) echo "${NPM_LATEST:?}" ;;
+      e404)
+        echo "npm error code E404" >&2
+        exit 1
+        ;;
+      other)
+        echo "npm error code ECONNRESET" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  publish) echo "PUBLISH $*" ;;
+esac
+STUB
+chmod +x "$publish_bin/npm"
+
+run_publish() { # mode version latest
+  PATH="$publish_bin:$PATH" NPM_MODE="$1" VERSION="$2" NPM_LATEST="${3:-}" \
+    bash "$publish_script" > "$test_tmp/publish-out" 2> "$test_tmp/publish-err"
+}
+expect_tag() { # label mode version latest tag
+  if ! run_publish "$2" "$3" "$4"; then
+    printf '%s\n' "publish dist-tag ($1): step failed" >&2
+    cat "$test_tmp/publish-err" >&2
+    exit 1
+  fi
+  if [ "$(grep -c -- "--tag $5\$" "$test_tmp/publish-out")" != 5 ] \
+    || [ "$(grep -c -- '--tag ' "$test_tmp/publish-out")" != 5 ]; then
+    printf '%s\n' "publish dist-tag ($1): expected five publishes under $5" >&2
+    cat "$test_tmp/publish-out" >&2
+    exit 1
+  fi
+}
+expect_tag "new release, stderr warning on a successful lookup" warn_ok 0.10.0 0.9.0 latest
+expect_tag "new release, clean lookup" clean_ok 0.10.0 0.9.0 latest
+expect_tag "genuine backfill" warn_ok 0.8.0 0.9.0 backfill
+expect_tag "E404 means never published" e404 0.10.0 "" latest
+if run_publish other 0.10.0 ""; then
+  printf '%s\n' "publish dist-tag (non-E404 failure): step unexpectedly passed" >&2
+  exit 1
+fi
+if ! grep -q '^::error::npm dist-tags lookup failed for @gitlawb/gl-darwin-arm64; not guessing the dist-tag$' "$test_tmp/publish-out" \
+  || grep -q PUBLISH "$test_tmp/publish-out" \
+  || ! grep -q ECONNRESET "$test_tmp/publish-err"; then
+  printf '%s\n' "publish dist-tag (non-E404 failure): wrong error output or a publish ran" >&2
+  cat "$test_tmp/publish-out" "$test_tmp/publish-err" >&2
   exit 1
 fi
 

@@ -759,15 +759,19 @@ jobs:
           # wrapper. E404 means the package has never been published, so this
           # release gets latest; any other lookup failure must fail closed
           # rather than guess at the dist-tag and risk moving latest backward.
+          # stderr goes to a file so a warning on a successful lookup cannot
+          # leak into registry_latest; it is read only when the lookup fails.
+          npm_err="$(mktemp)"
+          trap 'rm -f -- "$npm_err"' EXIT
           for pkg in gl-darwin-arm64 gl-darwin-x64 gl-linux-arm64 gl-linux-x64 gl; do
             name="@gitlawb/$pkg"
             if npm view "$name@$VERSION" version >/dev/null 2>&1; then
               echo "==> $name@$VERSION already published, skipping"
               continue
             fi
-            registry_latest="$(npm view "$name" dist-tags.latest 2>&1)" || {
-              if ! grep -q E404 <<<"$registry_latest"; then
-                printf '%s\n' "$registry_latest" >&2
+            registry_latest="$(npm view "$name" dist-tags.latest 2>"$npm_err")" || {
+              if ! grep -q E404 "$npm_err"; then
+                cat "$npm_err" >&2
                 echo "::error::npm dist-tags lookup failed for $name; not guessing the dist-tag"
                 exit 1
               fi
