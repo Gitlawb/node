@@ -20,7 +20,15 @@ on:
         type: string
 
 concurrency:
-  group: release-${{ github.ref }}
+  # Not keyed on the ref: two runs racing `imagetools create` on the same
+  # moving tags could interleave, so runs of this workflow serialize outright.
+  # GitHub keeps at most one running and one pending run per group; a newer
+  # queued run replaces the pending one, and cancel-in-progress: false
+  # protects only the run already executing. So a backfill dispatched while a
+  # release is running, followed by a push to main, is replaced silently: the
+  # remedy is to re-dispatch it once the running release completes, which the
+  # push-only gate on the moving-tag step makes safe in any ordering.
+  group: release
   cancel-in-progress: false
 
 # Least privilege by default; every job opts in to exactly what it needs.
@@ -37,6 +45,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    environment: release
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
@@ -78,6 +87,7 @@ jobs:
       # dispatch the release PR's head carries no check runs and the --locked
       # gate never validates it.
       actions: write
+    environment: release
     steps:
       # Prefer the fresh `pr` output when this run just created/updated the
       # release PR; otherwise fall back to querying for an open release-please
@@ -215,6 +225,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+    environment: release
     steps:
       - name: Check out workflow scripts
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -226,6 +237,7 @@ jobs:
         env:
           DISPATCH_TAG: ${{ inputs.docker_backfill_tag }}
           RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           scripts/resolve-release-tag.sh "${DISPATCH_TAG:-$RELEASE_TAG}"
@@ -237,7 +249,9 @@ jobs:
       - name: Checkout release tag
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ steps.rel.outputs.tag }}
+          # Pin the commit the resolver verified; a tag ref re-resolved here
+          # could have been moved between resolve and checkout.
+          ref: ${{ steps.rel.outputs.tag_commit || format('refs/tags/{0}', steps.rel.outputs.tag) }}
           persist-credentials: false
 
       - name: Set up Docker Buildx
@@ -312,6 +326,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+    environment: release
     steps:
       - name: Check out workflow scripts
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -323,9 +338,14 @@ jobs:
         env:
           DISPATCH_TAG: ${{ inputs.docker_backfill_tag }}
           RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           scripts/resolve-release-tag.sh "${DISPATCH_TAG:-$RELEASE_TAG}"
+          # ghcr requires a lowercase repository path, and unlike metadata-action,
+          # buildx's `--output name=` does no lowercasing, so a mixed-case owner
+          # makes the digest push fail with "invalid reference format".
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
       - name: Download digests
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -345,24 +365,80 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create and push multi-arch manifest
+        id: manifest
         env:
           VERSION: ${{ steps.rel.outputs.version }}
+          IMAGE: ${{ steps.rel.outputs.image }}
         run: |
           set -euo pipefail
-          # ghcr requires a lowercase repository path.
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
-          MAJOR_MINOR="${VERSION%.*}"
+          # The docker matrix pushes one digest per arch leg; anything else is
+          # a broken set, not a smaller multi-arch image.
+          count="$(find /tmp/digests -maxdepth 1 -type f | wc -l)"
+          if [ "$count" -ne 2 ]; then
+            echo "::error::expected 2 arch digests in /tmp/digests, found $count"
+            exit 1
+          fi
           digests=""
           for f in /tmp/digests/*; do
-            digests="$digests $IMAGE@sha256:$(basename "$f")"
+            d="$(basename "$f")"
+            case "$d" in
+              *[!0-9a-f]*)
+                echo "::error::digest filename is not lowercase sha256 hex: $d"
+                exit 1
+                ;;
+            esac
+            if [ "${#d}" -ne 64 ]; then
+              echo "::error::digest is not 64 hex chars: $d"
+              exit 1
+            fi
+            digests="$digests $IMAGE@sha256:$d"
           done
+          # The immutable tag always publishes. The moving tags are applied by
+          # the gated step below, which never runs on workflow_dispatch.
           # shellcheck disable=SC2086
-          docker buildx imagetools create \
-            -t "$IMAGE:$VERSION" \
-            -t "$IMAGE:$MAJOR_MINOR" \
-            -t "$IMAGE:latest" \
-            $digests
+          docker buildx imagetools create -t "$IMAGE:$VERSION" $digests
           docker buildx imagetools inspect "$IMAGE:$VERSION"
+          echo "digests=${digests# }" >> "$GITHUB_OUTPUT"
+
+      - name: Move floating tags
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        env:
+          VERSION: ${{ steps.rel.outputs.version }}
+          IMAGE: ${{ steps.rel.outputs.image }}
+          DIGESTS: ${{ steps.manifest.outputs.digests }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          MAJOR_MINOR="${VERSION%.*}"
+          # :latest and :X.Y track the newest release. Only a push to main
+          # carries a release-please-cut version, and release-please versions
+          # are monotonic, so on this path the tags only ever advance. A
+          # workflow_dispatch backfill republishes an existing tag and must
+          # never move a pointer, so this step skips on dispatch. After a
+          # backfill that is genuinely newest in its minor line, advance :X.Y
+          # by hand: docker buildx imagetools create -t "$IMAGE:X.Y" <digests>.
+          # The event gate alone does not bound a stale run: re-running an
+          # older push run replays its stored needs outputs under the
+          # original event and ref, and would move the pointers backward to
+          # that run's version. Floor against live state instead: this run's
+          # release already exists by now, so VERSION must be the newest
+          # published release or the run is stale and the tags stay put. The
+          # releases list is ordered by creation, not semver, so read every
+          # page and take the semver maximum, not the first page's.
+          tags="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            -q '.[] | select(.draft == false) | .tag_name')" || {
+            echo "::error::could not list releases to bound the moving tags"
+            exit 1
+          }
+          floor="$(printf '%s\n' "$tags" \
+            | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } \
+            | sed 's/^v//' | sort -V | tail -n 1)"
+          if [ -n "$floor" ] && [ "$floor" != "$VERSION" ]; then
+            echo "::error::release v$floor is newer than this run's v$VERSION; refusing to move the moving tags backward (stale re-run?)"
+            exit 1
+          fi
+          # shellcheck disable=SC2086
+          docker buildx imagetools create -t "$IMAGE:latest" -t "$IMAGE:$MAJOR_MINOR" $DIGESTS
 
       - name: Release summary
         env:
@@ -386,6 +462,7 @@ jobs:
     continue-on-error: ${{ startsWith(matrix.target, 'x86_64-pc-windows') }}
     permissions:
       contents: write
+    environment: release
     strategy:
       fail-fast: false
       matrix:
@@ -405,10 +482,27 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:
+      - name: Check out workflow scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Resolve release tag
+        id: rel
+        env:
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash # matrix includes windows-latest, where run: defaults to pwsh
+        run: |
+          set -euo pipefail
+          scripts/resolve-release-tag.sh "$RELEASE_TAG"
+
       - name: Checkout release tag
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          # Pin the commit the resolver verified; a tag ref re-resolved here
+          # could have been moved between resolve and checkout.
+          ref: ${{ steps.rel.outputs.tag_commit || format('refs/tags/{0}', steps.rel.outputs.tag) }}
           persist-credentials: false
 
       - name: Set up Rust toolchain
@@ -454,7 +548,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${{ needs.release-please.outputs.version }}"
+          VERSION="${{ steps.rel.outputs.version }}"
           BIN_DIR="target/${{ matrix.target }}/release"
           EXE=""
           case "${{ matrix.target }}" in *windows*) EXE=".exe" ;; esac
@@ -474,7 +568,7 @@ jobs:
         run: |
           set -euo pipefail
           TARGET="${{ matrix.target }}"
-          NAME="gitlawb-node-${{ needs.release-please.outputs.version }}-${TARGET}"
+          NAME="gitlawb-node-${{ steps.rel.outputs.version }}-${TARGET}"
           BIN_DIR="target/${TARGET}/release"
           EXE=""
           case "$TARGET" in *windows*) EXE=".exe" ;; esac
@@ -515,7 +609,7 @@ jobs:
       - name: Attach to release
         uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
         with:
-          tag_name: ${{ needs.release-please.outputs.tag_name }}
+          tag_name: ${{ steps.rel.outputs.tag }}
           files: |
             dist/*.tar.gz
             dist/*.zip
@@ -528,7 +622,9 @@ jobs:
     # (release-binaries is skipped on dispatch, hence !cancelled()). Publishing
     # auth is npm Trusted Publishing (GitHub OIDC) — no NPM_TOKEN. Each
     # @gitlawb package must have this repo + workflow (release.yml) configured
-    # as its trusted publisher on npmjs.com, or publish fails loudly here —
+    # as its trusted publisher on npmjs.com, scoped to the release environment
+    # so a dispatched copy of this file on another ref cannot mint a token, or
+    # publish fails loudly here —
     # deliberately loud: the silent secret-guard skip is how 0.4.x–0.6.0
     # never reached npm.
     if: >-
@@ -540,6 +636,7 @@ jobs:
     permissions:
       contents: read
       id-token: write # npm trusted publishing (OIDC) + provenance
+    environment: release
     steps:
       - name: Check out workflow scripts
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -551,6 +648,7 @@ jobs:
         env:
           DISPATCH_TAG: ${{ inputs.npm_backfill_tag }}
           RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           scripts/resolve-release-tag.sh "${DISPATCH_TAG:-$RELEASE_TAG}"
@@ -558,7 +656,9 @@ jobs:
       - name: Checkout release tag
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ steps.rel.outputs.tag }}
+          # Pin the commit the resolver verified; a tag ref re-resolved here
+          # could have been moved between resolve and checkout.
+          ref: ${{ steps.rel.outputs.tag_commit || format('refs/tags/{0}', steps.rel.outputs.tag) }}
           persist-credentials: false
 
       # npm >= 11.5.1 performs the OIDC token exchange automatically when the
@@ -571,14 +671,23 @@ jobs:
       - name: Ensure npm supports trusted publishing
         run: |
           set -euo pipefail
-          npm install -g npm@^11.5.1
-          npm --version
+          npm install -g npm@11.19.1
+          # Assert the pin took, so an accidental unpin or a drift off 11.19.1
+          # fails loudly here instead of silently running a different npm on
+          # the OIDC path.
+          installed="$(npm --version)"
+          echo "npm installed: $installed"
+          if [ "$installed" != "11.19.1" ]; then
+            echo "::error::npm is not the pinned 11.19.1 (got: $installed)"
+            exit 1
+          fi
 
       - name: Lay in release binaries
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.rel.outputs.version }}
           TAG: ${{ steps.rel.outputs.tag }}
+          ASSETS: ${{ steps.rel.outputs.assets }}
         run: |
           set -euo pipefail
           # npm platform package -> Rust target triple (unix only; Windows is not
@@ -595,8 +704,18 @@ jobs:
             target="${entry#*:}"
             archive="gitlawb-node-${VERSION}-${target}.tar.gz"
             echo "==> $pkg <- $archive"
-            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --pattern "$archive" --dir _dl --clobber
+            # Download by the asset id the resolver captured and uploader-
+            # checked, not by name: release assets are mutable, and an id can
+            # only ever point at the exact blob captured at resolve time.
+            # The map keys are base64-encoded asset names.
+            want="$(printf '%s' "$archive" | base64 -w0)"
+            asset_id="$(printf '%s\n' "$ASSETS" | awk -v n="$want" '$1 == n {print $2; exit}')"
+            if [ -z "$asset_id" ]; then
+              echo "::error::release $TAG has no asset $archive captured at resolve time"
+              exit 1
+            fi
+            gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+              -H 'Accept: application/octet-stream' > "_dl/$archive"
             tar -xzf "_dl/$archive" -C _dl
             src="_dl/gitlawb-node-${VERSION}-${target}"
             cp "$src/gl" "npm/packages/$pkg/gl"
@@ -635,14 +754,39 @@ jobs:
           # Platform packages first, then the wrapper (so its optionalDependencies resolve).
           # Skip versions already on the registry so a rerun after a partial publish
           # is idempotent instead of erroring on the first existing package.
+          # npm publish moves the latest dist-tag to whatever it publishes, so a
+          # backfilled older version would hand :latest to stale code. Decide
+          # the dist-tag per package from that package's own registry latest:
+          # a partial publish can leave the platform packages ahead of the
+          # wrapper. E404 means the package has never been published, so this
+          # release gets latest; any other lookup failure must fail closed
+          # rather than guess at the dist-tag and risk moving latest backward.
+          # stderr goes to a file so a warning on a successful lookup cannot
+          # leak into registry_latest; it is read only when the lookup fails.
+          npm_err="$(mktemp)"
+          trap 'rm -f -- "$npm_err"' EXIT
           for pkg in gl-darwin-arm64 gl-darwin-x64 gl-linux-arm64 gl-linux-x64 gl; do
             name="@gitlawb/$pkg"
             if npm view "$name@$VERSION" version >/dev/null 2>&1; then
               echo "==> $name@$VERSION already published, skipping"
               continue
             fi
-            echo "==> npm publish $name@$VERSION"
-            npm publish "npm/packages/$pkg" --provenance --access public
+            registry_latest="$(npm view "$name" dist-tags.latest 2>"$npm_err")" || {
+              if ! grep -q E404 "$npm_err"; then
+                cat "$npm_err" >&2
+                echo "::error::npm dist-tags lookup failed for $name; not guessing the dist-tag"
+                exit 1
+              fi
+              registry_latest=""
+            }
+            dist_tag="latest"
+            if [ -n "$registry_latest" ] && \
+               [ "$VERSION" != "$(printf '%s\n%s\n' "$registry_latest" "$VERSION" | sort -V | tail -1)" ]; then
+              dist_tag="backfill"
+              echo "::notice::$VERSION is older than $name@$registry_latest; publishing under dist-tag backfill"
+            fi
+            echo "==> npm publish $name@$VERSION (dist-tag $dist_tag)"
+            npm publish "npm/packages/$pkg" --provenance --access public --tag "$dist_tag"
           done
 
   homebrew-bump:
@@ -652,6 +796,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read # GITHUB_TOKEN downloads release assets; the tap push uses HOMEBREW_TAP_PAT
+    environment: release
     steps:
       - name: Guard on secret
         id: guard
@@ -664,6 +809,22 @@ jobs:
           else
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Check out workflow scripts
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Resolve release tag
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        id: rel
+        env:
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          scripts/resolve-release-tag.sh "$RELEASE_TAG"
 
       - name: Checkout tap repo
         if: ${{ steps.guard.outputs.enabled == 'true' }}
@@ -678,15 +839,32 @@ jobs:
         if: ${{ steps.guard.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.release-please.outputs.version }}
-          TAG: ${{ needs.release-please.outputs.tag_name }}
+          VERSION: ${{ steps.rel.outputs.version }}
+          TAG: ${{ steps.rel.outputs.tag }}
+          ASSETS: ${{ steps.rel.outputs.assets }}
         run: |
           set -euo pipefail
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
           mkdir -p _sums
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --pattern '*.tar.gz.sha256' --dir _sums --clobber
-          sha() { awk '{print $1}' "_sums/gitlawb-node-${VERSION}-$1.tar.gz.sha256"; }
+          # Hash the tarballs themselves, fetched by the asset id the resolver
+          # captured and uploader-checked. The *.sha256 sidecars are mutable
+          # release assets too; trusting them would trust the same surface.
+          sha() {
+            archive="gitlawb-node-${VERSION}-$1.tar.gz"
+            want="$(printf '%s' "$archive" | base64 -w0)"
+            asset_id="$(printf '%s\n' "$ASSETS" | awk -v n="$want" '$1 == n {print $2; exit}')"
+            if [ -z "$asset_id" ]; then
+              echo "::error::release $TAG has no asset $archive captured at resolve time" >&2
+              exit 1
+            fi
+            # errexit is off inside the $(...) this runs under, so a failed
+            # download must exit the function itself instead of hashing a
+            # truncated file.
+            gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+              -H 'Accept: application/octet-stream' > "_sums/$archive" \
+              || exit 1
+            sha256sum "_sums/$archive" | awk '{print $1}'
+          }
           SHA_MAC_ARM="$(sha aarch64-apple-darwin)"
           SHA_MAC_X64="$(sha x86_64-apple-darwin)"
           SHA_LNX_ARM="$(sha aarch64-unknown-linux-musl)"
@@ -747,7 +925,7 @@ jobs:
         working-directory: tap
         env:
           HOMEBREW_TAP_PAT: ${{ secrets.HOMEBREW_TAP_PAT }}
-          VERSION: ${{ needs.release-please.outputs.version }}
+          VERSION: ${{ steps.rel.outputs.version }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -769,6 +947,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read # GITHUB_TOKEN checks out node; the web PR uses WEB_SYNC_PAT
+    environment: release
     steps:
       - name: Guard on secret
         id: guard
@@ -782,11 +961,29 @@ jobs:
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Check out workflow scripts
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Resolve release tag
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        id: rel
+        env:
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          scripts/resolve-release-tag.sh "$RELEASE_TAG"
+
       - name: Checkout node (release tag)
         if: ${{ steps.guard.outputs.enabled == 'true' }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          # Pin the commit the resolver verified; a tag ref re-resolved here
+          # could have been moved between resolve and checkout.
+          ref: ${{ steps.rel.outputs.tag_commit || format('refs/tags/{0}', steps.rel.outputs.tag) }}
           path: node
           persist-credentials: false
 
@@ -806,8 +1003,8 @@ jobs:
         if: ${{ steps.guard.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.release-please.outputs.version }}
-          TAG: ${{ needs.release-please.outputs.tag_name }}
+          VERSION: ${{ steps.rel.outputs.version }}
+          TAG: ${{ steps.rel.outputs.tag }}
         run: |
           set -euo pipefail
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
@@ -825,8 +1022,8 @@ jobs:
         if: ${{ steps.guard.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.WEB_SYNC_PAT }}
-          VERSION: ${{ needs.release-please.outputs.version }}
-          TAG: ${{ needs.release-please.outputs.tag_name }}
+          VERSION: ${{ steps.rel.outputs.version }}
+          TAG: ${{ steps.rel.outputs.tag }}
         run: |
           set -euo pipefail
           # Canonical install scripts (source of truth lives in the node repo).
