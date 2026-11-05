@@ -397,15 +397,17 @@ job=docker-manifest
           # original event and ref, and would move the pointers backward to
           # that run's version. Floor against live state instead: this run's
           # release already exists by now, so VERSION must be the newest
-          # published release or the run is stale and the tags stay put.
-          floor="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" -q '
-            [ .[] | select(.draft == false) | .tag_name
-              | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))
-              | ltrimstr("v") | split(".") | map(tonumber) ]
-            | if length == 0 then "" else max | join(".") end')" || {
+          # published release or the run is stale and the tags stay put. The
+          # releases list is ordered by creation, not semver, so read every
+          # page and take the semver maximum, not the first page's.
+          tags="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            -q '.[] | select(.draft == false) | .tag_name')" || {
             echo "::error::could not list releases to bound the moving tags"
             exit 1
           }
+          floor="$(printf '%s\n' "$tags" \
+            | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } \
+            | sed 's/^v//' | sort -V | tail -n 1)"
           if [ -n "$floor" ] && [ "$floor" != "$VERSION" ]; then
             echo "::error::release v$floor is newer than this run's v$VERSION; refusing to move the moving tags backward (stale re-run?)"
             exit 1
@@ -1078,6 +1080,104 @@ if ! grep -q '^::error::npm dist-tags lookup failed for @gitlawb/gl-darwin-arm64
   printf '%s\n' "publish dist-tag (non-E404 failure): wrong error output or a publish ran" >&2
   cat "$test_tmp/publish-out" "$test_tmp/publish-err" >&2
   exit 1
+fi
+
+# Behavioral check of the Move floating tags floor. The run block is extracted
+# from the workflow and run against a stub gh and a stub docker. The stub gh
+# serves two pages of releases ordered by creation, with the newest semver on
+# page 2 plus a draft and non-semver tags as noise, and applies the -q jq
+# expression per page like the real gh does. Without --paginate it serves page
+# 1 only. The moving tags must be refused when a newer release exists only on a
+# later page, and must not move on any listing failure.
+moving_script="$test_tmp/moving-step.sh"
+awk '
+  /^job=docker-manifest$/ { want = 1; next }
+  /^job=/ { want = 0 }
+  /^      - name:/ { in_moving = ($0 ~ /^      - name:[[:space:]]*Move floating tags[[:space:]]*$/) }
+  want && in_moving && /^        run: \|$/ { in_run = 1; next }
+  want && in_run && /^$/ { exit }
+  want && in_run { sub(/^          /, ""); print }
+' "$actual_resolver_steps" > "$moving_script"
+if ! grep -q 'imagetools create' "$moving_script"; then
+  printf '%s\n' "could not extract the Move floating tags run block" >&2
+  exit 1
+fi
+
+moving_bin="$test_tmp/moving-bin"
+mkdir -p "$moving_bin"
+cat > "$moving_bin/gh" <<'STUB'
+#!/usr/bin/env bash
+# gh api [--paginate] <url> -q <jq-expr>
+paginate=0
+url=""
+expr=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    api) ;;
+    --paginate) paginate=1 ;;
+    -q) shift; expr="$1" ;;
+    *) url="$1" ;;
+  esac
+  shift
+done
+case "$url" in
+  repos/*/releases\?per_page=*) ;;
+  *) echo "stub gh: unexpected url $url" >&2; exit 2 ;;
+esac
+case "${GH_MODE:?GH_MODE unset}" in
+  fail) echo "gh: HTTP 502" >&2; exit 1 ;;
+  empty) pages='[]' ;;
+  two)
+    pages='[{"tag_name":"v0.3.0","draft":false},{"tag_name":"v0.4.0","draft":false}]
+[{"tag_name":"v0.5.0","draft":false},{"tag_name":"v9.0.0","draft":true},{"tag_name":"v9.9.9-rc1","draft":false},{"tag_name":"nightly","draft":false}]'
+    ;;
+esac
+if [ "$paginate" = 0 ]; then
+  pages="$(printf '%s\n' "$pages" | head -n 1)"
+fi
+printf '%s\n' "$pages" | while IFS= read -r page; do
+  printf '%s' "$page" | jq -r "$expr"
+done
+STUB
+cat > "$moving_bin/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "DOCKER $*" >> "${DOCKER_LOG:?DOCKER_LOG unset}"
+STUB
+chmod +x "$moving_bin/gh" "$moving_bin/docker"
+
+run_moving() { # mode version
+  : > "$test_tmp/docker-log"
+  PATH="$moving_bin:$PATH" GH_MODE="$1" VERSION="$2" \
+    IMAGE=ghcr.io/example/img DIGESTS="img@sha256:aa img@sha256:bb" \
+    GITHUB_REPOSITORY=example/repo DOCKER_LOG="$test_tmp/docker-log" \
+    bash "$moving_script" > "$test_tmp/moving-out" 2> "$test_tmp/moving-err"
+}
+moving_fail() { printf '%s\n' "moving-tag floor ($1)" >&2
+  cat "$test_tmp/moving-out" "$test_tmp/moving-err" "$test_tmp/docker-log" >&2
+  exit 1; }
+
+# Newest release only on page 2: a stale run must be refused.
+if run_moving two 0.4.0; then moving_fail "stale run, newest on page 2: step passed"; fi
+if ! grep -q '^::error::release v0.5.0 is newer than this run.s v0.4.0; refusing' "$test_tmp/moving-out" \
+  || [ -s "$test_tmp/docker-log" ]; then
+  moving_fail "stale run, newest on page 2: wrong error or docker ran"
+fi
+# This run is the newest release, and it sits on page 2.
+if ! run_moving two 0.5.0; then moving_fail "newest on page 2: step failed"; fi
+if [ "$(wc -l < "$test_tmp/docker-log")" != 1 ] \
+  || ! grep -q -- '^DOCKER buildx imagetools create -t ghcr.io/example/img:latest -t ghcr.io/example/img:0.5 img@sha256:aa img@sha256:bb$' "$test_tmp/docker-log"; then
+  moving_fail "newest on page 2: expected one imagetools create for latest and 0.5"
+fi
+# A listing failure fails closed.
+if run_moving fail 0.5.0; then moving_fail "gh failure: step passed"; fi
+if ! grep -q '^::error::could not list releases to bound the moving tags$' "$test_tmp/moving-out" \
+  || [ -s "$test_tmp/docker-log" ]; then
+  moving_fail "gh failure: wrong error or docker ran"
+fi
+# No releases at all means no floor.
+if ! run_moving empty 0.5.0; then moving_fail "empty list: step failed"; fi
+if [ "$(wc -l < "$test_tmp/docker-log")" != 1 ]; then
+  moving_fail "empty list: expected one imagetools create"
 fi
 
 printf '%s\n' "release tag validation tests passed"
