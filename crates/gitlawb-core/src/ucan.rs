@@ -1,7 +1,7 @@
 //! UCAN (User Controlled Authorization Networks) — capability token types.
 //!
 //! UCANs let a DID delegate specific capabilities to another DID,
-//! with optional expiry and revocation. gitlawb uses UCANs for:
+//! with optional expiry and revocation. Twigpine uses UCANs for:
 //!   - Delegating push access to a branch to a CI agent
 //!   - Granting a reviewer the ability to approve PRs
 //!   - Bootstrap tokens issued at registration
@@ -57,7 +57,7 @@ impl Capability {
     }
 }
 
-/// Well-known gitlawb capability strings.
+/// Well-known Twigpine capability strings.
 pub mod caps {
     pub const GIT_PUSH: &str = "git/push";
     pub const GIT_FETCH: &str = "git/fetch";

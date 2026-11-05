@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a defect in a Gitlawb crate or node behavior
+description: Report a defect in a Twigpine crate or node behavior
 labels: ["bug"]
 body:
   - type: markdown

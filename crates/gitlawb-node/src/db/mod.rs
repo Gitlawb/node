@@ -265,11 +265,6 @@ pub struct Db {
 }
 
 impl Db {
-    /// Access the underlying Postgres connection pool.
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
-    }
-
     #[cfg(test)]
     pub fn for_testing(pool: PgPool) -> Self {
         Self { pool }
@@ -308,6 +303,46 @@ impl Db {
         let db = Self { pool };
         db.migrate().await?;
         Ok(db)
+    }
+
+    /// Build the dedicated pool that advisory-lock connections come from.
+    ///
+    /// Deliberately **lazy**: connections open on first use rather than at boot.
+    /// The main pool has to connect eagerly because it runs migrations, which is
+    /// why it needs `connect_db_with_retry`'s backoff and degraded-server
+    /// handoff. This pool has no startup work at all, so an eager connect would
+    /// only add a new way for the process to fail to boot, and would need a
+    /// second copy of that retry machinery to be safe. Being lazy removes the
+    /// failure mode instead of handling it: if Postgres is unreachable when the
+    /// first write arrives, that write fails on the pool's own acquire timeout,
+    /// the same way any other database-backed request already does.
+    ///
+    /// Kept separate from the main pool so a burst of lock-holding connections
+    /// cannot starve ordinary request handlers. See
+    /// `GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS` for the sizing tradeoff.
+    pub fn lock_pool(
+        database_url: &str,
+        max_connections: u32,
+        acquire_timeout: Duration,
+    ) -> Result<PgPool> {
+        info!(
+            max_connections,
+            acquire_timeout_secs = acquire_timeout.as_secs(),
+            "creating dedicated advisory-lock pool (lazy)"
+        );
+        PgPoolOptions::new()
+            .max_connections(max_connections)
+            // Explicit, and load-bearing rather than cosmetic: `RepoWriteGuard::Drop`
+            // has a no-runtime branch that calls `PoolConnection::leak()` and relies
+            // on the husk's own drop doing nothing. With `min_connections > 0` that
+            // drop still spawns a pool-replenish task, and spawning without a runtime
+            // panics inside Drop, which aborts the process during unwind. It is 0 by
+            // default, so this line exists to keep a future tuning change from
+            // silently re-arming that panic.
+            .min_connections(0)
+            .acquire_timeout(acquire_timeout)
+            .connect_lazy(database_url)
+            .context("creating advisory-lock pool")
     }
 
     /// Cheap liveness probe against the pool, for readiness checks: one
@@ -2571,15 +2606,7 @@ impl Db {
             // The read-then-write race is benign: if a row appears in between,
             // this write becomes an UPDATE and the UnprovenRepoint guard below
             // still refuses any http_url change.
-            PeerWriteAuthority::Unproven
-                if !sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS(SELECT 1 FROM peers WHERE did = $1)",
-                )
-                .bind(did)
-                .fetch_one(&self.pool)
-                .await
-                .unwrap_or(false) =>
-            {
+            PeerWriteAuthority::Unproven if !self.peer_exists(did).await.unwrap_or(false) => {
                 match did.parse::<gitlawb_core::did::Did>() {
                     // Only reachable from the bootstrap announce-back in main.rs,
                     // which passes the contacted peer's raw JSON string; the
@@ -2707,6 +2734,21 @@ impl Db {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Whether a DID has a row in `peers`, by keyed lookup.
+    ///
+    /// For callers that only need the membership answer. `list_peers` fetches
+    /// and materializes every row, so using it as a membership test on a hot
+    /// path (the gossip ingest gate) makes the cost of one event grow with the
+    /// size of the table.
+    pub async fn peer_exists(&self, did: &str) -> Result<bool> {
+        Ok(
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM peers WHERE did = $1)")
+                .bind(did)
+                .fetch_one(&self.pool)
+                .await?,
+        )
     }
 
     pub async fn list_peers(&self) -> Result<Vec<PeerRecord>> {
@@ -7864,6 +7906,41 @@ mod peer_authority_tests {
         db
     }
 
+    /// `peer_exists` answers the membership question the gossip ingest gate
+    /// asks on every event, so both answers are pinned here: a registered DID
+    /// is true, and an unregistered one is false rather than an error or a
+    /// prefix match on a registered DID.
+    #[sqlx::test]
+    async fn peer_exists_answers_both_ways(pool: sqlx::PgPool) {
+        let db = db(pool).await;
+        let did = VICTIM_DID;
+
+        assert!(
+            !db.peer_exists(did).await.unwrap(),
+            "an empty peers table must answer false, not error"
+        );
+
+        db.upsert_peer(
+            did,
+            "https://peer.example.com",
+            PeerWriteAuthority::Proven(did),
+        )
+        .await
+        .unwrap();
+
+        assert!(db.peer_exists(did).await.unwrap());
+        assert!(
+            !db.peer_exists(OTHER_DID).await.unwrap(),
+            "a different DID must not match"
+        );
+        assert!(
+            !db.peer_exists(&VICTIM_DID[..VICTIM_DID.len() - 1])
+                .await
+                .unwrap(),
+            "the lookup is an equality test, not a prefix test"
+        );
+    }
+
     /// The whole row, read back through `list_peers` rather than raw SQL, so a
     /// case that claims "unchanged" is comparing every column a consumer sees.
     async fn row(db: &Db, did: &str) -> Option<(String, String, Option<String>, bool, String)> {
@@ -8280,6 +8357,7 @@ mod peer_authority_tests {
 /// | `a_legacy_row_can_still_refresh_its_liveness` (db/mod.rs) | test-only. Seeds a PRE-GATE row by raw SQL on purpose: `upsert_peer` cannot create one, since the gate it is testing refuses exactly that DID. The fixture models what a deployed table already holds |
 /// | `gossip_ping_round_requires_two_failures_before_persisting_unreachable` (main.rs) | test-only fixture seed. Raw SQL because the test drives the readiness HYSTERESIS, which needs a row already at `last_ping_ok = TRUE` before the round runs; it never exercises the announce gate |
 /// | `manual_ping_uses_readiness_without_mutating_federation_gate` (api/peers.rs) | test-only fixture seed, same shape and same reason: the row under test must pre-exist so the assertion is about what the ping does NOT rewrite |
+/// | `seed_peer` (p2p/mod.rs) | test-only fixture seed. Raw SQL so the gossip ingest tests can drive the known-peer gate directly, including the did:web case `upsert_peer` would refuse |
 ///
 /// And the `upsert_peer` CALL-SITE authority table, which the ledger above
 /// structurally cannot hold, because the bootstrap site issues no SQL of its own
@@ -8377,6 +8455,7 @@ mod peers_table_writer_guard {
         ("prune_non_public_peers", 1),
         ("prune_self_peers", 1),
         ("seed_local_peer", 1),
+        ("seed_peer", 1),
         ("upsert_peer", 2),
     ];
 
