@@ -38,7 +38,7 @@ mod whoami;
 #[derive(Parser)]
 #[command(
     name = "gl",
-    about = "gitlawb CLI — identity, repos, MCP server",
+    about = "Twigpine CLI — identity, repos, MCP server",
     version,
     propagate_version = true
 )]
@@ -49,16 +49,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Manage your gitlawb identity (DID + keypair)
+    /// Manage your Twigpine identity (DID + keypair)
     Identity {
         #[command(subcommand)]
         cmd: identity::IdentityCmd,
     },
 
-    /// Register this agent with a gitlawb node
+    /// Register this agent with a Twigpine node
     Register(register::RegisterArgs),
 
-    /// Clone a gitlawb repo, handling private subtrees cleanly
+    /// Clone a Twigpine repo, handling private subtrees cleanly
     Clone(clone::CloneArgs),
 
     /// Manage repositories
@@ -85,10 +85,10 @@ enum Commands {
     /// Manage webhooks for a repository
     Webhook(webhook::WebhookArgs),
 
-    /// Mirror a public GitHub/GitLab/any-git repo into gitlawb
+    /// Mirror a public GitHub/GitLab/any-git repo into Twigpine
     Mirror(mirror::MirrorArgs),
 
-    /// MCP server — expose gitlawb tools to LLM agents
+    /// MCP server — expose Twigpine tools to LLM agents
     Mcp(mcp::McpArgs),
 
     /// Sync repos from peer nodes (HTTP fallback for p2p gossip)
@@ -100,7 +100,7 @@ enum Commands {
     /// Register and resolve names on Base L2
     Name(name::NameArgs),
 
-    /// Check your gitlawb installation and connectivity
+    /// Check your Twigpine installation and connectivity
     Doctor(doctor::DoctorArgs),
 
     /// Zero-to-push in one command — init repo, identity, register, remote

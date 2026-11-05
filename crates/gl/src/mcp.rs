@@ -2,7 +2,7 @@
 //!
 //! Runs a JSON-RPC 2.0 server over stdin/stdout using LSP-style
 //! `Content-Length` framing.  Exposes 15 tools that give LLM agents
-//! structured access to the gitlawb network.
+//! structured access to the Twigpine network.
 //!
 //! # Tools
 //!   identity_show    — current agent DID
@@ -56,7 +56,11 @@ pub enum McpCmd {
     /// Start the MCP server (stdin/stdout JSON-RPC)
     Serve {
         /// Node URL to connect to
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         /// Identity directory
         #[arg(long)]
@@ -181,12 +185,12 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "node_info",
-            "description": "Get metadata about the connected gitlawb node: DID, version, network, protocols.",
+            "description": "Get metadata about the connected Twigpine node: DID, version, network, protocols.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "node_health",
-            "description": "Check if the gitlawb node is alive and responding.",
+            "description": "Check if the Twigpine node is alive and responding.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -204,12 +208,12 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "repo_list",
-            "description": "List all repositories on the connected gitlawb node.",
+            "description": "List all repositories on the connected Twigpine node.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "repo_list_federated",
-            "description": "List repositories across ALL nodes in the gitlawb network (federation). Returns repos from this node and all known peer nodes, each annotated with node_url and node_did.",
+            "description": "List repositories across ALL nodes in the Twigpine network (federation). Returns repos from this node and all known peer nodes, each annotated with node_url and node_did.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -262,7 +266,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "agent_register",
-            "description": "Register this agent with the gitlawb node to get a bootstrap UCAN token.",
+            "description": "Register this agent with the Twigpine node to get a bootstrap UCAN token.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -278,7 +282,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "agent_capabilities",
-            "description": "List all available UCAN capability strings in the gitlawb protocol.",
+            "description": "List all available UCAN capability strings in the Twigpine protocol.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -775,13 +779,15 @@ async fn call_tool(
             let did: gitlawb_core::did::Did = did_str
                 .parse()
                 .map_err(|e: gitlawb_core::Error| anyhow::anyhow!("{e}"))?;
-            if let Ok(vk) = did.to_verifying_key() {
-                let doc = gitlawb_core::did::DidDocument::new(did, &vk);
-                Ok(serde_json::to_string_pretty(&doc)?)
-            } else {
-                Err(anyhow::anyhow!(
-                    "cannot resolve '{did_str}' locally — only did:key is supported without a resolver"
-                ))
+            let is_did_key = did.is_did_key();
+            match did.to_verifying_key() {
+                Ok(vk) => {
+                    let doc = gitlawb_core::did::DidDocument::new(did, &vk);
+                    Ok(serde_json::to_string_pretty(&doc)?)
+                }
+                Err(e) => Err(anyhow::anyhow!(did_resolve_failure_message(
+                    did_str, is_did_key, &e
+                ))),
             }
         }
 
@@ -1339,6 +1345,76 @@ fn write_message(writer: &mut impl Write, value: &Value) -> Result<()> {
     write!(writer, "Content-Length: {}\r\n\r\n{}", json.len(), json)?;
     writer.flush()?;
     Ok(())
+}
+
+/// Message for a `did_resolve` failure. A `did:key` that fails to resolve is a
+/// different situation from a DID method we have no resolver for, so saying
+/// "only did:key is supported" about something that IS a did:key sends the
+/// reader looking for the wrong problem.
+fn did_resolve_failure_message(
+    did_str: &str,
+    is_did_key: bool,
+    err: &gitlawb_core::Error,
+) -> String {
+    if is_did_key {
+        format!("cannot resolve '{did_str}': {err}")
+    } else {
+        format!("cannot resolve '{did_str}' locally — only did:key is supported without a resolver")
+    }
+}
+
+#[cfg(test)]
+mod did_resolve_message_tests {
+    use super::did_resolve_failure_message;
+    use gitlawb_core::did::Did;
+    use std::str::FromStr;
+
+    /// A well-formed did:key encoding the compressed identity point, which is
+    /// small-order. Derived from the point bytes so the fixture states WHY it
+    /// is weak rather than pinning an opaque string (the literal also trips
+    /// secret scanners, which cannot tell a public DID from an API key).
+    fn weak_did_key() -> String {
+        let mut weak = [0u8; 32];
+        weak[0] = 1; // compressed identity point
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&weak).expect("decompresses");
+        Did::from_verifying_key(&vk).to_string()
+    }
+
+    #[test]
+    fn test_did_key_failure_does_not_claim_did_key_is_unsupported() {
+        // Drive the real parse and the real resolution error rather than
+        // hardcoding the discriminator, so flipping it at the call site fails.
+        let did_str = &weak_did_key();
+        let did = Did::from_str(did_str).expect("well-formed did:key");
+        let err = did
+            .to_verifying_key()
+            .expect_err("a small-order did:key must not resolve");
+
+        let msg = did_resolve_failure_message(did_str, did.is_did_key(), &err);
+        assert!(
+            !msg.contains("only did:key is supported"),
+            "a did:key must not be told did:key is unsupported: {msg}"
+        );
+        assert!(
+            msg.contains("small-order"),
+            "the real cause must survive into the message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_non_key_method_keeps_the_no_resolver_message() {
+        let did_str = "did:web:example.com";
+        let did = Did::from_str(did_str).expect("did:web parses");
+        let err = did
+            .to_verifying_key()
+            .expect_err("did:web has no local resolver");
+
+        let msg = did_resolve_failure_message(did_str, did.is_did_key(), &err);
+        assert!(
+            msg.contains("only did:key is supported"),
+            "an unresolvable method keeps its existing explanation: {msg}"
+        );
+    }
 }
 
 #[cfg(test)]

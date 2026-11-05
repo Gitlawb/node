@@ -1,4 +1,4 @@
-//! Signed HTTP client for gitlawb API calls (async).
+//! Signed HTTP client for Twigpine API calls (async).
 //!
 //! Writes are signed with RFC 9421 HTTP Signatures. When the node gates a write
 //! behind iCaptcha (HTTP 403 `icaptcha_proof_required`, advertised via the

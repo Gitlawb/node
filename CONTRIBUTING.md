@@ -1,12 +1,12 @@
-# Contributing to gitlawb
+# Contributing to Twigpine
 
-Thanks for your interest in contributing. gitlawb is an open protocol — agents and humans welcome.
+Thanks for your interest in contributing. Twigpine is an open protocol — agents and humans welcome.
 
 ## Quick start for contributors
 
 ```sh
 # Clone and build
-git clone https://github.com/Gitlawb/node
+git clone https://github.com/Twigpine/node
 cd node
 
 # Build everything
@@ -38,7 +38,7 @@ docs/                   Operator guides
 scripts/                Build helpers
 ```
 
-Smart contracts live in a separate repo: [github.com/Gitlawb/contracts](https://github.com/Gitlawb/contracts).
+Smart contracts live in a separate repo: [github.com/Twigpine/contracts](https://github.com/Twigpine/contracts).
 
 ## Ways to contribute
 

@@ -45,6 +45,27 @@ use gitlawb_core::identity::verify;
 #[derive(Clone, Copy, Debug)]
 pub struct SignatureBodyLimit(pub usize);
 
+/// The hint for an unresolvable DID, chosen by method. The hint is only true
+/// for a method we have no resolver for: a did:key that parsed and then failed
+/// on its key material (a small-order key, wrong multicodec, wrong length)
+/// would be sent looking for the wrong problem by the alpha-support wording.
+fn unresolvable_did_hint(key_id: &Did) -> &'static str {
+    if key_id.is_did_key() {
+        "the DID is a did:key whose key material did not resolve"
+    } else {
+        "only did:key is supported in alpha"
+    }
+}
+
+/// Bound the echoed keyid in the unresolvable-DID message. `key_id` is
+/// unauthenticated request input, so reflecting it back at whatever length the
+/// caller chose would amplify attacker input into the response body. The bound
+/// is slack (a did:key method-id is a fixed 48 characters) and only defends
+/// the echo, not the resolution.
+fn bounded_did_echo(key_id: &str) -> String {
+    key_id.chars().take(96).collect()
+}
+
 /// Axum middleware that enforces HTTP Signature authentication (RFC 9421).
 ///
 /// Every write request must carry:
@@ -163,7 +184,7 @@ async fn verify_signature(limit: usize, request: Request, next: Next) -> Respons
                     COVERED_COMPONENTS.join(", "),
                     missing.join(", ")
                 ),
-                "hint": "See https://gitlawb.com/agents#authentication",
+                "hint": "See https://twigpine.com/agents#authentication",
             })),
         )
             .into_response();
@@ -188,11 +209,14 @@ async fn verify_signature(limit: usize, request: Request, next: Next) -> Respons
                 StatusCode::BAD_REQUEST,
                 Json(json!({
                     "error": "unresolvable_did",
-                    "message": format!("cannot resolve DID '{}': {e}", sig.key_id),
-                    "hint": "only did:key is supported in alpha",
+                    "message": format!(
+                        "cannot resolve DID '{}': {e}",
+                        bounded_did_echo(&sig.key_id.to_string())
+                    ),
+                    "hint": unresolvable_did_hint(&sig.key_id),
                 })),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -205,17 +229,34 @@ async fn verify_signature(limit: usize, request: Request, next: Next) -> Respons
         .unwrap_or("/")
         .to_string();
 
-    let content_digest = parts
+    // Required, never defaulted. The signing string is rebuilt from the request,
+    // so an absent header would make the covered `content-digest` empty on both
+    // sides: verification would pass and the digest-versus-body comparison below
+    // would have nothing to compare, leaving a signed request free to carry a
+    // body its signature never covered. `sign_request` always emits the header,
+    // so refusing here costs no conforming client anything.
+    let content_digest = match parts
         .headers
         .get("content-digest")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    {
+        Some(v) => v.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "missing_content_digest",
+                    "message": "Content-Digest header is required on a signed request",
+                })),
+            )
+                .into_response()
+        }
+    };
 
     let mut request_values: HashMap<String, String> = HashMap::new();
     request_values.insert("@method".to_string(), method);
     request_values.insert("@path".to_string(), path_and_query);
-    request_values.insert("content-digest".to_string(), content_digest);
+    request_values.insert("content-digest".to_string(), content_digest.clone());
 
     // The @signature-params value is the part of Signature-Input after "sig1="
     let sig_params_value = sig_input.strip_prefix("sig1=").unwrap_or(&sig_input);
@@ -260,23 +301,18 @@ async fn verify_signature(limit: usize, request: Request, next: Next) -> Respons
             .into_response();
     }
 
-    // Verify Content-Digest matches the actual request body
-    if let Some(claimed) = parts
-        .headers
-        .get("content-digest")
-        .and_then(|v| v.to_str().ok())
-    {
-        let actual = compute_content_digest(&body_bytes);
-        if claimed != actual {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": "content_digest_mismatch",
-                    "message": "Content-Digest does not match request body",
-                })),
-            )
-                .into_response();
-        }
+    // Verify Content-Digest matches the actual request body. Unconditional: the
+    // header's presence was established above, so there is no branch here that
+    // skips the comparison.
+    if content_digest != compute_content_digest(&body_bytes) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "content_digest_mismatch",
+                "message": "Content-Digest does not match request body",
+            })),
+        )
+            .into_response();
     }
 
     tracing::info!(did = %sig.key_id, "✓ authenticated request");
@@ -429,7 +465,7 @@ fn human_detected(message: &str) -> impl IntoResponse {
             "error": "not_an_agent",
             "message": message,
             "hint": "gl identity new && gl register",
-            "docs": "https://gitlawb.com/agents",
+            "docs": "https://twigpine.com/agents",
         })),
     )
 }
@@ -470,6 +506,58 @@ mod tests {
         let token = delegation.encode().unwrap();
 
         assert!(validate_ucan_chain(&token, &node_did, &agent_did).is_ok());
+    }
+
+    /// The two-branch hint selection is the point of the unresolvable-DID
+    /// change: a did:key that failed on its key material must be told the key
+    /// material did not resolve, and any other method must be told only did:key
+    /// is supported. A regression that drops the is_did_key() check would send
+    /// a did:key caller after the wrong problem, so both branches are pinned.
+    #[test]
+    fn unresolvable_did_hint_distinguishes_key_material_from_method() {
+        // A real did:key whose key material fails to resolve (small-order):
+        // key-material hint.
+        let mut weak = [0u8; 32];
+        weak[0] = 1; // compressed identity point
+        let weak_vk = ed25519_dalek::VerifyingKey::from_bytes(&weak).unwrap();
+        let weak_did = Did::from_verifying_key(&weak_vk);
+        assert!(
+            weak_did.to_verifying_key().is_err(),
+            "fixture precondition: small-order did:key must not resolve"
+        );
+        assert_eq!(
+            unresolvable_did_hint(&weak_did),
+            "the DID is a did:key whose key material did not resolve"
+        );
+
+        // A method with no resolver: alpha-support hint.
+        let web = Did::web("example.com");
+        assert!(
+            web.to_verifying_key().is_err(),
+            "fixture precondition: did:web must not resolve locally"
+        );
+        assert_eq!(
+            unresolvable_did_hint(&web),
+            "only did:key is supported in alpha"
+        );
+    }
+
+    /// The unresolvable-DID message echoes the keyid, which is unauthenticated
+    /// request input. The echoed value must be bounded so a hostile caller
+    /// cannot amplify arbitrary-length input into the response body.
+    #[test]
+    fn unresolvable_did_message_bounds_the_echoed_keyid() {
+        let long_keyid = format!("did:key:z{}", "A".repeat(2000));
+        let shown = bounded_did_echo(&long_keyid);
+        assert!(
+            shown.len() <= 96,
+            "echoed keyid must be bounded, got {} chars",
+            shown.len()
+        );
+        assert!(
+            !shown.contains(&"A".repeat(1000)),
+            "the full keyid must not survive into the message"
+        );
     }
 
     #[test]
@@ -566,6 +654,7 @@ mod tests {
             rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
             create_ip_rate_limiter: RateLimiter::new(1000, Duration::from_secs(3600)),
             push_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+            close_issue_rate_limiter: RateLimiter::new(120, Duration::from_secs(3600)),
             ipfs_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
             ipfs_work_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
             ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
@@ -684,5 +773,76 @@ mod tests {
         let body_bytes = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body_json["error"], "invalid_ucan");
+    }
+
+    /// A request that signs `content-digest` as the EMPTY string and then sends
+    /// no Content-Digest header at all must be refused before any handler runs.
+    ///
+    /// This is the whole point of requiring the header rather than defaulting it:
+    /// the middleware rebuilds the signing string from the request, so an absent
+    /// header makes the covered digest empty on both sides. The Ed25519 check
+    /// passes, the body-versus-digest comparison is skipped for want of a header,
+    /// and a signed request carries a body the signature never covered.
+    #[tokio::test]
+    async fn signed_request_without_content_digest_is_rejected() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static REACHED: AtomicBool = AtomicBool::new(false);
+
+        let kp = Keypair::generate();
+        let did = kp.did();
+        let created = chrono::Utc::now().timestamp();
+        let signature_input = format!(
+            r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created={created}"#
+        );
+        let sig_params_value = &signature_input["sig1=".len()..];
+
+        let mut values: HashMap<String, String> = HashMap::new();
+        values.insert("@method".to_string(), "POST".to_string());
+        values.insert("@path".to_string(), "/x".to_string());
+        // Exactly what the middleware derives when the header is absent.
+        values.insert("content-digest".to_string(), String::new());
+        let signing_string =
+            build_signing_string(COVERED_COMPONENTS, sig_params_value, &values).unwrap();
+        let signature = format!(
+            "sig1=:{}:",
+            STANDARD.encode(kp.sign(signing_string.as_bytes()).to_bytes())
+        );
+
+        let app = Router::new()
+            .route(
+                "/x",
+                axum::routing::post(|| async {
+                    REACHED.store(true, Ordering::SeqCst);
+                    StatusCode::OK
+                }),
+            )
+            .layer(middleware::from_fn(require_signature));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/x")
+            .header("signature-input", signature_input)
+            .header("signature", signature)
+            .body(Body::from("a body no signature covers"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a signed request with no Content-Digest header must be refused"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["error"], "missing_content_digest",
+            "the refusal must name the absent Content-Digest header"
+        );
+        assert!(
+            !REACHED.load(Ordering::SeqCst),
+            "the handler must never see a request whose body no signature covers"
+        );
     }
 }

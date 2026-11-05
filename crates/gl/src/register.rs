@@ -1,4 +1,4 @@
-//! `gl register` — register this agent identity with a gitlawb node.
+//! `gl register` — register this agent identity with a Twigpine node.
 //!
 //! Sends a signed POST /api/register request and saves the returned bootstrap
 //! UCAN token to `~/.gitlawb/ucan.json` for use by other commands.
@@ -14,7 +14,11 @@ use crate::identity::load_keypair_from_dir;
 #[derive(Args)]
 pub struct RegisterArgs {
     /// Node URL to register with
-    #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+    #[arg(
+        long,
+        default_value = "https://node.twigpine.com",
+        env = "GITLAWB_NODE"
+    )]
     pub node: String,
 
     /// Capabilities to advertise (comma-separated)
@@ -100,7 +104,7 @@ pub async fn run(args: RegisterArgs) -> Result<()> {
     println!("  UCAN expires: {expires}");
     println!();
     println!("  Bootstrap UCAN saved to ~/.gitlawb/ucan.json");
-    println!("  You are now a verified agent on the gitlawb network.");
+    println!("  You are now a verified agent on the Twigpine network.");
 
     Ok(())
 }

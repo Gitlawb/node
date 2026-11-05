@@ -53,8 +53,8 @@ Recommended next CI additions:
 
 Fixed in this pass:
 
-- `install.sh` now downloads from `Gitlawb/node`, matches release asset names (`gitlawb-node-<version>-<target>.tar.gz`), handles `--version vX.Y.Z`, extracts the packaged directory, verifies checksums, and installs `gl`, `git-remote-gitlawb`, and `gitlawb-node` when present.
-- `docs/RUN-A-NODE.md` now matches the README Rust requirement (`1.91+`) and the release workflow's GHCR image path (`ghcr.io/gitlawb/node:latest`).
+- `install.sh` now downloads from `Twigpine/node`, matches release asset names (`gitlawb-node-<version>-<target>.tar.gz`), handles `--version vX.Y.Z`, extracts the packaged directory, verifies checksums, and installs `gl`, `git-remote-gitlawb`, and `gitlawb-node` when present.
+- `docs/RUN-A-NODE.md` now matches the README Rust requirement (`1.91+`) and the release workflow's GHCR image path (`ghcr.io/twigpine/node:latest`).
 - `docs/ECONOMICS.md` no longer claims this repo ships a `keeper-distribute.yml` workflow that is not present.
 - `.env.example` now distinguishes HTTP bootstrap peers from libp2p multiaddrs and documents seed-list opt-out.
 - `scripts/build-bins.sh` now writes to `dist/bin` instead of a missing `web/public/bin` path.
@@ -62,8 +62,8 @@ Fixed in this pass:
 
 Remaining doc caveats:
 
-- Public docs URLs (`gitlawb.com/install.sh`, `docs.gitlawb.com`) were not verified in this local pass.
-- `git-remote-gitlawb` defaults to `http://127.0.0.1:7545`, while most `gl` commands default to `https://node.gitlawb.com`; the docs should be explicit about setting `GITLAWB_NODE` for public-network cloning/fetching.
+- Public docs URLs (`twigpine.com/install.sh`, `docs.gitlawb.com`) were not verified in this local pass.
+- `git-remote-gitlawb` defaults to `http://127.0.0.1:7545`, while most `gl` commands default to `https://node.twigpine.com`; the docs should be explicit about setting `GITLAWB_NODE` for public-network cloning/fetching.
 
 ## Docker and self-hosting readiness
 
