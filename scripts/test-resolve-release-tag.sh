@@ -609,8 +609,8 @@ job=homebrew-bump
           mkdir -p tap/Formula
           cat > tap/Formula/gl.rb <<EOF
           class Gl < Formula
-            desc "Gitlawb CLI — decentralized git for AI agents and developers"
-            homepage "https://gitlawb.com"
+            desc "Twigpine CLI — decentralized git for AI agents and developers"
+            homepage "https://twigpine.com"
             version "${VERSION}"
             license "MIT OR Apache-2.0"
 
