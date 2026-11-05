@@ -52,7 +52,7 @@ if [ -n "${GH_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
   # an asset name is attacker-controlled text, and whitespace in it would
   # otherwise let a crafted name shift the positional fields.
   assets="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" \
-    -q '.assets[] | (.name | @base64) + " " + (.id | tostring) + " " + .uploader.login')"
+    -q '.assets[] | (.name | @base64) + " " + (.id | tostring) + " " + (.uploader.login // "unknown")')"
   uploaders="$(printf '%s\n' "$assets" | awk 'NF {print $3}' | sort -u)"
   if [ -n "$uploaders" ] && [ "$uploaders" != "github-actions[bot]" ]; then
     printf '%s\n' "::error::release $tag has assets not uploaded by the release automation: $uploaders"

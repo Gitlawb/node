@@ -101,7 +101,16 @@ case "$*" in
     # STUB_EVIL_NAME simulates an attacker-crafted asset name carrying a fake
     # uploader inside it; base64 keeps it a single first field and the real
     # uploader stays in $3, while a raw name lets the smuggled field through.
-    fixture='{"assets":[{"name":"gitlawb-node-9.9.9-x86_64-unknown-linux-musl.tar.gz","id":11,"uploader":{"login":"'"${STUB_UPLOADERS:-github-actions[bot]}"'"}}'
+    # STUB_UPLOADER_JSON replaces the uploader value verbatim (null, an
+    # object with a null login); STUB_NO_UPLOADER=1 omits the key entirely.
+    # STUB_EXTRA_BOT=1 appends a second asset uploaded by the bot.
+    uploader='"uploader":{"login":"'"${STUB_UPLOADERS:-github-actions[bot]}"'"}'
+    if [ -n "${STUB_UPLOADER_JSON:-}" ]; then uploader='"uploader":'"$STUB_UPLOADER_JSON"; fi
+    if [ "${STUB_NO_UPLOADER:-0}" = "1" ]; then uploader='"x":0'; fi
+    fixture='{"assets":[{"name":"gitlawb-node-9.9.9-x86_64-unknown-linux-musl.tar.gz","id":11,'"$uploader"'}'
+    if [ "${STUB_EXTRA_BOT:-0}" = "1" ]; then
+      fixture="$fixture"',{"name":"gitlawb-node-9.9.9-aarch64-unknown-linux-musl.tar.gz","id":12,"uploader":{"login":"github-actions[bot]"}}'
+    fi
     if [ "${STUB_EVIL_NAME:-0}" = "1" ]; then
       fixture="$fixture"',{"name":"gitlawb-node-9.9.9-x86_64-unknown-linux-musl.tar.gz 999 github-actions[bot]","id":999,"uploader":{"login":"collaborator"}}'
     fi
@@ -194,6 +203,44 @@ if run_resolver_ci behind 1 v9.9.9 collaborator; then
 fi
 if run_resolver_ci behind 1 v9.9.9 "github-actions[bot]" collaborator; then
   printf '%s\n' "provenance: release with collaborator-uploaded assets unexpectedly passed" >&2
+  exit 1
+fi
+# A null or absent uploader login must fail closed, not collapse the uploader
+# set to empty and skip the check. Each shape is a distinct jq path.
+if STUB_UPLOADER_JSON=null run_resolver_ci behind 1 v9.9.9; then
+  printf '%s\n' "provenance: assets with a null uploader unexpectedly passed" >&2
+  exit 1
+fi
+if ! grep -qF 'not uploaded by the release automation' "$test_tmp/prov-stdout"; then
+  printf '%s\n' "provenance: null uploader failed without the automation error" >&2
+  exit 1
+fi
+if STUB_UPLOADER_JSON='{"login":null}' run_resolver_ci behind 1 v9.9.9; then
+  printf '%s\n' "provenance: assets with a null uploader login unexpectedly passed" >&2
+  exit 1
+fi
+if STUB_NO_UPLOADER=1 run_resolver_ci behind 1 v9.9.9; then
+  printf '%s\n' "provenance: assets with no uploader key unexpectedly passed" >&2
+  exit 1
+fi
+# A bot asset next to a null-uploader asset (regression pin; already closed).
+if STUB_EXTRA_BOT=1 STUB_UPLOADER_JSON=null run_resolver_ci behind 1 v9.9.9; then
+  printf '%s\n' "provenance: bot plus null-uploader assets unexpectedly passed" >&2
+  exit 1
+fi
+# Positive control: all assets by the bot still pass and emit the same map.
+: > "$test_tmp/prov-output"
+if ! STUB_EXTRA_BOT=1 run_resolver_ci behind 1 v9.9.9; then
+  cat "$test_tmp/prov-stderr" >&2
+  printf '%s\n' "provenance: all-bot assets rejected" >&2
+  exit 1
+fi
+expected_map="$(printf '%s\n' \
+  "$(printf '%s' gitlawb-node-9.9.9-x86_64-unknown-linux-musl.tar.gz | base64 -w0) 11" \
+  "$(printf '%s' gitlawb-node-9.9.9-aarch64-unknown-linux-musl.tar.gz | base64 -w0) 12")"
+actual_map="$(sed -n '/^assets<<GHAE$/,/^GHAE$/p' "$test_tmp/prov-output" | sed '1d;$d')"
+if [ "$actual_map" != "$expected_map" ]; then
+  printf '%s\n' "provenance: all-bot assets map changed" >&2
   exit 1
 fi
 # A tag moved to a different main commit: compare would say behind, but the
