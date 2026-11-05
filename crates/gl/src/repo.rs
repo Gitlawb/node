@@ -25,14 +25,22 @@ pub enum RepoCmd {
         private: bool,
         #[arg(long, default_value = "main")]
         branch: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
     },
     /// List repositories on a node
     List {
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -40,7 +48,11 @@ pub enum RepoCmd {
     /// Print the gitlawb:// clone command for a repo
     Clone {
         name: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -48,7 +60,11 @@ pub enum RepoCmd {
     /// Show repository metadata
     Info {
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -63,7 +79,11 @@ pub enum RepoCmd {
         /// Max number of commits to show
         #[arg(long, short, default_value = "20")]
         limit: u32,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -75,7 +95,11 @@ pub enum RepoCmd {
         /// New name for the fork (defaults to source repo name)
         #[arg(long, short)]
         name: Option<String>,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -84,7 +108,11 @@ pub enum RepoCmd {
     LabelAdd {
         repo: String,
         label: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -93,7 +121,11 @@ pub enum RepoCmd {
     LabelRemove {
         repo: String,
         label: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -101,7 +133,11 @@ pub enum RepoCmd {
     /// List labels on a repository
     LabelList {
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -110,7 +146,11 @@ pub enum RepoCmd {
     Owner {
         /// Repository name or owner/repo
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -126,7 +166,11 @@ pub enum RepoCmd {
         #[arg(long)]
         url: String,
         /// URL of the origin node (where the repo lives)
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -135,7 +179,11 @@ pub enum RepoCmd {
     ReplicaUnregister {
         /// Repository in owner/repo format
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -144,7 +192,11 @@ pub enum RepoCmd {
     Replicas {
         /// Repository in owner/repo format
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -265,7 +317,7 @@ async fn cmd_create(
     println!("✓ Created repository: {name}");
     println!("  Clone: git clone {gitlawb_url}");
     println!("  HTTP:  {clone_url}");
-    println!("  View:  https://gitlawb.com/{owner_short}/{name}");
+    println!("  View:  https://twigpine.com/{owner_short}/{name}");
     if let Some(desc) = payload["description"].as_str().filter(|s| !s.is_empty()) {
         println!("  Desc:  {desc}");
     }
