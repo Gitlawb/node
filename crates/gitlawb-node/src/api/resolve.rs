@@ -1,4 +1,4 @@
-//! DID resolution — look up a node by its gitlawb DID.
+//! DID resolution — look up a node by its Twigpine DID.
 //!
 //! First checks the local peers table (HTTP-layer peer discovery),
 //! then queries the Kademlia DHT via the libp2p swarm.
@@ -14,7 +14,7 @@ use crate::state::AppState;
 
 /// GET /api/v1/resolve/{did}
 ///
-/// Resolves a gitlawb DID to an HTTP URL and p2p multiaddr.
+/// Resolves a Twigpine DID to an HTTP URL and p2p multiaddr.
 /// Checks local peer cache first, then falls back to Kademlia DHT lookup.
 pub async fn resolve_did(
     State(state): State<AppState>,
