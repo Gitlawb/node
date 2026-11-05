@@ -818,7 +818,10 @@ mod tests {
                     StatusCode::OK
                 }),
             )
-            .layer(middleware::from_fn(require_signature));
+            .layer(middleware::from_fn_with_state(
+                SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                require_signature,
+            ));
 
         let req = Request::builder()
             .method("POST")
