@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# gitlawb installer - downloads pre-built binaries from GitHub Releases.
+# Twigpine installer - downloads pre-built binaries from GitHub Releases.
 #
 # Usage:
-#   curl -fsSL https://gitlawb.com/install.sh | sh
-#   curl -fsSL https://gitlawb.com/install.sh | sh -s -- --version v0.3.9
+#   curl -fsSL https://twigpine.com/install.sh | sh
+#   curl -fsSL https://twigpine.com/install.sh | sh -s -- --version v0.3.9
 set -euo pipefail
 
-REPO="${GITLAWB_RELEASE_REPO:-Gitlawb/node}"
+REPO="${GITLAWB_RELEASE_REPO:-Twigpine/node}"
 INSTALL_DIR="${GITLAWB_INSTALL_DIR:-$HOME/.local/bin}"
 VERSION_ARG="latest"
 
 usage() {
   cat <<EOF
-gitlawb installer
+Twigpine installer
 
 Options:
   --version <tag>   Install a specific release tag, for example v0.3.9.
@@ -20,7 +20,7 @@ Options:
 
 Environment:
   GITLAWB_INSTALL_DIR   Install directory (default: $HOME/.local/bin)
-  GITLAWB_RELEASE_REPO  GitHub repo to download from (default: Gitlawb/node)
+  GITLAWB_RELEASE_REPO  GitHub repo to download from (default: Twigpine/node)
 EOF
 }
 
@@ -97,7 +97,7 @@ ARCHIVE="${PACKAGE_NAME}.tar.gz"
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${TAG}/${ARCHIVE}"
 CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
 
-echo "Installing gitlawb ${TAG} for ${OS_NAME}/${ARCH_NAME}"
+echo "Installing Twigpine ${TAG} for ${OS_NAME}/${ARCH_NAME}"
 echo "  Archive:  ${ARCHIVE}"
 echo "  Into:     ${INSTALL_DIR}"
 echo ""
@@ -161,7 +161,7 @@ if [ "${#INSTALLED[@]}" -eq 0 ]; then
 fi
 
 echo ""
-echo "Installed gitlawb ${TAG}"
+echo "Installed Twigpine ${TAG}"
 for BIN in "${INSTALLED[@]}"; do
   echo "  ${BIN} -> ${INSTALL_DIR}/${BIN}"
 done

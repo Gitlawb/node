@@ -39,7 +39,7 @@ jobs:
     # Skipped on manual dispatch: a backfill must never create or advance a
     # release PR as a side effect (npm-publish tolerates the skipped need via
     # !cancelled(), and every other job gates on release_created == 'true').
-    if: ${{ github.repository == 'Gitlawb/node' && github.event_name != 'workflow_dispatch' }}
+    if: ${{ github.repository == 'Twigpine/node' && github.event_name != 'workflow_dispatch' }}
     name: Release Please
     runs-on: ubuntu-latest
     permissions:
@@ -73,7 +73,7 @@ jobs:
   sync-release-lock:
     name: Sync Cargo.lock on the release PR
     needs: release-please
-    if: ${{ !cancelled() && github.repository == 'Gitlawb/node' && github.event_name != 'workflow_dispatch' }}
+    if: ${{ !cancelled() && github.repository == 'Twigpine/node' && github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -824,7 +824,7 @@ jobs:
         if: ${{ steps.guard.outputs.enabled == 'true' }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: Gitlawb/homebrew-tap
+          repository: Twigpine/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_PAT }}
           path: tap
           persist-credentials: false
@@ -867,8 +867,8 @@ jobs:
           mkdir -p tap/Formula
           cat > tap/Formula/gl.rb <<EOF
           class Gl < Formula
-            desc "Gitlawb CLI — decentralized git for AI agents and developers"
-            homepage "https://gitlawb.com"
+            desc "Twigpine CLI — decentralized git for AI agents and developers"
+            homepage "https://twigpine.com"
             version "${VERSION}"
             license "MIT OR Apache-2.0"
 
@@ -932,7 +932,7 @@ jobs:
           fi
           git commit -m "gl ${VERSION}"
           # Credentials are not persisted in .git/config; supply the token only for the push.
-          git push "https://x-access-token:${HOMEBREW_TAP_PAT}@github.com/Gitlawb/homebrew-tap.git" HEAD:main
+          git push "https://x-access-token:${HOMEBREW_TAP_PAT}@github.com/Twigpine/homebrew-tap.git" HEAD:main
 
   web-sync:
     name: Sync web (install scripts + version)
@@ -985,7 +985,7 @@ jobs:
         if: ${{ steps.guard.outputs.enabled == 'true' }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: Gitlawb/web
+          repository: Twigpine/web
           token: ${{ secrets.WEB_SYNC_PAT }}
           path: web
           persist-credentials: false
@@ -1028,7 +1028,7 @@ jobs:
           # One-time, idempotent drift fixes: drop orphaned binaries, fix stale link.
           rm -rf web/public/bin
           if [ -f web/public/skill.md ]; then
-            sed -i 's#github.com/gitlawb/releases#github.com/Gitlawb/node/releases#g' web/public/skill.md
+            sed -i 's#github.com/gitlawb/releases#github.com/Twigpine/node/releases#g' web/public/skill.md
           fi
 
           cd web
@@ -1042,16 +1042,16 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
-          git commit -m "chore: sync gitlawb ${TAG} (install scripts + version)"
+          git commit -m "chore: sync Twigpine ${TAG} (install scripts + version)"
           # Credentials are not persisted in .git/config; supply the token only for the push.
-          git push --force "https://x-access-token:${GH_TOKEN}@github.com/Gitlawb/web.git" "HEAD:$branch"
-          gh pr create --repo Gitlawb/web --head "$branch" \
-            --title "Sync gitlawb ${TAG}" \
-            --body "Automated sync from Gitlawb/node ${TAG}: install.sh, install.ps1, public/version.json, and one-time drift fixes (removed orphaned public/bin, fixed skill.md releases link). Review and merge to deploy via Vercel." \
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/Twigpine/web.git" "HEAD:$branch"
+          gh pr create --repo Twigpine/web --head "$branch" \
+            --title "Sync Twigpine ${TAG}" \
+            --body "Automated sync from Twigpine/node ${TAG}: install.sh, install.ps1, public/version.json, and one-time drift fixes (removed orphaned public/bin, fixed skill.md releases link). Review and merge to deploy via Vercel." \
             || {
               # Only swallow the "PR already exists" case; surface auth/API failures
               # (a failed gh pr list must not be misread as "PR exists").
-              pr_count="$(gh pr list --repo Gitlawb/web --head "$branch" --state open --json number --jq 'length')" || exit 1
+              pr_count="$(gh pr list --repo Twigpine/web --head "$branch" --state open --json number --jq 'length')" || exit 1
               if [ "$pr_count" != "0" ]; then
                 echo "PR for $branch already exists; branch was updated."
               else
