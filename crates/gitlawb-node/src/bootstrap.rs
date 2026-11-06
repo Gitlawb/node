@@ -1,4 +1,4 @@
-//! Embedded seed list of public Gitlawb network nodes.
+//! Embedded seed list of public Twigpine network nodes.
 //!
 //! This module parses `bootstrap-peers.json` (embedded at compile time) and
 //! merges its contents into the runtime config so a fresh `docker compose up`
