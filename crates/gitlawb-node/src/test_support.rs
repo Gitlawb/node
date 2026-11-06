@@ -17945,6 +17945,84 @@ mod tests {
         );
     }
 
+    fn open_bounty_on(id: &str, owner: &str, repo: &str, amount: i64) -> crate::db::BountyRecord {
+        crate::db::BountyRecord {
+            id: id.into(),
+            repo_owner: owner.into(),
+            repo_name: repo.into(),
+            issue_id: None,
+            title: id.into(),
+            amount,
+            creator_did: owner.into(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".into(),
+            created_at: "2026-03-01T00:00:00Z".into(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 86400,
+            tx_hash: None,
+        }
+    }
+
+    /// Mirror rows are written with `is_public = true` and no replicated rules,
+    /// so a mirror alone says nothing about the origin's visibility. The
+    /// aggregates must (a) hide bounties of a repo whose canonical twin is
+    /// private (the dedup keeps the canonical row and its rules), and (b) count
+    /// bounties of a mirror-only repo, which is how `authorize_repo_read` and
+    /// `/stats` already treat it. Both classes are pinned here.
+    #[sqlx::test]
+    async fn bounty_stats_mirror_rows_follow_canonical_twin_or_count_when_alone(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zMIRRORTWINOWNERAAAAAAAAAAAAAAAAAAA";
+        let short = owner.strip_prefix("did:key:").unwrap();
+        let remote = "did:key:zMIRRORONLYOWNERAAAAAAAAAAAAAAAAAAA";
+        let remote_short = remote.strip_prefix("did:key:").unwrap();
+
+        // Canonical private repo plus a mirror row for the same (owner, name).
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "twinned"))
+            .await
+            .unwrap();
+        state
+            .db
+            .upsert_mirror_repo(short, "twinned", "/tmp/mirror-twinned", None, false)
+            .await
+            .unwrap();
+        state
+            .db
+            .create_bounty(&open_bounty_on("bounty-twinned", owner, "twinned", 10))
+            .await
+            .unwrap();
+
+        // Mirror-only repo: no canonical twin on this node.
+        state
+            .db
+            .upsert_mirror_repo(remote_short, "alone", "/tmp/mirror-alone", None, false)
+            .await
+            .unwrap();
+        state
+            .db
+            .create_bounty(&open_bounty_on("bounty-alone", remote, "alone", 20))
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(anon_get("/api/v1/bounties/stats"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["open"], 1,
+            "only the mirror-only repo's bounty counts; the private canonical twin's must not"
+        );
+    }
+
     /// Exercises the root-rule branch of `listable_at_root`: a repo with
     /// `is_public = true` plus a root visibility rule (`path_glob = "/"`)
     /// whose `reader_dids` does NOT include the anonymous caller.  The rule
