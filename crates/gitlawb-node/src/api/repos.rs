@@ -8289,7 +8289,7 @@ mod tests {
         let add = server
             .mock("POST", mockito::Matcher::Any)
             .with_status(200)
-            .with_body(r#"{"Hash":"QmShouldNotHappen"}"#)
+            .with_body(r#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4"}"#)
             .expect(0)
             .create_async()
             .await;
