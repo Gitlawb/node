@@ -25,14 +25,22 @@ pub enum RepoCmd {
         private: bool,
         #[arg(long, default_value = "main")]
         branch: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
     },
     /// List repositories on a node
     List {
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -40,7 +48,11 @@ pub enum RepoCmd {
     /// Print the gitlawb:// clone command for a repo
     Clone {
         name: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -48,7 +60,11 @@ pub enum RepoCmd {
     /// Show repository metadata
     Info {
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -63,7 +79,11 @@ pub enum RepoCmd {
         /// Max number of commits to show
         #[arg(long, short, default_value = "20")]
         limit: u32,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -75,7 +95,11 @@ pub enum RepoCmd {
         /// New name for the fork (defaults to source repo name)
         #[arg(long, short)]
         name: Option<String>,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -84,7 +108,11 @@ pub enum RepoCmd {
     LabelAdd {
         repo: String,
         label: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -93,7 +121,11 @@ pub enum RepoCmd {
     LabelRemove {
         repo: String,
         label: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -101,7 +133,11 @@ pub enum RepoCmd {
     /// List labels on a repository
     LabelList {
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -110,7 +146,11 @@ pub enum RepoCmd {
     Owner {
         /// Repository name or owner/repo
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -126,7 +166,11 @@ pub enum RepoCmd {
         #[arg(long)]
         url: String,
         /// URL of the origin node (where the repo lives)
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -135,7 +179,11 @@ pub enum RepoCmd {
     ReplicaUnregister {
         /// Repository in owner/repo format
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -144,7 +192,11 @@ pub enum RepoCmd {
     Replicas {
         /// Repository in owner/repo format
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -251,13 +303,7 @@ async fn cmd_create(
         .post("/api/v1/repos", &body)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let payload: Value = resp.json().await.context("invalid JSON response")?;
-
-    if !status.is_success() {
-        let msg = payload["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("create failed ({status}): {msg}");
-    }
+    let payload = crate::http::read_json(resp, "create").await?;
 
     let clone_url = payload["clone_url"].as_str().unwrap_or("");
     let gitlawb_url = format!("gitlawb://{owner_did}/{name}");
@@ -265,7 +311,7 @@ async fn cmd_create(
     println!("✓ Created repository: {name}");
     println!("  Clone: git clone {gitlawb_url}");
     println!("  HTTP:  {clone_url}");
-    println!("  View:  https://gitlawb.com/{owner_short}/{name}");
+    println!("  View:  https://twigpine.com/{owner_short}/{name}");
     if let Some(desc) = payload["description"].as_str().filter(|s| !s.is_empty()) {
         println!("  Desc:  {desc}");
     }
@@ -277,12 +323,7 @@ async fn cmd_list(node: String, dir: Option<PathBuf>) -> Result<()> {
     let client = NodeClient::new(&node, None);
 
     let url = format!("/api/v1/repos?owner={owner}");
-    let repos: Value = client
-        .get(&url)
-        .await?
-        .json()
-        .await
-        .context("failed to list repos")?;
+    let repos = crate::http::read_json(client.get(&url).await?, "list repos").await?;
     let repos = repos.as_array().context("expected array")?;
 
     if repos.is_empty() {
@@ -351,20 +392,13 @@ async fn cmd_info(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
     // A non-existent (or unreadable/quarantined) repo is a real 404 from the
     // node — surface it plainly instead of printing a stub card with `?` fields
     // and a placeholder owner DID.
-    if !resp.status().is_success() {
-        if resp.status().as_u16() == 404 {
-            anyhow::bail!("repository '{owner}/{name}' not found");
-        }
-        let status = resp.status();
-        let msg = resp
-            .json::<Value>()
-            .await
-            .ok()
-            .and_then(|v| v["message"].as_str().map(String::from))
-            .unwrap_or_else(|| "request failed".to_string());
-        anyhow::bail!("repo info failed ({status}): {msg}");
+    if resp.status().as_u16() == 404 {
+        anyhow::bail!("repository '{owner}/{name}' not found");
     }
-    let r: Value = resp.json().await.context("parse repo info")?;
+    // Every other status routes through read_json: a 2xx yields the parsed body,
+    // any other non-2xx yields the node's capped + sanitized message, and
+    // the error read is bounded rather than buffering the whole hostile body.
+    let r = crate::http::read_json(resp, "repo info").await?;
 
     let owner_did = r["owner_did"].as_str().unwrap_or(&owner);
     let gitlawb_url = format!("gitlawb://{owner_did}/{name}");
@@ -423,12 +457,7 @@ async fn cmd_replica_register(
         .await
         .context("failed to connect to origin node")?;
 
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("replica register failed ({status}): {msg}");
-    }
+    let body = crate::http::read_json(resp, "replica register").await?;
 
     let count = body["replica_count"].as_i64().unwrap_or(0);
     println!("Registered as replica of {owner}/{name}");
@@ -455,12 +484,7 @@ async fn cmd_replica_unregister(repo: String, node: String, dir: Option<PathBuf>
         .await
         .context("failed to connect to origin node")?;
 
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("replica unregister failed ({status}): {msg}");
-    }
+    let body = crate::http::read_json(resp, "replica unregister").await?;
 
     let count = body["replica_count"].as_i64().unwrap_or(0);
     println!("Unregistered as replica of {owner}/{name}  ({count} replicas remaining)");
@@ -480,12 +504,7 @@ async fn cmd_replicas(repo: String, node: String, dir: Option<PathBuf>) -> Resul
         .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/replicas"))
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("replicas list failed ({status}): {msg}");
-    }
+    let body = crate::http::read_json(resp, "replicas list").await?;
 
     let count = body["replica_count"].as_i64().unwrap_or(0);
     println!("{owner}/{name}: {count} replicas");
@@ -521,12 +540,7 @@ pub(crate) async fn cmd_commits(
     };
 
     let url = format!("/api/v1/repos/{owner}/{name}/commits?branch={branch}&limit={limit}");
-    let resp: Value = client
-        .get(&url)
-        .await?
-        .json()
-        .await
-        .context("failed to fetch commits")?;
+    let resp = crate::http::read_json(client.get(&url).await?, "commits").await?;
 
     let commits = resp["commits"].as_array().cloned().unwrap_or_default();
     if commits.is_empty() {
@@ -579,13 +593,7 @@ async fn cmd_fork(
         .post(&format!("/api/v1/repos/{owner}/{repo_name}/fork"), &body)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON response")?;
-
-    if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("fork failed ({status}): {msg}");
-    }
+    let result = crate::http::read_json(resp, "fork").await?;
 
     let fork_name = result["name"].as_str().unwrap_or(&repo_name);
     let owner_did = result["owner_did"].as_str().unwrap_or("?");
@@ -623,13 +631,7 @@ async fn cmd_label_add(
         .post(&format!("/api/v1/repos/{owner}/{name}/labels"), &body)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("add label failed ({status}): {msg}");
-    }
+    let result = crate::http::read_json(resp, "add label").await?;
 
     let added = result["added"].as_bool().unwrap_or(true);
     if added {
@@ -654,13 +656,7 @@ async fn cmd_label_remove(
         .delete(&format!("/api/v1/repos/{owner}/{name}/labels/{label}"), &[])
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("remove label failed ({status}): {msg}");
-    }
+    let _ = crate::http::read_json(resp, "remove label").await?;
 
     println!("- Label removed: {label} from {owner}/{name}");
     Ok(())
@@ -673,18 +669,21 @@ async fn cmd_label_list(repo: String, node: String, dir: Option<PathBuf>) -> Res
     // read their own labels, while public repos stay anonymously listable.
     let client = NodeClient::new(&node, load_keypair_from_dir(dir.as_deref()).ok());
 
-    let resp = client
-        .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/labels"))
-        .await
-        .context("failed to connect to node")?;
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("list labels failed ({status}): {msg}");
-    }
+    // Marry both refactors: main's get_maybe_signed (read-visibility gating —
+    // public repos stay anon-listable, private-repo owner signs) carrying the
+    // PR's read_json status-check-before-parse (#186: bounded error read, no
+    // parse-before-status). get_authed from the PR is dropped in favor of
+    // get_maybe_signed so the visibility gate is preserved.
+    let resp = crate::http::read_json(
+        client
+            .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/labels"))
+            .await
+            .context("failed to connect to node")?,
+        "list labels",
+    )
+    .await?;
 
-    let labels = body["labels"].as_array().cloned().unwrap_or_default();
+    let labels = resp["labels"].as_array().cloned().unwrap_or_default();
     if labels.is_empty() {
         println!("No labels on {owner}/{name}");
     } else {
@@ -857,6 +856,7 @@ mod tests {
             .with_status(409)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository already exists"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -872,6 +872,8 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already exists"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -937,6 +939,33 @@ mod tests {
         cmd_list(server.url(), Some(dir.path().to_path_buf()))
             .await
             .unwrap();
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_list_repos_surfaces_denial() {
+        // A node error must Err with the status, not trip the vague "expected
+        // array" fallback that hides the node's actual response.
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos\?owner=".to_string()),
+            )
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"boom"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = cmd_list(server.url(), Some(dir.path().to_path_buf()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"), "got: {err}");
         _m.assert_async().await;
     }
 
@@ -1039,6 +1068,7 @@ mod tests {
             .with_status(400)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"you already have a repo named myrepo"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -1054,6 +1084,8 @@ mod tests {
             err.to_string().contains("already have a repo"),
             "got: {err}"
         );
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -1426,6 +1458,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -1438,6 +1471,106 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("not found"), "got: {err}");
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _repo.assert_async().await;
+    }
+
+    // ── Gated CLI reads surface node denials, not empty renders (#123) ──
+
+    #[tokio::test]
+    async fn cmd_commits_surfaces_denial_not_empty() {
+        // A gated 404 must Err, not print "No commits" as if the repo were empty.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/alice/secret/commits".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = cmd_commits(
+            "alice/secret".to_string(),
+            "main".to_string(),
+            20,
+            server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "cmd_commits must Err on 404");
+        assert!(result.unwrap_err().to_string().contains("not found"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_label_list_surfaces_denial_not_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/alice/secret/labels".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = cmd_label_list("alice/secret".to_string(), server.url(), None).await;
+        assert!(result.is_err(), "cmd_label_list must Err on 404");
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    // cmd_info keeps its bespoke 404 message ahead of read_json...
+    #[tokio::test]
+    async fn cmd_info_404_keeps_bespoke_message() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"gone"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let err = cmd_info("alice/secret".to_string(), server.url(), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("repository 'alice/secret' not found"),
+            "bespoke 404 text lost: {err}"
+        );
+        _m.assert_async().await;
+    }
+
+    // ...and every other non-2xx routes through read_json (capped + sanitized).
+    #[tokio::test]
+    async fn cmd_info_500_routes_through_read_json() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret")
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"boom"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let err = cmd_info("alice/secret".to_string(), server.url(), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("repo info failed"),
+            "read_json label lost: {err}"
+        );
+        assert!(err.contains("500"), "status not surfaced: {err}");
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -1636,7 +1769,7 @@ mod vet_merge_deny_arms {
     }
 
     // An authenticated caller DENIED with a 403 must surface an error, never
-    // render a repo card (deny-as-success is the INV-8 client-contract break).
+    // render a repo card (deny-as-success is the client-contract break).
     #[tokio::test]
     async fn cmd_info_403_denied_surfaces_error_not_card() {
         let dir = TempDir::new().unwrap();

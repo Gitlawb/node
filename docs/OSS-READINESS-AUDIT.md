@@ -53,8 +53,8 @@ Recommended next CI additions:
 
 Fixed in this pass:
 
-- `install.sh` now downloads from `Gitlawb/node`, matches release asset names (`gitlawb-node-<version>-<target>.tar.gz`), handles `--version vX.Y.Z`, extracts the packaged directory, verifies checksums, and installs `gl`, `git-remote-gitlawb`, and `gitlawb-node` when present.
-- `docs/RUN-A-NODE.md` now matches the README Rust requirement (`1.91+`) and the release workflow's GHCR image path (`ghcr.io/gitlawb/node:latest`).
+- `install.sh` now downloads from `Twigpine/node`, matches release asset names (`gitlawb-node-<version>-<target>.tar.gz`), handles `--version vX.Y.Z`, extracts the packaged directory, verifies checksums, and installs `gl`, `git-remote-gitlawb`, and `gitlawb-node` when present.
+- `docs/RUN-A-NODE.md` now matches the README Rust requirement (`1.91+`) and the release workflow's GHCR image path (`ghcr.io/twigpine/node:latest`).
 - `docs/ECONOMICS.md` no longer claims this repo ships a `keeper-distribute.yml` workflow that is not present.
 - `.env.example` now distinguishes HTTP bootstrap peers from libp2p multiaddrs and documents seed-list opt-out.
 - `scripts/build-bins.sh` now writes to `dist/bin` instead of a missing `web/public/bin` path.
@@ -62,8 +62,8 @@ Fixed in this pass:
 
 Remaining doc caveats:
 
-- Public docs URLs (`gitlawb.com/install.sh`, `docs.gitlawb.com`) were not verified in this local pass.
-- `git-remote-gitlawb` defaults to `http://127.0.0.1:7545`, while most `gl` commands default to `https://node.gitlawb.com`; the docs should be explicit about setting `GITLAWB_NODE` for public-network cloning/fetching.
+- Public docs URLs (`twigpine.com/install.sh`, `docs.gitlawb.com`) were not verified in this local pass.
+- `git-remote-gitlawb` defaults to `http://127.0.0.1:7545`, while most `gl` commands default to `https://node.twigpine.com`; the docs should be explicit about setting `GITLAWB_NODE` for public-network cloning/fetching.
 
 ## Docker and self-hosting readiness
 
@@ -95,7 +95,7 @@ Live-network blockers to prioritize:
 - GraphQL POST is still open for compatibility; GraphQL mutations should get mutation-aware auth before it becomes a public write API surface.
 - Push authorization is still not capability-complete. A valid DID signature is authentication, not authorization. Owner checks are now enforced on every branch, protected or not (`GITLAWB_ENFORCE_OWNER_PUSH`, on by default); what remains is that a UCAN `git/push` capability is not yet honored, so a delegated or CI key cannot push.
 - UCAN chain validation is incomplete and UCAN revocation/blocklisting is not implemented as an operator feature.
-- Private repository reads are not enforced. `is_public` and `GITLAWB_PUBLIC_READ` exist, but per-repository private-read behavior is not wired.
+- Private repository reads are enforced per repository through `is_public` and path-scoped visibility rules. `GITLAWB_PUBLIC_READ` remains reserved and inert.
 - Peer URLs are self-asserted by DIDs. Signatures prove control of the DID key when present, not ownership/safety of the announced URL.
 - Outbound peer fetch/ping/sync paths should be reviewed for SSRF protections before accepting arbitrary public peer registrations.
 
@@ -146,8 +146,16 @@ Risks:
 ## Obvious live-network priorities
 
 1. Implement repo write authorization: owner checks, UCAN capability checks, and clear delegation semantics for push/PR/issue/bounty operations.
-2. Implement private-read enforcement or remove private repo affordances until it exists.
+2. Private reads are already enforced per repository (`is_public` plus path-scoped rules); retire the reserved and inert `GITLAWB_PUBLIC_READ` flag or document it as permanently reserved.
 3. Add UCAN revocation/blocklisting and operator docs for emergency key compromise.
 4. Harden peer registration and outbound fetch behavior against SSRF and peer-list poisoning.
 5. Add Docker/installer/release smoke tests to CI.
 6. Label PoS/economics docs consistently with the current live contract and rewards status.
+
+## Status updates (post-snapshot)
+
+These entries record security-posture changes after the 2026-05-28 inspection above. They do not rewrite that snapshot's command output or test counts.
+
+### 2026-08-30: GraphQL mutation auth and completeness fence (#87, #219)
+
+At `main` from `bfc44f92` onward, GraphQL mutations require a verified signer bound to the acting DID. The surface stays limited to the agent-task queue; repo writes are not exposed over GraphQL. PR #219 adds `every_graphql_mutation_has_its_gate`, a CI completeness fence that discovers mutations from the built schema SDL (with an introspection cross-check for hidden fields) and requires signer acquisition plus actor binding in each registered resolver.

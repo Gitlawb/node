@@ -355,7 +355,13 @@ fn submit_answer(
 /// Returns `None` when stdin isn't a usable interactive source (e.g. an agent),
 /// so the caller surfaces a clear "couldn't auto-solve" error instead.
 fn interactive_prompt(challenge: &Challenge) -> Option<String> {
-    use std::io::{stderr, stdin, Write};
+    use std::io::{stderr, stdin, IsTerminal, Write};
+    // An open but silent stdin (a pipe an orchestrator holds open, an agent
+    // harness) has no one to answer: `read_line` would block forever. Only a
+    // terminal can be interactive.
+    if !stdin().is_terminal() {
+        return None;
+    }
     let mut err = stderr();
     let _ = writeln!(
         err,
@@ -760,5 +766,69 @@ mod tests {
             "empty GITLAWB_ICAPTCHA_API_KEY must normalize to None"
         );
         assert_eq!(non_empty.api_key.as_deref(), Some("secret-bearer"));
+    }
+
+    /// #345: an open-but-silent non-TTY stdin must not hang the prompt. The
+    /// child runs `interactive_prompt` with a held-open, empty pipe as stdin:
+    /// without the terminal check `read_line` blocks forever; with it the
+    /// child returns `None` and exits.
+    #[test]
+    fn interactive_prompt_skips_open_silent_pipe() {
+        const CHILD_ENV: &str = "ICAPTCHA_PROMPT_PIPE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let ch = Challenge {
+                challenge_id: "c".into(),
+                kind: "arithmetic".into(),
+                difficulty: 1,
+                prompt: "What is 1 + 1?".into(),
+                token: "t".into(),
+                pow: None,
+            };
+            assert!(interactive_prompt(&ch).is_none());
+            println!("prompt-skipped");
+            return;
+        }
+        let exe = std::env::current_exe().expect("current test binary");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "tests::interactive_prompt_skips_open_silent_pipe",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn child test");
+        // The parent keeps the write end open with no data, which is exactly
+        // the shape that hung: an open, silent, non-terminal stdin.
+        let _held_stdin = child.stdin.take();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match child.try_wait().expect("poll child") {
+                Some(status) => {
+                    assert!(status.success(), "child exited with {status}");
+                    let mut out = String::new();
+                    std::io::Read::read_to_string(
+                        &mut child.stdout.take().expect("child stdout"),
+                        &mut out,
+                    )
+                    .expect("read child stdout");
+                    assert!(
+                        out.contains("prompt-skipped"),
+                        "child test body did not run: {out}"
+                    );
+                    return;
+                }
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                None => {
+                    let _ = child.kill();
+                    panic!("interactive_prompt blocked on an open, silent non-TTY stdin");
+                }
+            }
+        }
     }
 }
