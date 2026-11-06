@@ -1,4 +1,4 @@
-//! `gl clone`: clean partial clone of a gitlawb repo with private subtrees.
+//! `gl clone`: clean partial clone of a Twigpine repo with private subtrees.
 //!
 //! A repo may withhold blob content under some path globs from the caller
 //! (Phase 3). The resulting pack is not closed under reachability, so a stock
@@ -76,7 +76,11 @@ pub struct CloneArgs {
     #[arg(long)]
     pub branch: Option<String>,
 
-    #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+    #[arg(
+        long,
+        default_value = "https://node.twigpine.com",
+        env = "GITLAWB_NODE"
+    )]
     pub node: String,
 
     /// Arweave gateway for B3 manifest discovery/fetch when a node cannot supply
@@ -574,7 +578,7 @@ fn merge_manifests(
         .collect()
 }
 
-/// Option B3 fallback recovery, with no dependency on a gitlawb node API. Query
+/// Option B3 fallback recovery, with no dependency on a Twigpine node API. Query
 /// the Arweave gateway for this repo's encrypted manifests, merge them, and for
 /// each blob still missing locally that the caller can decrypt, pull the envelope
 /// from a public IPFS gateway, decrypt, and install it as a loose object. Returns

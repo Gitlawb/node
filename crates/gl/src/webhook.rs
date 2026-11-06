@@ -31,7 +31,11 @@ pub enum WebhookCmd {
         /// Optional HMAC secret for payload signing (sets X-Gitlawb-Signature-256)
         #[arg(long)]
         secret: Option<String>,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -40,7 +44,11 @@ pub enum WebhookCmd {
     List {
         /// Repository name
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -51,7 +59,11 @@ pub enum WebhookCmd {
         repo: String,
         /// Webhook ID
         id: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -98,17 +110,17 @@ async fn cmd_create(
         "events": event_list,
     }))?;
 
-    let resp = client
-        .post(&format!("/api/v1/repos/{owner}/{name}/hooks"), &payload)
-        .await
-        .context("failed to connect to node")?;
-    let status = resp.status();
-    let hook: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = hook["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("create webhook failed ({status}): {msg}");
-    }
+    // #186: read_json status-checks before parsing and bounds the error body, so
+    // a denial (or a hostile oversized error) fails here instead of being parsed
+    // whole. `what` preserves main's "create webhook failed (...)" message prefix.
+    let hook = crate::http::read_json(
+        client
+            .post(&format!("/api/v1/repos/{owner}/{name}/hooks"), &payload)
+            .await
+            .context("failed to connect to node")?,
+        "create webhook",
+    )
+    .await?;
 
     let id = hook["id"].as_str().unwrap_or("?");
     let hook_events = hook["events"]
@@ -145,16 +157,15 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
 
     // get_signed (not get) attaches the RFC 9421 signature — plain get() never
     // signs, and the node owner-gates this route, so an unsigned GET 401s.
-    let resp = client
-        .get_signed(&format!("/api/v1/repos/{owner}/{name}/hooks"))
-        .await?;
-    let status = resp.status();
-    let body: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("list webhooks failed ({status}): {msg}");
-    }
+    // #186: read_json status-checks + bounds the error body; `what` preserves
+    // main's "list webhooks failed (...)" message prefix.
+    let body = crate::http::read_json(
+        client
+            .get_signed(&format!("/api/v1/repos/{owner}/{name}/hooks"))
+            .await?,
+        "list webhooks",
+    )
+    .await?;
 
     let hooks = body
         .get("webhooks")
@@ -195,20 +206,20 @@ async fn cmd_delete(repo: String, id: String, node: String, dir: Option<PathBuf>
     let client = NodeClient::new(&node, Some(keypair));
 
     let payload = serde_json::to_vec(&serde_json::json!({}))?;
-    let resp = client
-        .delete(
-            &format!("/api/v1/repos/{owner}/{name}/hooks/{id}"),
-            &payload,
-        )
-        .await
-        .context("failed to connect to node")?;
-    let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("delete webhook failed ({status}): {msg}");
-    }
+    // #186: read_json status-checks + bounds the error body; `what` preserves
+    // main's "delete webhook failed (...)" message prefix. The success body is
+    // unused, so discard it.
+    let _ = crate::http::read_json(
+        client
+            .delete(
+                &format!("/api/v1/repos/{owner}/{name}/hooks/{id}"),
+                &payload,
+            )
+            .await
+            .context("failed to connect to node")?,
+        "delete webhook",
+    )
+    .await?;
 
     println!("✓ Webhook {id} deleted");
     Ok(())

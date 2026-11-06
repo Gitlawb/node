@@ -67,7 +67,7 @@ class StatusBarController: NSObject {
 
         menu.addItem(.separator())
 
-        let quitItem = NSMenuItem(title: "Quit Gitlawb Node", action: #selector(quit), keyEquivalent: "q")
+        let quitItem = NSMenuItem(title: "Quit Twigpine Node", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
     }
@@ -102,7 +102,7 @@ class StatusBarController: NSObject {
                 iconImage = img
             } else {
                 // Last resort fallback to SF Symbol
-                iconImage = NSImage(systemSymbolName: "network", accessibilityDescription: "Gitlawb Node") ?? NSImage()
+                iconImage = NSImage(systemSymbolName: "network", accessibilityDescription: "Twigpine Node") ?? NSImage()
             }
         }
 
@@ -181,7 +181,7 @@ class StatusBarController: NSObject {
             backing: .buffered,
             defer: false
         )
-        panel.title = "Gitlawb Node Logs"
+        panel.title = "Twigpine Node Logs"
         panel.isReleasedWhenClosed = false
         panel.center()
         self.logsWindow = panel
@@ -235,7 +235,7 @@ class StatusBarController: NSObject {
         let alert = NSAlert()
         alert.messageText = "Docker Not Found"
         alert.informativeText = """
-            Gitlawb Node requires a Docker runtime to run.
+            Twigpine Node requires a Docker runtime to run.
 
             Install one of the following:
             • Docker Desktop (docker.com)

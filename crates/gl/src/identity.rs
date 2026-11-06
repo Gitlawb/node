@@ -154,7 +154,7 @@ async fn cmd_new_with_reader(
     println!("  DID:  {did}");
     println!("  Key:  {}", path.display());
     println!();
-    println!("  Your DID is your identity on the gitlawb network.");
+    println!("  Your DID is your identity on the Twigpine network.");
     println!("  Keep your key file safe — it cannot be recovered if lost.");
 
     Ok(())
