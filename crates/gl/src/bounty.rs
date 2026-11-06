@@ -403,7 +403,7 @@ async fn cmd_stats(node: String) -> Result<()> {
                 let did = entry["did"].as_str().unwrap_or("?");
                 let count = entry["completed"].as_i64().unwrap_or(0);
                 let earned = entry["total_earned"].as_i64().unwrap_or(0);
-                let short = &did[did.len().saturating_sub(8)..];
+                let short = crate::text::truncate_suffix(did, 8);
                 println!(
                     "  {}. ...{short}  {count} bounties  {earned} $GITLAWB",
                     i + 1
