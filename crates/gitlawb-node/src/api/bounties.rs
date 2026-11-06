@@ -456,21 +456,68 @@ pub async fn dispute_bounty(
     Ok(Json(updated))
 }
 
+/// Resolve the set of `(owner_did, name)` pairs for repos an anonymous caller
+/// can list.  Mirrors the `stats()` pattern in `server.rs` (#104): batch-load
+/// all deduped repos, batch-load their visibility rules, keep only those that
+/// pass `listable_at_root`.  Pure I/O after the two DB round-trips — no
+/// per-repo authorization queries.
+///
+/// Both bounty stats handlers mount behind `optional_signature` (see
+/// `bounty_read_routes` in server.rs), so the caller is always `None` for
+/// anonymous access.  Every caller, signed or not, currently receives the
+/// anonymous-scoped aggregates (matching the #104 pattern); per-caller
+/// visibility can be threaded through here when that work lands.
+///
+/// A database error is returned to the caller, never collapsed to an empty
+/// set: an empty set would render as HTTP 200 with zero counts, which a client
+/// reads as confirmed absence of activity.
+async fn visible_repo_pairs(state: &AppState) -> Result<Vec<(String, String)>> {
+    let rows = state.db.list_all_repos_deduped().await?;
+    let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+    let rules_by_repo = state.db.list_visibility_rules_for_repos(&ids).await?;
+    let pairs = rows
+        .iter()
+        .filter(|r| {
+            let rules = rules_by_repo.get(&r.id).map(Vec::as_slice).unwrap_or(&[]);
+            // mirror-rows-handled: a mirror with a canonical twin is deduped to the
+            // canonical row and its rules; a mirror-only repo counts as public, the
+            // same answer authorize_repo_read and /stats give. Pinned by
+            // bounty_stats_mirror_rows_follow_canonical_twin_or_count_when_alone.
+            crate::visibility::listable_at_root(rules, r.is_public, &r.owner_did, None)
+        })
+        .map(|r| {
+            (
+                crate::db::normalize_owner_key(&r.owner_did).to_string(),
+                r.name.clone(),
+            )
+        })
+        .collect();
+    Ok(pairs)
+}
+
 /// GET /api/v1/bounties/stats
+///
+/// Aggregates are restricted to anonymously-listable repos so private-repo
+/// bounty activity is not exposed (#477).  The visible-repo set is resolved
+/// once per request via `visible_repo_pairs` (two SQL round-trips), then
+/// passed into the filtered aggregate queries.
 pub async fn bounty_stats(State(state): State<AppState>) -> Result<Json<BountyStatsResponse>> {
-    let open = state.db.count_bounties_by_status("open").await.unwrap_or(0);
+    let visible = visible_repo_pairs(&state).await?;
+
+    let open = state
+        .db
+        .count_bounties_by_status_visible("open", &visible)
+        .await?;
     let claimed = state
         .db
-        .count_bounties_by_status("claimed")
-        .await
-        .unwrap_or(0);
+        .count_bounties_by_status_visible("claimed", &visible)
+        .await?;
     let completed = state
         .db
-        .count_bounties_by_status("completed")
-        .await
-        .unwrap_or(0);
+        .count_bounties_by_status_visible("completed", &visible)
+        .await?;
 
-    let leaders = state.db.bounty_leaderboard(10).await.unwrap_or_default();
+    let leaders = state.db.bounty_leaderboard_visible(10, &visible).await?;
     let leaderboard = leaders
         .into_iter()
         .map(|(did, cnt, total)| AgentBountyEntry {
@@ -489,11 +536,14 @@ pub async fn bounty_stats(State(state): State<AppState>) -> Result<Json<BountySt
 }
 
 /// GET /api/v1/agents/{did}/bounties
+///
+/// Per-agent earnings restricted to anonymously-listable repos (#477).
 pub async fn agent_bounty_stats(
     State(state): State<AppState>,
     Path(did): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let (count, total) = state.db.agent_bounty_stats(&did).await.unwrap_or((0, 0));
+    let visible = visible_repo_pairs(&state).await?;
+    let (count, total) = state.db.agent_bounty_stats_visible(&did, &visible).await?;
     Ok(Json(serde_json::json!({
         "did": did,
         "completed_bounties": count,

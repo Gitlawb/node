@@ -17647,6 +17647,626 @@ mod tests {
         );
     }
 
+    // ── #477: bounty stats aggregates ignore repo visibility ──────────────────
+
+    #[sqlx::test]
+    async fn bounty_stats_filters_private_repos_for_anon(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zSTATSBOUNTYOWNERAAAAAAAAAAAAAAAAAAAA";
+        let agent_private = "did:key:zSTATSPRIVATECLAIMANT00000000000";
+        let agent_public = "did:key:zSTATSPUBLICCLAIMANT000000000000";
+
+        // Private repo with 1 open and 1 completed bounty
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "private-repo"))
+            .await
+            .unwrap();
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-priv-open".into(),
+                repo_owner: owner.into(),
+                repo_name: "private-repo".into(),
+                issue_id: None,
+                title: "Private Open".into(),
+                amount: 100,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+        // Drive the private completed bounty through the real claim/approve path
+        // so `claimant_did` and `completed_at` are actually persisted (#477 P1).
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-priv-comp".into(),
+                repo_owner: owner.into(),
+                repo_name: "private-repo".into(),
+                issue_id: None,
+                title: "Private Completed".into(),
+                amount: 500,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-01-02T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .claim_bounty(
+                "bounty-priv-comp",
+                agent_private,
+                None,
+                "2026-01-02T01:00:00Z",
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .submit_bounty("bounty-priv-comp", "pr-priv-1", "2026-01-02T02:00:00Z")
+            .await
+            .unwrap();
+        state
+            .db
+            .approve_bounty("bounty-priv-comp", "2026-01-03T00:00:00Z", None)
+            .await
+            .unwrap();
+
+        // Public repo with 1 open and 1 completed bounty
+        let mut public_repo = seed_private_repo(owner, "public-repo");
+        public_repo.is_public = true;
+        state.db.create_repo(&public_repo).await.unwrap();
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-pub-open".into(),
+                repo_owner: owner.into(),
+                repo_name: "public-repo".into(),
+                issue_id: None,
+                title: "Public Open".into(),
+                amount: 200,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-01-04T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+        // Drive the public completed bounty through claim→submit→approve.
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-pub-comp".into(),
+                repo_owner: owner.into(),
+                repo_name: "public-repo".into(),
+                issue_id: None,
+                title: "Public Completed".into(),
+                amount: 300,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-01-05T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .claim_bounty(
+                "bounty-pub-comp",
+                agent_public,
+                None,
+                "2026-01-05T01:00:00Z",
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .submit_bounty("bounty-pub-comp", "pr-pub-1", "2026-01-05T02:00:00Z")
+            .await
+            .unwrap();
+        state
+            .db
+            .approve_bounty("bounty-pub-comp", "2026-01-06T00:00:00Z", None)
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(anon_get("/api/v1/bounties/stats"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+
+        // Anonymous observer must only see counts from the public repo (#477)
+        assert_eq!(
+            body["open"], 1,
+            "only 1 public open bounty should be counted"
+        );
+        assert_eq!(
+            body["completed"], 1,
+            "only 1 public completed bounty should be counted"
+        );
+        let leaders = body["leaderboard"].as_array().unwrap();
+        assert_eq!(
+            leaders.len(),
+            1,
+            "leaderboard must exclude private earnings"
+        );
+        assert_eq!(leaders[0]["did"], agent_public);
+        assert_eq!(leaders[0]["completed"], 1);
+        assert_eq!(leaders[0]["total_earned"], 300);
+    }
+
+    #[sqlx::test]
+    async fn agent_bounty_stats_filters_private_repos_for_anon(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zAGNTSTATSBOWNERAAAAAAAAAAAAAAAAAAAA";
+        let agent = "did:key:zAGNTSTATSAAGENT000000000000000000";
+
+        // Private repo where agent earned a bounty
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "agent-secret-repo"))
+            .await
+            .unwrap();
+        // Drive through the real claim path so claimant_did persists.
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-secret-agent".into(),
+                repo_owner: owner.into(),
+                repo_name: "agent-secret-repo".into(),
+                issue_id: None,
+                title: "Secret Task".into(),
+                amount: 750,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .claim_bounty("bounty-secret-agent", agent, None, "2026-01-01T01:00:00Z")
+            .await
+            .unwrap();
+        state
+            .db
+            .submit_bounty("bounty-secret-agent", "pr-secret-1", "2026-01-01T02:00:00Z")
+            .await
+            .unwrap();
+        state
+            .db
+            .approve_bounty("bounty-secret-agent", "2026-01-02T00:00:00Z", None)
+            .await
+            .unwrap();
+
+        // Public repo where the SAME agent also earned a bounty: proves the
+        // filter admits public earnings rather than always returning zero.
+        let mut public_repo = seed_private_repo(owner, "agent-public-repo");
+        public_repo.is_public = true;
+        state.db.create_repo(&public_repo).await.unwrap();
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-public-agent".into(),
+                repo_owner: owner.into(),
+                repo_name: "agent-public-repo".into(),
+                issue_id: None,
+                title: "Public Task".into(),
+                amount: 250,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-01-03T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .claim_bounty("bounty-public-agent", agent, None, "2026-01-03T01:00:00Z")
+            .await
+            .unwrap();
+        state
+            .db
+            .submit_bounty("bounty-public-agent", "pr-pub-1", "2026-01-03T02:00:00Z")
+            .await
+            .unwrap();
+        state
+            .db
+            .approve_bounty("bounty-public-agent", "2026-01-04T00:00:00Z", None)
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let uri = format!("/api/v1/agents/{agent}/bounties");
+        let resp = router.oneshot(anon_get(&uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+
+        // Anonymous query must not leak private earnings, but must still admit
+        // the agent's public earnings (not an always-zero over-denial).
+        assert_eq!(
+            body["completed_bounties"], 1,
+            "only the public completed bounty must be counted"
+        );
+        assert_eq!(
+            body["total_earned"], 250,
+            "only the public bounty's earnings must be counted, not the private 750"
+        );
+    }
+
+    fn open_bounty_on(id: &str, owner: &str, repo: &str, amount: i64) -> crate::db::BountyRecord {
+        crate::db::BountyRecord {
+            id: id.into(),
+            repo_owner: owner.into(),
+            repo_name: repo.into(),
+            issue_id: None,
+            title: id.into(),
+            amount,
+            creator_did: owner.into(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".into(),
+            created_at: "2026-03-01T00:00:00Z".into(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 86400,
+            tx_hash: None,
+        }
+    }
+
+    /// `claimant_did` is stored in whatever form the claimer sent, so the
+    /// per-agent lookup must match both `did:key:<key>` and the bare key for
+    /// either spelling of the request path.
+    #[sqlx::test]
+    async fn agent_bounty_stats_matches_full_and_bare_claimant_forms(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zCLAIMFORMOWNERAAAAAAAAAAAAAAAAAAAA";
+        let bare = "zCLAIMFORMAGENT0000000000000000000";
+        let full = format!("did:key:{bare}");
+
+        let mut repo = seed_private_repo(owner, "claim-form-repo");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.unwrap();
+
+        for (id, claimant, amount) in [("cf-full", full.as_str(), 100), ("cf-bare", bare, 30)] {
+            state
+                .db
+                .create_bounty(&open_bounty_on(id, owner, "claim-form-repo", amount))
+                .await
+                .unwrap();
+            state
+                .db
+                .claim_bounty(id, claimant, None, "2026-03-01T01:00:00Z")
+                .await
+                .unwrap();
+            state
+                .db
+                .submit_bounty(id, "pr-cf", "2026-03-01T02:00:00Z")
+                .await
+                .unwrap();
+            state
+                .db
+                .approve_bounty(id, "2026-03-02T00:00:00Z", None)
+                .await
+                .unwrap();
+        }
+
+        let router = crate::server::build_router(state);
+        for path_did in [full.as_str(), bare] {
+            let uri = format!("/api/v1/agents/{path_did}/bounties");
+            let resp = router.clone().oneshot(anon_get(&uri)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = json_body(resp).await;
+            assert_eq!(
+                body["completed_bounties"], 2,
+                "both claimant spellings must count for path {path_did}"
+            );
+            assert_eq!(
+                body["total_earned"], 130,
+                "both claimant spellings must be summed for path {path_did}"
+            );
+        }
+    }
+
+    /// A database failure must surface as an error status, never as a 200
+    /// carrying zero counts that read as confirmed absence of activity.
+    #[sqlx::test]
+    async fn bounty_stats_db_failure_is_not_reported_as_zero(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let router = crate::server::build_router(state);
+        pool.close().await;
+
+        for uri in [
+            "/api/v1/bounties/stats",
+            "/api/v1/agents/did:key:zDBFAILAGENTAAAAAAAAAAAAAAAAAAAAA/bounties",
+        ] {
+            let resp = router.clone().oneshot(anon_get(uri)).await.unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::OK,
+                "{uri} must not report zero counts when the database is down"
+            );
+            assert!(resp.status().is_server_error(), "{uri}: {}", resp.status());
+        }
+    }
+
+    /// Mirror rows are written with `is_public = true` and no replicated rules,
+    /// so a mirror alone says nothing about the origin's visibility. The
+    /// aggregates must (a) hide bounties of a repo whose canonical twin is
+    /// private (the dedup keeps the canonical row and its rules), and (b) count
+    /// bounties of a mirror-only repo, which is how `authorize_repo_read` and
+    /// `/stats` already treat it. Both classes are pinned here.
+    #[sqlx::test]
+    async fn bounty_stats_mirror_rows_follow_canonical_twin_or_count_when_alone(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zMIRRORTWINOWNERAAAAAAAAAAAAAAAAAAA";
+        let short = owner.strip_prefix("did:key:").unwrap();
+        let remote = "did:key:zMIRRORONLYOWNERAAAAAAAAAAAAAAAAAAA";
+        let remote_short = remote.strip_prefix("did:key:").unwrap();
+
+        // Canonical private repo plus a mirror row for the same (owner, name).
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "twinned"))
+            .await
+            .unwrap();
+        state
+            .db
+            .upsert_mirror_repo(short, "twinned", "/tmp/mirror-twinned", None, false)
+            .await
+            .unwrap();
+        state
+            .db
+            .create_bounty(&open_bounty_on("bounty-twinned", owner, "twinned", 10))
+            .await
+            .unwrap();
+
+        // Mirror-only repo: no canonical twin on this node.
+        state
+            .db
+            .upsert_mirror_repo(remote_short, "alone", "/tmp/mirror-alone", None, false)
+            .await
+            .unwrap();
+        state
+            .db
+            .create_bounty(&open_bounty_on("bounty-alone", remote, "alone", 20))
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(anon_get("/api/v1/bounties/stats"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["open"], 1,
+            "only the mirror-only repo's bounty counts; the private canonical twin's must not"
+        );
+    }
+
+    /// Exercises the root-rule branch of `listable_at_root`: a repo with
+    /// `is_public = true` plus a root visibility rule (`path_glob = "/"`)
+    /// whose `reader_dids` does NOT include the anonymous caller.  The rule
+    /// takes precedence over `is_public`, so the repo's bounties must be
+    /// excluded from anonymous aggregates.
+    #[sqlx::test]
+    async fn bounty_stats_root_rule_overrides_is_public(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zROOTRULEOWNERAAAAAAAAAAAAAAAAAAAAA";
+        let insider = "did:key:zROOTRULEINSIDERAAAAAAAAAAAAAAAAA";
+        let agent = "did:key:zROOTRULEAGENT0AAAAAAAAAAAAAAAAAAA";
+
+        // Public repo with a root rule that restricts to `insider` only.
+        // `is_public = true`, but the root rule makes it anonymous-invisible.
+        let mut repo = seed_private_repo(owner, "restricted-public");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.unwrap();
+        state
+            .db
+            .set_visibility_rule(
+                &repo.id,
+                "/",
+                crate::db::VisibilityMode::A,
+                &[insider.to_string()],
+                owner,
+            )
+            .await
+            .unwrap();
+
+        // Open bounty on the root-rule-restricted repo.
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-rootrule-open".into(),
+                repo_owner: owner.into(),
+                repo_name: "restricted-public".into(),
+                issue_id: None,
+                title: "Root Rule Open".into(),
+                amount: 400,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-02-01T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+
+        // Completed bounty, driven through claim→submit→approve.
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-rootrule-comp".into(),
+                repo_owner: owner.into(),
+                repo_name: "restricted-public".into(),
+                issue_id: None,
+                title: "Root Rule Completed".into(),
+                amount: 600,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-02-02T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .claim_bounty("bounty-rootrule-comp", agent, None, "2026-02-02T01:00:00Z")
+            .await
+            .unwrap();
+        state
+            .db
+            .submit_bounty(
+                "bounty-rootrule-comp",
+                "pr-rootrule-1",
+                "2026-02-02T02:00:00Z",
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .approve_bounty("bounty-rootrule-comp", "2026-02-03T00:00:00Z", None)
+            .await
+            .unwrap();
+
+        // Truly public repo (no root rule) as a control.
+        let mut control = seed_private_repo(owner, "truly-public");
+        control.is_public = true;
+        state.db.create_repo(&control).await.unwrap();
+        state
+            .db
+            .create_bounty(&crate::db::BountyRecord {
+                id: "bounty-control-open".into(),
+                repo_owner: owner.into(),
+                repo_name: "truly-public".into(),
+                issue_id: None,
+                title: "Control Open".into(),
+                amount: 100,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-02-04T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            })
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state.clone());
+        let resp = router
+            .oneshot(anon_get("/api/v1/bounties/stats"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+
+        // Anonymous caller must see only the control repo's bounty, not the
+        // root-rule-restricted repo's bounties — even though is_public = true.
+        assert_eq!(
+            body["open"], 1,
+            "root-rule-restricted repo's open bounty must be excluded"
+        );
+        assert_eq!(
+            body["completed"], 0,
+            "root-rule-restricted repo's completed bounty must be excluded"
+        );
+        let leaders = body["leaderboard"].as_array().unwrap();
+        assert!(
+            leaders.is_empty(),
+            "leaderboard must not show earnings from root-rule-restricted repo"
+        );
+
+        // Also verify agent bounty stats for the root-rule-restricted repo's claimant
+        let router = crate::server::build_router(state);
+        let resp_agent = router
+            .oneshot(anon_get(&format!("/api/v1/agents/{agent}/bounties")))
+            .await
+            .unwrap();
+        assert_eq!(resp_agent.status(), StatusCode::OK);
+        let body_agent = json_body(resp_agent).await;
+        assert_eq!(
+            body_agent["completed_bounties"], 0,
+            "root-rule-restricted repo's completed bounty must not count for agent"
+        );
+        assert_eq!(
+            body_agent["total_earned"], 0,
+            "root-rule-restricted repo's earnings must not count for agent"
+        );
+    }
+
     // ── Ref-update events (issue #144: owner_did wire format) ─────────────────
 
     fn events_router(state: AppState) -> Router {
