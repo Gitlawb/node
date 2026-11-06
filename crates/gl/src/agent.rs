@@ -88,7 +88,7 @@ async fn cmd_list(node: String, capability: Option<String>) -> Result<()> {
         let short = did
             .split(':')
             .next_back()
-            .map(|s| &s[..s.len().min(16)])
+            .map(|s| crate::text::truncate(s, 16))
             .unwrap_or("?");
         let trust = agent["trust_score"].as_f64().unwrap_or(0.0);
         let caps = agent["capabilities"]

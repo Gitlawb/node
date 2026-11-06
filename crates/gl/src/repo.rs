@@ -337,7 +337,10 @@ async fn cmd_list(node: String, dir: Option<PathBuf>) -> Result<()> {
         let name = r["name"].as_str().unwrap_or("?");
         let desc = r["description"].as_str().unwrap_or("");
         let public = r["is_public"].as_bool().unwrap_or(true);
-        let updated = r["updated_at"].as_str().map(|s| &s[..10]).unwrap_or("?");
+        let updated = r["updated_at"]
+            .as_str()
+            .map(|s| crate::text::truncate(s, 10))
+            .unwrap_or("?");
         let vis = if public { "public" } else { "private" };
         println!("  {name:<24}  {vis:<8}  {updated}  {desc}");
     }
@@ -514,7 +517,7 @@ async fn cmd_replicas(repo: String, node: String, dir: Option<PathBuf>) -> Resul
             let url = r["replica_url"].as_str().unwrap_or("?");
             let registered = r["registered_at"]
                 .as_str()
-                .map(|s| &s[..10.min(s.len())])
+                .map(|s| crate::text::truncate(s, 10))
                 .unwrap_or("?");
             println!("  {registered}  {did}  →  {url}");
         }
@@ -556,7 +559,7 @@ pub(crate) async fn cmd_commits(
             .or_else(|| c["sha"].as_str())
             .or_else(|| c["oid"].as_str())
             .unwrap_or("?");
-        let short_sha = &sha[..sha.len().min(10)];
+        let short_sha = crate::text::truncate(sha, 10);
         let msg = c["message"].as_str().unwrap_or("(no message)");
         let first_line = msg.lines().next().unwrap_or(msg);
         let author = c["author_name"]
@@ -566,7 +569,7 @@ pub(crate) async fn cmd_commits(
         let date = c["date"]
             .as_str()
             .or_else(|| c["committer_date"].as_str())
-            .map(|s| &s[..10.min(s.len())])
+            .map(|s| crate::text::truncate(s, 10))
             .unwrap_or("?");
         println!("  {short_sha}  {date}  {first_line}  ({author})");
     }

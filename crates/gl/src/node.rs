@@ -413,7 +413,7 @@ async fn cmd_status(node: String, dir: Option<PathBuf>) -> Result<()> {
                     let ref_name = ev["ref"].as_str().unwrap_or("?");
                     let ts = ev["timestamp"]
                         .as_str()
-                        .map(|s| &s[..10.min(s.len())])
+                        .map(|s| crate::text::truncate(s, 10))
                         .unwrap_or("?");
                     println!("  {ts}  {repo}  {ref_name}");
                 }
