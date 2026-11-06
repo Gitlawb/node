@@ -162,9 +162,22 @@ pub fn resolve_issue_id(repo_path: &Path, id_or_prefix: &str) -> Result<Option<S
         .filter(|l| !l.is_empty())
         .collect();
 
-    // An exact id wins over longer ids that share it as a prefix.
-    let found = match matches.iter().find(|m| **m == exact_ref) {
-        Some(m) => *m,
+    // An exact id wins over longer ids that share it as a prefix, but only if its
+    // object exists: for-each-ref also lists a ref whose blob is missing, so a
+    // dangling exact ref falls through to the prefix rules below.
+    let exact = match matches.iter().find(|m| **m == exact_ref) {
+        Some(m) => {
+            let check = Command::new("git")
+                .args(["cat-file", "-e", m])
+                .current_dir(repo_path)
+                .output()
+                .context("failed to run git cat-file -e")?;
+            check.status.success().then_some(*m)
+        }
+        None => None,
+    };
+    let found = match exact {
+        Some(m) => m,
         None => match matches.as_slice() {
             [] => return Ok(None),
             [m] => *m,
@@ -272,6 +285,33 @@ mod tests {
         create_issue(dir.path(), "abc12345-0000", r#"{"status":"open"}"#).unwrap();
         let resolved = resolve_issue_id(dir.path(), "abc12345").unwrap();
         assert_eq!(resolved, Some("abc12345".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_dangling_exact_id_does_not_win_over_longer_id() {
+        let dir = TempDir::new().unwrap();
+        init_repo(&dir);
+        create_issue(dir.path(), "abc12345", r#"{"status":"open","n":1}"#).unwrap();
+        create_issue(dir.path(), "abc12345-0000", r#"{"status":"open","n":2}"#).unwrap();
+        // Dangle the exact ref: the ref stays listed by for-each-ref, but its blob is gone.
+        let out = Command::new("git")
+            .args(["rev-parse", "refs/gitlawb/issues/abc12345"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let hash = String::from_utf8(out.stdout).unwrap();
+        let hash = hash.trim();
+        std::fs::remove_file(
+            dir.path()
+                .join(".git/objects")
+                .join(&hash[..2])
+                .join(&hash[2..]),
+        )
+        .unwrap();
+
+        let result = resolve_issue_id(dir.path(), "abc12345");
+        assert!(result.unwrap_err().to_string().contains("ambiguous"));
+        assert!(close_issue(dir.path(), "abc12345").is_err());
     }
 
     #[test]
