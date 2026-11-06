@@ -97,7 +97,7 @@ async fn cmd_list(node: String) -> Result<()> {
         let reachable = peer["reachable"].as_bool().unwrap_or(false);
         let last_seen = peer["last_seen"]
             .as_str()
-            .map(|s| &s[..10])
+            .map(|s| crate::text::truncate(s, 10))
             .unwrap_or("never");
         let status = if reachable { "✓" } else { "✗" };
         println!("  {status} {url}");

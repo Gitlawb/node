@@ -75,14 +75,14 @@ pub async fn run(args: ChangelogArgs) -> Result<()> {
 
     for event in &events {
         let ts = event["timestamp"].as_str().unwrap_or("?");
-        let date = &ts[..ts.len().min(10)];
+        let date = crate::text::truncate(ts, 10);
 
         match event["type"].as_str().unwrap_or("") {
             "commit" => {
                 let sha = event["sha"].as_str().unwrap_or("?");
                 let msg = event["message"].as_str().unwrap_or("?");
                 let first_line = msg.lines().next().unwrap_or(msg);
-                let short_sha = &sha[..sha.len().min(8)];
+                let short_sha = crate::text::truncate(sha, 8);
                 println!("  {date}  commit      {short_sha}  {first_line}");
             }
             "pr_merged" => {

@@ -251,7 +251,7 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
         let status = issue["status"].as_str().unwrap_or("?");
         let created = issue["created_at"]
             .as_str()
-            .map(|s| &s[..10])
+            .map(|s| crate::text::truncate(s, 10))
             .unwrap_or("?");
         let icon = match status {
             "open" => "○",
@@ -365,10 +365,13 @@ async fn cmd_issue_comments(
         let author_short = author
             .split(':')
             .next_back()
-            .map(|s| &s[..s.len().min(8)])
+            .map(|s| crate::text::truncate(s, 8))
             .unwrap_or("?");
         let cbody = c["body"].as_str().unwrap_or("");
-        let created = c["created_at"].as_str().map(|s| &s[..10]).unwrap_or("?");
+        let created = c["created_at"]
+            .as_str()
+            .map(|s| crate::text::truncate(s, 10))
+            .unwrap_or("?");
         println!("  · {author_short} ({created})");
         println!("    {cbody}");
         println!();
@@ -427,6 +430,34 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"issues":[{"id":"abc-123","title":"Bug report","status":"open","created_at":"2026-03-18T00:00:00Z"}]}"#)
+            .create_async()
+            .await;
+
+        cmd_list(
+            "myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cmd_list_survives_malformed_timestamps() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        // A short timestamp used to panic on `&s[..10]`; a timestamp whose
+        // byte 10 is mid-char panics even with a len() guard.
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/issues$".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"issues":[{"id":"a","title":"short ts","status":"open","created_at":"2026"},{"id":"b","title":"mb ts","status":"open","created_at":"2026-08-1é5T00:00:00Z"},{"id":"c","title":"empty ts","status":"open","created_at":""}]}"#)
             .create_async()
             .await;
 

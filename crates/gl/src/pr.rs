@@ -304,7 +304,7 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
         let author_short = author
             .split(':')
             .next_back()
-            .map(|s| &s[..s.len().min(8)])
+            .map(|s| crate::text::truncate(s, 8))
             .unwrap_or("?");
         let status_icon = match status {
             "open" => "○",
@@ -374,7 +374,7 @@ async fn cmd_view(repo: String, number: u64, node: String, dir: Option<PathBuf>)
             let reviewer_short = reviewer
                 .split(':')
                 .next_back()
-                .map(|s| &s[..s.len().min(8)])
+                .map(|s| crate::text::truncate(s, 8))
                 .unwrap_or("?");
             let rstatus = r["status"].as_str().unwrap_or("?");
             let rbody = r["body"].as_str().unwrap_or("");
@@ -414,10 +414,13 @@ async fn cmd_view(repo: String, number: u64, node: String, dir: Option<PathBuf>)
             let author_short = author
                 .split(':')
                 .next_back()
-                .map(|s| &s[..s.len().min(8)])
+                .map(|s| crate::text::truncate(s, 8))
                 .unwrap_or("?");
             let cbody = c["body"].as_str().unwrap_or("");
-            let created = c["created_at"].as_str().map(|s| &s[..10]).unwrap_or("?");
+            let created = c["created_at"]
+                .as_str()
+                .map(|s| crate::text::truncate(s, 10))
+                .unwrap_or("?");
             println!("  · {author_short} ({created})");
             println!("    {cbody}");
         }
@@ -464,7 +467,7 @@ async fn cmd_merge(repo: String, number: u64, node: String, dir: Option<PathBuf>
 
     let sha = result["merge_sha"].as_str().unwrap_or("?");
     println!("✓ Merged PR #{number}");
-    println!("  Merge commit: {}", &sha[..sha.len().min(12)]);
+    println!("  Merge commit: {}", crate::text::truncate(sha, 12));
     Ok(())
 }
 
@@ -555,10 +558,13 @@ async fn cmd_comments(repo: String, number: u64, node: String, dir: Option<PathB
         let author_short = author
             .split(':')
             .next_back()
-            .map(|s| &s[..s.len().min(8)])
+            .map(|s| crate::text::truncate(s, 8))
             .unwrap_or("?");
         let cbody = c["body"].as_str().unwrap_or("");
-        let created = c["created_at"].as_str().map(|s| &s[..10]).unwrap_or("?");
+        let created = c["created_at"]
+            .as_str()
+            .map(|s| crate::text::truncate(s, 10))
+            .unwrap_or("?");
         println!("  · {author_short} ({created})");
         println!("    {cbody}");
         println!();

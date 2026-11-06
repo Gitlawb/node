@@ -131,11 +131,7 @@ async fn cmd_list(node: String, dir: Option<PathBuf>) -> Result<()> {
         let sha = pin["sha256_hex"].as_str().unwrap_or("?");
         let pinned_at = pin["pinned_at"].as_str().unwrap_or("?");
         // Trim pinned_at to date+time without subseconds
-        let ts = if pinned_at.len() >= 19 {
-            &pinned_at[..19]
-        } else {
-            pinned_at
-        };
+        let ts = crate::text::truncate(pinned_at, 19);
         println!("  {cid}");
         println!("    sha256: {sha}");
         println!("    pinned: {ts}");

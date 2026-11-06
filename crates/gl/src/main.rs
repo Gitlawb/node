@@ -30,6 +30,7 @@ mod star;
 mod status;
 mod sync;
 mod task;
+mod text;
 mod ucan_cmd;
 mod visibility;
 mod webhook;

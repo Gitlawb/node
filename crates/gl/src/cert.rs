@@ -117,7 +117,10 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
         let id = cert["id"].as_str().unwrap_or("?");
         let ref_name = cert["ref_name"].as_str().unwrap_or("?");
         let new_sha = cert["new_sha"].as_str().unwrap_or("?");
-        let issued_at = cert["issued_at"].as_str().map(|s| &s[..19]).unwrap_or("?");
+        let issued_at = cert["issued_at"]
+            .as_str()
+            .map(|s| crate::text::truncate(s, 19))
+            .unwrap_or("?");
         println!("  {id:.8}  {issued_at}  {ref_name}  {new_sha:.12}");
     }
     Ok(())
