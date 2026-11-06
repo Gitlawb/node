@@ -476,6 +476,10 @@ async fn visible_repo_pairs(state: &AppState) -> Vec<(String, String)> {
             .iter()
             .filter(|r| {
                 let rules = rules_by_repo.get(&r.id).map(Vec::as_slice).unwrap_or(&[]);
+                // mirror-rows-handled: a mirror with a canonical twin is deduped to the
+                // canonical row and its rules; a mirror-only repo counts as public, the
+                // same answer authorize_repo_read and /stats give. Pinned by
+                // bounty_stats_mirror_rows_follow_canonical_twin_or_count_when_alone.
                 crate::visibility::listable_at_root(rules, r.is_public, &r.owner_did, None)
             })
             .map(|r| {
