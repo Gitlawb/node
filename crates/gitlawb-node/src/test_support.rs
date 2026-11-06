@@ -18021,6 +18021,28 @@ mod tests {
         }
     }
 
+    /// A database failure must surface as an error status, never as a 200
+    /// carrying zero counts that read as confirmed absence of activity.
+    #[sqlx::test]
+    async fn bounty_stats_db_failure_is_not_reported_as_zero(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let router = crate::server::build_router(state);
+        pool.close().await;
+
+        for uri in [
+            "/api/v1/bounties/stats",
+            "/api/v1/agents/did:key:zDBFAILAGENTAAAAAAAAAAAAAAAAAAAAA/bounties",
+        ] {
+            let resp = router.clone().oneshot(anon_get(uri)).await.unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::OK,
+                "{uri} must not report zero counts when the database is down"
+            );
+            assert!(resp.status().is_server_error(), "{uri}: {}", resp.status());
+        }
+    }
+
     /// Mirror rows are written with `is_public = true` and no replicated rules,
     /// so a mirror alone says nothing about the origin's visibility. The
     /// aggregates must (a) hide bounties of a repo whose canonical twin is
