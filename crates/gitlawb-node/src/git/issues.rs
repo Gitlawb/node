@@ -141,19 +141,10 @@ pub fn resolve_issue_id(repo_path: &Path, id_or_prefix: &str) -> Result<Option<S
         return Ok(None);
     }
 
-    // Try exact match first — fast path for callers passing the full UUID.
+    // List all refs that start with the given string; the glob also matches the exact
+    // ref. The id handed back is always git's own refname, never the request input.
     let exact_ref = format!("refs/gitlawb/issues/{id_or_prefix}");
-    let check = Command::new("git")
-        .args(["cat-file", "-e", &exact_ref])
-        .current_dir(repo_path)
-        .output()
-        .context("failed to run git cat-file -e")?;
-    if check.status.success() {
-        return Ok(Some(id_or_prefix.to_string()));
-    }
-
-    // Prefix search: list all refs that start with the given string.
-    let prefix_glob = format!("refs/gitlawb/issues/{id_or_prefix}*");
+    let prefix_glob = format!("{exact_ref}*");
     let list = Command::new("git")
         .args(["for-each-ref", "--format=%(refname)", &prefix_glob])
         .current_dir(repo_path)
@@ -165,25 +156,31 @@ pub fn resolve_issue_id(repo_path: &Path, id_or_prefix: &str) -> Result<Option<S
     }
 
     let output = String::from_utf8_lossy(&list.stdout);
-    let matches: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
+    let matches: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
 
-    match matches.len() {
-        0 => Ok(None),
-        1 => {
-            // Strip the "refs/gitlawb/issues/" prefix to get the bare ID.
-            let full_id = matches[0]
-                .trim()
-                .strip_prefix("refs/gitlawb/issues/")
-                .unwrap_or(matches[0].trim())
-                .to_string();
-            Ok(Some(full_id))
-        }
-        _ => anyhow::bail!(
-            "ambiguous issue prefix '{}': matches {} issues",
-            id_or_prefix,
-            matches.len()
-        ),
-    }
+    // An exact id wins over longer ids that share it as a prefix.
+    let found = match matches.iter().find(|m| **m == exact_ref) {
+        Some(m) => *m,
+        None => match matches.as_slice() {
+            [] => return Ok(None),
+            [m] => *m,
+            _ => anyhow::bail!(
+                "ambiguous issue prefix '{}': matches {} issues",
+                id_or_prefix,
+                matches.len()
+            ),
+        },
+    };
+    // Strip the "refs/gitlawb/issues/" prefix to get the bare ID.
+    let full_id = found
+        .strip_prefix("refs/gitlawb/issues/")
+        .unwrap_or(found)
+        .to_string();
+    Ok(Some(full_id))
 }
 
 /// Close an issue by updating its status to "closed" in the git ref.
@@ -265,6 +262,16 @@ mod tests {
         .unwrap();
         let resolved = resolve_issue_id(dir.path(), full_id).unwrap();
         assert_eq!(resolved, Some(full_id.to_string()));
+    }
+
+    #[test]
+    fn test_resolve_exact_id_wins_over_longer_id() {
+        let dir = TempDir::new().unwrap();
+        init_repo(&dir);
+        create_issue(dir.path(), "abc12345", r#"{"status":"open"}"#).unwrap();
+        create_issue(dir.path(), "abc12345-0000", r#"{"status":"open"}"#).unwrap();
+        let resolved = resolve_issue_id(dir.path(), "abc12345").unwrap();
+        assert_eq!(resolved, Some("abc12345".to_string()));
     }
 
     #[test]
