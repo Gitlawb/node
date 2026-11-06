@@ -17967,6 +17967,60 @@ mod tests {
         }
     }
 
+    /// `claimant_did` is stored in whatever form the claimer sent, so the
+    /// per-agent lookup must match both `did:key:<key>` and the bare key for
+    /// either spelling of the request path.
+    #[sqlx::test]
+    async fn agent_bounty_stats_matches_full_and_bare_claimant_forms(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zCLAIMFORMOWNERAAAAAAAAAAAAAAAAAAAA";
+        let bare = "zCLAIMFORMAGENT0000000000000000000";
+        let full = format!("did:key:{bare}");
+
+        let mut repo = seed_private_repo(owner, "claim-form-repo");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.unwrap();
+
+        for (id, claimant, amount) in [("cf-full", full.as_str(), 100), ("cf-bare", bare, 30)] {
+            state
+                .db
+                .create_bounty(&open_bounty_on(id, owner, "claim-form-repo", amount))
+                .await
+                .unwrap();
+            state
+                .db
+                .claim_bounty(id, claimant, None, "2026-03-01T01:00:00Z")
+                .await
+                .unwrap();
+            state
+                .db
+                .submit_bounty(id, "pr-cf", "2026-03-01T02:00:00Z")
+                .await
+                .unwrap();
+            state
+                .db
+                .approve_bounty(id, "2026-03-02T00:00:00Z", None)
+                .await
+                .unwrap();
+        }
+
+        let router = crate::server::build_router(state);
+        for path_did in [full.as_str(), bare] {
+            let uri = format!("/api/v1/agents/{path_did}/bounties");
+            let resp = router.clone().oneshot(anon_get(&uri)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = json_body(resp).await;
+            assert_eq!(
+                body["completed_bounties"], 2,
+                "both claimant spellings must count for path {path_did}"
+            );
+            assert_eq!(
+                body["total_earned"], 130,
+                "both claimant spellings must be summed for path {path_did}"
+            );
+        }
+    }
+
     /// Mirror rows are written with `is_public = true` and no replicated rules,
     /// so a mirror alone says nothing about the origin's visibility. The
     /// aggregates must (a) hide bounties of a repo whose canonical twin is

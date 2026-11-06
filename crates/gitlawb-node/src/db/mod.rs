@@ -4612,9 +4612,9 @@ impl Db {
         Ok(row.get::<i64, _>("c"))
     }
 
-    /// Per-agent bounty stats restricted to visible repos.  Both
-    /// `b.repo_owner` and `b.claimant_did` are normalized so `did:key:` and
-    /// bare-key forms match.
+    /// Per-agent bounty stats restricted to visible repos.  `b.repo_owner` is
+    /// normalized and `b.claimant_did` is matched against both spellings of the
+    /// agent key, so `did:key:` and bare-key forms match.
     pub async fn agent_bounty_stats_visible(
         &self,
         agent_did: &str,
@@ -4623,22 +4623,29 @@ impl Db {
         if visible.is_empty() {
             return Ok((0, 0));
         }
+        // Index-friendly form of `normalize(claimant_did) = N`: a claimant
+        // normalizes to N only when stored as N or as `did:key:N` (the latter
+        // only when N has no ':', else the prefix is not stripped). Matching
+        // the raw column keeps `idx_bounties_claimant` usable.
         let normalized_agent = normalize_owner_key(agent_did);
+        let mut claimants: Vec<String> = vec![normalized_agent.to_string()];
+        if !normalized_agent.contains(':') {
+            claimants.push(format!("did:key:{normalized_agent}"));
+        }
         let owners: Vec<String> = visible.iter().map(|(o, _)| o.clone()).collect();
         let names: Vec<String> = visible.iter().map(|(_, n)| n.clone()).collect();
         let sql = format!(
             "SELECT COUNT(*) as cnt, COALESCE(SUM(amount), 0)::BIGINT as total FROM bounties b \
-             WHERE ({claimant_case}) = $1 \
+             WHERE b.claimant_did = ANY($1::text[]) \
              AND b.status = 'completed' \
              AND EXISTS ( \
                  SELECT 1 FROM unnest($2::text[], $3::text[]) AS v(o, n) \
                  WHERE ({bounty_owner}) = v.o AND b.repo_name = v.n \
              )",
-            claimant_case = BOUNTY_CLAIMANT_CASE_SQL,
             bounty_owner = BOUNTY_OWNER_CASE_SQL,
         );
         let row = sqlx::query(&sql)
-            .bind(normalized_agent)
+            .bind(&claimants)
             .bind(&owners)
             .bind(&names)
             .fetch_one(&self.pool)
