@@ -1,4 +1,4 @@
-# gitlawb economics
+# Twigpine economics
 
 How $GITLAWB flows through the protocol and how stakers earn.
 

@@ -2,9 +2,9 @@
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in gitlawb, please **do not open a public issue**.
+If you discover a security vulnerability in Twigpine, please **do not open a public issue**.
 
-Report it privately by emailing **security@gitlawb.com** with:
+Report it privately by emailing **security@twigpine.com** with:
 - A description of the vulnerability
 - Steps to reproduce
 - Potential impact assessment
@@ -118,13 +118,13 @@ These are documented limitations of the current live release. They should be pri
 
 ## Threat Model
 
-gitlawb is designed to be secure against:
+Twigpine is designed to be secure against:
 - **Unauthenticated writes** — HTTP Signature auth on protected write endpoints; see Known Limitations for owner and capability authorization gaps
 - **Tampered git objects** — CIDv1 content addressing detects modification
 - **Identity spoofing** — DIDs derived from public keys, unforgeable without the private key
 - **Centralized takedown** — no single point of control; data on IPFS + Arweave
 
-gitlawb is **not yet** designed to defend against:
+Twigpine is **not yet** designed to defend against:
 - A compromised node operator (node operators are trusted for their own node)
 - Sybil attacks on the DHT (trust score system mitigates, not eliminates)
 - Timing attacks on signature verification (not constant-time compared in v0.1)
