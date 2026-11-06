@@ -4343,7 +4343,7 @@ mod mirror_state_tests {
 
         // Recreate the pre-v30 shape, then add data written by the old node.
         sqlx::query("ALTER TABLE repos DROP COLUMN upstream_url CASCADE")
-            .execute(db.pool())
+            .execute(&db.pool)
             .await
             .unwrap();
         for column in [
@@ -4353,12 +4353,12 @@ mod mirror_state_tests {
             "mirror_updated_at",
         ] {
             sqlx::query(&format!("ALTER TABLE repos DROP COLUMN {column}"))
-                .execute(db.pool())
+                .execute(&db.pool)
                 .await
                 .unwrap();
         }
         sqlx::query("DELETE FROM schema_migrations WHERE version IN (30, 31)")
-            .execute(db.pool())
+            .execute(&db.pool)
             .await
             .unwrap();
 
@@ -4369,7 +4369,7 @@ mod mirror_state_tests {
 
         let still_there: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repos WHERE id = $1")
             .bind(&existing.id)
-            .fetch_one(db.pool())
+            .fetch_one(&db.pool)
             .await
             .unwrap();
         assert_eq!(
@@ -4384,7 +4384,7 @@ mod mirror_state_tests {
                  FROM repos WHERE id = $1",
             )
             .bind(&existing.id)
-            .fetch_one(db.pool())
+            .fetch_one(&db.pool)
             .await
             .unwrap();
         assert_eq!(mirror_values, (None, None, None, None));
@@ -4393,7 +4393,7 @@ mod mirror_state_tests {
             "SELECT version, name FROM schema_migrations
              WHERE version IN (30, 31) ORDER BY version",
         )
-        .fetch_all(db.pool())
+        .fetch_all(&db.pool)
         .await
         .unwrap();
         assert_eq!(
@@ -4408,7 +4408,7 @@ mod mirror_state_tests {
              WHERE conrelid = 'repos'::regclass
                AND conname = 'repos_mirror_state_valid'",
         )
-        .fetch_one(db.pool())
+        .fetch_one(&db.pool)
         .await
         .unwrap();
         assert!(constraint_validated, "v31 must validate the v30 constraint");
@@ -4422,17 +4422,17 @@ mod mirror_state_tests {
         let db = migrated_db(pool).await;
 
         sqlx::query("ALTER TABLE repos DROP CONSTRAINT repos_mirror_state_valid")
-            .execute(db.pool())
+            .execute(&db.pool)
             .await
             .unwrap();
         sqlx::query(
             "ALTER TABLE repos ADD CONSTRAINT repos_mirror_state_valid CHECK (TRUE) NOT VALID",
         )
-        .execute(db.pool())
+        .execute(&db.pool)
         .await
         .unwrap();
         sqlx::query("DELETE FROM schema_migrations WHERE version IN (30, 31)")
-            .execute(db.pool())
+            .execute(&db.pool)
             .await
             .unwrap();
 
@@ -4444,7 +4444,7 @@ mod mirror_state_tests {
              WHERE conrelid = 'repos'::regclass
                AND conname = 'repos_mirror_state_valid'",
         )
-        .fetch_one(db.pool())
+        .fetch_one(&db.pool)
         .await
         .unwrap();
         assert!(
@@ -4463,7 +4463,7 @@ mod mirror_state_tests {
              WHERE id = $1",
         )
         .bind(&existing.id)
-        .execute(db.pool())
+        .execute(&db.pool)
         .await;
         assert!(
             malformed.is_err(),
@@ -4498,7 +4498,7 @@ mod mirror_state_tests {
         sqlx::query("UPDATE repos SET mirror_updated_at = $2 WHERE id = $1")
             .bind(&existing.id)
             .bind(original_updated_at.to_rfc3339())
-            .execute(db.pool())
+            .execute(&db.pool)
             .await
             .unwrap();
         let retry = db
@@ -4563,7 +4563,7 @@ mod mirror_state_tests {
         )
         .bind(&existing.id)
         .bind(transition_id)
-        .execute(db.pool())
+        .execute(&db.pool)
         .await
         .unwrap();
 
@@ -4599,7 +4599,7 @@ mod mirror_state_tests {
              WHERE id = $1",
         )
         .bind(&existing.id)
-        .execute(db.pool())
+        .execute(&db.pool)
         .await;
         assert!(partial.is_err(), "transition metadata must be durable");
 
@@ -4646,7 +4646,7 @@ mod mirror_state_tests {
             .bind(invalid.status)
             .bind(invalid.transition_id)
             .bind(invalid.transition_phase)
-            .execute(db.pool())
+            .execute(&db.pool)
             .await;
             assert!(result.is_err(), "constraint accepted {}", invalid.case);
         }
@@ -4659,7 +4659,7 @@ mod mirror_state_tests {
              WHERE id = $1",
         )
         .bind(&existing.id)
-        .execute(db.pool())
+        .execute(&db.pool)
         .await;
         assert!(
             insecure.is_err(),
@@ -4701,7 +4701,7 @@ mod mirror_state_tests {
                 .bind(status)
                 .bind(Uuid::new_v4())
                 .bind(phase)
-                .execute(db.pool())
+                .execute(&db.pool)
                 .await
                 .unwrap_or_else(|error| panic!("{status}/{phase} was rejected: {error}"));
             }
@@ -4718,7 +4718,7 @@ mod mirror_state_tests {
         )
         .bind(&existing.id)
         .bind(Uuid::new_v4())
-        .execute(db.pool())
+        .execute(&db.pool)
         .await
         .unwrap();
 
@@ -4754,7 +4754,7 @@ mod mirror_state_tests {
         let unchanged: (Option<String>, Option<String>) =
             sqlx::query_as("SELECT upstream_url, mirror_status FROM repos WHERE id = $1")
                 .bind("z6MkPeer/repo")
-                .fetch_one(db.pool())
+                .fetch_one(&db.pool)
                 .await
                 .unwrap();
         assert_eq!(unchanged, (None, None));
