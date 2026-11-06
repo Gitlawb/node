@@ -1,6 +1,6 @@
 //! `gl ipfs` — IPFS pin management commands.
 //!
-//! Communicates with the gitlawb node to list pinned CIDs and retrieve git
+//! Communicates with the Twigpine node to list pinned CIDs and retrieve git
 //! objects by their content-addressed CID.
 
 use std::path::PathBuf;
@@ -22,7 +22,11 @@ pub struct IpfsArgs {
 pub enum IpfsCmd {
     /// List all CIDs pinned to the node's local IPFS daemon
     List {
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         /// Identity directory (default: ~/.gitlawb)
         #[arg(long)]
@@ -69,7 +73,11 @@ pub enum IpfsCmd {
     Get {
         /// The CIDv1 string (e.g. bafkrei...)
         cid: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         /// Identity directory (default: ~/.gitlawb)
         #[arg(long)]
