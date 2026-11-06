@@ -1575,7 +1575,7 @@ pub async fn pin_git_object(
     // The string still has to be a CID. A garbage Hash would be recorded and
     // later cat-ed the same way a missing one was, so reject it here.
     Cid::from_str(&cid).map_err(|e| {
-        anyhow::anyhow!("IPFS /api/v0/add returned a Hash that is not a CID ({cid}): {e}")
+        anyhow::anyhow!("IPFS /api/v0/add returned a Hash that is not a CID ({cid:.200}): {e}")
     })?;
 
     tracing::debug!(sha256 = %sha256_hex, %cid, "pinned git object to IPFS");
@@ -2424,6 +2424,33 @@ mod tests {
         assert!(
             result.is_err(),
             "a Hash that is not a CID must be an add failure: {result:?}"
+        );
+    }
+
+    /// The Hash text goes into the error and `encrypted_pin` logs that error,
+    /// so a backend answering with a huge invalid Hash must not produce an
+    /// unbounded log entry.
+    #[tokio::test]
+    async fn pin_git_object_bounds_an_oversized_invalid_hash_in_the_error() {
+        let long = "x".repeat(5000);
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+            .with_status(200)
+            .with_body(format!(r#"{{"Hash":"{long}","Size":"19"}}"#))
+            .create_async()
+            .await;
+        let result = pin_git_object(&server.url(), "deadbeef", b"some object bytes\n", None).await;
+        let err = result.expect_err("an invalid Hash must be an add failure");
+        let msg = err.to_string();
+        assert!(
+            msg.len() < 1000,
+            "the error must bound the echoed Hash, got {} bytes",
+            msg.len()
+        );
+        assert!(
+            !msg.contains(&long),
+            "the error must not carry the full invalid Hash"
         );
     }
 
