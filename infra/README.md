@@ -24,7 +24,7 @@ file, so it points to `../../Dockerfile`.
 ## Deploying to AWS
 
 See [`aws/README.md`](aws/README.md) — Terraform for a single EC2 instance
-running the published `ghcr.io/gitlawb/node` image with Docker compose.
+running the published `ghcr.io/twigpine/node` image with Docker compose.
 
 ## What intentionally stays at the repo root
 
