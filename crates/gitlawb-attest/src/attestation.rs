@@ -505,6 +505,23 @@ mod tests {
     }
 
     #[test]
+    fn verify_rejects_oversized_method_id_before_decoding() {
+        let sk = fresh();
+        let mut att = dummy_attestation(&sk, sample_cert_hash());
+        // A well-formed prefix on an absurdly long id must fail the length
+        // bound, not the decoder: base58 decode cost is quadratic in input
+        // length, so reaching it at all is the defect.
+        att.signer = format!("did:key:z{}", "1".repeat(256));
+        let err = att.verify_signature(sample_cert_hash()).unwrap_err();
+        // Match the bound's own message: any other Did error (a decode or
+        // length mismatch downstream) means the oversized input was decoded.
+        match err {
+            Error::Did(m) => assert!(m.contains("too long"), "unexpected: {m}"),
+            e => panic!("expected Error::Did, got {e:?}"),
+        }
+    }
+
+    #[test]
     fn verify_rejects_bad_signature_base64() {
         let sk = fresh();
         let mut att = dummy_attestation(&sk, sample_cert_hash());
