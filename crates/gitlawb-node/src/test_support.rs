@@ -17526,6 +17526,204 @@ mod tests {
         assert!(resp.status().is_success());
     }
 
+    // ── #341: the id-keyed bounty mutations must gate on repo read before the
+    // status and participant checks, so a caller holding an opaque id cannot
+    // distinguish an existing private-repo bounty from an absent one. The deny
+    // shape is 404 with a "not found" body, identical to the absent-id case.
+
+    fn seed_bounty(
+        id: &str,
+        owner: &str,
+        repo: &str,
+        status: &str,
+        claimant: Option<&str>,
+    ) -> crate::db::BountyRecord {
+        crate::db::BountyRecord {
+            id: id.into(),
+            repo_owner: owner.into(),
+            repo_name: repo.into(),
+            issue_id: None,
+            title: "Bounty".into(),
+            amount: 100,
+            creator_did: owner.into(),
+            claimant_did: claimant.map(str::to_string),
+            claimant_wallet: None,
+            pr_id: None,
+            status: status.into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            claimed_at: claimant.map(|_| "2026-01-02T00:00:00Z".into()),
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 86400,
+            tx_hash: None,
+        }
+    }
+
+    fn signed_bounty_post(kp: &Keypair, uri: &str, body: &[u8]) -> Request<Body> {
+        let signed = gitlawb_core::http_sig::sign_request(kp, "POST", uri, body);
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::from(body.to_vec()))
+            .unwrap()
+    }
+
+    /// Drives one bounty mutation route as a stranger against a private repo and
+    /// asserts the denial is indistinguishable from the absent-id case: same
+    /// 404 status, same "not found" body shape, no status or participant detail.
+    /// `bounty_status` is whichever lifecycle state reaches the route's
+    /// participant check today, so the assertion exercises the deepest leak.
+    async fn assert_bounty_mutation_denies_stranger_on_private(
+        pool: PgPool,
+        route: &str,
+        bounty_status: &str,
+        body: &[u8],
+    ) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zB341PRIVOWNERAAAAAAAAAAAAAAAAAAAAAAAA";
+        let claimant = "did:key:zB341PRIVCLAIMANTAAAAAAAAAAAAAAAAAAAAA";
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-bounty-repo"))
+            .await
+            .unwrap();
+        state
+            .db
+            .create_bounty(&seed_bounty(
+                "b341-held-id",
+                owner,
+                "secret-bounty-repo",
+                bounty_status,
+                Some(claimant),
+            ))
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let stranger = Keypair::generate();
+
+        // Held id: the stranger knows the bounty id but cannot read the repo.
+        let held_uri = format!("/api/v1/bounties/b341-held-id/{route}");
+        let resp = router
+            .clone()
+            .oneshot(signed_bounty_post(&stranger, &held_uri, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "{route} on a held private-repo bounty id must deny as 404, not a \
+             distinguishable status/participant error"
+        );
+        let held_body = json_body(resp).await;
+
+        // Absent id: the control case. The body must carry the same not_found
+        // shape so a denial discloses nothing beyond the caller-supplied id.
+        let absent_uri = format!("/api/v1/bounties/b341-no-such-id/{route}");
+        let resp = router
+            .oneshot(signed_bounty_post(&stranger, &absent_uri, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let absent_body = json_body(resp).await;
+
+        for (id, got) in [
+            ("b341-held-id", &held_body),
+            ("b341-no-such-id", &absent_body),
+        ] {
+            assert_eq!(
+                *got,
+                serde_json::json!({
+                    "error": "not_found",
+                    "message": format!("bounty {id} not found"),
+                }),
+                "{route} denial body for {id} must be the bare not-found shape, got {got}"
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn submit_bounty_gate_denies_stranger_on_private(pool: PgPool) {
+        assert_bounty_mutation_denies_stranger_on_private(
+            pool,
+            "submit",
+            "claimed",
+            br#"{"pr_id":"owner/repo#1"}"#,
+        )
+        .await;
+    }
+
+    #[sqlx::test]
+    async fn approve_bounty_gate_denies_stranger_on_private(pool: PgPool) {
+        assert_bounty_mutation_denies_stranger_on_private(pool, "approve", "submitted", b"{}")
+            .await;
+    }
+
+    #[sqlx::test]
+    async fn cancel_bounty_gate_denies_stranger_on_private(pool: PgPool) {
+        assert_bounty_mutation_denies_stranger_on_private(pool, "cancel", "open", b"").await;
+    }
+
+    #[sqlx::test]
+    async fn dispute_bounty_gate_denies_stranger_on_private(pool: PgPool) {
+        assert_bounty_mutation_denies_stranger_on_private(pool, "dispute", "claimed", b"").await;
+    }
+
+    /// The read gate must admit readable repos: on a PUBLIC repo a stranger
+    /// still reaches the participant checks, so the four routes answer 403
+    /// rather than the gated 404.
+    #[sqlx::test]
+    async fn bounty_mutation_gates_still_reach_participant_check_on_public(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zB341PUBOWNERAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let claimant = "did:key:zB341PUBCLAIMANTAAAAAAAAAAAAAAAAAAAAAA";
+        let mut repo = seed_private_repo(owner, "public-bounty-repo");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.unwrap();
+
+        let cases: [(&str, &str, &[u8]); 4] = [
+            ("submit", "claimed", br#"{"pr_id":"owner/repo#1"}"#),
+            ("approve", "submitted", b"{}"),
+            ("cancel", "open", b""),
+            ("dispute", "claimed", b""),
+        ];
+        for (i, (_, status, _)) in cases.iter().enumerate() {
+            let id = format!("b341-pub-{i}");
+            state
+                .db
+                .create_bounty(&seed_bounty(
+                    &id,
+                    owner,
+                    "public-bounty-repo",
+                    status,
+                    Some(claimant),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let router = crate::server::build_router(state);
+        let stranger = Keypair::generate();
+        for (i, (route, _, body)) in cases.iter().enumerate() {
+            let id = format!("b341-pub-{i}");
+            let uri = format!("/api/v1/bounties/{id}/{route}");
+            let resp = router
+                .clone()
+                .oneshot(signed_bounty_post(&stranger, &uri, body))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{route} on a public repo must still reach the participant check"
+            );
+        }
+    }
+
     #[sqlx::test]
     async fn list_all_bounties_filters_private_repos_for_anon(pool: PgPool) {
         let state = test_state(pool).await;
