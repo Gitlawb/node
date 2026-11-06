@@ -478,7 +478,12 @@ async fn visible_repo_pairs(state: &AppState) -> Vec<(String, String)> {
                 let rules = rules_by_repo.get(&r.id).map(Vec::as_slice).unwrap_or(&[]);
                 crate::visibility::listable_at_root(rules, r.is_public, &r.owner_did, None)
             })
-            .map(|r| (crate::db::normalize_owner_key(&r.owner_did).to_string(), r.name.clone()))
+            .map(|r| {
+                (
+                    crate::db::normalize_owner_key(&r.owner_did).to_string(),
+                    r.name.clone(),
+                )
+            })
             .collect();
         Ok(pairs)
     }
@@ -554,4 +559,3 @@ pub async fn agent_bounty_stats(
         "total_earned": total,
     })))
 }
-

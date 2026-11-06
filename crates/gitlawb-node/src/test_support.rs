@@ -17712,7 +17712,12 @@ mod tests {
             .unwrap();
         state
             .db
-            .claim_bounty("bounty-priv-comp", agent_private, None, "2026-01-02T01:00:00Z")
+            .claim_bounty(
+                "bounty-priv-comp",
+                agent_private,
+                None,
+                "2026-01-02T01:00:00Z",
+            )
             .await
             .unwrap();
         state
@@ -17779,7 +17784,12 @@ mod tests {
             .unwrap();
         state
             .db
-            .claim_bounty("bounty-pub-comp", agent_public, None, "2026-01-05T01:00:00Z")
+            .claim_bounty(
+                "bounty-pub-comp",
+                agent_public,
+                None,
+                "2026-01-05T01:00:00Z",
+            )
             .await
             .unwrap();
         state
@@ -17802,13 +17812,20 @@ mod tests {
         let body = json_body(resp).await;
 
         // Anonymous observer must only see counts from the public repo (#477)
-        assert_eq!(body["open"], 1, "only 1 public open bounty should be counted");
+        assert_eq!(
+            body["open"], 1,
+            "only 1 public open bounty should be counted"
+        );
         assert_eq!(
             body["completed"], 1,
             "only 1 public completed bounty should be counted"
         );
         let leaders = body["leaderboard"].as_array().unwrap();
-        assert_eq!(leaders.len(), 1, "leaderboard must exclude private earnings");
+        assert_eq!(
+            leaders.len(),
+            1,
+            "leaderboard must exclude private earnings"
+        );
         assert_eq!(leaders[0]["did"], agent_public);
         assert_eq!(leaders[0]["completed"], 1);
         assert_eq!(leaders[0]["total_earned"], 300);
@@ -18013,7 +18030,11 @@ mod tests {
             .unwrap();
         state
             .db
-            .submit_bounty("bounty-rootrule-comp", "pr-rootrule-1", "2026-02-02T02:00:00Z")
+            .submit_bounty(
+                "bounty-rootrule-comp",
+                "pr-rootrule-1",
+                "2026-02-02T02:00:00Z",
+            )
             .await
             .unwrap();
         state
